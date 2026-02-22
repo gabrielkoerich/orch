@@ -99,212 +99,212 @@ jobs:
         with:
           args: detect --source . --config .gitleaks.toml --no-banner --redact --exit-code=1
 
-  release:
-    needs: [rust, bats, shellcheck, semgrep-and-secrets]
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+  # release:
+  #   needs: [rust, bats, shellcheck, semgrep-and-secrets]
+  #   if: github.ref == 'refs/heads/main'
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         fetch-depth: 0
 
-      - name: Check for new commits since last tag
-        id: check
-        run: |
-          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+  #     - name: Check for new commits since last tag
+  #       id: check
+  #       run: |
+  #         LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+  #         echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
 
-          if [ -n "$LAST_TAG" ]; then
-            COMMIT_COUNT=$(git rev-list "$LAST_TAG"..HEAD --count)
-          else
-            COMMIT_COUNT=$(git rev-list HEAD --count)
-          fi
-          echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+  #         if [ -n "$LAST_TAG" ]; then
+  #           COMMIT_COUNT=$(git rev-list "$LAST_TAG"..HEAD --count)
+  #         else
+  #           COMMIT_COUNT=$(git rev-list HEAD --count)
+  #         fi
+  #         echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
 
-          if [ "$COMMIT_COUNT" -eq 0 ]; then
-            echo "No new commits since $LAST_TAG — skipping release."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            # Skip release if ALL commits are chore-only
-            if [ -n "$LAST_TAG" ]; then
-              SUBJECTS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
-            else
-              SUBJECTS=$(git log --pretty=format:"%s")
-            fi
-            NON_CHORE=$(echo "$SUBJECTS" | grep -cvE '^chore(\(.*\))?:' || true)
-            if [ "$NON_CHORE" -eq 0 ]; then
-              echo "All $COMMIT_COUNT commits are chore — skipping release."
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "$COMMIT_COUNT new commits since ${LAST_TAG:-beginning} ($NON_CHORE non-chore)"
-              echo "skip=false" >> "$GITHUB_OUTPUT"
-            fi
-          fi
+  #         if [ "$COMMIT_COUNT" -eq 0 ]; then
+  #           echo "No new commits since $LAST_TAG — skipping release."
+  #           echo "skip=true" >> "$GITHUB_OUTPUT"
+  #         else
+  #           # Skip release if ALL commits are chore-only
+  #           if [ -n "$LAST_TAG" ]; then
+  #             SUBJECTS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
+  #           else
+  #             SUBJECTS=$(git log --pretty=format:"%s")
+  #           fi
+  #           NON_CHORE=$(echo "$SUBJECTS" | grep -cvE '^chore(\(.*\))?:' || true)
+  #           if [ "$NON_CHORE" -eq 0 ]; then
+  #             echo "All $COMMIT_COUNT commits are chore — skipping release."
+  #             echo "skip=true" >> "$GITHUB_OUTPUT"
+  #           else
+  #             echo "$COMMIT_COUNT new commits since ${LAST_TAG:-beginning} ($NON_CHORE non-chore)"
+  #             echo "skip=false" >> "$GITHUB_OUTPUT"
+  #           fi
+  #         fi
 
-      - name: Determine version bump from conventional commits
-        if: steps.check.outputs.skip == 'false'
-        id: version
-        run: |
-          LAST_TAG="${{ steps.check.outputs.last_tag }}"
+  #     - name: Determine version bump from conventional commits
+  #       if: steps.check.outputs.skip == 'false'
+  #       id: version
+  #       run: |
+  #         LAST_TAG="${{ steps.check.outputs.last_tag }}"
 
-          if [ -n "$LAST_TAG" ]; then
-            COMMITS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
-          else
-            COMMITS=$(git log --pretty=format:"%s")
-          fi
+  #         if [ -n "$LAST_TAG" ]; then
+  #           COMMITS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
+  #         else
+  #           COMMITS=$(git log --pretty=format:"%s")
+  #         fi
 
-          # Determine bump from commit prefixes: breaking: → major, feat: → minor, everything else → patch
-          BUMP="patch"
-          if echo "$COMMITS" | grep -qE '^feat(\(.*\))?:'; then
-            BUMP="minor"
-          fi
-          if echo "$COMMITS" | grep -qE '^breaking(\(.*\))?:'; then
-            BUMP="major"
-          fi
+  #         # Determine bump from commit prefixes: breaking: → major, feat: → minor, everything else → patch
+  #         BUMP="patch"
+  #         if echo "$COMMITS" | grep -qE '^feat(\(.*\))?:'; then
+  #           BUMP="minor"
+  #         fi
+  #         if echo "$COMMITS" | grep -qE '^breaking(\(.*\))?:'; then
+  #           BUMP="major"
+  #         fi
 
-          if [ -z "$LAST_TAG" ]; then
-            NEW_VERSION="v0.1.0"
-          else
-            CURRENT="${LAST_TAG#v}"
-            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-            case "$BUMP" in
-              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-              patch) PATCH=$((PATCH + 1)) ;;
-            esac
-            NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
-          fi
+  #         if [ -z "$LAST_TAG" ]; then
+  #           NEW_VERSION="v0.1.0"
+  #         else
+  #           CURRENT="${LAST_TAG#v}"
+  #           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+  #           case "$BUMP" in
+  #             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+  #             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+  #             patch) PATCH=$((PATCH + 1)) ;;
+  #           esac
+  #           NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+  #         fi
 
-          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
-          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Version: $NEW_VERSION (${BUMP} bump)"
+  #         echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+  #         echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+  #         echo "Version: $NEW_VERSION (${BUMP} bump)"
 
-      - name: Install Rust toolchain
-        if: steps.check.outputs.skip == 'false'
-        uses: dtolnay/rust-toolchain@stable
+  #     - name: Install Rust toolchain
+  #       if: steps.check.outputs.skip == 'false'
+  #       uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release binary
-        if: steps.check.outputs.skip == 'false'
-        run: cargo build --release
+  #     - name: Build release binary
+  #       if: steps.check.outputs.skip == 'false'
+  #       run: cargo build --release
 
-      - name: Create tag
-        if: steps.check.outputs.skip == 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "$VERSION" -m "$VERSION"
-          git push origin "$VERSION"
+  #     - name: Create tag
+  #       if: steps.check.outputs.skip == 'false'
+  #       env:
+  #         GH_TOKEN: ${{ github.token }}
+  #       run: |
+  #         VERSION="${{ steps.version.outputs.version }}"
+  #         git config user.name "github-actions[bot]"
+  #         git config user.email "github-actions[bot]@users.noreply.github.com"
+  #         git tag -a "$VERSION" -m "$VERSION"
+  #         git push origin "$VERSION"
 
-      - name: Create release
-        if: steps.check.outputs.skip == 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          LAST_TAG="${{ steps.check.outputs.last_tag }}"
+  #     - name: Create release
+  #       if: steps.check.outputs.skip == 'false'
+  #       env:
+  #         GH_TOKEN: ${{ github.token }}
+  #       run: |
+  #         VERSION="${{ steps.version.outputs.version }}"
+  #         LAST_TAG="${{ steps.check.outputs.last_tag }}"
 
-          # Build changelog from commit subjects
-          if [ -n "$LAST_TAG" ]; then
-            RAW=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s (%h)")
-          else
-            RAW=$(git log --pretty=format:"%s (%h)")
-          fi
+  #         # Build changelog from commit subjects
+  #         if [ -n "$LAST_TAG" ]; then
+  #           RAW=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s (%h)")
+  #         else
+  #           RAW=$(git log --pretty=format:"%s (%h)")
+  #         fi
 
-          FEATURES=""
-          FIXES=""
-          OTHER=""
-          while IFS= read -r line; do
-            [ -n "$line" ] || continue
-            if echo "$line" | grep -qE '^feat(\(.*\))?:'; then
-              FEATURES+="- ${line}"$'\n'
-            elif echo "$line" | grep -qE '^fix(\(.*\))?:'; then
-              FIXES+="- ${line}"$'\n'
-            elif echo "$line" | grep -qE '^chore(\(.*\))?:'; then
-              continue
-            else
-              OTHER+="- ${line}"$'\n'
-            fi
-          done <<< "$RAW"
+  #         FEATURES=""
+  #         FIXES=""
+  #         OTHER=""
+  #         while IFS= read -r line; do
+  #           [ -n "$line" ] || continue
+  #           if echo "$line" | grep -qE '^feat(\(.*\))?:'; then
+  #             FEATURES+="- ${line}"$'\n'
+  #           elif echo "$line" | grep -qE '^fix(\(.*\))?:'; then
+  #             FIXES+="- ${line}"$'\n'
+  #           elif echo "$line" | grep -qE '^chore(\(.*\))?:'; then
+  #             continue
+  #           else
+  #             OTHER+="- ${line}"$'\n'
+  #           fi
+  #         done <<< "$RAW"
 
-          BODY="## ${VERSION}"$'\n\n'
-          [ -n "$FEATURES" ] && BODY+="### Features"$'\n'"${FEATURES}"$'\n'
-          [ -n "$FIXES" ] && BODY+="### Bug Fixes"$'\n'"${FIXES}"$'\n'
-          [ -n "$OTHER" ] && BODY+="### Other"$'\n'"${OTHER}"$'\n'
+  #         BODY="## ${VERSION}"$'\n\n'
+  #         [ -n "$FEATURES" ] && BODY+="### Features"$'\n'"${FEATURES}"$'\n'
+  #         [ -n "$FIXES" ] && BODY+="### Bug Fixes"$'\n'"${FIXES}"$'\n'
+  #         [ -n "$OTHER" ] && BODY+="### Other"$'\n'"${OTHER}"$'\n'
 
-          if [ -n "$LAST_TAG" ]; then
-            BODY+="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${LAST_TAG}...${VERSION}"
-          fi
+  #         if [ -n "$LAST_TAG" ]; then
+  #           BODY+="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${LAST_TAG}...${VERSION}"
+  #         fi
 
-          gh release create "$VERSION" \
-            --title "$VERSION" \
-            --notes "$BODY"
+  #         gh release create "$VERSION" \
+  #           --title "$VERSION" \
+  #           --notes "$BODY"
 
-          echo "Created release $VERSION"
+  #         echo "Created release $VERSION"
 
-      - name: Update Homebrew formula
-        if: steps.check.outputs.skip == 'false'
-        env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          REPO="gabrielkoerich/orch"
-          URL="https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz"
-          TAP_REPO="gabrielkoerich/homebrew-tap"
+  #     - name: Update Homebrew formula
+  #       if: steps.check.outputs.skip == 'false'
+  #       env:
+  #         TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+  #       run: |
+  #         VERSION="${{ steps.version.outputs.version }}"
+  #         REPO="gabrielkoerich/orch"
+  #         URL="https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz"
+  #         TAP_REPO="gabrielkoerich/homebrew-tap"
 
-          # Download archive and compute sha256
-          SHA256=$(curl -sL "$URL" | sha256sum | awk '{print $1}')
-          echo "SHA256: $SHA256"
+  #         # Download archive and compute sha256
+  #         SHA256=$(curl -sL "$URL" | sha256sum | awk '{print $1}')
+  #         echo "SHA256: $SHA256"
 
-          if [ -z "${TAP_TOKEN}" ]; then
-            echo "HOMEBREW_TAP_TOKEN secret is required to push to ${TAP_REPO}"
-            exit 1
-          fi
+  #         if [ -z "${TAP_TOKEN}" ]; then
+  #           echo "HOMEBREW_TAP_TOKEN secret is required to push to ${TAP_REPO}"
+  #           exit 1
+  #         fi
 
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap-repo
-          mkdir -p tap-repo/Formula
+  #         git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap-repo
+  #         mkdir -p tap-repo/Formula
 
-          # Use the Formula from the repo, updating url and sha256
-          sed -e "s|url \"[^\"]*\"|url \"${URL}\"|" \
-              -e "s|sha256 \"[^\"]*\"|sha256 \"${SHA256}\"|" \
-              Formula/orch.rb > tap-repo/Formula/orch.rb
+  #         # Use the Formula from the repo, updating url and sha256
+  #         sed -e "s|url \"[^\"]*\"|url \"${URL}\"|" \
+  #             -e "s|sha256 \"[^\"]*\"|sha256 \"${SHA256}\"|" \
+  #             Formula/orch.rb > tap-repo/Formula/orch.rb
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git -C tap-repo config user.name "github-actions[bot]"
-          git -C tap-repo config user.email "github-actions[bot]@users.noreply.github.com"
-          git -C tap-repo add Formula/orch.rb
-          if git -C tap-repo diff --cached --quiet; then
-            echo "Homebrew formula unchanged"
-            exit 0
-          fi
-          git -C tap-repo commit -m "chore: update orch formula for ${VERSION}"
-          git -C tap-repo push origin main
+  #         git config user.name "github-actions[bot]"
+  #         git config user.email "github-actions[bot]@users.noreply.github.com"
+  #         git -C tap-repo config user.name "github-actions[bot]"
+  #         git -C tap-repo config user.email "github-actions[bot]@users.noreply.github.com"
+  #         git -C tap-repo add Formula/orch.rb
+  #         if git -C tap-repo diff --cached --quiet; then
+  #           echo "Homebrew formula unchanged"
+  #           exit 0
+  #         fi
+  #         git -C tap-repo commit -m "chore: update orch formula for ${VERSION}"
+  #         git -C tap-repo push origin main
 
-  deploy:
-    needs: [rust, bats, shellcheck, semgrep-and-secrets]
-    if: github.ref == 'refs/heads/main'
-    concurrency:
-      group: pages
-      cancel-in-progress: false
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: zola@0.22.1
-      - run: zola --root docs build
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: docs/public
-      - id: deployment
-        uses: actions/deploy-pages@v4
+  # deploy:
+  #   needs: [rust, bats, shellcheck, semgrep-and-secrets]
+  #   if: github.ref == 'refs/heads/main'
+  #   concurrency:
+  #     group: pages
+  #     cancel-in-progress: false
+  #   permissions:
+  #     contents: read
+  #     pages: write
+  #     id-token: write
+  #   environment:
+  #     name: github-pages
+  #     url: ${{ steps.deployment.outputs.page_url }}
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: taiki-e/install-action@v2
+  #       with:
+  #         tool: zola@0.22.1
+  #     - run: zola --root docs build
+  #     - uses: actions/upload-pages-artifact@v3
+  #       with:
+  #         path: docs/public
+  #     - id: deployment
+  #       uses: actions/deploy-pages@v4
