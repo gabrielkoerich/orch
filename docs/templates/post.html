@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+
+{% block title %}{{page.title}} - {{config.title}}{% endblock %}
+{% block description %}{{page.description | default(value=config.description)}}{% endblock %}
+
+{% block content %}
+<article>
+    <header style="margin-bottom: 2rem;">
+        <h1>{{page.title}}</h1>
+        {% if page.date %}
+        <time style="color: var(--text-secondary); font-size: .85rem; font-family: var(--font-mono);">{{page.date | date(format="%Y-%m-%d")}}</time>
+        {% endif %}
+    </header>
+    {{page.content | safe}}
+    <p style="margin-top: 3rem;"><a href="/posts/">&larr; All updates</a></p>
+</article>
+{% endblock %}

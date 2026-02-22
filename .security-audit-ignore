@@ -1,0 +1,6 @@
+^scripts/lib\.sh:.*eval
+^scripts/serve\.sh:.*rm -rf
+^scripts/stop\.sh:.*rm -rf
+^scripts/unlock\.sh:.*rm -rf
+^bin/security-audit:
+^\.github/workflows/.*sudo

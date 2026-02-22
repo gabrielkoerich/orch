@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+#   ./bin/security-audit                     # audit scripts/
+#   ./bin/security-audit <file-or-dir> ...
+#   ./bin/security-audit --strict <targets>  # fail on risky patterns
+
+strict=0
+ignore_file="${SECURITY_AUDIT_IGNORE:-.security-audit-ignore}"
+require_semgrep="${SECURITY_AUDIT_REQUIRE_SEMGREP:-0}"
+targets=()
+has_rg=0
+if command -v rg >/dev/null 2>&1; then
+  has_rg=1
+fi
+
+for arg in "$@"; do
+  case "$arg" in
+    --strict) strict=1 ;;
+    *) targets+=("$arg") ;;
+  esac
+done
+
+if [[ ${#targets[@]} -eq 0 ]]; then
+  targets=(scripts)
+fi
+
+files=()
+for t in "${targets[@]}"; do
+  if [[ -f "$t" ]]; then
+    files+=("$t")
+  elif [[ -d "$t" ]]; then
+    while IFS= read -r f; do
+      files+=("$f")
+    done < <(find "$t" -type f -not -path '*/.git/*' -not -name '.DS_Store')
+  else
+    echo "warning: target not found, skipping: $t"
+  fi
+done
+
+if [[ ${#files[@]} -eq 0 ]]; then
+  echo "error: no files found to audit" >&2
+  exit 2
+fi
+
+echo "==> Security audit: ${#files[@]} files"
+
+status=0
+syntax_fail=0
+shellcheck_fail=0
+risky_hits=0
+semgrep_fail=0
+
+shell_files=()
+shellcheck_files=()
+scan_files=()
+for f in "${files[@]}"; do
+  # Skip binary / non-text files
+  case "$f" in
+    *.pyc|*__pycache__*) continue ;;
+  esac
+
+  # Files to run pattern scans on
+  case "$f" in
+    *.md|*.txt|*.png|*.jpg|*.jpeg|*.gif|*.pdf|*.yml|*.yaml|*.toml|*.json|*.py|*.rb|*.sql) ;;
+    *) scan_files+=("$f") ;;
+  esac
+
+  # Shell-like files for bash -n / shellcheck
+  if read -r first_line < "$f" && [[ "$first_line" =~ ^#!.*(bash|sh|zsh) ]]; then
+    shell_files+=("$f")
+    shellcheck_files+=("$f")
+    continue
+  fi
+
+  case "$f" in
+    scripts/*)
+      # Exclude non-shell files in scripts/
+      [[ "$f" =~ \.(md|txt|json|toml|yaml|yml|py|rb|sql)$ ]] && continue
+      shell_files+=("$f")
+      shellcheck_files+=("$f")
+      ;;
+  esac
+done
+
+echo "-> bash -n (${#shell_files[@]} files)"
+for f in "${shell_files[@]}"; do
+  if ! bash -n "$f"; then
+    ((syntax_fail += 1))
+  fi
+done
+if [[ "$syntax_fail" -gt 0 ]]; then
+  echo "error: bash syntax failures: $syntax_fail"
+  status=1
+fi
+
+echo "-> shellcheck (${#shellcheck_files[@]} files)"
+if command -v shellcheck >/dev/null 2>&1; then
+  for f in "${shellcheck_files[@]}"; do
+    if ! shellcheck -S error "$f"; then
+      ((shellcheck_fail += 1))
+    fi
+  done
+  if [[ "$shellcheck_fail" -gt 0 ]]; then
+    echo "error: shellcheck failures: $shellcheck_fail"
+    status=1
+  fi
+else
+  echo "warning: shellcheck not installed; skipping static shell lint"
+fi
+
+echo "-> risky pattern scan (${#scan_files[@]} files)"
+raw_hits="$(mktemp)"
+filtered_hits="$(mktemp)"
+trap 'rm -f "$raw_hits" "$filtered_hits"' EXIT
+
+if [[ "$has_rg" -eq 1 ]]; then
+  if rg -n \
+    -e 'curl[[:space:]].*\|[[:space:]]*(sh|bash)' \
+    -e 'wget[[:space:]].*\|[[:space:]]*(sh|bash)' \
+    -e 'sh[[:space:]]+-c[[:space:]]+"\$\(curl' \
+    -e 'eval[[:space:]]' \
+    -e 'chmod[[:space:]]+777' \
+    -e 'rm[[:space:]]+-rf[[:space:]]+/' \
+    -e 'mktemp[[:space:]]+-u' \
+    -e 'sudo[[:space:]]' \
+    "${scan_files[@]}" >"$raw_hits"; then
+    :
+  else
+    echo "ok: no risky patterns matched"
+  fi
+else
+  if grep -nE \
+    -e 'curl[[:space:]].*\|[[:space:]]*(sh|bash)' \
+    -e 'wget[[:space:]].*\|[[:space:]]*(sh|bash)' \
+    -e 'sh[[:space:]]+-c[[:space:]]+"\$\(curl' \
+    -e 'eval[[:space:]]' \
+    -e 'chmod[[:space:]]+777' \
+    -e 'rm[[:space:]]+-rf[[:space:]]+/' \
+    -e 'mktemp[[:space:]]+-u' \
+    -e 'sudo[[:space:]]' \
+    "${scan_files[@]}" >"$raw_hits"; then
+    :
+  else
+    echo "ok: no risky patterns matched"
+  fi
+fi
+
+if [[ -s "$raw_hits" ]]; then
+  # Drop pure comment-line hits (path:line:# ...)
+  grep -Ev '^[^:]+:[0-9]+:[[:space:]]*#' "$raw_hits" >"$filtered_hits" || true
+
+  if [[ -f "$ignore_file" ]] && [[ -s "$ignore_file" ]]; then
+    grep -Evf "$ignore_file" "$filtered_hits" >"$raw_hits" || true
+    mv "$raw_hits" "$filtered_hits"
+  fi
+
+  if [[ -s "$filtered_hits" ]]; then
+    cat "$filtered_hits"
+    risky_hits=1
+  else
+    echo "ok: only ignored risky patterns matched"
+  fi
+
+  if [[ "$strict" -eq 1 ]]; then
+    if [[ "$risky_hits" -eq 1 ]]; then
+      echo "error: risky patterns found (strict mode)"
+      status=1
+    fi
+  else
+    if [[ "$risky_hits" -eq 1 ]]; then
+      echo "warning: risky patterns found (non-strict mode)"
+    fi
+  fi
+fi
+
+echo "-> semgrep shell rules"
+if command -v semgrep >/dev/null 2>&1; then
+  if [[ -f ".semgrep/shell-security.yml" ]]; then
+    if ! semgrep --quiet --error --config .semgrep/shell-security.yml "${scan_files[@]}"; then
+      semgrep_fail=1
+      if [[ "$strict" -eq 1 ]]; then
+        status=1
+      else
+        echo "warning: semgrep reported findings (non-strict mode)"
+      fi
+    fi
+  else
+    echo "warning: .semgrep/shell-security.yml not found; skipping semgrep rules"
+    if [[ "$require_semgrep" -eq 1 ]]; then
+      status=1
+    fi
+  fi
+else
+  echo "warning: semgrep not installed; skipping semgrep rules"
+  if [[ "$require_semgrep" -eq 1 ]]; then
+    status=1
+  fi
+fi
+
+echo "==> Summary"
+echo "shell files: ${#shell_files[@]}"
+echo "syntax failures: $syntax_fail"
+echo "shellcheck failures: $shellcheck_fail"
+echo "risky patterns: $risky_hits"
+echo "semgrep findings: $semgrep_fail"
+
+if [[ "$status" -eq 0 ]]; then
+  echo "security audit passed"
+else
+  echo "security audit failed"
+fi
+
+exit "$status"

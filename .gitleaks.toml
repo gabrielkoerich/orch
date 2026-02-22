@@ -1,0 +1,17 @@
+title = "Orchestrator Gitleaks Config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Ignore test fixtures and prompt templates"
+paths = [
+  '''^tests/''',
+  '''^prompts/''',
+]
+
+[[allowlists]]
+description = "security.rs contains fake API key patterns in #[cfg(test)] for leak detection tests"
+paths = [
+  '''^src/security\.rs$''',
+]

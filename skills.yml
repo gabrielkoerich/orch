@@ -1,0 +1,10 @@
+repositories:
+  - name: gabrielkoerich
+    url: https://github.com/gabrielkoerich/skills
+    description: Gabriel Koerich skills
+    pin: f9a2062d2a184f9625746262a6b7656d3b630973
+  - name: anthropics
+    url: https://github.com/anthropics/skills
+    description: Anthropic official skills
+    pin: 1ed29a03dc852d30fa6ef2ca53a67dc2c2c2c563
+skills: []

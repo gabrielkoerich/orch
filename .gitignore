@@ -1,0 +1,18 @@
+.env*
+.orchestrator/
+config.yml
+orchestrator.log
+orchestrator.pid
+skills/
+tasks.yml
+tasks.yml.lock*
+.lock
+.lock.*
+contexts/
+__pycache__/
+jobs.yml
+docs/public/
+orchestrator.db
+
+# Rust
+/target

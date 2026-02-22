@@ -1,0 +1,81 @@
+project_dir: ""  # Auto-detected from CWD, override if needed
+workflow:
+  auto_close: true
+  review_owner: "@owner"
+  enable_review_agent: false
+  review_agent: "claude"
+  max_attempts: 10
+  # Only accept issues from these GitHub users. Repo owner is always included.
+  # allowed_authors:
+  #   - my-bot
+  #   - trusted-collaborator
+  # Default task timeout (seconds). Set to 0 to disable timeouts entirely.
+  timeout_seconds: 1800
+  # Optional: per-complexity overrides (takes precedence over timeout_seconds).
+  # timeout_by_complexity:
+  #   simple: 600
+  #   medium: 1800
+  #   complex: 3600
+router:
+  mode: "llm"  # "llm" (default) or "round_robin"
+  agent: "claude"
+  model: "haiku"
+  timeout_seconds: 120
+  fallback_executor: "codex"
+  allowed_tools:
+    - yq
+    - jq
+    - bash
+    - just
+    - git
+    - rg
+    - sed
+    - awk
+    - python3
+    - node
+    - npm
+    - bun
+  default_skills:
+    - gh
+    - git-worktree
+model_map:
+  simple:
+    claude: haiku
+    codex: gpt-5.1-codex-mini
+    opencode: github-copilot/gpt-5-mini
+  medium:
+    claude: sonnet
+    codex: gpt-5.2
+    opencode: github-copilot/gpt-5.1-codex
+  complex:
+    claude: opus
+    codex: gpt-5.3-codex
+    opencode: github-copilot/claude-opus-4.5
+  review:
+    claude: sonnet
+    codex: gpt-5.2
+    opencode: github-copilot/gpt-5.1-codex
+  # Free models used as fallback when hitting usage limits (round-robin)
+  free:
+    - opencode/glm-5-free
+    - opencode/minimax-m2.5-free
+    - opencode/trinity-large-preview-free
+llm:
+  input_format: ""
+  output_format: "json"
+gh:
+  enabled: true
+  repo: "owner/repo"
+  sync_label: "sync"
+  project_id: ""
+  project_status_field_id: ""
+  project_status_names: {}
+  project_status_map:
+    backlog: ""
+    in_progress: ""
+    review: ""
+    done: ""
+  backoff:
+    mode: "wait"
+    base_seconds: 30
+    max_seconds: 900

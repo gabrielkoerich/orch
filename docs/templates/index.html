@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div id="intro">
+    <em>{{config.description}}</em>
+</div>
+
+<h2>Documentation</h2>
+<ul>
+    {% for page in section.pages %}
+    <li><a href="{{page.permalink | safe}}">{{page.title}}</a>{% if page.description %} — <span style="color: var(--text-secondary);">{{page.description}}</span>{% endif %}</li>
+    {% endfor %}
+</ul>
+
+{% set posts = get_section(path="posts/_index.md") %}
+{% if posts.pages | length > 0 %}
+<h2>Recent Updates</h2>
+<ul>
+    {% for page in posts.pages %}
+    <li>
+        <a href="{{page.permalink | safe}}">{{page.title}}</a>
+        {% if page.date %}<span style="color: var(--text-secondary); font-size: .85rem; font-family: var(--font-mono);"> — {{page.date | date(format="%Y-%m-%d")}}</span>{% endif %}
+    </li>
+    {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

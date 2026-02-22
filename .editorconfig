@@ -1,0 +1,13 @@
+root = true
+
+[*.{sh,bash,zsh}]
+indent_style = space
+indent_size = 2
+
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.{md,markdown}]
+indent_style = space
+indent_size = 2

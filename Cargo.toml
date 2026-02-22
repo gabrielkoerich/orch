@@ -1,0 +1,62 @@
+[package]
+name = "orch-core"
+version = "0.1.0"
+edition = "2021"
+description = "Orch — The Agent Orchestrator (Rust core)"
+license = "MIT"
+repository = "https://github.com/gabrielkoerich/orch"
+
+[[bin]]
+name = "orch-core"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Cron
+cron = "0.13"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Async trait
+async-trait = "0.1"
+
+# SHA256 for dedup hashing
+sha2 = "0.10"
+
+# URL encoding for label names
+urlencoding = "2"
+
+# Regex for leak detection
+regex = "1"
+
+# Directory helpers
+dirs = "6"
+
+# SQLite for internal tasks
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
