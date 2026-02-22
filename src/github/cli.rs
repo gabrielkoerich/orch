@@ -109,6 +109,10 @@ impl GhCli {
     }
 
     /// Add labels to an issue (appends to existing labels).
+    ///
+    /// Uses `--input -` with a JSON payload — the `-f labels[]=` form doesn't
+    /// map correctly to the GitHub JSON API.
+    #[allow(dead_code)] // available for backends, not all paths used yet
     pub async fn add_labels(
         &self,
         repo: &str,
@@ -116,13 +120,24 @@ impl GhCli {
         labels: &[String],
     ) -> anyhow::Result<()> {
         let endpoint = format!("repos/{repo}/issues/{number}/labels");
-        let mut args = vec![endpoint.as_str(), "-X", "POST"];
-        let label_args: Vec<String> = labels.iter().map(|l| format!("labels[]={l}")).collect();
-        for la in &label_args {
-            args.push("-f");
-            args.push(la.as_str());
+        let payload = serde_json::json!({ "labels": labels });
+        let mut child = Command::new("gh")
+            .arg("api")
+            .args([&endpoint, "-X", "POST", "--input", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(payload.to_string().as_bytes()).await?;
+            drop(stdin);
         }
-        self.api(&args).await?;
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api failed: {stderr}");
+        }
         Ok(())
     }
 
@@ -161,6 +176,7 @@ impl GhCli {
     ///
     /// Returns Ok if the label was removed or didn't exist (404).
     /// Propagates all other errors to prevent silent state corruption.
+    #[allow(dead_code)]
     pub async fn remove_label(&self, repo: &str, number: &str, label: &str) -> anyhow::Result<()> {
         let encoded = urlencoding::encode(label);
         let endpoint = format!("repos/{repo}/issues/{number}/labels/{encoded}");
@@ -201,6 +217,7 @@ impl GhCli {
     }
 
     /// List comments on an issue.
+    #[allow(dead_code)]
     pub async fn list_comments(
         &self,
         repo: &str,

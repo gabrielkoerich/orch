@@ -4,7 +4,13 @@
 //! Project config overrides global config for the same key.
 
 use anyhow::Context;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// Cached YAML values — parsed once per file, reused for all key lookups.
+static CACHE: std::sync::LazyLock<Mutex<HashMap<PathBuf, serde_yml::Value>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Resolve the global config path: `~/.orchestrator/config.yml`
 fn global_config_path() -> anyhow::Result<PathBuf> {
@@ -19,6 +25,7 @@ fn global_config_path() -> anyhow::Result<PathBuf> {
 /// 2. `~/.orchestrator/config.yml` (global config)
 ///
 /// Returns the first match as a string.
+/// Files are parsed once and cached for the process lifetime.
 pub fn get(key: &str) -> anyhow::Result<String> {
     // Try project config first
     let project_path = PathBuf::from(".orchestrator.yml");
@@ -38,11 +45,22 @@ pub fn get(key: &str) -> anyhow::Result<String> {
 }
 
 /// Resolve a dot-separated key from a YAML file.
+///
+/// Caches the parsed YAML so repeated lookups don't re-read disk.
 fn resolve_key(path: &PathBuf, key: &str) -> anyhow::Result<String> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let root: serde_yml::Value =
-        serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+    let root = {
+        let mut cache = CACHE.lock().unwrap();
+        if let Some(cached) = cache.get(path) {
+            cached.clone()
+        } else {
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let parsed: serde_yml::Value = serde_yml::from_str(&content)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            cache.insert(path.clone(), parsed.clone());
+            parsed
+        }
+    };
 
     let mut current = &root;
     for part in key.split('.') {

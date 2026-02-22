@@ -1,12 +1,13 @@
 class Orch < Formula
   desc "Multi-agent task orchestrator for AI coding agents (claude, codex, opencode)"
-  homepage "https://github.com/gabrielkoerich/orchestrator"
-  url "https://github.com/gabrielkoerich/orchestrator/archive/refs/tags/v1.0.0-alpha.1.tar.gz"
+  homepage "https://github.com/gabrielkoerich/orch"
+  url "https://github.com/gabrielkoerich/orch/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
-  head "https://github.com/gabrielkoerich/orchestrator.git", branch: "main"
+  head "https://github.com/gabrielkoerich/orch.git", branch: "main"
   license "MIT"
 
   depends_on "rust" => :build
+  depends_on "gh"
 
   def install
     system "cargo", "install", *std_cargo_args
@@ -39,8 +40,8 @@ class Orch < Formula
         brew install --cask codex         # Codex
         brew install opencode             # OpenCode
 
-      Optional for GitHub sync:
-        brew install gh && gh auth login
+      GitHub CLI (installed automatically):
+        gh auth login   # authenticate if not already logged in
     EOS
   end
 

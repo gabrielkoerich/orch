@@ -24,9 +24,19 @@ impl Channel for GitHubChannel {
     }
 
     async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
-        let (_tx, rx) = tokio::sync::mpsc::channel(64);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
         tracing::info!(repo = %self.repo, "github channel started (polling)");
-        // TODO: spawn polling loop for new issue comments
+        // TODO: spawn polling loop for new issue comments.
+        // Keep sender alive so the channel stays open for future messages.
+        let _repo = self.repo.clone();
+        tokio::spawn(async move {
+            // Hold the sender until the engine drops the receiver
+            let _tx = tx;
+            // Polling loop will go here — for now, just keep alive
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
         Ok(rx)
     }
 

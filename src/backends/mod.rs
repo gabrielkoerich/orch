@@ -83,9 +83,11 @@ pub trait ExternalBackend: Send + Sync {
     async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()>;
 
     /// Set metadata labels / tags.
+    #[allow(dead_code)]
     async fn set_labels(&self, id: &ExternalId, labels: &[String]) -> anyhow::Result<()>;
 
     /// Remove a label / tag.
+    #[allow(dead_code)]
     async fn remove_label(&self, id: &ExternalId, label: &str) -> anyhow::Result<()>;
 
     /// Check if connected and authenticated.

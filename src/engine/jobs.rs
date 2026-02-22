@@ -134,7 +134,6 @@ pub async fn tick(jobs_path: &PathBuf, backend: &Arc<dyn ExternalBackend>) -> an
                                 "previous task terminal, clearing"
                             );
                             job.active_task_id = None;
-                            changed = true;
                         }
                     }
                 }
@@ -149,7 +148,6 @@ pub async fn tick(jobs_path: &PathBuf, backend: &Arc<dyn ExternalBackend>) -> an
                     );
                     job.active_task_id = None;
                     job.last_task_status = Some("error".to_string());
-                    changed = true;
                 }
             }
         }

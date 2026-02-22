@@ -200,9 +200,18 @@ async fn tick(
 
         if !has_session {
             // No tmux session — check if stuck
-            let updated = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_default();
+            let updated = match chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
+                Ok(dt) => dt.with_timezone(&chrono::Utc),
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        updated_at = task.updated_at,
+                        ?e,
+                        "cannot parse updated_at, skipping stuck-task check"
+                    );
+                    continue;
+                }
+            };
             let age = chrono::Utc::now() - updated;
 
             if age.num_seconds() > config.stuck_timeout as i64 {
@@ -257,9 +266,18 @@ async fn tick(
             }
         };
 
+        // Mark in_progress BEFORE spawning to prevent double dispatch.
+        // If two ticks overlap, the second tick's list_by_status("new") won't
+        // include this task because it's already in_progress.
+        let task_id = task.id.0.clone();
+        if let Err(e) = backend.update_status(&task.id, Status::InProgress).await {
+            tracing::error!(task_id, ?e, "failed to set in_progress, skipping dispatch");
+            drop(permit);
+            continue;
+        }
+
         // Dispatch task
         let runner = runner.clone();
-        let task_id = task.id.0.clone();
         let backend = backend.clone();
 
         tokio::spawn(async move {

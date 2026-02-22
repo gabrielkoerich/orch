@@ -38,6 +38,7 @@ impl Db {
     }
 
     /// Open an in-memory database (for testing).
+    #[allow(dead_code)]
     pub fn open_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
         // WAL is a no-op for :memory: — only set busy_timeout
@@ -64,6 +65,7 @@ impl Db {
     }
 
     /// Get a reference to the connection (for running queries).
+    #[allow(dead_code)]
     pub async fn conn(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.conn.lock().await
     }

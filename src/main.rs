@@ -1,4 +1,5 @@
 mod backends;
+#[allow(dead_code)] // channels are scaffolding — not wired into engine yet
 mod channels;
 mod config;
 mod cron;
@@ -6,6 +7,7 @@ mod db;
 mod engine;
 mod github;
 mod parser;
+#[allow(dead_code)] // security module ready for use, not integrated yet
 mod security;
 mod sidecar;
 mod tmux;

@@ -56,8 +56,10 @@ impl ExternalBackend for GitHubBackend {
     }
 
     async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
-        // Atomic label replacement: GET current labels, swap status:* prefix,
-        // PUT the full set in a single API call. No window where labels are missing.
+        // GET current labels, swap status:* prefix, PUT the full set.
+        // The PUT itself is atomic, but there's a TOCTOU window between GET
+        // and PUT where another process could modify labels. Labels added in
+        // that window would be lost. Acceptable for orchestrator (single writer).
         let task = self.get_task(id).await?;
         let mut labels: Vec<String> = task
             .labels

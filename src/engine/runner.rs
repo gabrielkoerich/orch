@@ -111,8 +111,18 @@ impl TaskRunner {
     }
 
     /// Resolve the project directory for this repo.
+    ///
+    /// Priority: PROJECT_DIR env > bare clone > cwd > error.
+    /// Does NOT hardcode ~/Projects/ — that's user-specific.
     fn project_dir(&self) -> anyhow::Result<String> {
-        // Check for bare clone
+        // Explicit env var always wins
+        if let Ok(dir) = std::env::var("PROJECT_DIR") {
+            if !dir.is_empty() {
+                return Ok(dir);
+            }
+        }
+
+        // Check for bare clone in ORCH_HOME/projects/owner/repo.git
         let parts: Vec<&str> = self.repo.split('/').collect();
         if parts.len() == 2 {
             let bare = self
@@ -123,13 +133,6 @@ impl TaskRunner {
             if bare.exists() {
                 return Ok(bare.to_string_lossy().to_string());
             }
-        }
-
-        // Check for local project
-        let home = dirs::home_dir().unwrap_or_default();
-        let local = home.join("Projects").join(parts.last().unwrap_or(&""));
-        if local.exists() {
-            return Ok(local.to_string_lossy().to_string());
         }
 
         // Fall back to current directory
