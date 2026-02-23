@@ -6,6 +6,12 @@ source "$(dirname "$0")/lib.sh"
 JOBS=${POLL_JOBS:-4}
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
+# Resolve project config early so backend calls use the correct repo and
+# runtime paths (locks, contexts, state) for this project.
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+export PROJECT_DIR
+load_project_config
+
 # Recover tasks stuck in_progress — either no agent assigned, or stale (no lock, updated too long ago)
 STUCK_TIMEOUT=${STUCK_TIMEOUT:-$(config_get '.workflow.stuck_timeout // 1800')}
 NOW_EPOCH=$(date +%s)
