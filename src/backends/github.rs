@@ -4,7 +4,7 @@
 //! no credential storage. Everyone who has `gh` installed can use orch.
 
 use super::{ExternalBackend, ExternalId, ExternalTask, Status};
-use crate::github::cli::GhCli;
+use crate::github::cli::{status_label_color, GhCli};
 use async_trait::async_trait;
 
 pub struct GitHubBackend {
@@ -56,6 +56,25 @@ impl ExternalBackend for GitHubBackend {
     }
 
     async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+        // Ensure the target status label exists on the repo before assigning it.
+        // Mirrors bash `_gh_ensure_label` — creates the label on first use so
+        // callers never have to pre-create labels manually.  Failures are
+        // tolerated: if creation fails we still attempt the replace below.
+        let label = status.as_label();
+        let status_name = &label["status:".len()..]; // strip prefix for description
+        if let Err(e) = self
+            .gh
+            .ensure_label(
+                &self.repo,
+                label,
+                status_label_color(label),
+                &format!("Task status: {status_name}"),
+            )
+            .await
+        {
+            tracing::warn!(label, err = %e, "ensure_label failed, continuing with replace_labels");
+        }
+
         // GET current labels, swap status:* prefix, PUT the full set.
         // The PUT itself is atomic, but there's a TOCTOU window between GET
         // and PUT where another process could modify labels. Labels added in
@@ -66,7 +85,7 @@ impl ExternalBackend for GitHubBackend {
             .into_iter()
             .filter(|l| !l.starts_with("status:"))
             .collect();
-        labels.push(status.as_label().to_string());
+        labels.push(label.to_string());
         self.gh.replace_labels(&self.repo, &id.0, &labels).await?;
         Ok(())
     }
