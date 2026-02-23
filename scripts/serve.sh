@@ -159,7 +159,20 @@ fi
 while true; do
   $_stopping && { _log "[serve] shutting down gracefully" >> "$LOG_FILE"; run_hook on_service_stop; break; }
   _log "[serve] tick" >> "$LOG_FILE"
-  "$SCRIPT_DIR/poll.sh" >> "$LOG_FILE" 2>&1 || true
+  # Multi-project polling: if a projects registry exists, poll each project every tick.
+  PROJECT_DIRS=$(projects_list 2>/dev/null || true)
+  if [ -n "$PROJECT_DIRS" ]; then
+    for dir in $PROJECT_DIRS; do
+      $_stopping && break
+      if [ -n "$dir" ] && [ "$dir" != "null" ] && [ -d "$dir" ]; then
+        PROJECT_DIR="$dir" "$SCRIPT_DIR/poll.sh" >> "$LOG_FILE" 2>&1 || true
+      else
+        _log "[serve] skipping invalid project dir: ${dir:-<empty>}" >> "$LOG_FILE"
+      fi
+    done
+  else
+    "$SCRIPT_DIR/poll.sh" >> "$LOG_FILE" 2>&1 || true
+  fi
   $_stopping && break
   "$SCRIPT_DIR/jobs_tick.sh" >> "$LOG_FILE" 2>&1 || true
   $_stopping && break
