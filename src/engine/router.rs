@@ -425,10 +425,7 @@ impl Router {
 
     /// Set the number of LLM routing attempts for a task in sidecar.
     fn set_route_attempts(&self, task_id: &str, attempts: u32) -> anyhow::Result<()> {
-        crate::sidecar::set(
-            task_id,
-            &[format!("route_attempts={}", attempts)],
-        )
+        crate::sidecar::set(task_id, &[format!("route_attempts={}", attempts)])
     }
 
     /// Extract agent from labels (e.g., "agent:claude" -> "claude").
