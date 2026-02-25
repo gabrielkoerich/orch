@@ -203,31 +203,10 @@ render_template() {
     return 1
   fi
   local output
-  output=$(python3 - "$template_path" <<'PY'
-import os, sys, re
-path = sys.argv[1]
-with open(path, "r", encoding="utf-8") as fh:
-    data = fh.read()
-# Support simple conditional blocks:
-# {{#if VAR}} ... {{/if}}
-# A block renders only when VAR exists and is not whitespace-only.
-pattern = re.compile(r"\{\{#if\s+(\w+)\}\}(.*?)\{\{/if\}\}", re.DOTALL)
-while True:
-    changed = [False]
-    def repl_if(m):
-        changed[0] = True
-        value = os.environ.get(m.group(1), "")
-        return m.group(2) if value.strip() else ""
-    data = pattern.sub(repl_if, data)
-    if not changed[0]:
-        break
-data = re.sub(r'\{\{(\w+)\}\}', lambda m: os.environ.get(m.group(1), ''), data)
-sys.stdout.write(data)
-PY
-  )
+  output=$(orch-core template "$template_path" 2>&1)
   local rc=$?
   if [ "$rc" -ne 0 ]; then
-    log_err "[render_template] python3 failed (exit $rc) for $template_path"
+    log_err "[render_template] orch-core template failed (exit $rc) for $template_path: $output"
     return "$rc"
   fi
   if [ -z "$output" ]; then
