@@ -26,6 +26,7 @@ use crate::channels::transport::Transport;
 use crate::channels::ChannelRegistry;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::{get_route_result, RouteResult, Router};
+use crate::engine::tasks::TaskManager;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
@@ -82,6 +83,9 @@ pub async fn serve() -> anyhow::Result<()> {
     let db = Arc::new(Db::open(&crate::db::default_path()?)?);
     db.migrate().await?;
     tracing::info!("internal database ready");
+
+    // Initialize task manager
+    let task_manager = Arc::new(TaskManager::new(db.clone(), backend.clone()));
 
     // Initialize tmux manager
     let tmux = Arc::new(TmuxManager::new());
@@ -147,6 +151,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     &jobs_path,
                     &db,
                     &router,
+                    &task_manager,
                 ).await {
                     tracing::error!(?e, "tick failed");
                 }
@@ -203,6 +208,7 @@ async fn tick(
     jobs_path: &std::path::PathBuf,
     db: &Arc<Db>,
     router: &Router,
+    task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
     // Phase 1: Check active tmux sessions for completions
     let session_snapshot = tmux.snapshot().await;
@@ -225,7 +231,9 @@ async fn tick(
     }
 
     // Phase 2: Recover stuck tasks
-    let in_progress = backend.list_by_status(Status::InProgress).await?;
+    let in_progress = task_manager
+        .list_external_by_status(Status::InProgress)
+        .await?;
     for task in &in_progress {
         let session_name = tmux.session_name(&task.id.0);
         let has_session = tmux.session_exists(&session_name).await;
@@ -268,7 +276,7 @@ async fn tick(
     }
 
     // Phase 3a: Route new tasks
-    let new_tasks = backend.list_by_status(Status::New).await?;
+    let new_tasks = task_manager.list_external_by_status(Status::New).await?;
     let routable: Vec<&ExternalTask> = new_tasks
         .iter()
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
@@ -315,7 +323,7 @@ async fn tick(
     }
 
     // Phase 3b: Dispatch routed tasks
-    let routed_tasks = backend.list_by_status(Status::Routed).await?;
+    let routed_tasks = task_manager.list_external_by_status(Status::Routed).await?;
     let dispatchable: Vec<&ExternalTask> = routed_tasks
         .iter()
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
@@ -399,7 +407,9 @@ async fn tick(
     }
 
     // Phase 4: Unblock parents (blocked tasks whose children are all done)
-    let blocked = backend.list_by_status(Status::Blocked).await?;
+    let blocked = task_manager
+        .list_external_by_status(Status::Blocked)
+        .await?;
     for task in &blocked {
         let children = match backend.get_sub_issues(&task.id).await {
             Ok(ids) => ids,
