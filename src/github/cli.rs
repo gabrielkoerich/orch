@@ -172,6 +172,69 @@ impl GhCli {
         Ok(())
     }
 
+    /// Ensure a label exists on the repo, creating it if it does not.
+    ///
+    /// Mirrors the bash `_gh_ensure_label()`: GET the label; on 404 (or any
+    /// error) POST to create it.  Failures on creation are tolerated — the
+    /// caller is never blocked by a missing label (same as `|| true` in bash).
+    pub async fn ensure_label(
+        &self,
+        repo: &str,
+        name: &str,
+        color: &str,
+        description: &str,
+    ) -> anyhow::Result<()> {
+        let encoded = urlencoding::encode(name);
+        let get_endpoint = format!("repos/{repo}/labels/{encoded}");
+
+        // Check whether the label already exists.
+        match self.api(&[&get_endpoint]).await {
+            Ok(_) => return Ok(()), // label exists — nothing to do
+            Err(e) if e.to_string().contains("404") => {
+                tracing::debug!(repo, name, "ensure_label: label not found, creating");
+            }
+            Err(e) => {
+                // Any other GET error — log and attempt creation anyway.
+                tracing::warn!(repo, name, err = %e, "ensure_label: GET failed, attempting create");
+            }
+        }
+
+        // Create the label.
+        let create_endpoint = format!("repos/{repo}/labels");
+        let payload = serde_json::json!({
+            "name": name,
+            "color": color,
+            "description": description,
+        });
+        let mut child = Command::new("gh")
+            .arg("api")
+            .args([&create_endpoint, "-X", "POST", "--input", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(payload.to_string().as_bytes()).await?;
+            drop(stdin);
+        }
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // 422 means the label already exists (race condition) — not an error.
+            if stderr.contains("422")
+                || stderr.contains("already_exists")
+                || stderr.contains("Unprocessable")
+            {
+                tracing::debug!(repo, name, "ensure_label: label already exists (race)");
+                return Ok(());
+            }
+            // All other creation failures are tolerated (matches bash `|| true`).
+            tracing::warn!(repo, name, stderr = %stderr, "ensure_label: create failed, continuing");
+        }
+        Ok(())
+    }
+
     /// Remove a label from an issue.
     ///
     /// Returns Ok if the label was removed or didn't exist (404).
@@ -226,5 +289,45 @@ impl GhCli {
         let endpoint = format!("repos/{repo}/issues/{number}/comments");
         let json = self.api(&[&endpoint]).await?;
         Ok(serde_json::from_slice(&json)?)
+    }
+}
+
+/// Return the hex color string for a given `status:*` label.
+///
+/// Matches the bash `_gh_status_color()` palette so labels created from Rust
+/// look the same as those created by the shell orchestrator.
+pub fn status_label_color(label: &str) -> &'static str {
+    match label {
+        "status:new" => "0e8a16",
+        "status:routed" => "1d76db",
+        "status:in_progress" => "fbca04",
+        "status:done" => "0e8a16",
+        "status:blocked" => "d73a4a",
+        "status:in_review" => "0075ca",
+        "status:needs_review" => "e4e669",
+        _ => "c5def5",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_label_colors_match_bash_palette() {
+        assert_eq!(status_label_color("status:new"), "0e8a16");
+        assert_eq!(status_label_color("status:routed"), "1d76db");
+        assert_eq!(status_label_color("status:in_progress"), "fbca04");
+        assert_eq!(status_label_color("status:done"), "0e8a16");
+        assert_eq!(status_label_color("status:blocked"), "d73a4a");
+        assert_eq!(status_label_color("status:in_review"), "0075ca");
+        assert_eq!(status_label_color("status:needs_review"), "e4e669");
+    }
+
+    #[test]
+    fn unknown_label_gets_default_color() {
+        assert_eq!(status_label_color("agent:claude"), "c5def5");
+        assert_eq!(status_label_color("enhancement"), "c5def5");
+        assert_eq!(status_label_color(""), "c5def5");
     }
 }

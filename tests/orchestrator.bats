@@ -1077,6 +1077,35 @@ YAML
   [ "$output" = "myorg/myproject" ]
 }
 
+@test "load_project_config scopes locks and contexts to project" {
+  cat > "${TMP_DIR}/orchestrator.yml" <<'YAML'
+gh:
+  repo: "myorg/myproject"
+  sync_label: ""
+YAML
+
+  run bash -c 'source '"${REPO_DIR}"'/scripts/lib.sh; PROJECT_DIR='"${TMP_DIR}"'; load_project_config; echo "$LOCK_PATH"'
+  [ "$status" -eq 0 ]
+  [ "$output" = "${TMP_DIR}/.orchestrator/locks" ]
+
+  run bash -c 'source '"${REPO_DIR}"'/scripts/lib.sh; PROJECT_DIR='"${TMP_DIR}"'; load_project_config; echo "$CONTEXTS_DIR"'
+  [ "$status" -eq 0 ]
+  [ "$output" = "${TMP_DIR}/.orchestrator/contexts" ]
+}
+
+@test "projects_list reads projects.yml" {
+  mkdir -p "${ORCH_HOME}"
+  cat > "${ORCH_HOME}/projects.yml" <<'YAML'
+projects:
+  - dir: "/tmp/project-a"
+  - "/tmp/project-b"
+YAML
+
+  run bash -c "ORCH_HOME='${ORCH_HOME}'; source '${REPO_DIR}/scripts/lib.sh'; projects_list"
+  [ "$status" -eq 0 ]
+  [ "$output" = $'/tmp/project-a\n/tmp/project-b' ]
+}
+
 @test "run_task.sh uses plan prompt for decompose mode" {
   TASK_OUTPUT=$("${REPO_DIR}/scripts/add_task.sh" "Big Feature" "Build the whole thing" "plan")
   TASK2_ID=$(_task_id "$TASK_OUTPUT")

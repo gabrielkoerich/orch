@@ -489,6 +489,10 @@ load_project_config() {
   if [ -n "${PROJECT_DIR:-}" ]; then
     STATE_DIR="${PROJECT_DIR}/.orchestrator"
     ORCH_WORKTREES="${PROJECT_DIR}/.orchestrator/worktrees"
+    # Also scope locks + contexts to the project to avoid collisions when
+    # multiple repos have overlapping issue numbers (e.g. issue #13 in two repos).
+    LOCK_PATH="${PROJECT_DIR}/.orchestrator/locks"
+    CONTEXTS_DIR="${PROJECT_DIR}/.orchestrator/contexts"
   fi
   ensure_state_dir
   local merged="${STATE_DIR}/config-merged.yml"
@@ -496,6 +500,38 @@ load_project_config() {
   yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' \
     "$GLOBAL_CONFIG_PATH" "$project_config" > "$merged"
   CONFIG_PATH="$merged"
+}
+
+projects_path() {
+  echo "${PROJECTS_PATH:-${ORCH_HOME}/projects.yml}"
+}
+
+# List project directories from projects.yml.
+#
+# Supported formats:
+# 1) projects: ["/path/a", "/path/b"]
+# 2) projects:
+#      - dir: "/path/a"
+#      - dir: "/path/b"
+# 3) top-level YAML sequence of strings or maps with {dir,path}
+projects_list() {
+  local path
+  path=$(projects_path)
+  [ -f "$path" ] || return 0
+
+  local json
+  json=$(yq -o=json '.' "$path" 2>/dev/null || true)
+  [ -n "$json" ] || return 0
+
+  printf '%s' "$json" | jq -r '
+    (if type == "array" then . else (.projects // []) end)
+    | .[]
+    | if type == "string" then .
+      elif type == "object" then (.dir // .path // empty)
+      else empty
+      end
+    | select(length > 0)
+  ' 2>/dev/null || true
 }
 
 config_get() {
