@@ -22,6 +22,14 @@ router:
   model: "haiku"
   timeout_seconds: 120
   fallback_executor: "codex"
+  max_route_attempts: 3  # After N LLM routing failures, fall back to round-robin
+  # Agents to discover in PATH (checked at startup)
+  agents:
+    - claude
+    - codex
+    - opencode
+    - kimi
+    - minimax
   allowed_tools:
     - yq
     - jq
@@ -43,18 +51,26 @@ model_map:
     claude: haiku
     codex: gpt-5.1-codex-mini
     opencode: github-copilot/gpt-5-mini
+    kimi: kimi-lite
+    minimax: minimax-lite
   medium:
     claude: sonnet
     codex: gpt-5.2
     opencode: github-copilot/gpt-5.1-codex
+    kimi: kimi-standard
+    minimax: minimax-standard
   complex:
     claude: opus
     codex: gpt-5.3-codex
     opencode: github-copilot/claude-opus-4.5
+    kimi: kimi-pro
+    minimax: minimax-pro
   review:
     claude: sonnet
     codex: gpt-5.2
     opencode: github-copilot/gpt-5.1-codex
+    kimi: kimi-standard
+    minimax: minimax-standard
   # Free models used as fallback when hitting usage limits (round-robin)
   free:
     - opencode/glm-5-free
