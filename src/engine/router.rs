@@ -457,6 +457,7 @@ impl Router {
 
     /// Route using round-robin algorithm (task-ID based, stateless).
     /// Kept for backward compatibility; prefer `route_round_robin_stateful`.
+    #[allow(dead_code)]
     fn route_round_robin(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         let agents = &self.available_agents;
         if agents.is_empty() {
@@ -928,6 +929,7 @@ impl Router {
 
     /// Route multiple tasks concurrently using FuturesUnordered.
     /// Returns results in completion order (not input order).
+    #[allow(dead_code)]
     pub async fn route_batch(
         self: &Arc<Self>,
         tasks: &[ExternalTask],
@@ -1016,28 +1018,28 @@ mod tests {
         let router = Router::new(config);
 
         assert_eq!(
-            router.extract_agent_from_labels(&vec!["agent:claude".to_string()]),
+            router.extract_agent_from_labels(&["agent:claude".to_string()]),
             Some("claude".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&vec!["agent:codex".to_string()]),
+            router.extract_agent_from_labels(&["agent:codex".to_string()]),
             Some("codex".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&vec!["agent:opencode".to_string()]),
+            router.extract_agent_from_labels(&["agent:opencode".to_string()]),
             Some("opencode".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&vec!["status:new".to_string()]),
+            router.extract_agent_from_labels(&["status:new".to_string()]),
             None
         );
         // Verify kimi and minimax are recognized from labels
         assert_eq!(
-            router.extract_agent_from_labels(&vec!["agent:kimi".to_string()]),
+            router.extract_agent_from_labels(&["agent:kimi".to_string()]),
             Some("kimi".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&vec!["agent:minimax".to_string()]),
+            router.extract_agent_from_labels(&["agent:minimax".to_string()]),
             Some("minimax".to_string())
         );
     }
@@ -1056,19 +1058,19 @@ mod tests {
         let router = Router::new(config);
 
         assert_eq!(
-            router.extract_complexity_from_labels(&vec!["complexity:simple".to_string()]),
+            router.extract_complexity_from_labels(&["complexity:simple".to_string()]),
             "simple"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&vec!["complexity:medium".to_string()]),
+            router.extract_complexity_from_labels(&["complexity:medium".to_string()]),
             "medium"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&vec!["complexity:complex".to_string()]),
+            router.extract_complexity_from_labels(&["complexity:complex".to_string()]),
             "complex"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&vec!["status:new".to_string()]),
+            router.extract_complexity_from_labels(&["status:new".to_string()]),
             "medium"
         );
     }
@@ -1215,10 +1217,12 @@ Hope that helps!"#;
 
     #[tokio::test]
     async fn route_round_robin_basic() {
-        let mut config = RouterConfig::default();
         // Force at least one agent to be available for testing
         // In real usage, discover_agents finds installed CLIs
-        config.mode = "round_robin".to_string();
+        let config = RouterConfig {
+            mode: "round_robin".to_string(),
+            ..Default::default()
+        };
 
         // Create router with mock available agents
         let router = Router {
