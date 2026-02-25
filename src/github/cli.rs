@@ -346,25 +346,35 @@ impl GhCli {
         Ok(merged_at.map(|v| !v.is_null()).unwrap_or(false))
     }
 
-    /// Check if the current user is mentioned in issue/PR comments since a given time.
+    /// Get issue/PR comments since a given timestamp.
     ///
-    /// Returns comments that mention the current user.
+    /// Uses `--paginate` to fetch all pages (not just the first 100).
     pub async fn get_mentions(
         &self,
         repo: &str,
         since: &str,
     ) -> anyhow::Result<Vec<GitHubComment>> {
         let endpoint = format!("repos/{repo}/issues/comments");
-        let json = self
-            .api(&[
+        let since_field = format!("since={}", since);
+        let output = Command::new("gh")
+            .arg("api")
+            .arg("--paginate")
+            .args([
                 &endpoint,
+                "-X",
+                "GET",
                 "-f",
-                &format!("since={}", since),
+                &since_field,
                 "-f",
                 "per_page=100",
             ])
+            .output()
             .await?;
-        Ok(serde_json::from_slice(&json)?)
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api failed: {stderr}");
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
     }
 
     /// Get the current authenticated username.

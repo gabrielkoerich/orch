@@ -350,9 +350,52 @@ async fn tick(
     // Phase 4: Unblock parents (blocked tasks whose children are all done)
     let blocked = backend.list_by_status(Status::Blocked).await?;
     for task in &blocked {
-        // Check if all sub-issues are done
-        // TODO: query sub-issues API to check children status
-        let _ = task; // placeholder
+        let children = match backend.get_sub_issues(&task.id).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::debug!(task_id = task.id.0, ?e, "failed to get sub-issues");
+                continue;
+            }
+        };
+
+        // No children means nothing to wait on — skip (may be blocked for other reasons)
+        if children.is_empty() {
+            continue;
+        }
+
+        // Check if every child is done
+        let mut all_done = true;
+        for child_id in &children {
+            match backend.get_task(child_id).await {
+                Ok(child) => {
+                    if !child.labels.iter().any(|l| l == Status::Done.as_label()) {
+                        all_done = false;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        parent = task.id.0,
+                        child = child_id.0,
+                        ?e,
+                        "failed to fetch child task"
+                    );
+                    all_done = false;
+                    break;
+                }
+            }
+        }
+
+        if all_done {
+            tracing::info!(
+                task_id = task.id.0,
+                children = children.len(),
+                "all children done, unblocking parent"
+            );
+            if let Err(e) = backend.update_status(&task.id, Status::New).await {
+                tracing::warn!(task_id = task.id.0, ?e, "failed to unblock parent");
+            }
+        }
     }
 
     // Phase 5: Check job schedules
@@ -598,9 +641,12 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
         }
     };
 
-    // Get mentions since the last internal task or 24 hours ago
-    let since = chrono::Utc::now() - chrono::Duration::hours(24);
-    let since_str = since.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    // Use persisted cursor if available, otherwise fall back to 24h ago
+    let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
+    let since_str = match db.kv_get("mentions_last_checked").await {
+        Ok(Some(ts)) => ts,
+        _ => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    };
 
     let mentions = match backend.get_mentions(&since_str).await {
         Ok(m) => m,
@@ -647,6 +693,12 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
             .await?;
 
         tracing::info!(task_id, mention_id = %mention.id, "created mention task");
+    }
+
+    // Persist cursor so the next sync tick only fetches newer comments
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    if let Err(e) = db.kv_set("mentions_last_checked", &now).await {
+        tracing::warn!(err = %e, "failed to persist mentions cursor");
     }
 
     Ok(())

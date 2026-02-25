@@ -19,18 +19,6 @@ impl GitHubBackend {
             gh: GhCli::new(),
         }
     }
-
-    /// Get the repo name.
-    #[allow(dead_code)]
-    pub fn repo(&self) -> &str {
-        &self.repo
-    }
-
-    /// Get the gh CLI for direct API access.
-    #[allow(dead_code)]
-    pub fn gh(&self) -> &GhCli {
-        &self.gh
-    }
 }
 
 #[async_trait]
