@@ -20,6 +20,7 @@ pub enum TaskStatus {
     InProgress,
     Done,
     Blocked,
+    NeedsReview,
 }
 
 impl TaskStatus {
@@ -31,6 +32,7 @@ impl TaskStatus {
             Self::InProgress => "in_progress",
             Self::Done => "done",
             Self::Blocked => "blocked",
+            Self::NeedsReview => "needs_review",
         }
     }
 
@@ -41,6 +43,7 @@ impl TaskStatus {
             "in_progress" => Some(Self::InProgress),
             "done" => Some(Self::Done),
             "blocked" => Some(Self::Blocked),
+            "needs_review" => Some(Self::NeedsReview),
             _ => None,
         }
     }
@@ -55,6 +58,7 @@ pub struct InternalTask {
     pub source: String,
     pub source_id: String,
     pub agent: Option<String>,
+    pub block_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -138,13 +142,13 @@ impl Db {
     pub async fn get_internal_task(&self, id: i64) -> anyhow::Result<InternalTask> {
         let conn = self.conn.lock().await;
         let task = conn.query_row(
-            "SELECT id, title, body, status, source, source_id, agent, created_at, updated_at 
+            "SELECT id, title, body, status, source, source_id, agent, block_reason, created_at, updated_at
              FROM internal_tasks WHERE id = ?1",
             [id],
             |row| {
                 let status_str: String = row.get(3)?;
-                let created_str: String = row.get(7)?;
-                let updated_str: String = row.get(8)?;
+                let created_str: String = row.get(8)?;
+                let updated_str: String = row.get(9)?;
                 Ok(InternalTask {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -153,6 +157,7 @@ impl Db {
                     source: row.get(4)?,
                     source_id: row.get(5)?,
                     agent: row.get(6)?,
+                    block_reason: row.get(7)?,
                     created_at: DateTime::parse_from_rfc3339(&created_str)
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
@@ -172,13 +177,13 @@ impl Db {
     ) -> anyhow::Result<Vec<InternalTask>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, title, body, status, source, source_id, agent, created_at, updated_at 
+            "SELECT id, title, body, status, source, source_id, agent, block_reason, created_at, updated_at
              FROM internal_tasks WHERE status = ?1 ORDER BY created_at DESC",
         )?;
         let tasks = stmt.query_map([status.as_str()], |row| {
             let status_str: String = row.get(3)?;
-            let created_str: String = row.get(7)?;
-            let updated_str: String = row.get(8)?;
+            let created_str: String = row.get(8)?;
+            let updated_str: String = row.get(9)?;
             Ok(InternalTask {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -187,6 +192,7 @@ impl Db {
                 source: row.get(4)?,
                 source_id: row.get(5)?,
                 agent: row.get(6)?,
+                block_reason: row.get(7)?,
                 created_at: DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now()),
@@ -256,20 +262,41 @@ impl Db {
         )?;
         Ok(())
     }
+
+    pub async fn set_internal_task_block_reason(
+        &self,
+        id: i64,
+        reason: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE internal_tasks SET block_reason = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
+            rusqlite::params![reason, id],
+        )?;
+        Ok(())
+    }
+
+    /// Check if all children of a task are done (for unblocking parents)
+    pub async fn are_all_children_done(&self, _parent_id: i64) -> anyhow::Result<bool> {
+        // TODO: Implement when sub-task relationships are added to schema
+        // For now, return true to allow unblocking
+        Ok(true)
+    }
 }
 
 /// Schema v1 — initial tables for internal tasks and jobs.
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS internal_tasks (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    title       TEXT NOT NULL,
-    body        TEXT DEFAULT '',
-    status      TEXT DEFAULT 'new',
-    source      TEXT NOT NULL,  -- 'cron', 'mention', 'manual'
-    source_id   TEXT DEFAULT '', -- job ID, mention thread, etc.
-    agent       TEXT DEFAULT NULL,
-    created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    updated_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    title         TEXT NOT NULL,
+    body          TEXT DEFAULT '',
+    status        TEXT DEFAULT 'new',
+    source        TEXT NOT NULL,  -- 'cron', 'mention', 'manual'
+    source_id     TEXT DEFAULT '', -- job ID, mention thread, etc.
+    agent         TEXT DEFAULT NULL,
+    block_reason  TEXT DEFAULT NULL,
+    created_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS internal_task_results (
@@ -504,6 +531,7 @@ mod tests {
         assert_eq!(TaskStatus::InProgress.as_str(), "in_progress");
         assert_eq!(TaskStatus::Done.as_str(), "done");
         assert_eq!(TaskStatus::Blocked.as_str(), "blocked");
+        assert_eq!(TaskStatus::NeedsReview.as_str(), "needs_review");
     }
 
     #[test]
@@ -516,6 +544,10 @@ mod tests {
         );
         assert_eq!(TaskStatus::from_str("done"), Some(TaskStatus::Done));
         assert_eq!(TaskStatus::from_str("blocked"), Some(TaskStatus::Blocked));
+        assert_eq!(
+            TaskStatus::from_str("needs_review"),
+            Some(TaskStatus::NeedsReview)
+        );
         assert_eq!(TaskStatus::from_str("invalid"), None);
     }
 }
