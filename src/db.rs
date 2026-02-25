@@ -247,6 +247,17 @@ CREATE TABLE IF NOT EXISTS internal_tasks (
     updated_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS internal_task_results (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL,
+    summary     TEXT DEFAULT '',
+    status      TEXT DEFAULT '',
+    reason      TEXT DEFAULT '',
+    files_changed TEXT DEFAULT '[]',
+    created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    FOREIGN KEY (task_id) REFERENCES internal_tasks(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id          TEXT PRIMARY KEY,
     schedule    TEXT NOT NULL,
@@ -262,6 +273,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_internal_tasks_status ON internal_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_internal_tasks_source ON internal_tasks(source);
+CREATE INDEX IF NOT EXISTS idx_internal_task_results_task_id ON internal_task_results(task_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_enabled ON jobs(enabled);
 "#;
 

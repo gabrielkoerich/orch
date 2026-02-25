@@ -5,11 +5,16 @@
 //! for missed schedules (capped at 24h).
 //!
 //! Job types:
-//! - `task`: creates a GitHub Issue and lets the engine dispatch it
+//! - `task`: creates a task (GitHub Issue or internal SQLite) and lets the engine dispatch it
 //! - `bash`: runs a shell command directly (no LLM)
+//!
+//! For task jobs, the `external` field controls where the task is created:
+//! - `external: true` (default): Creates a GitHub Issue
+//! - `external: false`: Creates an internal SQLite task
 
 use crate::backends::{ExternalBackend, ExternalId};
-use crate::db::{Db, TaskStatus};
+use crate::db::Db;
+use crate::engine::internal_tasks::{create_internal_task_with_source, get_internal_task};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -30,8 +35,8 @@ pub struct Job {
     pub dir: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    #[serde(default)]
-    pub external: bool,
+    #[serde(default = "default_external")]
+    pub external: bool, // NEW: true = GitHub Issue, false = internal SQLite task
     #[serde(default)]
     pub last_run: Option<String>,
     #[serde(default)]
@@ -58,6 +63,10 @@ fn default_job_type() -> String {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_external() -> bool {
+    true // Default to external (GitHub) for backward compatibility
 }
 
 /// Top-level jobs.yml structure.
@@ -115,80 +124,101 @@ pub async fn tick(
         }
 
         // Check if previous task is still active
-        if let Some(ref task_id_str) = job.active_task_id {
-            if job.external {
-                let task_id: i64 = task_id_str.parse().unwrap_or(0);
-                match backend.get_task(&ExternalId(task_id_str.clone())).await {
+        let mut should_clear_task_id = false;
+        let mut should_skip = false;
+
+        if let Some(ref task_id) = job.active_task_id {
+            let task_id_clone = task_id.clone();
+            let is_active = if job.external {
+                // Check external (GitHub) task
+                match backend.get_task(&ExternalId(task_id_clone.clone())).await {
                     Ok(task) => {
                         let status = task.labels.iter().find(|l| l.starts_with("status:"));
                         match status.map(|s| s.as_str()) {
                             Some("status:in_progress")
                             | Some("status:routed")
-                            | Some("status:new") => {
-                                tracing::debug!(
-                                    job_id = job.id,
-                                    task_id,
-                                    "skipping: previous task still active"
-                                );
-                                continue;
-                            }
-                            None => {
-                                continue;
-                            }
-                            Some(_) => {
-                                tracing::debug!(
-                                    job_id = job.id,
-                                    task_id,
-                                    "previous task terminal, clearing"
-                                );
-                                job.active_task_id = None;
-                            }
+                            | Some("status:new") => true,
+                            None => true,     // No status label — treat as active
+                            Some(_) => false, // Terminal state
                         }
                     }
                     Err(e) => {
+                        // Task lookup failed (deleted, API error, rate limit).
+                        // Clear active_task_id so the job isn't permanently blocked.
                         tracing::warn!(
                             job_id = job.id,
-                            task_id,
+                            task_id = task_id_clone,
                             ?e,
                             "cannot fetch active task, clearing active_task_id"
                         );
-                        job.active_task_id = None;
+                        should_clear_task_id = true;
                         job.last_task_status = Some("error".to_string());
+                        false
                     }
                 }
             } else {
-                let task_id: i64 = task_id_str.parse().unwrap_or(0);
-                match db.get_internal_task(task_id).await {
-                    Ok(task) => match task.status {
-                        TaskStatus::New | TaskStatus::Routed | TaskStatus::InProgress => {
-                            tracing::debug!(
-                                job_id = job.id,
-                                task_id,
-                                "skipping: previous internal task still active"
-                            );
-                            continue;
+                // Check internal (SQLite) task
+                // Parse "internal:{id}" format
+                if let Some(internal_id_str) = task_id_clone.strip_prefix("internal:") {
+                    if let Ok(internal_id) = internal_id_str.parse::<i64>() {
+                        match get_internal_task(db, internal_id).await {
+                            Ok(Some(task)) => {
+                                match task.status.as_str() {
+                                    "new" | "routed" | "in_progress" => true,
+                                    _ => false, // Terminal state (done, blocked, needs_review, etc.)
+                                }
+                            }
+                            Ok(None) => {
+                                // Task not found — clear active_task_id
+                                tracing::warn!(
+                                    job_id = job.id,
+                                    task_id = task_id_clone,
+                                    "internal task not found, clearing active_task_id"
+                                );
+                                should_clear_task_id = true;
+                                false
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    job_id = job.id,
+                                    task_id = task_id_clone,
+                                    ?e,
+                                    "cannot fetch internal task, clearing active_task_id"
+                                );
+                                should_clear_task_id = true;
+                                false
+                            }
                         }
-                        TaskStatus::Done | TaskStatus::Blocked => {
-                            tracing::debug!(
-                                job_id = job.id,
-                                task_id,
-                                "previous internal task terminal, clearing"
-                            );
-                            job.active_task_id = None;
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            job_id = job.id,
-                            task_id,
-                            ?e,
-                            "cannot fetch internal task, clearing active_task_id"
-                        );
-                        job.active_task_id = None;
-                        job.last_task_status = Some("error".to_string());
+                    } else {
+                        // Invalid format — clear it
+                        should_clear_task_id = true;
+                        false
                     }
+                } else {
+                    // Legacy format without prefix — clear it
+                    should_clear_task_id = true;
+                    false
                 }
+            };
+
+            if is_active {
+                tracing::debug!(
+                    job_id = job.id,
+                    task_id = task_id_clone,
+                    external = job.external,
+                    "skipping: previous task still active"
+                );
+                should_skip = true;
             }
+        }
+
+        // Apply deferred mutations
+        if should_clear_task_id {
+            job.active_task_id = None;
+        }
+
+        if should_skip {
+            continue;
         }
 
         tracing::info!(job_id = job.id, r#type = job.r#type, "job due, executing");
@@ -201,6 +231,7 @@ pub async fn tick(
             "task" => {
                 if let Some(ref template) = job.task {
                     if job.external {
+                        // Create external (GitHub) task
                         let mut labels = template.labels.clone();
                         labels.push("scheduled".to_string());
                         labels.push(format!("job:{}", job.id));
@@ -234,23 +265,21 @@ pub async fn tick(
                             }
                         }
                     } else {
-                        match db
-                            .create_internal_task(&template.title, &template.body, "cron", &job.id)
-                            .await
+                        // Create internal (SQLite) task
+                        match create_internal_task_with_source(
+                            db,
+                            &template.title,
+                            &template.body,
+                            "cron",
+                            &job.id,
+                        )
+                        .await
                         {
-                            Ok(id) => {
-                                tracing::info!(
-                                    job_id = job.id,
-                                    task_id = id,
-                                    "created internal task"
-                                );
-                                job.active_task_id = Some(id.to_string());
+                            Ok(internal_id) => {
+                                let task_id = format!("internal:{}", internal_id);
+                                tracing::info!(job_id = job.id, task_id, "created internal task");
+                                job.active_task_id = Some(task_id);
                                 job.last_task_status = Some("new".to_string());
-                                if let Some(ref agent) = template.agent {
-                                    if !agent.is_empty() {
-                                        let _ = db.set_internal_task_agent(id, Some(agent)).await;
-                                    }
-                                }
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -399,7 +428,7 @@ mod tests {
             command: None,
             dir: None,
             enabled: true,
-            external: false,
+            external: true,
             last_run: Some("2026-02-22T10:00:00Z".to_string()),
             last_task_status: Some("done".to_string()),
             active_task_id: None,
