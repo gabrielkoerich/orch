@@ -14,7 +14,9 @@
 //! Phase 2 approach: Rust owns the loop, `run_task.sh` still handles agent
 //! invocation, git workflow, and prompt building.
 
+pub mod internal_tasks;
 pub mod jobs;
+pub mod router;
 mod runner;
 pub mod tasks;
 
@@ -24,6 +26,7 @@ use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
 use crate::channels::ChannelRegistry;
 use crate::db::Db;
+use crate::engine::router::{get_route_result, RouteResult};
 use crate::github::cli::GhCli;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
@@ -308,6 +311,9 @@ async fn tick(
         let session_name = tmux.session_name(&task_id);
         capture.register_session(&task_id, &session_name).await;
 
+        // Load routing result from sidecar
+        let route_result = get_route_result(&task_id).ok();
+
         // Dispatch task
         let runner = runner.clone();
         let backend = backend.clone();
@@ -317,7 +323,14 @@ async fn tick(
         tokio::spawn(async move {
             tracing::info!(task_id, "dispatching task");
 
-            match runner.run(&task_id).await {
+            // Pass agent/model to runner via environment variables
+            let agent = route_result.as_ref().map(|r: &RouteResult| r.agent.clone());
+            let model = route_result.as_ref().and_then(|r| r.model.clone());
+
+            match runner
+                .run(&task_id, agent.as_deref(), model.as_deref())
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(task_id, "task runner completed");
                 }
@@ -429,7 +442,7 @@ async fn cleanup_worktrees(
     let orch_home = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join(".orchestrator");
-    let project_name = repo.split('/').last().unwrap_or(repo);
+    let project_name = repo.split('/').next_back().unwrap_or(repo);
     let worktrees_base = orch_home.join("worktrees").join(project_name);
 
     if !worktrees_base.exists() {
@@ -564,7 +577,7 @@ async fn check_merged_prs(
     let orch_home = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join(".orchestrator");
-    let project_name = repo.split('/').last().unwrap_or(repo);
+    let project_name = repo.split('/').next_back().unwrap_or(repo);
     let worktrees_base = orch_home.join("worktrees").join(project_name);
     let git_dir = repo_git_dir(&orch_home, repo);
 
@@ -718,7 +731,7 @@ async fn scan_mentions(
         // Extract issue number from issue_url
         // Format: https://api.github.com/repos/owner/repo/issues/123
         let issue_number = match &comment.issue_url {
-            Some(url) => match url.split('/').last().and_then(|n| n.parse::<u64>().ok()) {
+            Some(url) => match url.split('/').next_back().and_then(|n| n.parse::<u64>().ok()) {
                 Some(n) => n.to_string(),
                 None => {
                     tracing::debug!(comment_id, "cannot parse issue number from issue_url");
