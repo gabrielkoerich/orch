@@ -20,6 +20,7 @@ pub mod tasks;
 
 use crate::backends::github::GitHubBackend;
 use crate::backends::{ExternalBackend, ExternalTask, Status};
+use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
 use crate::channels::ChannelRegistry;
 use crate::db::Db;
@@ -83,6 +84,13 @@ pub async fn serve() -> anyhow::Result<()> {
     // Initialize transport
     let transport = Arc::new(Transport::new());
 
+    // Initialize capture service and start background loop
+    let capture = Arc::new(CaptureService::new(transport.clone()));
+    let capture_for_tick = capture.clone();
+    tokio::spawn(async move {
+        capture.start().await;
+    });
+
     // Initialize channel registry
     let _channels = ChannelRegistry::new();
 
@@ -119,6 +127,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     &backend,
                     &tmux,
                     &runner,
+                    &capture_for_tick,
                     &semaphore,
                     &config,
                     &jobs_path,
@@ -172,6 +181,7 @@ async fn tick(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
     runner: &Arc<TaskRunner>,
+    capture: &Arc<CaptureService>,
     semaphore: &Arc<Semaphore>,
     config: &EngineConfig,
     jobs_path: &std::path::PathBuf,
@@ -182,6 +192,8 @@ async fn tick(
     for (task_id, active) in &session_snapshot {
         if !active {
             tracing::info!(task_id, "session completed, collecting results");
+            // Unregister from capture service
+            capture.unregister_session(task_id).await;
             // The run_task.sh process handles its own status updates
             // and GitHub comment posting. We just clean up the session.
             let session_name = tmux.session_name(task_id);
@@ -279,9 +291,15 @@ async fn tick(
             continue;
         }
 
+        // Register session for capture
+        let session_name = tmux.session_name(&task_id);
+        capture.register_session(&task_id, &session_name).await;
+
         // Dispatch task
         let runner = runner.clone();
         let backend = backend.clone();
+        let capture = capture.clone();
+        let task_id_for_cleanup = task_id.clone();
 
         tokio::spawn(async move {
             tracing::info!(task_id, "dispatching task");
@@ -304,6 +322,9 @@ async fn tick(
                         .await;
                 }
             }
+
+            // Unregister session from capture
+            capture.unregister_session(&task_id_for_cleanup).await;
 
             // Release the semaphore permit
             drop(permit);

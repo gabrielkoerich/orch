@@ -13,6 +13,7 @@ mod sidecar;
 mod tmux;
 
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "orch-core", version, about = "Orch — The Agent Orchestrator")]
@@ -47,6 +48,11 @@ enum Commands {
     Config {
         /// Config key (dot-separated path)
         key: String,
+    },
+    /// Stream live output from a running task
+    Stream {
+        /// Task ID to stream
+        task_id: String,
     },
 }
 
@@ -103,6 +109,62 @@ async fn main() -> anyhow::Result<()> {
         Commands::Config { key } => {
             let val = config::get(&key)?;
             println!("{val}");
+        }
+        Commands::Stream { task_id } => {
+            stream_task(&task_id).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Stream live output from a running task.
+///
+/// This connects to the transport layer and prints output chunks
+/// as they arrive from the tmux capture loop.
+async fn stream_task(task_id: &str) -> anyhow::Result<()> {
+    use crate::channels::transport::Transport;
+    use tokio::sync::broadcast;
+
+    // Create transport (this is a local connection to the running service)
+    let transport = Arc::new(Transport::new());
+
+    // Bind to the task session
+    let session_name = format!("orch-{}", task_id);
+    transport.bind(task_id, &session_name, "cli", "stream").await;
+
+    // Subscribe to output
+    let mut rx = match transport.subscribe(task_id).await {
+        Some(rx) => rx,
+        None => {
+            anyhow::bail!("no active session for task {}", task_id);
+        }
+    };
+
+    println!("Streaming output from task {} (session: {})", task_id, session_name);
+    println!("Press Ctrl+C to stop streaming");
+    println!("---");
+
+    // Print output chunks as they arrive
+    loop {
+        match rx.recv().await {
+            Ok(chunk) => {
+                print!("{}", chunk.content);
+                // Flush stdout to see output immediately
+                std::io::Write::flush(&mut std::io::stdout())?;
+
+                if chunk.is_final {
+                    println!("\n--- Stream ended ---");
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("skipped {} missed messages", n);
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                println!("\n--- Stream closed ---");
+                break;
+            }
         }
     }
 
