@@ -1,22 +1,22 @@
 //! Agent router — selects the best agent and model for each task.
 //!
 //! The router uses LLM-based classification to route tasks to the best agent
-//! (claude, codex, or opencode) based on task content, labels, and configured
-//! routing rules. It also generates a specialized agent profile for each task.
+//! (claude, codex, opencode, kimi, or minimax) based on task content, labels,
+//! and configured routing rules. It also generates a specialized agent profile.
 //!
 //! Routing logic (in priority order):
 //! 1. Check for `agent:*` label on task — use that agent directly
-//! 2. Check for `complexity:*` label — map to default model per agent
-//! 3. Call LLM classifier (claude with haiku model) for intelligent routing
-//! 4. Parse LLM response (JSON with agent, model, reason, profile)
-//! 5. Fallback to configured default agent if LLM fails
-
-#![allow(dead_code)]
+//! 2. If round_robin mode, cycle through agents (stateful, skips last-used)
+//! 3. Call LLM classifier for intelligent routing
+//! 4. After N LLM failures, fall back to round-robin
+//! 5. Track last routed agent to distribute load across agents
 
 use crate::backends::ExternalTask;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Result of routing a task to an agent.
@@ -64,6 +64,10 @@ pub struct RouterConfig {
     pub timeout_seconds: u64,
     /// Fallback executor if routing fails
     pub fallback_executor: String,
+    /// Configurable agent list (checked against PATH at runtime)
+    pub agents: Vec<String>,
+    /// Max LLM routing attempts before falling back to round-robin
+    pub max_route_attempts: u32,
     /// Default tools allowed
     pub allowed_tools: Vec<String>,
     /// Default skills to always include
@@ -71,6 +75,9 @@ pub struct RouterConfig {
     /// Model map for complexity levels
     pub model_map: HashMap<String, HashMap<String, String>>,
 }
+
+/// Default agents to check in PATH.
+pub const DEFAULT_AGENTS: &[&str] = &["claude", "codex", "opencode", "kimi", "minimax"];
 
 impl Default for RouterConfig {
     fn default() -> Self {
@@ -84,6 +91,8 @@ impl Default for RouterConfig {
             "opencode".to_string(),
             "github-copilot/gpt-5-mini".to_string(),
         );
+        simple.insert("kimi".to_string(), "haiku".to_string());
+        simple.insert("minimax".to_string(), "haiku".to_string());
         model_map.insert("simple".to_string(), simple);
 
         // Medium models
@@ -94,6 +103,8 @@ impl Default for RouterConfig {
             "opencode".to_string(),
             "github-copilot/gpt-5.1-codex".to_string(),
         );
+        medium.insert("kimi".to_string(), "sonnet".to_string());
+        medium.insert("minimax".to_string(), "sonnet".to_string());
         model_map.insert("medium".to_string(), medium);
 
         // Complex models
@@ -104,6 +115,8 @@ impl Default for RouterConfig {
             "opencode".to_string(),
             "github-copilot/claude-opus-4.5".to_string(),
         );
+        complex.insert("kimi".to_string(), "opus".to_string());
+        complex.insert("minimax".to_string(), "opus".to_string());
         model_map.insert("complex".to_string(), complex);
 
         // Review models
@@ -114,6 +127,8 @@ impl Default for RouterConfig {
             "opencode".to_string(),
             "github-copilot/gpt-5.1-codex".to_string(),
         );
+        review.insert("kimi".to_string(), "sonnet".to_string());
+        review.insert("minimax".to_string(), "sonnet".to_string());
         model_map.insert("review".to_string(), review);
 
         Self {
@@ -122,6 +137,8 @@ impl Default for RouterConfig {
             router_model: "haiku".to_string(),
             timeout_seconds: 120,
             fallback_executor: "codex".to_string(),
+            agents: DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect(),
+            max_route_attempts: 3,
             allowed_tools: vec![
                 "yq".to_string(),
                 "jq".to_string(),
@@ -175,6 +192,27 @@ impl RouterConfig {
         if let Ok(fallback) = crate::config::get("router.fallback_executor") {
             if !fallback.is_empty() {
                 config.fallback_executor = fallback;
+            }
+        }
+
+        // Parse agents list
+        if let Ok(agents_str) = crate::config::get("router.agents") {
+            if !agents_str.is_empty() && agents_str != "[]" {
+                if let Ok(agents_arr) = serde_json::from_str::<Vec<String>>(&agents_str) {
+                    config.agents = agents_arr;
+                } else {
+                    config.agents = agents_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+            }
+        }
+
+        if let Ok(max_attempts) = crate::config::get("router.max_route_attempts") {
+            if let Ok(n) = max_attempts.parse::<u32>() {
+                config.max_route_attempts = n;
             }
         }
 
@@ -257,7 +295,7 @@ struct LlmAgentProfile {
 impl Router {
     /// Create a new router with the given configuration.
     pub fn new(config: RouterConfig) -> Self {
-        let available_agents = Self::discover_agents();
+        let available_agents = Self::discover_agents(&config.agents);
         Self {
             config,
             available_agents,
@@ -270,9 +308,10 @@ impl Router {
     }
 
     /// Discover available agent CLIs in PATH.
-    fn discover_agents() -> Vec<String> {
+    /// Checks all agents from the configured list.
+    fn discover_agents(configured_agents: &[String]) -> Vec<String> {
         let mut agents = Vec::new();
-        for agent in &["claude", "codex", "opencode"] {
+        for agent in configured_agents {
             if Self::command_exists(agent) {
                 agents.push(agent.to_string());
             }
@@ -299,9 +338,9 @@ impl Router {
     ///
     /// Routing logic (in priority order):
     /// 1. Check for `agent:*` label — use that agent directly
-    /// 2. If round_robin mode, cycle through agents
+    /// 2. If round_robin mode, cycle through agents (stateful)
     /// 3. Call LLM classifier for intelligent routing
-    /// 4. Fallback to configured default agent if LLM fails
+    /// 4. After max_route_attempts LLM failures, fall back to round-robin
     pub async fn route(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         // 1. Check for explicit agent label
         if let Some(agent) = self.extract_agent_from_labels(&task.labels) {
@@ -327,27 +366,75 @@ impl Router {
             }
         }
 
-        // 2. Round-robin mode
+        // 2. Round-robin mode — use stateful round-robin
         if self.config.mode == "round_robin" {
-            return self.route_round_robin(task);
+            return self.route_round_robin_stateful(task);
         }
 
-        // 3. LLM-based routing
+        // 3. LLM-based routing with retry tracking
+        let route_attempts = self.get_route_attempts(&task.id.0);
+
+        if route_attempts >= self.config.max_route_attempts {
+            tracing::warn!(
+                task_id = %task.id.0,
+                attempts = route_attempts,
+                max = self.config.max_route_attempts,
+                "max LLM route attempts reached, falling back to round-robin"
+            );
+            return self.route_round_robin_stateful(task);
+        }
+
         match self.route_with_llm(task).await {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                // Reset attempts on success
+                let _ = self.set_route_attempts(&task.id.0, 0);
+                Ok(result)
+            }
             Err(e) => {
-                tracing::warn!(task_id = %task.id.0, error = %e, "LLM routing failed, using fallback");
-                self.route_fallback(task)
+                let new_attempts = route_attempts + 1;
+                let _ = self.set_route_attempts(&task.id.0, new_attempts);
+                tracing::warn!(
+                    task_id = %task.id.0,
+                    error = %e,
+                    attempt = new_attempts,
+                    max = self.config.max_route_attempts,
+                    "LLM routing failed"
+                );
+
+                if new_attempts >= self.config.max_route_attempts {
+                    tracing::info!(
+                        task_id = %task.id.0,
+                        "falling back to round-robin after {} failed attempts",
+                        new_attempts
+                    );
+                    self.route_round_robin_stateful(task)
+                } else {
+                    self.route_fallback(task)
+                }
             }
         }
     }
 
+    /// Get the number of LLM routing attempts for a task from sidecar.
+    fn get_route_attempts(&self, task_id: &str) -> u32 {
+        crate::sidecar::get(task_id, "route_attempts")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Set the number of LLM routing attempts for a task in sidecar.
+    fn set_route_attempts(&self, task_id: &str, attempts: u32) -> anyhow::Result<()> {
+        crate::sidecar::set(task_id, &[format!("route_attempts={}", attempts)])
+    }
+
     /// Extract agent from labels (e.g., "agent:claude" -> "claude").
+    /// Accepts any agent from the configured agents list.
     fn extract_agent_from_labels(&self, labels: &[String]) -> Option<String> {
         for label in labels {
             if let Some(agent) = label.strip_prefix("agent:") {
                 let agent = agent.to_lowercase();
-                if ["claude", "codex", "opencode"].contains(&agent.as_str()) {
+                if self.config.agents.iter().any(|a| a == &agent) {
                     return Some(agent);
                 }
             }
@@ -368,7 +455,9 @@ impl Router {
         "medium".to_string()
     }
 
-    /// Route using round-robin algorithm.
+    /// Route using round-robin algorithm (task-ID based, stateless).
+    /// Kept for backward compatibility; prefer `route_round_robin_stateful`.
+    #[allow(dead_code)]
     fn route_round_robin(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         let agents = &self.available_agents;
         if agents.is_empty() {
@@ -392,6 +481,70 @@ impl Router {
             model: self.config.model_for_complexity(&agent, "medium"),
             complexity: "medium".to_string(),
             reason: format!("round_robin (task {} % {} agents)", task.id.0, agents.len()),
+            profile,
+            selected_skills: self.config.default_skills.clone(),
+            warning: None,
+        })
+    }
+
+    /// Stateful round-robin: cycles through agents using a persistent index,
+    /// skipping the last-used agent when possible.
+    fn route_round_robin_stateful(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
+        let agents = &self.available_agents;
+        if agents.is_empty() {
+            anyhow::bail!("no agent CLIs found in PATH");
+        }
+
+        // Get current round-robin index from sidecar KV
+        let current_idx: usize = crate::sidecar::get("_router", "rr_index")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        // Get last routed agent
+        let last_agent = crate::sidecar::get("_router", "last_agent").ok();
+
+        // Pick the next agent, skipping last-used if we have >1 agent
+        let mut agent_idx = current_idx % agents.len();
+        if agents.len() > 1 {
+            if let Some(ref last) = last_agent {
+                if agents.get(agent_idx).map(|a| a.as_str()) == Some(last.as_str()) {
+                    agent_idx = (agent_idx + 1) % agents.len();
+                }
+            }
+        }
+
+        let agent = agents[agent_idx].clone();
+
+        // Persist the next index and last agent
+        let next_idx = (agent_idx + 1) % agents.len();
+        let _ = crate::sidecar::set(
+            "_router",
+            &[
+                format!("rr_index={}", next_idx),
+                format!("last_agent={}", agent),
+            ],
+        );
+
+        let complexity = self.extract_complexity_from_labels(&task.labels);
+        let model = self.config.model_for_complexity(&agent, &complexity);
+
+        let profile = AgentProfile {
+            role: "general".to_string(),
+            skills: vec![],
+            tools: self.config.allowed_tools.clone(),
+            constraints: vec![],
+        };
+
+        Ok(RouteResult {
+            agent: agent.clone(),
+            model,
+            complexity,
+            reason: format!(
+                "round_robin (index {} of {} agents)",
+                agent_idx,
+                agents.len()
+            ),
             profile,
             selected_skills: self.config.default_skills.clone(),
             warning: None,
@@ -471,6 +624,9 @@ impl Router {
 
         // Run sanity checks
         let warning = self.check_routing_sanity(task, &agent, &profile);
+
+        // Track last routed agent for distribution
+        let _ = crate::sidecar::set("_router", &[format!("last_agent={}", agent)]);
 
         Ok(RouteResult {
             agent,
@@ -770,6 +926,32 @@ impl Router {
 
         crate::sidecar::set(task_id, &fields)
     }
+
+    /// Route multiple tasks concurrently using FuturesUnordered.
+    /// Returns results in completion order (not input order).
+    #[allow(dead_code)]
+    pub async fn route_batch(
+        self: &Arc<Self>,
+        tasks: &[ExternalTask],
+    ) -> Vec<(String, anyhow::Result<RouteResult>)> {
+        let mut futures = FuturesUnordered::new();
+
+        for task in tasks {
+            let router = Arc::clone(self);
+            let task = task.clone();
+            futures.push(async move {
+                let task_id = task.id.0.clone();
+                let result = router.route(&task).await;
+                (task_id, result)
+            });
+        }
+
+        let mut results = Vec::with_capacity(tasks.len());
+        while let Some(result) = futures.next().await {
+            results.push(result);
+        }
+        results
+    }
 }
 
 /// Retrieve routing result from sidecar file.
@@ -836,21 +1018,38 @@ mod tests {
         let router = Router::new(config);
 
         assert_eq!(
-            router.extract_agent_from_labels(&vec!["agent:claude".to_string()]),
+            router.extract_agent_from_labels(&["agent:claude".to_string()]),
             Some("claude".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&vec!["agent:codex".to_string()]),
+            router.extract_agent_from_labels(&["agent:codex".to_string()]),
             Some("codex".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&vec!["agent:opencode".to_string()]),
+            router.extract_agent_from_labels(&["agent:opencode".to_string()]),
             Some("opencode".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&vec!["status:new".to_string()]),
+            router.extract_agent_from_labels(&["status:new".to_string()]),
             None
         );
+        // Verify kimi and minimax are recognized from labels
+        assert_eq!(
+            router.extract_agent_from_labels(&["agent:kimi".to_string()]),
+            Some("kimi".to_string())
+        );
+        assert_eq!(
+            router.extract_agent_from_labels(&["agent:minimax".to_string()]),
+            Some("minimax".to_string())
+        );
+    }
+
+    #[test]
+    fn default_agents_constant() {
+        assert_eq!(DEFAULT_AGENTS.len(), 5);
+        assert!(DEFAULT_AGENTS.contains(&"claude"));
+        assert!(DEFAULT_AGENTS.contains(&"kimi"));
+        assert!(DEFAULT_AGENTS.contains(&"minimax"));
     }
 
     #[test]
@@ -859,19 +1058,19 @@ mod tests {
         let router = Router::new(config);
 
         assert_eq!(
-            router.extract_complexity_from_labels(&vec!["complexity:simple".to_string()]),
+            router.extract_complexity_from_labels(&["complexity:simple".to_string()]),
             "simple"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&vec!["complexity:medium".to_string()]),
+            router.extract_complexity_from_labels(&["complexity:medium".to_string()]),
             "medium"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&vec!["complexity:complex".to_string()]),
+            router.extract_complexity_from_labels(&["complexity:complex".to_string()]),
             "complex"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&vec!["status:new".to_string()]),
+            router.extract_complexity_from_labels(&["status:new".to_string()]),
             "medium"
         );
     }
@@ -910,8 +1109,17 @@ mod tests {
         assert_eq!(config.router_agent, "claude");
         assert_eq!(config.router_model, "haiku");
         assert_eq!(config.fallback_executor, "codex");
+        assert_eq!(config.max_route_attempts, 3);
         assert!(!config.allowed_tools.is_empty());
         assert!(!config.default_skills.is_empty());
+
+        // Verify configurable agents list includes all 5 agents
+        assert_eq!(config.agents.len(), 5);
+        assert!(config.agents.contains(&"claude".to_string()));
+        assert!(config.agents.contains(&"codex".to_string()));
+        assert!(config.agents.contains(&"opencode".to_string()));
+        assert!(config.agents.contains(&"kimi".to_string()));
+        assert!(config.agents.contains(&"minimax".to_string()));
     }
 
     #[test]
@@ -933,6 +1141,23 @@ mod tests {
         assert_eq!(
             config.model_for_complexity("codex", "simple"),
             Some("gpt-5.1-codex-mini".to_string())
+        );
+        // Verify kimi and minimax use same models as claude
+        assert_eq!(
+            config.model_for_complexity("kimi", "simple"),
+            Some("haiku".to_string())
+        );
+        assert_eq!(
+            config.model_for_complexity("kimi", "complex"),
+            Some("opus".to_string())
+        );
+        assert_eq!(
+            config.model_for_complexity("minimax", "medium"),
+            Some("sonnet".to_string())
+        );
+        assert_eq!(
+            config.model_for_complexity("minimax", "complex"),
+            Some("opus".to_string())
         );
     }
 
@@ -992,10 +1217,12 @@ Hope that helps!"#;
 
     #[tokio::test]
     async fn route_round_robin_basic() {
-        let mut config = RouterConfig::default();
         // Force at least one agent to be available for testing
         // In real usage, discover_agents finds installed CLIs
-        config.mode = "round_robin".to_string();
+        let config = RouterConfig {
+            mode: "round_robin".to_string(),
+            ..Default::default()
+        };
 
         // Create router with mock available agents
         let router = Router {

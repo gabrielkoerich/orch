@@ -93,6 +93,13 @@ router:
   model: "haiku"           # fast/cheap model for classification
   timeout_seconds: 120     # routing timeout
   fallback_executor: "codex"  # fallback if routing fails
+  max_route_attempts: 3    # after N LLM failures, fall back to round-robin
+  agents:                  # agents to discover in PATH
+    - claude
+    - codex
+    - opencode
+    - kimi
+    - minimax
   allowed_tools:           # default tools for agent profiles
     - yq
     - jq

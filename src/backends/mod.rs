@@ -86,8 +86,79 @@ pub trait ExternalBackend: Send + Sync {
     /// Fetch a task by its external ID.
     async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask>;
 
-    /// Update task status.
-    async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()>;
+    /// Update task status using idempotent remove + add operations.
+    ///
+    /// Default implementation retries up to 3 times with a fresh snapshot on
+    /// each attempt to narrow the TOCTOU window. Backends that provide a native
+    /// atomic status-update endpoint can override this.
+    ///
+    /// The retry loop:
+    ///   1. Fetches a fresh label snapshot via `get_task`.
+    ///   2. Removes all `status:*` labels except the target via `remove_label`.
+    ///   3. Adds the target label via `set_labels`.
+    ///
+    /// Note: labels removed in a previous attempt are already gone — the retry
+    /// re-evaluates the current state rather than undoing prior work.
+    async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+        let label = status.as_label();
+
+        // Hook for backends that need to auto-create labels (e.g. GitHub).
+        if let Err(e) = self.ensure_status_label(label).await {
+            tracing::warn!(label, err = %e, "ensure_status_label failed, continuing");
+        }
+
+        const MAX_RETRIES: u32 = 3;
+        let mut last_err =
+            anyhow::anyhow!("update_status({label}) failed: all {MAX_RETRIES} attempts exhausted");
+
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)))
+                    .await;
+                tracing::debug!(attempt, label, "retrying update_status");
+            }
+
+            // Fresh snapshot on every attempt.
+            let task = match self.get_task(id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            };
+
+            // Remove all existing status labels except the target.
+            let mut remove_failed = false;
+            for old in task
+                .labels
+                .iter()
+                .filter(|l| l.starts_with("status:") && l.as_str() != label)
+            {
+                if let Err(e) = self.remove_label(id, old).await {
+                    tracing::warn!(old_label = %old, err = %e, attempt, "remove_label failed");
+                    last_err = e;
+                    remove_failed = true;
+                    break;
+                }
+            }
+            if remove_failed {
+                continue;
+            }
+
+            // Add the target status label.
+            match self.set_labels(id, &[label.to_string()]).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(label, err = %e, attempt, "set_labels failed");
+                    last_err = e;
+                }
+            }
+        }
+
+        Err(last_err.context(format!(
+            "update_status({label}) failed after {MAX_RETRIES} attempts"
+        )))
+    }
 
     /// List tasks by status.
     async fn list_by_status(&self, status: Status) -> anyhow::Result<Vec<ExternalTask>>;
@@ -95,7 +166,9 @@ pub trait ExternalBackend: Send + Sync {
     /// Post a comment / activity note.
     async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()>;
 
-    /// Set metadata labels / tags.
+    /// Add metadata labels / tags (additive — does not remove existing labels).
+    /// The GitHub backend uses POST /repos/{repo}/issues/{number}/labels,
+    /// which appends to the existing label set.
     #[allow(dead_code)]
     async fn set_labels(&self, id: &ExternalId, labels: &[String]) -> anyhow::Result<()>;
 
@@ -108,6 +181,15 @@ pub trait ExternalBackend: Send + Sync {
     /// Returns the list of external IDs for sub-issues.
     /// Empty list means no sub-issues or sub-issues not supported.
     async fn get_sub_issues(&self, id: &ExternalId) -> anyhow::Result<Vec<ExternalId>>;
+
+    /// Ensure a status label exists in the backend system.
+    ///
+    /// Called by the default `update_status` before applying labels.
+    /// GitHub overrides this to auto-create labels on the repo.
+    /// Default is a no-op.
+    async fn ensure_status_label(&self, _label: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Check if connected and authenticated.
     async fn health_check(&self) -> anyhow::Result<()>;
@@ -137,6 +219,222 @@ pub trait ExternalBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    /// Mock backend that exercises the default trait `update_status` implementation.
+    ///
+    /// Does NOT override `update_status` — the trait default (retry loop with
+    /// get_task → remove_label → set_labels) is what runs. This means tests
+    /// verify the actual production orchestration logic, not a simplified mock.
+    struct MockBackend {
+        /// Current labels on the (single) tracked issue.
+        labels: Arc<Mutex<Vec<String>>>,
+        /// If set, `remove_label` returns this error for the matching label.
+        remove_err: Option<String>,
+        /// Counter for `set_labels` failures. Each call decrements; fails while > 0.
+        set_labels_fail_count: Arc<Mutex<u32>>,
+    }
+
+    impl MockBackend {
+        fn with_labels(labels: Vec<&str>) -> Self {
+            Self {
+                labels: Arc::new(Mutex::new(labels.into_iter().map(String::from).collect())),
+                remove_err: None,
+                set_labels_fail_count: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn current_labels(&self) -> Vec<String> {
+            self.labels.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ExternalBackend for MockBackend {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn create_task(
+            &self,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("1".into()))
+        }
+
+        async fn get_task(&self, _id: &ExternalId) -> anyhow::Result<ExternalTask> {
+            Ok(ExternalTask {
+                id: ExternalId("1".into()),
+                title: "mock".into(),
+                body: "".into(),
+                state: "open".into(),
+                labels: self.current_labels(),
+                author: "user".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                url: "https://example.com".into(),
+            })
+        }
+
+        // update_status is NOT overridden — uses the default trait implementation
+        // which calls get_task, remove_label, set_labels with retry logic.
+
+        async fn list_by_status(&self, _status: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+
+        async fn post_comment(&self, _id: &ExternalId, _body: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn set_labels(&self, _id: &ExternalId, labels: &[String]) -> anyhow::Result<()> {
+            let mut fail_count = self.set_labels_fail_count.lock().unwrap();
+            if *fail_count > 0 {
+                *fail_count -= 1;
+                return Err(anyhow::anyhow!("transient network error"));
+            }
+            drop(fail_count);
+            let mut current = self.labels.lock().unwrap();
+            for l in labels {
+                if !current.contains(l) {
+                    current.push(l.clone());
+                }
+            }
+            Ok(())
+        }
+
+        async fn remove_label(&self, _id: &ExternalId, label: &str) -> anyhow::Result<()> {
+            if let Some(ref err_label) = self.remove_err {
+                if label == err_label {
+                    return Err(anyhow::anyhow!("rate limit (429)"));
+                }
+            }
+            self.labels.lock().unwrap().retain(|l| l != label);
+            Ok(())
+        }
+
+        async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // --- Tests exercise the default trait update_status (retry + remove + add) ---
+
+    #[tokio::test]
+    async fn update_status_replaces_single_old_label() {
+        let backend = MockBackend::with_labels(vec!["status:new", "priority:high"]);
+        let id = ExternalId("1".into());
+        backend
+            .update_status(&id, Status::InProgress)
+            .await
+            .unwrap();
+        let labels = backend.current_labels();
+        assert!(
+            labels.contains(&"status:in_progress".to_string()),
+            "new label added: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"status:new".to_string()),
+            "old label removed: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"priority:high".to_string()),
+            "non-status label preserved: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_status_removes_multiple_old_status_labels() {
+        // Simulate state left by a previous partial failure: two status labels
+        let backend = MockBackend::with_labels(vec!["status:in_progress", "status:blocked", "bug"]);
+        let id = ExternalId("1".into());
+        backend.update_status(&id, Status::Done).await.unwrap();
+        let labels = backend.current_labels();
+        let status_labels: Vec<_> = labels.iter().filter(|l| l.starts_with("status:")).collect();
+        assert_eq!(
+            status_labels,
+            vec!["status:done"],
+            "exactly one status label: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_status_is_idempotent() {
+        let backend = MockBackend::with_labels(vec!["status:done"]);
+        let id = ExternalId("1".into());
+        backend.update_status(&id, Status::Done).await.unwrap();
+        let labels = backend.current_labels();
+        let status_count = labels.iter().filter(|l| l.starts_with("status:")).count();
+        assert_eq!(
+            status_count, 1,
+            "idempotent: still exactly one status label: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_status_non_status_labels_are_preserved() {
+        let backend =
+            MockBackend::with_labels(vec!["status:routed", "agent:claude", "maintenance"]);
+        let id = ExternalId("1".into());
+        backend
+            .update_status(&id, Status::InProgress)
+            .await
+            .unwrap();
+        let labels = backend.current_labels();
+        assert!(
+            labels.contains(&"agent:claude".to_string()),
+            "agent label preserved: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"maintenance".to_string()),
+            "other label preserved: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_status_retries_on_transient_set_labels_failure() {
+        let backend = MockBackend::with_labels(vec!["status:new"]);
+        // set_labels fails once, then succeeds on retry
+        *backend.set_labels_fail_count.lock().unwrap() = 1;
+        let id = ExternalId("1".into());
+        backend
+            .update_status(&id, Status::InProgress)
+            .await
+            .unwrap();
+        let labels = backend.current_labels();
+        assert!(
+            labels.contains(&"status:in_progress".to_string()),
+            "label added after retry: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"status:new".to_string()),
+            "old label removed: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_status_fails_after_max_retries() {
+        let backend = MockBackend::with_labels(vec!["status:new"]);
+        // set_labels always fails (more failures than retries)
+        *backend.set_labels_fail_count.lock().unwrap() = 10;
+        let id = ExternalId("1".into());
+        let result = backend.update_status(&id, Status::Done).await;
+        assert!(result.is_err(), "should fail after max retries");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("failed after 3 attempts"),
+            "error message mentions retry exhaustion"
+        );
+    }
 
     #[test]
     fn status_as_label() {

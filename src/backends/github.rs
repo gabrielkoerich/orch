@@ -55,15 +55,13 @@ impl ExternalBackend for GitHubBackend {
         })
     }
 
-    async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
-        // Ensure the target status label exists on the repo before assigning it.
-        // Mirrors bash `_gh_ensure_label` — creates the label on first use so
-        // callers never have to pre-create labels manually.  Failures are
-        // tolerated: if creation fails we still attempt the replace below.
-        let label = status.as_label();
-        let status_name = &label["status:".len()..]; // strip prefix for description
-        if let Err(e) = self
-            .gh
+    // update_status uses the default trait implementation (retry loop with
+    // get_task → remove_label → set_labels). Only ensure_status_label is
+    // overridden to auto-create labels on the GitHub repo.
+
+    async fn ensure_status_label(&self, label: &str) -> anyhow::Result<()> {
+        let status_name = &label["status:".len()..];
+        self.gh
             .ensure_label(
                 &self.repo,
                 label,
@@ -71,23 +69,6 @@ impl ExternalBackend for GitHubBackend {
                 &format!("Task status: {status_name}"),
             )
             .await
-        {
-            tracing::warn!(label, err = %e, "ensure_label failed, continuing with replace_labels");
-        }
-
-        // GET current labels, swap status:* prefix, PUT the full set.
-        // The PUT itself is atomic, but there's a TOCTOU window between GET
-        // and PUT where another process could modify labels. Labels added in
-        // that window would be lost. Acceptable for orchestrator (single writer).
-        let task = self.get_task(id).await?;
-        let mut labels: Vec<String> = task
-            .labels
-            .into_iter()
-            .filter(|l| !l.starts_with("status:"))
-            .collect();
-        labels.push(label.to_string());
-        self.gh.replace_labels(&self.repo, &id.0, &labels).await?;
-        Ok(())
     }
 
     async fn list_by_status(&self, status: Status) -> anyhow::Result<Vec<ExternalTask>> {
@@ -112,6 +93,7 @@ impl ExternalBackend for GitHubBackend {
         self.gh.add_comment(&self.repo, &id.0, body).await
     }
 
+    /// Additive: uses POST (gh.add_labels), so existing labels like bug, priority:high are preserved.
     async fn set_labels(&self, id: &ExternalId, labels: &[String]) -> anyhow::Result<()> {
         self.gh.add_labels(&self.repo, &id.0, labels).await
     }

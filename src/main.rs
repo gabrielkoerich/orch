@@ -13,6 +13,8 @@ mod sidecar;
 mod template;
 mod tmux;
 
+use crate::engine::tasks::{CreateTaskRequest, TaskFilter, TaskManager, TaskType};
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 
@@ -62,6 +64,11 @@ enum Commands {
         /// Additional KEY=VALUE pairs (optional)
         vars: Vec<String>,
     },
+    /// Task management (internal and external tasks)
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -79,6 +86,43 @@ enum SidecarAction {
         task_id: String,
         /// Field=value pairs
         fields: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskAction {
+    /// List tasks (internal + external)
+    List {
+        /// Filter by status
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by source
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Create an internal task
+    Add {
+        /// Task title
+        title: String,
+        /// Task body
+        #[arg(short, long)]
+        body: Option<String>,
+        /// Task source (e.g., manual, cron, mention)
+        #[arg(short, long, default_value = "manual")]
+        source: String,
+    },
+    /// Get task details
+    Get {
+        /// Task ID
+        id: i64,
+    },
+    /// Publish internal task to GitHub
+    Publish {
+        /// Task ID
+        id: i64,
+        /// Labels to add
+        #[arg(short, long)]
+        labels: Vec<String>,
     },
 }
 
@@ -124,6 +168,24 @@ async fn main() -> anyhow::Result<()> {
         Commands::Template { path, vars } => {
             template::render_and_print(&path, &vars)?;
         }
+        Commands::Task { action } => match action {
+            TaskAction::List { status, source } => {
+                task_list(status, source).await?;
+            }
+            TaskAction::Add {
+                title,
+                body,
+                source,
+            } => {
+                task_add(title, body, source).await?;
+            }
+            TaskAction::Get { id } => {
+                task_get(id).await?;
+            }
+            TaskAction::Publish { id, labels } => {
+                task_publish(id, labels).await?;
+            }
+        },
     }
 
     Ok(())
@@ -184,5 +246,133 @@ async fn stream_task(task_id: &str) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Initialize task manager with database and backend.
+async fn init_task_manager() -> anyhow::Result<TaskManager> {
+    use crate::backends::github::GitHubBackend;
+    use crate::backends::ExternalBackend;
+    use crate::db::Db;
+
+    let repo = config::get("repo").context(
+        "'repo' not set in config — run `orch-core init` or set repo in ~/.orchestrator/config.yml",
+    )?;
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+    let db = Arc::new(Db::open(&crate::db::default_path()?)?);
+    db.migrate().await?;
+    Ok(TaskManager::new(db, backend))
+}
+
+/// List tasks with optional filters.
+async fn task_list(status: Option<String>, source: Option<String>) -> anyhow::Result<()> {
+    let task_manager = init_task_manager().await?;
+    let filter = TaskFilter { status, source };
+    let tasks = task_manager.list_tasks(filter).await?;
+
+    if tasks.is_empty() {
+        println!("No tasks found.");
+        return Ok(());
+    }
+
+    println!("{:<10} {:<12} {:<20} TITLE", "ID", "TYPE", "STATUS");
+    println!("{}", "-".repeat(80));
+
+    for task in tasks {
+        match task {
+            engine::tasks::Task::External(ext) => {
+                let status = ext
+                    .labels
+                    .iter()
+                    .find(|l| l.starts_with("status:"))
+                    .map(|s| s.replace("status:", ""))
+                    .unwrap_or_else(|| "unknown".to_string());
+                println!(
+                    "{:<10} {:<12} {:<20} {}",
+                    ext.id.0, "external", status, ext.title
+                );
+            }
+            engine::tasks::Task::Internal(int) => {
+                println!(
+                    "{:<10} {:<12} {:<20} {}",
+                    int.id,
+                    "internal",
+                    int.status.as_str(),
+                    int.title
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Create a new internal task.
+async fn task_add(title: String, body: Option<String>, source: String) -> anyhow::Result<()> {
+    let task_manager = init_task_manager().await?;
+    let req = CreateTaskRequest {
+        title,
+        body: body.unwrap_or_default(),
+        task_type: TaskType::Internal,
+        labels: vec![],
+        source,
+        source_id: String::new(),
+    };
+    let task = task_manager.create_task(req).await?;
+
+    match task {
+        engine::tasks::Task::Internal(t) => {
+            println!("Created internal task #{}: {}", t.id, t.title);
+        }
+        _ => {
+            println!("Created task");
+        }
+    }
+
+    Ok(())
+}
+
+/// Get task details by ID.
+async fn task_get(id: i64) -> anyhow::Result<()> {
+    let task_manager = init_task_manager().await?;
+    let task = task_manager.get_task(id).await?;
+
+    match task {
+        engine::tasks::Task::External(ext) => {
+            println!("ID: {} (external)", ext.id.0);
+            println!("Title: {}", ext.title);
+            println!("State: {}", ext.state);
+            println!("Labels: {}", ext.labels.join(", "));
+            println!("Author: {}", ext.author);
+            println!("URL: {}", ext.url);
+            println!("Created: {}", ext.created_at);
+            println!("Updated: {}", ext.updated_at);
+            println!("\n{}", ext.body);
+        }
+        engine::tasks::Task::Internal(int) => {
+            println!("ID: {} (internal)", int.id);
+            println!("Title: {}", int.title);
+            println!("Status: {}", int.status.as_str());
+            println!("Source: {}", int.source);
+            if let Some(agent) = &int.agent {
+                println!("Agent: {}", agent);
+            }
+            if let Some(reason) = &int.block_reason {
+                println!("Block reason: {}", reason);
+            }
+            println!("Created: {}", int.created_at.to_rfc3339());
+            println!("Updated: {}", int.updated_at.to_rfc3339());
+            println!("\n{}", int.body);
+        }
+    }
+
+    Ok(())
+}
+
+/// Publish an internal task to GitHub.
+async fn task_publish(id: i64, labels: Vec<String>) -> anyhow::Result<()> {
+    let task_manager = init_task_manager().await?;
+    let ext_id = task_manager.publish_task(id, &labels).await?;
+    println!("Published task #{} as GitHub issue {}", id, ext_id.0);
     Ok(())
 }
