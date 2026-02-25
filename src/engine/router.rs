@@ -11,8 +11,6 @@
 //! 4. Parse LLM response (JSON with agent, model, reason, profile)
 //! 5. Fallback to configured default agent if LLM fails
 
-#![allow(dead_code)]
-
 use crate::backends::ExternalTask;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
