@@ -90,6 +90,12 @@ pub trait ExternalBackend: Send + Sync {
     #[allow(dead_code)]
     async fn remove_label(&self, id: &ExternalId, label: &str) -> anyhow::Result<()>;
 
+    /// Get sub-issues (children) of a task.
+    ///
+    /// Returns the list of external IDs for sub-issues.
+    /// Empty list means no sub-issues or sub-issues not supported.
+    async fn get_sub_issues(&self, id: &ExternalId) -> anyhow::Result<Vec<ExternalId>>;
+
     /// Check if connected and authenticated.
     async fn health_check(&self) -> anyhow::Result<()>;
 }

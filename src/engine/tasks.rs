@@ -1,5 +1,6 @@
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::db::{Db, InternalTask, TaskStatus};
+use chrono;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -167,5 +168,71 @@ impl TaskManager {
             .update_internal_task_status(id, TaskStatus::Done)
             .await?;
         Ok(ext_id)
+    }
+
+    /// Unblock parent tasks whose children are all done.
+    ///
+    /// Returns the list of task IDs that were unblocked.
+    pub async fn unblock_parents(&self) -> anyhow::Result<Vec<i64>> {
+        let blocked = self.backend.list_by_status(Status::Blocked).await?;
+        let mut unblocked = Vec::new();
+
+        for task in blocked {
+            // Get sub-issues (children)
+            let children = match self.backend.get_sub_issues(&task.id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(task_id = task.id.0, ?e, "get_sub_issues failed, skipping");
+                    continue;
+                }
+            };
+
+            if children.is_empty() {
+                tracing::debug!(task_id = task.id.0, "no sub-issues found, skipping unblock");
+                continue;
+            }
+
+            // Check if all children are done
+            let mut all_done = true;
+            for child_id in &children {
+                match self.backend.get_task(child_id).await {
+                    Ok(child_task) => {
+                        if !child_task.labels.iter().any(|l| l == "status:done") {
+                            all_done = false;
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(child_id = child_id.0, ?e, "get_task failed for child");
+                        all_done = false;
+                        break;
+                    }
+                }
+            }
+
+            if all_done {
+                tracing::info!(
+                    task_id = task.id.0,
+                    "all sub-tasks completed, unblocking parent"
+                );
+                self.backend.update_status(&task.id, Status::New).await?;
+                self.backend
+                    .post_comment(
+                        &task.id,
+                        &format!(
+                            "[{}] All sub-tasks completed. Unblocking parent task.",
+                            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+                        ),
+                    )
+                    .await?;
+
+                // Parse the ID as i64 for the return list
+                if let Ok(id_num) = task.id.0.parse::<i64>() {
+                    unblocked.push(id_num);
+                }
+            }
+        }
+
+        Ok(unblocked)
     }
 }
