@@ -31,6 +31,33 @@ orchestrator tasks unblock all
 - Brew stdout: `/opt/homebrew/var/log/orchestrator.log` (startup messages only)
 - Brew stderr: `/opt/homebrew/var/log/orchestrator.error.log`
 
+## Live Session Streaming
+
+The orchestrator can stream live output from running agent sessions. This allows you to watch agent work in real-time from the terminal.
+
+### Streaming via CLI
+
+```bash
+orchestrator task stream <task_id>
+```
+
+This connects to the running task's tmux session and prints output as it arrives. The stream updates every 2 seconds with new content from the agent's pane.
+
+### How It Works
+
+1. **Capture Service** (`src/channels/capture.rs`): Runs a background loop every 2 seconds that captures tmux pane output
+2. **Diffing**: Compares new output against previous capture to find only new content
+3. **Transport Layer**: Broadcasts output chunks to all subscribers (CLI, Telegram, Discord, etc.)
+4. **Output Chunks**: Each chunk contains:
+   - `task_id`: The task identifier
+   - `content`: New output text
+   - `timestamp`: When captured
+   - `is_final`: Whether this is the final output
+
+### No Duplicate Output
+
+The capture loop diffs against the previous capture, so multiple clients streaming the same session each receive only new content — no duplicates.
+
 ## Complexity-based model routing
 
 The router assigns `complexity: simple|medium|complex` instead of specific model names. The actual model is resolved per agent from `config.yml`:
