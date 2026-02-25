@@ -5,10 +5,58 @@
 //! No bidirectional sync — each storage is authoritative for its domain.
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    New,
+    Routed,
+    InProgress,
+    Done,
+    Blocked,
+}
+
+impl TaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Routed => "routed",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "new" => Some(Self::New),
+            "routed" => Some(Self::Routed),
+            "in_progress" => Some(Self::InProgress),
+            "done" => Some(Self::Done),
+            "blocked" => Some(Self::Blocked),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InternalTask {
+    pub id: i64,
+    pub title: String,
+    pub body: String,
+    pub status: TaskStatus,
+    pub source: String,
+    pub source_id: String,
+    pub agent: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
 
 /// Default database path: `~/.orchestrator/orchestrator.db`
 pub fn default_path() -> anyhow::Result<PathBuf> {
@@ -69,6 +117,105 @@ impl Db {
     pub async fn conn(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.conn.lock().await
     }
+
+    pub async fn create_internal_task(
+        &self,
+        title: &str,
+        body: &str,
+        source: &str,
+        source_id: &str,
+    ) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO internal_tasks (title, body, source, source_id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![title, body, source, source_id],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub async fn get_internal_task(&self, id: i64) -> anyhow::Result<InternalTask> {
+        let conn = self.conn.lock().await;
+        let task = conn.query_row(
+            "SELECT id, title, body, status, source, source_id, agent, created_at, updated_at 
+             FROM internal_tasks WHERE id = ?1",
+            [id],
+            |row| {
+                let status_str: String = row.get(3)?;
+                let created_str: String = row.get(7)?;
+                let updated_str: String = row.get(8)?;
+                Ok(InternalTask {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    body: row.get(2)?,
+                    status: TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::New),
+                    source: row.get(4)?,
+                    source_id: row.get(5)?,
+                    agent: row.get(6)?,
+                    created_at: DateTime::parse_from_rfc3339(&created_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    updated_at: DateTime::parse_from_rfc3339(&updated_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                })
+            },
+        )?;
+        Ok(task)
+    }
+
+    pub async fn list_internal_tasks_by_status(&self, status: TaskStatus) -> anyhow::Result<Vec<InternalTask>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, body, status, source, source_id, agent, created_at, updated_at 
+             FROM internal_tasks WHERE status = ?1 ORDER BY created_at DESC",
+        )?;
+        let tasks = stmt.query_map([status.as_str()], |row| {
+            let status_str: String = row.get(3)?;
+            let created_str: String = row.get(7)?;
+            let updated_str: String = row.get(8)?;
+            Ok(InternalTask {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                body: row.get(2)?,
+                status: TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::New),
+                source: row.get(4)?,
+                source_id: row.get(5)?,
+                agent: row.get(6)?,
+                created_at: DateTime::parse_from_rfc3339(&created_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                updated_at: DateTime::parse_from_rfc3339(&updated_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        let result: Vec<InternalTask> = tasks.filter_map(|t| t.ok()).collect();
+        Ok(result)
+    }
+
+    pub async fn update_internal_task_status(&self, id: i64, status: TaskStatus) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE internal_tasks SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
+            rusqlite::params![status.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    pub async fn delete_internal_task(&self, id: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute("DELETE FROM internal_tasks WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub async fn set_internal_task_agent(&self, id: i64, agent: Option<&str>) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE internal_tasks SET agent = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
+            rusqlite::params![agent, id],
+        )?;
+        Ok(())
+    }
 }
 
 /// Schema v1 — initial tables for internal tasks and jobs.
@@ -80,6 +227,7 @@ CREATE TABLE IF NOT EXISTS internal_tasks (
     status      TEXT DEFAULT 'new',
     source      TEXT NOT NULL,  -- 'cron', 'mention', 'manual'
     source_id   TEXT DEFAULT '', -- job ID, mention thread, etc.
+    agent       TEXT DEFAULT NULL,
     created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
@@ -178,5 +326,109 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.migrate().await.unwrap();
         db.migrate().await.unwrap(); // should not error
+    }
+
+    #[tokio::test]
+    async fn create_internal_task_crud() {
+        let db = Db::open_memory().unwrap();
+        db.migrate().await.unwrap();
+
+        let id = db
+            .create_internal_task("Test task", "Test body", "cron", "daily-sync")
+            .await
+            .unwrap();
+        assert_eq!(id, 1);
+
+        let task = db.get_internal_task(id).await.unwrap();
+        assert_eq!(task.title, "Test task");
+        assert_eq!(task.body, "Test body");
+        assert_eq!(task.source, "cron");
+        assert_eq!(task.source_id, "daily-sync");
+        assert_eq!(task.status, TaskStatus::New);
+
+        db.update_internal_task_status(id, TaskStatus::Done)
+            .await
+            .unwrap();
+        let task = db.get_internal_task(id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::Done);
+
+        db.delete_internal_task(id).await.unwrap();
+        let result = db.get_internal_task(id).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_internal_tasks_by_status() {
+        let db = Db::open_memory().unwrap();
+        db.migrate().await.unwrap();
+
+        db.create_internal_task("Task 1", "", "cron", "job1")
+            .await
+            .unwrap();
+        db.create_internal_task("Task 2", "", "cron", "job2")
+            .await
+            .unwrap();
+        db.create_internal_task("Task 3", "", "manual", "manual1")
+            .await
+            .unwrap();
+
+        let new_tasks = db
+            .list_internal_tasks_by_status(TaskStatus::New)
+            .await
+            .unwrap();
+        assert_eq!(new_tasks.len(), 3);
+
+        db.update_internal_task_status(1, TaskStatus::Done)
+            .await
+            .unwrap();
+        let done_tasks = db
+            .list_internal_tasks_by_status(TaskStatus::Done)
+            .await
+            .unwrap();
+        assert_eq!(done_tasks.len(), 1);
+        assert_eq!(done_tasks[0].title, "Task 1");
+    }
+
+    #[tokio::test]
+    async fn set_internal_task_agent() {
+        let db = Db::open_memory().unwrap();
+        db.migrate().await.unwrap();
+
+        let id = db
+            .create_internal_task("Test", "", "manual", "")
+            .await
+            .unwrap();
+
+        db.set_internal_task_agent(id, Some("claude"))
+            .await
+            .unwrap();
+        let task = db.get_internal_task(id).await.unwrap();
+        assert_eq!(task.agent, Some("claude".to_string()));
+
+        db.set_internal_task_agent(id, None).await.unwrap();
+        let task = db.get_internal_task(id).await.unwrap();
+        assert_eq!(task.agent, None);
+    }
+
+    #[test]
+    fn task_status_as_str() {
+        assert_eq!(TaskStatus::New.as_str(), "new");
+        assert_eq!(TaskStatus::Routed.as_str(), "routed");
+        assert_eq!(TaskStatus::InProgress.as_str(), "in_progress");
+        assert_eq!(TaskStatus::Done.as_str(), "done");
+        assert_eq!(TaskStatus::Blocked.as_str(), "blocked");
+    }
+
+    #[test]
+    fn task_status_from_str() {
+        assert_eq!(TaskStatus::from_str("new"), Some(TaskStatus::New));
+        assert_eq!(TaskStatus::from_str("routed"), Some(TaskStatus::Routed));
+        assert_eq!(
+            TaskStatus::from_str("in_progress"),
+            Some(TaskStatus::InProgress)
+        );
+        assert_eq!(TaskStatus::from_str("done"), Some(TaskStatus::Done));
+        assert_eq!(TaskStatus::from_str("blocked"), Some(TaskStatus::Blocked));
+        assert_eq!(TaskStatus::from_str("invalid"), None);
     }
 }
