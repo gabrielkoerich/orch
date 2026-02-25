@@ -14,7 +14,9 @@
 //! Phase 2 approach: Rust owns the loop, `run_task.sh` still handles agent
 //! invocation, git workflow, and prompt building.
 
+pub mod internal_tasks;
 pub mod jobs;
+pub mod router;
 mod runner;
 pub mod tasks;
 
@@ -26,6 +28,7 @@ use crate::channels::transport::{MessageRoute, Transport};
 use crate::channels::ChannelRegistry;
 use crate::channels::IncomingMessage;
 use crate::db::Db;
+use crate::engine::router::{get_route_result, RouteResult};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use runner::TaskRunner;
@@ -331,10 +334,20 @@ async fn tick(
         let capture = capture.clone();
         let task_id_for_cleanup = task_id.clone();
 
+        // Load routing result from sidecar
+        let route_result = get_route_result(&task_id).ok();
+
         tokio::spawn(async move {
             tracing::info!(task_id, "dispatching task");
 
-            match runner.run(&task_id).await {
+            // Pass agent/model to runner via environment variables
+            let agent = route_result.as_ref().map(|r: &RouteResult| r.agent.clone());
+            let model = route_result.as_ref().and_then(|r| r.model.clone());
+
+            match runner
+                .run(&task_id, agent.as_deref(), model.as_deref())
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(task_id, "task runner completed");
                 }

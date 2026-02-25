@@ -83,7 +83,10 @@ impl Channel for TmuxChannel {
         _rx: broadcast::Receiver<OutputChunk>,
     ) -> anyhow::Result<()> {
         // tmux IS the output source — this captures and broadcasts
-        tracing::debug!(session = thread_id, "tmux channel handles its own output capture");
+        tracing::debug!(
+            session = thread_id,
+            "tmux channel handles its own output capture"
+        );
         Ok(())
     }
 
