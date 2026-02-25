@@ -313,13 +313,20 @@ impl GhCli {
     ///
     /// Returns Ok(true) if merged, Ok(false) if not merged or not a PR.
     pub async fn is_pr_merged(&self, repo: &str, branch: &str) -> anyhow::Result<bool> {
-        // Search for PRs with this branch as head
+        // The GitHub PRs endpoint `head` filter requires "owner:branch" format
+        let owner = repo
+            .split('/')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+        let head = format!("{}:{}", owner, branch);
+
+        // Search for closed PRs with this branch as head
         let endpoint = format!("repos/{repo}/pulls");
         let json = self
             .api(&[
                 &endpoint,
                 "-f",
-                &format!("head={}", branch),
+                &format!("head={}", head),
                 "-f",
                 "state=closed",
                 "-f",

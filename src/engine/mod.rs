@@ -462,7 +462,29 @@ async fn cleanup_done_worktrees(
         if let Some(wt) = worktree_to_remove {
             tracing::info!(task_id, worktree = %wt.display(), "removing worktree");
 
-            // Delete branch FIRST (before removing worktree), from the main repo root
+            // Remove worktree FIRST, then delete the branch.
+            // Git refuses to remove a worktree if its branch is already deleted.
+            // Both commands run from the main repo root (not the worktree dir).
+            let wt_str = wt.to_string_lossy().to_string();
+            let remove_result = Command::new("git")
+                .args(["-C", &repo_root, "worktree", "remove", &wt_str, "--force"])
+                .output()
+                .await;
+
+            match remove_result {
+                Ok(output) if output.status.success() => {
+                    tracing::info!(task_id, "worktree removed");
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(task_id, err = %stderr, "failed to remove worktree");
+                }
+                Err(e) => {
+                    tracing::warn!(task_id, err = %e, "failed to remove worktree");
+                }
+            }
+
+            // Delete branch from the main repo root (worktree is already gone)
             if let Some(ref br) = branch {
                 let branch_delete_result = Command::new("git")
                     .args(["-C", &repo_root, "branch", "-D", br])
@@ -480,26 +502,6 @@ async fn cleanup_done_worktrees(
                     Err(e) => {
                         tracing::warn!(task_id, err = %e, "failed to delete branch");
                     }
-                }
-            }
-
-            // Remove worktree using git from the main repo root
-            let wt_str = wt.to_string_lossy().to_string();
-            let remove_result = Command::new("git")
-                .args(["-C", &repo_root, "worktree", "remove", &wt_str, "--force"])
-                .output()
-                .await;
-
-            match remove_result {
-                Ok(output) if output.status.success() => {
-                    tracing::info!(task_id, "worktree removed");
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!(task_id, err = %stderr, "failed to remove worktree");
-                }
-                Err(e) => {
-                    tracing::warn!(task_id, err = %e, "failed to remove worktree");
                 }
             }
 
