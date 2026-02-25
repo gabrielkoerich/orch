@@ -16,6 +16,7 @@
 
 pub mod jobs;
 mod runner;
+pub mod tasks;
 
 use crate::backends::github::GitHubBackend;
 use crate::backends::{ExternalBackend, ExternalTask, Status};
@@ -121,6 +122,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     &semaphore,
                     &config,
                     &jobs_path,
+                    &db,
                 ).await {
                     tracing::error!(?e, "tick failed");
                 }
@@ -173,6 +175,7 @@ async fn tick(
     semaphore: &Arc<Semaphore>,
     config: &EngineConfig,
     jobs_path: &std::path::PathBuf,
+    db: &Arc<Db>,
 ) -> anyhow::Result<()> {
     // Phase 1: Check active tmux sessions for completions
     let session_snapshot = tmux.snapshot().await;
@@ -316,7 +319,7 @@ async fn tick(
     }
 
     // Phase 5: Check job schedules
-    if let Err(e) = jobs::tick(jobs_path, backend).await {
+    if let Err(e) = jobs::tick(jobs_path, backend, &db).await {
         tracing::error!(?e, "job scheduler tick failed");
     }
 
