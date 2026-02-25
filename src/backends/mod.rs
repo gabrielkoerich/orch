@@ -7,6 +7,7 @@ pub mod github;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 
 /// Opaque identifier from the external system (issue number, Linear ID, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +99,9 @@ pub trait ExternalBackend: Send + Sync {
 
     /// Check if connected and authenticated.
     async fn health_check(&self) -> anyhow::Result<()>;
+
+    /// Downcast to concrete type for backend-specific operations.
+    fn as_any(&self) -> &dyn Any;
 }
 
 #[cfg(test)]

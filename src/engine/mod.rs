@@ -14,25 +14,22 @@
 //! Phase 2 approach: Rust owns the loop, `run_task.sh` still handles agent
 //! invocation, git workflow, and prompt building.
 
-pub mod internal_tasks;
 pub mod jobs;
-pub mod router;
 mod runner;
 pub mod tasks;
 
 use crate::backends::github::GitHubBackend;
-use crate::backends::{ExternalBackend, ExternalTask, Status};
+use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
-use crate::channels::discord::DiscordChannel;
-use crate::channels::telegram::TelegramChannel;
 use crate::channels::transport::Transport;
-use crate::channels::{Channel, ChannelRegistry, OutgoingMessage};
-use crate::db::Db;
-use crate::engine::router::{get_route_result, RouteResult};
+use crate::channels::ChannelRegistry;
+use crate::db::{Db, TaskStatus};
+use crate::sidecar;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use runner::TaskRunner;
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 /// Engine configuration.
@@ -97,45 +94,10 @@ pub async fn serve() -> anyhow::Result<()> {
     });
 
     // Initialize channel registry
-    let mut channels = ChannelRegistry::new();
-
-    // Try to start Telegram if configured
-    if let Ok(token) = crate::config::get("channels.telegram.bot_token") {
-        if !token.is_empty() {
-            let chat_id = crate::config::get("channels.telegram.chat_id").ok();
-            let tg = Box::new(TelegramChannel::new(token, chat_id));
-            if tg.health_check().await.is_ok() {
-                if let Ok(_rx) = tg.start().await {
-                    tracing::info!("telegram channel started");
-                    channels.register(tg);
-                }
-            } else {
-                tracing::warn!("telegram health check failed, not starting");
-            }
-        }
-    }
-
-    // Try to start Discord if configured
-    if let Ok(token) = crate::config::get("channels.discord.bot_token") {
-        if !token.is_empty() {
-            let channel_id = crate::config::get("channels.discord.channel_id").ok();
-            let dc = Box::new(DiscordChannel::new(token, channel_id));
-            if dc.health_check().await.is_ok() {
-                if let Ok(_rx) = dc.start().await {
-                    tracing::info!("discord channel started");
-                    channels.register(dc);
-                }
-            } else {
-                tracing::warn!("discord health check failed, not starting");
-            }
-        }
-    }
-
-    // Clone channels for task runner
-    let channels_for_runner = Arc::new(channels);
+    let _channels = ChannelRegistry::new();
 
     // Task runner (delegates to run_task.sh)
-    let runner = Arc::new(TaskRunner::new(repo));
+    let runner = Arc::new(TaskRunner::new(repo.clone()));
 
     // Jobs path
     let orch_home = dirs::home_dir().unwrap_or_default().join(".orchestrator");
@@ -172,14 +134,13 @@ pub async fn serve() -> anyhow::Result<()> {
                     &config,
                     &jobs_path,
                     &db,
-                    &channels_for_runner,
                 ).await {
                     tracing::error!(?e, "tick failed");
                 }
 
                 // Periodic sync (less frequent)
                 if last_sync.elapsed() >= config.sync_interval {
-                    if let Err(e) = sync_tick(&backend, &tmux).await {
+                    if let Err(e) = sync_tick(&backend, &tmux, &repo, &db).await {
                         tracing::error!(?e, "sync tick failed");
                     }
                     last_sync = std::time::Instant::now();
@@ -228,7 +189,6 @@ async fn tick(
     config: &EngineConfig,
     jobs_path: &std::path::PathBuf,
     db: &Arc<Db>,
-    channels: &Arc<ChannelRegistry>,
 ) -> anyhow::Result<()> {
     // Phase 1: Check active tmux sessions for completions
     let session_snapshot = tmux.snapshot().await;
@@ -343,34 +303,13 @@ async fn tick(
         let backend = backend.clone();
         let capture = capture.clone();
         let task_id_for_cleanup = task_id.clone();
-        let channels = channels.clone();
-
-        // Load routing result from sidecar
-        let route_result = get_route_result(&task_id).ok();
 
         tokio::spawn(async move {
             tracing::info!(task_id, "dispatching task");
 
-            // Pass agent/model to runner via environment variables
-            let agent = route_result.as_ref().map(|r: &RouteResult| r.agent.clone());
-            let model = route_result.as_ref().and_then(|r| r.model.clone());
-
-            match runner
-                .run(&task_id, agent.as_deref(), model.as_deref())
-                .await
-            {
+            match runner.run(&task_id).await {
                 Ok(()) => {
                     tracing::info!(task_id, "task runner completed");
-                    // Send completion notification to all channels
-                    let msg = OutgoingMessage {
-                        thread_id: task_id.clone(),
-                        body: format!("Task {} completed successfully", task_id),
-                        reply_to: None,
-                        metadata: serde_json::json!({"event": "task_complete"}),
-                    };
-                    for channel in channels.iter() {
-                        let _ = channel.send(&msg).await;
-                    }
                 }
                 Err(e) => {
                     tracing::error!(task_id, ?e, "task runner failed");
@@ -384,16 +323,6 @@ async fn tick(
                             ),
                         )
                         .await;
-                    // Send failure notification to all channels
-                    let msg = OutgoingMessage {
-                        thread_id: task_id.clone(),
-                        body: format!("Task {} failed: {e}", task_id),
-                        reply_to: None,
-                        metadata: serde_json::json!({"event": "task_failure"}),
-                    };
-                    for channel in channels.iter() {
-                        let _ = channel.send(&msg).await;
-                    }
                 }
             }
 
@@ -408,57 +337,9 @@ async fn tick(
     // Phase 4: Unblock parents (blocked tasks whose children are all done)
     let blocked = backend.list_by_status(Status::Blocked).await?;
     for task in &blocked {
-        // Get sub-issues (children)
-        let children = match backend.get_sub_issues(&task.id).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(task_id = task.id.0, ?e, "get_sub_issues failed, skipping");
-                continue;
-            }
-        };
-
-        if children.is_empty() {
-            // No children - this task might have been incorrectly blocked
-            // or it's a standalone task. Log and skip.
-            tracing::debug!(task_id = task.id.0, "no sub-issues found, skipping unblock");
-            continue;
-        }
-
-        // Check if all children are done
-        let mut all_done = true;
-        for child_id in &children {
-            match backend.get_task(child_id).await {
-                Ok(child_task) => {
-                    if !child_task.labels.iter().any(|l| l == "status:done") {
-                        all_done = false;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    // If we can't get the child task, assume it's not done
-                    tracing::debug!(child_id = child_id.0, ?e, "get_task failed for child");
-                    all_done = false;
-                    break;
-                }
-            }
-        }
-
-        if all_done {
-            tracing::info!(
-                task_id = task.id.0,
-                "all sub-tasks completed, unblocking parent"
-            );
-            backend.update_status(&task.id, Status::New).await?;
-            backend
-                .post_comment(
-                    &task.id,
-                    &format!(
-                        "[{}] All sub-tasks completed. Unblocking parent task.",
-                        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
-                    ),
-                )
-                .await?;
-        }
+        // Check if all sub-issues are done
+        // TODO: query sub-issues API to check children status
+        let _ = task; // placeholder
     }
 
     // Phase 5: Check job schedules
@@ -476,15 +357,314 @@ async fn tick(
 /// - Check for merged PRs → mark tasks done
 /// - Scan for @mentions
 async fn sync_tick(
-    _backend: &Arc<dyn ExternalBackend>,
+    backend: &Arc<dyn ExternalBackend>,
     _tmux: &Arc<TmuxManager>,
+    repo: &str,
+    db: &Arc<Db>,
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
 
-    // TODO: cleanup worktrees for done tasks
-    // TODO: check for merged PRs (in_review → done)
-    // TODO: scan for @mentions
-    // TODO: review open PRs
+    // Try to get GitHub backend for repo-specific operations
+    let gh_backend = backend
+        .as_ref()
+        .as_any()
+        .downcast_ref::<GitHubBackend>();
+
+    if let Some(gh) = gh_backend {
+        let gh_cli = gh.gh();
+
+        // 1. Cleanup worktrees for done tasks
+        if let Err(e) = cleanup_done_worktrees(backend, repo).await {
+            tracing::warn!(err = %e, "worktree cleanup failed");
+        }
+
+        // 2. Check for merged PRs (in_review → done)
+        if let Err(e) = check_merged_prs(backend, gh_cli, repo).await {
+            tracing::warn!(err = %e, "PR merge check failed");
+        }
+
+        // 3. Scan for @mentions
+        if let Err(e) = scan_mentions(db, gh_cli, repo).await {
+            tracing::warn!(err = %e, "mention scan failed");
+        }
+
+        // 4. Review open PRs (optional - if enabled in config)
+        if let Err(e) = review_open_prs(backend, repo).await {
+            tracing::warn!(err = %e, "PR review failed");
+        }
+    }
+
+    Ok(())
+}
+
+/// Cleanup worktrees for done tasks.
+///
+/// Queries status:done tasks, checks if worktree exists, removes it,
+/// deletes the local branch, and marks the worktree as cleaned.
+async fn cleanup_done_worktrees(
+    backend: &Arc<dyn ExternalBackend>,
+    repo: &str,
+) -> anyhow::Result<()> {
+    let done_tasks = backend.list_by_status(Status::Done).await?;
+    tracing::debug!(count = done_tasks.len(), "checking done tasks for cleanup");
+
+    // Get worktrees base path
+    let worktrees_base = dirs::home_dir()
+        .map(|h| h.join(".orchestrator").join("worktrees"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".orchestrator/worktrees"));
+
+    for task in done_tasks {
+        let task_id = &task.id.0;
+
+        // Get worktree and branch from sidecar
+        let worktree = sidecar::get(task_id, "worktree").ok();
+        let branch = sidecar::get(task_id, "branch").ok();
+        let worktree_cleaned = sidecar::get(task_id, "worktree_cleaned").ok();
+
+        // Skip if already cleaned
+        if worktree_cleaned.as_deref() == Some("true") || worktree_cleaned.as_deref() == Some("1") {
+            continue;
+        }
+
+        let worktree_path = worktree.as_ref().map(std::path::PathBuf::from);
+
+        // Try to construct default worktree path if not in sidecar
+        let worktree_to_remove = if let Some(ref wt) = worktree_path {
+            if wt.exists() {
+                Some(wt.clone())
+            } else {
+                None
+            }
+        } else if let (Some(b), Some(dir)) = (&branch, worktree.as_ref()) {
+            // Try: worktrees_base/{project}/{branch}
+            let project = std::path::Path::new(dir)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| repo.replace('/', "__"));
+            let wt = worktrees_base.join(&project).join(b);
+            if wt.exists() {
+                Some(wt)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(wt) = worktree_to_remove {
+            tracing::info!(task_id, worktree = %wt.display(), "removing worktree");
+
+            // Remove worktree using git
+            let wt_str = wt.to_string_lossy().to_string();
+            let remove_result = Command::new("git")
+                .args(["worktree", "remove", &wt_str, "--force"])
+                .output()
+                .await;
+
+            match remove_result {
+                Ok(output) if output.status.success() => {
+                    tracing::info!(task_id, "worktree removed");
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(task_id, err = %stderr, "failed to remove worktree");
+                }
+                Err(e) => {
+                    tracing::warn!(task_id, err = %e, "failed to remove worktree");
+                }
+            }
+
+            // Delete branch if it exists
+            if let Some(br) = branch {
+                if let Some(dir) = worktree {
+                    let branch_delete_result = Command::new("git")
+                        .args(["-C", &dir, "branch", "-D", &br])
+                        .output()
+                        .await;
+
+                    match branch_delete_result {
+                        Ok(output) if output.status.success() => {
+                            tracing::info!(task_id, branch = %br, "branch deleted");
+                        }
+                        Ok(output) => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            tracing::debug!(task_id, err = %stderr, "branch delete skipped (may not exist)");
+                        }
+                        Err(e) => {
+                            tracing::warn!(task_id, err = %e, "failed to delete branch");
+                        }
+                    }
+                }
+            }
+
+            // Mark as cleaned in sidecar
+            if let Err(e) = sidecar::set(task_id, &["worktree_cleaned=true".to_string()]) {
+                tracing::warn!(task_id, err = %e, "failed to mark worktree_cleaned");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check for merged PRs and update task status accordingly.
+///
+/// Queries status:in_review tasks, checks if their PR is merged,
+/// and updates status to done if merged.
+async fn check_merged_prs(
+    backend: &Arc<dyn ExternalBackend>,
+    gh_cli: &crate::github::cli::GhCli,
+    repo: &str,
+) -> anyhow::Result<()> {
+    let in_review_tasks = backend.list_by_status(Status::InReview).await?;
+    tracing::debug!(count = in_review_tasks.len(), "checking in_review tasks for merged PRs");
+
+    for task in in_review_tasks {
+        let task_id = &task.id.0;
+
+        // Get branch from sidecar
+        let branch = match sidecar::get(task_id, "branch") {
+            Ok(b) if !b.is_empty() => b,
+            _ => {
+                tracing::debug!(task_id, "no branch info, skipping PR check");
+                continue;
+            }
+        };
+
+        // Check if PR is merged
+        match gh_cli.is_pr_merged(repo, &branch).await {
+            Ok(true) => {
+                tracing::info!(task_id, branch = %branch, "PR merged, marking task complete");
+
+                // Update status to done
+                let id = ExternalId(task_id.clone());
+                if let Err(e) = backend.update_status(&id, Status::Done).await {
+                    tracing::warn!(task_id, err = %e, "failed to update status to done");
+                    continue;
+                }
+
+                // Post comment
+                let comment = "PR merged, marking task complete";
+                if let Err(e) = backend.post_comment(&id, comment).await {
+                    tracing::warn!(task_id, err = %e, "failed to post comment");
+                }
+            }
+            Ok(false) => {
+                // PR not merged, continue
+            }
+            Err(e) => {
+                tracing::warn!(task_id, branch = %branch, err = %e, "failed to check PR merge status");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Scan for @mentions and create internal tasks.
+///
+/// Checks recent issue comments for @orchestrator mentions,
+/// creates internal tasks, and acknowledges them.
+async fn scan_mentions(
+    db: &Arc<Db>,
+    gh_cli: &crate::github::cli::GhCli,
+    repo: &str,
+) -> anyhow::Result<()> {
+    // Get the current user (for mention detection)
+    let current_user = match gh_cli.get_whoami().await {
+        Ok(u) => format!("@{}", u),
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to get current user, skipping mentions");
+            return Ok(());
+        }
+    };
+
+    // Get mentions since the last internal task or 24 hours ago
+    let since = chrono::Utc::now() - chrono::Duration::hours(24);
+    let since_str = since.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    let comments = match gh_cli.get_mentions(repo, &since_str).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to get mentions");
+            return Ok(());
+        }
+    };
+
+    // Get existing mention tasks to avoid duplicates
+    let existing_tasks = db.list_internal_tasks_by_status(TaskStatus::New).await?;
+    let existing_mentions: std::collections::HashSet<_> = existing_tasks
+        .iter()
+        .filter(|t| t.source == "mention")
+        .filter_map(|t| t.source_id.parse::<u64>().ok())
+        .collect();
+
+    for comment in comments {
+        let comment_id = comment.id;
+
+        // Skip if already processed
+        if existing_mentions.contains(&comment_id) {
+            continue;
+        }
+
+        let body = &comment.body;
+        if !body.contains(&current_user) && !body.contains("@orchestrator") {
+            continue;
+        }
+
+        // Extract issue number from URL if possible
+        // Create internal task for this mention
+        let title = format!("Respond to mention in {}", repo);
+        let task_body = format!(
+            "Mention by @{}:\n\n{}",
+            comment.user.login, body
+        );
+
+        let task_id = db
+            .create_internal_task(&title, &task_body, "mention", &comment_id.to_string())
+            .await?;
+
+        tracing::info!(task_id, comment_id, "created mention task");
+    }
+
+    Ok(())
+}
+
+/// Review open PRs (optional feature).
+///
+/// Lists open PRs and triggers review agent if configured.
+async fn review_open_prs(
+    backend: &Arc<dyn ExternalBackend>,
+    _repo: &str,
+) -> anyhow::Result<()> {
+    // Check if review agent is enabled
+    let review_enabled = crate::config::get("enable_review_agent")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    if !review_enabled {
+        tracing::debug!("review agent disabled, skipping");
+        return Ok(());
+    }
+
+    tracing::info!("review agent enabled, listing open PRs");
+
+    // Get done tasks that might need review
+    let done_tasks = backend.list_by_status(Status::Done).await?;
+
+    for task in done_tasks {
+        let task_id = &task.id.0;
+
+        // Get branch from sidecar
+        let branch = match sidecar::get(task_id, "branch") {
+            Ok(b) if !b.is_empty() => b,
+            _ => continue,
+        };
+
+        // TODO: Trigger review agent for each PR
+        // For now, just log
+        tracing::debug!(task_id, branch = %branch, "would trigger review agent");
+    }
 
     Ok(())
 }

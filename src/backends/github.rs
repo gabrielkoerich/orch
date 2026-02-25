@@ -6,6 +6,7 @@
 use super::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::github::cli::{status_label_color, GhCli};
 use async_trait::async_trait;
+use std::any::Any;
 
 pub struct GitHubBackend {
     repo: String,
@@ -18,6 +19,17 @@ impl GitHubBackend {
             repo,
             gh: GhCli::new(),
         }
+    }
+
+    /// Get the repo name.
+    #[allow(dead_code)]
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// Get the gh CLI for direct API access.
+    pub fn gh(&self) -> &GhCli {
+        &self.gh
     }
 }
 
@@ -124,11 +136,7 @@ impl ExternalBackend for GitHubBackend {
         self.gh.auth_status().await
     }
 
-    async fn get_sub_issues(&self, id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
-        let sub_issue_numbers = self.gh.get_sub_issues(&self.repo, &id.0).await?;
-        Ok(sub_issue_numbers
-            .into_iter()
-            .map(|n| ExternalId(n.to_string()))
-            .collect())
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

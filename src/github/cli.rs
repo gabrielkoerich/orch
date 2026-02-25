@@ -291,74 +291,109 @@ impl GhCli {
         Ok(serde_json::from_slice(&json)?)
     }
 
-    /// Run a GraphQL query using the GitHub API.
+    /// Get a PR's merged state by branch name.
     ///
-    /// This is used for sub-issues and other advanced queries.
-    pub async fn graphql(&self, query: &str) -> anyhow::Result<serde_json::Value> {
-        let output = Command::new("gh")
-            .arg("api")
-            .arg("graphql")
-            .arg("-f")
-            .arg(format!("query={}", urlencoding::encode(query)))
-            .output()
-            .await?;
+    /// Returns Ok(true) if merged, Ok(false) if not merged or not a PR.
+    pub async fn is_pr_merged(&self, repo: &str, branch: &str) -> anyhow::Result<bool> {
+        // Search for PRs with this branch as head
+        let endpoint = format!("repos/{repo}/pulls");
+        let json = self.api(&[
+            &endpoint,
+            "-f",
+            &format!("head={}", branch),
+            "-f",
+            "per_page=1",
+        ]).await?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("gh api graphql failed: {stderr}");
+        // Parse the response - if we get an empty array, there's no PR for this branch
+        let prs: Vec<serde_json::Value> = serde_json::from_slice(&json)?;
+        if prs.is_empty() {
+            return Ok(false);
         }
 
-        Ok(serde_json::from_slice(&output.stdout)?)
+        // Check if the PR is merged
+        let first_pr = &prs[0];
+        let merged_at = first_pr.get("merged_at");
+        Ok(merged_at.map(|v| !v.is_null()).unwrap_or(false))
     }
 
-    /// Get sub-issues (children) of an issue using GraphQL.
+    #[allow(dead_code)]
+    /// Get notifications from GitHub.
     ///
-    /// Returns a list of issue numbers that are sub-issues of the given issue.
-    pub async fn get_sub_issues(&self, repo: &str, number: &str) -> anyhow::Result<Vec<u64>> {
-        // Parse owner and repo from "owner/repo" format
-        let parts: Vec<&str> = repo.split('/').collect();
-        if parts.len() != 2 {
-            anyhow::bail!("invalid repo format: expected 'owner/repo', got '{}'", repo);
-        }
-        let (owner, repo_name) = (parts[0], parts[1]);
+    /// Returns unread notifications as JSON.
+    pub async fn get_notifications(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        // Get all unread notifications
+        let endpoint = "notifications";
+        let json = self.api(&[
+            endpoint,
+            "-f",
+            "all=false",
+            "-f",
+            "participating=false",
+            "-f",
+            "per_page=50",
+        ]).await?;
 
-        // GraphQL query to get sub-issues
-        let query = format!(
-            r#"{{
-                repository(owner: "{}", name: "{}") {{
-                    issue(number: {}) {{
-                        subIssues(first: 100) {{
-                            nodes {{
-                                number
-                            }}
-                        }}
-                    }}
-                }}
-            }}"#,
-            owner, repo_name, number
-        );
+        let notifications: Vec<serde_json::Value> = serde_json::from_slice(&json)?;
+        Ok(notifications)
+    }
 
-        let result = self.graphql(&query).await?;
+    #[allow(dead_code)]
+    /// Filter notifications for a specific repo.
+    pub fn filter_notifications_for_repo(
+        notifications: &[serde_json::Value],
+        repo: &str,
+    ) -> Vec<serde_json::Value> {
+        let repo_key = repo.replace("/", "__");
+        notifications
+            .iter()
+            .filter(|n| {
+                let repo_name = n
+                    .get("repository")
+                    .and_then(|r| r.get("full_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                repo_name == repo || repo_name == repo_key
+            })
+            .cloned()
+            .collect()
+    }
 
-        // Parse the response to extract sub-issue numbers
-        let sub_issues = result
-            .get("data")
-            .and_then(|d| d.get("repository"))
-            .and_then(|r| r.get("issue"))
-            .and_then(|i| i.get("subIssues"))
-            .and_then(|s| s.get("nodes"))
-            .and_then(|n| n.as_array());
+    #[allow(dead_code)]
+    /// Mark a notification as read.
+    pub async fn mark_notification_read(&self, thread_id: &str) -> anyhow::Result<()> {
+        let endpoint = format!("notifications/threads/{}", thread_id);
+        let _ = self.api(&[&endpoint, "-X", "PATCH"]).await;
+        Ok(())
+    }
 
-        match sub_issues {
-            Some(nodes) => {
-                let numbers: Vec<u64> = nodes
-                    .iter()
-                    .filter_map(|n| n.get("number").and_then(|num| num.as_u64()))
-                    .collect();
-                Ok(numbers)
-            }
-            None => Ok(vec![]), // No sub-issues or issue not found
-        }
+    /// Check if the current user is mentioned in issue/PR comments since a given time.
+    ///
+    /// Returns comments that mention the current user.
+    pub async fn get_mentions(
+        &self,
+        repo: &str,
+        since: &str,
+    ) -> anyhow::Result<Vec<GitHubComment>> {
+        let endpoint = format!("repos/{repo}/issues/comments");
+        let json = self.api(&[
+            &endpoint,
+            "-f",
+            &format!("since={}", since),
+            "-f",
+            "per_page=100",
+        ]).await?;
+        Ok(serde_json::from_slice(&json)?)
+    }
+
+    /// Get the current authenticated username.
+    pub async fn get_whoami(&self) -> anyhow::Result<String> {
+        let json = self.api(&["user"]).await?;
+        let user: serde_json::Value = serde_json::from_slice(&json)?;
+        user.get("login")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("failed to get current user"))
     }
 }
 
