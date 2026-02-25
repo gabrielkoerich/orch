@@ -1,39 +1,33 @@
 # Contributing
 
-Thanks for contributing to Orchestrator!
+Thanks for contributing to Orch!
 
 ## Development setup
 
 Prereqs (macOS/Homebrew):
 
 ```bash
-brew install yq jq just python@3 ripgrep fd bats-core
-# Optional (used in Beads/`bd` experiments): brew install bd
+brew install just ripgrep fd
+# Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 Clone + sanity check:
 
 ```bash
-git clone https://github.com/gabrielkoerich/orchestrator.git
-cd orchestrator
-just            # list available commands
+git clone https://github.com/gabrielkoerich/orch.git
+cd orch
+cargo build       # build orch-core binary
+cargo test        # run tests
+cargo clippy      # lint
 ```
 
 ## Running tests
 
-Tests use the `bats` framework:
-
 ```bash
-bats tests/orchestrator.bats   # main test file
-# bats tests                  # run all tests
+cargo test                    # all tests
+cargo test -- test_name       # specific test
 ```
-
-## Shell scripting & CI linting
-
-CI runs `shellcheck` and `semgrep-and-secrets` on `scripts/*.sh`.
-
-- Prefer `$(...)` over backticks for command substitution.
-- If you need to include *literal* backticks in user-facing strings (help/ack messages), avoid putting them in a double-quoted shell string (they will be command-substituted). Use single quotes, a quoted heredoc, or `printf '%s'`.
 
 ## Commit message conventions
 

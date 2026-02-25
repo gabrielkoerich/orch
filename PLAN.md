@@ -619,72 +619,107 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 
 ## Implementation Phases
 
-### Phase 0: Stabilize v0 (NOW)
-- Fix all known bugs
-- Run clean for 2+ weeks
-- Collect baseline metrics
-- Grow test suite to cover all edge cases
-- Update README
+### Phase 0: Stabilize v0 ✅ DONE
+- [x] Fix all known bugs
+- [x] Run clean for 2+ weeks
+- [x] Collect baseline metrics
+- [x] Grow test suite to cover all edge cases
+- [ ] Update README
 
-### Phase 1: Foundation (replace internal tools)
+### Phase 1: Foundation (replace internal tools) ✅ DONE
 
-**Goal:** Single Rust binary (`orch-core`) that replaces jq/python3/yq calls. Bash scripts call `orch-core` instead.
+**Goal:** Single Rust binary (`orch-core`) that replaces jq/python3/yq calls.
 
-- [ ] Config loading (config.yml, .orchestrator.yml) — in-memory struct
-- [ ] Sidecar JSON I/O (read/write/merge) — native file ops
-- [ ] GitHub API client (reqwest, rate limits, connection pool, backoff)
-- [ ] GitHub App auth (JWT, token refresh, GH_TOKEN export)
-- [ ] Agent response parser (replaces `normalize_json.py`)
-- [ ] Cron matcher (replaces `cron_match.py`)
-- [ ] Template renderer (replaces `python3 render_template()`)
-- [ ] CLI: `orch-core config`, `orch-core sidecar`, `orch-core api`, `orch-core parse`, `orch-core cron`
+- [x] Config loading (config.yml, .orchestrator.yml) — `src/config.rs` (hot-reload via `notify`)
+- [x] Sidecar JSON I/O (read/write/merge) — `src/sidecar.rs`
+- [x] GitHub API client (gh CLI wrapper with serde parsing) — `src/github/cli.rs`, `src/github/types.rs`
+- [ ] GitHub App auth (JWT, token refresh, GH_TOKEN export) — using `gh` CLI auth instead
+- [x] Agent response parser — `src/parser.rs`
+- [x] Cron matcher — `src/cron.rs`
+- [x] Template renderer — `src/template.rs`
+- [x] CLI: `orch-core config`, `orch-core sidecar`, `orch-core parse`, `orch-core cron`, `orch-core template`, `orch-core stream`
 
-**Bash scripts call `orch-core` for data ops. Process management stays in bash.**
-
-### Phase 2: Engine (replace serve.sh/poll.sh)
+### Phase 2: Engine (replace serve.sh/poll.sh) ✅ MOSTLY DONE
 
 **Goal:** Tokio event loop replaces the bash 10s tick loop.
 
-- [ ] Task polling (direct GitHub API, no gh CLI)
-- [ ] Job scheduler (native cron with catch-up)
-- [ ] Internal task SQLite database
-- [ ] Task runner (spawns `run_task.sh`, monitors tmux)
-- [ ] tmux bridge (capture-pane, send-keys, session lifecycle)
-- [ ] Graceful shutdown (drain sessions, save state)
-- [ ] CLI: `orch-core serve`
+- [x] ExternalBackend trait — `src/backends/mod.rs` (Status, ExternalTask, ExternalId)
+- [x] GitHub backend — `src/backends/github.rs` (implements ExternalBackend via `gh api`)
+- [x] Engine main loop — `src/engine/mod.rs` (tokio::select! with 10s tick + 120s sync)
+- [x] Task polling (GitHub API via gh CLI + serde) — Phase 3 of tick()
+- [x] Task runner (spawns `run_task.sh`, monitors tmux, 30-min timeout) — `src/engine/runner.rs`
+- [x] Stuck task recovery — Phase 2 of tick()
+- [x] Parent/child unblocking — Phase 4 of tick()
+- [x] Job scheduler (native cron with catch-up) — `src/engine/jobs.rs`
+- [x] Internal task SQLite database — `src/db.rs` (schema, CRUD, migrations)
+- [x] Internal task API — `src/engine/internal_tasks.rs`
+- [x] TaskManager (unified internal + external) — `src/engine/tasks.rs`
+- [x] Agent router (label-based, round-robin, LLM classification) — `src/engine/router.rs`
+- [x] Router wired into engine dispatch loop (Phase 3a route → Phase 3b dispatch)
+- [x] tmux bridge (capture-pane, send-keys, session lifecycle) — `src/tmux.rs`
+- [x] Output capture service (2s polling loop) — `src/channels/capture.rs`
+- [x] Transport layer (pub/sub broadcast) — `src/channels/transport.rs`
+- [x] Graceful shutdown (SIGTERM/SIGINT handlers)
+- [x] CLI: `orch-core serve`
+- [x] Sync tick: cleanup done worktrees — `cleanup_done_worktrees()` in Rust
+- [x] Sync tick: check merged PRs — `check_merged_prs()` in Rust
+- [x] Sync tick: scan @mentions — `scan_mentions()` in Rust
+- [x] Sync tick: review open PRs — `review_open_prs()` in Rust
+- [x] Task CRUD CLI commands — `orch-core task list/add/get/publish`
+- [x] Security module — `src/security.rs`
+- [ ] **Rewrite run_task.sh in Rust** — agent invocation, worktree, git, prompt, PR creation
+- [ ] **Rewrite route_task.sh in Rust** — currently delegated to bash via run_task.sh
+- [ ] Multi-project support — serve.sh iterates PROJECT_DIRS, engine needs this
+- [ ] Config hot-reload wired into engine (notify watcher exists but not connected)
 
-**`run_task.sh` still handles agent invocation, git, worktrees.**
+### Phase 3: Channels (scaffolding done, not wired)
 
-### Phase 3: GitHub Channel (webhooks)
+**Goal:** Multi-channel I/O for task management and live streaming.
 
+- [x] Channel trait + ChannelRegistry — `src/channels/mod.rs` (scaffolding)
+- [x] Transport layer — `src/channels/transport.rs` (session bindings, broadcast)
+- [x] Tmux channel — `src/channels/tmux.rs` (pane monitoring)
+- [x] Capture service — `src/channels/capture.rs` (output diffing + streaming)
+- [ ] GitHub channel (webhooks via axum) — `src/channels/github.rs` (stub only)
+- [ ] Telegram channel — `src/channels/telegram.rs` (stub only)
+- [ ] Discord channel — `src/channels/discord.rs` (stub only)
 - [ ] Webhook HTTP server (axum)
-- [ ] Issue/comment/PR event handlers
-- [ ] Mention detection (instant, no polling)
-- [ ] Channel trait implementation
-- [ ] Transport: GitHub threads ↔ tmux sessions
+- [ ] Mention detection via webhooks (instant, no polling)
+- [ ] Wire channels into engine event loop
 
-### Phase 4: Telegram Channel
+### Phase 4: CLI & User-Facing Commands
 
-- [ ] Bot API client (long polling or webhook)
-- [ ] Command handlers (/status, /tasks, /add, /attach)
-- [ ] Task thread binding (reply threads)
-- [ ] Output streaming (pane capture → message edits)
-- [ ] Inline keyboards for actions (approve, retry, block)
+**Goal:** Replace justfile → bash script routing with native `orch` CLI.
 
-### Phase 5: Discord Channel
+- [x] `orch-core serve` — start engine
+- [x] `orch-core config <key>` — read config
+- [x] `orch-core sidecar get/set` — task metadata
+- [x] `orch-core parse <path>` — parse agent response
+- [x] `orch-core cron <expr>` — cron matching
+- [x] `orch-core template <path>` — render templates
+- [x] `orch-core stream <id>` — live output streaming
+- [x] `orch-core task list/add/get/publish` — task CRUD
+- [ ] `orch task status` — task status overview (replaces scripts/status.sh)
+- [ ] `orch task route <id>` — route task to agent
+- [ ] `orch task run <id>` — execute task
+- [ ] `orch task retry <id>` — retry failed task
+- [ ] `orch task attach <id>` — attach to tmux session
+- [ ] `orch task kill <id>` — kill agent session
+- [ ] `orch job list/add/remove/enable/disable` — job management
+- [ ] `orch init` — project initialization
+- [ ] `orch agents` — list available agent CLIs
+- [ ] Rename binary from `orch-core` to `orch`
+- [ ] Absorb justfile routing into native CLI
 
-- [ ] Gateway websocket
-- [ ] Slash commands (/status, /task, /add)
-- [ ] Thread-per-task binding
-- [ ] Output streaming to threads
-- [ ] Reaction-based actions
+### Phase 5: Polish & Migration
 
-### Phase 6: Polish
-
-- [ ] Unified notification system (events → all channels)
-- [ ] Channel health monitoring
+- [ ] Rename `~/.orchestrator/` → `~/.orch/` (with backward compat)
+- [ ] Rename `.orchestrator.yml` → `.orch.yml`
+- [ ] Update brew formula (from `orchestrator` to `orch`)
+- [ ] Update AGENTS.md with Rust engine docs
 - [ ] Metrics / observability (tracing, prometheus)
-- [ ] `orch` rename (binary, formula, service, docs)
+- [ ] Cross-compile CI pipeline (macOS arm64 + x86_64)
+- [ ] Unified notification system (events → all channels)
 
 ---
 

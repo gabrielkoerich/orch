@@ -42,63 +42,12 @@ jobs:
       - name: Run tests
         run: cargo test
 
-  bats:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build orch-core
-        run: cargo build --release
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bats jq ripgrep bsdmainutils fd-find
-          # fd-find installs as 'fdfind' on Debian/Ubuntu — symlink to 'fd'
-          sudo ln -sf "$(which fdfind)" /usr/local/bin/fd
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
-
-      - name: Install orch-core
-        run: sudo cp target/release/orch-core /usr/local/bin/
-
-      - name: Run tests
-        run: bats tests
-
-  shellcheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install shellcheck + ripgrep
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck ripgrep
-
-      - name: Security audit (strict)
-        run: ./bin/security-audit --strict
-
-  semgrep-and-secrets:
+  secrets:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Install shellcheck + ripgrep + semgrep
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck ripgrep
-          python3 -m pip install --upgrade pip
-          python3 -m pip install semgrep
-
-      - name: Security audit with semgrep
-        env:
-          SECURITY_AUDIT_REQUIRE_SEMGREP: "1"
-        run: ./bin/security-audit --strict
 
       - name: Gitleaks
         uses: gitleaks/gitleaks-action@v2
@@ -108,7 +57,7 @@ jobs:
           args: detect --source . --config .gitleaks.toml --no-banner --redact --exit-code=1
 
   # release:
-  #   needs: [rust, bats, shellcheck, semgrep-and-secrets]
+  #   needs: [rust, secrets]
   #   if: github.ref == 'refs/heads/main'
   #   runs-on: ubuntu-latest
   #   steps:
@@ -292,7 +241,7 @@ jobs:
   #         git -C tap-repo push origin main
 
   # deploy:
-  #   needs: [rust, bats, shellcheck, semgrep-and-secrets]
+  #   needs: [rust, secrets]
   #   if: github.ref == 'refs/heads/main'
   #   concurrency:
   #     group: pages

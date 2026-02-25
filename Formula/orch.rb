@@ -12,10 +12,8 @@ class Orch < Formula
   def install
     system "cargo", "install", *std_cargo_args
 
-    # Install shell scripts (still used by run_task.sh in phase 2)
-    libexec.install "scripts" if (buildpath/"scripts").exist?
+    # Install prompt templates and config examples
     libexec.install "prompts" if (buildpath/"prompts").exist?
-    libexec.install "justfile" if (buildpath/"justfile").exist?
     libexec.install Dir["*.example.yml"]
     libexec.install "skills.yml" if (buildpath/"skills.yml").exist?
   end
