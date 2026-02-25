@@ -93,6 +93,7 @@ impl ExternalBackend for GitHubBackend {
         self.gh.add_comment(&self.repo, &id.0, body).await
     }
 
+    /// Additive: uses POST (gh.add_labels), so existing labels like bug, priority:high are preserved.
     async fn set_labels(&self, id: &ExternalId, labels: &[String]) -> anyhow::Result<()> {
         self.gh.add_labels(&self.repo, &id.0, labels).await
     }
