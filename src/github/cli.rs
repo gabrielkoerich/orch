@@ -3,7 +3,7 @@
 //! All GitHub API calls go through `gh api`. Auth is handled by `gh`.
 //! We build the command args in Rust and deserialize the JSON output via serde.
 
-use super::types::{GitHubComment, GitHubIssue};
+use super::types::{GitHubComment, GitHubIssue, GitHubPullRequest};
 use tokio::process::Command;
 
 pub struct GhCli;
@@ -289,6 +289,146 @@ impl GhCli {
         let endpoint = format!("repos/{repo}/issues/{number}/comments");
         let json = self.api(&[&endpoint]).await?;
         Ok(serde_json::from_slice(&json)?)
+    }
+
+    /// List repository issue comments (for mention scanning).
+    ///
+    /// Uses `--paginate` to fetch all pages.
+    pub async fn list_issue_comments(
+        &self,
+        repo: &str,
+        since: &str,
+    ) -> anyhow::Result<Vec<GitHubComment>> {
+        let endpoint = format!("repos/{repo}/issues/comments");
+        let output = Command::new("gh")
+            .arg("api")
+            .arg("--paginate")
+            .args([
+                &endpoint,
+                "-X",
+                "GET",
+                "-f",
+                &format!("since={since}"),
+                "-f",
+                "per_page=100",
+                "-f",
+                "sort=created",
+                "-f",
+                "direction=desc",
+            ])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api failed: {stderr}");
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
+    /// List pull requests.
+    ///
+    /// Uses `--paginate` to fetch all pages.
+    pub async fn list_pulls(
+        &self,
+        repo: &str,
+        state: &str, // open, closed, all
+    ) -> anyhow::Result<Vec<GitHubPullRequest>> {
+        let endpoint = format!("repos/{repo}/pulls");
+        let output = Command::new("gh")
+            .arg("api")
+            .arg("--paginate")
+            .args([
+                &endpoint,
+                "-X",
+                "GET",
+                "-f",
+                &format!("state={state}"),
+                "-f",
+                "per_page=100",
+            ])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api failed: {stderr}");
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
+    /// Get a single pull request.
+    #[allow(dead_code)]
+    pub async fn get_pull(&self, repo: &str, number: u64) -> anyhow::Result<GitHubPullRequest> {
+        let endpoint = format!("repos/{repo}/pulls/{number}");
+        let json = self.api(&[&endpoint]).await?;
+        Ok(serde_json::from_slice(&json)?)
+    }
+
+    /// Search for merged PRs that close a specific issue.
+    ///
+    /// Returns the PR number if found.
+    pub async fn find_merged_pr_for_issue(
+        &self,
+        repo: &str,
+        issue_number: &str,
+    ) -> anyhow::Result<Option<u64>> {
+        // Use gh pr list with search
+        let output = Command::new("gh")
+            .args([
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "merged",
+                "--search",
+                &format!("closes #{issue_number}"),
+                "--json",
+                "number",
+            ])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!("gh pr list failed: {stderr}");
+            return Ok(None);
+        }
+
+        let results: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+        Ok(results.first().and_then(|v| v["number"].as_u64()))
+    }
+
+    /// Post a PR review (approve or request changes).
+    pub async fn post_pr_review(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        event: &str, // APPROVE, REQUEST_CHANGES, COMMENT
+        body: &str,
+    ) -> anyhow::Result<()> {
+        let endpoint = format!("repos/{repo}/pulls/{pr_number}/reviews");
+        let payload = serde_json::json!({
+            "event": event,
+            "body": body,
+        });
+        let mut child = Command::new("gh")
+            .arg("api")
+            .args([&endpoint, "-X", "POST", "--input", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(payload.to_string().as_bytes()).await?;
+            drop(stdin);
+        }
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api failed: {stderr}");
+        }
+        Ok(())
     }
 }
 
