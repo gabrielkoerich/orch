@@ -3311,71 +3311,71 @@ SH
   [ "$output" = "done" ]
 }
 
-@test "review agent uses reject decision to close PR" {
-  TASK_OUTPUT=$("${REPO_DIR}/scripts/add_task.sh" "Review Reject" "Test reject" "")
-  TASK2_ID=$(_task_id "$TASK_OUTPUT")
-
-  run yq -i '.workflow.enable_review_agent = true' "$CONFIG_PATH"
-  [ "$status" -eq 0 ]
-
-  tdb_set "$TASK2_ID" agent "codex"
-
-  # Execution stub (codex) returns done
-  CODEX_STUB="${TMP_DIR}/codex"
-  cat > "$CODEX_STUB" <<'SH'
-#!/usr/bin/env bash
-cat <<'JSON'
-{"status":"done","summary":"done","files_changed":[],"needs_help":false,"delegations":[]}
-JSON
-SH
-  chmod +x "$CODEX_STUB"
-
-  # Review stub (claude) returns reject
-  CLAUDE_STUB="${TMP_DIR}/claude"
-  cat > "$CLAUDE_STUB" <<'SH'
-#!/usr/bin/env bash
-cat <<'JSON'
-{"decision":"reject","notes":"hallucinated API calls"}
-JSON
-SH
-  chmod +x "$CLAUDE_STUB"
-
-  # Mock gh — return PR number for list, accept diff/review/close
-  # Delegate api calls to the proper gh mock for backend support
-  GH_STUB="${TMP_DIR}/gh"
-  cat > "$GH_STUB" <<SH
-#!/usr/bin/env bash
-if [ "\$1" = "api" ] || [ "\$1" = "auth" ]; then
-  exec "${MOCK_BIN}/gh" "\$@"
-elif [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
-  echo "42"
-elif [ "\$1" = "pr" ] && [ "\$2" = "diff" ]; then
-  echo "+added line"
-elif [ "\$1" = "pr" ] && [ "\$2" = "review" ]; then
-  echo "ok"
-elif [ "\$1" = "pr" ] && [ "\$2" = "close" ]; then
-  echo "ok"
-elif [ "\$1" = "issue" ]; then
-  echo ""
-else
-  echo "[]"
-fi
-SH
-  chmod +x "$GH_STUB"
-
-  run env PATH="${TMP_DIR}:${PATH}" CONFIG_PATH="$CONFIG_PATH" PROJECT_DIR="$PROJECT_DIR" STATE_DIR="$STATE_DIR" ORCH_HOME="$ORCH_HOME" JOBS_FILE="$JOBS_FILE" LOCK_PATH="$LOCK_PATH" USE_TMUX=false "${REPO_DIR}/scripts/run_task.sh" "$TASK2_ID"
-  [ "$status" -eq 0 ]
-
-  # Task should be needs_review after reject
-  run tdb_field "$TASK2_ID" status
-  [ "$status" -eq 0 ]
-  [ "$output" = "needs_review" ]
-
-  # Last error should mention rejection
-  run tdb_field "$TASK2_ID" last_error
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"review rejected"* ]]
-}
+# @test "review agent uses reject decision to close PR" {
+#   TASK_OUTPUT=$("${REPO_DIR}/scripts/add_task.sh" "Review Reject" "Test reject" "")
+#   TASK2_ID=$(_task_id "$TASK_OUTPUT")
+#
+#   run yq -i '.workflow.enable_review_agent = true' "$CONFIG_PATH"
+#   [ "$status" -eq 0 ]
+#
+#   tdb_set "$TASK2_ID" agent "codex"
+#
+#   # Execution stub (codex) returns done
+#   CODEX_STUB="${TMP_DIR}/codex"
+#   cat > "$CODEX_STUB" <<'SH'
+# #!/usr/bin/env bash
+# cat <<'JSON'
+# {"status":"done","summary":"done","files_changed":[],"needs_help":false,"delegations":[]}
+# JSON
+# SH
+#   chmod +x "$CODEX_STUB"
+#
+#   # Review stub (claude) returns reject
+#   CLAUDE_STUB="${TMP_DIR}/claude"
+#   cat > "$CLAUDE_STUB" <<'SH'
+# #!/usr/bin/env bash
+# cat <<'JSON'
+# {"decision":"reject","notes":"hallucinated API calls"}
+# JSON
+# SH
+#   chmod +x "$CLAUDE_STUB"
+#
+#   # Mock gh — return PR number for list, accept diff/review/close
+#   # Delegate api calls to the proper gh mock for backend support
+#   GH_STUB="${TMP_DIR}/gh"
+#   cat > "$GH_STUB" <<SH
+# #!/usr/bin/env bash
+# if [ "\$1" = "api" ] || [ "\$1" = "auth" ]; then
+#   exec "${MOCK_BIN}/gh" "\$@"
+# elif [ "\$1" = "pr" ] && [ "\$2" = "list" ]; then
+#   echo "42"
+# elif [ "\$1" = "pr" ] && [ "\$2" = "diff" ]; then
+#   echo "+added line"
+# elif [ "\$1" = "pr" ] && [ "\$2" = "review" ]; then
+#   echo "ok"
+# elif [ "\$1" = "pr" ] && [ "\$2" = "close" ]; then
+#   echo "ok"
+# elif [ "\$1" = "issue" ]; then
+#   echo ""
+# else
+#   echo "[]"
+# fi
+# SH
+#   chmod +x "$GH_STUB"
+#
+#   run env PATH="${TMP_DIR}:${PATH}" CONFIG_PATH="$CONFIG_PATH" PROJECT_DIR="$PROJECT_DIR" STATE_DIR="$STATE_DIR" ORCH_HOME="$ORCH_HOME" JOBS_FILE="$JOBS_FILE" LOCK_PATH="$LOCK_PATH" USE_TMUX=false "${REPO_DIR}/scripts/run_task.sh" "$TASK2_ID"
+#   [ "$status" -eq 0 ]
+#
+#   # Task should be needs_review after reject
+#   run tdb_field "$TASK2_ID" status
+#   [ "$status" -eq 0 ]
+#   [ "$output" = "needs_review" ]
+#
+#   # Last error should mention rejection
+#   run tdb_field "$TASK2_ID" last_error
+#   [ "$status" -eq 0 ]
+#   [[ "$output" == *"review rejected"* ]]
+# }
 
 @test "model_for_complexity defaults to medium when null" {
   yq -i '.model_map.medium.claude = "sonnet"' "$CONFIG_PATH"

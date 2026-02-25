@@ -10,6 +10,7 @@ mod parser;
 #[allow(dead_code)] // security module ready for use, not integrated yet
 mod security;
 mod sidecar;
+mod template;
 mod tmux;
 
 use clap::{Parser, Subcommand};
@@ -53,6 +54,13 @@ enum Commands {
     Stream {
         /// Task ID to stream
         task_id: String,
+    },
+    /// Render a template file with environment variables
+    Template {
+        /// Path to template file
+        path: String,
+        /// Additional KEY=VALUE pairs (optional)
+        vars: Vec<String>,
     },
 }
 
@@ -112,6 +120,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Stream { task_id } => {
             stream_task(&task_id).await?;
+        }
+        Commands::Template { path, vars } => {
+            template::render_and_print(&path, &vars)?;
         }
     }
 
