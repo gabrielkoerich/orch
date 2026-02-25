@@ -79,3 +79,14 @@ gh:
     mode: "wait"
     base_seconds: 30
     max_seconds: 900
+
+# External notification channels
+channels:
+  telegram:
+    enabled: true
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_id: "${TELEGRAM_CHAT_ID}"
+  discord:
+    enabled: true
+    bot_token: "${DISCORD_BOT_TOKEN}"
+    channel_id: "${DISCORD_CHANNEL_ID}"
