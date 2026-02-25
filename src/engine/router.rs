@@ -91,8 +91,8 @@ impl Default for RouterConfig {
             "opencode".to_string(),
             "github-copilot/gpt-5-mini".to_string(),
         );
-        simple.insert("kimi".to_string(), "kimi-lite".to_string());
-        simple.insert("minimax".to_string(), "minimax-lite".to_string());
+        simple.insert("kimi".to_string(), "haiku".to_string());
+        simple.insert("minimax".to_string(), "haiku".to_string());
         model_map.insert("simple".to_string(), simple);
 
         // Medium models
@@ -103,8 +103,8 @@ impl Default for RouterConfig {
             "opencode".to_string(),
             "github-copilot/gpt-5.1-codex".to_string(),
         );
-        medium.insert("kimi".to_string(), "kimi-standard".to_string());
-        medium.insert("minimax".to_string(), "minimax-standard".to_string());
+        medium.insert("kimi".to_string(), "sonnet".to_string());
+        medium.insert("minimax".to_string(), "sonnet".to_string());
         model_map.insert("medium".to_string(), medium);
 
         // Complex models
@@ -115,8 +115,8 @@ impl Default for RouterConfig {
             "opencode".to_string(),
             "github-copilot/claude-opus-4.5".to_string(),
         );
-        complex.insert("kimi".to_string(), "kimi-pro".to_string());
-        complex.insert("minimax".to_string(), "minimax-pro".to_string());
+        complex.insert("kimi".to_string(), "opus".to_string());
+        complex.insert("minimax".to_string(), "opus".to_string());
         model_map.insert("complex".to_string(), complex);
 
         // Review models
@@ -127,8 +127,8 @@ impl Default for RouterConfig {
             "opencode".to_string(),
             "github-copilot/gpt-5.1-codex".to_string(),
         );
-        review.insert("kimi".to_string(), "kimi-standard".to_string());
-        review.insert("minimax".to_string(), "minimax-standard".to_string());
+        review.insert("kimi".to_string(), "sonnet".to_string());
+        review.insert("minimax".to_string(), "sonnet".to_string());
         model_map.insert("review".to_string(), review);
 
         Self {
@@ -1142,22 +1142,22 @@ mod tests {
             config.model_for_complexity("codex", "simple"),
             Some("gpt-5.1-codex-mini".to_string())
         );
-        // Verify kimi and minimax model mappings
+        // Verify kimi and minimax use same models as claude
         assert_eq!(
             config.model_for_complexity("kimi", "simple"),
-            Some("kimi-lite".to_string())
+            Some("haiku".to_string())
         );
         assert_eq!(
             config.model_for_complexity("kimi", "complex"),
-            Some("kimi-pro".to_string())
+            Some("opus".to_string())
         );
         assert_eq!(
             config.model_for_complexity("minimax", "medium"),
-            Some("minimax-standard".to_string())
+            Some("sonnet".to_string())
         );
         assert_eq!(
             config.model_for_complexity("minimax", "complex"),
-            Some("minimax-pro".to_string())
+            Some("opus".to_string())
         );
     }
 

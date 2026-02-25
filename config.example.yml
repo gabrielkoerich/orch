@@ -51,26 +51,26 @@ model_map:
     claude: haiku
     codex: gpt-5.1-codex-mini
     opencode: github-copilot/gpt-5-mini
-    kimi: kimi-lite
-    minimax: minimax-lite
+    kimi: haiku
+    minimax: haiku
   medium:
     claude: sonnet
     codex: gpt-5.2
     opencode: github-copilot/gpt-5.1-codex
-    kimi: kimi-standard
-    minimax: minimax-standard
+    kimi: sonnet
+    minimax: sonnet
   complex:
     claude: opus
     codex: gpt-5.3-codex
     opencode: github-copilot/claude-opus-4.5
-    kimi: kimi-pro
-    minimax: minimax-pro
+    kimi: opus
+    minimax: opus
   review:
     claude: sonnet
     codex: gpt-5.2
     opencode: github-copilot/gpt-5.1-codex
-    kimi: kimi-standard
-    minimax: minimax-standard
+    kimi: sonnet
+    minimax: sonnet
   # Free models used as fallback when hitting usage limits (round-robin)
   free:
     - opencode/glm-5-free
