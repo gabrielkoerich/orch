@@ -3,10 +3,9 @@
 //! Auth is handled by `gh` (OAuth, tokens, SSO). No JWT, no token refresh,
 //! no credential storage. Everyone who has `gh` installed can use orch.
 
-use super::{ExternalBackend, ExternalId, ExternalTask, Status};
+use super::{ExternalBackend, ExternalId, ExternalTask, Mention, Status};
 use crate::github::cli::{status_label_color, GhCli};
 use async_trait::async_trait;
-use std::any::Any;
 
 pub struct GitHubBackend {
     repo: String,
@@ -28,6 +27,7 @@ impl GitHubBackend {
     }
 
     /// Get the gh CLI for direct API access.
+    #[allow(dead_code)]
     pub fn gh(&self) -> &GhCli {
         &self.gh
     }
@@ -144,7 +144,24 @@ impl ExternalBackend for GitHubBackend {
         self.gh.auth_status().await
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    async fn is_pr_merged(&self, branch: &str) -> anyhow::Result<bool> {
+        self.gh.is_pr_merged(&self.repo, branch).await
+    }
+
+    async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+        self.gh.get_whoami().await.map(Some)
+    }
+
+    async fn get_mentions(&self, since: &str) -> anyhow::Result<Vec<Mention>> {
+        let comments = self.gh.get_mentions(&self.repo, since).await?;
+        Ok(comments
+            .into_iter()
+            .map(|c| Mention {
+                id: c.id.to_string(),
+                body: c.body,
+                author: c.user.login,
+                created_at: c.created_at,
+            })
+            .collect())
     }
 }

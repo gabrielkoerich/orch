@@ -7,11 +7,23 @@ pub mod github;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::any::Any;
 
 /// Opaque identifier from the external system (issue number, Linear ID, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalId(pub String);
+
+/// A mention/comment from the external system (backend-agnostic).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Mention {
+    /// Unique identifier for deduplication.
+    pub id: String,
+    /// The comment/mention body text.
+    pub body: String,
+    /// Author of the mention.
+    pub author: String,
+    /// When the mention was created (RFC 3339).
+    pub created_at: String,
+}
 
 /// A task as represented in the external system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,8 +112,26 @@ pub trait ExternalBackend: Send + Sync {
     /// Check if connected and authenticated.
     async fn health_check(&self) -> anyhow::Result<()>;
 
-    /// Downcast to concrete type for backend-specific operations.
-    fn as_any(&self) -> &dyn Any;
+    /// Check if a PR/merge request for the given branch has been merged.
+    ///
+    /// Returns false by default (backends that don't track PRs).
+    async fn is_pr_merged(&self, _branch: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Get the authenticated user's username.
+    ///
+    /// Returns None by default (backends that don't support user identity).
+    async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Get recent mentions/comments since a given timestamp.
+    ///
+    /// Returns empty by default (backends that don't support mention scanning).
+    async fn get_mentions(&self, _since: &str) -> anyhow::Result<Vec<Mention>> {
+        Ok(vec![])
+    }
 }
 
 #[cfg(test)]

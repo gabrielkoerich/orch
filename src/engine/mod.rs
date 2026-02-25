@@ -20,7 +20,6 @@ pub mod router;
 mod runner;
 pub mod tasks;
 
-use crate::backends::github::GitHubBackend;
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
@@ -72,7 +71,8 @@ pub async fn serve() -> anyhow::Result<()> {
     )?;
 
     // Initialize backend
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let backend: Arc<dyn ExternalBackend> =
+        Arc::new(crate::backends::github::GitHubBackend::new(repo.clone()));
 
     // Health check
     backend.health_check().await?;
@@ -377,31 +377,24 @@ async fn sync_tick(
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
 
-    // Try to get GitHub backend for repo-specific operations
-    let gh_backend = backend.as_ref().as_any().downcast_ref::<GitHubBackend>();
+    // 1. Cleanup worktrees for done tasks
+    if let Err(e) = cleanup_done_worktrees(backend, repo).await {
+        tracing::warn!(err = %e, "worktree cleanup failed");
+    }
 
-    if let Some(gh) = gh_backend {
-        let gh_cli = gh.gh();
+    // 2. Check for merged PRs (in_review → done)
+    if let Err(e) = check_merged_prs(backend).await {
+        tracing::warn!(err = %e, "PR merge check failed");
+    }
 
-        // 1. Cleanup worktrees for done tasks
-        if let Err(e) = cleanup_done_worktrees(backend, repo).await {
-            tracing::warn!(err = %e, "worktree cleanup failed");
-        }
+    // 3. Scan for @mentions
+    if let Err(e) = scan_mentions(backend, db).await {
+        tracing::warn!(err = %e, "mention scan failed");
+    }
 
-        // 2. Check for merged PRs (in_review → done)
-        if let Err(e) = check_merged_prs(backend, gh_cli, repo).await {
-            tracing::warn!(err = %e, "PR merge check failed");
-        }
-
-        // 3. Scan for @mentions
-        if let Err(e) = scan_mentions(db, gh_cli, repo).await {
-            tracing::warn!(err = %e, "mention scan failed");
-        }
-
-        // 4. Review open PRs (optional - if enabled in config)
-        if let Err(e) = review_open_prs(backend, repo).await {
-            tracing::warn!(err = %e, "PR review failed");
-        }
+    // 4. Review open PRs (optional - if enabled in config)
+    if let Err(e) = review_open_prs(backend).await {
+        tracing::warn!(err = %e, "PR review failed");
     }
 
     Ok(())
@@ -418,6 +411,11 @@ async fn cleanup_done_worktrees(
     let done_tasks = backend.list_by_status(Status::Done).await?;
     tracing::debug!(count = done_tasks.len(), "checking done tasks for cleanup");
 
+    // Resolve the main repository root for git operations.
+    // We need this because worktree removal and branch deletion must run
+    // from the main repo, not from the (soon-to-be-deleted) worktree dir.
+    let repo_root = resolve_repo_root().await?;
+
     // Get worktrees base path
     let worktrees_base = dirs::home_dir()
         .map(|h| h.join(".orchestrator").join("worktrees"))
@@ -432,7 +430,8 @@ async fn cleanup_done_worktrees(
         let worktree_cleaned = sidecar::get(task_id, "worktree_cleaned").ok();
 
         // Skip if already cleaned
-        if worktree_cleaned.as_deref() == Some("true") || worktree_cleaned.as_deref() == Some("1") {
+        if worktree_cleaned.as_deref() == Some("true") || worktree_cleaned.as_deref() == Some("1")
+        {
             continue;
         }
 
@@ -464,10 +463,31 @@ async fn cleanup_done_worktrees(
         if let Some(wt) = worktree_to_remove {
             tracing::info!(task_id, worktree = %wt.display(), "removing worktree");
 
-            // Remove worktree using git
+            // Delete branch FIRST (before removing worktree), from the main repo root
+            if let Some(ref br) = branch {
+                let branch_delete_result = Command::new("git")
+                    .args(["-C", &repo_root, "branch", "-D", br])
+                    .output()
+                    .await;
+
+                match branch_delete_result {
+                    Ok(output) if output.status.success() => {
+                        tracing::info!(task_id, branch = %br, "branch deleted");
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        tracing::debug!(task_id, err = %stderr, "branch delete skipped (may not exist)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id, err = %e, "failed to delete branch");
+                    }
+                }
+            }
+
+            // Remove worktree using git from the main repo root
             let wt_str = wt.to_string_lossy().to_string();
             let remove_result = Command::new("git")
-                .args(["worktree", "remove", &wt_str, "--force"])
+                .args(["-C", &repo_root, "worktree", "remove", &wt_str, "--force"])
                 .output()
                 .await;
 
@@ -484,29 +504,6 @@ async fn cleanup_done_worktrees(
                 }
             }
 
-            // Delete branch if it exists
-            if let Some(br) = branch {
-                if let Some(dir) = worktree {
-                    let branch_delete_result = Command::new("git")
-                        .args(["-C", &dir, "branch", "-D", &br])
-                        .output()
-                        .await;
-
-                    match branch_delete_result {
-                        Ok(output) if output.status.success() => {
-                            tracing::info!(task_id, branch = %br, "branch deleted");
-                        }
-                        Ok(output) => {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            tracing::debug!(task_id, err = %stderr, "branch delete skipped (may not exist)");
-                        }
-                        Err(e) => {
-                            tracing::warn!(task_id, err = %e, "failed to delete branch");
-                        }
-                    }
-                }
-            }
-
             // Mark as cleaned in sidecar
             if let Err(e) = sidecar::set(task_id, &["worktree_cleaned=true".to_string()]) {
                 tracing::warn!(task_id, err = %e, "failed to mark worktree_cleaned");
@@ -517,15 +514,23 @@ async fn cleanup_done_worktrees(
     Ok(())
 }
 
+/// Resolve the main git repository root path.
+async fn resolve_repo_root() -> anyhow::Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!("failed to resolve git repo root");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Check for merged PRs and update task status accordingly.
 ///
 /// Queries status:in_review tasks, checks if their PR is merged,
 /// and updates status to done if merged.
-async fn check_merged_prs(
-    backend: &Arc<dyn ExternalBackend>,
-    gh_cli: &crate::github::cli::GhCli,
-    repo: &str,
-) -> anyhow::Result<()> {
+async fn check_merged_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<()> {
     let in_review_tasks = backend.list_by_status(Status::InReview).await?;
     tracing::debug!(
         count = in_review_tasks.len(),
@@ -544,8 +549,8 @@ async fn check_merged_prs(
             }
         };
 
-        // Check if PR is merged
-        match gh_cli.is_pr_merged(repo, &branch).await {
+        // Check if PR is merged via the backend trait
+        match backend.is_pr_merged(&branch).await {
             Ok(true) => {
                 tracing::info!(task_id, branch = %branch, "PR merged, marking task complete");
 
@@ -579,13 +584,16 @@ async fn check_merged_prs(
 /// Checks recent issue comments for @orchestrator mentions,
 /// creates internal tasks, and acknowledges them.
 async fn scan_mentions(
+    backend: &Arc<dyn ExternalBackend>,
     db: &Arc<Db>,
-    gh_cli: &crate::github::cli::GhCli,
-    repo: &str,
 ) -> anyhow::Result<()> {
     // Get the current user (for mention detection)
-    let current_user = match gh_cli.get_whoami().await {
-        Ok(u) => format!("@{}", u),
+    let current_user = match backend.get_authenticated_user().await {
+        Ok(Some(u)) => format!("@{}", u),
+        Ok(None) => {
+            tracing::debug!("backend does not support user identity, skipping mentions");
+            return Ok(());
+        }
         Err(e) => {
             tracing::warn!(err = %e, "failed to get current user, skipping mentions");
             return Ok(());
@@ -596,45 +604,51 @@ async fn scan_mentions(
     let since = chrono::Utc::now() - chrono::Duration::hours(24);
     let since_str = since.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    let comments = match gh_cli.get_mentions(repo, &since_str).await {
-        Ok(c) => c,
+    let mentions = match backend.get_mentions(&since_str).await {
+        Ok(m) => m,
         Err(e) => {
             tracing::warn!(err = %e, "failed to get mentions");
             return Ok(());
         }
     };
 
-    // Get existing mention tasks to avoid duplicates
-    let existing_tasks = db.list_internal_tasks_by_status(TaskStatus::New).await?;
-    let existing_mentions: std::collections::HashSet<_> = existing_tasks
-        .iter()
-        .filter(|t| t.source == "mention")
-        .filter_map(|t| t.source_id.parse::<u64>().ok())
-        .collect();
+    // Get existing mention tasks across ALL statuses to avoid duplicates.
+    // Only checking New status would miss tasks that progressed to InProgress/Done,
+    // causing duplicate tasks on the next sync tick within the 24h window.
+    let mut existing_mentions = std::collections::HashSet::new();
+    for status in &[
+        TaskStatus::New,
+        TaskStatus::InProgress,
+        TaskStatus::Done,
+        TaskStatus::Blocked,
+    ] {
+        let tasks = db.list_internal_tasks_by_status(*status).await?;
+        for t in tasks {
+            if t.source == "mention" {
+                existing_mentions.insert(t.source_id.clone());
+            }
+        }
+    }
 
-    for comment in comments {
-        let comment_id = comment.id;
-
+    for mention in mentions {
         // Skip if already processed
-        if existing_mentions.contains(&comment_id) {
+        if existing_mentions.contains(&mention.id) {
             continue;
         }
 
-        let body = &comment.body;
-        if !body.contains(&current_user) && !body.contains("@orchestrator") {
+        if !mention.body.contains(&current_user) && !mention.body.contains("@orchestrator") {
             continue;
         }
 
-        // Extract issue number from URL if possible
         // Create internal task for this mention
-        let title = format!("Respond to mention in {}", repo);
-        let task_body = format!("Mention by @{}:\n\n{}", comment.user.login, body);
+        let title = format!("Respond to mention by @{}", mention.author);
+        let task_body = format!("Mention by @{}:\n\n{}", mention.author, mention.body);
 
         let task_id = db
-            .create_internal_task(&title, &task_body, "mention", &comment_id.to_string())
+            .create_internal_task(&title, &task_body, "mention", &mention.id)
             .await?;
 
-        tracing::info!(task_id, comment_id, "created mention task");
+        tracing::info!(task_id, mention_id = %mention.id, "created mention task");
     }
 
     Ok(())
@@ -642,8 +656,8 @@ async fn scan_mentions(
 
 /// Review open PRs (optional feature).
 ///
-/// Lists open PRs and triggers review agent if configured.
-async fn review_open_prs(backend: &Arc<dyn ExternalBackend>, _repo: &str) -> anyhow::Result<()> {
+/// Lists tasks in review and triggers review agent if configured.
+async fn review_open_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<()> {
     // Check if review agent is enabled
     let review_enabled = crate::config::get("enable_review_agent")
         .map(|v| v == "true")
@@ -654,12 +668,12 @@ async fn review_open_prs(backend: &Arc<dyn ExternalBackend>, _repo: &str) -> any
         return Ok(());
     }
 
-    tracing::info!("review agent enabled, listing open PRs");
+    tracing::info!("review agent enabled, listing in_review tasks");
 
-    // Get done tasks that might need review
-    let done_tasks = backend.list_by_status(Status::Done).await?;
+    // Get tasks that are in review (have open PRs)
+    let in_review_tasks = backend.list_by_status(Status::InReview).await?;
 
-    for task in done_tasks {
+    for task in in_review_tasks {
         let task_id = &task.id.0;
 
         // Get branch from sidecar

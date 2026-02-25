@@ -321,6 +321,8 @@ impl GhCli {
                 "-f",
                 &format!("head={}", branch),
                 "-f",
+                "state=closed",
+                "-f",
                 "per_page=1",
             ])
             .await?;
@@ -335,58 +337,6 @@ impl GhCli {
         let first_pr = &prs[0];
         let merged_at = first_pr.get("merged_at");
         Ok(merged_at.map(|v| !v.is_null()).unwrap_or(false))
-    }
-
-    #[allow(dead_code)]
-    /// Get notifications from GitHub.
-    ///
-    /// Returns unread notifications as JSON.
-    pub async fn get_notifications(&self) -> anyhow::Result<Vec<serde_json::Value>> {
-        // Get all unread notifications
-        let endpoint = "notifications";
-        let json = self
-            .api(&[
-                endpoint,
-                "-f",
-                "all=false",
-                "-f",
-                "participating=false",
-                "-f",
-                "per_page=50",
-            ])
-            .await?;
-
-        let notifications: Vec<serde_json::Value> = serde_json::from_slice(&json)?;
-        Ok(notifications)
-    }
-
-    #[allow(dead_code)]
-    /// Filter notifications for a specific repo.
-    pub fn filter_notifications_for_repo(
-        notifications: &[serde_json::Value],
-        repo: &str,
-    ) -> Vec<serde_json::Value> {
-        let repo_key = repo.replace("/", "__");
-        notifications
-            .iter()
-            .filter(|n| {
-                let repo_name = n
-                    .get("repository")
-                    .and_then(|r| r.get("full_name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                repo_name == repo || repo_name == repo_key
-            })
-            .cloned()
-            .collect()
-    }
-
-    #[allow(dead_code)]
-    /// Mark a notification as read.
-    pub async fn mark_notification_read(&self, thread_id: &str) -> anyhow::Result<()> {
-        let endpoint = format!("notifications/threads/{}", thread_id);
-        let _ = self.api(&[&endpoint, "-X", "PATCH"]).await;
-        Ok(())
     }
 
     /// Check if the current user is mentioned in issue/PR comments since a given time.
