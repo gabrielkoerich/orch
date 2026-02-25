@@ -123,4 +123,12 @@ impl ExternalBackend for GitHubBackend {
     async fn health_check(&self) -> anyhow::Result<()> {
         self.gh.auth_status().await
     }
+
+    async fn get_sub_issues(&self, id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+        let sub_issue_numbers = self.gh.get_sub_issues(&self.repo, &id.0).await?;
+        Ok(sub_issue_numbers
+            .into_iter()
+            .map(|n| ExternalId(n.to_string()))
+            .collect())
+    }
 }

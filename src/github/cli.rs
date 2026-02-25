@@ -3,8 +3,6 @@
 //! All GitHub API calls go through `gh api`. Auth is handled by `gh`.
 //! We build the command args in Rust and deserialize the JSON output via serde.
 
-#![allow(dead_code)]
-
 use super::types::{GitHubComment, GitHubIssue};
 use tokio::process::Command;
 
@@ -293,110 +291,74 @@ impl GhCli {
         Ok(serde_json::from_slice(&json)?)
     }
 
-    /// Check whether a PR for the given branch has been merged.
+    /// Run a GraphQL query using the GitHub API.
     ///
-    /// Uses `gh pr list --state merged --head {branch}` — returns true when at
-    /// least one merged PR exists for that branch in the repo.
-    pub async fn is_pr_merged(&self, repo: &str, branch: &str) -> anyhow::Result<bool> {
+    /// This is used for sub-issues and other advanced queries.
+    pub async fn graphql(&self, query: &str) -> anyhow::Result<serde_json::Value> {
         let output = Command::new("gh")
-            .args([
-                "pr", "list", "--repo", repo, "--head", branch, "--state", "merged", "--json",
-                "number", "--limit", "1",
-            ])
+            .arg("api")
+            .arg("graphql")
+            .arg("-f")
+            .arg(format!("query={}", urlencoding::encode(query)))
             .output()
             .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("gh pr list failed: {stderr}");
-        }
-        let prs: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        Ok(prs.as_array().map(|a| !a.is_empty()).unwrap_or(false))
-    }
 
-    /// List recent issue comments across the whole repo, updated since `since`.
-    ///
-    /// `since` must be an ISO-8601 timestamp (e.g. "2026-01-01T00:00:00Z").
-    /// Returns up to 100 comments.  Call repeatedly with an advancing `since`
-    /// to avoid re-processing old comments.
-    pub async fn list_recent_comments(
-        &self,
-        repo: &str,
-        since: &str,
-    ) -> anyhow::Result<Vec<GitHubComment>> {
-        let endpoint = format!("repos/{repo}/issues/comments");
-        let since_field = format!("since={since}");
-        let output = Command::new("gh")
-            .args([
-                "api",
-                &endpoint,
-                "-X",
-                "GET",
-                "-f",
-                &since_field,
-                "-f",
-                "per_page=100",
-            ])
-            .output()
-            .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("gh api failed: {stderr}");
+            anyhow::bail!("gh api graphql failed: {stderr}");
         }
+
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
-    /// Close a GitHub issue (PATCH state=closed).
-    pub async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
-        let endpoint = format!("repos/{repo}/issues/{number}");
-        let payload = serde_json::json!({ "state": "closed" });
-        let mut child = Command::new("gh")
-            .arg("api")
-            .args([&endpoint, "-X", "PATCH", "--input", "-"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(payload.to_string().as_bytes()).await?;
-            drop(stdin);
-        }
-        let output = child.wait_with_output().await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("gh api failed: {stderr}");
-        }
-        Ok(())
-    }
-
-    /// Delete a branch in a bare-clone git dir (local branch cleanup).
+    /// Get sub-issues (children) of an issue using GraphQL.
     ///
-    /// Uses `git --git-dir={git_dir} branch -D {branch}`.
-    /// Returns Ok if the branch was deleted or didn't exist.
-    pub async fn delete_local_branch(
-        &self,
-        git_dir: &std::path::Path,
-        branch: &str,
-    ) -> anyhow::Result<()> {
-        let output = Command::new("git")
-            .args([
-                "--git-dir",
-                &git_dir.to_string_lossy(),
-                "branch",
-                "-D",
-                branch,
-            ])
-            .output()
-            .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Treat "branch not found" as success
-            if stderr.contains("not found") || stderr.contains("error: branch") {
-                return Ok(());
-            }
-            anyhow::bail!("git branch -D failed: {stderr}");
+    /// Returns a list of issue numbers that are sub-issues of the given issue.
+    pub async fn get_sub_issues(&self, repo: &str, number: &str) -> anyhow::Result<Vec<u64>> {
+        // Parse owner and repo from "owner/repo" format
+        let parts: Vec<&str> = repo.split('/').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("invalid repo format: expected 'owner/repo', got '{}'", repo);
         }
-        Ok(())
+        let (owner, repo_name) = (parts[0], parts[1]);
+
+        // GraphQL query to get sub-issues
+        let query = format!(
+            r#"{{
+                repository(owner: "{}", name: "{}") {{
+                    issue(number: {}) {{
+                        subIssues(first: 100) {{
+                            nodes {{
+                                number
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#,
+            owner, repo_name, number
+        );
+
+        let result = self.graphql(&query).await?;
+
+        // Parse the response to extract sub-issue numbers
+        let sub_issues = result
+            .get("data")
+            .and_then(|d| d.get("repository"))
+            .and_then(|r| r.get("issue"))
+            .and_then(|i| i.get("subIssues"))
+            .and_then(|s| s.get("nodes"))
+            .and_then(|n| n.as_array());
+
+        match sub_issues {
+            Some(nodes) => {
+                let numbers: Vec<u64> = nodes
+                    .iter()
+                    .filter_map(|n| n.get("number").and_then(|num| num.as_u64()))
+                    .collect();
+                Ok(numbers)
+            }
+            None => Ok(vec![]), // No sub-issues or issue not found
+        }
     }
 }
 

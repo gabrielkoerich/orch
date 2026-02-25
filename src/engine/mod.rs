@@ -408,9 +408,54 @@ async fn tick(
     // Phase 4: Unblock parents (blocked tasks whose children are all done)
     let blocked = backend.list_by_status(Status::Blocked).await?;
     for task in &blocked {
-        // Check if all sub-issues are done
-        // TODO: query sub-issues API to check children status
-        let _ = task; // placeholder
+        // Get sub-issues (children)
+        let children = match backend.get_sub_issues(&task.id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(task_id = task.id.0, ?e, "get_sub_issues failed, skipping");
+                continue;
+            }
+        };
+
+        if children.is_empty() {
+            // No children - this task might have been incorrectly blocked
+            // or it's a standalone task. Log and skip.
+            tracing::debug!(task_id = task.id.0, "no sub-issues found, skipping unblock");
+            continue;
+        }
+
+        // Check if all children are done
+        let mut all_done = true;
+        for child_id in &children {
+            match backend.get_task(child_id).await {
+                Ok(child_task) => {
+                    if !child_task.labels.iter().any(|l| l == "status:done") {
+                        all_done = false;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // If we can't get the child task, assume it's not done
+                    tracing::debug!(child_id = child_id.0, ?e, "get_task failed for child");
+                    all_done = false;
+                    break;
+                }
+            }
+        }
+
+        if all_done {
+            tracing::info!(task_id = task.id.0, "all sub-tasks completed, unblocking parent");
+            backend.update_status(&task.id, Status::New).await?;
+            backend
+                .post_comment(
+                    &task.id,
+                    &format!(
+                        "[{}] All sub-tasks completed. Unblocking parent task.",
+                        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+                    ),
+                )
+                .await?;
+        }
     }
 
     // Phase 5: Check job schedules
