@@ -68,7 +68,7 @@ pub fn render_and_print(template_path: &str, extra_vars: &[String]) -> io::Resul
         }
         Err(e) => {
             io::stderr().write_all(e.as_bytes())?;
-            Err(io::Error::new(io::ErrorKind::Other, e))
+            Err(io::Error::other(e))
         }
     }
 }
