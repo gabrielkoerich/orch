@@ -430,8 +430,7 @@ async fn cleanup_done_worktrees(
         let worktree_cleaned = sidecar::get(task_id, "worktree_cleaned").ok();
 
         // Skip if already cleaned
-        if worktree_cleaned.as_deref() == Some("true") || worktree_cleaned.as_deref() == Some("1")
-        {
+        if worktree_cleaned.as_deref() == Some("true") || worktree_cleaned.as_deref() == Some("1") {
             continue;
         }
 
@@ -583,10 +582,7 @@ async fn check_merged_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<
 ///
 /// Checks recent issue comments for @orchestrator mentions,
 /// creates internal tasks, and acknowledges them.
-async fn scan_mentions(
-    backend: &Arc<dyn ExternalBackend>,
-    db: &Arc<Db>,
-) -> anyhow::Result<()> {
+async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyhow::Result<()> {
     // Get the current user (for mention detection)
     let current_user = match backend.get_authenticated_user().await {
         Ok(Some(u)) => format!("@{}", u),
