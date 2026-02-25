@@ -162,9 +162,17 @@ impl CaptureService {
                         }
                     }
                     Err(e) => {
-                        // Check if session is dead (no longer exists)
+                        // Check if session is dead (no longer exists).
+                        // This is a best-effort check — `tmux has-session` is spawned
+                        // on every capture failure, including transient ones. For alive
+                        // sessions with transient failures, the overhead is minimal
+                        // (one extra subprocess per poll cycle).
                         if tmux::is_session_dead(&buffer.session).await {
-                            tracing::debug!(task_id, session = buffer.session, "session ended, sending final chunk");
+                            tracing::info!(
+                                task_id,
+                                session = buffer.session,
+                                "session ended, sending final chunk"
+                            );
                             // Send final chunk to signal stream termination
                             let chunk = OutputChunk {
                                 task_id: task_id.clone(),
@@ -173,10 +181,16 @@ impl CaptureService {
                                 is_final: true,
                             };
                             self.transport.push_output(&task_id, chunk).await;
+                            // Unregister immediately — prevents re-processing on next tick
                             self.unregister_session(&task_id).await;
                         } else {
-                            // Session still exists but capture failed - don't spam logs
-                            tracing::trace!(task_id, session = buffer.session, ?e, "capture failed");
+                            // Session still exists but capture failed transiently
+                            tracing::trace!(
+                                task_id,
+                                session = buffer.session,
+                                ?e,
+                                "capture failed (transient)"
+                            );
                         }
                     }
                 }
