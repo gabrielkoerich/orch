@@ -45,7 +45,7 @@ impl Channel for DiscordChannel {
     async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tracing::info!(token_prefix = %self.token.chars().take(8).collect::<String>(), "discord channel started");
-        
+
         let token = self.token.clone();
         tokio::spawn(async move {
             let _tx = tx;
@@ -58,10 +58,17 @@ impl Channel for DiscordChannel {
     }
 
     async fn send(&self, msg: &OutgoingMessage) -> anyhow::Result<()> {
-        let channel_id = self.channel_id.as_ref().ok_or_else(|| anyhow::anyhow!("discord channel_id not configured"))?;
-        
-        let url = format!("https://discord.com/api/v10/channels/{}/messages", channel_id);
-        let response = self.client
+        let channel_id = self
+            .channel_id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("discord channel_id not configured"))?;
+
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages",
+            channel_id
+        );
+        let response = self
+            .client
             .post(&url)
             .header("Authorization", format!("Bot {}", self.token))
             .header("Content-Type", "application/json")
@@ -89,8 +96,9 @@ impl Channel for DiscordChannel {
 
     async fn health_check(&self) -> anyhow::Result<()> {
         let url = "https://discord.com/api/v10/users/@me";
-        
-        let response = self.client
+
+        let response = self
+            .client
             .get(url)
             .header("Authorization", format!("Bot {}", self.token))
             .send()

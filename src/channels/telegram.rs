@@ -46,7 +46,7 @@ impl Channel for TelegramChannel {
     async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tracing::info!(token_prefix = %self.token.chars().take(8).collect::<String>(), "telegram channel started");
-        
+
         let token = self.token.clone();
         tokio::spawn(async move {
             let _tx = tx;
@@ -59,8 +59,11 @@ impl Channel for TelegramChannel {
     }
 
     async fn send(&self, msg: &OutgoingMessage) -> anyhow::Result<()> {
-        let chat_id = self.chat_id.as_ref().ok_or_else(|| anyhow::anyhow!("telegram chat_id not configured"))?;
-        
+        let chat_id = self
+            .chat_id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("telegram chat_id not configured"))?;
+
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
         let params = serde_json::json!({
             "chat_id": chat_id,
@@ -68,11 +71,7 @@ impl Channel for TelegramChannel {
             "parse_mode": "Markdown"
         });
 
-        let response = self.client
-            .post(&url)
-            .json(&params)
-            .send()
-            .await?;
+        let response = self.client.post(&url).json(&params).send().await?;
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -92,11 +91,8 @@ impl Channel for TelegramChannel {
 
     async fn health_check(&self) -> anyhow::Result<()> {
         let url = format!("https://api.telegram.org/bot{}/getMe", self.token);
-        
-        let response = self.client
-            .get(&url)
-            .send()
-            .await?;
+
+        let response = self.client.get(&url).send().await?;
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
