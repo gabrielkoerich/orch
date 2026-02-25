@@ -15,15 +15,17 @@
 //! invocation, git workflow, and prompt building.
 
 pub mod jobs;
+pub mod router;
 mod runner;
 pub mod tasks;
 
 use crate::backends::github::GitHubBackend;
-use crate::backends::{ExternalBackend, ExternalTask, Status};
+use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
 use crate::channels::ChannelRegistry;
 use crate::db::Db;
+use crate::engine::router::{RouteResult, Router};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use runner::TaskRunner;
@@ -97,6 +99,15 @@ pub async fn serve() -> anyhow::Result<()> {
     // Task runner (delegates to run_task.sh)
     let runner = Arc::new(TaskRunner::new(repo));
 
+    // Initialize router
+    let router = Router::from_config();
+    tracing::info!(
+        mode = %router.config.mode,
+        router_agent = %router.config.router_agent,
+        fallback = %router.config.fallback_executor,
+        "router initialized"
+    );
+
     // Jobs path
     let orch_home = dirs::home_dir().unwrap_or_default().join(".orchestrator");
     let jobs_path = orch_home.join("jobs.yml");
@@ -128,6 +139,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     &tmux,
                     &runner,
                     &capture_for_tick,
+                    &router,
                     &semaphore,
                     &config,
                     &jobs_path,
@@ -176,13 +188,15 @@ pub async fn serve() -> anyhow::Result<()> {
 /// Phases (matching v0 poll.sh):
 /// 1. Monitor active tmux sessions (detect completions)
 /// 2. Recover stuck in_progress tasks
-/// 3. Dispatch new/routed tasks
+/// 3. Route new tasks (status:new → status:routed)
+/// 4. Dispatch routed tasks
 #[allow(clippy::too_many_arguments)]
 async fn tick(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
     runner: &Arc<TaskRunner>,
     capture: &Arc<CaptureService>,
+    router: &Router,
     semaphore: &Arc<Semaphore>,
     config: &EngineConfig,
     jobs_path: &std::path::PathBuf,
@@ -251,13 +265,75 @@ async fn tick(
         }
     }
 
-    // Phase 3: Dispatch new/routed tasks
-    let mut new_tasks = backend.list_by_status(Status::New).await?;
+    // Phase 3: Route new tasks (status:new -> status:routed)
+    let new_tasks = backend.list_by_status(Status::New).await?;
+    for task in &new_tasks {
+        // Skip no-agent tasks
+        if task.labels.iter().any(|l| l == "no-agent") {
+            continue;
+        }
+
+        let task_id = task.id.0.clone();
+        tracing::info!(task_id, "routing task");
+
+        match router.route(task).await {
+            Ok(route_result) => {
+                // Store routing result in sidecar
+                if let Err(e) = router.store_route_result(&task_id, &route_result) {
+                    tracing::warn!(task_id, ?e, "failed to store route result");
+                }
+
+                // Add agent label
+                let agent_label = format!("agent:{}", route_result.agent);
+                if let Err(e) = backend.set_labels(&task.id, &[agent_label]).await {
+                    tracing::warn!(task_id, ?e, "failed to add agent label");
+                }
+
+                // Post routing comment
+                let note = if let Some(ref warning) = route_result.warning {
+                    format!(
+                        "routed to {} (complexity: {}) (warning: {})",
+                        route_result.agent, route_result.complexity, warning
+                    )
+                } else {
+                    format!(
+                        "routed to {} (complexity: {})",
+                        route_result.agent, route_result.complexity
+                    )
+                };
+
+                if let Err(e) = backend.post_comment(&task.id, &note).await {
+                    tracing::warn!(task_id, ?e, "failed to post routing comment");
+                }
+
+                // Mark as routed
+                if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
+                    tracing::error!(task_id, ?e, "failed to set routed status");
+                } else {
+                    tracing::info!(
+                        task_id,
+                        agent = %route_result.agent,
+                        complexity = %route_result.complexity,
+                        "task routed"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(task_id, ?e, "routing failed");
+                // Mark as needs_review since routing failed
+                let _ = backend
+                    .post_comment(&task.id, &format!("routing failed: {e}"))
+                    .await;
+                let _ = backend.update_status(&task.id, Status::NeedsReview).await;
+            }
+        }
+    }
+
+    // Phase 4: Dispatch routed tasks
     let routed_tasks = backend.list_by_status(Status::Routed).await?;
-    new_tasks.extend(routed_tasks);
 
     // Filter out no-agent tasks
-    let dispatchable: Vec<&ExternalTask> = new_tasks
+    let dispatchable: Vec<&ExternalTask> = routed_tasks
         .iter()
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
         .collect();
@@ -283,7 +359,7 @@ async fn tick(
         };
 
         // Mark in_progress BEFORE spawning to prevent double dispatch.
-        // If two ticks overlap, the second tick's list_by_status("new") won't
+        // If two ticks overlap, the second tick's list_by_status("routed") won't
         // include this task because it's already in_progress.
         let task_id = task.id.0.clone();
         if let Err(e) = backend.update_status(&task.id, Status::InProgress).await {
@@ -296,6 +372,9 @@ async fn tick(
         let session_name = tmux.session_name(&task_id);
         capture.register_session(&task_id, &session_name).await;
 
+        // Load routing result from sidecar
+        let route_result = router::get_route_result(&task_id).ok();
+
         // Dispatch task
         let runner = runner.clone();
         let backend = backend.clone();
@@ -305,7 +384,14 @@ async fn tick(
         tokio::spawn(async move {
             tracing::info!(task_id, "dispatching task");
 
-            match runner.run(&task_id).await {
+            // Pass agent/model to runner via environment variables
+            let agent = route_result.as_ref().map(|r: &RouteResult| r.agent.clone());
+            let model = route_result.as_ref().and_then(|r| r.model.clone());
+
+            match runner
+                .run(&task_id, agent.as_deref(), model.as_deref())
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(task_id, "task runner completed");
                 }
@@ -314,7 +400,7 @@ async fn tick(
                     // Post error comment
                     let _ = backend
                         .post_comment(
-                            &crate::backends::ExternalId(task_id.clone()),
+                            &ExternalId(task_id.clone()),
                             &format!(
                                 "[{}] error: task runner failed: {e}",
                                 chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
@@ -332,7 +418,7 @@ async fn tick(
         });
     }
 
-    // Phase 4: Unblock parents (blocked tasks whose children are all done)
+    // Phase 5: Unblock parents (blocked tasks whose children are all done)
     let blocked = backend.list_by_status(Status::Blocked).await?;
     for task in &blocked {
         // Check if all sub-issues are done
@@ -340,7 +426,7 @@ async fn tick(
         let _ = task; // placeholder
     }
 
-    // Phase 5: Check job schedules
+    // Phase 6: Check job schedules
     if let Err(e) = jobs::tick(jobs_path, backend, db).await {
         tracing::error!(?e, "job scheduler tick failed");
     }

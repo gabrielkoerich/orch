@@ -52,6 +52,9 @@ dirs = "6"
 # SQLite for internal tasks
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# Command discovery for agents
+which = "7"
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"

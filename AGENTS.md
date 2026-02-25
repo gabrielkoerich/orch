@@ -80,6 +80,102 @@ model_map:
 
 See `model_for_complexity()` in `scripts/lib.sh`.
 
+## Router Module (Rust)
+
+The agent router is implemented in `src/engine/router.rs`. It selects the best agent (claude/codex/opencode) and model for each task based on task content, labels, and configured routing rules.
+
+### Router Configuration
+
+```yaml
+router:
+  mode: "llm"              # "llm" (default) or "round_robin"
+  agent: "claude"          # which LLM performs routing
+  model: "haiku"           # fast/cheap model for classification
+  timeout_seconds: 120     # routing timeout
+  fallback_executor: "codex"  # fallback if routing fails
+  allowed_tools:           # default tools for agent profiles
+    - yq
+    - jq
+    - bash
+    - just
+    - git
+    - rg
+    - sed
+    - awk
+    - python3
+    - node
+    - npm
+    - bun
+  default_skills:          # skills always included
+    - gh
+    - git-worktree
+```
+
+### Routing Logic
+
+The router follows this priority order:
+
+1. **Label-based override**: If task has `agent:*` label (e.g., `agent:claude`), use that agent directly
+2. **Round-robin mode**: If `router.mode` is `round_robin`, cycle through available agents by task ID
+3. **LLM classification**: Call the configured router LLM with the routing prompt
+4. **Parse response**: Extract executor, complexity, profile, and selected skills from JSON
+5. **Fallback**: If LLM fails, use `router.fallback_executor`
+
+### Label-Based Routing
+
+Override the router by adding labels to tasks:
+
+| Label | Effect |
+|-------|--------|
+| `agent:claude` | Force Claude executor |
+| `agent:codex` | Force Codex executor |
+| `agent:opencode` | Force OpenCode executor |
+| `complexity:simple` | Use simple model tier |
+| `complexity:medium` | Use medium model tier |
+| `complexity:complex` | Use complex model tier |
+
+### RouteResult Struct
+
+Routing results are stored in the sidecar file (`~/.orchestrator/.orchestrator/{task_id}.json`):
+
+```rust
+pub struct RouteResult {
+    pub agent: String,           // "claude", "codex", or "opencode"
+    pub model: Option<String>,   // e.g., "sonnet", "opus"
+    pub complexity: String,      // "simple", "medium", "complex"
+    pub reason: String,          // why this agent was selected
+    pub profile: AgentProfile,   // role, skills, tools, constraints
+    pub selected_skills: Vec<String>,
+    pub warning: Option<String>, // routing sanity check warnings
+}
+```
+
+### AgentProfile Struct
+
+```rust
+pub struct AgentProfile {
+    pub role: String,           // e.g., "backend specialist"
+    pub skills: Vec<String>,    // focus skills for this task
+    pub tools: Vec<String>,     // tools allowed
+    pub constraints: Vec<String>, // constraints for this task
+}
+```
+
+### Environment Variables
+
+The runner passes routing results to `run_task.sh` via:
+
+- `ORCH_AGENT` — the selected agent (claude/codex/opencode)
+- `ORCH_MODEL` — the specific model to use
+
+### Routing Prompt
+
+The routing prompt template is at `prompts/route.md`. It includes:
+- Available executors
+- Skills catalog
+- Task details (ID, title, labels, body)
+- Expected JSON output format
+
 ## Directory layout
 
 ```
