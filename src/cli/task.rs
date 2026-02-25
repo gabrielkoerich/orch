@@ -349,10 +349,7 @@ pub async fn live() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<20} {:<12} {:<10} CREATED",
-        "SESSION", "TASK", "ACTIVE"
-    );
+    println!("{:<20} {:<12} {:<10} CREATED", "SESSION", "TASK", "ACTIVE");
     println!("{}", "-".repeat(60));
 
     for session in &sessions {

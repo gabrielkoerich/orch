@@ -48,9 +48,8 @@ pub async fn auto_commit(
         return Ok(false);
     }
 
-    let commit_msg = format!(
-        "feat: {title}\n\nTask #{task_id}\nAgent: {agent}\nAttempt: {attempt}"
-    );
+    let commit_msg =
+        format!("feat: {title}\n\nTask #{task_id}\nAgent: {agent}\nAttempt: {attempt}");
 
     tracing::info!(task_id, "auto-committing uncommitted changes");
 
@@ -164,7 +163,10 @@ pub async fn create_pr_if_needed(
     }
 
     // Build PR body
-    let mut body = format!("## Summary\n\n{}", if summary.is_empty() { title } else { summary });
+    let mut body = format!(
+        "## Summary\n\n{}",
+        if summary.is_empty() { title } else { summary }
+    );
 
     if !accomplished.is_empty() {
         body.push_str("\n\n### What was done\n\n");
@@ -195,14 +197,7 @@ pub async fn create_pr_if_needed(
 
     let output = Command::new("gh")
         .args([
-            "pr",
-            "create",
-            "--title",
-            pr_title,
-            "--body",
-            &body,
-            "--head",
-            branch,
+            "pr", "create", "--title", pr_title, "--body", &body, "--head", branch,
         ])
         .current_dir(dir)
         .output()
@@ -258,9 +253,7 @@ async fn get_current_branch(dir: &Path) -> String {
         .await;
 
     match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => String::new(),
     }
 }
@@ -291,9 +284,7 @@ async fn has_unpushed_commits(dir: &Path, branch: &str) -> bool {
         .await;
 
     match output {
-        Ok(o) if o.status.success() => {
-            !String::from_utf8_lossy(&o.stdout).trim().is_empty()
-        }
+        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
         _ => false,
     }
 }

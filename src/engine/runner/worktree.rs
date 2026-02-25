@@ -47,9 +47,7 @@ pub async fn detect_default_branch(project_dir: &Path) -> String {
         .await;
 
     match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => "main".to_string(),
     }
 }
@@ -89,7 +87,12 @@ pub async fn resolve_main_repo(project_dir: &Path) -> PathBuf {
 /// Check if a directory is a bare git repository.
 async fn is_bare_repo(dir: &Path) -> bool {
     let output = Command::new("git")
-        .args(["-C", &dir.to_string_lossy(), "rev-parse", "--is-bare-repository"])
+        .args([
+            "-C",
+            &dir.to_string_lossy(),
+            "rev-parse",
+            "--is-bare-repository",
+        ])
         .output()
         .await;
 
@@ -115,9 +118,7 @@ pub async fn setup_worktree(
         .trim_end_matches(".git")
         .to_string();
 
-    let orch_home = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".orchestrator");
+    let orch_home = dirs::home_dir().unwrap_or_default().join(".orchestrator");
     let worktrees_base = orch_home.join("worktrees").join(&project_name);
     std::fs::create_dir_all(&worktrees_base)?;
 
@@ -164,7 +165,13 @@ pub async fn setup_worktree(
         // Fetch if bare repo
         if is_bare_repo(&main_dir).await {
             let _ = Command::new("git")
-                .args(["-C", &main_dir.to_string_lossy(), "fetch", "--all", "--prune"])
+                .args([
+                    "-C",
+                    &main_dir.to_string_lossy(),
+                    "fetch",
+                    "--all",
+                    "--prune",
+                ])
                 .output()
                 .await;
         }
@@ -208,7 +215,13 @@ pub async fn setup_worktree(
                 .await;
 
             let _ = Command::new("git")
-                .args(["-C", &main_dir.to_string_lossy(), "branch", "-D", &branch_name_str])
+                .args([
+                    "-C",
+                    &main_dir.to_string_lossy(),
+                    "branch",
+                    "-D",
+                    &branch_name_str,
+                ])
                 .output()
                 .await;
 

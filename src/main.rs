@@ -252,8 +252,7 @@ enum ServiceAction {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("orch=info".parse()?),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("orch=info".parse()?),
         )
         .init();
 
@@ -356,7 +355,13 @@ async fn main() -> anyhow::Result<()> {
                 r#type,
                 command,
             } => {
-                cli::job::add(&schedule, &title, body.as_deref(), &r#type, command.as_deref())?;
+                cli::job::add(
+                    &schedule,
+                    &title,
+                    body.as_deref(),
+                    &r#type,
+                    command.as_deref(),
+                )?;
             }
             JobAction::Remove { id } => {
                 cli::job::remove(&id)?;

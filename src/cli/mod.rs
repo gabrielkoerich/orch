@@ -30,7 +30,14 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
         None => {
             // Try to detect from git remote
             let output = std::process::Command::new("gh")
-                .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+                .args([
+                    "repo",
+                    "view",
+                    "--json",
+                    "nameWithOwner",
+                    "-q",
+                    ".nameWithOwner",
+                ])
                 .output();
 
             match output {
@@ -83,9 +90,7 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
 
 /// Show orchestrator logs.
 pub fn log(lines: &str) -> anyhow::Result<()> {
-    let orch_home = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".orchestrator");
+    let orch_home = dirs::home_dir().unwrap_or_default().join(".orchestrator");
     let state_dir = orch_home.join(".orchestrator");
     let brew_prefix = std::env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".into());
 
@@ -102,7 +107,11 @@ pub fn log(lines: &str) -> anyhow::Result<()> {
     ];
 
     for path in &candidates {
-        if path.exists() && std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+        if path.exists()
+            && std::fs::metadata(path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
             log_files.push(path.clone());
         }
     }
@@ -116,9 +125,7 @@ pub fn log(lines: &str) -> anyhow::Result<()> {
         let args: Vec<String> = std::iter::once("-f".to_string())
             .chain(log_files.iter().map(|p| p.to_string_lossy().to_string()))
             .collect();
-        let status = std::process::Command::new("tail")
-            .args(&args)
-            .status()?;
+        let status = std::process::Command::new("tail").args(&args).status()?;
         std::process::exit(status.code().unwrap_or(1));
     } else {
         let n = lines.parse::<usize>().unwrap_or(50);

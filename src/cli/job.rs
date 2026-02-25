@@ -31,11 +31,7 @@ pub fn list() -> anyhow::Result<()> {
     for job in &jobs {
         let desc = match job.r#type.as_str() {
             "bash" => job.command.as_deref().unwrap_or(""),
-            _ => job
-                .task
-                .as_ref()
-                .map(|t| t.title.as_str())
-                .unwrap_or(""),
+            _ => job.task.as_ref().map(|t| t.title.as_str()).unwrap_or(""),
         };
 
         println!(

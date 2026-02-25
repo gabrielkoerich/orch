@@ -45,10 +45,7 @@ pub fn load_task_context(task_id: &str) -> String {
 
 /// Build parent task context for subtasks.
 #[allow(dead_code)]
-pub async fn build_parent_context(
-    task: &ExternalTask,
-    backend: &dyn ExternalBackend,
-) -> String {
+pub async fn build_parent_context(task: &ExternalTask, backend: &dyn ExternalBackend) -> String {
     // Check if task has a parent via sidecar
     let parent_id = match sidecar::get(&task.id.0, "parent_id") {
         Ok(id) if !id.is_empty() => id,
@@ -83,10 +80,7 @@ pub async fn build_parent_context(
                         .find(|l| l.starts_with("status:"))
                         .map(|s| s.replace("status:", ""))
                         .unwrap_or_else(|| "unknown".to_string());
-                    ctx.push_str(&format!(
-                        "- #{} [{}]: {}\n",
-                        sib.id.0, status, sib.title
-                    ));
+                    ctx.push_str(&format!("- #{} [{}]: {}\n", sib.id.0, status, sib.title));
 
                     // Include sidecar summary if available
                     if let Ok(summary) = sidecar::get(&sib.id.0, "summary") {
@@ -164,7 +158,10 @@ pub async fn build_repo_tree(project_dir: &Path) -> String {
             let lines: Vec<&str> = full.lines().take(200).collect();
             let result = lines.join("\n");
             if full.lines().count() > 200 {
-                format!("{result}\n... (truncated, {} total files)", full.lines().count())
+                format!(
+                    "{result}\n... (truncated, {} total files)",
+                    full.lines().count()
+                )
             } else {
                 result
             }

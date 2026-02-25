@@ -27,11 +27,7 @@ pub enum RunResult {
 }
 
 /// Collect and classify the agent's response.
-pub fn collect_response(
-    task_id: &str,
-    exit_code: i32,
-    output_file: &Path,
-) -> RunResult {
+pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> RunResult {
     let state_dir = dirs::home_dir()
         .unwrap_or_default()
         .join(".orchestrator")
@@ -202,11 +198,45 @@ fn is_auth_error(text: &str) -> bool {
 /// Detect missing tooling from agent output.
 fn detect_missing_tooling(text: &str) -> Option<String> {
     let known_tools = [
-        "bun", "node", "npm", "pnpm", "yarn", "deno", "tsc", "eslint", "prettier",
-        "jest", "vitest", "cargo", "rustc", "go", "python", "python3", "pip", "pip3",
-        "uv", "poetry", "pytest", "ruff", "black", "mypy", "make", "cmake", "ninja",
-        "just", "bats", "docker", "docker-compose", "podman", "kubectl", "helm",
-        "terraform", "anchor", "avm", "solana", "solana-test-validator",
+        "bun",
+        "node",
+        "npm",
+        "pnpm",
+        "yarn",
+        "deno",
+        "tsc",
+        "eslint",
+        "prettier",
+        "jest",
+        "vitest",
+        "cargo",
+        "rustc",
+        "go",
+        "python",
+        "python3",
+        "pip",
+        "pip3",
+        "uv",
+        "poetry",
+        "pytest",
+        "ruff",
+        "black",
+        "mypy",
+        "make",
+        "cmake",
+        "ninja",
+        "just",
+        "bats",
+        "docker",
+        "docker-compose",
+        "podman",
+        "kubectl",
+        "helm",
+        "terraform",
+        "anchor",
+        "avm",
+        "solana",
+        "solana-test-validator",
     ];
 
     let lower = text.to_lowercase();

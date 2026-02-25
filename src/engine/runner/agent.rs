@@ -68,10 +68,7 @@ pub fn build_runner_script(inv: &AgentInvocation) -> String {
     };
 
     let disallowed = if !inv.disallowed_tools.is_empty() {
-        format!(
-            "--disallowedTools '{}'",
-            inv.disallowed_tools.join(",")
-        )
+        format!("--disallowedTools '{}'", inv.disallowed_tools.join(","))
     } else {
         String::new()
     };
@@ -117,7 +114,10 @@ pub fn build_runner_script(inv: &AgentInvocation) -> String {
         }
         other => {
             // Unknown agent — try as claude-compatible
-            tracing::warn!(agent = other, "unknown agent, using claude-compatible invocation");
+            tracing::warn!(
+                agent = other,
+                "unknown agent, using claude-compatible invocation"
+            );
             format!(
                 r#"{timeout_cmd} {other} -p {model_flag} \
   --permission-mode bypassPermissions \
@@ -174,10 +174,7 @@ exit $CMD_STATUS
 /// Spawn the agent in a tmux session.
 ///
 /// Returns the tmux session name.
-pub async fn spawn_in_tmux(
-    tmux: &TmuxManager,
-    inv: &AgentInvocation,
-) -> anyhow::Result<String> {
+pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow::Result<String> {
     let script_content = build_runner_script(inv);
 
     // Write runner script
@@ -199,11 +196,7 @@ pub async fn spawn_in_tmux(
 
     let command = format!("bash {}", script_path.display());
     let session = tmux
-        .create_session(
-            &inv.task_id,
-            &inv.work_dir.to_string_lossy(),
-            &command,
-        )
+        .create_session(&inv.task_id, &inv.work_dir.to_string_lossy(), &command)
         .await?;
 
     tracing::info!(
@@ -258,7 +251,8 @@ pub fn build_system_prompt(
     }
 
     // Output format instructions
-    prompt.push_str(r#"## Output Format
+    prompt.push_str(
+        r#"## Output Format
 
 You MUST output a JSON object with the following fields:
 
@@ -272,7 +266,8 @@ You MUST output a JSON object with the following fields:
   "reason": "reason if blocked or needs_review"
 }
 ```
-"#);
+"#,
+    );
 
     prompt
 }

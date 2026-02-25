@@ -133,7 +133,8 @@ impl TaskRunner {
         };
 
         // Build a minimal ExternalTask for prompt building
-        let task_title = sidecar::get(task_id, "title").unwrap_or_else(|_| format!("Task #{task_id}"));
+        let task_title =
+            sidecar::get(task_id, "title").unwrap_or_else(|_| format!("Task #{task_id}"));
         let task_body = sidecar::get(task_id, "body").unwrap_or_default();
         let pseudo_task = ExternalTask {
             id: ExternalId(task_id.to_string()),
@@ -152,8 +153,7 @@ impl TaskRunner {
         let agent_message = agent::build_agent_message(&pseudo_task, &ctx, attempts);
 
         // Git identity
-        let git_name = config::get("git.name")
-            .unwrap_or_else(|_| format!("{agent_name}[bot]"));
+        let git_name = config::get("git.name").unwrap_or_else(|_| format!("{agent_name}[bot]"));
         let git_email = config::get("git.email")
             .unwrap_or_else(|_| format!("{agent_name}[bot]@users.noreply.github.com"));
 
@@ -161,10 +161,7 @@ impl TaskRunner {
         let output_file = PathBuf::from(format!("/tmp/output-{task_id}.json"));
 
         // Build sandbox disallowed tools
-        let mut disallowed_tools = vec![
-            "Bash(rm *)".to_string(),
-            "Bash(rm -*)".to_string(),
-        ];
+        let mut disallowed_tools = vec!["Bash(rm *)".to_string(), "Bash(rm -*)".to_string()];
 
         // Sandbox: block access to main project dir
         if wt.work_dir != wt.main_project_dir {
@@ -321,9 +318,7 @@ impl TaskRunner {
                     .map(|s| s.to_string())
                     .collect();
 
-                if let Some(next) =
-                    response::pick_fallback_agent(&agent_name, &chain, &available)
-                {
+                if let Some(next) = response::pick_fallback_agent(&agent_name, &chain, &available) {
                     tracing::info!(
                         task_id,
                         from = agent_name,
@@ -358,9 +353,7 @@ impl TaskRunner {
                     .map(|s| s.to_string())
                     .collect();
 
-                if let Some(next) =
-                    response::pick_fallback_agent(&agent_name, "", &available)
-                {
+                if let Some(next) = response::pick_fallback_agent(&agent_name, "", &available) {
                     tracing::info!(
                         task_id,
                         from = agent_name,
@@ -373,7 +366,9 @@ impl TaskRunner {
                             format!("agent={next}"),
                             "agent_model=".to_string(),
                             "status=new".to_string(),
-                            format!("last_error={agent_name} auth/billing error, switched to {next}"),
+                            format!(
+                                "last_error={agent_name} auth/billing error, switched to {next}"
+                            ),
                         ],
                     )?;
                 } else {
