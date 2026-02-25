@@ -39,6 +39,7 @@ pub struct TaskManager {
     backend: Arc<dyn ExternalBackend>,
 }
 
+#[allow(dead_code)] // Public API methods available for CLI and future engine use
 impl TaskManager {
     pub fn new(db: Arc<Db>, backend: Arc<dyn ExternalBackend>) -> Self {
         Self { db, backend }
