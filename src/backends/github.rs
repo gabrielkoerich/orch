@@ -61,7 +61,7 @@ impl ExternalBackend for GitHubBackend {
         // callers never have to pre-create labels manually.  Failures are
         // tolerated: if creation fails we still attempt the replace below.
         let label = status.as_label();
-        let status_name = &label["status:".len()..]; // strip prefix for description
+        let status_name = &label["status:".len()..];
         if let Err(e) = self
             .gh
             .ensure_label(
@@ -72,21 +72,14 @@ impl ExternalBackend for GitHubBackend {
             )
             .await
         {
-            tracing::warn!(label, err = %e, "ensure_label failed, continuing with replace_labels");
+            tracing::warn!(label, err = %e, "ensure_label failed, continuing with label updates");
         }
 
-        // GET current labels, swap status:* prefix, PUT the full set.
-        // The PUT itself is atomic, but there's a TOCTOU window between GET
-        // and PUT where another process could modify labels. Labels added in
-        // that window would be lost. Acceptable for orchestrator (single writer).
         let task = self.get_task(id).await?;
-        let mut labels: Vec<String> = task
-            .labels
-            .into_iter()
-            .filter(|l| !l.starts_with("status:"))
-            .collect();
-        labels.push(label.to_string());
-        self.gh.replace_labels(&self.repo, &id.0, &labels).await?;
+        for old_status in task.labels.iter().filter(|l| l.starts_with("status:")) {
+            let _ = self.gh.remove_label(&self.repo, &id.0, old_status).await;
+        }
+        self.gh.add_labels(&self.repo, &id.0, &[label.to_string()]).await?;
         Ok(())
     }
 
