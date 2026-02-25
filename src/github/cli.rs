@@ -3,6 +3,8 @@
 //! All GitHub API calls go through `gh api`. Auth is handled by `gh`.
 //! We build the command args in Rust and deserialize the JSON output via serde.
 
+#![allow(dead_code)]
+
 use super::types::{GitHubComment, GitHubIssue};
 use tokio::process::Command;
 
