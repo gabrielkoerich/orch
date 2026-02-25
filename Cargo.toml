@@ -49,6 +49,9 @@ regex = "1"
 # Directory helpers
 dirs = "6"
 
+# File watching for config hot reload
+notify = "7"
+
 # SQLite for internal tasks
 rusqlite = { version = "0.31", features = ["bundled"] }
 

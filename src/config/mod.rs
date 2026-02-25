@@ -2,15 +2,89 @@
 //!
 //! Reads `~/.orchestrator/config.yml` (global) and `.orchestrator.yml` (project).
 //! Project config overrides global config for the same key.
+//!
+//! Features:
+//! - In-memory cache: parsed YAML is cached for the process lifetime
+//! - File watching: uses notify crate to watch for config file changes
+//! - Hot reload: cache is invalidated when config files change
 
 use anyhow::Context;
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 /// Cached YAML values — parsed once per file, reused for all key lookups.
-static CACHE: std::sync::LazyLock<Mutex<HashMap<PathBuf, serde_yml::Value>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Protected by RwLock for concurrent read access.
+static CACHE: std::sync::LazyLock<RwLock<HashMap<PathBuf, serde_yml::Value>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Files currently being watched for changes.
+static WATCHER: std::sync::LazyLock<RwLock<HashMap<PathBuf, ()>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Global file watcher instance (started on first use).
+static FILE_WATCHER: std::sync::LazyLock<Arc<Mutex<Option<RecommendedWatcher>>>> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(None)));
+
+/// Invalidate the cache entry for a specific config file.
+fn invalidate_cache(path: &PathBuf) {
+    if let Ok(mut cache) = CACHE.write() {
+        cache.remove(path);
+        tracing::debug!("config cache invalidated for: {}", path.display());
+    }
+}
+
+/// Start the file watcher if not already running.
+fn ensure_watcher() {
+    let mut watcher_guard = FILE_WATCHER.lock().unwrap();
+    if watcher_guard.is_some() {
+        return;
+    }
+
+    // Create the watcher
+    let watcher = RecommendedWatcher::new(
+        move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                for path in event.paths {
+                    // Check if it's a config file we care about
+                    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+                    if filename == "config.yml" || filename == ".orchestrator.yml" {
+                        invalidate_cache(&path);
+                    }
+                }
+            }
+        },
+        Config::default().with_poll_interval(Duration::from_secs(2)),
+    );
+
+    if let Ok(w) = watcher {
+        *watcher_guard = Some(w);
+    }
+}
+
+/// Watch a config file for changes.
+fn watch_file(path: &PathBuf) {
+    // First ensure watcher is running
+    ensure_watcher();
+
+    // Track that we want to watch this file
+    if let Ok(mut watched) = WATCHER.write() {
+        if !watched.contains_key(path) {
+            watched.insert(path.clone(), ());
+
+            // Add to notify watcher
+            if let Ok(mut guard) = FILE_WATCHER.lock() {
+                if let Some(ref mut watcher) = *guard {
+                    let _ = watcher.watch(path, RecursiveMode::NonRecursive);
+                    tracing::debug!("now watching config file: {}", path.display());
+                }
+            }
+        }
+    }
+}
 
 /// Resolve the global config path: `~/.orchestrator/config.yml`
 fn global_config_path() -> anyhow::Result<PathBuf> {
@@ -47,22 +121,38 @@ pub fn get(key: &str) -> anyhow::Result<String> {
 /// Resolve a dot-separated key from a YAML file.
 ///
 /// Caches the parsed YAML so repeated lookups don't re-read disk.
+/// Sets up file watching for hot reload when first loading.
 fn resolve_key(path: &PathBuf, key: &str) -> anyhow::Result<String> {
     let root = {
-        let mut cache = CACHE.lock().unwrap();
-        if let Some(cached) = cache.get(path) {
-            cached.clone()
-        } else {
-            let content = std::fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            let parsed: serde_yml::Value = serde_yml::from_str(&content)
-                .with_context(|| format!("parsing {}", path.display()))?;
-            cache.insert(path.clone(), parsed.clone());
-            parsed
+        // First, ensure we're watching this file for changes
+        watch_file(path);
+
+        // Try to get from cache first (read lock)
+        if let Ok(cache) = CACHE.read() {
+            if let Some(cached) = cache.get(path) {
+                return extract_value(cached, key);
+            }
         }
+
+        // Not in cache, load and cache it (write lock)
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let parsed: serde_yml::Value =
+            serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+
+        if let Ok(mut cache) = CACHE.write() {
+            cache.insert(path.clone(), parsed.clone());
+        }
+
+        parsed
     };
 
-    let mut current = &root;
+    extract_value(&root, key)
+}
+
+/// Extract a value from a YAML tree by dot-separated key.
+fn extract_value(root: &serde_yml::Value, key: &str) -> anyhow::Result<String> {
+    let mut current = root;
     for part in key.split('.') {
         current = current
             .get(part)
