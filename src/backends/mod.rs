@@ -137,6 +137,196 @@ pub trait ExternalBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    /// Minimal mock backend for testing update_status semantics.
+    struct MockBackend {
+        /// Current labels on the (single) tracked issue.
+        labels: Arc<Mutex<Vec<String>>>,
+        /// If set, `remove_label` returns this error for matching labels.
+        remove_err: Option<String>,
+        /// If true, `add_labels` returns an error once, then succeeds.
+        add_fails_once: Arc<Mutex<bool>>,
+    }
+
+    impl MockBackend {
+        fn with_labels(labels: Vec<&str>) -> Self {
+            Self {
+                labels: Arc::new(Mutex::new(labels.into_iter().map(String::from).collect())),
+                remove_err: None,
+                add_fails_once: Arc::new(Mutex::new(false)),
+            }
+        }
+
+        fn current_labels(&self) -> Vec<String> {
+            self.labels.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ExternalBackend for MockBackend {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn create_task(
+            &self,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("1".into()))
+        }
+
+        async fn get_task(&self, _id: &ExternalId) -> anyhow::Result<ExternalTask> {
+            Ok(ExternalTask {
+                id: ExternalId("1".into()),
+                title: "mock".into(),
+                body: "".into(),
+                state: "open".into(),
+                labels: self.current_labels(),
+                author: "user".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                url: "https://example.com".into(),
+            })
+        }
+
+        async fn update_status(&self, _id: &ExternalId, status: Status) -> anyhow::Result<()> {
+            let new_label = status.as_label().to_string();
+            let mut labels = self.labels.lock().unwrap();
+
+            // Check for non-404 remove error
+            if let Some(ref err_label) = self.remove_err {
+                if labels
+                    .iter()
+                    .any(|l| l.starts_with("status:") && l != &new_label)
+                {
+                    if labels.iter().any(|l| l == err_label) {
+                        return Err(anyhow::anyhow!("rate limit (429)"));
+                    }
+                }
+            }
+
+            // Remove old status labels, propagating errors (mock: always succeeds)
+            labels.retain(|l| !l.starts_with("status:") || l == &new_label);
+
+            // Simulate add_labels failing once
+            let mut fails = self.add_fails_once.lock().unwrap();
+            if *fails {
+                *fails = false;
+                return Err(anyhow::anyhow!("transient network error"));
+            }
+
+            if !labels.contains(&new_label) {
+                labels.push(new_label);
+            }
+            Ok(())
+        }
+
+        async fn list_by_status(&self, _status: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+
+        async fn post_comment(&self, _id: &ExternalId, _body: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn set_labels(&self, _id: &ExternalId, labels: &[String]) -> anyhow::Result<()> {
+            self.labels.lock().unwrap().extend_from_slice(labels);
+            Ok(())
+        }
+
+        async fn remove_label(&self, _id: &ExternalId, label: &str) -> anyhow::Result<()> {
+            if let Some(ref err_label) = self.remove_err {
+                if label == err_label {
+                    return Err(anyhow::anyhow!("rate limit (429)"));
+                }
+            }
+            self.labels.lock().unwrap().retain(|l| l != label);
+            Ok(())
+        }
+
+        async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn update_status_replaces_single_old_label() {
+        let backend = MockBackend::with_labels(vec!["status:new", "priority:high"]);
+        let id = ExternalId("1".into());
+        backend
+            .update_status(&id, Status::InProgress)
+            .await
+            .unwrap();
+        let labels = backend.current_labels();
+        assert!(
+            labels.contains(&"status:in_progress".to_string()),
+            "new label added: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"status:new".to_string()),
+            "old label removed: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"priority:high".to_string()),
+            "non-status label preserved: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_status_removes_multiple_old_status_labels() {
+        // Simulate state left by a previous partial failure: two status labels
+        let backend = MockBackend::with_labels(vec!["status:in_progress", "status:blocked", "bug"]);
+        let id = ExternalId("1".into());
+        backend.update_status(&id, Status::Done).await.unwrap();
+        let labels = backend.current_labels();
+        let status_labels: Vec<_> = labels.iter().filter(|l| l.starts_with("status:")).collect();
+        assert_eq!(
+            status_labels,
+            vec!["status:done"],
+            "exactly one status label: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_status_is_idempotent() {
+        let backend = MockBackend::with_labels(vec!["status:done"]);
+        let id = ExternalId("1".into());
+        backend.update_status(&id, Status::Done).await.unwrap();
+        let labels = backend.current_labels();
+        let status_count = labels.iter().filter(|l| l.starts_with("status:")).count();
+        assert_eq!(
+            status_count, 1,
+            "idempotent: still exactly one status label: {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_status_non_status_labels_are_preserved() {
+        let backend =
+            MockBackend::with_labels(vec!["status:routed", "agent:claude", "maintenance"]);
+        let id = ExternalId("1".into());
+        backend
+            .update_status(&id, Status::InProgress)
+            .await
+            .unwrap();
+        let labels = backend.current_labels();
+        assert!(
+            labels.contains(&"agent:claude".to_string()),
+            "agent label preserved: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"maintenance".to_string()),
+            "other label preserved: {labels:?}"
+        );
+    }
 
     #[test]
     fn status_as_label() {
