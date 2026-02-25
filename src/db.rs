@@ -23,6 +23,7 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::New => "new",
@@ -163,6 +164,7 @@ impl Db {
         Ok(task)
     }
 
+    #[allow(dead_code)]
     pub async fn list_internal_tasks_by_status(
         &self,
         status: TaskStatus,
@@ -196,6 +198,7 @@ impl Db {
         Ok(result)
     }
 
+    #[allow(dead_code)]
     pub async fn update_internal_task_status(
         &self,
         id: i64,
@@ -209,6 +212,7 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn delete_internal_task(&self, id: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock().await;
         conn.execute("DELETE FROM internal_tasks WHERE id = ?1", [id])?;

@@ -5,12 +5,14 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum TaskType {
     External,
     Internal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct CreateTaskRequest {
     pub title: String,
     pub body: String,
@@ -21,6 +23,7 @@ pub struct CreateTaskRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct TaskFilter {
     pub status: Option<String>,
     pub source: Option<String>,
@@ -28,16 +31,19 @@ pub struct TaskFilter {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(dead_code)]
 pub enum Task {
     External(ExternalTask),
     Internal(InternalTask),
 }
 
+#[allow(dead_code)]
 pub struct TaskManager {
     db: Arc<Db>,
     backend: Arc<dyn ExternalBackend>,
 }
 
+#[allow(dead_code)]
 impl TaskManager {
     pub fn new(db: Arc<Db>, backend: Arc<dyn ExternalBackend>) -> Self {
         Self { db, backend }

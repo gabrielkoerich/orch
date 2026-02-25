@@ -177,6 +177,7 @@ pub async fn serve() -> anyhow::Result<()> {
 /// 1. Monitor active tmux sessions (detect completions)
 /// 2. Recover stuck in_progress tasks
 /// 3. Dispatch new/routed tasks
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -340,7 +341,7 @@ async fn tick(
     }
 
     // Phase 5: Check job schedules
-    if let Err(e) = jobs::tick(jobs_path, backend, &db).await {
+    if let Err(e) = jobs::tick(jobs_path, backend, db).await {
         tracing::error!(?e, "job scheduler tick failed");
     }
 

@@ -71,13 +71,12 @@ pub fn set(task_id: &str, fields: &[String]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use tempfile::TempDir;
 
     /// Override sidecar dir to use a temp directory for tests.
-    fn setup_temp_sidecar() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
+    fn setup_temp_sidecar() -> TempDir {
         // We'll test the low-level path logic directly
-        dir
+        tempfile::tempdir().unwrap()
     }
 
     #[test]
