@@ -11,13 +11,13 @@
 //! All state transitions go through the engine. Channels and backends are
 //! pluggable — the engine doesn't know which ones are active.
 //!
-//! Phase 2 approach: Rust owns the loop, `run_task.sh` still handles agent
-//! invocation, git workflow, and prompt building.
+//! The engine owns the full loop: task polling, routing, agent invocation,
+//! git workflow, prompt building, and result handling — all in Rust.
 
 pub mod internal_tasks;
 pub mod jobs;
 pub mod router;
-mod runner;
+pub mod runner;
 pub mod tasks;
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
@@ -60,15 +60,15 @@ impl Default for EngineConfig {
 
 /// Start the orchestrator service.
 ///
-/// This is the main entry point — called by `orch-core serve`.
+/// This is the main entry point — called by `orch serve`.
 pub async fn serve() -> anyhow::Result<()> {
-    tracing::info!("orch-core engine starting");
+    tracing::info!("orch engine starting");
 
     let config = EngineConfig::default();
 
     // Load config — repo is required
     let repo = crate::config::get("repo").context(
-        "'repo' not set in config — run `orch-core init` or set repo in ~/.orchestrator/config.yml",
+        "'repo' not set in config — run `orch init` or set repo in ~/.orchestrator/config.yml",
     )?;
 
     // Initialize backend
@@ -103,7 +103,7 @@ pub async fn serve() -> anyhow::Result<()> {
     // Initialize channel registry
     let _channels = ChannelRegistry::new();
 
-    // Task runner (delegates to run_task.sh)
+    // Task runner
     let runner = Arc::new(TaskRunner::new(repo.clone()));
 
     // Agent router (selects agent + model per task)
@@ -187,7 +187,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // transport and channels drop here at end of scope
     let _ = transport;
-    tracing::info!("orch-core engine stopped");
+    tracing::info!("orch engine stopped");
     Ok(())
 }
 
@@ -217,8 +217,8 @@ async fn tick(
             tracing::info!(task_id, "session completed, collecting results");
             // Unregister from capture service
             capture.unregister_session(task_id).await;
-            // The run_task.sh process handles its own status updates
-            // and GitHub comment posting. We just clean up the session.
+            // The runner handles status updates and GitHub comment posting.
+            // We just clean up the session.
             let session_name = tmux.session_name(task_id);
             if let Err(e) = tmux.kill_session(&session_name).await {
                 tracing::debug!(

@@ -19,7 +19,7 @@ class Orch < Formula
   end
 
   service do
-    run [opt_bin/"orch-core", "serve"]
+    run [opt_bin/"orch", "serve"]
     keep_alive true
     log_path var/"log/orch.log"
     error_log_path var/"log/orch.error.log"
@@ -29,8 +29,8 @@ class Orch < Formula
     <<~EOS
       To get started:
         cd ~/your-project
-        orch-core init                # configure project
-        orch-core task add "title"    # add a task
+        orch init                     # configure project
+        orch task add "title"         # add a task
         brew services start orch      # start background server
 
       Required agent CLIs (install at least one):
@@ -44,6 +44,6 @@ class Orch < Formula
   end
 
   test do
-    assert_match "orch-core", shell_output("#{bin}/orch-core --version 2>&1", 0)
+    assert_match "orch", shell_output("#{bin}/orch --version 2>&1", 0)
   end
 end

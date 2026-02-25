@@ -17,7 +17,7 @@ Clone + sanity check:
 ```bash
 git clone https://github.com/gabrielkoerich/orch.git
 cd orch
-cargo build       # build orch-core binary
+cargo build       # build orch binary
 cargo test        # run tests
 cargo clippy      # lint
 ```

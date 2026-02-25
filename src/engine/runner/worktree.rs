@@ -1,0 +1,286 @@
+//! Git worktree management for task execution.
+//!
+//! Each task runs in an isolated worktree to prevent conflicts.
+//! Worktrees are stored at `~/.orchestrator/worktrees/<project>/<branch>/`.
+
+use crate::sidecar;
+use std::path::{Path, PathBuf};
+use tokio::process::Command;
+
+/// Result of worktree setup.
+pub struct WorktreeSetup {
+    /// The directory where the agent will work
+    pub work_dir: PathBuf,
+    /// The branch name
+    pub branch: String,
+    /// The default branch of the repository
+    pub default_branch: String,
+    /// The main project directory (original, not worktree)
+    pub main_project_dir: PathBuf,
+}
+
+/// Generate a branch name from task ID and title.
+///
+/// Format: `gh-task-{issue}-{slug}` where slug is lowercase, non-alphanum→`-`, max 40 chars.
+pub fn branch_name(task_id: &str, title: &str) -> String {
+    let slug: String = title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+
+    // Truncate slug to 40 chars
+    let slug = if slug.len() > 40 { &slug[..40] } else { &slug };
+    let slug = slug.trim_end_matches('-');
+
+    format!("gh-task-{task_id}-{slug}")
+}
+
+/// Detect the default branch of a repository.
+pub async fn detect_default_branch(project_dir: &Path) -> String {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(project_dir)
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => "main".to_string(),
+    }
+}
+
+/// Resolve PROJECT_DIR to the main repo if it's inside a worktree.
+///
+/// This prevents nested worktrees when subtasks inherit a parent's worktree dir.
+pub async fn resolve_main_repo(project_dir: &Path) -> PathBuf {
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(project_dir)
+        .output()
+        .await;
+
+    if let Ok(o) = output {
+        if o.status.success() {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            if let Some(first_line) = stdout.lines().next() {
+                if let Some(path) = first_line.strip_prefix("worktree ") {
+                    let main_path = PathBuf::from(path);
+                    if main_path != project_dir {
+                        tracing::info!(
+                            worktree = %project_dir.display(),
+                            main = %main_path.display(),
+                            "resolved worktree to main repo"
+                        );
+                        return main_path;
+                    }
+                }
+            }
+        }
+    }
+
+    project_dir.to_path_buf()
+}
+
+/// Check if a directory is a bare git repository.
+async fn is_bare_repo(dir: &Path) -> bool {
+    let output = Command::new("git")
+        .args(["-C", &dir.to_string_lossy(), "rev-parse", "--is-bare-repository"])
+        .output()
+        .await;
+
+    matches!(output, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+}
+
+/// Set up a worktree for task execution.
+///
+/// Returns the working directory, branch name, and default branch.
+pub async fn setup_worktree(
+    task_id: &str,
+    title: &str,
+    project_dir: &Path,
+) -> anyhow::Result<WorktreeSetup> {
+    // Resolve to main repo (avoid nested worktrees)
+    let main_dir = resolve_main_repo(project_dir).await;
+    let default_branch = detect_default_branch(&main_dir).await;
+
+    let project_name = main_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string())
+        .trim_end_matches(".git")
+        .to_string();
+
+    let orch_home = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".orchestrator");
+    let worktrees_base = orch_home.join("worktrees").join(&project_name);
+    std::fs::create_dir_all(&worktrees_base)?;
+
+    // Check if we have a saved branch/worktree in sidecar
+    let saved_branch = sidecar::get(task_id, "branch").ok();
+    let saved_worktree = sidecar::get(task_id, "worktree").ok();
+
+    let (branch_name_str, worktree_dir) = if let Some(ref saved) = saved_branch {
+        if !saved.is_empty() {
+            let wt = match &saved_worktree {
+                Some(wt) if !wt.is_empty() && Path::new(wt).exists() => PathBuf::from(wt),
+                _ => worktrees_base.join(saved),
+            };
+            (saved.clone(), wt)
+        } else {
+            let bn = branch_name(task_id, title);
+            (bn.clone(), worktrees_base.join(&bn))
+        }
+    } else {
+        // Check for existing worktree by prefix pattern
+        let existing = find_existing_worktree(&worktrees_base, task_id);
+        if let Some(existing_dir) = existing {
+            let bn = existing_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            tracing::info!(task_id, worktree = %existing_dir.display(), "found existing worktree");
+            (bn, existing_dir)
+        } else {
+            let bn = branch_name(task_id, title);
+            (bn.clone(), worktrees_base.join(&bn))
+        }
+    };
+
+    if branch_name_str.is_empty() {
+        anyhow::bail!("empty branch name for task {task_id}");
+    }
+
+    // Create worktree if it doesn't exist
+    if !worktree_dir.exists() {
+        tracing::info!(task_id, worktree = %worktree_dir.display(), "creating worktree");
+
+        // Fetch if bare repo
+        if is_bare_repo(&main_dir).await {
+            let _ = Command::new("git")
+                .args(["-C", &main_dir.to_string_lossy(), "fetch", "--all", "--prune"])
+                .output()
+                .await;
+        }
+
+        // Create branch from default
+        let _ = Command::new("git")
+            .args([
+                "-C",
+                &main_dir.to_string_lossy(),
+                "branch",
+                &branch_name_str,
+                &default_branch,
+            ])
+            .output()
+            .await;
+
+        // Create worktree
+        if let Some(parent) = worktree_dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &main_dir.to_string_lossy(),
+                "worktree",
+                "add",
+                &worktree_dir.to_string_lossy(),
+                &branch_name_str,
+            ])
+            .output()
+            .await?;
+
+        if !output.status.success() && !worktree_dir.exists() {
+            // Retry: prune and recreate
+            tracing::warn!(task_id, "worktree creation failed, retrying after prune");
+
+            let _ = Command::new("git")
+                .args(["-C", &main_dir.to_string_lossy(), "worktree", "prune"])
+                .output()
+                .await;
+
+            let _ = Command::new("git")
+                .args(["-C", &main_dir.to_string_lossy(), "branch", "-D", &branch_name_str])
+                .output()
+                .await;
+
+            let _ = Command::new("git")
+                .args([
+                    "-C",
+                    &main_dir.to_string_lossy(),
+                    "branch",
+                    &branch_name_str,
+                    &default_branch,
+                ])
+                .output()
+                .await;
+
+            let _ = Command::new("git")
+                .args([
+                    "-C",
+                    &main_dir.to_string_lossy(),
+                    "worktree",
+                    "add",
+                    &worktree_dir.to_string_lossy(),
+                    &branch_name_str,
+                ])
+                .output()
+                .await;
+
+            if !worktree_dir.exists() {
+                anyhow::bail!(
+                    "failed to create worktree at {} for task {}",
+                    worktree_dir.display(),
+                    task_id
+                );
+            }
+        }
+    }
+
+    // Save worktree info to sidecar
+    sidecar::set(
+        task_id,
+        &[
+            format!("worktree={}", worktree_dir.display()),
+            format!("branch={branch_name_str}"),
+        ],
+    )?;
+
+    tracing::info!(
+        task_id,
+        worktree = %worktree_dir.display(),
+        branch = %branch_name_str,
+        "worktree ready"
+    );
+
+    Ok(WorktreeSetup {
+        work_dir: worktree_dir,
+        branch: branch_name_str,
+        default_branch,
+        main_project_dir: main_dir,
+    })
+}
+
+/// Find an existing worktree by task ID prefix.
+fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<PathBuf> {
+    let prefix = format!("gh-task-{task_id}-");
+
+    if let Ok(entries) = std::fs::read_dir(worktrees_base) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) && entry.path().is_dir() {
+                return Some(entry.path());
+            }
+        }
+    }
+
+    None
+}

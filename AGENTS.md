@@ -5,31 +5,31 @@ You are an autonomous orchestrator. You should look for ways to make yourself be
 ## Upgrading
 
 ```bash
-brew update && brew upgrade orchestrator
+brew update && brew upgrade orch
 ```
 
 ## Restarting the service
 
 ```bash
-orchestrator stop && orchestrator start
+orch service restart
 ```
 
 Or equivalently:
 ```bash
-brew services restart orchestrator
+brew services restart orch
 ```
 
 ## Unblocking tasks
 
 ```bash
-orchestrator tasks unblock all
+orch task unblock all
 ```
 
 ## Logs
 
-- Service log: `~/.orchestrator/.orchestrator/orchestrator.log`
-- Brew stdout: `/opt/homebrew/var/log/orchestrator.log` (startup messages only)
-- Brew stderr: `/opt/homebrew/var/log/orchestrator.error.log`
+- Service log: `~/.orchestrator/.orchestrator/orch.log`
+- Brew stdout: `/opt/homebrew/var/log/orch.log` (startup messages only)
+- Brew stderr: `/opt/homebrew/var/log/orch.error.log`
 
 ## Live Session Streaming
 
@@ -38,7 +38,7 @@ The orchestrator can stream live output from running agent sessions. This allows
 ### Streaming via CLI
 
 ```bash
-orchestrator task stream <task_id>
+orch stream <task_id>
 ```
 
 This connects to the running task's tmux session and prints output as it arrives. The stream updates every 2 seconds with new content from the agent's pane.
@@ -78,7 +78,7 @@ model_map:
     codex: gpt-5.2
 ```
 
-See `model_for_complexity()` in `scripts/lib.sh`.
+See `model_for_complexity()` in the router module.
 
 ## Router Module (Rust)
 
@@ -170,7 +170,7 @@ pub struct AgentProfile {
 
 ### Environment Variables
 
-The runner passes routing results to `run_task.sh` via:
+The runner passes routing results to the agent invocation via:
 
 - `ORCH_AGENT` — the selected agent (claude/codex/opencode)
 - `ORCH_MODEL` — the specific model to use
@@ -193,7 +193,7 @@ The routing prompt template is at `prompts/route.md`. It includes:
   projects/              # bare clones added via `orch project add`
     owner/repo.git       #   each has .orchestrator.yml inside
   worktrees/             # agent worktrees (all projects)
-    repo/branch/         #   created by run_task.sh, one per task
+    repo/branch/         #   created by the runner, one per task
   .orchestrator/         # runtime state (logs, prompts, pid, locks)
 ```
 
@@ -201,16 +201,6 @@ The routing prompt template is at `prompts/route.md`. It includes:
 - **Orch-managed projects** (`orch project add owner/repo`): bare clone at `~/.orchestrator/projects/<owner>/<repo>.git`.
 - **Worktrees**: always at `~/.orchestrator/worktrees/<project>/<branch>/` regardless of project type.
 - `ORCH_WORKTREES` env var overrides the worktrees base directory.
-
-## Adding external projects
-
-```bash
-orch project add owner/repo               # bare clone + write config + sync issues
-orch task add "title" -p owner/repo        # add task to managed project
-orch project create                        # link or create GitHub Project board
-```
-
-`project add` clones via SSH (`git@github.com:owner/repo.git`), writes `.orchestrator.yml` inside the bare repo, and imports open GitHub issues as tasks.
 
 ## Specs & Roadmap
 
@@ -221,10 +211,10 @@ See [specs.md](specs.md) for architecture overview, what's working, what's not, 
 1. Push to `main`
 2. CI runs tests, auto-tags (semver from conventional commits)
 3. GitHub release created, Homebrew tap formula updated automatically
-4. `brew upgrade orchestrator` picks up the new version
-5. `orchestrator stop && orchestrator start` to load new code
+4. `brew upgrade orch` picks up the new version
+5. `orch service restart` to load new code
 
-**Do NOT manually edit the tap formula** — the CI pipeline handles it. The `Formula/orchestrator.rb` in this repo is a local reference copy, not the real tap.
+**Do NOT manually edit the tap formula** — the CI pipeline handles it. The `Formula/orch.rb` in this repo is a local reference copy, not the real tap.
 
 ### Post-push workflow
 
@@ -233,9 +223,9 @@ After pushing to main, always complete the full cycle:
 ```bash
 git push                                    # 1. push
 gh run watch --exit-status                  # 2. watch CI (tests → release → deploy)
-brew update && brew upgrade orchestrator    # 3. pull new formula + install
-brew services restart orchestrator          # 4. restart service with new code
-orchestrator version                        # 5. verify
+brew update && brew upgrade orch            # 3. pull new formula + install
+brew services restart orch                  # 4. restart service with new code
+orch version                                # 5. verify
 ```
 
 Do not skip steps — the service runs from the Homebrew cellar, not the repo.
@@ -256,7 +246,7 @@ Do not skip steps — the service runs from the Homebrew cellar, not the repo.
 
 ## Agent sandbox
 
-Agents run in worktrees, NOT the main project directory. The orchestrator enforces this:
+Agents run in worktrees, NOT the main project directory. Orch enforces this:
 
 1. **Prompt-level**: system prompt tells agents the main project dir is read-only
 2. **Tool-level**: dynamic `--disallowedTools` blocks Read/Write/Edit/Bash targeting the main project dir
@@ -273,7 +263,7 @@ agents:
     sandbox: full-auto  # full-auto | workspace-write | danger-full-access | none
 ```
 
-Or per-run: `CODEX_SANDBOX=danger-full-access orchestrator task run 5`
+Or per-run: `CODEX_SANDBOX=danger-full-access orch task run 5`
 
 Modes:
 - `full-auto` (default) — filesystem sandboxed, network enabled

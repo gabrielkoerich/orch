@@ -1,5 +1,5 @@
 [package]
-name = "orch-core"
+name = "orch"
 version = "0.1.0"
 edition = "2021"
 description = "Orch — The Agent Orchestrator (Rust core)"
@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/gabrielkoerich/orch"
 
 [[bin]]
-name = "orch-core"
+name = "orch"
 path = "src/main.rs"
 
 [dependencies]
@@ -21,6 +21,7 @@ serde_yml = "0.0.12"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 
 # Cron
 cron = "0.13"
