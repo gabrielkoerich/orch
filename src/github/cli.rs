@@ -5,12 +5,30 @@
 
 use super::types::{GitHubComment, GitHubIssue};
 use tokio::process::Command;
+use urlencoding;
 
 pub struct GhCli;
 
 impl GhCli {
     pub fn new() -> Self {
         Self
+    }
+
+    pub async fn graphql(&self, query: &str) -> anyhow::Result<serde_json::Value> {
+        let output = Command::new("gh")
+            .arg("api")
+            .arg("graphql")
+            .arg("-f")
+            .arg(format!("query={}", urlencoding::encode(query)))
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api graphql failed: {stderr}");
+        }
+
+        Ok(serde_json::from_slice(&output.stdout)?)
     }
 
     /// Run `gh api` with args and return raw JSON bytes.
@@ -291,29 +309,84 @@ impl GhCli {
         Ok(serde_json::from_slice(&json)?)
     }
 
-    /// Run a GraphQL query using the GitHub API.
+    /// Get a PR's merged state by branch name.
     ///
-    /// This is used for sub-issues and other advanced queries.
-    pub async fn graphql(&self, query: &str) -> anyhow::Result<serde_json::Value> {
-        let output = Command::new("gh")
-            .arg("api")
-            .arg("graphql")
-            .arg("-f")
-            .arg(format!("query={}", urlencoding::encode(query)))
-            .output()
+    /// Returns Ok(true) if merged, Ok(false) if not merged or not a PR.
+    pub async fn is_pr_merged(&self, repo: &str, branch: &str) -> anyhow::Result<bool> {
+        // The GitHub PRs endpoint `head` filter requires "owner:branch" format
+        let owner = repo
+            .split('/')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+        let head = format!("{}:{}", owner, branch);
+
+        // Search for closed PRs with this branch as head
+        let endpoint = format!("repos/{repo}/pulls");
+        let json = self
+            .api(&[
+                &endpoint,
+                "-f",
+                &format!("head={}", head),
+                "-f",
+                "state=closed",
+                "-f",
+                "per_page=1",
+            ])
             .await?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("gh api graphql failed: {stderr}");
+        // Parse the response - if we get an empty array, there's no PR for this branch
+        let prs: Vec<serde_json::Value> = serde_json::from_slice(&json)?;
+        if prs.is_empty() {
+            return Ok(false);
         }
 
+        // Check if the PR is merged
+        let first_pr = &prs[0];
+        let merged_at = first_pr.get("merged_at");
+        Ok(merged_at.map(|v| !v.is_null()).unwrap_or(false))
+    }
+
+    /// Get issue/PR comments since a given timestamp.
+    ///
+    /// Uses `--paginate` to fetch all pages (not just the first 100).
+    pub async fn get_mentions(
+        &self,
+        repo: &str,
+        since: &str,
+    ) -> anyhow::Result<Vec<GitHubComment>> {
+        let endpoint = format!("repos/{repo}/issues/comments");
+        let since_field = format!("since={}", since);
+        let output = Command::new("gh")
+            .arg("api")
+            .arg("--paginate")
+            .args([
+                &endpoint,
+                "-X",
+                "GET",
+                "-f",
+                &since_field,
+                "-f",
+                "per_page=100",
+            ])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api failed: {stderr}");
+        }
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
-    /// Get sub-issues (children) of an issue using GraphQL.
-    ///
-    /// Returns a list of issue numbers that are sub-issues of the given issue.
+    /// Get the current authenticated username.
+    pub async fn get_whoami(&self) -> anyhow::Result<String> {
+        let json = self.api(&["user"]).await?;
+        let user: serde_json::Value = serde_json::from_slice(&json)?;
+        user.get("login")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("failed to get current user"))
+    }
+
     pub async fn get_sub_issues(&self, repo: &str, number: &str) -> anyhow::Result<Vec<u64>> {
         // Parse owner and repo from "owner/repo" format
         let parts: Vec<&str> = repo.split('/').collect();

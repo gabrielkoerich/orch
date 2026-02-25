@@ -220,6 +220,30 @@ impl Db {
         Ok(())
     }
 
+    /// Get a value from the kv store.
+    pub async fn kv_get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().await;
+        let result = conn.query_row("SELECT value FROM kv WHERE key = ?1", [key], |row| {
+            row.get(0)
+        });
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Set a value in the kv store (upsert).
+    pub async fn kv_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
     pub async fn set_internal_task_agent(
         &self,
         id: i64,
@@ -270,6 +294,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_run    TEXT DEFAULT '',
     last_status TEXT DEFAULT '',
     created_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS kv (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_internal_tasks_status ON internal_tasks(status);
@@ -436,6 +466,35 @@ mod tests {
         db.set_internal_task_agent(id, None).await.unwrap();
         let task = db.get_internal_task(id).await.unwrap();
         assert_eq!(task.agent, None);
+    }
+
+    #[tokio::test]
+    async fn kv_get_set() {
+        let db = Db::open_memory().unwrap();
+        db.migrate().await.unwrap();
+
+        // Missing key returns None
+        assert_eq!(db.kv_get("foo").await.unwrap(), None);
+
+        // Set and get
+        db.kv_set("foo", "bar").await.unwrap();
+        assert_eq!(db.kv_get("foo").await.unwrap(), Some("bar".to_string()));
+
+        // Upsert overwrites
+        db.kv_set("foo", "baz").await.unwrap();
+        assert_eq!(db.kv_get("foo").await.unwrap(), Some("baz".to_string()));
+    }
+
+    #[tokio::test]
+    async fn kv_multiple_keys() {
+        let db = Db::open_memory().unwrap();
+        db.migrate().await.unwrap();
+
+        db.kv_set("a", "1").await.unwrap();
+        db.kv_set("b", "2").await.unwrap();
+
+        assert_eq!(db.kv_get("a").await.unwrap(), Some("1".to_string()));
+        assert_eq!(db.kv_get("b").await.unwrap(), Some("2".to_string()));
     }
 
     #[test]
