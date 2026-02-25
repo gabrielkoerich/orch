@@ -163,7 +163,10 @@ impl Db {
         Ok(task)
     }
 
-    pub async fn list_internal_tasks_by_status(&self, status: TaskStatus) -> anyhow::Result<Vec<InternalTask>> {
+    pub async fn list_internal_tasks_by_status(
+        &self,
+        status: TaskStatus,
+    ) -> anyhow::Result<Vec<InternalTask>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
             "SELECT id, title, body, status, source, source_id, agent, created_at, updated_at 
@@ -193,7 +196,11 @@ impl Db {
         Ok(result)
     }
 
-    pub async fn update_internal_task_status(&self, id: i64, status: TaskStatus) -> anyhow::Result<()> {
+    pub async fn update_internal_task_status(
+        &self,
+        id: i64,
+        status: TaskStatus,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE internal_tasks SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
@@ -208,7 +215,11 @@ impl Db {
         Ok(())
     }
 
-    pub async fn set_internal_task_agent(&self, id: i64, agent: Option<&str>) -> anyhow::Result<()> {
+    pub async fn set_internal_task_agent(
+        &self,
+        id: i64,
+        agent: Option<&str>,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
             "UPDATE internal_tasks SET agent = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",

@@ -9,9 +9,9 @@
 //! Sessions are registered when tasks are dispatched and unregistered
 //! when they complete.
 
+use crate::channels::tmux;
 use crate::channels::transport::Transport;
 use crate::channels::OutputChunk;
-use crate::channels::tmux;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -65,14 +65,21 @@ impl CaptureService {
             last_content: String::new(),
             last_capture: Utc::now(),
         };
-        self.buffers.write().await.insert(task_id.to_string(), buffer);
+        self.buffers
+            .write()
+            .await
+            .insert(task_id.to_string(), buffer);
         tracing::debug!(task_id, session, "session registered for capture");
     }
 
     /// Unregister a session (stop tracking).
     pub async fn unregister_session(&self, task_id: &str) {
         if let Some(buffer) = self.buffers.write().await.remove(task_id) {
-            tracing::debug!(task_id = buffer.task_id, session = buffer.session, "session unregistered");
+            tracing::debug!(
+                task_id = buffer.task_id,
+                session = buffer.session,
+                "session unregistered"
+            );
         }
     }
 
@@ -80,7 +87,10 @@ impl CaptureService {
     ///
     /// This runs indefinitely, polling registered sessions for new output.
     pub async fn start(&self) {
-        tracing::info!(interval_secs = self.interval.as_secs(), "capture service started");
+        tracing::info!(
+            interval_secs = self.interval.as_secs(),
+            "capture service started"
+        );
         let mut interval = tokio::time::interval(self.interval);
 
         loop {

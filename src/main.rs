@@ -131,7 +131,9 @@ async fn stream_task(task_id: &str) -> anyhow::Result<()> {
 
     // Bind to the task session
     let session_name = format!("orch-{}", task_id);
-    transport.bind(task_id, &session_name, "cli", "stream").await;
+    transport
+        .bind(task_id, &session_name, "cli", "stream")
+        .await;
 
     // Subscribe to output
     let mut rx = match transport.subscribe(task_id).await {
@@ -141,7 +143,10 @@ async fn stream_task(task_id: &str) -> anyhow::Result<()> {
         }
     };
 
-    println!("Streaming output from task {} (session: {})", task_id, session_name);
+    println!(
+        "Streaming output from task {} (session: {})",
+        task_id, session_name
+    );
     println!("Press Ctrl+C to stop streaming");
     println!("---");
 

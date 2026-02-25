@@ -122,7 +122,9 @@ pub async fn tick(
                     Ok(task) => {
                         let status = task.labels.iter().find(|l| l.starts_with("status:"));
                         match status.map(|s| s.as_str()) {
-                            Some("status:in_progress") | Some("status:routed") | Some("status:new") => {
+                            Some("status:in_progress")
+                            | Some("status:routed")
+                            | Some("status:new") => {
                                 tracing::debug!(
                                     job_id = job.id,
                                     task_id,
@@ -157,26 +159,24 @@ pub async fn tick(
             } else {
                 let task_id: i64 = task_id_str.parse().unwrap_or(0);
                 match db.get_internal_task(task_id).await {
-                    Ok(task) => {
-                        match task.status {
-                            TaskStatus::New | TaskStatus::Routed | TaskStatus::InProgress => {
-                                tracing::debug!(
-                                    job_id = job.id,
-                                    task_id,
-                                    "skipping: previous internal task still active"
-                                );
-                                continue;
-                            }
-                            TaskStatus::Done | TaskStatus::Blocked => {
-                                tracing::debug!(
-                                    job_id = job.id,
-                                    task_id,
-                                    "previous internal task terminal, clearing"
-                                );
-                                job.active_task_id = None;
-                            }
+                    Ok(task) => match task.status {
+                        TaskStatus::New | TaskStatus::Routed | TaskStatus::InProgress => {
+                            tracing::debug!(
+                                job_id = job.id,
+                                task_id,
+                                "skipping: previous internal task still active"
+                            );
+                            continue;
                         }
-                    }
+                        TaskStatus::Done | TaskStatus::Blocked => {
+                            tracing::debug!(
+                                job_id = job.id,
+                                task_id,
+                                "previous internal task terminal, clearing"
+                            );
+                            job.active_task_id = None;
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(
                             job_id = job.id,
@@ -216,12 +216,20 @@ pub async fn tick(
                             .await
                         {
                             Ok(ext_id) => {
-                                tracing::info!(job_id = job.id, task_id = ext_id.0, "created external task");
+                                tracing::info!(
+                                    job_id = job.id,
+                                    task_id = ext_id.0,
+                                    "created external task"
+                                );
                                 job.active_task_id = Some(ext_id.0);
                                 job.last_task_status = Some("new".to_string());
                             }
                             Err(e) => {
-                                tracing::error!(job_id = job.id, ?e, "failed to create external task");
+                                tracing::error!(
+                                    job_id = job.id,
+                                    ?e,
+                                    "failed to create external task"
+                                );
                                 job.last_task_status = Some("failed".to_string());
                             }
                         }
@@ -231,7 +239,11 @@ pub async fn tick(
                             .await
                         {
                             Ok(id) => {
-                                tracing::info!(job_id = job.id, task_id = id, "created internal task");
+                                tracing::info!(
+                                    job_id = job.id,
+                                    task_id = id,
+                                    "created internal task"
+                                );
                                 job.active_task_id = Some(id.to_string());
                                 job.last_task_status = Some("new".to_string());
                                 if let Some(ref agent) = template.agent {
@@ -241,7 +253,11 @@ pub async fn tick(
                                 }
                             }
                             Err(e) => {
-                                tracing::error!(job_id = job.id, ?e, "failed to create internal task");
+                                tracing::error!(
+                                    job_id = job.id,
+                                    ?e,
+                                    "failed to create internal task"
+                                );
                                 job.last_task_status = Some("failed".to_string());
                             }
                         }

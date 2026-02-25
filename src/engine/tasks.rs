@@ -81,7 +81,9 @@ impl TaskManager {
         if let Some(status) = &filter.status {
             let internal_tasks = self
                 .db
-                .list_internal_tasks_by_status(TaskStatus::from_str(status).unwrap_or(TaskStatus::New))
+                .list_internal_tasks_by_status(
+                    TaskStatus::from_str(status).unwrap_or(TaskStatus::New),
+                )
                 .await?;
             for t in internal_tasks {
                 tasks.push(Task::Internal(t));
@@ -89,7 +91,10 @@ impl TaskManager {
         }
 
         if let Some(source) = &filter.source {
-            let all_internal = self.db.list_internal_tasks_by_status(TaskStatus::New).await?;
+            let all_internal = self
+                .db
+                .list_internal_tasks_by_status(TaskStatus::New)
+                .await?;
             let filtered: Vec<InternalTask> = all_internal
                 .into_iter()
                 .filter(|t| t.source == *source)
@@ -100,7 +105,10 @@ impl TaskManager {
         }
 
         if filter.status.is_none() && filter.source.is_none() {
-            let internal_tasks = self.db.list_internal_tasks_by_status(TaskStatus::New).await?;
+            let internal_tasks = self
+                .db
+                .list_internal_tasks_by_status(TaskStatus::New)
+                .await?;
             for t in internal_tasks {
                 tasks.push(Task::Internal(t));
             }
@@ -149,7 +157,9 @@ impl TaskManager {
             .backend
             .create_task(&internal.title, &internal.body, labels)
             .await?;
-        self.db.update_internal_task_status(id, TaskStatus::Done).await?;
+        self.db
+            .update_internal_task_status(id, TaskStatus::Done)
+            .await?;
         Ok(ext_id)
     }
 }
