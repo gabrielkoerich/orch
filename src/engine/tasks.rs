@@ -39,7 +39,6 @@ pub struct TaskManager {
     backend: Arc<dyn ExternalBackend>,
 }
 
-#[allow(dead_code)] // Public API methods available for CLI and future engine use
 impl TaskManager {
     pub fn new(db: Arc<Db>, backend: Arc<dyn ExternalBackend>) -> Self {
         Self { db, backend }
@@ -69,10 +68,14 @@ impl TaskManager {
     pub async fn get_task(&self, id: i64) -> anyhow::Result<Task> {
         match self.db.get_internal_task(id).await {
             Ok(internal) => Ok(Task::Internal(internal)),
-            Err(_) => {
+            Err(internal_err) => {
                 let ext_id = ExternalId(id.to_string());
-                let external = self.backend.get_task(&ext_id).await?;
-                Ok(Task::External(external))
+                match self.backend.get_task(&ext_id).await {
+                    Ok(external) => Ok(Task::External(external)),
+                    Err(external_err) => Err(internal_err.context(format!(
+                        "task {id} not found internally or externally (external: {external_err})"
+                    ))),
+                }
             }
         }
     }
@@ -115,23 +118,16 @@ impl TaskManager {
                 tasks.push(Task::External(t));
             }
         } else if let Some(source) = &filter.source {
-            // Only source filter, no status filter
-            // For now, only internal tasks have a source field
-            let all_internal = self
-                .db
-                .list_internal_tasks_by_status(TaskStatus::New)
-                .await?;
+            // Only source filter — query all internal tasks across all statuses
+            let all_internal = self.db.list_all_internal_tasks().await?;
             for t in all_internal {
                 if t.source == *source {
                     tasks.push(Task::Internal(t));
                 }
             }
         } else {
-            // No filters - return all new tasks (both internal and external)
-            let internal_tasks = self
-                .db
-                .list_internal_tasks_by_status(TaskStatus::New)
-                .await?;
+            // No filters — return all internal tasks + new external tasks
+            let internal_tasks = self.db.list_all_internal_tasks().await?;
             for t in internal_tasks {
                 tasks.push(Task::Internal(t));
             }
@@ -153,6 +149,7 @@ impl TaskManager {
     }
 
     /// Get internal tasks by status (for engine use)
+    #[allow(dead_code)]
     pub async fn list_internal_by_status(
         &self,
         status: TaskStatus,
@@ -160,6 +157,7 @@ impl TaskManager {
         self.db.list_internal_tasks_by_status(status).await
     }
 
+    #[allow(dead_code)]
     pub async fn update_status(&self, id: i64, status: Status) -> anyhow::Result<()> {
         match self.db.get_internal_task(id).await {
             Ok(_) => {
@@ -181,6 +179,7 @@ impl TaskManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn delete_task(&self, id: i64) -> anyhow::Result<()> {
         match self.db.get_internal_task(id).await {
             Ok(_) => self.db.delete_internal_task(id).await,
@@ -206,6 +205,7 @@ impl TaskManager {
     /// Unblock parent tasks whose children are all done.
     ///
     /// Returns the list of task IDs that were unblocked.
+    #[allow(dead_code)]
     pub async fn unblock_parents(&self) -> anyhow::Result<Vec<i64>> {
         let blocked = self.backend.list_by_status(Status::Blocked).await?;
         let mut unblocked = Vec::new();
@@ -270,33 +270,33 @@ impl TaskManager {
     }
 
     /// Assign an agent to a task (route the task to a specific agent)
+    #[allow(dead_code)]
     pub async fn route_task(&self, id: i64, agent: &str) -> anyhow::Result<()> {
         match self.db.get_internal_task(id).await {
             Ok(_) => {
-                // Internal task: set the agent field and update status to routed
                 self.db.set_internal_task_agent(id, Some(agent)).await?;
                 self.db
                     .update_internal_task_status(id, TaskStatus::Routed)
-                    .await?;
-                Ok(())
+                    .await
             }
-            Err(_) => {
-                // External task: use backend to add the agent label
+            Err(internal_err) => {
+                // Verify the external task exists before operating on it
                 let ext_id = ExternalId(id.to_string());
-                // Add agent label (e.g., "agent:claude")
+                self.backend.get_task(&ext_id).await.map_err(|e| {
+                    internal_err.context(format!("task {id} not found (external: {e})"))
+                })?;
                 let agent_label = format!("agent:{}", agent);
                 self.backend.set_labels(&ext_id, &[agent_label]).await?;
-                // Update status to routed
                 self.backend.update_status(&ext_id, Status::Routed).await
             }
         }
     }
 
     /// Mark a task as blocked with a reason
+    #[allow(dead_code)]
     pub async fn block_task(&self, id: i64, reason: &str) -> anyhow::Result<()> {
         match self.db.get_internal_task(id).await {
             Ok(_) => {
-                // Internal task: set block reason and update status
                 self.db
                     .set_internal_task_block_reason(id, Some(reason))
                     .await?;
@@ -304,9 +304,11 @@ impl TaskManager {
                     .update_internal_task_status(id, TaskStatus::Blocked)
                     .await
             }
-            Err(_) => {
-                // External task: post a comment with the reason and update status
+            Err(internal_err) => {
                 let ext_id = ExternalId(id.to_string());
+                self.backend.get_task(&ext_id).await.map_err(|e| {
+                    internal_err.context(format!("task {id} not found (external: {e})"))
+                })?;
                 let comment = format!("Task blocked: {}", reason);
                 self.backend.post_comment(&ext_id, &comment).await?;
                 self.backend.update_status(&ext_id, Status::Blocked).await
@@ -314,23 +316,21 @@ impl TaskManager {
         }
     }
 
-    /// Unblock a task (check if all children are done first)
+    /// Unblock a task
+    #[allow(dead_code)]
     pub async fn unblock_task(&self, id: i64) -> anyhow::Result<()> {
         match self.db.get_internal_task(id).await {
             Ok(_) => {
-                // Internal task: check if children are done, then unblock
-                let all_children_done = self.db.are_all_children_done(id).await?;
-                if !all_children_done {
-                    anyhow::bail!("Cannot unblock: not all child tasks are done");
-                }
                 self.db.set_internal_task_block_reason(id, None).await?;
                 self.db
                     .update_internal_task_status(id, TaskStatus::New)
                     .await
             }
-            Err(_) => {
-                // External task: unblock directly
+            Err(internal_err) => {
                 let ext_id = ExternalId(id.to_string());
+                self.backend.get_task(&ext_id).await.map_err(|e| {
+                    internal_err.context(format!("task {id} not found (external: {e})"))
+                })?;
                 self.backend.update_status(&ext_id, Status::New).await
             }
         }

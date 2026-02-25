@@ -276,11 +276,36 @@ impl Db {
         Ok(())
     }
 
-    /// Check if all children of a task are done (for unblocking parents)
-    pub async fn are_all_children_done(&self, _parent_id: i64) -> anyhow::Result<bool> {
-        // TODO: Implement when sub-task relationships are added to schema
-        // For now, return true to allow unblocking
-        Ok(true)
+    /// List all internal tasks regardless of status.
+    pub async fn list_all_internal_tasks(&self) -> anyhow::Result<Vec<InternalTask>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, body, status, source, source_id, agent, block_reason, created_at, updated_at
+             FROM internal_tasks ORDER BY created_at DESC",
+        )?;
+        let tasks = stmt.query_map([], |row| {
+            let status_str: String = row.get(3)?;
+            let created_str: String = row.get(8)?;
+            let updated_str: String = row.get(9)?;
+            Ok(InternalTask {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                body: row.get(2)?,
+                status: TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::New),
+                source: row.get(4)?,
+                source_id: row.get(5)?,
+                agent: row.get(6)?,
+                block_reason: row.get(7)?,
+                created_at: DateTime::parse_from_rfc3339(&created_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                updated_at: DateTime::parse_from_rfc3339(&updated_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        let result: Vec<InternalTask> = tasks.filter_map(|t| t.ok()).collect();
+        Ok(result)
     }
 }
 
