@@ -55,15 +55,13 @@ impl ExternalBackend for GitHubBackend {
         })
     }
 
-    async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
-        // Ensure the target status label exists on the repo before assigning it.
-        // Mirrors bash `_gh_ensure_label` — creates the label on first use so
-        // callers never have to pre-create labels manually.  Failures are
-        // tolerated: if creation fails we still attempt the assign below.
-        let label = status.as_label();
+    // update_status uses the default trait implementation (retry loop with
+    // get_task → remove_label → set_labels). Only ensure_status_label is
+    // overridden to auto-create labels on the GitHub repo.
+
+    async fn ensure_status_label(&self, label: &str) -> anyhow::Result<()> {
         let status_name = &label["status:".len()..];
-        if let Err(e) = self
-            .gh
+        self.gh
             .ensure_label(
                 &self.repo,
                 label,
@@ -71,78 +69,6 @@ impl ExternalBackend for GitHubBackend {
                 &format!("Task status: {status_name}"),
             )
             .await
-        {
-            tracing::warn!(label, err = %e, "ensure_label failed, continuing with label updates");
-        }
-
-        // Retry loop to narrow the TOCTOU window and handle transient failures.
-        //
-        // True atomicity is not achievable via the GitHub label API (no CAS
-        // endpoint exists). Retrying with a fresh GET on each attempt reduces
-        // the probability of leaving the task with duplicate or missing status
-        // labels under concurrent modification.
-        //
-        // Error-handling contract:
-        //   - `remove_label` already treats 404 as success (label already gone).
-        //     We propagate all other errors rather than swallowing them, so
-        //     auth failures, rate-limit responses, and network errors are surfaced.
-        //   - If `add_labels` fails after successful removes, we retry the whole
-        //     operation instead of leaving the task with no status label.
-        const MAX_RETRIES: u32 = 3;
-        let mut last_err = anyhow::anyhow!("update_status: no attempts made");
-
-        for attempt in 0..MAX_RETRIES {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)))
-                    .await;
-                tracing::debug!(attempt, label, "retrying update_status");
-            }
-
-            // Fresh snapshot on every attempt to minimise the TOCTOU window.
-            let task = match self.get_task(id).await {
-                Ok(t) => t,
-                Err(e) => {
-                    last_err = e;
-                    continue;
-                }
-            };
-
-            // Remove all existing status labels except the target.
-            // GhCli::remove_label treats 404 as success; all other errors propagate.
-            let mut remove_failed = false;
-            for old in task
-                .labels
-                .iter()
-                .filter(|l| l.starts_with("status:") && l.as_str() != label)
-            {
-                if let Err(e) = self.gh.remove_label(&self.repo, &id.0, old).await {
-                    tracing::warn!(old_label = %old, err = %e, attempt, "remove_label failed");
-                    last_err = e;
-                    remove_failed = true;
-                    break;
-                }
-            }
-            if remove_failed {
-                continue;
-            }
-
-            // Add the target status label.
-            match self
-                .gh
-                .add_labels(&self.repo, &id.0, &[label.to_string()])
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    tracing::warn!(label, err = %e, attempt, "add_labels failed");
-                    last_err = e;
-                }
-            }
-        }
-
-        Err(last_err.context(format!(
-            "update_status({label}) failed after {MAX_RETRIES} attempts"
-        )))
     }
 
     async fn list_by_status(&self, status: Status) -> anyhow::Result<Vec<ExternalTask>> {
