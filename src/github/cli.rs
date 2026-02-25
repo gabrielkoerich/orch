@@ -298,18 +298,8 @@ impl GhCli {
     pub async fn is_pr_merged(&self, repo: &str, branch: &str) -> anyhow::Result<bool> {
         let output = Command::new("gh")
             .args([
-                "pr",
-                "list",
-                "--repo",
-                repo,
-                "--head",
-                branch,
-                "--state",
-                "merged",
-                "--json",
-                "number",
-                "--limit",
-                "1",
+                "pr", "list", "--repo", repo, "--head", branch, "--state", "merged", "--json",
+                "number", "--limit", "1",
             ])
             .output()
             .await?;
