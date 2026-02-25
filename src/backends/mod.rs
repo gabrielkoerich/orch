@@ -166,7 +166,9 @@ pub trait ExternalBackend: Send + Sync {
     /// Post a comment / activity note.
     async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()>;
 
-    /// Set metadata labels / tags.
+    /// Add metadata labels / tags (additive — does not remove existing labels).
+    /// The GitHub backend uses POST /repos/{repo}/issues/{number}/labels,
+    /// which appends to the existing label set.
     #[allow(dead_code)]
     async fn set_labels(&self, id: &ExternalId, labels: &[String]) -> anyhow::Result<()>;
 

@@ -61,6 +61,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # Command discovery for agents
 which = "7"
 
+# Async combinators (FuturesUnordered for concurrent routing)
+futures = "0.3"
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"

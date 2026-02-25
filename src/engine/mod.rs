@@ -290,7 +290,7 @@ async fn tick(
                     tracing::warn!(task_id = task.id.0, ?e, "failed to store route result");
                 }
 
-                // Add agent and complexity labels for visibility
+                // Add agent and complexity labels (additive — does not remove existing labels)
                 let labels = vec![
                     format!("agent:{}", result.agent),
                     format!("complexity:{}", result.complexity),
@@ -322,7 +322,9 @@ async fn tick(
         }
     }
 
-    // Phase 3b: Dispatch routed tasks
+    // Phase 3b: Dispatch routed tasks.
+    // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
+    // but we keep this filter as defense-in-depth.
     let routed_tasks = task_manager.list_external_by_status(Status::Routed).await?;
     let dispatchable: Vec<&ExternalTask> = routed_tasks
         .iter()
