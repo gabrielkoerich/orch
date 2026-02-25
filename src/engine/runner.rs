@@ -65,24 +65,50 @@ impl TaskRunner {
     /// we kill it and release the semaphore permit.
     const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-    pub async fn run(&self, task_id: &str) -> anyhow::Result<()> {
+    /// Run a task by delegating to `run_task.sh`.
+    ///
+    /// The `agent` and `model` parameters are optional. If provided, they are
+    /// passed to run_task.sh via environment variables (ORCH_AGENT, ORCH_MODEL).
+    pub async fn run(
+        &self,
+        task_id: &str,
+        agent: Option<&str>,
+        model: Option<&str>,
+    ) -> anyhow::Result<()> {
         let script = self.scripts_dir.join("run_task.sh");
 
         if !script.exists() {
             anyhow::bail!("run_task.sh not found at {}", script.display());
         }
 
-        tracing::info!(task_id, script = %script.display(), "spawning run_task.sh");
+        tracing::info!(
+            task_id,
+            agent = agent.unwrap_or("default"),
+            model = model.unwrap_or("default"),
+            script = %script.display(),
+            "spawning run_task.sh"
+        );
+
+        // Build command with environment variables
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
+            .arg(task_id)
+            .env("ORCH_HOME", &self.orch_home)
+            .env("GH_REPO", &self.repo)
+            .env("PROJECT_DIR", self.project_dir()?);
+
+        // Pass agent and model if provided
+        if let Some(agent) = agent {
+            cmd.env("ORCH_AGENT", agent);
+        }
+        if let Some(model) = model {
+            cmd.env("ORCH_MODEL", model);
+        }
 
         // Use Stdio::inherit() — run_task.sh handles its own output
         // (GitHub comments, logging, git). Piped I/O would deadlock if the
         // child writes more than the OS pipe buffer (~64KB) before we read.
-        let mut child = Command::new("bash")
-            .arg(&script)
-            .arg(task_id)
-            .env("ORCH_HOME", &self.orch_home)
-            .env("GH_REPO", &self.repo)
-            .env("PROJECT_DIR", self.project_dir()?)
+        let mut child = cmd
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .spawn()
