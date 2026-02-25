@@ -211,7 +211,10 @@ impl TaskManager {
             }
 
             if all_done {
-                tracing::info!(task_id = task.id.0, "all sub-tasks completed, unblocking parent");
+                tracing::info!(
+                    task_id = task.id.0,
+                    "all sub-tasks completed, unblocking parent"
+                );
                 self.backend.update_status(&task.id, Status::New).await?;
                 self.backend
                     .post_comment(
