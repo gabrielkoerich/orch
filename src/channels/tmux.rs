@@ -149,6 +149,23 @@ pub async fn list_orch_sessions() -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
+/// Check if a tmux session is dead (no longer exists).
+///
+/// Best-effort check — spawns `tmux has-session` to verify.
+/// Used by the capture service to detect ended sessions and send
+/// final output chunks.
+pub async fn is_session_dead(session: &str) -> bool {
+    let output = tokio::process::Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .output()
+        .await;
+
+    match output {
+        Ok(output) => !output.status.success(),
+        Err(_) => true,
+    }
+}
+
 /// Background loop that captures tmux output every 2 seconds for active sessions.
 ///
 /// Runs continuously:

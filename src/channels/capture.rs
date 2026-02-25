@@ -162,8 +162,22 @@ impl CaptureService {
                         }
                     }
                     Err(e) => {
-                        // Session might have ended - don't spam logs
-                        tracing::trace!(task_id, session = buffer.session, ?e, "capture failed");
+                        // Check if session is dead (no longer exists)
+                        if tmux::is_session_dead(&buffer.session).await {
+                            tracing::debug!(task_id, session = buffer.session, "session ended, sending final chunk");
+                            // Send final chunk to signal stream termination
+                            let chunk = OutputChunk {
+                                task_id: task_id.clone(),
+                                content: String::new(),
+                                timestamp: Utc::now(),
+                                is_final: true,
+                            };
+                            self.transport.push_output(&task_id, chunk).await;
+                            self.unregister_session(&task_id).await;
+                        } else {
+                            // Session still exists but capture failed - don't spam logs
+                            tracing::trace!(task_id, session = buffer.session, ?e, "capture failed");
+                        }
                     }
                 }
             }
