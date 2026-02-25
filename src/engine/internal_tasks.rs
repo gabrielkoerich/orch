@@ -9,6 +9,8 @@
 //! - update_internal_task_status
 //! - delete_internal_task
 
+#![allow(dead_code)]
+
 use crate::backends::Status;
 use crate::db::Db;
 use anyhow::Context;

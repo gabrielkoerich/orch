@@ -16,6 +16,7 @@
 
 pub mod internal_tasks;
 pub mod jobs;
+pub mod router;
 mod runner;
 pub mod tasks;
 
@@ -25,6 +26,7 @@ use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
 use crate::channels::ChannelRegistry;
 use crate::db::Db;
+use crate::engine::router::{get_route_result, RouteResult};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use internal_tasks::{list_internal_tasks_by_status, update_internal_task_status, InternalTask};
@@ -34,11 +36,13 @@ use tokio::sync::Semaphore;
 
 /// Source of a unified task — either external (GitHub) or internal (SQLite).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum TaskSource {
     External(String), // External ID (e.g., GitHub issue number)
     Internal(i64),    // SQLite row ID
 }
 
+#[allow(dead_code)]
 impl TaskSource {
     /// Returns true if this is an internal task.
     pub fn is_internal(&self) -> bool {
@@ -64,6 +68,7 @@ impl TaskSource {
 
 /// A unified task that can come from either external (GitHub) or internal (SQLite) sources.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct UnifiedTask {
     pub id: String,
     pub title: String,
@@ -456,10 +461,24 @@ async fn tick(
         let capture = capture.clone();
         let task_id_for_cleanup = task_id.clone();
 
+        // Load routing result from sidecar for external tasks
+        let route_result = if !is_internal {
+            get_route_result(&task_id).ok()
+        } else {
+            None
+        };
+
         tokio::spawn(async move {
             tracing::info!(task_id, is_internal, "dispatching task");
 
-            match runner.run(&task_id).await {
+            // Pass agent/model to runner via environment variables
+            let agent = route_result.as_ref().map(|r: &RouteResult| r.agent.clone());
+            let model = route_result.as_ref().and_then(|r| r.model.clone());
+
+            match runner
+                .run(&task_id, agent.as_deref(), model.as_deref())
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(task_id, "task runner completed");
                 }

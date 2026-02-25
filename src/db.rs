@@ -72,6 +72,7 @@ pub struct Db {
     conn: Arc<Mutex<Connection>>,
 }
 
+#[allow(dead_code)]
 impl Db {
     /// Open (or create) the database at the given path.
     pub fn open(path: &PathBuf) -> anyhow::Result<Self> {
