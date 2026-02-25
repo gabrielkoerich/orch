@@ -14,7 +14,9 @@
 //! Phase 2 approach: Rust owns the loop, `run_task.sh` still handles agent
 //! invocation, git workflow, and prompt building.
 
+pub mod internal_tasks;
 pub mod jobs;
+pub mod router;
 mod runner;
 pub mod tasks;
 
@@ -24,6 +26,7 @@ use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
 use crate::channels::ChannelRegistry;
 use crate::db::{Db, TaskStatus};
+use crate::engine::router::{get_route_result, RouteResult};
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
@@ -304,10 +307,20 @@ async fn tick(
         let capture = capture.clone();
         let task_id_for_cleanup = task_id.clone();
 
+        // Load routing result from sidecar
+        let route_result = get_route_result(&task_id).ok();
+
         tokio::spawn(async move {
             tracing::info!(task_id, "dispatching task");
 
-            match runner.run(&task_id).await {
+            // Pass agent/model to runner via environment variables
+            let agent = route_result.as_ref().map(|r: &RouteResult| r.agent.clone());
+            let model = route_result.as_ref().and_then(|r| r.model.clone());
+
+            match runner
+                .run(&task_id, agent.as_deref(), model.as_deref())
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(task_id, "task runner completed");
                 }
@@ -365,10 +378,7 @@ async fn sync_tick(
     tracing::debug!("sync tick");
 
     // Try to get GitHub backend for repo-specific operations
-    let gh_backend = backend
-        .as_ref()
-        .as_any()
-        .downcast_ref::<GitHubBackend>();
+    let gh_backend = backend.as_ref().as_any().downcast_ref::<GitHubBackend>();
 
     if let Some(gh) = gh_backend {
         let gh_cli = gh.gh();
@@ -517,7 +527,10 @@ async fn check_merged_prs(
     repo: &str,
 ) -> anyhow::Result<()> {
     let in_review_tasks = backend.list_by_status(Status::InReview).await?;
-    tracing::debug!(count = in_review_tasks.len(), "checking in_review tasks for merged PRs");
+    tracing::debug!(
+        count = in_review_tasks.len(),
+        "checking in_review tasks for merged PRs"
+    );
 
     for task in in_review_tasks {
         let task_id = &task.id.0;
@@ -615,10 +628,7 @@ async fn scan_mentions(
         // Extract issue number from URL if possible
         // Create internal task for this mention
         let title = format!("Respond to mention in {}", repo);
-        let task_body = format!(
-            "Mention by @{}:\n\n{}",
-            comment.user.login, body
-        );
+        let task_body = format!("Mention by @{}:\n\n{}", comment.user.login, body);
 
         let task_id = db
             .create_internal_task(&title, &task_body, "mention", &comment_id.to_string())
@@ -633,10 +643,7 @@ async fn scan_mentions(
 /// Review open PRs (optional feature).
 ///
 /// Lists open PRs and triggers review agent if configured.
-async fn review_open_prs(
-    backend: &Arc<dyn ExternalBackend>,
-    _repo: &str,
-) -> anyhow::Result<()> {
+async fn review_open_prs(backend: &Arc<dyn ExternalBackend>, _repo: &str) -> anyhow::Result<()> {
     // Check if review agent is enabled
     let review_enabled = crate::config::get("enable_review_agent")
         .map(|v| v == "true")

@@ -5,12 +5,30 @@
 
 use super::types::{GitHubComment, GitHubIssue};
 use tokio::process::Command;
+use urlencoding;
 
 pub struct GhCli;
 
 impl GhCli {
     pub fn new() -> Self {
         Self
+    }
+
+    pub async fn graphql(&self, query: &str) -> anyhow::Result<serde_json::Value> {
+        let output = Command::new("gh")
+            .arg("api")
+            .arg("graphql")
+            .arg("-f")
+            .arg(format!("query={}", urlencoding::encode(query)))
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api graphql failed: {stderr}");
+        }
+
+        Ok(serde_json::from_slice(&output.stdout)?)
     }
 
     /// Run `gh api` with args and return raw JSON bytes.
@@ -297,13 +315,15 @@ impl GhCli {
     pub async fn is_pr_merged(&self, repo: &str, branch: &str) -> anyhow::Result<bool> {
         // Search for PRs with this branch as head
         let endpoint = format!("repos/{repo}/pulls");
-        let json = self.api(&[
-            &endpoint,
-            "-f",
-            &format!("head={}", branch),
-            "-f",
-            "per_page=1",
-        ]).await?;
+        let json = self
+            .api(&[
+                &endpoint,
+                "-f",
+                &format!("head={}", branch),
+                "-f",
+                "per_page=1",
+            ])
+            .await?;
 
         // Parse the response - if we get an empty array, there's no PR for this branch
         let prs: Vec<serde_json::Value> = serde_json::from_slice(&json)?;
@@ -324,15 +344,17 @@ impl GhCli {
     pub async fn get_notifications(&self) -> anyhow::Result<Vec<serde_json::Value>> {
         // Get all unread notifications
         let endpoint = "notifications";
-        let json = self.api(&[
-            endpoint,
-            "-f",
-            "all=false",
-            "-f",
-            "participating=false",
-            "-f",
-            "per_page=50",
-        ]).await?;
+        let json = self
+            .api(&[
+                endpoint,
+                "-f",
+                "all=false",
+                "-f",
+                "participating=false",
+                "-f",
+                "per_page=50",
+            ])
+            .await?;
 
         let notifications: Vec<serde_json::Value> = serde_json::from_slice(&json)?;
         Ok(notifications)
@@ -376,13 +398,15 @@ impl GhCli {
         since: &str,
     ) -> anyhow::Result<Vec<GitHubComment>> {
         let endpoint = format!("repos/{repo}/issues/comments");
-        let json = self.api(&[
-            &endpoint,
-            "-f",
-            &format!("since={}", since),
-            "-f",
-            "per_page=100",
-        ]).await?;
+        let json = self
+            .api(&[
+                &endpoint,
+                "-f",
+                &format!("since={}", since),
+                "-f",
+                "per_page=100",
+            ])
+            .await?;
         Ok(serde_json::from_slice(&json)?)
     }
 
@@ -394,6 +418,53 @@ impl GhCli {
             .and_then(|v| v.as_str())
             .map(String::from)
             .ok_or_else(|| anyhow::anyhow!("failed to get current user"))
+    }
+
+    pub async fn get_sub_issues(&self, repo: &str, number: &str) -> anyhow::Result<Vec<u64>> {
+        // Parse owner and repo from "owner/repo" format
+        let parts: Vec<&str> = repo.split('/').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("invalid repo format: expected 'owner/repo', got '{}'", repo);
+        }
+        let (owner, repo_name) = (parts[0], parts[1]);
+
+        // GraphQL query to get sub-issues
+        let query = format!(
+            r#"{{
+                repository(owner: "{}", name: "{}") {{
+                    issue(number: {}) {{
+                        subIssues(first: 100) {{
+                            nodes {{
+                                number
+                            }}
+                        }}
+                    }}
+                }}
+            }}"#,
+            owner, repo_name, number
+        );
+
+        let result = self.graphql(&query).await?;
+
+        // Parse the response to extract sub-issue numbers
+        let sub_issues = result
+            .get("data")
+            .and_then(|d| d.get("repository"))
+            .and_then(|r| r.get("issue"))
+            .and_then(|i| i.get("subIssues"))
+            .and_then(|s| s.get("nodes"))
+            .and_then(|n| n.as_array());
+
+        match sub_issues {
+            Some(nodes) => {
+                let numbers: Vec<u64> = nodes
+                    .iter()
+                    .filter_map(|n| n.get("number").and_then(|num| num.as_u64()))
+                    .collect();
+                Ok(numbers)
+            }
+            None => Ok(vec![]), // No sub-issues or issue not found
+        }
     }
 }
 
