@@ -3,9 +3,7 @@
 //! All GitHub API calls go through `gh api`. Auth is handled by `gh`.
 //! We build the command args in Rust and deserialize the JSON output via serde.
 
-#![allow(dead_code)]
-
-use super::types::{GitHubComment, GitHubIssue, GitHubPullRequest};
+use super::types::{GitHubComment, GitHubIssue};
 use tokio::process::Command;
 
 pub struct GhCli;
@@ -293,58 +291,46 @@ impl GhCli {
         Ok(serde_json::from_slice(&json)?)
     }
 
-    /// List repository issue comments (for mention scanning).
+    /// Check whether a PR for the given branch has been merged.
     ///
-    /// Uses `--paginate` to fetch all pages.
-    pub async fn list_issue_comments(
+    /// Uses `gh pr list --state merged --head {branch}` — returns true when at
+    /// least one merged PR exists for that branch in the repo.
+    pub async fn is_pr_merged(&self, repo: &str, branch: &str) -> anyhow::Result<bool> {
+        let output = Command::new("gh")
+            .args([
+                "pr", "list", "--repo", repo, "--head", branch, "--state", "merged", "--json",
+                "number", "--limit", "1",
+            ])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh pr list failed: {stderr}");
+        }
+        let prs: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        Ok(prs.as_array().map(|a| !a.is_empty()).unwrap_or(false))
+    }
+
+    /// List recent issue comments across the whole repo, updated since `since`.
+    ///
+    /// `since` must be an ISO-8601 timestamp (e.g. "2026-01-01T00:00:00Z").
+    /// Returns up to 100 comments.  Call repeatedly with an advancing `since`
+    /// to avoid re-processing old comments.
+    pub async fn list_recent_comments(
         &self,
         repo: &str,
         since: &str,
     ) -> anyhow::Result<Vec<GitHubComment>> {
         let endpoint = format!("repos/{repo}/issues/comments");
+        let since_field = format!("since={since}");
         let output = Command::new("gh")
-            .arg("api")
-            .arg("--paginate")
             .args([
+                "api",
                 &endpoint,
                 "-X",
                 "GET",
                 "-f",
-                &format!("since={since}"),
-                "-f",
-                "per_page=100",
-                "-f",
-                "sort=created",
-                "-f",
-                "direction=desc",
-            ])
-            .output()
-            .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("gh api failed: {stderr}");
-        }
-        Ok(serde_json::from_slice(&output.stdout)?)
-    }
-
-    /// List pull requests.
-    ///
-    /// Uses `--paginate` to fetch all pages.
-    pub async fn list_pulls(
-        &self,
-        repo: &str,
-        state: &str, // open, closed, all
-    ) -> anyhow::Result<Vec<GitHubPullRequest>> {
-        let endpoint = format!("repos/{repo}/pulls");
-        let output = Command::new("gh")
-            .arg("api")
-            .arg("--paginate")
-            .args([
-                &endpoint,
-                "-X",
-                "GET",
-                "-f",
-                &format!("state={state}"),
+                &since_field,
                 "-f",
                 "per_page=100",
             ])
@@ -357,65 +343,13 @@ impl GhCli {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
-    /// Get a single pull request.
-    #[allow(dead_code)]
-    pub async fn get_pull(&self, repo: &str, number: u64) -> anyhow::Result<GitHubPullRequest> {
-        let endpoint = format!("repos/{repo}/pulls/{number}");
-        let json = self.api(&[&endpoint]).await?;
-        Ok(serde_json::from_slice(&json)?)
-    }
-
-    /// Search for merged PRs that close a specific issue.
-    ///
-    /// Returns the PR number if found.
-    pub async fn find_merged_pr_for_issue(
-        &self,
-        repo: &str,
-        issue_number: &str,
-    ) -> anyhow::Result<Option<u64>> {
-        // Use gh pr list with search
-        let output = Command::new("gh")
-            .args([
-                "pr",
-                "list",
-                "--repo",
-                repo,
-                "--state",
-                "merged",
-                "--search",
-                &format!("closes #{issue_number}"),
-                "--json",
-                "number",
-            ])
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::debug!("gh pr list failed: {stderr}");
-            return Ok(None);
-        }
-
-        let results: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
-        Ok(results.first().and_then(|v| v["number"].as_u64()))
-    }
-
-    /// Post a PR review (approve or request changes).
-    pub async fn post_pr_review(
-        &self,
-        repo: &str,
-        pr_number: u64,
-        event: &str, // APPROVE, REQUEST_CHANGES, COMMENT
-        body: &str,
-    ) -> anyhow::Result<()> {
-        let endpoint = format!("repos/{repo}/pulls/{pr_number}/reviews");
-        let payload = serde_json::json!({
-            "event": event,
-            "body": body,
-        });
+    /// Close a GitHub issue (PATCH state=closed).
+    pub async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
+        let endpoint = format!("repos/{repo}/issues/{number}");
+        let payload = serde_json::json!({ "state": "closed" });
         let mut child = Command::new("gh")
             .arg("api")
-            .args([&endpoint, "-X", "POST", "--input", "-"])
+            .args([&endpoint, "-X", "PATCH", "--input", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -429,6 +363,36 @@ impl GhCli {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("gh api failed: {stderr}");
+        }
+        Ok(())
+    }
+
+    /// Delete a branch in a bare-clone git dir (local branch cleanup).
+    ///
+    /// Uses `git --git-dir={git_dir} branch -D {branch}`.
+    /// Returns Ok if the branch was deleted or didn't exist.
+    pub async fn delete_local_branch(
+        &self,
+        git_dir: &std::path::Path,
+        branch: &str,
+    ) -> anyhow::Result<()> {
+        let output = Command::new("git")
+            .args([
+                "--git-dir",
+                &git_dir.to_string_lossy(),
+                "branch",
+                "-D",
+                branch,
+            ])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Treat "branch not found" as success
+            if stderr.contains("not found") || stderr.contains("error: branch") {
+                return Ok(());
+            }
+            anyhow::bail!("git branch -D failed: {stderr}");
         }
         Ok(())
     }
