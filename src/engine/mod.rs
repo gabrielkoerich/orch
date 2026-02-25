@@ -14,26 +14,23 @@
 //! Phase 2 approach: Rust owns the loop, `run_task.sh` still handles agent
 //! invocation, git workflow, and prompt building.
 
-pub mod internal_tasks;
 pub mod jobs;
-pub mod router;
 mod runner;
 pub mod tasks;
 
 use crate::backends::github::GitHubBackend;
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
-use crate::channels::tmux::TmuxChannel;
-use crate::channels::transport::{MessageRoute, Transport};
-use crate::channels::ChannelRegistry;
-use crate::channels::IncomingMessage;
+use crate::channels::discord::DiscordChannel;
+use crate::channels::transport::Transport;
+use crate::channels::telegram::TelegramChannel;
+use crate::channels::{Channel, ChannelRegistry, OutgoingMessage};
 use crate::db::Db;
-use crate::engine::router::{get_route_result, RouteResult};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use runner::TaskRunner;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::Semaphore;
 
 /// Engine configuration.
 pub struct EngineConfig {
@@ -96,19 +93,43 @@ pub async fn serve() -> anyhow::Result<()> {
         capture.start().await;
     });
 
-    // Initialize channel registry with tmux channel wired to transport
+    // Initialize channel registry
     let mut channels = ChannelRegistry::new();
-    let tmux_channel = Box::new(TmuxChannel::with_transport(transport.clone()));
-    channels.register(tmux_channel);
 
-    // Spawn channel message handlers
-    let transport_for_handler = transport.clone();
-    let backend_for_handler = backend.clone();
-    tokio::spawn(async move {
-        if let Err(e) = channel_message_handler(transport_for_handler, backend_for_handler).await {
-            tracing::error!(?e, "channel message handler failed");
+    // Try to start Telegram if configured
+    if let Ok(token) = crate::config::get("channels.telegram.bot_token") {
+        if !token.is_empty() {
+            let chat_id = crate::config::get("channels.telegram.chat_id").ok();
+            let tg = Box::new(TelegramChannel::new(token, chat_id));
+            if tg.health_check().await.is_ok() {
+                if let Ok(_rx) = tg.start().await {
+                    tracing::info!("telegram channel started");
+                    channels.register(tg);
+                }
+            } else {
+                tracing::warn!("telegram health check failed, not starting");
+            }
         }
-    });
+    }
+
+    // Try to start Discord if configured
+    if let Ok(token) = crate::config::get("channels.discord.bot_token") {
+        if !token.is_empty() {
+            let channel_id = crate::config::get("channels.discord.channel_id").ok();
+            let dc = Box::new(DiscordChannel::new(token, channel_id));
+            if dc.health_check().await.is_ok() {
+                if let Ok(_rx) = dc.start().await {
+                    tracing::info!("discord channel started");
+                    channels.register(dc);
+                }
+            } else {
+                tracing::warn!("discord health check failed, not starting");
+            }
+        }
+    }
+
+    // Clone channels for task runner
+    let channels_for_runner = Arc::new(channels);
 
     // Task runner (delegates to run_task.sh)
     let runner = Arc::new(TaskRunner::new(repo));
@@ -142,13 +163,13 @@ pub async fn serve() -> anyhow::Result<()> {
                 if let Err(e) = tick(
                     &backend,
                     &tmux,
-                    &transport,
                     &runner,
                     &capture_for_tick,
                     &semaphore,
                     &config,
                     &jobs_path,
                     &db,
+                    &channels_for_runner,
                 ).await {
                     tracing::error!(?e, "tick failed");
                 }
@@ -182,6 +203,8 @@ pub async fn serve() -> anyhow::Result<()> {
         );
     }
 
+    // transport and channels drop here at end of scope
+    let _ = transport;
     tracing::info!("orch-core engine stopped");
     Ok(())
 }
@@ -196,13 +219,13 @@ pub async fn serve() -> anyhow::Result<()> {
 async fn tick(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
-    transport: &Arc<Transport>,
     runner: &Arc<TaskRunner>,
     capture: &Arc<CaptureService>,
     semaphore: &Arc<Semaphore>,
     config: &EngineConfig,
     jobs_path: &std::path::PathBuf,
     db: &Arc<Db>,
+    channels: &Arc<ChannelRegistry>,
 ) -> anyhow::Result<()> {
     // Phase 1: Check active tmux sessions for completions
     let session_snapshot = tmux.snapshot().await;
@@ -308,48 +331,33 @@ async fn tick(
             continue;
         }
 
-        // Register session for capture and transport
+        // Register session for capture
         let session_name = tmux.session_name(&task_id);
         capture.register_session(&task_id, &session_name).await;
-
-        // Register session with transport for output streaming
-        let tmux_session = session_name.clone();
-        let task_id_for_transport = task.id.0.clone();
-        let transport = transport.clone();
-        tokio::spawn(async move {
-            // Bind the session to the transport (use "engine" as channel since this is internal)
-            transport
-                .bind(&task_id_for_transport, &tmux_session, "engine", "main")
-                .await;
-            tracing::debug!(
-                task_id = task_id_for_transport,
-                session = tmux_session,
-                "registered session with transport"
-            );
-        });
 
         // Dispatch task
         let runner = runner.clone();
         let backend = backend.clone();
         let capture = capture.clone();
         let task_id_for_cleanup = task_id.clone();
-
-        // Load routing result from sidecar
-        let route_result = get_route_result(&task_id).ok();
+        let channels = channels.clone();
 
         tokio::spawn(async move {
             tracing::info!(task_id, "dispatching task");
 
-            // Pass agent/model to runner via environment variables
-            let agent = route_result.as_ref().map(|r: &RouteResult| r.agent.clone());
-            let model = route_result.as_ref().and_then(|r| r.model.clone());
-
-            match runner
-                .run(&task_id, agent.as_deref(), model.as_deref())
-                .await
-            {
+            match runner.run(&task_id).await {
                 Ok(()) => {
                     tracing::info!(task_id, "task runner completed");
+                    // Send completion notification to all channels
+                    let msg = OutgoingMessage {
+                        thread_id: task_id.clone(),
+                        body: format!("Task {} completed successfully", task_id),
+                        reply_to: None,
+                        metadata: serde_json::json!({"event": "task_complete"}),
+                    };
+                    for channel in channels.iter() {
+                        let _ = channel.send(&msg).await;
+                    }
                 }
                 Err(e) => {
                     tracing::error!(task_id, ?e, "task runner failed");
@@ -363,6 +371,16 @@ async fn tick(
                             ),
                         )
                         .await;
+                    // Send failure notification to all channels
+                    let msg = OutgoingMessage {
+                        thread_id: task_id.clone(),
+                        body: format!("Task {} failed: {e}", task_id),
+                        reply_to: None,
+                        metadata: serde_json::json!({"event": "task_failure"}),
+                    };
+                    for channel in channels.iter() {
+                        let _ = channel.send(&msg).await;
+                    }
                 }
             }
 
@@ -408,90 +426,4 @@ async fn sync_tick(
     // TODO: review open PRs
 
     Ok(())
-}
-
-/// Handle incoming messages from channels.
-///
-/// This runs as a background task and:
-/// 1. Receives messages from connected channels
-/// 2. Routes them via transport (determines task session or command)
-/// 3. Executes commands or forwards to tmux sessions
-async fn channel_message_handler(
-    transport: Arc<Transport>,
-    backend: Arc<dyn ExternalBackend>,
-) -> anyhow::Result<()> {
-    // Create a channel for receiving messages from all channels
-    // Note: In a full implementation, channels would send messages to this handler
-    let (_tx, mut rx) = mpsc::channel::<IncomingMessage>(64);
-
-    tracing::info!("channel message handler started");
-
-    // Note: In a full implementation, each channel would forward messages to this handler.
-    // For now, this demonstrates the routing logic.
-
-    loop {
-        tokio::select! {
-            Some(msg) = rx.recv() => {
-                let route = transport.route(&msg).await;
-
-                match route {
-                    MessageRoute::TaskSession { task_id } => {
-                        // Forward message to tmux session
-                        if let Some(session) = transport.tmux_session_for(&task_id).await {
-                            tracing::debug!(
-                                task_id = task_id,
-                                session = session,
-                                "forwarding message to tmux session"
-                            );
-                            // Use the tmux send-keys mechanism
-                            let _ = crate::channels::tmux::send_keys(&session, &msg.body).await;
-                        }
-                    }
-                    MessageRoute::Command { raw } => {
-                        // Handle orchestrator commands
-                        let response = handle_command(&raw, &backend).await;
-                        // Send response back to the channel that sent the message
-                        tracing::debug!(command = raw, response = response);
-                    }
-                    MessageRoute::NewTask => {
-                        // Could create a new task from this message
-                        tracing::debug!(channel = msg.channel, "new task request");
-                    }
-                }
-            }
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {
-                // Periodic cleanup or health check
-            }
-        }
-    }
-}
-
-/// Handle orchestrator commands.
-async fn handle_command(raw: &str, _backend: &Arc<dyn ExternalBackend>) -> String {
-    let parts: Vec<&str> = raw.split_whitespace().collect();
-    let cmd = parts.first().copied().unwrap_or("");
-
-    match cmd {
-        "/status" => {
-            // Return status of active tasks
-            "Use `orch task status` to view task status".to_string()
-        }
-        "/attach" => {
-            // Attach to a running session
-            if parts.len() < 2 {
-                "Usage: /attach <task-id>".to_string()
-            } else {
-                format!("Attaching to task {}...", parts[1])
-            }
-        }
-        "orch" => {
-            // Handle orch CLI commands
-            let subcmd = parts.get(1).copied().unwrap_or("");
-            match subcmd {
-                "task" => "Use `orch task` commands".to_string(),
-                _ => "Unknown orch command".to_string(),
-            }
-        }
-        _ => format!("Unknown command: {cmd}"),
-    }
 }
