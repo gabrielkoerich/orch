@@ -21,8 +21,8 @@ use crate::engine::router::{get_route_result, RouteResult};
 use crate::security;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
-pub use response::WeightSignal;
 use response::RunResult;
+pub use response::WeightSignal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
@@ -454,9 +454,13 @@ impl TaskRunner {
             || last_error.contains("rate limit")
             || last_error.contains("rerouted");
         let weight_signal = if status == "new" && is_rate_limited {
-            WeightSignal::RateLimited { agent: agent_name.clone() }
+            WeightSignal::RateLimited {
+                agent: agent_name.clone(),
+            }
         } else if status == "done" || status == "in_progress" || status == "in_review" {
-            WeightSignal::Success { agent: agent_name.clone() }
+            WeightSignal::Success {
+                agent: agent_name.clone(),
+            }
         } else {
             WeightSignal::None
         };

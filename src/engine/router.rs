@@ -237,7 +237,9 @@ impl AgentWeights {
 fn simple_hash_fraction() -> f64 {
     let nanos = Instant::now().elapsed().as_nanos() as u64;
     // Mix bits using a simple hash
-    let hash = nanos.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let hash = nanos
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (hash % 10000) as f64 / 10000.0
 }
 
@@ -247,7 +249,9 @@ fn simple_hash_index(len: usize) -> usize {
         return 0;
     }
     let nanos = Instant::now().elapsed().as_nanos() as u64;
-    let hash = nanos.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let hash = nanos
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (hash as usize) % len
 }
 
@@ -1232,6 +1236,7 @@ impl Router {
     }
 
     /// Get a snapshot of current agent weights for logging.
+    #[allow(dead_code)]
     pub fn weight_snapshot(&self) -> Vec<(String, f64, u32)> {
         self.weights.snapshot()
     }
@@ -1727,7 +1732,11 @@ Hope that helps!"#;
         assert!(claude_weight < DEFAULT_WEIGHT);
 
         // Ensure agents again — claude's weight should be preserved
-        let agents2 = vec!["claude".to_string(), "codex".to_string(), "opencode".to_string()];
+        let agents2 = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "opencode".to_string(),
+        ];
         weights.ensure_agents(&agents2);
 
         assert_eq!(weights.get_weight("claude"), claude_weight);
