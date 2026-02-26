@@ -7,18 +7,24 @@
 //! Job types:
 //! - `task`: creates a task (GitHub Issue or internal SQLite) and lets the engine dispatch it
 //! - `bash`: runs a shell command directly (no LLM)
+//! - `self-review`: analyzes task metrics and creates self-improvement issues
 //!
 //! For task jobs, the `external` field controls where the task is created:
 //! - `external: true` (default): Creates a GitHub Issue
 //! - `external: false`: Creates an internal SQLite task
 
 use crate::backends::{ExternalBackend, ExternalId};
-use crate::db::Db;
+use crate::db::{
+    Db, ErrorStat, MetricsSummary, SlowTaskInfo,
+};
 use crate::engine::internal_tasks::{create_internal_task_with_source, get_internal_task};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Maximum self-improvement issues that can be created per week.
+const MAX_SELF_IMPROVEMENT_ISSUES_PER_WEEK: i64 = 3;
 
 /// A scheduled job definition (from jobs.yml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -355,6 +361,27 @@ pub async fn tick(
                     }
                 }
             }
+            "self-review" => {
+                // Analyze metrics and create self-improvement issues
+                match run_self_review(db, backend).await {
+                    Ok(issues_created) => {
+                        tracing::info!(
+                            job_id = job.id,
+                            issues_created,
+                            "self-review completed"
+                        );
+                        job.last_task_status = Some(if issues_created > 0 {
+                            "done".to_string()
+                        } else {
+                            "no_issues".to_string()
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(job_id = job.id, ?e, "self-review failed");
+                        job.last_task_status = Some("failed".to_string());
+                    }
+                }
+            }
             other => {
                 tracing::warn!(job_id = job.id, r#type = other, "unknown job type");
             }
@@ -366,6 +393,215 @@ pub async fn tick(
     }
 
     Ok(())
+}
+
+/// Run the self-review job: analyze metrics and create improvement issues.
+async fn run_self_review(
+    db: &Arc<Db>,
+    backend: &Arc<dyn ExternalBackend>,
+) -> anyhow::Result<i64> {
+    let mut issues_created: i64 = 0;
+
+    // Check rate limit
+    let current_count = db.count_self_improvement_issues_7d().await?;
+    if current_count >= MAX_SELF_IMPROVEMENT_ISSUES_PER_WEEK {
+        tracing::info!(
+            current_count,
+            max = MAX_SELF_IMPROVEMENT_ISSUES_PER_WEEK,
+            "rate limited: max self-improvement issues per week reached"
+        );
+        return Ok(0);
+    }
+
+    // Gather metrics data
+    let summary = db.get_metrics_summary_24h().await?;
+    let _failed_tasks = db.get_failed_tasks_7d().await?;
+    let slow_tasks = db.get_slow_tasks_7d().await?;
+    let error_distribution = db.get_error_distribution_7d().await?;
+
+    // Analyze and create issues for each pattern
+    let remaining_slots = MAX_SELF_IMPROVEMENT_ISSUES_PER_WEEK - current_count;
+
+    // Issue 1: High failure rate agent
+    if let Some(issue) = detect_high_failure_agent(&summary.agent_stats, remaining_slots > 0) {
+        if create_self_improvement_issue(backend, &issue.title, &issue.body).await.is_ok() {
+            db.increment_self_improvement_counter().await?;
+            issues_created += 1;
+        }
+    }
+
+    // Issue 2: Common error patterns
+    if issues_created < remaining_slots {
+        if let Some(issue) = detect_common_errors(&error_distribution, remaining_slots - issues_created > 0) {
+            if create_self_improvement_issue(backend, &issue.title, &issue.body).await.is_ok() {
+                db.increment_self_improvement_counter().await?;
+                issues_created += 1;
+            }
+        }
+    }
+
+    // Issue 3: Slow tasks pattern
+    if issues_created < remaining_slots {
+        if let Some(issue) = detect_slow_tasks(&slow_tasks, &summary, remaining_slots - issues_created > 0) {
+            if create_self_improvement_issue(backend, &issue.title, &issue.body).await.is_ok() {
+                db.increment_self_improvement_counter().await?;
+                issues_created += 1;
+            }
+        }
+    }
+
+    Ok(issues_created)
+}
+
+/// Create a self-improvement issue in GitHub.
+async fn create_self_improvement_issue(
+    backend: &Arc<dyn ExternalBackend>,
+    title: &str,
+    body: &str,
+) -> anyhow::Result<ExternalId> {
+    let labels = vec![
+        "self-improvement".to_string(),
+        "scheduled".to_string(),
+        "automation".to_string(),
+    ];
+    backend.create_task(title, body, &labels).await
+}
+
+/// Detect if any agent has a high failure rate (>50% failures).
+fn detect_high_failure_agent(agent_stats: &[crate::db::AgentStat], should_issue: bool) -> Option<ImprovementIssue> {
+    if !should_issue {
+        return None;
+    }
+
+    for stat in agent_stats {
+        if stat.total_runs >= 3 && stat.success_rate < 50.0 {
+            return Some(ImprovementIssue {
+                title: format!("[Self-Improvement] High failure rate for {} agent", stat.agent),
+                body: format!(
+                    r#"## Analysis
+
+The **{}** agent has a high failure rate based on recent metrics:
+
+- **Total runs (24h):** {}
+- **Successful:** {}
+- **Failure rate:** {:.1}%
+
+## Recommendation
+
+Consider investigating the {} agent for:
+- Task type mismatch (routing to wrong complexity level)
+- Missing required skills or tools
+- Model capacity issues
+
+## Evidence
+
+This issue was automatically created by the orchestrator's self-review job."#,
+                    stat.agent,
+                    stat.total_runs,
+                    stat.success_count,
+                    100.0 - stat.success_rate,
+                    stat.agent
+                ),
+            });
+        }
+    }
+    None
+}
+
+/// Detect common error patterns.
+fn detect_common_errors(errors: &[ErrorStat], should_issue: bool) -> Option<ImprovementIssue> {
+    if !should_issue || errors.is_empty() {
+        return None;
+    }
+
+    // Find error types with 2+ occurrences
+    let significant_errors: Vec<_> = errors.iter().filter(|e| e.count >= 2).collect();
+
+    if significant_errors.is_empty() {
+        return None;
+    }
+
+    let mut body = String::from("## Error Distribution (Last 7 Days)\n\n");
+    body.push_str("| Error Type | Count |\n|------------|-------|\n");
+    for err in &significant_errors {
+        body.push_str(&format!("| {} | {} |\n", err.error_type.as_deref().unwrap_or("unknown"), err.count));
+    }
+    body.push_str("\n## Recommendation\n\n");
+    body.push_str("Consider addressing these recurring error patterns:\n");
+    for err in &significant_errors {
+        if let Some(ref error_type) = err.error_type {
+            body.push_str(&format!("- **{}**: {} occurrences\n", error_type, err.count));
+        }
+    }
+    body.push_str("\n## Evidence\n\nThis issue was automatically created by the orchestrator's self-review job.\n");
+
+    Some(ImprovementIssue {
+        title: "[Self-Improvement] Recurring error patterns detected".to_string(),
+        body,
+    })
+}
+
+/// Detect slow tasks pattern.
+fn detect_slow_tasks(
+    slow_tasks: &[SlowTaskInfo],
+    summary: &MetricsSummary,
+    should_issue: bool,
+) -> Option<ImprovementIssue> {
+    if !should_issue || slow_tasks.is_empty() {
+        return None;
+    }
+
+    // Only create issue if there are genuinely slow tasks (complex tasks > 10 min)
+    let slow_complex_tasks: Vec<_> = slow_tasks
+        .iter()
+        .filter(|t| t.complexity.as_deref() == Some("complex") && t.duration_seconds > 600.0)
+        .collect();
+
+    if slow_complex_tasks.is_empty() {
+        return None;
+    }
+
+    let mut body = String::from("## Slowest Completed Tasks (Last 7 Days)\n\n");
+    body.push_str("| Task ID | Agent | Complexity | Duration |\n|---------|-------|------------|----------|\n");
+    for task in slow_tasks.iter().take(5) {
+        body.push_str(&format!(
+            "| {} | {} | {} | {:.1}m |\n",
+            task.task_id,
+            task.agent,
+            task.complexity.as_deref().unwrap_or("unknown"),
+            task.duration_seconds / 60.0
+        ));
+    }
+
+    body.push_str("\n## Duration by Complexity\n\n");
+    if let Some(avg) = summary.avg_duration_simple {
+        body.push_str(&format!("- **Simple:** {:.1}m\n", avg / 60.0));
+    }
+    if let Some(avg) = summary.avg_duration_medium {
+        body.push_str(&format!("- **Medium:** {:.1}m\n", avg / 60.0));
+    }
+    if let Some(avg) = summary.avg_duration_complex {
+        body.push_str(&format!("- **Complex:** {:.1}m\n", avg / 60.0));
+    }
+
+    body.push_str("\n## Recommendation\n\n");
+    body.push_str("Consider the following improvements:\n");
+    body.push_str("- Review routing logic for complex tasks\n");
+    body.push_str("- Add more specific skills or tools for complex work\n");
+    body.push_str("- Consider using a more capable model for complex tasks\n");
+    body.push_str("\n## Evidence\n\n");
+    body.push_str("This issue was automatically created by the orchestrator's self-review job.\n");
+
+    Some(ImprovementIssue {
+        title: "[Self-Improvement] Slow task execution patterns detected".to_string(),
+        body,
+    })
+}
+
+/// A self-improvement issue to be created.
+struct ImprovementIssue {
+    title: String,
+    body: String,
 }
 
 #[cfg(test)]
@@ -512,5 +748,188 @@ mod tests {
 
         let jobs = load_jobs(&path).unwrap();
         assert_eq!(jobs[0].r#type, "task");
+    }
+
+    #[test]
+    fn detect_high_failure_agent_with_high_failure() {
+        let agent_stats = vec![
+            crate::db::AgentStat {
+                agent: "claude".to_string(),
+                total_runs: 10,
+                success_count: 3,
+                success_rate: 30.0,
+            },
+            crate::db::AgentStat {
+                agent: "codex".to_string(),
+                total_runs: 5,
+                success_count: 4,
+                success_rate: 80.0,
+            },
+        ];
+
+        let issue = detect_high_failure_agent(&agent_stats, true);
+        assert!(issue.is_some());
+        let issue = issue.unwrap();
+        assert!(issue.title.contains("claude"));
+        assert!(issue.body.contains("70.0%")); // failure rate
+    }
+
+    #[test]
+    fn detect_high_failure_agent_ignores_low_runs() {
+        // Agent with high failure rate but only 2 runs should be ignored
+        let agent_stats = vec![crate::db::AgentStat {
+            agent: "claude".to_string(),
+            total_runs: 2,
+            success_count: 0,
+            success_rate: 0.0,
+        }];
+
+        let issue = detect_high_failure_agent(&agent_stats, true);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_high_failure_agent_ignores_good_success_rate() {
+        let agent_stats = vec![crate::db::AgentStat {
+            agent: "claude".to_string(),
+            total_runs: 10,
+            success_count: 9,
+            success_rate: 90.0,
+        }];
+
+        let issue = detect_high_failure_agent(&agent_stats, true);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_high_failure_agent_respects_should_issue_flag() {
+        let agent_stats = vec![crate::db::AgentStat {
+            agent: "claude".to_string(),
+            total_runs: 10,
+            success_count: 3,
+            success_rate: 30.0,
+        }];
+
+        // When should_issue is false, no issue should be created
+        let issue = detect_high_failure_agent(&agent_stats, false);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_common_errors_with_significant_errors() {
+        let errors = vec![
+            ErrorStat {
+                error_type: Some("timeout".to_string()),
+                count: 5,
+            },
+            ErrorStat {
+                error_type: Some("rate_limit".to_string()),
+                count: 3,
+            },
+            ErrorStat {
+                error_type: Some("auth_error".to_string()),
+                count: 1,
+            },
+        ];
+
+        let issue = detect_common_errors(&errors, true);
+        assert!(issue.is_some());
+        let issue = issue.unwrap();
+        assert!(issue.title.contains("Recurring error patterns"));
+        assert!(issue.body.contains("timeout"));
+        assert!(issue.body.contains("rate_limit"));
+        // auth_error has count 1, should not be included
+        assert!(!issue.body.contains("auth_error"));
+    }
+
+    #[test]
+    fn detect_common_errors_ignores_low_count() {
+        // All errors have count < 2
+        let errors = vec![ErrorStat {
+            error_type: Some("timeout".to_string()),
+            count: 1,
+        }];
+
+        let issue = detect_common_errors(&errors, true);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_common_errors_empty_errors() {
+        let errors: Vec<ErrorStat> = vec![];
+        let issue = detect_common_errors(&errors, true);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_slow_tasks_with_slow_complex_tasks() {
+        let slow_tasks = vec![
+            SlowTaskInfo {
+                task_id: "task-123".to_string(),
+                agent: "claude".to_string(),
+                complexity: Some("complex".to_string()),
+                duration_seconds: 900.0, // 15 minutes
+            },
+            SlowTaskInfo {
+                task_id: "task-456".to_string(),
+                agent: "codex".to_string(),
+                complexity: Some("medium".to_string()),
+                duration_seconds: 300.0, // 5 minutes
+            },
+        ];
+        let summary = MetricsSummary {
+            tasks_completed_24h: 10,
+            tasks_failed_24h: 2,
+            avg_duration_simple: Some(60.0),
+            avg_duration_medium: Some(300.0),
+            avg_duration_complex: Some(600.0),
+            agent_stats: vec![],
+            rate_limits_24h: 0,
+        };
+
+        let issue = detect_slow_tasks(&slow_tasks, &summary, true);
+        assert!(issue.is_some());
+        let issue = issue.unwrap();
+        assert!(issue.title.contains("Slow task"));
+        assert!(issue.body.contains("15.0m")); // 900s = 15m
+    }
+
+    #[test]
+    fn detect_slow_tasks_ignores_fast_tasks() {
+        let slow_tasks = vec![SlowTaskInfo {
+            task_id: "task-123".to_string(),
+            agent: "claude".to_string(),
+            complexity: Some("complex".to_string()),
+            duration_seconds: 300.0, // Only 5 minutes - not slow enough
+        }];
+        let summary = MetricsSummary {
+            tasks_completed_24h: 10,
+            tasks_failed_24h: 2,
+            avg_duration_simple: Some(60.0),
+            avg_duration_medium: Some(300.0),
+            avg_duration_complex: Some(600.0),
+            agent_stats: vec![],
+            rate_limits_24h: 0,
+        };
+
+        let issue = detect_slow_tasks(&slow_tasks, &summary, true);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_slow_tasks_empty_list() {
+        let slow_tasks: Vec<SlowTaskInfo> = vec![];
+        let summary = MetricsSummary {
+            tasks_completed_24h: 10,
+            tasks_failed_24h: 2,
+            avg_duration_simple: Some(60.0),
+            avg_duration_medium: Some(300.0),
+            avg_duration_complex: Some(600.0),
+            agent_stats: vec![],
+            rate_limits_24h: 0,
+        };
+
+        let issue = detect_slow_tasks(&slow_tasks, &summary, true);
+        assert!(issue.is_none());
     }
 }
