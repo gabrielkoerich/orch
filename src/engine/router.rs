@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 pub struct RouteResult {
     /// The selected agent: "claude", "codex", or "opencode"
     pub agent: String,
-    /// Optional model suggestion, e.g., "sonnet", "opus", "gpt-4.1"
+    /// Optional model suggestion, e.g., "claude-sonnet-4-6", "claude-opus-4-6", "o3"
     pub model: Option<String>,
     /// Complexity level: "simple", "medium", or "complex"
     pub complexity: String,
@@ -282,64 +282,72 @@ pub struct RouterConfig {
 }
 
 /// Default agents to check in PATH.
+///
+/// All 5 agents are listed, but availability is checked at runtime via
+/// `which::which()`. Agents not installed (e.g. kimi, minimax) are
+/// automatically skipped during routing. Users can customize this list
+/// in their `config.yml` under `routing.agents`.
 pub const DEFAULT_AGENTS: &[&str] = &["claude", "codex", "opencode", "kimi", "minimax"];
 
 impl Default for RouterConfig {
     fn default() -> Self {
         let mut model_map = HashMap::new();
 
-        // Simple models
+        // Simple tasks — fast, cheap models
         let mut simple = HashMap::new();
-        simple.insert("claude".to_string(), "haiku".to_string());
-        simple.insert("codex".to_string(), "gpt-5.1-codex-mini".to_string());
         simple.insert(
-            "opencode".to_string(),
-            "github-copilot/gpt-5-mini".to_string(),
+            "claude".to_string(),
+            "claude-haiku-4-5-20251001".to_string(),
         );
-        simple.insert("kimi".to_string(), "haiku".to_string());
-        simple.insert("minimax".to_string(), "haiku".to_string());
+        simple.insert("codex".to_string(), "o4-mini".to_string());
+        simple.insert("opencode".to_string(), "openai/gpt-4.1-mini".to_string());
+        simple.insert("kimi".to_string(), "claude-haiku-4-5-20251001".to_string());
+        simple.insert(
+            "minimax".to_string(),
+            "claude-haiku-4-5-20251001".to_string(),
+        );
         model_map.insert("simple".to_string(), simple);
 
-        // Medium models
+        // Medium tasks — balanced cost/capability
         let mut medium = HashMap::new();
-        medium.insert("claude".to_string(), "sonnet".to_string());
-        medium.insert("codex".to_string(), "gpt-5.2".to_string());
+        medium.insert("claude".to_string(), "claude-sonnet-4-6".to_string());
+        medium.insert("codex".to_string(), "gpt-4.1".to_string());
         medium.insert(
             "opencode".to_string(),
-            "github-copilot/gpt-5.1-codex".to_string(),
+            "anthropic/claude-sonnet-4-6".to_string(),
         );
-        medium.insert("kimi".to_string(), "sonnet".to_string());
-        medium.insert("minimax".to_string(), "sonnet".to_string());
+        medium.insert("kimi".to_string(), "claude-sonnet-4-6".to_string());
+        medium.insert("minimax".to_string(), "claude-sonnet-4-6".to_string());
         model_map.insert("medium".to_string(), medium);
 
-        // Complex models
+        // Complex tasks — most capable models
         let mut complex = HashMap::new();
-        complex.insert("claude".to_string(), "opus".to_string());
-        complex.insert("codex".to_string(), "gpt-5.3-codex".to_string());
+        complex.insert("claude".to_string(), "claude-opus-4-6".to_string());
+        complex.insert("codex".to_string(), "o3".to_string());
         complex.insert(
             "opencode".to_string(),
-            "github-copilot/claude-opus-4.5".to_string(),
+            "anthropic/claude-opus-4-6".to_string(),
         );
-        complex.insert("kimi".to_string(), "opus".to_string());
-        complex.insert("minimax".to_string(), "opus".to_string());
+        complex.insert("kimi".to_string(), "claude-opus-4-6".to_string());
+        complex.insert("minimax".to_string(), "claude-opus-4-6".to_string());
         model_map.insert("complex".to_string(), complex);
 
-        // Review models
+        // Review tasks — strong reasoning, moderate cost
         let mut review = HashMap::new();
-        review.insert("claude".to_string(), "sonnet".to_string());
-        review.insert("codex".to_string(), "gpt-5.2".to_string());
+        review.insert("claude".to_string(), "claude-sonnet-4-6".to_string());
+        review.insert("codex".to_string(), "gpt-4.1".to_string());
         review.insert(
             "opencode".to_string(),
-            "github-copilot/gpt-5.1-codex".to_string(),
+            "anthropic/claude-sonnet-4-6".to_string(),
         );
-        review.insert("kimi".to_string(), "sonnet".to_string());
-        review.insert("minimax".to_string(), "sonnet".to_string());
+        review.insert("kimi".to_string(), "claude-sonnet-4-6".to_string());
+        review.insert("minimax".to_string(), "claude-sonnet-4-6".to_string());
         model_map.insert("review".to_string(), review);
 
         Self {
             mode: "llm".to_string(),
             router_agent: "claude".to_string(),
-            router_model: "haiku".to_string(),
+            router_model: "claude-haiku-4-5-20251001".to_string(),
             timeout_seconds: 120,
             fallback_executor: "codex".to_string(),
             agents: DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect(),
@@ -1443,7 +1451,7 @@ mod tests {
 
         assert_eq!(config.mode, "llm");
         assert_eq!(config.router_agent, "claude");
-        assert_eq!(config.router_model, "haiku");
+        assert_eq!(config.router_model, "claude-haiku-4-5-20251001");
         assert_eq!(config.fallback_executor, "codex");
         assert_eq!(config.max_route_attempts, 3);
         assert!(!config.allowed_tools.is_empty());
@@ -1464,36 +1472,36 @@ mod tests {
 
         assert_eq!(
             config.model_for_complexity("claude", "simple"),
-            Some("haiku".to_string())
+            Some("claude-haiku-4-5-20251001".to_string())
         );
         assert_eq!(
             config.model_for_complexity("claude", "medium"),
-            Some("sonnet".to_string())
+            Some("claude-sonnet-4-6".to_string())
         );
         assert_eq!(
             config.model_for_complexity("claude", "complex"),
-            Some("opus".to_string())
+            Some("claude-opus-4-6".to_string())
         );
         assert_eq!(
             config.model_for_complexity("codex", "simple"),
-            Some("gpt-5.1-codex-mini".to_string())
+            Some("o4-mini".to_string())
         );
         // Verify kimi and minimax use same models as claude
         assert_eq!(
             config.model_for_complexity("kimi", "simple"),
-            Some("haiku".to_string())
+            Some("claude-haiku-4-5-20251001".to_string())
         );
         assert_eq!(
             config.model_for_complexity("kimi", "complex"),
-            Some("opus".to_string())
+            Some("claude-opus-4-6".to_string())
         );
         assert_eq!(
             config.model_for_complexity("minimax", "medium"),
-            Some("sonnet".to_string())
+            Some("claude-sonnet-4-6".to_string())
         );
         assert_eq!(
             config.model_for_complexity("minimax", "complex"),
-            Some("opus".to_string())
+            Some("claude-opus-4-6".to_string())
         );
     }
 

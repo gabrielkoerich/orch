@@ -12,7 +12,7 @@ use std::path::PathBuf;
 pub struct AgentInvocation {
     /// Agent name (claude, codex, opencode, kimi, minimax)
     pub agent: String,
-    /// Model override (e.g., "sonnet", "opus", "gpt-5.2")
+    /// Model override (e.g., "claude-sonnet-4-6", "o3", "gpt-4.1")
     pub model: Option<String>,
     /// Working directory
     pub work_dir: PathBuf,
