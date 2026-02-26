@@ -58,6 +58,48 @@ This connects to the running task's tmux session and prints output as it arrives
 
 The capture loop diffs against the previous capture, so multiple clients streaming the same session each receive only new content — no duplicates.
 
+## Webhooks & Polling Fallback
+
+The orchestrator has two modes for receiving GitHub events:
+
+1. **Webhook mode** (instant) — via `webhook.enabled: true` in config
+2. **Polling mode** — via periodic `sync_tick()` (every 120s by default)
+
+### Polling Fallback
+
+When webhooks are enabled but the local server becomes unavailable (e.g. port conflict, crash), the orchestrator automatically switches to polling fallback mode. When webhooks are disabled entirely, polling mode is used from the start.
+
+- **Health check**: Pings the local webhook server's `/health` endpoint every 60 seconds (configurable). This verifies the local HTTP listener is running — it does not verify GitHub-side reachability or webhook secret validity.
+- **Faster polling**: When in fallback mode, sync operations run every 30 seconds (configurable) instead of 120s
+- **Logging**: Clear log messages when entering/exiting fallback mode:
+  - `entering polling fallback mode` — webhook health check failed
+  - `exiting polling fallback mode` — webhook health restored
+
+### Configuration
+
+```yaml
+webhook:
+  enabled: true
+  port: 8080
+  secret: "${WEBHOOK_SECRET}"
+
+engine:
+  tick_interval: 10          # Main tick interval (seconds)
+  sync_interval: 120        # Normal sync interval (seconds)
+  fallback_sync_interval: 30 # Faster sync when webhooks fail
+  webhook_health_check_interval: 60 # Health check frequency
+```
+
+### Features Affected
+
+| Feature | Webhook | Polling Fallback |
+|---------|---------|------------------|
+| Issue creation | Instant | Next sync |
+| @mention detection | Instant | Next sync |
+| PR review comments | Instant | Next sync |
+| Issue close/reopen | Instant | Next sync |
+| PR merge events | Instant | Next sync |
+
 ## Complexity-based model routing
 
 The router assigns `complexity: simple|medium|complex` instead of specific model names. The actual model is resolved per agent from `config.yml`:

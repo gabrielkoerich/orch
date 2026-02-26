@@ -503,6 +503,23 @@ async fn webhook_health() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
 
+/// Check if the webhook server is healthy by pinging its local health endpoint.
+///
+/// This only verifies the local HTTP listener is running. It does NOT verify
+/// that GitHub can reach the endpoint (NAT/firewall) or that the webhook
+/// secret is valid.
+pub async fn check_webhook_health(port: u16) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    let url = format!("http://localhost:{}/health", port);
+    match client.get(&url).send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
 pub async fn start_webhook_server(
     port: u16,
     secret: String,

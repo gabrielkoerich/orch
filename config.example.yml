@@ -106,6 +106,15 @@ webhook:
   port: 8080
   secret: "${WEBHOOK_SECRET}"
 
+# Engine settings
+engine:
+  tick_interval: 10
+  sync_interval: 120
+  fallback_sync_interval: 30
+  webhook_health_check_interval: 60
+  max_parallel: 4
+  stuck_timeout: 1800
+
 # Task completion notifications — broadcast to all configured channels.
 # Level controls which events are sent:
 #   all         — every task completion (default)

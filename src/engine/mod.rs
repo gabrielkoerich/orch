@@ -59,6 +59,10 @@ pub struct EngineConfig {
     pub tick_interval: std::time::Duration,
     /// GitHub sync interval (cleanup, PR review, mentions)
     pub sync_interval: std::time::Duration,
+    /// Fallback sync interval when webhooks are unavailable (seconds)
+    pub fallback_sync_interval: Option<std::time::Duration>,
+    /// Webhook health check interval (seconds)
+    pub webhook_health_check_interval: Option<std::time::Duration>,
     /// Maximum parallel task executions
     pub max_parallel: usize,
     /// Stuck task timeout (seconds)
@@ -70,6 +74,8 @@ impl Default for EngineConfig {
         Self {
             tick_interval: std::time::Duration::from_secs(10),
             sync_interval: std::time::Duration::from_secs(120),
+            fallback_sync_interval: Some(std::time::Duration::from_secs(30)),
+            webhook_health_check_interval: Some(std::time::Duration::from_secs(60)),
             max_parallel: 4,
             stuck_timeout: 1800,
         }
@@ -102,6 +108,27 @@ impl EngineConfig {
         if let Ok(val) = crate::config::get("engine.stuck_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.stuck_timeout = secs;
+            }
+        }
+
+        if let Ok(val) = crate::config::get("engine.fallback_sync_interval") {
+            if let Ok(secs) = val.parse::<u64>() {
+                if secs > 0 {
+                    config.fallback_sync_interval = Some(std::time::Duration::from_secs(secs));
+                } else {
+                    config.fallback_sync_interval = None;
+                }
+            }
+        }
+
+        if let Ok(val) = crate::config::get("engine.webhook_health_check_interval") {
+            if let Ok(secs) = val.parse::<u64>() {
+                if secs > 0 {
+                    config.webhook_health_check_interval =
+                        Some(std::time::Duration::from_secs(secs));
+                } else {
+                    config.webhook_health_check_interval = None;
+                }
             }
         }
 
@@ -351,6 +378,14 @@ pub async fn serve() -> anyhow::Result<()> {
     // Notify used by webhook events to wake up the engine tick immediately
     let webhook_notify = Arc::new(Notify::new());
 
+    // Track webhook state for health checks and fallback.
+    // When webhooks are disabled, `in_fallback_mode` stays true so sync
+    // uses the faster fallback interval for polling.
+    let webhook_port: Option<u16>;
+    let mut webhook_healthy: bool;
+    let mut last_webhook_health_check = std::time::Instant::now();
+    let mut in_fallback_mode: bool;
+
     // Start webhook server if configured
     let webhook_enabled = crate::config::get("webhook.enabled")
         .map(|v| v == "true")
@@ -361,6 +396,7 @@ pub async fn serve() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8080);
+        webhook_port = Some(port);
         let secret = crate::config::get("webhook.secret").unwrap_or_default();
         let webhook_repo = project_engines
             .first()
@@ -394,9 +430,14 @@ pub async fn serve() -> anyhow::Result<()> {
             }
         });
 
+        webhook_healthy = true;
+        in_fallback_mode = false;
         tracing::info!(port, "webhook server started");
     } else {
-        tracing::info!("webhook server disabled (set webhook.enabled: true to enable)");
+        webhook_port = None;
+        webhook_healthy = false;
+        in_fallback_mode = true;
+        tracing::info!("webhook server disabled, using polling fallback mode");
     }
 
     // Agent router (selects agent + model per task) - shared across projects
@@ -484,13 +525,43 @@ pub async fn serve() -> anyhow::Result<()> {
                 drop(router_guard);
 
                 // Periodic sync (less frequent)
-                if last_sync.elapsed() >= config.sync_interval {
+                // Use fallback interval if in fallback mode
+                let current_sync_interval = if in_fallback_mode {
+                    config.fallback_sync_interval.unwrap_or(config.sync_interval)
+                } else {
+                    config.sync_interval
+                };
+
+                if last_sync.elapsed() >= current_sync_interval {
                     for engine in &project_engines {
                         if let Err(e) = sync_tick(&engine.backend, &tmux, &engine.repo, &db).await {
                             tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
                         }
                     }
                     last_sync = std::time::Instant::now();
+                }
+
+                // Periodic webhook health check
+                if webhook_enabled {
+                    let health_check_interval = config.webhook_health_check_interval
+                        .unwrap_or(std::time::Duration::from_secs(60));
+
+                    if last_webhook_health_check.elapsed() >= health_check_interval {
+                        if let Some(port) = webhook_port {
+                            let health = crate::channels::github::check_webhook_health(port).await;
+                            if health != webhook_healthy {
+                                webhook_healthy = health;
+                                if webhook_healthy {
+                                    in_fallback_mode = false;
+                                    tracing::info!(port, "webhook health restored, exiting polling fallback mode");
+                                } else {
+                                    in_fallback_mode = true;
+                                    tracing::warn!(port, "webhook health check failed, entering polling fallback mode");
+                                }
+                            }
+                        }
+                        last_webhook_health_check = std::time::Instant::now();
+                    }
                 }
             }
             // Webhook events trigger an immediate tick (bypass polling interval)
