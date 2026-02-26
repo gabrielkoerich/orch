@@ -141,7 +141,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
 
-    let repo = config::get("repo").context("'repo' not set in config")?;
+    let repo = config::get("gh.repo").context("'repo' not set in config")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
 
     let statuses = [
@@ -233,7 +233,7 @@ pub async fn route(id: i64) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
 
-    let repo = config::get("repo").context("'repo' not set in config")?;
+    let repo = config::get("gh.repo").context("'repo' not set in config")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
 
     let ext_id = ExternalId(id.to_string());
@@ -267,7 +267,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
     use crate::backends::ExternalBackend;
     use crate::engine::router::get_route_result;
 
-    let repo = config::get("repo").context("'repo' not set in config")?;
+    let repo = config::get("gh.repo").context("'repo' not set in config")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
 
     // Resolve task ID
@@ -320,7 +320,7 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
 
-    let repo = config::get("repo").context("'repo' not set in config")?;
+    let repo = config::get("gh.repo").context("'repo' not set in config")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
 
     let ext_id = ExternalId(id.to_string());
@@ -345,7 +345,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
 
-    let repo = config::get("repo").context("'repo' not set in config")?;
+    let repo = config::get("gh.repo").context("'repo' not set in config")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
 
     if id == "all" {
