@@ -161,18 +161,18 @@ Optional future enhancement. The current `gh` CLI approach works fine for single
 
 ## What's Not Working / Known Issues
 
-### Phase 3+ (Channels) — Scaffolding Done
+### Phase 3+ (Channels) — Wired into Engine
 
-- **Telegram bot** — stub only (`src/channels/telegram.rs`)
-- **Discord bot** — stub only (`src/channels/discord.rs`)
-- **GitHub webhooks** — stub only (`src/channels/github.rs`)
-- **HTTP webhook server** — not implemented (needs axum)
+- **Telegram bot** — long-poll implementation wired into engine (#81)
+- **Discord bot** — polling implementation wired into engine (#81)
+- **GitHub mentions** — `gh` CLI polling wired into engine (#81)
+- **HTTP webhook server** — not implemented (axum server in progress, #88)
 
-These require webhook servers and async channel traits to be wired into the engine.
+Channel trait and registry are operational. Webhook server will replace polling for GitHub events.
 
 ### Observability
 
-- **Metrics collection** — success rate, avg duration, tokens per task, cost tracking
+- **Metrics collection** — in progress: tracing spans, task duration, success rates (#90)
 - **Web dashboard** — simple HTTP server showing task tree, status, logs
 - **Alerting** — error log exists but no proactive alerting
 
@@ -180,14 +180,14 @@ These require webhook servers and async channel traits to be wired into the engi
 
 ### Short Term
 
-- [ ] **Config hot-reload** — `notify` watcher exists but not connected to engine
-- [ ] **Multi-project support** — engine currently handles one repo
-- [ ] **Token budget** — config `max_tokens_per_task`, abort agent if exceeded
-- [ ] **Cost tracking** — estimate cost from input/output tokens + model pricing table
+- [x] **Config hot-reload** — `notify` watcher connected to engine (#78)
+- [x] **Multi-project support** — engine iterates `ProjectEngine` per repo (#82)
+- [ ] **Token budget** — config `max_tokens_per_task`, abort agent if exceeded (#87)
+- [ ] **Cost tracking** — estimate cost from input/output tokens + model pricing table (#87)
 
 ### Medium Term
 
-- [ ] **Webhook receiver** — GitHub webhook for instant issue sync instead of 60s polling
+- [ ] **Webhook receiver** — GitHub webhook for instant issue sync instead of 60s polling (#88)
 - [ ] **Agent memory** — persist agent learnings across retries (what worked, what didn't)
 - [ ] **PR review integration** — parse GitHub PR review comments, create follow-up tasks
 - [ ] **Parallel task execution** — currently limited by semaphore (4), could be dynamic
