@@ -1,0 +1,18 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "duration_ms": 45000,
+  "result": "```json\n{\"status\": \"done\", \"summary\": \"Implemented the feature\", \"accomplished\": [\"Added new function\", \"Updated tests\"], \"remaining\": [], \"files\": [\"src/main.rs\", \"tests/test.rs\"]}\n```",
+  "usage": {
+    "input_tokens": 15000,
+    "output_tokens": 3500
+  },
+  "modelUsage": {
+    "claude-haiku-4-5-20251001": {
+      "inputTokens": 15000,
+      "outputTokens": 3500
+    }
+  },
+  "permission_denials": []
+}

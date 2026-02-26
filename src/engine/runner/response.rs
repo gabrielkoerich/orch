@@ -10,7 +10,8 @@ use crate::parser::{self, AgentResponse};
 use crate::sidecar;
 use std::path::{Path, PathBuf};
 
-/// Classification of agent execution result.
+/// Classification of agent execution result (legacy, used in tests).
+#[allow(dead_code)]
 pub enum RunResult {
     /// Agent completed successfully with a parsed response.
     Success(AgentResponse),
@@ -40,7 +41,8 @@ pub enum WeightSignal {
     None,
 }
 
-/// Collect and classify the agent's response.
+/// Collect and classify the agent's response (legacy, kept for backward compat).
+#[allow(dead_code)]
 pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> RunResult {
     // Read stderr (check new state dir, fall back to legacy)
     let stderr_path = sidecar::state_file(&format!("stderr-{task_id}.txt"))
@@ -129,7 +131,7 @@ pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> Ru
 }
 
 /// Read the agent's output file, trying multiple locations.
-fn read_output_file(task_id: &str, primary_path: &Path) -> String {
+pub fn read_output_file(task_id: &str, primary_path: &Path) -> String {
     // Primary: explicit output file
     if let Ok(content) = std::fs::read_to_string(primary_path) {
         if !content.is_empty() {
@@ -164,7 +166,8 @@ fn read_output_file(task_id: &str, primary_path: &Path) -> String {
     String::new()
 }
 
-/// Check if output indicates a usage/rate limit error.
+/// Check if output indicates a usage/rate limit error (legacy helper).
+#[allow(dead_code)]
 fn is_usage_limit_error(text: &str) -> bool {
     let lower = text.to_lowercase();
     let patterns = [
@@ -186,7 +189,8 @@ fn is_usage_limit_error(text: &str) -> bool {
     patterns.iter().any(|p| lower.contains(p))
 }
 
-/// Check if output indicates an auth/billing error.
+/// Check if output indicates an auth/billing error (legacy helper).
+#[allow(dead_code)]
 fn is_auth_error(text: &str) -> bool {
     let lower = text.to_lowercase();
     let patterns = [
@@ -209,7 +213,8 @@ fn is_auth_error(text: &str) -> bool {
     patterns.iter().any(|p| lower.contains(p))
 }
 
-/// Detect missing tooling from agent output.
+/// Detect missing tooling from agent output (legacy helper).
+#[allow(dead_code)]
 fn detect_missing_tooling(text: &str) -> Option<String> {
     let known_tools = [
         "bun",
@@ -273,6 +278,11 @@ fn detect_missing_tooling(text: &str) -> Option<String> {
 /// Cooldown duration for failed agents (30 minutes).
 const AGENT_COOLDOWN_SECS: i64 = 30 * 60;
 
+/// Cooldown duration for model-specific failures (1 hour).
+/// When a specific agent+model combo fails (e.g., model not available,
+/// model-specific rate limit), we ban that combo for longer.
+const MODEL_COOLDOWN_SECS: i64 = 60 * 60;
+
 /// Path to the agent cooldowns file.
 fn cooldowns_path() -> std::path::PathBuf {
     crate::sidecar::state_dir()
@@ -282,48 +292,66 @@ fn cooldowns_path() -> std::path::PathBuf {
 
 /// Record that an agent has failed and should be temporarily avoided.
 pub fn record_agent_failure(agent_name: &str) {
-    let path = cooldowns_path();
+    record_failure_with_reason(agent_name, "agent_error");
+}
 
-    // Load existing or create new
-    let mut cooldowns: serde_json::Map<String, serde_json::Value> = if path.exists() {
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        serde_json::Map::new()
-    };
+/// Record that a specific agent+model combo has failed.
+///
+/// The cooldown key is `"agent:model"` so we can track model-specific
+/// failures separately (e.g., codex with o3-mini fails but gpt-4o works).
+pub fn record_model_failure(agent_name: &str, model: &str) {
+    let key = format!("{agent_name}:{model}");
+    record_failure_with_reason(&key, "model_error");
+}
+
+/// Check if a specific agent+model combo is in cooldown.
+pub fn is_model_in_cooldown(agent_name: &str, model: &str) -> bool {
+    let key = format!("{agent_name}:{model}");
+    is_key_in_cooldown(&key, MODEL_COOLDOWN_SECS)
+}
+
+/// Check if an agent is currently in cooldown period.
+pub fn is_agent_in_cooldown(agent_name: &str) -> bool {
+    is_key_in_cooldown(agent_name, AGENT_COOLDOWN_SECS)
+}
+
+/// Shared helper: check if a given key is in cooldown within `max_age_secs`.
+fn is_key_in_cooldown(key: &str, max_age_secs: i64) -> bool {
+    let cooldowns = read_cooldowns_file();
+    if let Some(entry) = cooldowns.get(key) {
+        if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
+            let now = chrono::Utc::now().timestamp();
+            return (now - failed_at) < max_age_secs;
+        }
+    }
+    false
+}
+
+/// Read and parse the cooldowns JSON file. Returns empty map on any error.
+fn read_cooldowns_file() -> serde_json::Map<String, serde_json::Value> {
+    let path = cooldowns_path();
+    if !path.exists() {
+        return serde_json::Map::new();
+    }
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn record_failure_with_reason(key: &str, reason: &str) {
+    let path = cooldowns_path();
+    let mut cooldowns = read_cooldowns_file();
 
     // Record failure with current timestamp
     let timestamp = chrono::Utc::now().timestamp();
     cooldowns.insert(
-        agent_name.to_string(),
-        serde_json::json!({ "failed_at": timestamp, "reason": "agent_error" }),
+        key.to_string(),
+        serde_json::json!({ "failed_at": timestamp, "reason": reason }),
     );
 
     // Write back
     if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns)) {
         std::fs::write(&path, content).ok();
     }
-}
-
-/// Check if an agent is currently in cooldown period.
-pub fn is_agent_in_cooldown(agent_name: &str) -> bool {
-    let path = cooldowns_path();
-    if !path.exists() {
-        return false;
-    }
-
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let cooldowns: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&content).unwrap_or_default();
-
-    if let Some(entry) = cooldowns.get(agent_name) {
-        if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
-            let now = chrono::Utc::now().timestamp();
-            return (now - failed_at) < AGENT_COOLDOWN_SECS;
-        }
-    }
-
-    false
 }
 
 /// Clear expired cooldowns from the file.
@@ -333,9 +361,7 @@ pub fn clear_expired_cooldowns() {
         return;
     }
 
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut cooldowns: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&content).unwrap_or_default();
+    let mut cooldowns = read_cooldowns_file();
 
     let now = chrono::Utc::now().timestamp();
     let mut to_remove = Vec::new();
@@ -484,8 +510,8 @@ pub fn handle_failover(
             "failover: switching to fallback agent"
         );
 
-        // Record the error in DB if available
-        if let Some(ref db) = db {
+        // Record the error in DB if available (sync call — fire and forget)
+        if let Some(db) = db {
             let error_type_str = match error_type {
                 RetryableError::Timeout => "timeout",
                 RetryableError::UsageLimit => "rate_limit",
@@ -493,7 +519,7 @@ pub fn handle_failover(
                 RetryableError::Failed => "failed",
                 RetryableError::MissingTooling => "missing_tooling",
             };
-            let _ = db.record_rate_limit(agent_name, error_type_str, Some(task_id));
+            drop(db.record_rate_limit(agent_name, error_type_str, Some(task_id)));
         }
 
         // Record agent failure for cooldown tracking (temporary failure)
@@ -525,13 +551,19 @@ pub fn handle_failover(
     false
 }
 
-/// Get a truncated snippet for error messages (last 300 chars).
+/// Get a truncated snippet for error messages (last 300 chars, UTF-8 safe).
+#[allow(dead_code)]
 fn snippet(text: &str) -> String {
-    if text.len() > 300 {
-        text[text.len() - 300..].to_string()
-    } else {
-        text.to_string()
+    if text.len() <= 300 {
+        return text.to_string();
     }
+    let start = text.len() - 300;
+    // Walk forward to find a char boundary
+    let mut idx = start;
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    text[idx..].to_string()
 }
 
 /// Get the reroute chain from sidecar.

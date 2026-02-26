@@ -10,6 +10,7 @@
 //! 7. Updates status labels and posts result comments
 
 pub mod agent;
+pub mod agents;
 pub mod context;
 pub mod git_ops;
 pub mod response;
@@ -23,7 +24,6 @@ use crate::security;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use chrono::Utc;
-use response::RunResult;
 pub use response::WeightSignal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -263,12 +263,29 @@ impl TaskRunner {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(-1);
 
-        // Collect and classify response
-        let result = response::collect_response(task_id, exit_code, &output_file);
+        // Get per-agent runner for parsing
+        let agent_runner = agents::get_runner(&agent_name);
 
-        // Handle result
-        match result {
-            RunResult::Success(resp) => {
+        // Read raw output + stderr
+        let raw_stdout = response::read_output_file(task_id, &output_file);
+        let stderr_path = sidecar::state_file(&format!("stderr-{task_id}.txt"))
+            .unwrap_or_else(|_| PathBuf::from(format!("/tmp/stderr-{task_id}.txt")));
+        let raw_stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+
+        // Use agent-specific parsing when exit code is 0, fall back to classify_error
+        let parse_result = if exit_code == 0 && !raw_stdout.is_empty() {
+            agent_runner.parse_response(&raw_stdout)
+        } else if exit_code != 0 {
+            Err(agent_runner.classify_error(exit_code, &raw_stdout, &raw_stderr))
+        } else {
+            // Exit 0 but empty output — check stderr for clues
+            let combined = format!("{raw_stdout}{raw_stderr}");
+            Err(agents::patterns::classify_from_text(exit_code, &combined))
+        };
+
+        match parse_result {
+            Ok(parsed) => {
+                let resp = parsed.response;
                 tracing::info!(
                     task_id,
                     status = resp.status,
@@ -325,8 +342,10 @@ impl TaskRunner {
                     ],
                 )?;
 
-                // Store token usage if available
-                if let (Some(input), Some(output)) = (resp.input_tokens, resp.output_tokens) {
+                // Store token usage — prefer agent-parsed tokens, fall back to response
+                let input_tokens = parsed.input_tokens.or(resp.input_tokens);
+                let output_tokens = parsed.output_tokens.or(resp.output_tokens);
+                if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
                     let model = model_name.as_deref().unwrap_or("haiku");
                     if let Err(e) = sidecar::store_token_usage(task_id, input, output, model) {
                         tracing::warn!(task_id, ?e, "failed to store token usage");
@@ -363,81 +382,147 @@ impl TaskRunner {
                     sidecar::set(task_id, &["status=in_review".to_string()])?;
                 }
             }
-            RunResult::Timeout => {
+            Err(agent_err) => {
                 tracing::warn!(
                     task_id,
                     agent = agent_name,
-                    "agent timed out, attempting failover"
-                );
-                response::handle_failover(
-                    task_id,
-                    &agent_name,
-                    response::RetryableError::Timeout,
-                    &format!("{} timed out", agent_name),
-                    self.db.as_deref(),
-                );
-            }
-            RunResult::UsageLimit(snippet) => {
-                tracing::warn!(
-                    task_id,
-                    agent = agent_name,
-                    "usage/rate limit hit, attempting failover"
+                    error = %agent_err,
+                    "agent error, attempting recovery"
                 );
 
-                // Record rate limit event if db is available
+                // Map AgentError to RetryableError for the existing handle_failover()
+                let (retryable, error_msg) = match &agent_err {
+                    agents::AgentError::RateLimit { message, .. } => {
+                        (response::RetryableError::UsageLimit, format!("{agent_name} rate limit: {message}"))
+                    }
+                    agents::AgentError::Auth { message } => {
+                        (response::RetryableError::AuthError, format!("{agent_name} auth error: {message}"))
+                    }
+                    agents::AgentError::Timeout { elapsed } => {
+                        (response::RetryableError::Timeout, format!("{agent_name} timed out after {}s", elapsed.as_secs()))
+                    }
+                    agents::AgentError::MissingTool { tool } => {
+                        (response::RetryableError::MissingTooling, format!("missing tool: {tool}"))
+                    }
+                    agents::AgentError::ModelUnavailable { model, .. } => {
+                        // Record model-specific cooldown (1 hour ban)
+                        response::record_model_failure(&agent_name, model);
+
+                        // Try next model before switching agent
+                        let models = agent_runner.available_models();
+                        let current_model = model_name.as_deref().unwrap_or("");
+                        let next_model = models.iter().find(|m| {
+                            m.as_str() != current_model
+                                && m.as_str() != model
+                                && !response::is_model_in_cooldown(&agent_name, m)
+                        });
+                        if let Some(next) = next_model {
+                            tracing::info!(task_id, model = %next, "retrying with different model");
+                            sidecar::set(
+                                task_id,
+                                &[
+                                    format!("agent_model={next}"),
+                                    "status=new".to_string(),
+                                    format!("last_error=model {model} unavailable, trying {next}"),
+                                ],
+                            )?;
+                            // Skip normal failover — we're retrying same agent with different model
+                            self.record_metrics(task_id, &agent_name, &model_name, &route_result, &started_at, attempts).await;
+                            return Ok(());
+                        }
+                        (response::RetryableError::Failed, format!("model {model} unavailable"))
+                    }
+                    agents::AgentError::ContextOverflow { .. } => {
+                        // Could truncate and retry, but for now treat as failed
+                        (response::RetryableError::Failed, format!("{agent_name} context overflow"))
+                    }
+                    agents::AgentError::WaitingForInput { message } => {
+                        // Requires human — skip failover, go straight to needs_review
+                        sidecar::set(
+                            task_id,
+                            &[
+                                "status=needs_review".to_string(),
+                                format!("last_error=waiting for input: {message}"),
+                            ],
+                        )?;
+                        self.record_metrics(task_id, &agent_name, &model_name, &route_result, &started_at, attempts).await;
+                        return Ok(());
+                    }
+                    agents::AgentError::PermissionDenied { message } => {
+                        (response::RetryableError::Failed, format!("permission denied: {message}"))
+                    }
+                    agents::AgentError::InvalidResponse { .. } => {
+                        (response::RetryableError::Failed, format!("{agent_name} invalid response"))
+                    }
+                    agents::AgentError::AgentFailed { message } => {
+                        (response::RetryableError::Failed, format!("{agent_name} failed: {message}"))
+                    }
+                    agents::AgentError::Unknown { exit_code, message } => {
+                        (response::RetryableError::Failed, format!("{agent_name} exit {exit_code}: {message}"))
+                    }
+                };
+
+                // Record rate limit in DB for rate-limit and auth errors
                 if let Some(ref db) = self.db {
+                    let error_type_str = match retryable {
+                        response::RetryableError::UsageLimit => "rate",
+                        response::RetryableError::AuthError => "budget",
+                        _ => "error",
+                    };
                     let _ = db
-                        .record_rate_limit(&agent_name, "rate", Some(task_id))
+                        .record_rate_limit(&agent_name, error_type_str, Some(task_id))
                         .await;
+                }
+
+                // Try free models as last resort before giving up
+                let chain = response::get_reroute_chain(task_id);
+                let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
+                    .iter()
+                    .filter(|a| which::which(a).is_ok())
+                    .map(|s| s.to_string())
+                    .collect();
+
+                let all_agents_tried = {
+                    let chain_set: std::collections::HashSet<&str> =
+                        if chain.is_empty() { std::collections::HashSet::new() } else { chain.split(',').collect() };
+                    !available.iter().any(|a| a != &agent_name && !chain_set.contains(a.as_str()))
+                };
+
+                if all_agents_tried {
+                    // All agents exhausted — try free models via opencode
+                    let free = agent_runner.free_models();
+                    if !free.is_empty() {
+                        let tried_models: String = sidecar::get(task_id, "model_reroute_chain").unwrap_or_default();
+                        let tried_set: std::collections::HashSet<&str> = tried_models.split(',').filter(|s| !s.is_empty()).collect();
+
+                        if let Some(free_model) = free.iter().find(|m| !tried_set.contains(m.as_str())) {
+                            tracing::info!(task_id, model = %free_model, "last resort: trying free model via opencode");
+                            let new_tried = if tried_models.is_empty() {
+                                free_model.clone()
+                            } else {
+                                format!("{tried_models},{free_model}")
+                            };
+                            sidecar::set(
+                                task_id,
+                                &[
+                                    "agent=opencode".to_string(),
+                                    format!("agent_model={free_model}"),
+                                    "status=new".to_string(),
+                                    format!("model_reroute_chain={new_tried}"),
+                                    format!("last_error=all agents exhausted, trying free model {free_model}"),
+                                ],
+                            )?;
+                            self.record_metrics(task_id, &agent_name, &model_name, &route_result, &started_at, attempts).await;
+                            return Ok(());
+                        }
+                    }
                 }
 
                 response::handle_failover(
                     task_id,
                     &agent_name,
-                    response::RetryableError::UsageLimit,
-                    &format!("{} usage/rate limit: {}", agent_name, snippet),
-                    self.db.as_deref(),
-                );
-            }
-            RunResult::AuthError(snippet) => {
-                tracing::warn!(
-                    task_id,
-                    agent = agent_name,
-                    "auth/billing error, attempting failover"
-                );
-
-                // Record rate limit event (auth errors are a form of limit) if db is available
-                if let Some(ref db) = self.db {
-                    let _ = db
-                        .record_rate_limit(&agent_name, "budget", Some(task_id))
-                        .await;
-                }
-
-                response::handle_failover(
-                    task_id,
-                    &agent_name,
-                    response::RetryableError::AuthError,
-                    &format!("{} auth/billing error: {}", agent_name, snippet),
-                    self.db.as_deref(),
-                );
-            }
-            RunResult::MissingTooling(msg) => {
-                tracing::warn!(task_id, msg = %msg, agent = agent_name, "missing tooling, attempting failover");
-                response::handle_failover(
-                    task_id,
-                    &agent_name,
-                    response::RetryableError::MissingTooling,
-                    &msg,
-                    self.db.as_deref(),
-                );
-            }
-            RunResult::Failed(msg) => {
-                tracing::warn!(task_id, msg = %msg, agent = agent_name, "task failed, attempting failover");
-                response::handle_failover(
-                    task_id,
-                    &agent_name,
-                    response::RetryableError::Failed,
-                    &msg,
+                    retryable,
+                    &error_msg,
                     self.db.as_deref(),
                 );
             }
@@ -450,115 +535,70 @@ impl TaskRunner {
             }
         }
 
-        // Record metrics after task completion
-        let completed_at = Utc::now();
-        let duration_seconds = (completed_at - started_at).num_milliseconds() as f64 / 1000.0;
-
-        // Determine outcome based on final status
-        let final_status = sidecar::get(task_id, "status").unwrap_or_default();
-        let outcome = match final_status.as_str() {
-            "done" | "in_progress" | "in_review" => "success",
-            "needs_review" => {
-                let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
-                if last_error.contains("timeout") {
-                    "timeout"
-                } else if last_error.contains("rate limit") || last_error.contains("usage") {
-                    "rate_limit"
-                } else if last_error.contains("auth") || last_error.contains("billing") {
-                    "auth_error"
-                } else {
-                    "failed"
-                }
-            }
-            _ => "success",
-        };
-
-        // Get complexity from route result
-        let complexity = route_result.as_ref().map(|r| r.complexity.clone());
-
-        // Get files changed count (approximate from git status)
-        let files_changed = git_ops::count_changed_files(&wt.work_dir)
-            .await
-            .unwrap_or(0);
-
-        // Record metrics if db is available
-        if let Some(ref db) = self.db {
-            let error_type: Option<String> = sidecar::get(task_id, "last_error").ok();
-            let metric = InsertTaskMetric {
-                task_id,
-                agent: &agent_name,
-                model: model_name.as_deref(),
-                complexity: complexity.as_deref(),
-                outcome,
-                duration_seconds,
-                started_at: &started_at,
-                completed_at: &completed_at,
-                attempts: attempts as i32 + 1,
-                files_changed: files_changed as i32,
-                error_type: error_type.as_deref(),
-            };
-            let metric_result = db.insert_task_metric(metric).await;
-
-            if let Err(e) = metric_result {
-                tracing::warn!(task_id, ?e, "failed to record task metrics");
-            }
-        }
-
-        // Record metrics after task completion
-        let completed_at = Utc::now();
-        let duration_seconds = (completed_at - started_at).num_milliseconds() as f64 / 1000.0;
-
-        // Determine outcome based on final status
-        let final_status = sidecar::get(task_id, "status").unwrap_or_default();
-        let outcome = match final_status.as_str() {
-            "done" | "in_progress" | "in_review" => "success",
-            "needs_review" => {
-                let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
-                if last_error.contains("timeout") {
-                    "timeout"
-                } else if last_error.contains("rate limit") || last_error.contains("usage") {
-                    "rate_limit"
-                } else if last_error.contains("auth") || last_error.contains("billing") {
-                    "auth_error"
-                } else {
-                    "failed"
-                }
-            }
-            _ => "success",
-        };
-
-        // Get complexity from route result
-        let complexity = route_result.as_ref().map(|r| r.complexity.clone());
-
-        // Get files changed count (approximate from git status)
-        let files_changed = git_ops::count_changed_files(&wt.work_dir)
-            .await
-            .unwrap_or(0);
-
-        // Record metrics if db is available
-        if let Some(ref db) = self.db {
-            let error_type: Option<String> = sidecar::get(task_id, "last_error").ok();
-            let metric = InsertTaskMetric {
-                task_id,
-                agent: &agent_name,
-                model: model_name.as_deref(),
-                complexity: complexity.as_deref(),
-                outcome,
-                duration_seconds,
-                started_at: &started_at,
-                completed_at: &completed_at,
-                attempts: attempts as i32 + 1,
-                files_changed: files_changed as i32,
-                error_type: error_type.as_deref(),
-            };
-            let metric_result = db.insert_task_metric(metric).await;
-
-            if let Err(e) = metric_result {
-                tracing::warn!(task_id, ?e, "failed to record task metrics");
-            }
-        }
+        // Record metrics
+        self.record_metrics(task_id, &agent_name, &model_name, &route_result, &started_at, attempts).await;
 
         Ok(())
+    }
+
+    /// Record task execution metrics to the database.
+    async fn record_metrics(
+        &self,
+        task_id: &str,
+        agent_name: &str,
+        model_name: &Option<String>,
+        route_result: &Option<RouteResult>,
+        started_at: &chrono::DateTime<Utc>,
+        attempts: u32,
+    ) {
+        let completed_at = Utc::now();
+        let duration_seconds = (completed_at - *started_at).num_milliseconds() as f64 / 1000.0;
+
+        let final_status = sidecar::get(task_id, "status").unwrap_or_default();
+        let outcome = match final_status.as_str() {
+            "done" | "in_progress" | "in_review" => "success",
+            "needs_review" => {
+                let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
+                if last_error.contains("timeout") {
+                    "timeout"
+                } else if last_error.contains("rate limit") || last_error.contains("usage") {
+                    "rate_limit"
+                } else if last_error.contains("auth") || last_error.contains("billing") {
+                    "auth_error"
+                } else {
+                    "failed"
+                }
+            }
+            _ => "success",
+        };
+
+        let complexity = route_result.as_ref().map(|r| r.complexity.clone());
+        let files_changed = git_ops::count_changed_files(&PathBuf::from(
+            sidecar::get(task_id, "worktree").unwrap_or_default(),
+        ))
+        .await
+        .unwrap_or(0);
+
+        if let Some(ref db) = self.db {
+            let error_type: Option<String> = sidecar::get(task_id, "last_error").ok();
+            let metric = InsertTaskMetric {
+                task_id,
+                agent: agent_name,
+                model: model_name.as_deref(),
+                complexity: complexity.as_deref(),
+                outcome,
+                duration_seconds,
+                started_at,
+                completed_at: &completed_at,
+                attempts: attempts as i32 + 1,
+                files_changed: files_changed as i32,
+                error_type: error_type.as_deref(),
+            };
+
+            if let Err(e) = db.insert_task_metric(metric).await {
+                tracing::warn!(task_id, ?e, "failed to record task metrics");
+            }
+        }
     }
 
     /// Run a task with full engine context (backend, tmux, capture).

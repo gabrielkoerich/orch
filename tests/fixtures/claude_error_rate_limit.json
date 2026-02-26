@@ -1,0 +1,9 @@
+{
+  "type": "result",
+  "subtype": "error",
+  "is_error": true,
+  "duration_ms": 500,
+  "result": "Error: 429 Too Many Requests - rate limit exceeded. Please try again in 30 seconds.",
+  "usage": {},
+  "permission_denials": []
+}

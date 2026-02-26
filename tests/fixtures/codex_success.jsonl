@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"thread_abc123"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"I'll implement the requested changes."}}
+{"type":"item.completed","item":{"type":"command_execution","command":"echo 'hello world'"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"Implemented the requested feature\",\"accomplished\":[\"Created handler\",\"Added route\"],\"remaining\":[],\"files\":[\"src/handler.rs\"]}"}}
+{"type":"turn.completed"}

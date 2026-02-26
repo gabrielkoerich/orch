@@ -41,6 +41,8 @@ pub struct AgentInvocation {
 /// Build the runner script content that tmux will execute.
 ///
 /// The script sets up environment, runs the agent, captures output and exit code.
+/// Delegates agent-specific command building to the `AgentRunner` trait, which
+/// translates unified `PermissionRules` into each agent's native CLI flags.
 pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
     let state_dir = sidecar::state_dir().unwrap_or_else(|_| {
         dirs::home_dir()
@@ -58,83 +60,38 @@ pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
     std::fs::write(&sys_file, &inv.system_prompt)?;
     std::fs::write(&msg_file, &inv.agent_message)?;
 
-    let model_flag = inv
-        .model
-        .as_ref()
-        .map(|m| format!("--model {m}"))
-        .unwrap_or_default();
-
     let timeout_cmd = if inv.timeout_seconds > 0 {
         format!("timeout {}", inv.timeout_seconds)
     } else {
         String::new()
     };
 
-    let disallowed = if !inv.disallowed_tools.is_empty() {
-        format!("--disallowedTools '{}'", inv.disallowed_tools.join(","))
-    } else {
-        String::new()
-    };
+    // Build unified permission rules from config + invocation
+    let mut permissions = super::agents::PermissionRules::from_config();
 
-    let agent_cmd = match inv.agent.as_str() {
-        "claude" | "kimi" | "minimax" => {
-            // Claude-compatible agents
-            let binary = &inv.agent;
-            format!(
-                r#"{timeout_cmd} {binary} -p {model_flag} \
-  --permission-mode bypassPermissions \
-  --output-format json \
-  {disallowed} \
-  --append-system-prompt "{sys_file}" \
-  < "{msg_file}""#,
-                timeout_cmd = timeout_cmd,
-                binary = binary,
-                model_flag = model_flag,
-                disallowed = disallowed,
-                sys_file = sys_file.display(),
-                msg_file = msg_file.display(),
-            )
+    // Merge invocation-specific disallowed tools into the unified rules
+    if !inv.disallowed_tools.is_empty() {
+        for tool in &inv.disallowed_tools {
+            if !permissions.disallowed_tools.contains(tool) {
+                permissions.disallowed_tools.push(tool.clone());
+            }
         }
-        "codex" => {
-            format!(
-                r#"cat "{msg_file}" | {timeout_cmd} codex {model_flag} \
-  --ask-for-approval never \
-  --sandbox workspace-write \
-  exec --json -"#,
-                msg_file = msg_file.display(),
-                timeout_cmd = timeout_cmd,
-                model_flag = model_flag,
-            )
-        }
-        "opencode" => {
-            format!(
-                r#"{timeout_cmd} opencode run {model_flag} \
-  --format json - < "{msg_file}""#,
-                timeout_cmd = timeout_cmd,
-                model_flag = model_flag,
-                msg_file = msg_file.display(),
-            )
-        }
-        other => {
-            // Unknown agent — try as claude-compatible
-            tracing::warn!(
-                agent = other,
-                "unknown agent, using claude-compatible invocation"
-            );
-            format!(
-                r#"{timeout_cmd} {other} -p {model_flag} \
-  --permission-mode bypassPermissions \
-  --output-format json \
-  --append-system-prompt "{sys_file}" \
-  < "{msg_file}""#,
-                timeout_cmd = timeout_cmd,
-                other = other,
-                model_flag = model_flag,
-                sys_file = sys_file.display(),
-                msg_file = msg_file.display(),
-            )
-        }
-    };
+    }
+
+    // Block main project dir when running in a worktree
+    if inv.work_dir != inv.main_project_dir {
+        permissions.blocked_paths.push(inv.main_project_dir.clone());
+    }
+
+    // Get the per-agent runner and delegate command building
+    let runner = super::agents::get_runner(&inv.agent);
+    let agent_cmd = runner.build_command(
+        inv.model.as_deref(),
+        &timeout_cmd,
+        &sys_file.to_string_lossy(),
+        &msg_file.to_string_lossy(),
+        &permissions,
+    );
 
     Ok(format!(
         r#"#!/usr/bin/env bash
@@ -249,11 +206,24 @@ pub fn build_system_prompt(
         prompt.push_str("\n```\n\n");
     }
 
-    // Output format instructions
+    // Workflow instructions — must be explicit about git operations
     prompt.push_str(
-        r#"## Output Format
+        r#"## Workflow — CRITICAL
 
-You MUST output a JSON object with the following fields:
+After completing your work, you MUST perform these git steps IN ORDER before outputting your response:
+
+1. **Stage all changes**: `git add` all modified and new files
+2. **Commit**: `git commit` with a descriptive message referencing the task
+3. **Push**: `git push origin HEAD` to push your branch to the remote
+4. **Create PR**: If no PR exists for this branch, create one using `gh pr create`
+
+Do NOT skip any of these steps. Do NOT report "done" unless you have committed, pushed, and verified the PR exists. The orchestrator relies on your git operations — if you only make changes without committing and pushing, your work will be lost.
+
+If git push fails (e.g., auth error, no remote), set status to "needs_review" with the error.
+
+## Output Format
+
+Your final output MUST be a JSON object with these fields:
 
 ```json
 {
@@ -265,6 +235,11 @@ You MUST output a JSON object with the following fields:
   "reason": "reason if blocked or needs_review"
 }
 ```
+
+- Use "done" ONLY when all work is committed, pushed, and PR is created
+- Use "in_progress" if partial work was committed but more remains
+- Use "blocked" if you need information or are waiting on dependencies
+- Use "needs_review" if you encountered errors you cannot resolve
 "#,
     );
 
