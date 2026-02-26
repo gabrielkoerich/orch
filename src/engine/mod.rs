@@ -25,7 +25,7 @@ use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
 use crate::channels::ChannelRegistry;
 use crate::db::{Db, TaskStatus};
-use crate::engine::router::{get_route_result, RouteResult, Router};
+use crate::engine::router::{get_route_result, Router};
 use crate::engine::tasks::TaskManager;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
@@ -366,8 +366,10 @@ async fn tick(
         // Dispatch task
         let runner = runner.clone();
         let backend = backend.clone();
+        let tmux = tmux.clone();
         let capture = capture.clone();
         let task_id_for_cleanup = task_id.clone();
+        let task_owned = task.clone();
 
         // Load routing result from sidecar (stored during Phase 3a)
         let route_result = get_route_result(&task_id).ok();
@@ -375,12 +377,8 @@ async fn tick(
         tokio::spawn(async move {
             tracing::info!(task_id, "dispatching task");
 
-            // Pass agent/model to runner via environment variables
-            let agent = route_result.as_ref().map(|r: &RouteResult| r.agent.clone());
-            let model = route_result.as_ref().and_then(|r| r.model.clone());
-
             match runner
-                .run(&task_id, agent.as_deref(), model.as_deref())
+                .run_with_context(&task_owned, &backend, &tmux, route_result.as_ref())
                 .await
             {
                 Ok(()) => {
