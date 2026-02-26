@@ -1355,7 +1355,7 @@ async fn create_review_follow_up_task(
 
     body.push_str("---\n**Parent Task:** #");
     body.push_str(parent_task_id);
-    body.push_str("\n");
+    body.push('\n');
 
     // Create labels
     let mut labels = vec!["pr-review-followup".to_string(), "status:new".to_string()];

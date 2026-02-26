@@ -407,6 +407,7 @@ impl GhCli {
     /// Get review comments for a PR review.
     ///
     /// Uses `gh api` to fetch all comments for a specific review.
+    #[allow(dead_code)]
     pub async fn get_pr_review_comments(
         &self,
         repo: &str,

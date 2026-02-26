@@ -80,6 +80,7 @@ pub struct PullRequestReview {
 
 impl PullRequestReview {
     /// Check if this review requests changes.
+    #[allow(dead_code)]
     pub fn requests_changes(&self) -> bool {
         self.review.state == "CHANGES_REQUESTED"
     }
