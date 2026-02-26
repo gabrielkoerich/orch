@@ -256,12 +256,102 @@ fn detect_missing_tooling(text: &str) -> Option<String> {
     None
 }
 
-/// Pick a fallback agent, avoiding agents already in the reroute chain.
+/// Cooldown duration for failed agents (30 minutes).
+const AGENT_COOLDOWN_SECS: i64 = 30 * 60;
+
+/// Path to the agent cooldowns file.
+fn cooldowns_path() -> std::path::PathBuf {
+    crate::sidecar::state_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+        .join("agent_cooldowns.json")
+}
+
+/// Record that an agent has failed and should be temporarily avoided.
+pub fn record_agent_failure(agent_name: &str) {
+    let path = cooldowns_path();
+
+    // Load existing or create new
+    let mut cooldowns: serde_json::Map<String, serde_json::Value> = if path.exists() {
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+
+    // Record failure with current timestamp
+    let timestamp = chrono::Utc::now().timestamp();
+    cooldowns.insert(
+        agent_name.to_string(),
+        serde_json::json!({ "failed_at": timestamp, "reason": "agent_error" }),
+    );
+
+    // Write back
+    if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns)) {
+        std::fs::write(&path, content).ok();
+    }
+}
+
+/// Check if an agent is currently in cooldown period.
+pub fn is_agent_in_cooldown(agent_name: &str) -> bool {
+    let path = cooldowns_path();
+    if !path.exists() {
+        return false;
+    }
+
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let cooldowns: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&content).unwrap_or_default();
+
+    if let Some(entry) = cooldowns.get(agent_name) {
+        if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
+            let now = chrono::Utc::now().timestamp();
+            return (now - failed_at) < AGENT_COOLDOWN_SECS;
+        }
+    }
+
+    false
+}
+
+/// Clear expired cooldowns from the file.
+pub fn clear_expired_cooldowns() {
+    let path = cooldowns_path();
+    if !path.exists() {
+        return;
+    }
+
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut cooldowns: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&content).unwrap_or_default();
+
+    let now = chrono::Utc::now().timestamp();
+    let mut to_remove = Vec::new();
+
+    for (agent, entry) in &cooldowns {
+        if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
+            if (now - failed_at) >= AGENT_COOLDOWN_SECS {
+                to_remove.push(agent.clone());
+            }
+        }
+    }
+
+    for agent in to_remove {
+        cooldowns.remove(&agent);
+    }
+
+    if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns)) {
+        std::fs::write(&path, content).ok();
+    }
+}
+
+/// Pick a fallback agent, avoiding agents already in the reroute chain and agents in cooldown.
 pub fn pick_fallback_agent(
     current_agent: &str,
     chain: &str,
     available_agents: &[String],
 ) -> Option<String> {
+    // Clear expired cooldowns first
+    clear_expired_cooldowns();
+
     let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
         std::collections::HashSet::new()
     } else {
@@ -269,12 +359,159 @@ pub fn pick_fallback_agent(
     };
 
     for agent in available_agents {
-        if agent != current_agent && !chain_set.contains(agent.as_str()) {
+        if agent != current_agent
+            && !chain_set.contains(agent.as_str())
+            && !is_agent_in_cooldown(agent)
+        {
             return Some(agent.clone());
         }
     }
 
     None
+}
+
+/// Retryable error types that should trigger agent failover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryableError {
+    /// Agent timed out.
+    Timeout,
+    /// Usage/rate limit hit.
+    UsageLimit,
+    /// Auth/billing error.
+    AuthError,
+    /// General failure (non-retryable but we still try fallback agents).
+    Failed,
+    /// Missing tooling - fallback might help if another agent has the tool.
+    MissingTooling,
+}
+
+impl RetryableError {
+    /// Check if this error type should be retried with the same agent first.
+    pub fn should_retry_same_agent(&self) -> bool {
+        matches!(self, RetryableError::Timeout | RetryableError::Failed)
+    }
+
+    /// Check if this error type should trigger a fallback to a different agent.
+    pub fn should_fallback(&self) -> bool {
+        true // All error types should try fallback agents
+    }
+
+    /// Check if this error is "exhausted" - no more retries should be attempted.
+    /// This is determined by checking if we've exhausted all available agents.
+    pub fn is_exhausted(&self, chain: &str, available_agents: &[String]) -> bool {
+        let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            chain.split(',').collect()
+        };
+
+        // Check if any available agent is NOT in the chain
+        available_agents
+            .iter()
+            .any(|a| !chain_set.contains(a.as_str()))
+    }
+}
+
+/// Handle failover for any retryable error type.
+/// Returns true if the task was rerouted, false if it should be marked needs_review.
+pub fn handle_failover(
+    task_id: &str,
+    agent_name: &str,
+    error_type: RetryableError,
+    error_message: &str,
+    db: Option<&crate::db::Db>,
+) -> bool {
+    // Get the reroute chain
+    let chain = get_reroute_chain(task_id);
+    let chain = update_reroute_chain(task_id, agent_name, &chain);
+
+    // Get all available agents
+    let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
+        .iter()
+        .filter(|a| which::which(a).is_ok())
+        .map(|s| s.to_string())
+        .collect();
+
+    // Check if we've exhausted all agents
+    let is_exhausted = !available.iter().any(|a| {
+        let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            chain.split(',').collect()
+        };
+        !chain_set.contains(a.as_str())
+    });
+
+    if is_exhausted {
+        tracing::warn!(
+            task_id,
+            agent = agent_name,
+            "all agents exhausted, marking needs_review"
+        );
+        sidecar::set(
+            task_id,
+            &[
+                "status=needs_review".to_string(),
+                format!("last_error={error_message} (all agents exhausted)"),
+            ],
+        )
+        .ok();
+        return false;
+    }
+
+    // Pick a fallback agent
+    if let Some(next) = pick_fallback_agent(agent_name, &chain, &available) {
+        tracing::info!(
+            task_id,
+            from = agent_name,
+            to = next,
+            error_type = ?error_type,
+            "failover: switching to fallback agent"
+        );
+
+        // Record the error in DB if available
+        if let Some(ref db) = db {
+            let error_type_str = match error_type {
+                RetryableError::Timeout => "timeout",
+                RetryableError::UsageLimit => "rate_limit",
+                RetryableError::AuthError => "budget",
+                RetryableError::Failed => "failed",
+                RetryableError::MissingTooling => "missing_tooling",
+            };
+            let _ = db.record_rate_limit(agent_name, error_type_str, Some(task_id));
+        }
+
+        // Record agent failure for cooldown tracking (temporary failure)
+        record_agent_failure(agent_name);
+
+        sidecar::set(
+            task_id,
+            &[
+                format!("agent={next}"),
+                "agent_model=".to_string(),
+                "status=new".to_string(),
+                format!("last_error={error_message}, rerouted to {next}"),
+            ],
+        )
+        .ok();
+        return true;
+    }
+
+    // No fallback available
+    tracing::warn!(
+        task_id,
+        agent = agent_name,
+        "no fallback agents available"
+    );
+    sidecar::set(
+        task_id,
+        &[
+            "status=needs_review".to_string(),
+            format!("last_error={error_message}, no fallback agents"),
+        ],
+    )
+    .ok();
+    false
 }
 
 /// Get a truncated snippet for error messages (last 300 chars).

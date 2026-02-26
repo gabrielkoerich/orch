@@ -317,124 +317,54 @@ impl TaskRunner {
                 }
             }
             RunResult::Timeout => {
-                tracing::error!(task_id, "agent timed out");
-                sidecar::set(
+                tracing::warn!(task_id, agent = agent_name, "agent timed out, attempting failover");
+                response::handle_failover(
                     task_id,
-                    &[
-                        "status=needs_review".to_string(),
-                        "last_error=agent timed out".to_string(),
-                    ],
-                )?;
+                    &agent_name,
+                    response::RetryableError::Timeout,
+                    &format!("{} timed out", agent_name),
+                    self.db.as_deref(),
+                );
             }
-            RunResult::UsageLimit(_snippet) => {
-                tracing::warn!(task_id, "usage/rate limit hit");
-
-                // Record rate limit event if db is available
-                if let Some(ref db) = self.db {
-                    let _ = db
-                        .record_rate_limit(&agent_name, "rate", Some(task_id))
-                        .await;
-                }
-
-                let chain = response::get_reroute_chain(task_id);
-                let chain = response::update_reroute_chain(task_id, &agent_name, &chain);
-
-                // Try to find available agents for fallback
-                let available: Vec<String> = ["claude", "codex", "opencode"]
-                    .iter()
-                    .filter(|a| which::which(a).is_ok())
-                    .map(|s| s.to_string())
-                    .collect();
-
-                if let Some(next) = response::pick_fallback_agent(&agent_name, &chain, &available) {
-                    tracing::info!(
-                        task_id,
-                        from = agent_name,
-                        to = next,
-                        "rerouting due to usage limit"
-                    );
-                    sidecar::set(
-                        task_id,
-                        &[
-                            format!("agent={next}"),
-                            "agent_model=".to_string(),
-                            "status=new".to_string(),
-                            format!("last_error={agent_name} usage/rate limit, rerouted to {next}"),
-                        ],
-                    )?;
-                } else {
-                    sidecar::set(
-                        task_id,
-                        &[
-                            "status=needs_review".to_string(),
-                            format!("last_error={agent_name} usage limit, no fallback agents"),
-                        ],
-                    )?;
-                }
+            RunResult::UsageLimit(snippet) => {
+                tracing::warn!(task_id, agent = agent_name, "usage/rate limit hit, attempting failover");
+                response::handle_failover(
+                    task_id,
+                    &agent_name,
+                    response::RetryableError::UsageLimit,
+                    &format!("{} usage/rate limit: {}", agent_name, snippet),
+                    self.db.as_deref(),
+                );
             }
-            RunResult::AuthError(_snippet) => {
-                tracing::warn!(task_id, agent = agent_name, "auth/billing error");
-
-                // Record rate limit event (auth errors are a form of limit) if db is available
-                if let Some(ref db) = self.db {
-                    let _ = db
-                        .record_rate_limit(&agent_name, "budget", Some(task_id))
-                        .await;
-                }
-
-                let available: Vec<String> = ["claude", "codex", "opencode"]
-                    .iter()
-                    .filter(|a| which::which(a).is_ok())
-                    .map(|s| s.to_string())
-                    .collect();
-
-                if let Some(next) = response::pick_fallback_agent(&agent_name, "", &available) {
-                    tracing::info!(
-                        task_id,
-                        from = agent_name,
-                        to = next,
-                        "switching agent due to auth error"
-                    );
-                    sidecar::set(
-                        task_id,
-                        &[
-                            format!("agent={next}"),
-                            "agent_model=".to_string(),
-                            "status=new".to_string(),
-                            format!(
-                                "last_error={agent_name} auth/billing error, switched to {next}"
-                            ),
-                        ],
-                    )?;
-                } else {
-                    sidecar::set(
-                        task_id,
-                        &[
-                            "status=needs_review".to_string(),
-                            format!("last_error={agent_name} auth error, no fallback agents"),
-                        ],
-                    )?;
-                }
+            RunResult::AuthError(snippet) => {
+                tracing::warn!(task_id, agent = agent_name, "auth/billing error, attempting failover");
+                response::handle_failover(
+                    task_id,
+                    &agent_name,
+                    response::RetryableError::AuthError,
+                    &format!("{} auth/billing error: {}", agent_name, snippet),
+                    self.db.as_deref(),
+                );
             }
             RunResult::MissingTooling(msg) => {
-                tracing::warn!(task_id, msg = %msg, "missing tooling");
-                sidecar::set(
+                tracing::warn!(task_id, msg = %msg, agent = agent_name, "missing tooling, attempting failover");
+                response::handle_failover(
                     task_id,
-                    &[
-                        "status=needs_review".to_string(),
-                        format!("last_error={msg}"),
-                    ],
-                )?;
+                    &agent_name,
+                    response::RetryableError::MissingTooling,
+                    &msg,
+                    self.db.as_deref(),
+                );
             }
             RunResult::Failed(msg) => {
-                tracing::error!(task_id, msg = %msg, "task failed");
-                sidecar::set(
+                tracing::warn!(task_id, msg = %msg, agent = agent_name, "task failed, attempting failover");
+                response::handle_failover(
                     task_id,
-                    &[
-                        "status=needs_review".to_string(),
-                        format!("last_error={msg}"),
-                    ],
-                )?;
+                    &agent_name,
+                    response::RetryableError::Failed,
+                    &msg,
+                    self.db.as_deref(),
+                );
             }
         }
 
