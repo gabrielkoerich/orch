@@ -610,7 +610,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] PR #191 auto-reroute on usage limits — merged (in orchestrator repo)
 - [x] README is outdated — refreshed (#70)
 - [x] Internal tasks design — implemented (SQLite + engine integration)
-- [ ] Weighted round-robin for agent routing — scale based on rate limit capacity
+- [x] Weighted round-robin for agent routing — PR #94 merged
 - [x] Worktree cleanup for stuck/failed tasks — implemented in sync_tick
 
 ### Metrics to Collect Before v1
@@ -692,8 +692,8 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] GitHub channel (polling implementation) — PR #81 merged
 - [x] Telegram channel (long-poll implementation) — PR #81 merged
 - [x] Discord channel (polling implementation) — PR #81 merged
-- [ ] Webhook HTTP server (axum) — needed for instant event delivery
-- [ ] Mention detection via webhooks (instant, no polling)
+- [x] Webhook HTTP server (axum) — PR #93 merged
+- [ ] Mention detection via webhooks (#112 — wire webhook into engine)
 - [x] Wire channels into engine event loop — PR #81 merged
 
 ### Phase 4: CLI & User-Facing Commands
@@ -733,9 +733,9 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Update brew formula (from `orchestrator` to `orch`) — `Formula/orch.rb`
 - [x] Update AGENTS.md with Rust engine docs
 - [x] Jobs config consolidated into `.orchestrator.yml` (no separate `jobs.yml`)
-- [ ] Metrics / observability (tracing, prometheus)
-- [ ] Cross-compile CI pipeline (macOS arm64 + x86_64)
-- [ ] Unified notification system (events → all channels)
+- [x] Cross-compile CI pipeline (macOS arm64 + x86_64) — PR #92 merged
+- [ ] Metrics / observability (tracing, prometheus) — PR #95 pending
+- [ ] Unified notification system (events → all channels) — #113
 
 ---
 
