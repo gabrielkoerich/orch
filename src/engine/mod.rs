@@ -37,7 +37,7 @@ use crate::tmux::TmuxManager;
 use runner::{TaskRunner, WeightSignal};
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 
 /// Per-project engine state.
 ///
@@ -273,42 +273,55 @@ pub async fn serve() -> anyhow::Result<()> {
         });
     }
 
+    // Notify used by webhook events to wake up the engine tick immediately
+    let webhook_notify = Arc::new(Notify::new());
+
     // Start webhook server if configured
-    let webhook_handle = if let (Ok(port_str), Ok(secret)) = (
-        crate::config::get("webhook.port"),
-        crate::config::get("webhook.secret"),
-    ) {
-        let port: u16 = port_str.parse().unwrap_or(8080);
-        if !secret.is_empty() && !port_str.is_empty() {
-            let webhook_tx = transport.clone();
-            let webhook_repo = project_engines
-                .first()
-                .map(|e| e.repo.clone())
-                .unwrap_or_default();
+    let webhook_enabled = crate::config::get("webhook.enabled")
+        .map(|v| v == "true")
+        .unwrap_or(false);
 
-            Some(tokio::spawn(async move {
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
+    if webhook_enabled {
+        let port: u16 = crate::config::get("webhook.port")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8080);
+        let secret = crate::config::get("webhook.secret").unwrap_or_default();
+        let webhook_repo = project_engines
+            .first()
+            .map(|e| e.repo.clone())
+            .unwrap_or_default();
 
-                // Start the webhook server
-                if let Err(e) = start_webhook_server(port, secret, webhook_repo, tx).await {
-                    tracing::error!(?e, "webhook server failed");
-                }
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
 
-                // Forward webhook messages to transport
-                while let Some(msg) = rx.recv().await {
-                    tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received webhook event");
-                    let _ = webhook_tx.route(&msg).await;
-                }
-            }))
-        } else {
-            None
-        }
+        // Spawn the HTTP server (runs until shutdown)
+        tokio::spawn(async move {
+            if let Err(e) = start_webhook_server(port, secret, webhook_repo, tx).await {
+                tracing::error!(?e, "webhook server failed");
+            }
+        });
+
+        // Spawn the message forwarding task (reads from webhook channel)
+        let notify = webhook_notify.clone();
+        let transport_for_webhook = transport.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                tracing::info!(
+                    channel = %msg.channel,
+                    thread = %msg.thread_id,
+                    event = %msg.metadata.get("event").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                    action = %msg.metadata.get("action").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                    "webhook event received, triggering immediate tick"
+                );
+                let _ = transport_for_webhook.route(&msg).await;
+                // Wake up the engine tick immediately instead of waiting up to 10s
+                notify.notify_one();
+            }
+        });
+
+        tracing::info!(port, "webhook server started");
     } else {
-        None
-    };
-
-    if webhook_handle.is_some() {
-        tracing::info!("webhook server enabled");
+        tracing::info!("webhook server disabled (set webhook.enabled: true to enable)");
     }
 
     // Agent router (selects agent + model per task) - shared across projects
@@ -403,6 +416,33 @@ pub async fn serve() -> anyhow::Result<()> {
                     }
                     last_sync = std::time::Instant::now();
                 }
+            }
+            // Webhook events trigger an immediate tick (bypass polling interval)
+            _ = webhook_notify.notified() => {
+                tracing::info!("webhook event triggered immediate tick");
+
+                let router_guard = router.read().await;
+                for engine in &project_engines {
+                    if let Err(e) = tick(
+                        &engine.backend,
+                        &tmux,
+                        &engine.runner,
+                        &capture_for_tick,
+                        &semaphore,
+                        &config,
+                        &jobs_path,
+                        &db,
+                        &router_guard,
+                        &engine.task_manager,
+                        &weight_tx,
+                    ).await {
+                        tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
+                    }
+                }
+                drop(router_guard);
+
+                // Also reset the interval so we don't get a redundant tick right after
+                interval.reset();
             }
             result = config_rx.recv() => {
                 match result {

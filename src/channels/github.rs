@@ -317,6 +317,7 @@ struct WebhookPayload {
     #[serde(rename = "pull_request")]
     pr: Option<PullRequestPayload>,
     comment: Option<CommentPayload>,
+    review: Option<ReviewPayload>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -344,6 +345,13 @@ struct CommentPayload {
     body: String,
     user: GhUser,
     created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ReviewPayload {
+    state: String,
+    body: Option<String>,
+    user: GhUser,
 }
 
 fn verify_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
@@ -409,18 +417,46 @@ fn parse_github_event(
             }
         }
         "issue_comment" => {
-            if let (Some(action), Some(comment)) = (&payload.action, &payload.comment) {
+            if let (Some(action), Some(comment), Some(issue)) =
+                (&payload.action, &payload.comment, &payload.issue)
+            {
                 if action == "created" {
                     return Some(IncomingMessage {
                         channel: "github".to_string(),
-                        id: format!("comment-{}-{}", action, timestamp.timestamp()),
-                        thread_id: "0".to_string(),
+                        id: format!("comment-{}-{}", issue.number, timestamp.timestamp()),
+                        thread_id: issue.number.to_string(),
                         author: comment.user.login.clone(),
                         body: comment.body.clone(),
                         timestamp: comment.created_at.unwrap_or(timestamp),
                         metadata: serde_json::json!({
                             "event": "issue_comment",
-                            "action": action
+                            "action": action,
+                            "issue_number": issue.number
+                        }),
+                    });
+                }
+            }
+        }
+        "pull_request_review" => {
+            if let (Some(action), Some(review), Some(pr)) =
+                (&payload.action, &payload.review, &payload.pr)
+            {
+                if action == "submitted" {
+                    return Some(IncomingMessage {
+                        channel: "github".to_string(),
+                        id: format!("review-{}-{}", pr.number, timestamp.timestamp()),
+                        thread_id: pr.number.to_string(),
+                        author: review.user.login.clone(),
+                        body: review
+                            .body
+                            .clone()
+                            .unwrap_or_else(|| format!("Review {}", review.state)),
+                        timestamp,
+                        metadata: serde_json::json!({
+                            "event": "pull_request_review",
+                            "action": action,
+                            "pr_number": pr.number,
+                            "review_state": review.state
                         }),
                     });
                 }
@@ -534,6 +570,7 @@ mod tests {
             }),
             pr: None,
             comment: None,
+            review: None,
         };
 
         let msg = parse_github_event(payload, "issues", "owner/repo");
@@ -564,6 +601,7 @@ mod tests {
             }),
             pr: None,
             comment: None,
+            review: None,
         };
 
         let msg = parse_github_event(payload, "issues", "owner/repo");
@@ -587,6 +625,7 @@ mod tests {
                 action: Some("opened".to_string()),
             }),
             comment: None,
+            review: None,
         };
 
         let msg = parse_github_event(payload, "pull_request", "owner/repo");
@@ -610,6 +649,7 @@ mod tests {
                 action: Some("synchronize".to_string()),
             }),
             comment: None,
+            review: None,
         };
 
         let msg = parse_github_event(payload, "pull_request", "owner/repo");
@@ -630,6 +670,7 @@ mod tests {
             }),
             pr: None,
             comment: None,
+            review: None,
         };
 
         let msg = parse_github_event(payload, "issues", "owner/repo");
@@ -643,6 +684,7 @@ mod tests {
             issue: None,
             pr: None,
             comment: None,
+            review: None,
         };
 
         let msg = parse_github_event(payload, "unknown_event", "owner/repo");
@@ -653,7 +695,11 @@ mod tests {
     fn test_parse_github_event_issue_comment() {
         let payload = WebhookPayload {
             action: Some("created".to_string()),
-            issue: None,
+            issue: Some(IssuePayload {
+                number: 42,
+                title: "Test issue".to_string(),
+                labels: vec![],
+            }),
             pr: None,
             comment: Some(CommentPayload {
                 body: "This is a comment".to_string(),
@@ -666,6 +712,7 @@ mod tests {
                         .with_timezone(&chrono::Utc),
                 ),
             }),
+            review: None,
         };
 
         let msg = parse_github_event(payload, "issue_comment", "owner/repo");
@@ -674,5 +721,310 @@ mod tests {
         let msg = msg.unwrap();
         assert_eq!(msg.author, "testuser");
         assert_eq!(msg.body, "This is a comment");
+        assert_eq!(msg.thread_id, "42");
+        assert_eq!(
+            msg.metadata.get("issue_number").unwrap().as_u64().unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn test_parse_github_event_issue_comment_without_issue_ignored() {
+        let payload = WebhookPayload {
+            action: Some("created".to_string()),
+            issue: None,
+            pr: None,
+            comment: Some(CommentPayload {
+                body: "Orphan comment".to_string(),
+                user: GhUser {
+                    login: "testuser".to_string(),
+                },
+                created_at: None,
+            }),
+            review: None,
+        };
+
+        let msg = parse_github_event(payload, "issue_comment", "owner/repo");
+        assert!(msg.is_none(), "comment without issue should be ignored");
+    }
+
+    #[test]
+    fn test_parse_github_event_pr_review_submitted() {
+        let payload = WebhookPayload {
+            action: Some("submitted".to_string()),
+            issue: None,
+            pr: Some(PullRequestPayload {
+                number: 55,
+                title: "Add feature".to_string(),
+                body: Some("Description".to_string()),
+                action: None,
+            }),
+            comment: None,
+            review: Some(ReviewPayload {
+                state: "changes_requested".to_string(),
+                body: Some("Please fix the tests".to_string()),
+                user: GhUser {
+                    login: "reviewer".to_string(),
+                },
+            }),
+        };
+
+        let msg = parse_github_event(payload, "pull_request_review", "owner/repo");
+        assert!(msg.is_some());
+
+        let msg = msg.unwrap();
+        assert_eq!(msg.thread_id, "55");
+        assert_eq!(msg.author, "reviewer");
+        assert_eq!(msg.body, "Please fix the tests");
+        assert_eq!(
+            msg.metadata.get("review_state").unwrap().as_str().unwrap(),
+            "changes_requested"
+        );
+    }
+
+    #[test]
+    fn test_parse_github_event_pr_review_non_submitted_ignored() {
+        let payload = WebhookPayload {
+            action: Some("dismissed".to_string()),
+            issue: None,
+            pr: Some(PullRequestPayload {
+                number: 55,
+                title: "Add feature".to_string(),
+                body: None,
+                action: None,
+            }),
+            comment: None,
+            review: Some(ReviewPayload {
+                state: "dismissed".to_string(),
+                body: None,
+                user: GhUser {
+                    login: "reviewer".to_string(),
+                },
+            }),
+        };
+
+        let msg = parse_github_event(payload, "pull_request_review", "owner/repo");
+        assert!(msg.is_none(), "dismissed review should be ignored");
+    }
+
+    #[test]
+    fn test_verify_signature_correct() {
+        let secret = "mysecret";
+        let payload = br#"{"action":"opened"}"#;
+
+        // Compute the correct HMAC-SHA256
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(payload);
+        let result = mac.finalize().into_bytes();
+        let signature = format!("sha256={:x}", result);
+
+        assert!(
+            verify_signature(secret, payload, &signature),
+            "correct signature should verify"
+        );
+    }
+
+    /// Integration test: exercise the webhook HTTP handler end-to-end.
+    /// Sends a POST to /webhook with an issues.opened payload and verifies
+    /// the IncomingMessage arrives on the mpsc channel.
+    #[tokio::test]
+    async fn test_webhook_handler_issues_opened() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt; // for oneshot()
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+
+        let state = WebhookState {
+            secret: String::new(), // empty secret = skip verification
+            repo: "owner/repo".to_string(),
+            tx,
+        };
+
+        let app = Router::new()
+            .route("/webhook", post(handle_webhook))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "number": 99,
+                "title": "New bug report",
+                "labels": [{"name": "bug"}]
+            }
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook")
+            .header("content-type", "application/json")
+            .header("x-github-event", "issues")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The handler should have sent an IncomingMessage to the channel
+        let msg = rx.try_recv().expect("should receive webhook message");
+        assert_eq!(msg.channel, "github");
+        assert_eq!(msg.thread_id, "99");
+        assert_eq!(
+            msg.metadata.get("event").unwrap().as_str().unwrap(),
+            "issues"
+        );
+        assert_eq!(
+            msg.metadata.get("action").unwrap().as_str().unwrap(),
+            "opened"
+        );
+    }
+
+    /// Integration test: verify that issue_comment events include the correct thread_id.
+    #[tokio::test]
+    async fn test_webhook_handler_issue_comment() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+
+        let state = WebhookState {
+            secret: String::new(),
+            repo: "owner/repo".to_string(),
+            tx,
+        };
+
+        let app = Router::new()
+            .route("/webhook", post(handle_webhook))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "action": "created",
+            "issue": {
+                "number": 42,
+                "title": "Existing issue",
+                "labels": []
+            },
+            "comment": {
+                "body": "@orchestrator please fix this",
+                "user": {"login": "contributor"},
+                "created_at": "2024-06-15T12:00:00Z"
+            }
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook")
+            .header("content-type", "application/json")
+            .header("x-github-event", "issue_comment")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let msg = rx.try_recv().expect("should receive comment message");
+        assert_eq!(msg.thread_id, "42", "thread_id should be the issue number");
+        assert_eq!(msg.author, "contributor");
+        assert!(msg.body.contains("@orchestrator"));
+    }
+
+    /// Integration test: verify pull_request_review.submitted events are handled.
+    #[tokio::test]
+    async fn test_webhook_handler_pr_review_submitted() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+
+        let state = WebhookState {
+            secret: String::new(),
+            repo: "owner/repo".to_string(),
+            tx,
+        };
+
+        let app = Router::new()
+            .route("/webhook", post(handle_webhook))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "action": "submitted",
+            "pull_request": {
+                "number": 77,
+                "title": "Add feature X"
+            },
+            "review": {
+                "state": "changes_requested",
+                "body": "Fix the failing tests",
+                "user": {"login": "maintainer"}
+            }
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook")
+            .header("content-type", "application/json")
+            .header("x-github-event", "pull_request_review")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let msg = rx.try_recv().expect("should receive review message");
+        assert_eq!(msg.thread_id, "77");
+        assert_eq!(msg.author, "maintainer");
+        assert_eq!(
+            msg.metadata.get("review_state").unwrap().as_str().unwrap(),
+            "changes_requested"
+        );
+    }
+
+    /// Integration test: verify that invalid signatures are rejected.
+    #[tokio::test]
+    async fn test_webhook_handler_rejects_invalid_signature() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+
+        let state = WebhookState {
+            secret: "real-secret".to_string(),
+            repo: "owner/repo".to_string(),
+            tx,
+        };
+
+        let app = Router::new()
+            .route("/webhook", post(handle_webhook))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "number": 1,
+                "title": "Should be rejected",
+                "labels": []
+            }
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook")
+            .header("content-type", "application/json")
+            .header("x-github-event", "issues")
+            .header("x-hub-signature-256", "sha256=invalid")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // No message should have been sent
+        assert!(
+            rx.try_recv().is_err(),
+            "no message should be sent for invalid signature"
+        );
     }
 }
