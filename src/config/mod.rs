@@ -139,6 +139,91 @@ pub fn get(key: &str) -> anyhow::Result<String> {
     anyhow::bail!("config key not found: {key}")
 }
 
+/// Get all projects configured in the global config.
+///
+/// Returns a list of project repo slugs (owner/repo).
+/// Falls back to the single `repo` key if `projects` is not defined.
+pub fn get_projects() -> anyhow::Result<Vec<String>> {
+    let global_path = global_config_path()?;
+
+    // Try to get projects list first
+    if global_path.exists() {
+        if let Ok(projects) = resolve_projects_list(&global_path, "projects") {
+            if !projects.is_empty() {
+                return Ok(projects);
+            }
+        }
+    }
+
+    // Fall back to single repo key
+    let repo = get("repo")?;
+    Ok(vec![repo])
+}
+
+/// Resolve a projects list from a config file.
+fn resolve_projects_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String>> {
+    // First, ensure we're watching this file for changes
+    watch_file(path);
+
+    let root = {
+        // Try to get from cache first (read lock)
+        if let Ok(cache) = CACHE.read() {
+            if let Some(cached) = cache.get(path) {
+                return extract_projects_list(cached, key);
+            }
+        }
+
+        // Not in cache, load and cache it (write lock)
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let parsed: serde_yml::Value =
+            serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+
+        if let Ok(mut cache) = CACHE.write() {
+            cache.insert(path.clone(), parsed.clone());
+        }
+
+        parsed
+    };
+
+    // Try to extract projects list - if key doesn't exist, return empty vector
+    match extract_projects_list(&root, key) {
+        Ok(projects) => Ok(projects),
+        Err(_) => Ok(vec![]),
+    }
+}
+
+/// Extract a projects list from a YAML tree.
+fn extract_projects_list(root: &serde_yml::Value, key: &str) -> anyhow::Result<Vec<String>> {
+    let mut current = root;
+    for part in key.split('.') {
+        // If key doesn't exist, return empty vector
+        let next = match current.get(part) {
+            Some(v) => v,
+            None => return Ok(vec![]),
+        };
+        current = next;
+    }
+
+    match current {
+        serde_yml::Value::Sequence(seq) => {
+            let mut projects = Vec::new();
+            for item in seq {
+                if let serde_yml::Value::String(s) = item {
+                    projects.push(s.clone());
+                } else if let serde_yml::Value::Mapping(map) = item {
+                    // Support map format: { repo: "owner/repo", project_dir: "/path" }
+                    if let Some(serde_yml::Value::String(repo)) = map.get("repo") {
+                        projects.push(repo.clone());
+                    }
+                }
+            }
+            Ok(projects)
+        }
+        _ => Ok(vec![]),
+    }
+}
+
 /// Resolve a dot-separated key from a YAML file.
 ///
 /// Caches the parsed YAML so repeated lookups don't re-read disk.
@@ -250,6 +335,61 @@ mod tests {
         let path = PathBuf::from("/nonexistent/config.yml");
         let result = resolve_key(&path, "repo");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_projects_list_string_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_yaml(
+            dir.path(),
+            "config.yml",
+            "projects:\n  - owner/repo1\n  - owner/repo2\n",
+        );
+        let projects = resolve_projects_list(&path, "projects").unwrap();
+        assert_eq!(projects, vec!["owner/repo1", "owner/repo2"]);
+    }
+
+    #[test]
+    fn resolve_projects_list_map_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_yaml(
+            dir.path(),
+            "config.yml",
+            "projects:\n  - repo: owner/repo1\n    project_dir: /path/to/repo1\n  - repo: owner/repo2\n    project_dir: /path/to/repo2\n",
+        );
+        let projects = resolve_projects_list(&path, "projects").unwrap();
+        assert_eq!(projects, vec!["owner/repo1", "owner/repo2"]);
+    }
+
+    #[test]
+    fn resolve_projects_list_fallback_to_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_yaml(dir.path(), "config.yml", "repo: owner/single-repo\n");
+        let projects = resolve_projects_list(&path, "projects").unwrap();
+        assert!(projects.is_empty());
+    }
+
+    #[test]
+    fn extract_projects_list_from_sequence() {
+        let yaml =
+            serde_yml::from_str::<serde_yml::Value>("projects:\n  - a\n  - b\n  - c\n").unwrap();
+        let projects = extract_projects_list(&yaml, "projects").unwrap();
+        assert_eq!(projects, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn extract_projects_list_from_mapping_sequence() {
+        let yaml = serde_yml::from_str::<serde_yml::Value>("projects:\n  - repo: a\n  - repo: b\n")
+            .unwrap();
+        let projects = extract_projects_list(&yaml, "projects").unwrap();
+        assert_eq!(projects, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn extract_projects_list_empty_for_missing() {
+        let yaml = serde_yml::from_str::<serde_yml::Value>("foo: bar").unwrap();
+        let projects = extract_projects_list(&yaml, "projects").unwrap();
+        assert!(projects.is_empty());
     }
 
     #[test]

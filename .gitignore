@@ -14,5 +14,8 @@ jobs.yml
 docs/public/
 orchestrator.db
 
+# Agent configs
+opencode.json
+
 # Rust
 /target
