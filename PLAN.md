@@ -737,11 +737,11 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Jobs config consolidated into `.orchestrator.yml` (no separate `jobs.yml`)
 - [x] Cross-compile CI pipeline (macOS arm64 + x86_64) — PR #92 merged
 - [x] Metrics / observability (tracing, prometheus) — PR #95 merged
-- [ ] Unified notification system (events → all channels) — PR #124 open
+- [x] Unified notification system (events → all channels) — PR #124 merged
 - [x] Per-agent runner trait (AgentRunner, AgentError, per-agent parsers) — PR #116 merged
-- [ ] Agent memory (persist learnings across retries) — PR #122 open
-- [ ] PR review integration (parse review comments → follow-up tasks) — PR #125 open
-- [ ] Self-improvement loop (auto-create issues from metrics) — PR #120 open
+- [x] Agent memory (persist learnings across retries) — PR #122 merged
+- [x] PR review integration (parse review comments → follow-up tasks) — PR #125 merged
+- [x] Self-improvement loop (auto-create issues from metrics) — PR #120 merged
 - [ ] Polling fallback for webhooks (mentions, PR reviews, issue status) — #TBD
 
 ---
@@ -768,17 +768,18 @@ src/
 │   ├── mod.rs               # Channel trait, IncomingMessage, OutgoingMessage
 │   ├── transport.rs         # Session bindings, routing, output broadcast
 │   ├── capture.rs           # tmux output capture + diffing service
+│   ├── notification.rs      # Unified notification dispatch (levels, formatting, broadcast)
 │   ├── tmux.rs              # tmux channel (pane monitoring)
 │   ├── github.rs            # GitHub App: webhooks (stub)
 │   ├── telegram.rs          # Telegram Bot API (stub)
 │   └── discord.rs           # Discord gateway websocket (stub)
 │
 ├── engine/
-│   ├── mod.rs               # Engine struct, main async event loop (10s tick + 120s sync)
+│   ├── mod.rs               # Engine struct, event loop (10s tick + 120s sync), PR review integration
 │   ├── tasks.rs             # TaskManager — unified internal + external CRUD
 │   ├── internal_tasks.rs    # Internal task SQLite operations
 │   ├── router.rs            # Agent routing (label, round-robin, LLM, circuit breaker)
-│   ├── jobs.rs              # Cron scheduler (reads from .orchestrator.yml)
+│   ├── jobs.rs              # Cron scheduler + self-review job (metrics → improvement issues)
 │   └── runner/
 │       ├── mod.rs           # TaskRunner — orchestrates full task lifecycle
 │       ├── context.rs       # Prompt context building (project instructions, repo tree, etc.)
@@ -789,7 +790,7 @@ src/
 │       │   ├── claude.rs    # Claude/Kimi/MiniMax runner (JSON envelope parser)
 │       │   ├── codex.rs     # Codex runner (NDJSON stream parser)
 │       │   └── opencode.rs  # OpenCode runner (NDJSON parser + free model discovery)
-│       ├── response.rs      # Failover logic, cooldowns, weight signals
+│       ├── response.rs      # Failover logic, cooldowns, weight signals, memory storage
 │       └── git_ops.rs       # Auto-commit, push, PR creation, PR override detection
 │
 ├── github/
@@ -798,13 +799,116 @@ src/
 │   └── types.rs             # GitHubIssue, GitHubComment, GitHubLabel, etc.
 │
 ├── db.rs                    # SQLite for internal tasks (schema + migrations)
-├── sidecar.rs               # JSON sidecar file I/O
+├── sidecar.rs               # JSON sidecar file I/O + agent memory persistence
 ├── parser.rs                # Agent response normalization (JSON → AgentResponse)
 ├── template.rs              # Template rendering (env var substitution)
 ├── tmux.rs                  # TmuxManager (session create/kill/list/capture)
 ├── security.rs              # Secret scanning + redaction
+├── home.rs                  # Home directory resolution (~/.orch/ with ~/.orchestrator/ compat)
 └── cron.rs                  # Native cron expression matching
 ```
+
+---
+
+## Feature Documentation
+
+### Agent Memory System
+
+**Location:** `src/sidecar.rs` (memory storage), `src/engine/runner/response.rs` (write), `src/engine/runner/context.rs` (read)
+
+Agents persist learnings across retries so subsequent attempts don't repeat the same mistakes. Memory entries are stored in the task's sidecar JSON file (`~/.orch/state/{task_id}.json`) under the `"memory"` key.
+
+**`MemoryEntry` structure:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `attempt` | `u32` | 1-indexed attempt number |
+| `agent` | `String` | Agent that made the attempt |
+| `model` | `Option<String>` | Model used |
+| `learnings` | `Vec<String>` | Key learnings from the attempt |
+| `error` | `Option<String>` | Error message if failed |
+| `files_modified` | `Vec<String>` | Files changed |
+| `approach` | `String` | Approach taken (from summary) |
+| `timestamp` | `String` | ISO 8601 formatted |
+
+**How it works:**
+
+1. After each attempt, `store_memory()` or `store_failure_memory()` writes a `MemoryEntry` to the sidecar.
+2. On retry, `build_memory_context()` in `context.rs` fetches the most recent entries and formats them as a markdown section in the agent prompt.
+3. Max **3 entries** per task (`MAX_MEMORY_ENTRIES = 3`) to prevent context overflow.
+
+### Notification System
+
+**Location:** `src/channels/notification.rs`
+
+Unified notification dispatch that broadcasts task completion events to all configured channels (Telegram, Discord). Notifications are filtered by a configurable level.
+
+**Configuration:**
+
+| Key | Values | Default | Description |
+|-----|--------|---------|-------------|
+| `notifications.level` | `all`, `errors_only`, `none` | `all` | Controls which events trigger notifications |
+
+**`NotificationLevel` behavior:**
+
+| Level | Notifies on |
+|-------|------------|
+| `all` | All task completions (done, in_review, needs_review, blocked, failed) |
+| `errors_only` | Only `needs_review`, `blocked`, `failed` |
+| `none` | Disabled entirely |
+
+**`TaskNotification` fields:** `task_id`, `title`, `status`, `summary`, `agent`, `duration_seconds`
+
+**Formatting:** Channel-specific formatters (`format_telegram()`, `format_discord()`) with status emoji mapping (✅ done, ⚠️ needs_review, 🚫 blocked, ❌ failed, etc.).
+
+**Integration:** The notification dispatcher is spawned in the engine loop. After task completion, a notification is pushed, filtered by level, formatted per channel, and broadcast via the transport layer. GitHub notifications are handled separately (comments), and tmux is skipped.
+
+### PR Review Integration
+
+**Location:** `src/engine/mod.rs` (`review_open_prs()`)
+
+Automatically creates follow-up tasks when a PR receives a `CHANGES_REQUESTED` review. This closes the feedback loop between code review and agent execution.
+
+**How it works:**
+
+1. During the 120s sync tick, `review_open_prs()` lists all tasks with `Status::InReview`.
+2. For each task, fetches PR reviews via the GitHub CLI.
+3. Filters for `CHANGES_REQUESTED` reviews with actionable comments (non-empty, non-reply).
+4. Creates internal follow-up tasks with these labels:
+   - `pr-review-followup`
+   - `status:new`
+   - `agent:{original_agent}` — routes to the same agent that created the PR
+5. Each follow-up task's sidecar stores: `pr_number`, `branch`, `reviewer`, `file_path`, `parent_task_id`.
+
+**Deduplication:** Uses `review_comment_{pr_number}_{comment_id}` as a key to prevent duplicate follow-up tasks for the same review comment.
+
+### Self-Review Job
+
+**Location:** `src/engine/jobs.rs` (`run_self_review()`)
+
+A scheduled job that analyzes task metrics and auto-creates GitHub issues for orchestrator improvements. Detects patterns of failure, recurring errors, and slow execution.
+
+**Job type:** `self-review`
+
+**Detection patterns:**
+
+| Pattern | Function | What it detects |
+|---------|----------|----------------|
+| High failure rate agents | `detect_high_failure_agent()` | Agents with disproportionately high failure rates |
+| Recurring errors | `detect_common_errors()` | Error patterns appearing across multiple tasks |
+| Slow tasks | `detect_slow_tasks()` | Tasks taking significantly longer than average |
+
+**Rate limiting:** Max **3 self-improvement issues per 7-day** rolling window (`MAX_SELF_IMPROVEMENT_ISSUES_PER_WEEK = 3`). Checked via `db.count_self_improvement_issues_7d()` before creating new issues.
+
+**Metrics sources:**
+
+| Source | Window | Purpose |
+|--------|--------|---------|
+| `get_metrics_summary_24h()` | 24 hours | Current performance snapshot |
+| `get_slow_tasks_7d()` | 7 days | Historical execution time analysis |
+| `get_error_distribution_7d()` | 7 days | Error pattern detection |
+
+**Output:** Creates GitHub issues via `create_self_improvement_issue()` with detailed analysis and suggested fixes. Sets `job.last_task_status` to `"done"`, `"no_issues"`, or `"failed"`.
 
 ---
 
