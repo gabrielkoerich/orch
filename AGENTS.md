@@ -27,7 +27,7 @@ orch task unblock all
 
 ## Logs
 
-- Service log: `~/.orchestrator/.orchestrator/orch.log`
+- Service log: `~/.orchestrator/state/orch.log`
 - Brew stdout: `/opt/homebrew/var/log/orch.log` (startup messages only)
 - Brew stderr: `/opt/homebrew/var/log/orch.error.log`
 
@@ -143,7 +143,7 @@ Override the router by adding labels to tasks:
 
 ### RouteResult Struct
 
-Routing results are stored in the sidecar file (`~/.orchestrator/.orchestrator/{task_id}.json`):
+Routing results are stored in the sidecar file (`~/.orchestrator/state/{task_id}.json`):
 
 ```rust
 pub struct RouteResult {
@@ -194,7 +194,7 @@ The routing prompt template is at `prompts/route.md`. It includes:
     owner/repo.git       #   each has .orchestrator.yml inside
   worktrees/             # agent worktrees (all projects)
     repo/branch/         #   created by the runner, one per task
-  .orchestrator/         # runtime state (logs, prompts, pid, locks)
+  state/                 # runtime state (logs, prompts, pid, locks)
 ```
 
 - **User-managed projects** (e.g. `~/Projects/foo`): user clones, runs `orch init`. Project dir stays where the user put it.
@@ -236,7 +236,7 @@ Do not skip steps — the service runs from the Homebrew cellar, not the repo.
 - **`needs_review`** — requires human attention (max attempts, review rejection, agent failures, retry loops, timeouts)
 - `mark_needs_review()` sets `needs_review`, NOT `blocked`
 - Only parent tasks waiting on children should be `blocked`
-- `poll.sh` auto-unblocks parent tasks when all children are done
+- Engine auto-unblocks parent tasks when all children are done (Phase 4 of tick)
 
 ## Preferred tools
 
