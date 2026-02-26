@@ -181,9 +181,10 @@ impl TaskRunner {
             .unwrap_or(1800);
 
         // Build agent invocation
+        let model_for_invocation = model_name.clone();
         let invocation = agent::AgentInvocation {
             agent: agent_name.clone(),
-            model: model_name,
+            model: model_for_invocation,
             work_dir: wt.work_dir.clone(),
             system_prompt,
             agent_message,
@@ -290,6 +291,41 @@ impl TaskRunner {
                         format!("summary={}", resp.summary),
                     ],
                 )?;
+
+                // Store token usage if available
+                if let (Some(input), Some(output)) = (resp.input_tokens, resp.output_tokens) {
+                    let model = model_name.as_deref().unwrap_or("haiku");
+                    if let Err(e) = sidecar::store_token_usage(task_id, input, output, model) {
+                        tracing::warn!(task_id, ?e, "failed to store token usage");
+                    }
+                }
+
+                // Check token budget
+                let max_tokens: u64 = config::get("max_tokens_per_task")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(100_000);
+
+                let total_tokens = sidecar::get_total_tokens(task_id);
+                if total_tokens > max_tokens {
+                    tracing::warn!(
+                        task_id,
+                        total_tokens,
+                        max_tokens,
+                        "exceeded token budget"
+                    );
+                    sidecar::set(
+                        task_id,
+                        &[
+                            "status=needs_review".to_string(),
+                            format!(
+                                "last_error=token budget exceeded: {}/{} tokens",
+                                total_tokens, max_tokens
+                            ),
+                        ],
+                    )?;
+                    return Ok(());
+                }
 
                 // Check PR override: done → in_review
                 if resp.status == "done"

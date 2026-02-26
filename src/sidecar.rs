@@ -11,6 +11,48 @@ use anyhow::Context;
 use serde_json::Value;
 use std::path::PathBuf;
 
+/// Token usage for an agent run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
+/// Per-1M token pricing in USD.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelPricing {
+    pub input_per_million_usd: f64,
+    pub output_per_million_usd: f64,
+}
+
+impl ModelPricing {
+    pub fn estimate_cost_usd(self, usage: TokenUsage) -> CostEstimate {
+        let input_cost =
+            (usage.input_tokens as f64 / 1_000_000.0) * self.input_per_million_usd;
+        let output_cost =
+            (usage.output_tokens as f64 / 1_000_000.0) * self.output_per_million_usd;
+        CostEstimate {
+            input_cost_usd: input_cost,
+            output_cost_usd: output_cost,
+            total_cost_usd: input_cost + output_cost,
+        }
+    }
+}
+
+/// Cost estimate in USD.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CostEstimate {
+    pub input_cost_usd: f64,
+    pub output_cost_usd: f64,
+    pub total_cost_usd: f64,
+}
+
 /// Get the runtime state directory path.
 ///
 /// New location: `~/.orch/state/`
@@ -114,8 +156,137 @@ pub fn set(task_id: &str, fields: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read a numeric sidecar field as u64. Missing or invalid values return 0.
+pub fn get_u64(task_id: &str, field: &str) -> u64 {
+    get(task_id, field)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Read a numeric sidecar field as f64. Missing or invalid values return 0.0.
+pub fn get_f64(task_id: &str, field: &str) -> f64 {
+    get(task_id, field)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+/// Store token usage for a task.
+pub fn store_token_usage(
+    task_id: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    model: &str,
+) -> anyhow::Result<()> {
+    // Store raw token counts
+    set(
+        task_id,
+        &[
+            format!("input_tokens={}", input_tokens),
+            format!("output_tokens={}", output_tokens),
+        ],
+    )?;
+
+    // Calculate and store cost
+    let pricing = pricing_for_model(model);
+    let usage = TokenUsage {
+        input_tokens,
+        output_tokens,
+    };
+    let cost = pricing.estimate_cost_usd(usage);
+
+    set(
+        task_id,
+        &[
+            format!("input_cost_usd={:.6}", cost.input_cost_usd),
+            format!("output_cost_usd={:.6}", cost.output_cost_usd),
+            format!("total_cost_usd={:.6}", cost.total_cost_usd),
+            format!("model={}", model),
+        ],
+    )?;
+
+    Ok(())
+}
+
+/// Get token usage for a task.
+pub fn get_token_usage(task_id: &str) -> TokenUsage {
+    TokenUsage {
+        input_tokens: get_u64(task_id, "input_tokens"),
+        output_tokens: get_u64(task_id, "output_tokens"),
+    }
+}
+
+/// Get cost estimate for a task.
+pub fn get_cost_estimate(task_id: &str) -> CostEstimate {
+    CostEstimate {
+        input_cost_usd: get_f64(task_id, "input_cost_usd"),
+        output_cost_usd: get_f64(task_id, "output_cost_usd"),
+        total_cost_usd: get_f64(task_id, "total_cost_usd"),
+    }
+}
+
+/// Get the model used for a task.
+pub fn get_model(task_id: &str) -> String {
+    get(task_id, "model").unwrap_or_default()
+}
+
+/// Get total tokens used for a task.
+pub fn get_total_tokens(task_id: &str) -> u64 {
+    let usage = get_token_usage(task_id);
+    usage.total_tokens()
+}
+
+/// Resolve model pricing using a built-in table and normalized model aliases.
+pub fn pricing_for_model(model: &str) -> ModelPricing {
+    let normalized = model.trim().to_lowercase();
+    if normalized.contains("gpt-5.3-codex") {
+        return ModelPricing {
+            input_per_million_usd: 5.0,
+            output_per_million_usd: 20.0,
+        };
+    }
+    if normalized.contains("gpt-5.2") {
+        return ModelPricing {
+            input_per_million_usd: 2.0,
+            output_per_million_usd: 8.0,
+        };
+    }
+    if normalized.contains("gpt-5.1-codex-mini") || normalized.contains("gpt-5-mini") {
+        return ModelPricing {
+            input_per_million_usd: 0.25,
+            output_per_million_usd: 2.0,
+        };
+    }
+    if normalized.contains("opus") {
+        return ModelPricing {
+            input_per_million_usd: 15.0,
+            output_per_million_usd: 75.0,
+        };
+    }
+    if normalized.contains("sonnet") {
+        return ModelPricing {
+            input_per_million_usd: 3.0,
+            output_per_million_usd: 15.0,
+        };
+    }
+    if normalized.contains("haiku") {
+        return ModelPricing {
+            input_per_million_usd: 0.8,
+            output_per_million_usd: 4.0,
+        };
+    }
+
+    // Fallback baseline when model is unknown.
+    ModelPricing {
+        input_per_million_usd: 1.0,
+        output_per_million_usd: 4.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use tempfile::TempDir;
 
     /// Override sidecar dir to use a temp directory for tests.
@@ -188,5 +359,43 @@ mod tests {
         assert_eq!(final_obj["agent"], "claude");
         assert_eq!(final_obj["status"], "new");
         assert_eq!(final_obj["model"], "opus");
+    }
+
+    #[test]
+    fn pricing_lookup_known_models() {
+        let codex = pricing_for_model("gpt-5.3-codex");
+        assert_eq!(
+            codex,
+            ModelPricing {
+                input_per_million_usd: 5.0,
+                output_per_million_usd: 20.0
+            }
+        );
+
+        let haiku = pricing_for_model("haiku");
+        assert_eq!(
+            haiku,
+            ModelPricing {
+                input_per_million_usd: 0.8,
+                output_per_million_usd: 4.0
+            }
+        );
+    }
+
+    #[test]
+    fn cost_estimation_uses_both_input_and_output() {
+        let pricing = ModelPricing {
+            input_per_million_usd: 2.0,
+            output_per_million_usd: 8.0,
+        };
+        let usage = TokenUsage {
+            input_tokens: 50_000,
+            output_tokens: 10_000,
+        };
+        let cost = pricing.estimate_cost_usd(usage);
+
+        assert!((cost.input_cost_usd - 0.1).abs() < 1e-9);
+        assert!((cost.output_cost_usd - 0.08).abs() < 1e-9);
+        assert!((cost.total_cost_usd - 0.18).abs() < 1e-9);
     }
 }

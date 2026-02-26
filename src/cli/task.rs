@@ -160,8 +160,22 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         counts.push((s, tasks.len()));
     }
 
+    // Calculate total cost across all tasks
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+    let mut total_cost: f64 = 0.0;
+
+    for s in &statuses {
+        let tasks = backend.list_by_status(*s).await?;
+        for task in tasks {
+            total_input_tokens += sidecar::get_u64(&task.id.0, "input_tokens");
+            total_output_tokens += sidecar::get_u64(&task.id.0, "output_tokens");
+            total_cost += sidecar::get_f64(&task.id.0, "total_cost_usd");
+        }
+    }
+
     if json {
-        let map: serde_json::Map<String, serde_json::Value> = counts
+        let mut map: serde_json::Map<String, serde_json::Value> = counts
             .iter()
             .map(|(s, c)| {
                 (
@@ -170,6 +184,25 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
                 )
             })
             .collect();
+
+        // Add cost summary
+        map.insert(
+            "total_cost_usd".to_string(),
+            serde_json::Value::Number(serde_json::Number::from_f64(total_cost).unwrap_or(serde_json::Number::from(0))),
+        );
+        map.insert(
+            "total_input_tokens".to_string(),
+            serde_json::Value::Number(total_input_tokens.into()),
+        );
+        map.insert(
+            "total_output_tokens".to_string(),
+            serde_json::Value::Number(total_output_tokens.into()),
+        );
+        map.insert(
+            "total_tokens".to_string(),
+            serde_json::Value::Number((total_input_tokens + total_output_tokens).into()),
+        );
+
         println!("{}", serde_json::to_string_pretty(&map)?);
     } else {
         println!("{:<20} COUNT", "STATUS");
@@ -182,6 +215,14 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         }
         println!("{}", "-".repeat(30));
         println!("{:<20} {}", "total", total);
+
+        // Show cost summary if any
+        if total_cost > 0.0 {
+            println!();
+            println!("Cost summary:");
+            println!("  Total tokens: {}", total_input_tokens + total_output_tokens);
+            println!("  Total cost:   ${:.6}", total_cost);
+        }
     }
 
     Ok(())
@@ -380,5 +421,32 @@ pub async fn publish(id: i64, labels: Vec<String>) -> anyhow::Result<()> {
     let task_manager = init_task_manager().await?;
     let ext_id = task_manager.publish_task(id, &labels).await?;
     println!("Published task #{} as GitHub issue #{}", id, ext_id.0);
+    Ok(())
+}
+
+/// Show token cost breakdown for a task.
+pub fn cost(id: &str) -> anyhow::Result<()> {
+    let usage = sidecar::get_token_usage(id);
+    let cost_estimate = sidecar::get_cost_estimate(id);
+    let model = sidecar::get_model(id);
+
+    if usage.total_tokens() == 0 {
+        println!("No token data available for task #{}", id);
+        return Ok(println!("Run the task first to collect token usage."));
+    }
+
+    println!("Token usage for task #{}", id);
+    println!("{}", "-".repeat(40));
+    println!("Model: {}", if model.is_empty() { "unknown" } else { &model });
+    println!("Input tokens:  {:>12}", usage.input_tokens);
+    println!("Output tokens: {:>12}", usage.output_tokens);
+    println!("{}", "-".repeat(40));
+    println!("Total tokens:  {:>12}", usage.total_tokens());
+    println!();
+    println!("Cost breakdown:");
+    println!("  Input:  ${:.6}", cost_estimate.input_cost_usd);
+    println!("  Output: ${:.6}", cost_estimate.output_cost_usd);
+    println!("  Total:  ${:.6}", cost_estimate.total_cost_usd);
+
     Ok(())
 }
