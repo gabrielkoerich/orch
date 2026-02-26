@@ -414,7 +414,6 @@ impl TaskRunner {
     /// Run a task with full engine context (backend, tmux, capture).
     ///
     /// Called by the engine dispatch loop with richer context.
-    #[allow(dead_code)]
     pub async fn run_with_context(
         &self,
         task: &ExternalTask,

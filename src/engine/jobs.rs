@@ -69,30 +69,62 @@ fn default_external() -> bool {
     true // Default to external (GitHub) for backward compatibility
 }
 
-/// Top-level jobs.yml structure.
+/// Top-level config structure (for reading jobs from .orchestrator.yml / config.yml).
 #[derive(Debug, Serialize, Deserialize)]
-pub struct JobsFile {
+struct ConfigFile {
     #[serde(default)]
-    pub jobs: Vec<Job>,
+    jobs: Vec<Job>,
+    // Capture all other fields so we can round-trip them
+    #[serde(flatten)]
+    other: serde_yml::Mapping,
 }
 
-/// Load jobs from a YAML file.
+/// Resolve the config file that contains jobs.
+///
+/// Priority:
+/// 1. `.orchestrator.yml` in the current directory (project config)
+/// 2. `~/.orchestrator/config.yml` (global config)
+pub fn resolve_jobs_path() -> PathBuf {
+    let project = PathBuf::from(".orchestrator.yml");
+    if project.exists() {
+        return project;
+    }
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".orchestrator")
+        .join("config.yml")
+}
+
+/// Load jobs from the orchestrator config file.
+///
+/// Reads the `jobs` key from `.orchestrator.yml` (project) or
+/// `~/.orchestrator/config.yml` (global).
 pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
     if !path.exists() {
         return Ok(vec![]);
     }
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let file: JobsFile =
+    let file: ConfigFile =
         serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
     Ok(file.jobs)
 }
 
-/// Save jobs back to the YAML file (updates last_run, active_task_id, etc.).
+/// Save jobs back to the config file, preserving all other keys.
 pub fn save_jobs(path: &PathBuf, jobs: &[Job]) -> anyhow::Result<()> {
-    let file = JobsFile {
-        jobs: jobs.to_vec(),
+    // Read the existing file to preserve non-jobs keys
+    let mut file: ConfigFile = if path.exists() {
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?
+    } else {
+        ConfigFile {
+            jobs: vec![],
+            other: serde_yml::Mapping::new(),
+        }
     };
+
+    file.jobs = jobs.to_vec();
     let content = serde_yml::to_string(&file)?;
     std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
