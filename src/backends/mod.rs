@@ -191,6 +191,15 @@ pub trait ExternalBackend: Send + Sync {
         Ok(())
     }
 
+    /// Check if an open issue with the given title already exists.
+    ///
+    /// Used for deduplication before creating issues. The `label` parameter
+    /// narrows the search to issues with a specific label.
+    /// Default returns `false` (no dedup for backends that don't support it).
+    async fn has_open_issue_with_title(&self, _title: &str, _label: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Check if connected and authenticated.
     async fn health_check(&self) -> anyhow::Result<()>;
 

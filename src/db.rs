@@ -5,7 +5,7 @@
 //! No bidirectional sync — each storage is authoritative for its domain.
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -249,7 +249,15 @@ impl Db {
                     .unwrap_or_else(|_| Utc::now()),
             })
         })?;
-        let result: Vec<InternalTask> = tasks.filter_map(|t| t.ok()).collect();
+        let result: Vec<InternalTask> = tasks
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
+            .collect();
         Ok(result)
     }
 
@@ -352,7 +360,15 @@ impl Db {
                     .unwrap_or_else(|_| Utc::now()),
             })
         })?;
-        let result: Vec<InternalTask> = tasks.filter_map(|t| t.ok()).collect();
+        let result: Vec<InternalTask> = tasks
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
+            .collect();
         Ok(result)
     }
 
@@ -476,7 +492,13 @@ impl Db {
                     },
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
             .collect();
 
         // Rate limit events in last 24h
@@ -533,7 +555,13 @@ impl Db {
                     failure_count: row.get(3)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
             .collect();
         Ok(failures)
     }
@@ -558,7 +586,13 @@ impl Db {
                     duration_seconds: row.get(3)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
             .collect();
         Ok(slow_tasks)
     }
@@ -582,68 +616,42 @@ impl Db {
                     count: row.get(1)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
             .collect();
         Ok(errors)
     }
 
-    /// Get agent performance by complexity level from the last 7 days.
-    pub async fn get_agent_complexity_performance_7d(
-        &self,
-    ) -> anyhow::Result<Vec<AgentComplexityStat>> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT agent, complexity,
-                    COUNT(*) as total,
-                    SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as success_count,
-                    AVG(duration_seconds) as avg_duration
-             FROM task_metrics
-             WHERE completed_at >= datetime('now', '-7 days')
-               AND complexity IS NOT NULL
-             GROUP BY agent, complexity
-             ORDER BY agent, complexity",
-        )?;
-        let stats = stmt
-            .query_map([], |row| {
-                let total: i64 = row.get(2)?;
-                let success: i64 = row.get(3)?;
-                Ok(AgentComplexityStat {
-                    agent: row.get(0)?,
-                    complexity: row.get(1)?,
-                    total_runs: total,
-                    success_count: success,
-                    success_rate: if total > 0 {
-                        (success as f64 / total as f64) * 100.0
-                    } else {
-                        0.0
-                    },
-                    avg_duration_seconds: row.get(4)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(stats)
+    /// Build the week-scoped KV key for the self-improvement counter.
+    /// Uses ISO week number so the counter naturally rotates each week.
+    fn self_improvement_key() -> String {
+        let now = Utc::now();
+        format!(
+            "self_improvement_issues_{}_w{}",
+            now.iso_week().year(),
+            now.iso_week().week()
+        )
     }
 
-    /// Get count of self-improvement issues created in the last 7 days.
+    /// Get count of self-improvement issues created this week.
     pub async fn count_self_improvement_issues_7d(&self) -> anyhow::Result<i64> {
-        // This is tracked via kv store - we store a weekly counter
-        let count = self.kv_get("self_improvement_issues_7d").await?;
+        let key = Self::self_improvement_key();
+        let count = self.kv_get(&key).await?;
         Ok(count.and_then(|c| c.parse().ok()).unwrap_or(0))
     }
 
     /// Increment the self-improvement issue counter for the current week.
     pub async fn increment_self_improvement_counter(&self) -> anyhow::Result<()> {
-        let current = self.kv_get("self_improvement_issues_7d").await?;
+        let key = Self::self_improvement_key();
+        let current = self.kv_get(&key).await?;
         let new_count = current.and_then(|c| c.parse::<i64>().ok()).unwrap_or(0) + 1;
-        self.kv_set("self_improvement_issues_7d", &new_count.to_string())
-            .await?;
+        self.kv_set(&key, &new_count.to_string()).await?;
         Ok(())
-    }
-
-    /// Reset weekly self-improvement counter (call this at week start).
-    pub async fn reset_self_improvement_counter(&self) -> anyhow::Result<()> {
-        self.kv_set("self_improvement_issues_7d", "0").await
     }
 }
 
@@ -691,17 +699,6 @@ pub struct SlowTaskInfo {
 pub struct ErrorStat {
     pub error_type: Option<String>,
     pub count: i64,
-}
-
-/// Agent complexity performance for pattern detection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentComplexityStat {
-    pub agent: String,
-    pub complexity: Option<String>,
-    pub total_runs: i64,
-    pub success_count: i64,
-    pub success_rate: f64,
-    pub avg_duration_seconds: Option<f64>,
 }
 
 /// Schema v1 — initial tables for internal tasks and jobs.
