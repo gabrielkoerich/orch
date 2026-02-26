@@ -295,6 +295,7 @@ pub fn get_reroute_chain(task_id: &str) -> String {
 }
 
 /// Update the reroute chain in sidecar.
+#[allow(dead_code)]
 pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: &str) -> String {
     let mut chain = existing_chain.to_string();
     if chain.is_empty() {
@@ -305,4 +306,97 @@ pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: 
 
     sidecar::set(task_id, &[format!("limit_reroute_chain={chain}")]).ok();
     chain
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_usage_limit_detects_rate_limit() {
+        assert!(is_usage_limit_error("Error: rate limit exceeded"));
+        assert!(is_usage_limit_error("HTTP 429 Too Many Requests"));
+        assert!(is_usage_limit_error("quota exceeded for model"));
+        assert!(is_usage_limit_error("context_length_exceeded"));
+    }
+
+    #[test]
+    fn is_usage_limit_rejects_normal_text() {
+        assert!(!is_usage_limit_error("task completed successfully"));
+        assert!(!is_usage_limit_error(""));
+    }
+
+    #[test]
+    fn is_auth_error_detects_common_patterns() {
+        assert!(is_auth_error("401 Unauthorized"));
+        assert!(is_auth_error("invalid api key provided"));
+        assert!(is_auth_error("Your billing plan has expired"));
+        assert!(is_auth_error("Error: 403 Forbidden"));
+    }
+
+    #[test]
+    fn is_auth_error_rejects_normal_text() {
+        assert!(!is_auth_error("task completed successfully"));
+        assert!(!is_auth_error(""));
+    }
+
+    #[test]
+    fn detect_missing_tooling_finds_known_tools() {
+        assert_eq!(
+            detect_missing_tooling("bun: command not found"),
+            Some("bun".to_string())
+        );
+        assert_eq!(
+            detect_missing_tooling("env: anchor: no such file"),
+            Some("anchor".to_string())
+        );
+        assert_eq!(
+            detect_missing_tooling("spawn docker enoent"),
+            Some("docker".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_missing_tooling_returns_none_for_normal() {
+        assert!(detect_missing_tooling("everything works fine").is_none());
+        assert!(detect_missing_tooling("").is_none());
+    }
+
+    #[test]
+    fn pick_fallback_skips_current_agent() {
+        let available = vec!["claude".to_string(), "codex".to_string()];
+        let result = pick_fallback_agent("claude", "", &available);
+        assert_eq!(result, Some("codex".to_string()));
+    }
+
+    #[test]
+    fn pick_fallback_skips_chain_agents() {
+        let available = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "opencode".to_string(),
+        ];
+        let result = pick_fallback_agent("claude", "claude,codex", &available);
+        assert_eq!(result, Some("opencode".to_string()));
+    }
+
+    #[test]
+    fn pick_fallback_returns_none_when_exhausted() {
+        let available = vec!["claude".to_string(), "codex".to_string()];
+        let result = pick_fallback_agent("claude", "claude,codex", &available);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn snippet_truncates_long_text() {
+        let long = "x".repeat(500);
+        let s = snippet(&long);
+        assert_eq!(s.len(), 300);
+    }
+
+    #[test]
+    fn snippet_preserves_short_text() {
+        let short = "hello";
+        assert_eq!(snippet(short), "hello");
+    }
 }
