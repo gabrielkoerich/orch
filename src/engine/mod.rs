@@ -115,9 +115,8 @@ pub async fn serve() -> anyhow::Result<()> {
         "router initialized"
     );
 
-    // Jobs path
-    let orch_home = dirs::home_dir().unwrap_or_default().join(".orchestrator");
-    let jobs_path = orch_home.join("jobs.yml");
+    // Jobs config path (from .orchestrator.yml or global config)
+    let jobs_path = jobs::resolve_jobs_path();
 
     // Concurrency limiter
     let semaphore = Arc::new(Semaphore::new(config.max_parallel));

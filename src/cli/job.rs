@@ -1,19 +1,11 @@
 use crate::config;
 use crate::engine::jobs::{self, Job, TaskTemplate};
 use anyhow::Context;
-use std::path::PathBuf;
 use std::sync::Arc;
-
-fn jobs_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".orchestrator")
-        .join("jobs.yml")
-}
 
 /// List scheduled jobs.
 pub fn list() -> anyhow::Result<()> {
-    let path = jobs_path();
+    let path = jobs::resolve_jobs_path();
     let jobs = jobs::load_jobs(&path)?;
 
     if jobs.is_empty() {
@@ -63,7 +55,7 @@ pub fn add(
     job_type: &str,
     command: Option<&str>,
 ) -> anyhow::Result<()> {
-    let path = jobs_path();
+    let path = jobs::resolve_jobs_path();
     let mut jobs = jobs::load_jobs(&path)?;
 
     // Generate ID from title
@@ -112,7 +104,7 @@ pub fn add(
 
 /// Remove a job.
 pub fn remove(id: &str) -> anyhow::Result<()> {
-    let path = jobs_path();
+    let path = jobs::resolve_jobs_path();
     let mut jobs = jobs::load_jobs(&path)?;
 
     let initial_len = jobs.len();
@@ -138,7 +130,7 @@ pub fn disable(id: &str) -> anyhow::Result<()> {
 }
 
 fn toggle_job(id: &str, enabled: bool) -> anyhow::Result<()> {
-    let path = jobs_path();
+    let path = jobs::resolve_jobs_path();
     let mut jobs = jobs::load_jobs(&path)?;
 
     let job = jobs
@@ -168,7 +160,7 @@ pub async fn tick() -> anyhow::Result<()> {
     let db = Arc::new(Db::open(&crate::db::default_path()?)?);
     db.migrate().await?;
 
-    let path = jobs_path();
+    let path = jobs::resolve_jobs_path();
     jobs::tick(&path, &backend, &db).await?;
 
     println!("Job tick completed");
