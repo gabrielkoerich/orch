@@ -6,10 +6,11 @@
 //!
 //! Routing logic (in priority order):
 //! 1. Check for `agent:*` label on task — use that agent directly
-//! 2. If round_robin mode, cycle through agents (stateful, skips last-used)
-//! 3. Call LLM classifier for intelligent routing
-//! 4. After N LLM failures, fall back to round-robin
-//! 5. Track last routed agent to distribute load across agents
+//! 2. If weighted_round_robin enabled, select by capacity-weighted probability
+//! 3. If round_robin mode, cycle through agents (stateful, skips last-used)
+//! 4. Call LLM classifier for intelligent routing
+//! 5. After N LLM failures, fall back to round-robin
+//! 6. Track last routed agent to distribute load across agents
 
 use crate::backends::ExternalTask;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Result of routing a task to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -51,6 +52,207 @@ pub struct AgentProfile {
     pub constraints: Vec<String>,
 }
 
+/// Default weight for agents with full capacity.
+const DEFAULT_WEIGHT: f64 = 1.0;
+
+/// Minimum weight — an agent never drops below this (still gets occasional tasks).
+const MIN_WEIGHT: f64 = 0.05;
+
+/// How much to reduce weight on each rate limit hit (multiplicative decay).
+const RATE_LIMIT_DECAY: f64 = 0.3;
+
+/// Duration after which a rate-limited agent starts recovering weight.
+const RECOVERY_DELAY: Duration = Duration::from_secs(60);
+
+/// Per-tick weight recovery amount (additive, applied each routing call).
+const RECOVERY_RATE: f64 = 0.1;
+
+/// Rate limit state for a single agent.
+#[derive(Debug, Clone)]
+pub struct RateLimitState {
+    /// Current routing weight (0.0..=1.0). Higher = more tasks.
+    pub weight: f64,
+    /// When the last rate limit error was recorded.
+    pub last_limited_at: Option<Instant>,
+    /// How many consecutive rate limit hits.
+    pub consecutive_hits: u32,
+}
+
+impl Default for RateLimitState {
+    fn default() -> Self {
+        Self {
+            weight: DEFAULT_WEIGHT,
+            last_limited_at: None,
+            consecutive_hits: 0,
+        }
+    }
+}
+
+impl RateLimitState {
+    /// Record a rate limit event — decay the weight.
+    pub fn record_rate_limit(&mut self) {
+        self.consecutive_hits += 1;
+        self.weight = (self.weight * RATE_LIMIT_DECAY).max(MIN_WEIGHT);
+        self.last_limited_at = Some(Instant::now());
+    }
+
+    /// Record a successful completion — bump weight back toward 1.0.
+    pub fn record_success(&mut self) {
+        self.consecutive_hits = 0;
+        self.weight = (self.weight + RECOVERY_RATE).min(DEFAULT_WEIGHT);
+    }
+
+    /// Tick recovery: if enough time has passed since the last limit, gradually restore.
+    pub fn maybe_recover(&mut self) {
+        if let Some(last) = self.last_limited_at {
+            if last.elapsed() >= RECOVERY_DELAY {
+                self.weight = (self.weight + RECOVERY_RATE).min(DEFAULT_WEIGHT);
+                if self.weight >= DEFAULT_WEIGHT {
+                    self.last_limited_at = None;
+                    self.consecutive_hits = 0;
+                }
+            }
+        }
+    }
+
+    /// Is this agent currently rate-limited (weight below full)?
+    pub fn is_limited(&self) -> bool {
+        self.weight < DEFAULT_WEIGHT
+    }
+}
+
+/// Tracks per-agent weights for weighted round-robin routing.
+#[derive(Debug, Clone, Default)]
+pub struct AgentWeights {
+    pub states: HashMap<String, RateLimitState>,
+}
+
+impl AgentWeights {
+    /// Ensure all available agents have an entry.
+    pub fn ensure_agents(&mut self, agents: &[String]) {
+        for agent in agents {
+            self.states.entry(agent.clone()).or_default();
+        }
+    }
+
+    /// Record a rate limit event for an agent.
+    pub fn record_rate_limit(&mut self, agent: &str) {
+        self.states
+            .entry(agent.to_string())
+            .or_default()
+            .record_rate_limit();
+        tracing::info!(
+            agent,
+            weight = self.states[agent].weight,
+            hits = self.states[agent].consecutive_hits,
+            "agent weight reduced (rate limit)"
+        );
+    }
+
+    /// Record a successful task completion for an agent.
+    pub fn record_success(&mut self, agent: &str) {
+        self.states
+            .entry(agent.to_string())
+            .or_default()
+            .record_success();
+    }
+
+    /// Tick recovery for all agents.
+    pub fn tick_recovery(&mut self) {
+        for (agent, state) in &mut self.states {
+            let was_limited = state.is_limited();
+            state.maybe_recover();
+            if was_limited && !state.is_limited() {
+                tracing::info!(agent, "agent weight fully recovered");
+            }
+        }
+    }
+
+    /// Select an agent by weighted probability from the given list.
+    ///
+    /// Uses a simple weighted random selection: each agent's probability is
+    /// proportional to its weight. If all weights are zero (shouldn't happen
+    /// due to MIN_WEIGHT), falls back to uniform selection.
+    pub fn weighted_select(&self, agents: &[String]) -> Option<String> {
+        if agents.is_empty() {
+            return None;
+        }
+
+        let weights: Vec<f64> = agents
+            .iter()
+            .map(|a| {
+                self.states
+                    .get(a)
+                    .map(|s| s.weight)
+                    .unwrap_or(DEFAULT_WEIGHT)
+            })
+            .collect();
+
+        let total: f64 = weights.iter().sum();
+        if total <= 0.0 {
+            // Safety fallback: uniform random
+            let idx = simple_hash_index(agents.len());
+            return Some(agents[idx].clone());
+        }
+
+        // Deterministic-ish selection using a hash of the current time
+        // to avoid requiring rand crate. Good enough for load distribution.
+        let pick = simple_hash_fraction() * total;
+        let mut cumulative = 0.0;
+        for (i, w) in weights.iter().enumerate() {
+            cumulative += w;
+            if pick < cumulative {
+                return Some(agents[i].clone());
+            }
+        }
+
+        // Rounding edge case — return last agent
+        Some(agents.last().unwrap().clone())
+    }
+
+    /// Get the current weight for an agent.
+    pub fn get_weight(&self, agent: &str) -> f64 {
+        self.states
+            .get(agent)
+            .map(|s| s.weight)
+            .unwrap_or(DEFAULT_WEIGHT)
+    }
+
+    /// Get a snapshot of all agent weights (for logging/debugging).
+    pub fn snapshot(&self) -> Vec<(String, f64, u32)> {
+        let mut snap: Vec<_> = self
+            .states
+            .iter()
+            .map(|(a, s)| (a.clone(), s.weight, s.consecutive_hits))
+            .collect();
+        snap.sort_by(|a, b| a.0.cmp(&b.0));
+        snap
+    }
+}
+
+/// Simple deterministic-ish fraction [0.0, 1.0) based on Instant::now().
+/// Not cryptographic, but sufficient for load distribution.
+fn simple_hash_fraction() -> f64 {
+    let nanos = Instant::now().elapsed().as_nanos() as u64;
+    // Mix bits using a simple hash
+    let hash = nanos
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (hash % 10000) as f64 / 10000.0
+}
+
+/// Simple index selection using instant-based hash.
+fn simple_hash_index(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let nanos = Instant::now().elapsed().as_nanos() as u64;
+    let hash = nanos
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (hash as usize) % len
+}
+
 /// Router configuration.
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
@@ -74,6 +276,9 @@ pub struct RouterConfig {
     pub default_skills: Vec<String>,
     /// Model map for complexity levels
     pub model_map: HashMap<String, HashMap<String, String>>,
+    /// Enable weighted round-robin routing based on rate limit capacity.
+    /// When true, agents that hit rate limits get fewer tasks.
+    pub weighted_round_robin: bool,
 }
 
 /// Default agents to check in PATH.
@@ -155,6 +360,7 @@ impl Default for RouterConfig {
             ],
             default_skills: vec!["gh".to_string(), "git-worktree".to_string()],
             model_map,
+            weighted_round_robin: false,
         }
     }
 }
@@ -233,6 +439,11 @@ impl RouterConfig {
             }
         }
 
+        // Parse weighted_round_robin
+        if let Ok(val) = crate::config::get("router.weighted_round_robin") {
+            config.weighted_round_robin = val == "true" || val == "1";
+        }
+
         // Parse default_skills
         if let Ok(skills_str) = crate::config::get("router.default_skills") {
             if !skills_str.is_empty() && skills_str != "[]" {
@@ -266,6 +477,8 @@ pub struct Router {
     pub config: RouterConfig,
     /// Available agents discovered at runtime
     pub available_agents: Vec<String>,
+    /// Per-agent rate limit weights (used when weighted_round_robin is enabled)
+    pub weights: AgentWeights,
 }
 
 /// Response from the LLM router.
@@ -296,9 +509,12 @@ impl Router {
     /// Create a new router with the given configuration.
     pub fn new(config: RouterConfig) -> Self {
         let available_agents = Self::discover_agents(&config.agents);
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&available_agents);
         Self {
             config,
             available_agents,
+            weights,
         }
     }
 
@@ -310,7 +526,7 @@ impl Router {
     /// Reload router configuration from config files.
     ///
     /// Re-reads all router settings and re-discovers available agents.
-    /// Called when config files change on disk.
+    /// Called when config files change on disk. Preserves existing agent weights.
     pub fn reload(&mut self) {
         let new_config = RouterConfig::from_config();
         let new_agents = Self::discover_agents(&new_config.agents);
@@ -318,10 +534,13 @@ impl Router {
             mode = %new_config.mode,
             agents = ?new_agents,
             fallback = %new_config.fallback_executor,
+            weighted_rr = new_config.weighted_round_robin,
             "router reloaded"
         );
         self.config = new_config;
-        self.available_agents = new_agents;
+        self.available_agents = new_agents.clone();
+        // Ensure new agents have weight entries (preserves existing weights)
+        self.weights.ensure_agents(&new_agents);
     }
 
     /// Discover available agent CLIs in PATH.
@@ -355,9 +574,10 @@ impl Router {
     ///
     /// Routing logic (in priority order):
     /// 1. Check for `agent:*` label — use that agent directly
-    /// 2. If round_robin mode, cycle through agents (stateful)
-    /// 3. Call LLM classifier for intelligent routing
-    /// 4. After max_route_attempts LLM failures, fall back to round-robin
+    /// 2. If weighted_round_robin enabled, select by capacity-weighted probability
+    /// 3. If round_robin mode, cycle through agents (stateful)
+    /// 4. Call LLM classifier for intelligent routing
+    /// 5. After max_route_attempts LLM failures, fall back to round-robin
     pub async fn route(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         // 1. Check for explicit agent label
         if let Some(agent) = self.extract_agent_from_labels(&task.labels) {
@@ -384,7 +604,12 @@ impl Router {
             }
         }
 
-        // 2. Round-robin mode — use stateful round-robin
+        // 2. Weighted round-robin — capacity-based selection
+        if self.config.weighted_round_robin {
+            return self.route_weighted_round_robin(task);
+        }
+
+        // 3. Round-robin mode — use stateful round-robin
         if self.config.mode == "round_robin" {
             tracing::debug!(task_id = %task.id.0, "routing via round-robin mode");
             return self.route_round_robin_stateful(task);
@@ -570,6 +795,67 @@ impl Router {
                 agent_idx,
                 agents.len()
             ),
+            profile,
+            selected_skills: self.config.default_skills.clone(),
+            warning: None,
+        })
+    }
+
+    /// Weighted round-robin: selects an agent based on capacity weights.
+    ///
+    /// Agents with higher weights (more capacity) get more tasks.
+    /// Rate-limited agents have reduced weights and receive fewer tasks.
+    fn route_weighted_round_robin(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
+        let agents = &self.available_agents;
+        if agents.is_empty() {
+            anyhow::bail!("no agent CLIs found in PATH");
+        }
+
+        let agent = self
+            .weights
+            .weighted_select(agents)
+            .unwrap_or_else(|| agents[0].clone());
+
+        let weight = self.weights.get_weight(&agent);
+        let complexity = self.extract_complexity_from_labels(&task.labels);
+        let model = self.config.model_for_complexity(&agent, &complexity);
+
+        // Build weight summary for reason
+        let weight_summary: Vec<String> = self
+            .weights
+            .snapshot()
+            .iter()
+            .filter(|(a, _, _)| agents.contains(a))
+            .map(|(a, w, _)| format!("{a}={w:.2}"))
+            .collect();
+
+        let profile = AgentProfile {
+            role: "general".to_string(),
+            skills: vec![],
+            tools: self.config.allowed_tools.clone(),
+            constraints: vec![],
+        };
+
+        // Track last agent
+        let _ = crate::sidecar::set("_router", &[format!("last_agent={}", agent)]);
+
+        let reason = format!(
+            "weighted_round_robin (weight={weight:.2}, weights=[{}])",
+            weight_summary.join(", ")
+        );
+
+        tracing::info!(
+            task_id = %task.id.0,
+            agent = %agent,
+            weight,
+            "weighted round-robin selected agent"
+        );
+
+        Ok(RouteResult {
+            agent,
+            model,
+            complexity,
+            reason,
             profile,
             selected_skills: self.config.default_skills.clone(),
             warning: None,
@@ -937,6 +1223,32 @@ impl Router {
             .join(format!("route-prompt-{task_id}.txt"))
     }
 
+    /// Record a rate limit event for an agent, reducing its routing weight.
+    ///
+    /// Called by the engine when an agent returns a 429/rate limit error.
+    pub fn record_rate_limit(&mut self, agent: &str) {
+        self.weights.record_rate_limit(agent);
+    }
+
+    /// Record a successful task completion, restoring agent weight.
+    pub fn record_success(&mut self, agent: &str) {
+        self.weights.record_success(agent);
+    }
+
+    /// Tick weight recovery for all agents.
+    ///
+    /// Called periodically by the engine to gradually restore weights
+    /// as rate limit windows expire.
+    pub fn tick_weight_recovery(&mut self) {
+        self.weights.tick_recovery();
+    }
+
+    /// Get a snapshot of current agent weights for logging.
+    #[allow(dead_code)]
+    pub fn weight_snapshot(&self) -> Vec<(String, f64, u32)> {
+        self.weights.snapshot()
+    }
+
     /// Store routing result in sidecar file.
     pub fn store_route_result(&self, task_id: &str, result: &RouteResult) -> anyhow::Result<()> {
         let fields = vec![
@@ -1249,9 +1561,13 @@ Hope that helps!"#;
         };
 
         // Create router with mock available agents
+        let agents = vec!["claude".to_string(), "codex".to_string()];
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&agents);
         let router = Router {
             config,
-            available_agents: vec!["claude".to_string(), "codex".to_string()],
+            available_agents: agents,
+            weights,
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -1265,9 +1581,13 @@ Hope that helps!"#;
     #[tokio::test]
     async fn route_uses_label_override() {
         let config = RouterConfig::default();
+        let agents = vec!["claude".to_string(), "codex".to_string()];
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&agents);
         let router = Router {
             config,
-            available_agents: vec!["claude".to_string(), "codex".to_string()],
+            available_agents: agents,
+            weights,
         };
 
         let task = create_test_task("1", "Test", vec!["agent:claude".to_string()]);
@@ -1310,9 +1630,13 @@ Hope that helps!"#;
     #[test]
     fn router_reload_preserves_structure() {
         let config = RouterConfig::default();
+        let agents = vec!["claude".to_string()];
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&agents);
         let mut router = Router {
             config,
-            available_agents: vec!["claude".to_string()],
+            available_agents: agents,
+            weights,
         };
 
         // Reload — should re-read config and remain valid
@@ -1328,5 +1652,306 @@ Hope that helps!"#;
         assert!(!router.config.fallback_executor.is_empty());
         // Tools should always be populated
         assert!(!router.config.allowed_tools.is_empty());
+    }
+
+    // --- Weighted round-robin tests ---
+
+    #[test]
+    fn rate_limit_state_defaults_to_full_weight() {
+        let state = RateLimitState::default();
+        assert_eq!(state.weight, DEFAULT_WEIGHT);
+        assert_eq!(state.consecutive_hits, 0);
+        assert!(state.last_limited_at.is_none());
+        assert!(!state.is_limited());
+    }
+
+    #[test]
+    fn rate_limit_state_decays_on_hit() {
+        let mut state = RateLimitState::default();
+        state.record_rate_limit();
+
+        assert!(state.weight < DEFAULT_WEIGHT);
+        assert_eq!(state.consecutive_hits, 1);
+        assert!(state.last_limited_at.is_some());
+        assert!(state.is_limited());
+
+        // Weight should be DEFAULT_WEIGHT * RATE_LIMIT_DECAY
+        let expected = DEFAULT_WEIGHT * RATE_LIMIT_DECAY;
+        assert!((state.weight - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rate_limit_state_never_drops_below_min() {
+        let mut state = RateLimitState::default();
+
+        // Hit many times
+        for _ in 0..100 {
+            state.record_rate_limit();
+        }
+
+        assert!(state.weight >= MIN_WEIGHT);
+        assert_eq!(state.consecutive_hits, 100);
+    }
+
+    #[test]
+    fn rate_limit_state_recovers_on_success() {
+        let mut state = RateLimitState::default();
+
+        // Decay first
+        state.record_rate_limit();
+        state.record_rate_limit();
+        let after_decay = state.weight;
+
+        // Record success
+        state.record_success();
+        assert!(state.weight > after_decay);
+        assert_eq!(state.consecutive_hits, 0);
+    }
+
+    #[test]
+    fn rate_limit_state_success_caps_at_default() {
+        let mut state = RateLimitState::default();
+
+        // Already at full weight, success shouldn't exceed it
+        state.record_success();
+        assert_eq!(state.weight, DEFAULT_WEIGHT);
+    }
+
+    #[test]
+    fn agent_weights_ensure_agents() {
+        let mut weights = AgentWeights::default();
+        let agents = vec!["claude".to_string(), "codex".to_string()];
+        weights.ensure_agents(&agents);
+
+        assert_eq!(weights.states.len(), 2);
+        assert_eq!(weights.get_weight("claude"), DEFAULT_WEIGHT);
+        assert_eq!(weights.get_weight("codex"), DEFAULT_WEIGHT);
+    }
+
+    #[test]
+    fn agent_weights_ensure_agents_preserves_existing() {
+        let mut weights = AgentWeights::default();
+        let agents = vec!["claude".to_string(), "codex".to_string()];
+        weights.ensure_agents(&agents);
+
+        // Reduce claude's weight
+        weights.record_rate_limit("claude");
+        let claude_weight = weights.get_weight("claude");
+        assert!(claude_weight < DEFAULT_WEIGHT);
+
+        // Ensure agents again — claude's weight should be preserved
+        let agents2 = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "opencode".to_string(),
+        ];
+        weights.ensure_agents(&agents2);
+
+        assert_eq!(weights.get_weight("claude"), claude_weight);
+        assert_eq!(weights.get_weight("opencode"), DEFAULT_WEIGHT);
+    }
+
+    #[test]
+    fn agent_weights_record_rate_limit() {
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&["claude".to_string(), "codex".to_string()]);
+
+        weights.record_rate_limit("claude");
+
+        assert!(weights.get_weight("claude") < DEFAULT_WEIGHT);
+        assert_eq!(weights.get_weight("codex"), DEFAULT_WEIGHT);
+    }
+
+    #[test]
+    fn agent_weights_record_success() {
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&["claude".to_string()]);
+
+        weights.record_rate_limit("claude");
+        let after_limit = weights.get_weight("claude");
+
+        weights.record_success("claude");
+        assert!(weights.get_weight("claude") > after_limit);
+    }
+
+    #[test]
+    fn agent_weights_snapshot() {
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&["claude".to_string(), "codex".to_string()]);
+        weights.record_rate_limit("claude");
+
+        let snap = weights.snapshot();
+        assert_eq!(snap.len(), 2);
+
+        // Snapshot is sorted alphabetically
+        assert_eq!(snap[0].0, "claude");
+        assert!(snap[0].1 < DEFAULT_WEIGHT);
+        assert_eq!(snap[0].2, 1); // 1 hit
+
+        assert_eq!(snap[1].0, "codex");
+        assert_eq!(snap[1].1, DEFAULT_WEIGHT);
+        assert_eq!(snap[1].2, 0); // 0 hits
+    }
+
+    #[test]
+    fn agent_weights_weighted_select_favors_higher_weight() {
+        let mut weights = AgentWeights::default();
+        let agents = vec!["claude".to_string(), "codex".to_string()];
+        weights.ensure_agents(&agents);
+
+        // Heavily penalize claude
+        for _ in 0..10 {
+            weights.record_rate_limit("claude");
+        }
+
+        // Run many selections and count
+        let mut claude_count = 0;
+        let mut codex_count = 0;
+        for _ in 0..100 {
+            match weights.weighted_select(&agents) {
+                Some(ref a) if a == "claude" => claude_count += 1,
+                Some(ref a) if a == "codex" => codex_count += 1,
+                _ => {}
+            }
+        }
+
+        // Codex should get significantly more selections
+        // (claude weight is near MIN_WEIGHT, codex is at 1.0)
+        assert!(
+            codex_count > claude_count,
+            "codex ({codex_count}) should get more selections than claude ({claude_count})"
+        );
+    }
+
+    #[test]
+    fn agent_weights_weighted_select_empty_returns_none() {
+        let weights = AgentWeights::default();
+        assert!(weights.weighted_select(&[]).is_none());
+    }
+
+    #[test]
+    fn agent_weights_weighted_select_single_agent() {
+        let mut weights = AgentWeights::default();
+        let agents = vec!["claude".to_string()];
+        weights.ensure_agents(&agents);
+
+        let selected = weights.weighted_select(&agents);
+        assert_eq!(selected, Some("claude".to_string()));
+    }
+
+    #[test]
+    fn agent_weights_tick_recovery_restores_weight() {
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&["claude".to_string()]);
+
+        // Set up a rate limit that looks like it happened long ago
+        let state = weights.states.get_mut("claude").unwrap();
+        state.weight = 0.5;
+        state.last_limited_at = Some(Instant::now() - RECOVERY_DELAY - Duration::from_secs(1));
+        state.consecutive_hits = 2;
+
+        let before = weights.get_weight("claude");
+        weights.tick_recovery();
+        let after = weights.get_weight("claude");
+
+        assert!(after > before, "weight should increase after recovery tick");
+    }
+
+    #[test]
+    fn agent_weights_tick_recovery_clears_on_full_restore() {
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&["claude".to_string()]);
+
+        // Set weight just below full with an old limit
+        let state = weights.states.get_mut("claude").unwrap();
+        state.weight = DEFAULT_WEIGHT - 0.01;
+        state.last_limited_at = Some(Instant::now() - RECOVERY_DELAY - Duration::from_secs(1));
+        state.consecutive_hits = 1;
+
+        weights.tick_recovery();
+
+        let state = weights.states.get("claude").unwrap();
+        assert_eq!(state.weight, DEFAULT_WEIGHT);
+        assert!(state.last_limited_at.is_none());
+        assert_eq!(state.consecutive_hits, 0);
+    }
+
+    #[tokio::test]
+    async fn route_weighted_round_robin_basic() {
+        let config = RouterConfig {
+            weighted_round_robin: true,
+            ..Default::default()
+        };
+
+        let agents = vec!["claude".to_string(), "codex".to_string()];
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&agents);
+        let router = Router {
+            config,
+            available_agents: agents,
+            weights,
+        };
+
+        let task = create_test_task("1", "Test task", vec![]);
+        let result = router.route(&task).await.unwrap();
+
+        // Should use weighted_round_robin
+        assert!(result.reason.contains("weighted_round_robin"));
+        assert!(
+            result.agent == "claude" || result.agent == "codex",
+            "agent should be claude or codex, got '{}'",
+            result.agent
+        );
+    }
+
+    #[tokio::test]
+    async fn route_weighted_round_robin_respects_label_override() {
+        let config = RouterConfig {
+            weighted_round_robin: true,
+            ..Default::default()
+        };
+
+        let agents = vec!["claude".to_string(), "codex".to_string()];
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&agents);
+        let router = Router {
+            config,
+            available_agents: agents,
+            weights,
+        };
+
+        // Label override should take precedence over weighted routing
+        let task = create_test_task("1", "Test task", vec!["agent:codex".to_string()]);
+        let result = router.route(&task).await.unwrap();
+        assert_eq!(result.agent, "codex");
+        assert!(result.reason.contains("label"));
+    }
+
+    #[test]
+    fn router_config_weighted_round_robin_default_false() {
+        let config = RouterConfig::default();
+        assert!(!config.weighted_round_robin);
+    }
+
+    #[test]
+    fn router_record_and_recover_weights() {
+        let config = RouterConfig {
+            weighted_round_robin: true,
+            ..Default::default()
+        };
+        let mut router = Router::new(config);
+        // Override discovered agents for test
+        router.available_agents = vec!["claude".to_string(), "codex".to_string()];
+        router.weights.ensure_agents(&router.available_agents);
+
+        // Record rate limit
+        router.record_rate_limit("claude");
+        assert!(router.weights.get_weight("claude") < DEFAULT_WEIGHT);
+        assert_eq!(router.weights.get_weight("codex"), DEFAULT_WEIGHT);
+
+        // Record success for claude
+        router.record_success("claude");
+        let after_success = router.weights.get_weight("claude");
+        assert!(after_success > MIN_WEIGHT);
     }
 }
