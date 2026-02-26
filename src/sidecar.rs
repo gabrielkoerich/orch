@@ -322,6 +322,7 @@ pub fn get_recent_memory(task_id: &str, max_entries: usize) -> anyhow::Result<Ve
 }
 
 /// Clear all memory entries for a task.
+#[allow(dead_code)]
 pub fn clear_memory(task_id: &str) -> anyhow::Result<()> {
     let path = sidecar_path(task_id)?;
 
