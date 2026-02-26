@@ -1,7 +1,7 @@
 //! Git worktree management for task execution.
 //!
 //! Each task runs in an isolated worktree to prevent conflicts.
-//! Worktrees are stored at `~/.orchestrator/worktrees/<project>/<branch>/`.
+//! Worktrees are stored at `~/.orch/worktrees/<project>/<branch>/`.
 
 use crate::sidecar;
 use std::path::{Path, PathBuf};
@@ -118,8 +118,9 @@ pub async fn setup_worktree(
         .trim_end_matches(".git")
         .to_string();
 
-    let orch_home = dirs::home_dir().unwrap_or_default().join(".orchestrator");
-    let worktrees_base = orch_home.join("worktrees").join(&project_name);
+    let worktrees_base = crate::home::worktrees_dir()
+        .unwrap_or_default()
+        .join(&project_name);
     std::fs::create_dir_all(&worktrees_base)?;
 
     // Check if we have a saved branch/worktree in sidecar

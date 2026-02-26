@@ -28,10 +28,7 @@ pub enum RunResult {
 
 /// Collect and classify the agent's response.
 pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> RunResult {
-    let state_dir = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".orchestrator")
-        .join(".orchestrator");
+    let state_dir = crate::home::state_dir().unwrap_or_default();
 
     // Read stderr
     let stderr_path = state_dir.join(format!("stderr-{task_id}.txt"));
@@ -128,10 +125,7 @@ fn read_output_file(task_id: &str, primary_path: &Path) -> String {
     }
 
     // Fallback locations
-    let state_dir = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".orchestrator")
-        .join(".orchestrator");
+    let state_dir = crate::home::state_dir().unwrap_or_default();
 
     let fallbacks = [
         PathBuf::from(format!("/tmp/output-{task_id}.json")),

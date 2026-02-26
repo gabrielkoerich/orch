@@ -18,9 +18,7 @@ pub fn version() {
 
 /// Initialize orchestrator for a project.
 pub fn init(repo: Option<String>) -> anyhow::Result<()> {
-    let orch_home = dirs::home_dir()
-        .context("cannot determine home directory")?
-        .join(".orchestrator");
+    let orch_home = crate::home::orch_home()?;
     std::fs::create_dir_all(&orch_home)?;
 
     let config_path = orch_home.join("config.yml");
@@ -75,14 +73,14 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     println!("Initialized orch for {repo_value}");
     println!("Config: {}", config_path.display());
 
-    // Create project-local .orchestrator.yml if not exists
-    let local_config = std::path::Path::new(".orchestrator.yml");
+    // Create project-local .orch.yml if not exists
+    let local_config = std::path::Path::new(".orch.yml");
     if !local_config.exists() {
         std::fs::write(
             local_config,
             format!("# Project-specific orch config\nrepo: {repo_value}\n"),
         )?;
-        println!("Created .orchestrator.yml");
+        println!("Created .orch.yml");
     }
 
     Ok(())
@@ -90,15 +88,14 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
 
 /// Show orchestrator logs.
 pub fn log(lines: &str) -> anyhow::Result<()> {
-    let orch_home = dirs::home_dir().unwrap_or_default().join(".orchestrator");
-    let state_dir = orch_home.join(".orchestrator");
+    let state_dir = crate::home::state_dir().unwrap_or_default();
     let brew_prefix = std::env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".into());
 
     let mut log_files = Vec::new();
 
     let candidates = [
-        state_dir.join("orchestrator.log"),
-        state_dir.join("orchestrator.error.log"),
+        state_dir.join("orch.log"),
+        state_dir.join("orch.error.log"),
         std::path::PathBuf::from(&brew_prefix).join("var/log/orch.log"),
         std::path::PathBuf::from(&brew_prefix).join("var/log/orch.error.log"),
         // Legacy paths
@@ -249,7 +246,7 @@ pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
     use crate::db::Db;
 
     let repo = config::get("repo").context(
-        "'repo' not set in config — run `orch init` or set repo in ~/.orchestrator/config.yml",
+        "'repo' not set in config — run `orch init` or set repo in ~/.orch/config.yml",
     )?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
     let db = Arc::new(Db::open(&crate::db::default_path()?)?);

@@ -8,10 +8,8 @@ fn is_brew_installed() -> bool {
 }
 
 fn pid_file() -> PathBuf {
-    dirs::home_dir()
+    crate::home::state_dir()
         .unwrap_or_default()
-        .join(".orchestrator")
-        .join(".orchestrator")
         .join("orch.pid")
 }
 
@@ -28,14 +26,11 @@ pub fn start() -> anyhow::Result<()> {
     } else {
         // Daemonize: fork orch serve
         let orch_bin = std::env::current_exe()?;
-        let log_dir = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".orchestrator")
-            .join(".orchestrator");
+        let log_dir = crate::home::state_dir()?;
         std::fs::create_dir_all(&log_dir)?;
 
-        let stdout_log = std::fs::File::create(log_dir.join("orchestrator.log"))?;
-        let stderr_log = std::fs::File::create(log_dir.join("orchestrator.error.log"))?;
+        let stdout_log = std::fs::File::create(log_dir.join("orch.log"))?;
+        let stderr_log = std::fs::File::create(log_dir.join("orch.error.log"))?;
 
         let child = std::process::Command::new(orch_bin)
             .arg("serve")

@@ -41,10 +41,7 @@ pub struct AgentInvocation {
 ///
 /// The script sets up environment, runs the agent, captures output and exit code.
 pub fn build_runner_script(inv: &AgentInvocation) -> String {
-    let state_dir = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".orchestrator")
-        .join(".orchestrator");
+    let state_dir = crate::home::state_dir().unwrap_or_default();
 
     let sys_file = state_dir.join(format!("prompt-{}-sys.txt", inv.task_id));
     let msg_file = state_dir.join(format!("prompt-{}-msg.txt", inv.task_id));
@@ -178,10 +175,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     let script_content = build_runner_script(inv);
 
     // Write runner script
-    let state_dir = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".orchestrator")
-        .join(".orchestrator");
+    let state_dir = crate::home::state_dir()?;
     std::fs::create_dir_all(&state_dir)?;
 
     let script_path = state_dir.join(format!("runner-{}.sh", inv.task_id));

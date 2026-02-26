@@ -7,6 +7,7 @@ mod cron;
 mod db;
 mod engine;
 mod github;
+mod home;
 mod parser;
 #[allow(dead_code)] // security module ready for use, not integrated yet
 mod security;

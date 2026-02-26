@@ -1,6 +1,6 @@
 //! Sidecar file management — JSON metadata files alongside tasks.
 //!
-//! Each task gets a `.orchestrator/{task_id}.json` sidecar file that stores
+//! Each task gets a `.orch/{task_id}.json` sidecar file that stores
 //! runtime metadata (model, prompt hash, timing, token counts, etc.).
 //! This is the authoritative source for data that doesn't belong in GitHub labels.
 
@@ -10,10 +10,7 @@ use std::path::PathBuf;
 
 /// Get the sidecar directory path.
 fn sidecar_dir() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    let dir = home.join(".orchestrator").join(".orchestrator");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    crate::home::sidecar_dir()
 }
 
 /// Get the path to a task's sidecar file.

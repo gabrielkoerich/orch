@@ -34,10 +34,7 @@ pub struct TaskContext {
 
 /// Load task-specific context from context file.
 pub fn load_task_context(task_id: &str) -> String {
-    let contexts_dir = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".orchestrator")
-        .join("contexts");
+    let contexts_dir = crate::home::contexts_dir().unwrap_or_default();
 
     let path = contexts_dir.join(format!("task-{task_id}.md"));
     std::fs::read_to_string(&path).unwrap_or_default()
@@ -125,10 +122,7 @@ pub fn build_skills_docs(selected_skills: &[String]) -> String {
             .unwrap_or_default()
             .join(".claude")
             .join("skills"),
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".orchestrator")
-            .join("skills"),
+        crate::home::skills_dir().unwrap_or_default(),
     ];
 
     for skill in selected_skills {

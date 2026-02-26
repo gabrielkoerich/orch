@@ -63,12 +63,9 @@ pub struct InternalTask {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Default database path: `~/.orchestrator/orchestrator.db`
+/// Default database path: `~/.orch/orchestrator.db`
 pub fn default_path() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    let dir = home.join(".orchestrator");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("orchestrator.db"))
+    crate::home::db_path()
 }
 
 /// Database handle with async-safe locking.

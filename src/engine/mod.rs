@@ -68,7 +68,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // Load config — repo is required
     let repo = crate::config::get("repo").context(
-        "'repo' not set in config — run `orch init` or set repo in ~/.orchestrator/config.yml",
+        "'repo' not set in config — run `orch init` or set repo in ~/.orch/config.yml",
     )?;
 
     // Initialize backend
@@ -520,9 +520,8 @@ async fn cleanup_done_worktrees(
     let repo_root = resolve_repo_root().await?;
 
     // Get worktrees base path
-    let worktrees_base = dirs::home_dir()
-        .map(|h| h.join(".orchestrator").join("worktrees"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".orchestrator/worktrees"));
+    let worktrees_base = crate::home::worktrees_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from(".orch/worktrees"));
 
     for task in done_tasks {
         let task_id = &task.id.0;

@@ -35,9 +35,8 @@ pub struct TaskRunner {
 
 impl TaskRunner {
     pub fn new(repo: String) -> Self {
-        let orch_home = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".orchestrator");
+        let orch_home = crate::home::orch_home()
+            .unwrap_or_else(|_| PathBuf::from("/tmp").join(".orch"));
 
         Self { repo, orch_home }
     }
@@ -227,7 +226,7 @@ impl TaskRunner {
         }
 
         // Read exit code
-        let state_dir = self.orch_home.join(".orchestrator");
+        let state_dir = crate::home::state_dir()?;
         let status_file = state_dir.join(format!("exit-{task_id}.txt"));
         let exit_code: i32 = std::fs::read_to_string(&status_file)
             .ok()
