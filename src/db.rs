@@ -5,7 +5,7 @@
 //! No bidirectional sync — each storage is authoritative for its domain.
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -249,7 +249,15 @@ impl Db {
                     .unwrap_or_else(|_| Utc::now()),
             })
         })?;
-        let result: Vec<InternalTask> = tasks.filter_map(|t| t.ok()).collect();
+        let result: Vec<InternalTask> = tasks
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
+            .collect();
         Ok(result)
     }
 
@@ -352,7 +360,15 @@ impl Db {
                     .unwrap_or_else(|_| Utc::now()),
             })
         })?;
-        let result: Vec<InternalTask> = tasks.filter_map(|t| t.ok()).collect();
+        let result: Vec<InternalTask> = tasks
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
+            .collect();
         Ok(result)
     }
 
@@ -476,7 +492,13 @@ impl Db {
                     },
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
             .collect();
 
         // Rate limit events in last 24h
@@ -511,6 +533,126 @@ impl Db {
         )?;
         Ok(conn.last_insert_rowid())
     }
+
+    /// Get failed tasks with error details from the last 7 days.
+    pub async fn get_failed_tasks_7d(&self) -> anyhow::Result<Vec<FailedTaskInfo>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, agent, error_type, COUNT(*) as failure_count
+             FROM task_metrics
+             WHERE completed_at >= datetime('now', '-7 days')
+               AND outcome != 'success'
+             GROUP BY task_id, agent, error_type
+             ORDER BY failure_count DESC
+             LIMIT 20",
+        )?;
+        let failures = stmt
+            .query_map([], |row| {
+                Ok(FailedTaskInfo {
+                    task_id: row.get(0)?,
+                    agent: row.get(1)?,
+                    error_type: row.get(2)?,
+                    failure_count: row.get(3)?,
+                })
+            })?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
+            .collect();
+        Ok(failures)
+    }
+
+    /// Get slow tasks (top 10 longest running) from the last 7 days.
+    pub async fn get_slow_tasks_7d(&self) -> anyhow::Result<Vec<SlowTaskInfo>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, agent, complexity, duration_seconds
+             FROM task_metrics
+             WHERE completed_at >= datetime('now', '-7 days')
+               AND outcome = 'success'
+             ORDER BY duration_seconds DESC
+             LIMIT 10",
+        )?;
+        let slow_tasks = stmt
+            .query_map([], |row| {
+                Ok(SlowTaskInfo {
+                    task_id: row.get(0)?,
+                    agent: row.get(1)?,
+                    complexity: row.get(2)?,
+                    duration_seconds: row.get(3)?,
+                })
+            })?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
+            .collect();
+        Ok(slow_tasks)
+    }
+
+    /// Get error type distribution from the last 7 days.
+    pub async fn get_error_distribution_7d(&self) -> anyhow::Result<Vec<ErrorStat>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT error_type, COUNT(*) as count
+             FROM task_metrics
+             WHERE completed_at >= datetime('now', '-7 days')
+               AND outcome != 'success'
+               AND error_type IS NOT NULL
+             GROUP BY error_type
+             ORDER BY count DESC",
+        )?;
+        let errors = stmt
+            .query_map([], |row| {
+                Ok(ErrorStat {
+                    error_type: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to parse row");
+                    None
+                }
+            })
+            .collect();
+        Ok(errors)
+    }
+
+    /// Build the week-scoped KV key for the self-improvement counter.
+    /// Uses ISO week number so the counter naturally rotates each week.
+    fn self_improvement_key() -> String {
+        let now = Utc::now();
+        format!(
+            "self_improvement_issues_{}_w{}",
+            now.iso_week().year(),
+            now.iso_week().week()
+        )
+    }
+
+    /// Get count of self-improvement issues created this week.
+    pub async fn count_self_improvement_issues_7d(&self) -> anyhow::Result<i64> {
+        let key = Self::self_improvement_key();
+        let count = self.kv_get(&key).await?;
+        Ok(count.and_then(|c| c.parse().ok()).unwrap_or(0))
+    }
+
+    /// Increment the self-improvement issue counter for the current week.
+    pub async fn increment_self_improvement_counter(&self) -> anyhow::Result<()> {
+        let key = Self::self_improvement_key();
+        let current = self.kv_get(&key).await?;
+        let new_count = current.and_then(|c| c.parse::<i64>().ok()).unwrap_or(0) + 1;
+        self.kv_set(&key, &new_count.to_string()).await?;
+        Ok(())
+    }
 }
 
 /// Metrics summary for the CLI output.
@@ -532,6 +674,31 @@ pub struct AgentStat {
     pub total_runs: i64,
     pub success_count: i64,
     pub success_rate: f64,
+}
+
+/// Failed task info for pattern detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedTaskInfo {
+    pub task_id: String,
+    pub agent: String,
+    pub error_type: Option<String>,
+    pub failure_count: i64,
+}
+
+/// Slow task info for pattern detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlowTaskInfo {
+    pub task_id: String,
+    pub agent: String,
+    pub complexity: Option<String>,
+    pub duration_seconds: f64,
+}
+
+/// Error type distribution for pattern detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorStat {
+    pub error_type: Option<String>,
+    pub count: i64,
 }
 
 /// Schema v1 — initial tables for internal tasks and jobs.

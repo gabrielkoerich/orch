@@ -110,6 +110,11 @@ impl ExternalBackend for GitHubBackend {
             .collect())
     }
 
+    async fn has_open_issue_with_title(&self, title: &str, label: &str) -> anyhow::Result<bool> {
+        let issues = self.gh.list_issues(&self.repo, label).await?;
+        Ok(issues.iter().any(|i| i.title == title))
+    }
+
     async fn health_check(&self) -> anyhow::Result<()> {
         self.gh.auth_status().await
     }
