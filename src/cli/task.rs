@@ -188,7 +188,9 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         // Add cost summary
         map.insert(
             "total_cost_usd".to_string(),
-            serde_json::Value::Number(serde_json::Number::from_f64(total_cost).unwrap_or(serde_json::Number::from(0))),
+            serde_json::Value::Number(
+                serde_json::Number::from_f64(total_cost).unwrap_or(serde_json::Number::from(0)),
+            ),
         );
         map.insert(
             "total_input_tokens".to_string(),
@@ -220,7 +222,10 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         if total_cost > 0.0 {
             println!();
             println!("Cost summary:");
-            println!("  Total tokens: {}", total_input_tokens + total_output_tokens);
+            println!(
+                "  Total tokens: {}",
+                total_input_tokens + total_output_tokens
+            );
             println!("  Total cost:   ${:.6}", total_cost);
         }
     }
@@ -437,7 +442,10 @@ pub fn cost(id: &str) -> anyhow::Result<()> {
 
     println!("Token usage for task #{}", id);
     println!("{}", "-".repeat(40));
-    println!("Model: {}", if model.is_empty() { "unknown" } else { &model });
+    println!(
+        "Model: {}",
+        if model.is_empty() { "unknown" } else { &model }
+    );
     println!("Input tokens:  {:>12}", usage.input_tokens);
     println!("Output tokens: {:>12}", usage.output_tokens);
     println!("{}", "-".repeat(40));

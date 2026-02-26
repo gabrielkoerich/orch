@@ -135,7 +135,11 @@ fn extract_u64(val: Option<&serde_json::Value>) -> Option<u64> {
 /// Extract tokens from a usage object (common in OpenAI-compatible APIs).
 fn extract_usage_tokens(usage: Option<&serde_json::Value>, is_input: bool) -> Option<u64> {
     let obj = usage?.as_object()?;
-    let key = if is_input { "input_tokens" } else { "output_tokens" };
+    let key = if is_input {
+        "input_tokens"
+    } else {
+        "output_tokens"
+    };
     obj.get(key).and_then(|v| v.as_u64())
 }
 

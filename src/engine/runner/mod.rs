@@ -308,12 +308,7 @@ impl TaskRunner {
 
                 let total_tokens = sidecar::get_total_tokens(task_id);
                 if total_tokens > max_tokens {
-                    tracing::warn!(
-                        task_id,
-                        total_tokens,
-                        max_tokens,
-                        "exceeded token budget"
-                    );
+                    tracing::warn!(task_id, total_tokens, max_tokens, "exceeded token budget");
                     sidecar::set(
                         task_id,
                         &[

@@ -33,10 +33,8 @@ pub struct ModelPricing {
 
 impl ModelPricing {
     pub fn estimate_cost_usd(self, usage: TokenUsage) -> CostEstimate {
-        let input_cost =
-            (usage.input_tokens as f64 / 1_000_000.0) * self.input_per_million_usd;
-        let output_cost =
-            (usage.output_tokens as f64 / 1_000_000.0) * self.output_per_million_usd;
+        let input_cost = (usage.input_tokens as f64 / 1_000_000.0) * self.input_per_million_usd;
+        let output_cost = (usage.output_tokens as f64 / 1_000_000.0) * self.output_per_million_usd;
         CostEstimate {
             input_cost_usd: input_cost,
             output_cost_usd: output_cost,
