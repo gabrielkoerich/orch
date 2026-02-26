@@ -425,42 +425,16 @@ pub enum RetryableError {
     MissingTooling,
 }
 
-#[allow(dead_code)]
-impl RetryableError {
-    /// Check if this error type should be retried with the same agent first.
-    pub fn should_retry_same_agent(&self) -> bool {
-        matches!(self, RetryableError::Timeout | RetryableError::Failed)
-    }
-
-    /// Check if this error type should trigger a fallback to a different agent.
-    pub fn should_fallback(&self) -> bool {
-        true // All error types should try fallback agents
-    }
-
-    /// Check if this error is "exhausted" - no more retries should be attempted.
-    /// This is determined by checking if we've exhausted all available agents.
-    pub fn is_exhausted(&self, chain: &str, available_agents: &[String]) -> bool {
-        let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
-            std::collections::HashSet::new()
-        } else {
-            chain.split(',').collect()
-        };
-
-        // Check if any available agent is NOT in the chain
-        available_agents
-            .iter()
-            .any(|a| !chain_set.contains(a.as_str()))
-    }
-}
-
 /// Handle failover for any retryable error type.
 /// Returns true if the task was rerouted, false if it should be marked needs_review.
+///
+/// Note: DB recording of rate limit events is handled by the caller (mod.rs)
+/// which has async context. This function only handles sidecar state + cooldowns.
 pub fn handle_failover(
     task_id: &str,
     agent_name: &str,
     error_type: RetryableError,
     error_message: &str,
-    db: Option<&crate::db::Db>,
 ) -> bool {
     // Get the reroute chain
     let chain = get_reroute_chain(task_id);
@@ -473,15 +447,13 @@ pub fn handle_failover(
         .map(|s| s.to_string())
         .collect();
 
-    // Check if we've exhausted all agents
-    let is_exhausted = !available.iter().any(|a| {
-        let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
-            std::collections::HashSet::new()
-        } else {
-            chain.split(',').collect()
-        };
-        !chain_set.contains(a.as_str())
-    });
+    // Check if we've exhausted all agents (build chain_set once)
+    let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        chain.split(',').collect()
+    };
+    let is_exhausted = available.iter().all(|a| chain_set.contains(a.as_str()));
 
     if is_exhausted {
         tracing::warn!(
@@ -489,14 +461,15 @@ pub fn handle_failover(
             agent = agent_name,
             "all agents exhausted, marking needs_review"
         );
-        sidecar::set(
+        if let Err(e) = sidecar::set(
             task_id,
             &[
                 "status=needs_review".to_string(),
                 format!("last_error={error_message} (all agents exhausted)"),
             ],
-        )
-        .ok();
+        ) {
+            tracing::error!(task_id, ?e, "failed to update task status during failover");
+        }
         return false;
     }
 
@@ -510,22 +483,13 @@ pub fn handle_failover(
             "failover: switching to fallback agent"
         );
 
-        // Record the error in DB if available (sync call — fire and forget)
-        if let Some(db) = db {
-            let error_type_str = match error_type {
-                RetryableError::Timeout => "timeout",
-                RetryableError::UsageLimit => "rate_limit",
-                RetryableError::AuthError => "budget",
-                RetryableError::Failed => "failed",
-                RetryableError::MissingTooling => "missing_tooling",
-            };
-            drop(db.record_rate_limit(agent_name, error_type_str, Some(task_id)));
+        // Record agent failure for cooldown tracking
+        // Skip cooldown for MissingTooling — it's permanent, not transient
+        if !matches!(error_type, RetryableError::MissingTooling) {
+            record_agent_failure(agent_name);
         }
 
-        // Record agent failure for cooldown tracking (temporary failure)
-        record_agent_failure(agent_name);
-
-        sidecar::set(
+        if let Err(e) = sidecar::set(
             task_id,
             &[
                 format!("agent={next}"),
@@ -533,21 +497,23 @@ pub fn handle_failover(
                 "status=new".to_string(),
                 format!("last_error={error_message}, rerouted to {next}"),
             ],
-        )
-        .ok();
+        ) {
+            tracing::error!(task_id, ?e, "failed to update task status during failover");
+        }
         return true;
     }
 
     // No fallback available
     tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
-    sidecar::set(
+    if let Err(e) = sidecar::set(
         task_id,
         &[
             "status=needs_review".to_string(),
             format!("last_error={error_message}, no fallback agents"),
         ],
-    )
-    .ok();
+    ) {
+        tracing::error!(task_id, ?e, "failed to update task status during failover");
+    }
     false
 }
 

@@ -82,7 +82,6 @@ impl PermissionRules {
 
         rules
     }
-
 }
 
 /// Parsed response from an agent, including metadata extracted from the
@@ -154,10 +153,9 @@ impl std::fmt::Display for AgentError {
                 write!(f, "invalid response: {}", &raw[..end])
             }
             Self::AgentFailed { message } => write!(f, "agent failed: {message}"),
-            Self::Unknown {
-                exit_code,
-                message,
-            } => write!(f, "unknown error (exit {exit_code}): {message}"),
+            Self::Unknown { exit_code, message } => {
+                write!(f, "unknown error (exit {exit_code}): {message}")
+            }
         }
     }
 }
@@ -235,7 +233,10 @@ pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
         "opencode" => Box::new(opencode::OpenCodeRunner::new()),
         // Unknown agents fall back to Claude-compatible parsing
         other => {
-            tracing::warn!(agent = other, "unknown agent, using claude-compatible runner");
+            tracing::warn!(
+                agent = other,
+                "unknown agent, using claude-compatible runner"
+            );
             Box::new(claude::ClaudeRunner::new(other))
         }
     }
@@ -325,10 +326,44 @@ pub(crate) mod patterns {
     /// Check for missing tooling patterns. Returns the tool name.
     pub fn detect_missing_tool(text: &str) -> Option<AgentError> {
         let known_tools = [
-            "bun", "node", "npm", "pnpm", "yarn", "deno", "tsc", "eslint", "prettier", "jest",
-            "vitest", "cargo", "rustc", "go", "python", "python3", "pip", "pip3", "uv", "poetry",
-            "pytest", "ruff", "black", "mypy", "make", "cmake", "ninja", "just", "bats", "docker",
-            "docker-compose", "podman", "kubectl", "helm", "terraform", "anchor", "avm", "solana",
+            "bun",
+            "node",
+            "npm",
+            "pnpm",
+            "yarn",
+            "deno",
+            "tsc",
+            "eslint",
+            "prettier",
+            "jest",
+            "vitest",
+            "cargo",
+            "rustc",
+            "go",
+            "python",
+            "python3",
+            "pip",
+            "pip3",
+            "uv",
+            "poetry",
+            "pytest",
+            "ruff",
+            "black",
+            "mypy",
+            "make",
+            "cmake",
+            "ninja",
+            "just",
+            "bats",
+            "docker",
+            "docker-compose",
+            "podman",
+            "kubectl",
+            "helm",
+            "terraform",
+            "anchor",
+            "avm",
+            "solana",
             "solana-test-validator",
         ];
 

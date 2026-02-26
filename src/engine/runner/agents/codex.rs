@@ -216,9 +216,7 @@ impl AgentRunner for CodexRunner {
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
-        let model_flag = model
-            .map(|m| format!("--model {m}"))
-            .unwrap_or_default();
+        let model_flag = model.map(|m| format!("--model {m}")).unwrap_or_default();
 
         // Codex approval: autonomous → never, supervised → suggest
         let approval = if permissions.autonomous {
@@ -250,9 +248,7 @@ impl AgentRunner for CodexRunner {
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(AgentError::InvalidResponse {
-                raw: String::new(),
-            });
+            return Err(AgentError::InvalidResponse { raw: String::new() });
         }
 
         let events = self.parse_ndjson(trimmed);
@@ -279,11 +275,11 @@ impl AgentRunner for CodexRunner {
         }
 
         // Extract agent response text
-        let agent_text = self.extract_agent_text(&events).ok_or_else(|| {
-            AgentError::InvalidResponse {
-                raw: trimmed.to_string(),
-            }
-        })?;
+        let agent_text =
+            self.extract_agent_text(&events)
+                .ok_or_else(|| AgentError::InvalidResponse {
+                    raw: trimmed.to_string(),
+                })?;
 
         // Parse the agent text through our standard parser
         let response = parser::parse(&agent_text).map_err(|_| AgentError::InvalidResponse {

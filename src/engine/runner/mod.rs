@@ -392,18 +392,22 @@ impl TaskRunner {
 
                 // Map AgentError to RetryableError for the existing handle_failover()
                 let (retryable, error_msg) = match &agent_err {
-                    agents::AgentError::RateLimit { message, .. } => {
-                        (response::RetryableError::UsageLimit, format!("{agent_name} rate limit: {message}"))
-                    }
-                    agents::AgentError::Auth { message } => {
-                        (response::RetryableError::AuthError, format!("{agent_name} auth error: {message}"))
-                    }
-                    agents::AgentError::Timeout { elapsed } => {
-                        (response::RetryableError::Timeout, format!("{agent_name} timed out after {}s", elapsed.as_secs()))
-                    }
-                    agents::AgentError::MissingTool { tool } => {
-                        (response::RetryableError::MissingTooling, format!("missing tool: {tool}"))
-                    }
+                    agents::AgentError::RateLimit { message, .. } => (
+                        response::RetryableError::UsageLimit,
+                        format!("{agent_name} rate limit: {message}"),
+                    ),
+                    agents::AgentError::Auth { message } => (
+                        response::RetryableError::AuthError,
+                        format!("{agent_name} auth error: {message}"),
+                    ),
+                    agents::AgentError::Timeout { elapsed } => (
+                        response::RetryableError::Timeout,
+                        format!("{agent_name} timed out after {}s", elapsed.as_secs()),
+                    ),
+                    agents::AgentError::MissingTool { tool } => (
+                        response::RetryableError::MissingTooling,
+                        format!("missing tool: {tool}"),
+                    ),
                     agents::AgentError::ModelUnavailable { model, .. } => {
                         // Record model-specific cooldown (1 hour ban)
                         response::record_model_failure(&agent_name, model);
@@ -427,14 +431,28 @@ impl TaskRunner {
                                 ],
                             )?;
                             // Skip normal failover — we're retrying same agent with different model
-                            self.record_metrics(task_id, &agent_name, &model_name, &route_result, &started_at, attempts).await;
+                            self.record_metrics(
+                                task_id,
+                                &agent_name,
+                                &model_name,
+                                &route_result,
+                                &started_at,
+                                attempts,
+                            )
+                            .await;
                             return Ok(());
                         }
-                        (response::RetryableError::Failed, format!("model {model} unavailable"))
+                        (
+                            response::RetryableError::Failed,
+                            format!("model {model} unavailable"),
+                        )
                     }
                     agents::AgentError::ContextOverflow { .. } => {
                         // Could truncate and retry, but for now treat as failed
-                        (response::RetryableError::Failed, format!("{agent_name} context overflow"))
+                        (
+                            response::RetryableError::Failed,
+                            format!("{agent_name} context overflow"),
+                        )
                     }
                     agents::AgentError::WaitingForInput { message } => {
                         // Requires human — skip failover, go straight to needs_review
@@ -445,21 +463,33 @@ impl TaskRunner {
                                 format!("last_error=waiting for input: {message}"),
                             ],
                         )?;
-                        self.record_metrics(task_id, &agent_name, &model_name, &route_result, &started_at, attempts).await;
+                        self.record_metrics(
+                            task_id,
+                            &agent_name,
+                            &model_name,
+                            &route_result,
+                            &started_at,
+                            attempts,
+                        )
+                        .await;
                         return Ok(());
                     }
-                    agents::AgentError::PermissionDenied { message } => {
-                        (response::RetryableError::Failed, format!("permission denied: {message}"))
-                    }
-                    agents::AgentError::InvalidResponse { .. } => {
-                        (response::RetryableError::Failed, format!("{agent_name} invalid response"))
-                    }
-                    agents::AgentError::AgentFailed { message } => {
-                        (response::RetryableError::Failed, format!("{agent_name} failed: {message}"))
-                    }
-                    agents::AgentError::Unknown { exit_code, message } => {
-                        (response::RetryableError::Failed, format!("{agent_name} exit {exit_code}: {message}"))
-                    }
+                    agents::AgentError::PermissionDenied { message } => (
+                        response::RetryableError::Failed,
+                        format!("permission denied: {message}"),
+                    ),
+                    agents::AgentError::InvalidResponse { .. } => (
+                        response::RetryableError::Failed,
+                        format!("{agent_name} invalid response"),
+                    ),
+                    agents::AgentError::AgentFailed { message } => (
+                        response::RetryableError::Failed,
+                        format!("{agent_name} failed: {message}"),
+                    ),
+                    agents::AgentError::Unknown { exit_code, message } => (
+                        response::RetryableError::Failed,
+                        format!("{agent_name} exit {exit_code}: {message}"),
+                    ),
                 };
 
                 // Record rate limit in DB for rate-limit and auth errors
@@ -483,19 +513,28 @@ impl TaskRunner {
                     .collect();
 
                 let all_agents_tried = {
-                    let chain_set: std::collections::HashSet<&str> =
-                        if chain.is_empty() { std::collections::HashSet::new() } else { chain.split(',').collect() };
-                    !available.iter().any(|a| a != &agent_name && !chain_set.contains(a.as_str()))
+                    let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
+                        std::collections::HashSet::new()
+                    } else {
+                        chain.split(',').collect()
+                    };
+                    !available
+                        .iter()
+                        .any(|a| a != &agent_name && !chain_set.contains(a.as_str()))
                 };
 
                 if all_agents_tried {
                     // All agents exhausted — try free models via opencode
                     let free = agent_runner.free_models();
                     if !free.is_empty() {
-                        let tried_models: String = sidecar::get(task_id, "model_reroute_chain").unwrap_or_default();
-                        let tried_set: std::collections::HashSet<&str> = tried_models.split(',').filter(|s| !s.is_empty()).collect();
+                        let tried_models: String =
+                            sidecar::get(task_id, "model_reroute_chain").unwrap_or_default();
+                        let tried_set: std::collections::HashSet<&str> =
+                            tried_models.split(',').filter(|s| !s.is_empty()).collect();
 
-                        if let Some(free_model) = free.iter().find(|m| !tried_set.contains(m.as_str())) {
+                        if let Some(free_model) =
+                            free.iter().find(|m| !tried_set.contains(m.as_str()))
+                        {
                             tracing::info!(task_id, model = %free_model, "last resort: trying free model via opencode");
                             let new_tried = if tried_models.is_empty() {
                                 free_model.clone()
@@ -512,19 +551,25 @@ impl TaskRunner {
                                     format!("last_error=all agents exhausted, trying free model {free_model}"),
                                 ],
                             )?;
-                            self.record_metrics(task_id, &agent_name, &model_name, &route_result, &started_at, attempts).await;
+                            self.record_metrics(
+                                task_id,
+                                &agent_name,
+                                &model_name,
+                                &route_result,
+                                &started_at,
+                                attempts,
+                            )
+                            .await;
                             return Ok(());
                         }
                     }
                 }
 
-                response::handle_failover(
-                    task_id,
-                    &agent_name,
-                    retryable,
-                    &error_msg,
-                    self.db.as_deref(),
-                );
+                let rerouted =
+                    response::handle_failover(task_id, &agent_name, retryable, &error_msg);
+                if !rerouted {
+                    tracing::warn!(task_id, "failover exhausted, task marked needs_review");
+                }
             }
         }
 
@@ -536,7 +581,15 @@ impl TaskRunner {
         }
 
         // Record metrics
-        self.record_metrics(task_id, &agent_name, &model_name, &route_result, &started_at, attempts).await;
+        self.record_metrics(
+            task_id,
+            &agent_name,
+            &model_name,
+            &route_result,
+            &started_at,
+            attempts,
+        )
+        .await;
 
         Ok(())
     }
@@ -569,7 +622,8 @@ impl TaskRunner {
                     "failed"
                 }
             }
-            _ => "success",
+            "new" => "rerouted",
+            _ => "unknown",
         };
 
         let complexity = route_result.as_ref().map(|r| r.complexity.clone());

@@ -45,10 +45,10 @@
 //! - "rate limit" / "429" — standard rate limiting
 //! - "context_length_exceeded" — context overflow
 
-use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
-use crate::parser;
 #[cfg(test)]
 use super::SandboxLevel;
+use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
+use crate::parser;
 
 /// Runner for Claude-compatible agents (Claude, Kimi, MiniMax).
 pub struct ClaudeRunner {
@@ -66,23 +66,22 @@ impl ClaudeRunner {
     /// Parse the Claude `--output-format json` envelope.
     ///
     /// Extracts `result`, `usage`, `permission_denials`, and `is_error`.
-    fn parse_envelope(
-        &self,
-        raw: &str,
-    ) -> Result<ParsedResponse, AgentError> {
-        let val: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
+    fn parse_envelope(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
+        let parsed_json: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
             // Not valid JSON at all — try as raw text
             AgentError::InvalidResponse {
                 raw: raw.to_string(),
             }
         })?;
 
-        let obj = val.as_object().ok_or_else(|| AgentError::InvalidResponse {
-            raw: raw.to_string(),
-        })?;
+        let envelope = parsed_json
+            .as_object()
+            .ok_or_else(|| AgentError::InvalidResponse {
+                raw: raw.to_string(),
+            })?;
 
         // Check if this is a Claude envelope (has "type" field)
-        let is_envelope = obj.get("type").and_then(|v| v.as_str()) == Some("result");
+        let is_envelope = envelope.get("type").and_then(|v| v.as_str()) == Some("result");
 
         if !is_envelope {
             // Not a Claude envelope — try direct parsing via generic parser
@@ -90,13 +89,13 @@ impl ClaudeRunner {
         }
 
         // Check is_error flag
-        let is_error = obj
+        let is_error = envelope
             .get("is_error")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
         // Extract the result text
-        let result_text = obj
+        let result_text = envelope
             .get("result")
             .and_then(|v| v.as_str())
             .unwrap_or("");
@@ -121,13 +120,13 @@ impl ClaudeRunner {
         }
 
         // Extract token usage from top-level `usage` object
-        let (input_tokens, output_tokens) = extract_usage(obj);
+        let (input_tokens, output_tokens) = extract_usage(envelope);
 
         // Extract duration
-        let duration_ms = obj.get("duration_ms").and_then(|v| v.as_u64());
+        let duration_ms = envelope.get("duration_ms").and_then(|v| v.as_u64());
 
         // Extract permission denials
-        let permission_denials = obj
+        let permission_denials = envelope
             .get("permission_denials")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -190,9 +189,7 @@ impl AgentRunner for ClaudeRunner {
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
-        let model_flag = model
-            .map(|m| format!("--model {m}"))
-            .unwrap_or_default();
+        let model_flag = model.map(|m| format!("--model {m}")).unwrap_or_default();
 
         // Claude permission mode: autonomous → bypassPermissions, supervised → acceptEdits
         let permission_mode = if permissions.autonomous {
@@ -239,9 +236,7 @@ impl AgentRunner for ClaudeRunner {
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(AgentError::InvalidResponse {
-                raw: String::new(),
-            });
+            return Err(AgentError::InvalidResponse { raw: String::new() });
         }
 
         self.parse_envelope(trimmed)
@@ -253,12 +248,12 @@ impl AgentRunner for ClaudeRunner {
     }
 }
 
-/// Extract input/output tokens from the Claude usage objects.
+/// Extract input/output tokens from the Claude envelope's usage objects.
 fn extract_usage(
-    obj: &serde_json::Map<String, serde_json::Value>,
+    envelope: &serde_json::Map<String, serde_json::Value>,
 ) -> (Option<u64>, Option<u64>) {
     // Try top-level `usage` first
-    if let Some(usage) = obj.get("usage").and_then(|v| v.as_object()) {
+    if let Some(usage) = envelope.get("usage").and_then(|v| v.as_object()) {
         let input = usage.get("input_tokens").and_then(|v| v.as_u64());
         let output = usage.get("output_tokens").and_then(|v| v.as_u64());
         if input.is_some() || output.is_some() {
@@ -267,24 +262,24 @@ fn extract_usage(
     }
 
     // Try modelUsage (aggregated across models)
-    if let Some(model_usage) = obj.get("modelUsage").and_then(|v| v.as_object()) {
+    if let Some(model_usage) = envelope.get("modelUsage").and_then(|v| v.as_object()) {
         let mut total_input = 0u64;
         let mut total_output = 0u64;
         let mut found = false;
 
-        for (_model, stats) in model_usage {
-            if let Some(stats_obj) = stats.as_object() {
-                if let Some(i) = stats_obj
+        for (_model_name, model_stats) in model_usage {
+            if let Some(stats) = model_stats.as_object() {
+                if let Some(i) = stats
                     .get("inputTokens")
-                    .or_else(|| stats_obj.get("input_tokens"))
+                    .or_else(|| stats.get("input_tokens"))
                     .and_then(|v| v.as_u64())
                 {
                     total_input += i;
                     found = true;
                 }
-                if let Some(o) = stats_obj
+                if let Some(o) = stats
                     .get("outputTokens")
-                    .or_else(|| stats_obj.get("output_tokens"))
+                    .or_else(|| stats.get("output_tokens"))
                     .and_then(|v| v.as_u64())
                 {
                     total_output += o;
@@ -380,7 +375,8 @@ mod tests {
 
     #[test]
     fn parse_direct_json_no_envelope() {
-        let raw = r#"{"status":"done","summary":"hello","accomplished":[],"remaining":[],"files":[]}"#;
+        let raw =
+            r#"{"status":"done","summary":"hello","accomplished":[],"remaining":[],"files":[]}"#;
 
         let parsed = runner().parse_response(raw).unwrap();
         assert_eq!(parsed.response.status, "done");
@@ -407,7 +403,7 @@ mod tests {
 
     #[test]
     fn extract_usage_from_model_usage() {
-        let val: serde_json::Value = serde_json::json!({
+        let response_json: serde_json::Value = serde_json::json!({
             "modelUsage": {
                 "claude-haiku-4-5-20251001": {
                     "inputTokens": 1000,
@@ -415,8 +411,8 @@ mod tests {
                 }
             }
         });
-        let obj = val.as_object().unwrap();
-        let (input, output) = extract_usage(obj);
+        let envelope = response_json.as_object().unwrap();
+        let (input, output) = extract_usage(envelope);
         assert_eq!(input, Some(1000));
         assert_eq!(output, Some(500));
     }

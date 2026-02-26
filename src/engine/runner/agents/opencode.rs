@@ -155,7 +155,10 @@ impl OpenCodeRunner {
     /// Discover free models via `opencode models | grep free`.
     /// Results are cached for 1 hour.
     fn discover_free_models_cached(&self) -> Vec<String> {
-        let mut cache = self.free_models_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self
+            .free_models_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Check cache freshness (1 hour)
         if let Some((ref models, ref ts)) = *cache {
@@ -191,9 +194,7 @@ impl AgentRunner for OpenCodeRunner {
         // OpenCode has no permission/sandbox flags — it relies on its own
         // built-in safety. Permission rules are enforced by the orchestrator
         // at the worktree level (filesystem isolation).
-        let model_flag = model
-            .map(|m| format!("--model {m}"))
-            .unwrap_or_default();
+        let model_flag = model.map(|m| format!("--model {m}")).unwrap_or_default();
 
         format!(
             r#"{timeout_cmd} opencode run {model_flag} \
@@ -207,9 +208,7 @@ impl AgentRunner for OpenCodeRunner {
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(AgentError::InvalidResponse {
-                raw: String::new(),
-            });
+            return Err(AgentError::InvalidResponse { raw: String::new() });
         }
 
         let events = self.parse_ndjson(trimmed);
@@ -236,19 +235,18 @@ impl AgentRunner for OpenCodeRunner {
         }
 
         // Extract text
-        let text = self.extract_text(&events).ok_or_else(|| {
-            AgentError::InvalidResponse {
+        let text = self
+            .extract_text(&events)
+            .ok_or_else(|| AgentError::InvalidResponse {
                 raw: trimmed.to_string(),
-            }
-        })?;
+            })?;
 
         // Extract tokens
         let (input_tokens, output_tokens) = self.extract_tokens(&events);
 
         // Parse the text through standard parser
-        let response = parser::parse(&text).map_err(|_| AgentError::InvalidResponse {
-            raw: text.clone(),
-        })?;
+        let response =
+            parser::parse(&text).map_err(|_| AgentError::InvalidResponse { raw: text.clone() })?;
 
         Ok(ParsedResponse {
             response,
@@ -311,8 +309,7 @@ fn classify_opencode_message(message: &str) -> AgentError {
         };
     }
 
-    if lower.contains("model") && (lower.contains("not found") || lower.contains("not supported"))
-    {
+    if lower.contains("model") && (lower.contains("not found") || lower.contains("not supported")) {
         return AgentError::ModelUnavailable {
             message: message.to_string(),
             model: String::new(),
