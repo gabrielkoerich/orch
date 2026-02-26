@@ -246,9 +246,7 @@ mod tests {
     #[tokio::test]
     async fn bind_and_route_to_session() {
         let transport = Transport::new();
-        transport
-            .bind("42", "orch-42", "telegram", "12345")
-            .await;
+        transport.bind("42", "orch-42", "telegram", "12345").await;
 
         let msg = IncomingMessage {
             channel: "telegram".to_string(),
