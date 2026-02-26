@@ -70,7 +70,7 @@ jobs:
             os: macos-latest
             arch: arm64
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             arch: x86_64
     runs-on: ${{ matrix.os }}
     steps:
