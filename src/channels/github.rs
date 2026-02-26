@@ -29,7 +29,7 @@ struct GhComment {
     created_at: DateTime<Utc>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 struct GhUser {
     login: String,
 }
@@ -288,5 +288,391 @@ impl Channel for GitHubChannel {
 
     async fn shutdown(&self) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
+};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Clone)]
+struct WebhookState {
+    secret: String,
+    repo: String,
+    tx: tokio::sync::mpsc::Sender<IncomingMessage>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct WebhookPayload {
+    action: Option<String>,
+    issue: Option<IssuePayload>,
+    #[serde(rename = "pull_request")]
+    pr: Option<PullRequestPayload>,
+    comment: Option<CommentPayload>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct IssuePayload {
+    number: u64,
+    title: String,
+    labels: Vec<LabelPayload>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct LabelPayload {
+    name: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PullRequestPayload {
+    number: u64,
+    title: String,
+    body: Option<String>,
+    action: Option<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct CommentPayload {
+    body: String,
+    user: GhUser,
+    created_at: Option<DateTime<Utc>>,
+}
+
+fn verify_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(payload);
+    let result = mac.finalize().into_bytes();
+
+    let expected = format!("sha256={:x}", result);
+    expected == signature
+}
+
+fn parse_github_event(
+    payload: WebhookPayload,
+    event_type: &str,
+    _repo: &str,
+) -> Option<IncomingMessage> {
+    let timestamp = chrono::Utc::now();
+
+    match event_type {
+        "issues" => {
+            if let (Some(action), Some(issue)) = (&payload.action, &payload.issue) {
+                if action == "opened" || action == "labeled" {
+                    let labels: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
+                    return Some(IncomingMessage {
+                        channel: "github".to_string(),
+                        id: format!("issue-{}-{}", issue.number, action),
+                        thread_id: issue.number.to_string(),
+                        author: "github".to_string(),
+                        body: format!("Issue {}: {}", action, issue.title),
+                        timestamp,
+                        metadata: serde_json::json!({
+                            "event": "issues",
+                            "action": action,
+                            "issue_number": issue.number,
+                            "labels": labels
+                        }),
+                    });
+                }
+            }
+        }
+        "pull_request" => {
+            if let (Some(action), Some(pr)) = (&payload.action, &payload.pr) {
+                let relevant_actions = ["opened", "synchronize", "labeled", "ready_for_review"];
+                if relevant_actions.contains(&action.as_str()) {
+                    return Some(IncomingMessage {
+                        channel: "github".to_string(),
+                        id: format!("pr-{}-{}", pr.number, action),
+                        thread_id: pr.number.to_string(),
+                        author: "github".to_string(),
+                        body: format!("PR {}: {}", action, pr.title),
+                        timestamp,
+                        metadata: serde_json::json!({
+                            "event": "pull_request",
+                            "action": action,
+                            "pr_number": pr.number,
+                            "pr_title": pr.title
+                        }),
+                    });
+                }
+            }
+        }
+        "issue_comment" => {
+            if let (Some(action), Some(comment)) = (&payload.action, &payload.comment) {
+                if action == "created" {
+                    return Some(IncomingMessage {
+                        channel: "github".to_string(),
+                        id: format!("comment-{}-{}", action, timestamp.timestamp()),
+                        thread_id: "0".to_string(),
+                        author: comment.user.login.clone(),
+                        body: comment.body.clone(),
+                        timestamp: comment.created_at.unwrap_or(timestamp),
+                        metadata: serde_json::json!({
+                            "event": "issue_comment",
+                            "action": action
+                        }),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    None
+}
+
+async fn handle_webhook(
+    State(state): State<WebhookState>,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::extract::Json<WebhookPayload>,
+) -> impl IntoResponse {
+    let payload = raw_body.0;
+    let signature = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let body_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    if !state.secret.is_empty() && !verify_signature(&state.secret, &body_bytes, signature) {
+        tracing::warn!("webhook signature verification failed");
+        return (StatusCode::UNAUTHORIZED, "Invalid signature");
+    }
+
+    let event_type = headers
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if let Some(msg) = parse_github_event(payload, event_type, &state.repo) {
+        if state.tx.send(msg).await.is_err() {
+            tracing::warn!("webhook event channel receiver dropped");
+        }
+    }
+
+    (StatusCode::OK, "OK")
+}
+
+async fn webhook_health() -> impl IntoResponse {
+    (StatusCode::OK, "OK")
+}
+
+pub async fn start_webhook_server(
+    port: u16,
+    secret: String,
+    repo: String,
+    tx: tokio::sync::mpsc::Sender<IncomingMessage>,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+
+    let state = WebhookState { secret, repo, tx };
+
+    let app = Router::new()
+        .route("/health", get(webhook_health))
+        .route("/webhook", post(handle_webhook))
+        .with_state(state);
+
+    tracing::info!(port = port, "starting webhook server");
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_signature_valid() {
+        let secret = "test-secret";
+        let payload = br#"{"action":"opened"}"#;
+        let signature = "sha256=e7f446e3b1c1c8e7b8c8e7b8c8e7b8c8e7b8c8e7b8c8e7b8c8e7b8c8e7b8c8";
+
+        let result = verify_signature(secret, payload, signature);
+        assert!(!result, "Invalid signature format should fail");
+    }
+
+    #[test]
+    fn test_verify_signature_invalid() {
+        let secret = "test-secret";
+        let payload = br#"{"action":"opened"}"#;
+        let signature = "sha256=invalidsignature";
+
+        let result = verify_signature(secret, payload, signature);
+        assert!(!result, "Invalid signature should return false");
+    }
+
+    #[test]
+    fn test_verify_signature_empty_secret() {
+        let secret = "";
+        let payload = br#"{"action":"opened"}"#;
+        let signature = "sha256=anysignature";
+
+        let result = verify_signature(secret, payload, signature);
+        assert!(!result, "Empty secret should return false");
+    }
+
+    #[test]
+    fn test_parse_github_event_issue_opened() {
+        let payload = WebhookPayload {
+            action: Some("opened".to_string()),
+            issue: Some(IssuePayload {
+                number: 42,
+                title: "Test issue".to_string(),
+                labels: vec![],
+            }),
+            pr: None,
+            comment: None,
+        };
+
+        let msg = parse_github_event(payload, "issues", "owner/repo");
+        assert!(msg.is_some());
+
+        let msg = msg.unwrap();
+        assert_eq!(msg.channel, "github");
+        assert_eq!(msg.thread_id, "42");
+        assert!(msg.body.contains("opened"));
+        assert!(msg.body.contains("Test issue"));
+    }
+
+    #[test]
+    fn test_parse_github_event_issue_labeled() {
+        let payload = WebhookPayload {
+            action: Some("labeled".to_string()),
+            issue: Some(IssuePayload {
+                number: 42,
+                title: "Test issue".to_string(),
+                labels: vec![
+                    LabelPayload {
+                        name: "bug".to_string(),
+                    },
+                    LabelPayload {
+                        name: "urgent".to_string(),
+                    },
+                ],
+            }),
+            pr: None,
+            comment: None,
+        };
+
+        let msg = parse_github_event(payload, "issues", "owner/repo");
+        assert!(msg.is_some());
+
+        let msg = msg.unwrap();
+        assert_eq!(msg.thread_id, "42");
+        let labels = msg.metadata.get("labels").unwrap().as_array().unwrap();
+        assert_eq!(labels.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_github_event_pr_opened() {
+        let payload = WebhookPayload {
+            action: Some("opened".to_string()),
+            issue: None,
+            pr: Some(PullRequestPayload {
+                number: 101,
+                title: "New feature".to_string(),
+                body: Some("Description".to_string()),
+                action: Some("opened".to_string()),
+            }),
+            comment: None,
+        };
+
+        let msg = parse_github_event(payload, "pull_request", "owner/repo");
+        assert!(msg.is_some());
+
+        let msg = msg.unwrap();
+        assert_eq!(msg.thread_id, "101");
+        assert!(msg.body.contains("opened"));
+        assert!(msg.body.contains("New feature"));
+    }
+
+    #[test]
+    fn test_parse_github_event_pr_synchronize() {
+        let payload = WebhookPayload {
+            action: Some("synchronize".to_string()),
+            issue: None,
+            pr: Some(PullRequestPayload {
+                number: 101,
+                title: "New feature".to_string(),
+                body: Some("Description".to_string()),
+                action: Some("synchronize".to_string()),
+            }),
+            comment: None,
+        };
+
+        let msg = parse_github_event(payload, "pull_request", "owner/repo");
+        assert!(msg.is_some());
+
+        let msg = msg.unwrap();
+        assert!(msg.body.contains("synchronize"));
+    }
+
+    #[test]
+    fn test_parse_github_event_ignored_action() {
+        let payload = WebhookPayload {
+            action: Some("closed".to_string()),
+            issue: Some(IssuePayload {
+                number: 42,
+                title: "Test issue".to_string(),
+                labels: vec![],
+            }),
+            pr: None,
+            comment: None,
+        };
+
+        let msg = parse_github_event(payload, "issues", "owner/repo");
+        assert!(msg.is_none(), "closed action should be ignored");
+    }
+
+    #[test]
+    fn test_parse_github_event_unknown_type() {
+        let payload = WebhookPayload {
+            action: Some("created".to_string()),
+            issue: None,
+            pr: None,
+            comment: None,
+        };
+
+        let msg = parse_github_event(payload, "unknown_event", "owner/repo");
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn test_parse_github_event_issue_comment() {
+        let payload = WebhookPayload {
+            action: Some("created".to_string()),
+            issue: None,
+            pr: None,
+            comment: Some(CommentPayload {
+                body: "This is a comment".to_string(),
+                user: GhUser {
+                    login: "testuser".to_string(),
+                },
+                created_at: Some(
+                    chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+            }),
+        };
+
+        let msg = parse_github_event(payload, "issue_comment", "owner/repo");
+        assert!(msg.is_some());
+
+        let msg = msg.unwrap();
+        assert_eq!(msg.author, "testuser");
+        assert_eq!(msg.body, "This is a comment");
     }
 }

@@ -196,6 +196,11 @@ enum TaskAction {
         #[arg(short, long)]
         labels: Vec<String>,
     },
+    /// Show token cost breakdown for a task
+    Cost {
+        /// Task ID
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -343,6 +348,9 @@ async fn main() -> anyhow::Result<()> {
             }
             TaskAction::Publish { id, labels } => {
                 cli::task::publish(id, labels).await?;
+            }
+            TaskAction::Cost { id } => {
+                cli::task::cost(&id)?;
             }
         },
         Commands::Job { action } => match action {

@@ -38,7 +38,7 @@ thiserror = "2"
 # Async trait
 async-trait = "0.1"
 
-# SHA256 for dedup hashing
+# SHA256 for dedup hashing and webhook signatures
 sha2 = "0.10"
 
 # URL encoding for label names
@@ -61,6 +61,13 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Command discovery for agents
 which = "7"
+
+# HTTP server for webhooks
+axum = "0.7"
+tower-http = { version = "0.5", features = ["trace"] }
+
+# HMAC for webhook signature verification
+hmac = "0.12"
 
 # Async combinators (FuturesUnordered for concurrent routing)
 futures = "0.3"

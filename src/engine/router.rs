@@ -760,13 +760,15 @@ impl Router {
 
         // Persist the next index and last agent
         let next_idx = (agent_idx + 1) % agents.len();
-        let _ = crate::sidecar::set(
+        if let Err(e) = crate::sidecar::set(
             "_router",
             &[
                 format!("rr_index={}", next_idx),
                 format!("last_agent={}", agent),
             ],
-        );
+        ) {
+            tracing::warn!(error = ?e, "failed to persist round-robin state");
+        }
 
         let complexity = self.extract_complexity_from_labels(&task.labels);
         let model = self.config.model_for_complexity(&agent, &complexity);
@@ -929,7 +931,9 @@ impl Router {
         let warning = self.check_routing_sanity(task, &agent, &profile);
 
         // Track last routed agent for distribution
-        let _ = crate::sidecar::set("_router", &[format!("last_agent={}", agent)]);
+        if let Err(e) = crate::sidecar::set("_router", &[format!("last_agent={}", agent)]) {
+            tracing::warn!(error = ?e, "failed to persist last_agent");
+        }
 
         Ok(RouteResult {
             agent,

@@ -18,6 +18,12 @@ pub struct AgentResponse {
     pub files: Vec<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Input token count (if available from agent).
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    /// Output token count (if available from agent).
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
 }
 
 /// Parse an agent response from a file path (or stdin if "-").
@@ -64,6 +70,8 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
         remaining: vec![],
         files: vec![],
         error: None,
+        input_tokens: None,
+        output_tokens: None,
     })
 }
 
@@ -99,6 +107,14 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
     let files = extract_string_array(obj.get("files"));
     let error = obj.get("error").and_then(|v| v.as_str()).map(String::from);
 
+    // Extract token counts if available
+    let input_tokens = extract_u64(obj.get("input_tokens"))
+        .or_else(|| extract_u64(obj.get("tokens_input")))
+        .or_else(|| extract_usage_tokens(obj.get("usage"), true));
+    let output_tokens = extract_u64(obj.get("output_tokens"))
+        .or_else(|| extract_u64(obj.get("tokens_output")))
+        .or_else(|| extract_usage_tokens(obj.get("usage"), false));
+
     Ok(AgentResponse {
         status,
         summary,
@@ -106,7 +122,25 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
         remaining,
         files,
         error,
+        input_tokens,
+        output_tokens,
     })
+}
+
+/// Extract a u64 from a JSON value.
+fn extract_u64(val: Option<&serde_json::Value>) -> Option<u64> {
+    val.and_then(|v| v.as_u64())
+}
+
+/// Extract tokens from a usage object (common in OpenAI-compatible APIs).
+fn extract_usage_tokens(usage: Option<&serde_json::Value>, is_input: bool) -> Option<u64> {
+    let obj = usage?.as_object()?;
+    let key = if is_input {
+        "input_tokens"
+    } else {
+        "output_tokens"
+    };
+    obj.get(key).and_then(|v| v.as_u64())
 }
 
 fn extract_string_array(val: Option<&serde_json::Value>) -> Vec<String> {
