@@ -75,7 +75,7 @@ impl TaskRunner {
         }
 
         // Check max attempts
-        let max_attempts: u32 = config::get("max_attempts")
+        let max_attempts: u32 = config::get("workflow.max_attempts")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
