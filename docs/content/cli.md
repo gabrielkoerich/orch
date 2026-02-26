@@ -110,12 +110,12 @@ orch agents                 # list available agents and their status
 
 | Log | Location |
 |-----|----------|
-| Server log | `~/.orchestrator/.orchestrator/orchestrator.log` |
-| Server archive | `~/.orchestrator/.orchestrator/orchestrator.archive.log` |
-| Jobs log | `~/.orchestrator/.orchestrator/jobs.log` |
-| Per-task output | `~/.orchestrator/.orchestrator/output-{id}.json` |
-| Per-task tools | `~/.orchestrator/.orchestrator/tools-{id}.json` |
-| Per-task prompts | `~/.orchestrator/.orchestrator/prompt-{id}.md` |
+| Server log | `~/.orchestrator/state/orchestrator.log` |
+| Server archive | `~/.orchestrator/state/orchestrator.archive.log` |
+| Jobs log | `~/.orchestrator/state/jobs.log` |
+| Per-task output | `~/.orchestrator/state/output-{id}.json` |
+| Per-task tools | `~/.orchestrator/state/tools-{id}.json` |
+| Per-task prompts | `~/.orchestrator/state/prompt-{id}.md` |
 | Task context | `~/.orchestrator/contexts/task-{id}.md` |
 | Brew stdout | `/opt/homebrew/var/log/orchestrator.log` |
 | Brew stderr | `/opt/homebrew/var/log/orchestrator.error.log` |

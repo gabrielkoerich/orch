@@ -227,9 +227,13 @@ impl TaskRunner {
             }
         }
 
-        // Read exit code
-        let state_dir = self.orch_home.join(".orchestrator");
-        let status_file = state_dir.join(format!("exit-{task_id}.txt"));
+        // Read exit code (check new state dir, fall back to legacy)
+        let status_file =
+            sidecar::state_file(&format!("exit-{task_id}.txt")).unwrap_or_else(|_| {
+                self.orch_home
+                    .join("state")
+                    .join(format!("exit-{task_id}.txt"))
+            });
         let exit_code: i32 = std::fs::read_to_string(&status_file)
             .ok()
             .and_then(|s| s.trim().parse().ok())

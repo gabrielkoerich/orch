@@ -1,3 +1,4 @@
+use crate::sidecar;
 use std::path::PathBuf;
 
 /// Check if orch was installed via Homebrew.
@@ -8,11 +9,13 @@ fn is_brew_installed() -> bool {
 }
 
 fn pid_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".orchestrator")
-        .join(".orchestrator")
-        .join("orch.pid")
+    sidecar::state_file("orch.pid").unwrap_or_else(|_| {
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".orchestrator")
+            .join("state")
+            .join("orch.pid")
+    })
 }
 
 /// Start the orchestrator service.
@@ -28,11 +31,7 @@ pub fn start() -> anyhow::Result<()> {
     } else {
         // Daemonize: fork orch serve
         let orch_bin = std::env::current_exe()?;
-        let log_dir = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".orchestrator")
-            .join(".orchestrator");
-        std::fs::create_dir_all(&log_dir)?;
+        let log_dir = sidecar::state_dir()?;
 
         let stdout_log = std::fs::File::create(log_dir.join("orchestrator.log"))?;
         let stderr_log = std::fs::File::create(log_dir.join("orchestrator.error.log"))?;
