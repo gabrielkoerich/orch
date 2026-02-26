@@ -10,10 +10,10 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 
 pub struct TelegramChannel {
-    token: String,
-    client: Client,
-    chat_id: Option<String>,
-    offset: std::sync::Arc<std::sync::Mutex<i64>>,
+    pub token: String,
+    pub client: Client,
+    pub chat_id: Option<String>,
+    pub offset: std::sync::Arc<std::sync::Mutex<i64>>,
 }
 
 #[derive(Deserialize)]
@@ -123,11 +123,19 @@ impl Channel for TelegramChannel {
     async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let token = self.token.clone();
-        let _client = self.client.clone();
+        let client = self.client.clone();
         let chat_id = self.chat_id.clone();
         let offset = self.offset.clone();
 
         tracing::info!(token_prefix = %token.chars().take(8).collect::<String>(), "telegram channel started");
+
+        // Create a single TelegramChannel instance to reuse for all API calls
+        let channel = TelegramChannel {
+            token: token.clone(),
+            client: client.clone(),
+            chat_id: chat_id.clone(),
+            offset: offset.clone(),
+        };
 
         tokio::spawn(async move {
             loop {
@@ -136,10 +144,7 @@ impl Channel for TelegramChannel {
                     *off
                 };
 
-                let updates = match TelegramChannel::new(token.clone(), chat_id.clone())
-                    .get_updates(current_offset)
-                    .await
-                {
+                let updates = match channel.get_updates(current_offset).await {
                     Ok(u) => u,
                     Err(e) => {
                         tracing::warn!(?e, "failed to get telegram updates");

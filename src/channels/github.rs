@@ -11,9 +11,9 @@ use std::process::Command;
 use tokio::sync::broadcast;
 
 pub struct GitHubChannel {
-    repo: String,
-    client: reqwest::Client,
-    last_comment_ids: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
+    pub repo: String,
+    pub client: reqwest::Client,
+    pub last_comment_ids: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -132,7 +132,7 @@ impl Channel for GitHubChannel {
     async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let repo = self.repo.clone();
-        let _client = self.client.clone();
+        let client = self.client.clone();
         let last_comment_ids = self.last_comment_ids.clone();
 
         tracing::info!(repo = %repo, "github channel started (polling)");
@@ -140,15 +140,18 @@ impl Channel for GitHubChannel {
         tokio::spawn(async move {
             let polling_interval = std::time::Duration::from_secs(30);
             let mut last_check = Utc::now();
-            let repo_clone = repo.clone();
+
+            // Create a single GitHubChannel instance to reuse for all API calls
+            let channel = GitHubChannel {
+                repo: repo.clone(),
+                client: client.clone(),
+                last_comment_ids: last_comment_ids.clone(),
+            };
 
             loop {
                 tokio::time::sleep(polling_interval).await;
 
-                let issues = match GitHubChannel::new(repo_clone.clone())
-                    .fetch_in_progress_issues()
-                    .await
-                {
+                let issues = match channel.fetch_in_progress_issues().await {
                     Ok(i) => i,
                     Err(e) => {
                         tracing::warn!(?e, "failed to fetch in_progress issues");
@@ -157,10 +160,7 @@ impl Channel for GitHubChannel {
                 };
 
                 for issue in issues {
-                    let comments = match GitHubChannel::new(repo_clone.clone())
-                        .fetch_comments(issue.number)
-                        .await
-                    {
+                    let comments = match channel.fetch_comments(issue.number).await {
                         Ok(c) => c,
                         Err(e) => {
                             tracing::warn!(issue = issue.number, ?e, "failed to fetch comments");
