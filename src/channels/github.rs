@@ -475,11 +475,7 @@ pub async fn start_webhook_server(
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
 
-    let state = WebhookState {
-        secret,
-        repo,
-        tx,
-    };
+    let state = WebhookState { secret, repo, tx };
 
     let app = Router::new()
         .route("/health", get(webhook_health))
@@ -558,8 +554,12 @@ mod tests {
                 number: 42,
                 title: "Test issue".to_string(),
                 labels: vec![
-                    LabelPayload { name: "bug".to_string() },
-                    LabelPayload { name: "urgent".to_string() },
+                    LabelPayload {
+                        name: "bug".to_string(),
+                    },
+                    LabelPayload {
+                        name: "urgent".to_string(),
+                    },
                 ],
             }),
             pr: None,
@@ -660,7 +660,11 @@ mod tests {
                 user: GhUser {
                     login: "testuser".to_string(),
                 },
-                created_at: Some(chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z").unwrap().with_timezone(&chrono::Utc)),
+                created_at: Some(
+                    chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
             }),
         };
 
