@@ -693,7 +693,9 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Telegram channel (long-poll implementation) — PR #81 merged
 - [x] Discord channel (polling implementation) — PR #81 merged
 - [x] Webhook HTTP server (axum) — PR #93 merged
-- [ ] Mention detection via webhooks (#112 — wire webhook into engine)
+- [x] Wire webhook server into engine — PR #123 merged
+- [ ] Mention detection via webhooks (#112)
+- [ ] Polling fallback when webhooks not configured (mentions, PR reviews, issue status)
 - [x] Wire channels into engine event loop — PR #81 merged
 
 ### Phase 4: CLI & User-Facing Commands
@@ -734,8 +736,13 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Update AGENTS.md with Rust engine docs
 - [x] Jobs config consolidated into `.orchestrator.yml` (no separate `jobs.yml`)
 - [x] Cross-compile CI pipeline (macOS arm64 + x86_64) — PR #92 merged
-- [ ] Metrics / observability (tracing, prometheus) — PR #95 pending
-- [ ] Unified notification system (events → all channels) — #113
+- [x] Metrics / observability (tracing, prometheus) — PR #95 merged
+- [ ] Unified notification system (events → all channels) — PR #124 open
+- [x] Per-agent runner trait (AgentRunner, AgentError, per-agent parsers) — PR #116 merged
+- [ ] Agent memory (persist learnings across retries) — PR #122 open
+- [ ] PR review integration (parse review comments → follow-up tasks) — PR #125 open
+- [ ] Self-improvement loop (auto-create issues from metrics) — PR #120 open
+- [ ] Polling fallback for webhooks (mentions, PR reviews, issue status) — #TBD
 
 ---
 
@@ -776,8 +783,13 @@ src/
 │       ├── mod.rs           # TaskRunner — orchestrates full task lifecycle
 │       ├── context.rs       # Prompt context building (project instructions, repo tree, etc.)
 │       ├── worktree.rs      # Git worktree creation, branch naming, reuse
-│       ├── agent.rs         # Agent command building (Claude, Codex, OpenCode, Kimi, MiniMax)
-│       ├── response.rs      # Response collection + error classification (timeout, rate limit, auth)
+│       ├── agent.rs         # Agent invocation + prompt building
+│       ├── agents/
+│       │   ├── mod.rs       # AgentRunner trait, AgentError enum, PermissionRules, pattern detection
+│       │   ├── claude.rs    # Claude/Kimi/MiniMax runner (JSON envelope parser)
+│       │   ├── codex.rs     # Codex runner (NDJSON stream parser)
+│       │   └── opencode.rs  # OpenCode runner (NDJSON parser + free model discovery)
+│       ├── response.rs      # Failover logic, cooldowns, weight signals
 │       └── git_ops.rs       # Auto-commit, push, PR creation, PR override detection
 │
 ├── github/
@@ -941,6 +953,6 @@ The binary rename (`orch-core` → `orch`) is complete. Directory rename (`~/.or
 | `dirs` | XDG directory helpers | In use |
 | `async-trait` | Async trait support | In use |
 | `urlencoding` | URL encoding for labels | In use |
-| `axum` | Webhook HTTP server | Future (Phase 3) |
+| `axum` | Webhook HTTP server | In use |
 | `teloxide` | Telegram bot | Future (Phase 3) |
 | `serenity` | Discord bot | Future (Phase 3) |

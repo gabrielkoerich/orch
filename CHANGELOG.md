@@ -1,5 +1,65 @@
 # Changelog
 
+## 2026-02-26 — Per-Agent Runners, Error Mapping & PR Maintenance
+
+### Summary
+
+Implemented the AgentRunner trait system for per-agent output parsing and error classification,
+enabling autonomous failover when agents fail. Also rebased, fixed, and pushed all 4 open PRs.
+
+### Features
+
+- **Per-agent runner trait** (#116): Each agent (Claude, Codex, OpenCode) now has its own parser:
+  - `AgentRunner` trait with `build_command()`, `parse_response()`, `classify_error()`
+  - `AgentError` enum (11 variants) for granular error classification
+  - Claude runner: JSON envelope parser, extracts usage/permission_denials
+  - Codex runner: NDJSON stream parser, detects turn.failed/error events
+  - OpenCode runner: NDJSON parser, step_finish tokens, free model discovery
+- **Unified PermissionRules**: Each agent translates to its native CLI flags
+  - Claude: `--permission-mode bypassPermissions`, `--disallowedTools`
+  - Codex: `--ask-for-approval never`, `--sandbox workspace-write`
+  - OpenCode: worktree-level isolation (no native permission flags)
+- **Model-level cooldowns**: 1-hour ban on agent+model combos that fail
+- **Free model last resort**: When all agents exhausted, try OpenCode free models
+- **Explicit git workflow in agent prompts**: Agents now instructed to commit, push, create PR
+- **UTF-8-safe string truncation** in all error messages
+
+### Bug Fixes (from PR review)
+
+- Fixed async DB call without `.await` in `handle_failover()` — future was never polled
+- Fixed metrics outcome: rerouted tasks no longer counted as "success"
+- Fixed `sidecar::set` errors silently swallowed — now logged
+- Removed dead `RetryableError` methods with inverted `is_exhausted` logic
+- Skipped cooldown for `MissingTooling` errors (permanent, not transient)
+- Fixed HashSet rebuilt per iteration in exhaustion check
+
+### PR Fixes (from review comments on PR #120)
+
+- Fixed rate limiting counter that never reset — now uses week-scoped keys
+- Removed unused `_failed_tasks` DB query
+- Removed dead `get_agent_complexity_performance_7d()` and `AgentComplexityStat`
+- Added logging for silently dropped DB row parse failures
+- Removed redundant `should_issue` parameter from detection functions
+- Added issue deduplication via `has_open_issue_with_title()`
+
+### PRs Rebased & Fixed (4 in session)
+
+| PR | Title | Fixes Applied |
+|----|-------|--------------|
+| #125 | PR review integration | `cargo fmt`, clippy warnings |
+| #124 | Unified notification system | `cargo fmt`, merge conflict resolution, missing `transport` arg |
+| #122 | Agent memory across retries | `cargo fmt`, merge conflict in runner error handling |
+| #120 | Self-improvement loop | `cargo fmt`, rate limit counter, dead code, dedup, review fixes |
+
+### Tests
+
+- **206+ tests** passing across all branches
+- Added fixture-based tests for all 3 agent parsers (Claude, Codex, OpenCode)
+- Test fixtures in `tests/fixtures/` with real agent output samples
+- Zero `cargo clippy` warnings, clean `cargo fmt`
+
+---
+
 ## 2026-02-25 / 2026-02-26 — Major Milestone: Full Rust Rewrite Complete
 
 ### Summary
