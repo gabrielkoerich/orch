@@ -46,7 +46,7 @@ Orchestrator is an autonomous task management system that delegates work to AI c
 | **Engine** | `src/engine/mod.rs` | Main async event loop (10s tick + 120s sync) |
 | **Router** | `src/engine/router.rs` | LLM-based agent selection + complexity |
 | **Task Manager** | `src/engine/tasks.rs` | Unified internal + external task CRUD |
-| **Runner** | `src/engine/runner.rs` | Agent invocation, worktree, git, PR creation |
+| **Runner** | `src/engine/runner/` | Agent invocation, worktree, git, PR creation (5 sub-modules) |
 | **GitHub Backend** | `src/backends/github.rs` | GitHub Issues via `gh api` |
 | **Job Scheduler** | `src/engine/jobs.rs` | Cron-like scheduled tasks |
 | **Capture Service** | `src/channels/capture.rs` | tmux output streaming |
@@ -60,7 +60,7 @@ Tasks are stored in **GitHub Issues** (external) or **SQLite** (internal). A plu
 - **Status** → prefixed labels (`status:new`, `status:in_progress`, etc.)
 - **Agent/Complexity** → prefixed labels (`agent:claude`, `complexity:medium`)
 - **History/Response** → structured issue comments with `<!-- orch:* -->` markers
-- **Ephemeral fields** (branch, worktree, attempts) → local sidecar JSON (`~/.orchestrator/.orchestrator/{id}.json`)
+- **Ephemeral fields** (branch, worktree, attempts) → local sidecar JSON (`~/.orchestrator/state/{id}.json`)
 
 ### Key Design Decisions
 
@@ -311,28 +311,38 @@ gh:
 | File | Purpose |
 |------|---------|
 | `Cargo.toml` | Rust dependencies |
-| `src/main.rs` | CLI entrypoint (clap) |
-| `src/config.rs` | Config loading (config.yml + .orchestrator.yml) |
-| `src/db.rs` | SQLite for internal tasks |
-| `src/sidecar.rs` | JSON sidecar I/O |
+| `src/main.rs` | CLI entrypoint (clap) + subcommand dispatch |
+| `src/config/mod.rs` | Config loading (.orchestrator.yml + config.yml), hot-reload |
+| `src/db.rs` | SQLite for internal tasks (schema + migrations) |
+| `src/sidecar.rs` | JSON sidecar I/O + state directory helpers |
 | `src/parser.rs` | Agent response normalization |
 | `src/cron.rs` | Native cron matching |
 | `src/template.rs` | Template rendering |
-| `src/tmux.rs` | tmux session management |
-| `src/backends/mod.rs` | ExternalBackend trait |
-| `src/backends/github.rs` | GitHub Issues implementation |
+| `src/tmux.rs` | TmuxManager (session create/kill/list/capture) |
+| `src/security.rs` | Secret scanning + redaction |
+| `src/backends/mod.rs` | ExternalBackend trait, Status, ExternalTask |
+| `src/backends/github.rs` | GitHub Issues implementation (via `gh api`) |
 | `src/channels/mod.rs` | Channel trait + registry |
 | `src/channels/transport.rs` | Broadcast transport layer |
-| `src/channels/capture.rs` | tmux output capture |
+| `src/channels/capture.rs` | tmux output capture + diffing |
 | `src/channels/tmux.rs` | tmux channel |
-| `src/engine/mod.rs` | Main engine loop |
-| `src/engine/tasks.rs` | Task manager |
-| `src/engine/router.rs` | Agent router |
-| `src/engine/runner.rs` | Task runner |
-| `src/engine/jobs.rs` | Job scheduler |
-| `src/cli/mod.rs` | CLI utilities |
-| `src/cli/task.rs` | Task commands |
-| `src/cli/job.rs` | Job commands |
-| `src/cli/service.rs` | Service commands |
+| `src/engine/mod.rs` | Main engine loop (10s tick + 120s sync) |
+| `src/engine/tasks.rs` | TaskManager (unified internal + external) |
+| `src/engine/internal_tasks.rs` | Internal task SQLite operations |
+| `src/engine/router.rs` | Agent router (label, round-robin, LLM, circuit breaker) |
+| `src/engine/runner/mod.rs` | TaskRunner — orchestrates full task lifecycle |
+| `src/engine/runner/context.rs` | Prompt context building |
+| `src/engine/runner/worktree.rs` | Git worktree creation + branch naming |
+| `src/engine/runner/agent.rs` | Agent command building (Claude, Codex, OpenCode, Kimi, MiniMax) |
+| `src/engine/runner/response.rs` | Response collection + error classification |
+| `src/engine/runner/git_ops.rs` | Auto-commit, push, PR creation |
+| `src/engine/jobs.rs` | Job scheduler (reads from .orchestrator.yml) |
+| `src/github/mod.rs` | GitHub helpers |
+| `src/github/cli.rs` | `gh api` wrapper (structured args in, serde out) |
+| `src/github/types.rs` | GitHubIssue, GitHubComment, GitHubLabel types |
+| `src/cli/mod.rs` | CLI utilities (agents, init, log, version) |
+| `src/cli/task.rs` | Task subcommand handlers |
+| `src/cli/job.rs` | Job subcommand handlers |
+| `src/cli/service.rs` | Service management (start/stop/restart/status) |
 | `prompts/*.md` | Prompt templates |
 | `.github/workflows/release.yml` | CI/CD pipeline |

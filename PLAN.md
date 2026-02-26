@@ -63,8 +63,7 @@ graph TB
     subgraph "Data Storage"
         ISSUES["GitHub Issues<br/>(source of truth)"]
         SIDECAR["Sidecar JSON<br/>.orchestrator/tasks/*.json"]
-        CONFIG["config.yml<br/>+ .orchestrator.yml"]
-        JOBSFILE["jobs.yml"]
+        CONFIG["config.yml<br/>+ .orchestrator.yml<br/>(includes jobs)"]
     end
 
     BREW --> SERVE
@@ -93,7 +92,6 @@ graph TB
     GH --> ISSUES
     RUN --> SIDECAR
     YQ --> CONFIG
-    YQ --> JOBSFILE
 ```
 
 ### Current Process Flow Per Tick
@@ -209,24 +207,26 @@ graph TB
         CLI_CH["CLI / HTTP<br/>(local API)"]
     end
 
-    subgraph "orch-core (Rust binary, Tokio)"
+    subgraph "orch (Rust binary, Tokio)"
         TRANSPORT["Transport Layer<br/>routes messages ↔ sessions<br/>broadcasts output"]
 
         subgraph "Engine"
             TASKS["Task Manager<br/>internal + GitHub"]
             ROUTER["Router<br/>agent selection"]
             SCHEDULER["Cron Scheduler<br/>minute-precision"]
-            RUNNER["Task Runner<br/>spawns bash scripts"]
+            RUNNER["Task Runner<br/>Rust native"]
         end
 
-        HTTP["HTTP Client<br/>reqwest + connection pool"]
+        subgraph "Runner Modules"
+            CTX["context.rs<br/>prompt building"]
+            WT["worktree.rs<br/>git worktree mgmt"]
+            AGT["agent.rs<br/>agent invocation"]
+            RESP["response.rs<br/>error classification"]
+            GITOPS["git_ops.rs<br/>commit, push, PR"]
+        end
+
         CONFIG_RS["Config<br/>in-memory, hot-reload"]
         SQLITE["SQLite<br/>internal tasks + state"]
-    end
-
-    subgraph "Bash Scripts (kept)"
-        RUN_SH["run_task.sh<br/>agent invocation"]
-        GIT_OPS["git operations<br/>worktree, push, PR"]
     end
 
     subgraph "Agent CLIs (unchanged)"
@@ -244,7 +244,7 @@ graph TB
     subgraph "Data"
         GH_ISSUES["GitHub Issues<br/>(external tasks)"]
         LOCAL_DB["SQLite<br/>(internal tasks)"]
-        YAML["config.yml<br/>jobs.yml"]
+        YAML[".orchestrator.yml<br/>+ config.yml"]
         SIDE["Sidecar JSON<br/>(ephemeral state)"]
     end
 
@@ -263,16 +263,18 @@ graph TB
     TASKS --> SCHEDULER
     TASKS --> RUNNER
 
-    RUNNER --> RUN_SH
-    RUN_SH --> GIT_OPS
-    RUN_SH --> T1
-    RUN_SH --> T2
+    RUNNER --> CTX
+    RUNNER --> WT
+    RUNNER --> AGT
+    RUNNER --> RESP
+    RUNNER --> GITOPS
+    AGT --> T1
+    AGT --> T2
 
     T1 --> CL
     T2 --> CO
     T3 --> OC
 
-    HTTP --> GH_ISSUES
     SQLITE --> LOCAL_DB
     CONFIG_RS --> YAML
     RUNNER --> SIDE
@@ -330,37 +332,44 @@ In v1, the tmux bridge changes this completely:
 
 ## What Stays in Bash
 
-| Component | Why |
-|-----------|-----|
-| `run_task.sh` | Agent invocation (claude/codex/opencode CLI flags, environment setup, tmux session creation) |
-| Git operations | `git worktree add/remove`, `git push`, `git branch` — complex CLI interactions |
-| `gh pr create/merge` | PR creation with body templates, auto-merge flags |
-| Agent-specific flags | `claude --permission-mode bypassPermissions`, `codex --sandbox workspace-write`, etc. |
-| `justfile` | User-facing task runner, remains the CLI entry point |
-| Prompt templates | Markdown files in `prompts/`, rendered by the engine |
-| `config.yml`, `jobs.yml` | YAML config stays human-editable, read by Rust |
+> **Update (v1):** Almost everything originally planned to stay in bash has been ported to Rust.
+> The only remaining bash dependency is the shell scripts generated at runtime for tmux sessions
+> (agents need a real terminal environment).
 
-**Principle:** Bash stays for what it does well — gluing CLIs together, managing tmux, git workflows. Rust takes over everything that involves data, HTTP, concurrency, or long-running state.
+| Component | Status | Notes |
+|-----------|--------|-------|
+| ~~`run_task.sh`~~ | **Ported to Rust** | `src/engine/runner/` — context, worktree, agent, response, git_ops |
+| ~~Git operations~~ | **Ported to Rust** | `src/engine/runner/git_ops.rs` — auto-commit, push, PR creation via `tokio::process::Command` |
+| ~~`gh pr create/merge`~~ | **Ported to Rust** | `git_ops::create_pr_if_needed()` via `gh` CLI subprocess |
+| Agent invocation | **Hybrid** | Rust builds the command, generates a runner script, tmux executes it |
+| ~~`justfile`~~ | **Deleted** | All recipes ported to native `orch` CLI subcommands |
+| Prompt templates | **Unchanged** | Markdown files in `prompts/`, rendered by Rust `template.rs` |
+| Config | **Consolidated** | Single `.orchestrator.yml` per project + `~/.orchestrator/config.yml` global |
+
+**Principle:** Rust owns the entire lifecycle. The only bash left is the thin runner scripts that tmux executes (agents need a real TTY). All orchestration logic, git operations, and API calls are native Rust.
 
 ---
 
 ## What Moves to Rust
 
-| Component | Currently | Moves To | Benefit |
-|-----------|-----------|----------|---------|
-| Service loop | `serve.sh` (sleep 10s) | Tokio event loop | Instant reaction, async I/O |
-| Task polling | `poll.sh` (5x gh CLI calls) | Direct HTTP + in-memory state | ~750ms → ~50ms per tick |
-| Config loading | `yq` subprocess per read | In-memory struct, hot-reload | ~10 forks eliminated |
-| Cron matching | `python3 cron_match.py` | Native `cron` crate | ~8 forks eliminated |
-| JSON parsing | `jq` subprocesses | `serde_json` | ~15 forks eliminated |
-| Response normalization | `python3 normalize_json.py` | Native parser | 1 fork eliminated |
-| GitHub API calls | `gh` CLI + `jq` parsing | `gh` CLI + `serde` parsing | No jq forks, typed responses |
-| Mention detection | `gh_mentions.sh` (polling) | Webhook events (instant) | No polling needed |
-| PR review trigger | `review_prs.sh` (polling) | Webhook on PR open | Instant review |
-| Rate limit backoff | File-based state | In-memory with retry queue | Smarter backoff |
-| Sidecar I/O | `jq` read/write | Direct file I/O | No subprocess |
-| Template rendering | `python3 render_template()` | Rust `tera` or `handlebars` | 1 fork eliminated |
-| Internal task DB | Not supported | `rusqlite` (embedded SQLite) | Local tasks without GitHub |
+| Component | v0 (bash) | v1 (Rust) | Status |
+|-----------|-----------|-----------|--------|
+| Service loop | `serve.sh` (sleep 10s) | Tokio event loop | **Done** |
+| Task polling | `poll.sh` (5x gh CLI calls) | `gh api` + `serde` parsing | **Done** |
+| Config loading | `yq` subprocess per read | In-memory struct, hot-reload | **Done** |
+| Cron matching | `python3 cron_match.py` | Native `cron` crate | **Done** |
+| JSON parsing | `jq` subprocesses | `serde_json` | **Done** |
+| Response normalization | `python3 normalize_json.py` | Native parser | **Done** |
+| GitHub API calls | `gh` CLI + `jq` parsing | `gh` CLI + `serde` parsing | **Done** |
+| Task execution | `run_task.sh` (bash) | `src/engine/runner/` (Rust) | **Done** |
+| Git operations | bash `git` + `gh pr` | `runner/git_ops.rs` | **Done** |
+| Agent invocation | bash script | `runner/agent.rs` | **Done** |
+| Mention detection | `gh_mentions.sh` (polling) | Rust polling (webhook future) | **Done** (polling) |
+| PR review trigger | `review_prs.sh` (polling) | Rust polling (webhook future) | **Done** (polling) |
+| Sidecar I/O | `jq` read/write | Direct file I/O | **Done** |
+| Template rendering | `python3 render_template()` | Native Rust | **Done** |
+| Internal task DB | Not supported | `rusqlite` (embedded SQLite) | **Done** |
+| CLI entry point | `justfile` (34+ recipes) | Native `clap` subcommands | **Done** |
 
 ### Total Subprocess Savings
 
@@ -734,41 +743,55 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 
 ```
 src/
-├── main.rs                  # CLI entrypoint (clap)
-├── config.rs                # Config loading (config.yml + .orchestrator.yml)
+├── main.rs                  # CLI entrypoint (clap) + all subcommand dispatch
+├── config/
+│   └── mod.rs               # Config loading (.orchestrator.yml + ~/.orchestrator/config.yml)
+│
+├── cli/
+│   ├── mod.rs               # CLI utilities (agents, init, log, version)
+│   ├── task.rs              # Task subcommand handlers
+│   ├── job.rs               # Job subcommand handlers
+│   └── service.rs           # Service management (start/stop/restart/status)
 │
 ├── backends/
-│   ├── mod.rs               # ExternalBackend trait, ExternalTask, ExternalId
-│   ├── github.rs            # GitHub Issues implementation
-│   ├── linear.rs            # Linear implementation (future)
-│   └── jira.rs              # Jira implementation (future)
+│   ├── mod.rs               # ExternalBackend trait, ExternalTask, ExternalId, Status
+│   └── github.rs            # GitHub Issues implementation (via `gh api`)
 │
 ├── channels/
 │   ├── mod.rs               # Channel trait, IncomingMessage, OutgoingMessage
 │   ├── transport.rs         # Session bindings, routing, output broadcast
-│   ├── github.rs            # GitHub App: webhooks + REST API
-│   ├── telegram.rs          # Telegram Bot API
-│   ├── discord.rs           # Discord gateway websocket
-│   └── tmux.rs              # tmux capture-pane / send-keys bridge
+│   ├── capture.rs           # tmux output capture + diffing service
+│   ├── tmux.rs              # tmux channel (pane monitoring)
+│   ├── github.rs            # GitHub App: webhooks (stub)
+│   ├── telegram.rs          # Telegram Bot API (stub)
+│   └── discord.rs           # Discord gateway websocket (stub)
 │
 ├── engine/
-│   ├── mod.rs               # Engine struct, main event loop
-│   ├── tasks.rs             # Task CRUD (dispatches to backend or SQLite)
-│   ├── router.rs            # Agent routing (round-robin, LLM, weighted)
-│   ├── runner.rs            # Spawns run_task.sh, monitors tmux
-│   ├── jobs.rs              # Cron scheduler (minute-precision)
-│   └── mentions.rs          # @mention via webhook events
+│   ├── mod.rs               # Engine struct, main async event loop (10s tick + 120s sync)
+│   ├── tasks.rs             # TaskManager — unified internal + external CRUD
+│   ├── internal_tasks.rs    # Internal task SQLite operations
+│   ├── router.rs            # Agent routing (label, round-robin, LLM, circuit breaker)
+│   ├── jobs.rs              # Cron scheduler (reads from .orchestrator.yml)
+│   └── runner/
+│       ├── mod.rs           # TaskRunner — orchestrates full task lifecycle
+│       ├── context.rs       # Prompt context building (project instructions, repo tree, etc.)
+│       ├── worktree.rs      # Git worktree creation, branch naming, reuse
+│       ├── agent.rs         # Agent command building (Claude, Codex, OpenCode, Kimi, MiniMax)
+│       ├── response.rs      # Response collection + error classification (timeout, rate limit, auth)
+│       └── git_ops.rs       # Auto-commit, push, PR creation, PR override detection
 │
 ├── github/
 │   ├── mod.rs               # GitHub helpers (shared by backend + channel)
 │   ├── cli.rs               # `gh api` wrapper — structured args in, serde out
-│   ├── types.rs             # GitHubIssue, GitHubComment, GitHubLabel, etc.
-│   └── webhooks.rs          # Webhook HTTP server (axum, optional)
+│   └── types.rs             # GitHubIssue, GitHubComment, GitHubLabel, etc.
 │
-├── db.rs                    # SQLite for internal tasks + job state
+├── db.rs                    # SQLite for internal tasks (schema + migrations)
 ├── sidecar.rs               # JSON sidecar file I/O
-├── parser.rs                # Agent response normalization
-└── cron.rs                  # Cron expression matching
+├── parser.rs                # Agent response normalization (JSON → AgentResponse)
+├── template.rs              # Template rendering (env var substitution)
+├── tmux.rs                  # TmuxManager (session create/kill/list/capture)
+├── security.rs              # Secret scanning + redaction
+└── cron.rs                  # Native cron expression matching
 ```
 
 ---
@@ -784,11 +807,11 @@ Telegram msg: "add a login page with OAuth"
   → Engine.create_task(title, body, type=github)
   → GitHub Issues API: POST /repos/owner/repo/issues
   → Engine.route_task() → agent=claude, complexity=medium
-  → Engine.run_task() → bash run_task.sh (tmux session orch-42)
+  → Engine.run_with_context() → Rust runner (worktree → agent → tmux session orch-42)
   → Transport.bind("42", "orch-42", "telegram", chat_id)
   → tmux bridge captures output → Transport.push_output()
   → Telegram channel streams output to chat
-  → Agent finishes → Engine stores result → all channels notified
+  → Agent finishes → runner posts result comment → all channels notified
 ```
 
 ### User replies to agent in Discord
@@ -809,7 +832,7 @@ Discord msg in task thread: "use shadcn instead of material ui"
 Scheduler: job "morning-review" matches 08:00 UTC
   → Engine.create_task(title, body, type=internal)  ← SQLite, not GitHub
   → Engine.route_task() → agent=claude
-  → Engine.run_task() → bash run_task.sh (tmux session orch-int-5)
+  → Engine.run_with_context() → Rust runner (worktree → agent → tmux session orch-int-5)
   → No branch, no PR, no GitHub issue
   → Agent finishes → result stored in SQLite
   → Summary posted to Telegram (if configured)
@@ -830,7 +853,7 @@ GitHub webhook: issues.opened
 
 ## Brew Upgrade Path
 
-### Formula Structure (v1)
+### Formula Structure (current)
 
 ```ruby
 class Orch < Formula
@@ -839,20 +862,17 @@ class Orch < Formula
 
   # Prebuilt Rust binary (cross-compiled in CI)
   if Hardware::CPU.arm?
-    url "https://github.com/.../orch-core-aarch64-apple-darwin.tar.gz"
+    url "https://github.com/.../orch-aarch64-apple-darwin.tar.gz"
   else
-    url "https://github.com/.../orch-core-x86_64-apple-darwin.tar.gz"
+    url "https://github.com/.../orch-x86_64-apple-darwin.tar.gz"
   end
 
-  depends_on "jq"       # still needed for bash scripts
-  depends_on "yq"       # config reads (until Phase 2)
+  # No jq/yq/python3 dependencies — everything is native Rust
+  depends_on "gh"  # GitHub CLI for API calls
 
   def install
-    bin.install "orch-core"
-    libexec.install Dir["scripts/*"]
+    bin.install "orch"
     libexec.install Dir["prompts/*"]
-    libexec.install "justfile"
-    bin.install "bin/orch"  # wrapper (delegates to just or orch-core)
   end
 
   service do
@@ -868,18 +888,18 @@ end
 
 ```
 push to main
-  → CI: cargo test + bats test
+  → CI: cargo test + cargo clippy + cargo fmt --check
   → CI: cargo build --release (macOS arm64 + x86_64)
   → CI: create universal binary (lipo)
   → CI: auto-tag (semver from conventional commits)
-  → CI: GitHub release with orch-core binary + scripts tarball
+  → CI: GitHub release with orch binary + prompts tarball
   → CI: update homebrew-tap formula
   → brew upgrade orch
 ```
 
 ### Rollback
 
-If v1 has issues: `brew switch orch 0.x.y`. Bash scripts are self-contained. The wrapper detects if `orch-core` is missing and falls back to bash-only mode.
+If a release has issues: `brew switch orch 0.x.y`. The binary is self-contained — no external scripts required.
 
 ---
 
@@ -896,23 +916,31 @@ If v1 has issues: `brew switch orch 0.x.y`. Bash scripts are self-contained. The
 | `ORCH_HOME` | `ORCH_HOME` (unchanged) |
 | `.orchestrator.yml` | `.orch.yml` (with backward compat) |
 
-The rename happens in Phase 6 (Polish) — after the Rust core is stable. During development, both names work.
+The binary rename (`orch-core` → `orch`) is complete. Directory rename (`~/.orchestrator/` → `~/.orch/`) and config rename (`.orchestrator.yml` → `.orch.yml`) are in progress (Phase 5).
 
 ---
 
 ## Key Dependencies
 
-| Crate | Purpose | Phase |
-|-------|---------|-------|
-| `tokio` | Async runtime | 1 |
-| `serde` / `serde_json` / `serde_yaml` | Serialization | 1 |
-| `clap` | CLI parsing | 1 |
-| `chrono` | Timestamps | 1 |
-| `tracing` | Structured logging | 1 |
-| `anyhow` / `thiserror` | Error handling | 1 |
-| `sha2` | Hashing (dedup) | 1 |
-| `cron` | Cron expressions | 1 |
-| `rusqlite` | Internal task DB | 2 |
-| `axum` | Webhook HTTP server | 3 |
-| `teloxide` | Telegram bot | 4 |
-| `serenity` | Discord bot | 5 |
+| Crate | Purpose | Status |
+|-------|---------|--------|
+| `tokio` | Async runtime | In use |
+| `serde` / `serde_json` / `serde_yml` | Serialization | In use |
+| `clap` / `clap_complete` | CLI parsing + shell completions | In use |
+| `chrono` | Timestamps | In use |
+| `tracing` / `tracing-subscriber` | Structured logging | In use |
+| `anyhow` / `thiserror` | Error handling | In use |
+| `sha2` | Hashing (dedup) | In use |
+| `cron` | Cron expressions | In use |
+| `rusqlite` | Internal task SQLite DB | In use |
+| `reqwest` | HTTP client | In use |
+| `regex` | Secret/leak detection | In use |
+| `notify` | Config file watching | In use |
+| `which` | Agent CLI discovery | In use |
+| `futures` | Async combinators | In use |
+| `dirs` | XDG directory helpers | In use |
+| `async-trait` | Async trait support | In use |
+| `urlencoding` | URL encoding for labels | In use |
+| `axum` | Webhook HTTP server | Future (Phase 3) |
+| `teloxide` | Telegram bot | Future (Phase 3) |
+| `serenity` | Discord bot | Future (Phase 3) |
