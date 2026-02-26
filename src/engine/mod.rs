@@ -24,16 +24,27 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
 use crate::channels::ChannelRegistry;
+use crate::config;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::{get_route_result, Router};
 use crate::engine::tasks::TaskManager;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
-use anyhow::Context;
 use runner::TaskRunner;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
+
+/// Per-project engine state.
+///
+/// Each project has its own backend, task runner, and task manager,
+/// but they share the global tmux manager, transport, and semaphore.
+pub struct ProjectEngine {
+    pub repo: String,
+    pub backend: Arc<dyn ExternalBackend>,
+    pub task_manager: Arc<TaskManager>,
+    pub runner: Arc<TaskRunner>,
+}
 
 /// Engine configuration.
 pub struct EngineConfig {
@@ -58,6 +69,54 @@ impl Default for EngineConfig {
     }
 }
 
+/// Initialize all project engines from config.
+///
+/// Returns a vector of ProjectEngine, one for each configured project.
+async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
+    let repos = config::get_projects()?;
+    tracing::info!(repos = ?repos, "loading projects from config");
+
+    let mut engines = Vec::new();
+
+    for repo in repos {
+        tracing::info!(repo = %repo, "initializing project engine");
+
+        // Initialize backend
+        let backend: Arc<dyn ExternalBackend> =
+            Arc::new(crate::backends::github::GitHubBackend::new(repo.clone()));
+
+        // Health check
+        if let Err(e) = backend.health_check().await {
+            tracing::warn!(repo = %repo, ?e, "backend health check failed, skipping project");
+            continue;
+        }
+        tracing::info!(repo = %repo, backend = backend.name(), "backend connected");
+
+        // Initialize task manager
+        // Note: we need a shared db, so we'll add that after initialization
+        let task_manager = Arc::new(TaskManager::new(
+            Arc::new(Db::open(&crate::db::default_path()?)?),
+            backend.clone(),
+        ));
+
+        // Task runner
+        let runner = Arc::new(TaskRunner::new(repo.clone()));
+
+        engines.push(ProjectEngine {
+            repo,
+            backend,
+            task_manager,
+            runner,
+        });
+    }
+
+    if engines.is_empty() {
+        anyhow::bail!("no valid projects configured");
+    }
+
+    Ok(engines)
+}
+
 /// Start the orchestrator service.
 ///
 /// This is the main entry point — called by `orch serve`.
@@ -66,28 +125,31 @@ pub async fn serve() -> anyhow::Result<()> {
 
     let config = EngineConfig::default();
 
-    // Load config — repo is required
-    let repo = crate::config::get("repo").context(
-        "'repo' not set in config — run `orch init` or set repo in ~/.orchestrator/config.yml",
-    )?;
-
-    // Initialize backend
-    let backend: Arc<dyn ExternalBackend> =
-        Arc::new(crate::backends::github::GitHubBackend::new(repo.clone()));
-
-    // Health check
-    backend.health_check().await?;
-    tracing::info!(backend = backend.name(), "backend connected");
-
-    // Initialize internal database
+    // Initialize internal database (shared across all projects)
     let db = Arc::new(Db::open(&crate::db::default_path()?)?);
     db.migrate().await?;
     tracing::info!("internal database ready");
 
-    // Initialize task manager
-    let task_manager = Arc::new(TaskManager::new(db.clone(), backend.clone()));
+    // Initialize project engines
+    let mut project_engines = init_project_engines().await?;
 
-    // Initialize tmux manager
+    if project_engines.is_empty() {
+        anyhow::bail!(
+            "no valid projects configured — run `orch init` or add repos to ~/.orchestrator/config.yml"
+        );
+    }
+
+    tracing::info!(
+        project_count = project_engines.len(),
+        "initialized project engines"
+    );
+
+    // Re-create task managers with shared db
+    for engine in &mut project_engines {
+        engine.task_manager = Arc::new(TaskManager::new(db.clone(), engine.backend.clone()));
+    }
+
+    // Initialize tmux manager (shared across all projects)
     let tmux = Arc::new(TmuxManager::new());
 
     // Initialize transport
@@ -103,10 +165,7 @@ pub async fn serve() -> anyhow::Result<()> {
     // Initialize channel registry
     let _channels = ChannelRegistry::new();
 
-    // Task runner
-    let runner = Arc::new(TaskRunner::new(repo.clone()));
-
-    // Agent router (selects agent + model per task)
+    // Agent router (selects agent + model per task) - shared across projects
     let router = Arc::new(Router::from_config());
     tracing::info!(
         mode = %router.config.mode,
@@ -118,7 +177,7 @@ pub async fn serve() -> anyhow::Result<()> {
     // Jobs config path (from .orchestrator.yml or global config)
     let jobs_path = jobs::resolve_jobs_path();
 
-    // Concurrency limiter
+    // Concurrency limiter (shared across all projects)
     let semaphore = Arc::new(Semaphore::new(config.max_parallel));
 
     // Track sync interval
@@ -139,26 +198,30 @@ pub async fn serve() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                // Core tick: poll tasks, check sessions
-                if let Err(e) = tick(
-                    &backend,
-                    &tmux,
-                    &runner,
-                    &capture_for_tick,
-                    &semaphore,
-                    &config,
-                    &jobs_path,
-                    &db,
-                    &router,
-                    &task_manager,
-                ).await {
-                    tracing::error!(?e, "tick failed");
+                // Core tick: poll tasks for all projects
+                for engine in &project_engines {
+                    if let Err(e) = tick(
+                        &engine.backend,
+                        &tmux,
+                        &engine.runner,
+                        &capture_for_tick,
+                        &semaphore,
+                        &config,
+                        &jobs_path,
+                        &db,
+                        &router,
+                        &engine.task_manager,
+                    ).await {
+                        tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
+                    }
                 }
 
                 // Periodic sync (less frequent)
                 if last_sync.elapsed() >= config.sync_interval {
-                    if let Err(e) = sync_tick(&backend, &tmux, &repo, &db).await {
-                        tracing::error!(?e, "sync tick failed");
+                    for engine in &project_engines {
+                        if let Err(e) = sync_tick(&engine.backend, &tmux, &engine.repo, &db).await {
+                            tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
+                        }
                     }
                     last_sync = std::time::Instant::now();
                 }
