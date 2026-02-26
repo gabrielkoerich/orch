@@ -106,6 +106,14 @@ webhook:
   port: 8080
   secret: "${WEBHOOK_SECRET}"
 
+# Task completion notifications — broadcast to all configured channels.
+# Level controls which events are sent:
+#   all         — every task completion (default)
+#   errors_only — only failures (needs_review, blocked, failed)
+#   none        — disable notifications
+notifications:
+  level: "all"
+
 # External notification channels
 channels:
   telegram:

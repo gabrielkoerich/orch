@@ -180,3 +180,109 @@ pub enum MessageRoute {
     /// Message is new — should create a task
     NewTask,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn push_notification_reaches_subscriber() {
+        let transport = Transport::new();
+        let mut rx = transport.subscribe_notifications();
+
+        let notification = TaskNotification {
+            task_id: "42".to_string(),
+            title: "Test task".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 60.0,
+            summary: "Completed successfully".to_string(),
+        };
+
+        transport.push_notification(notification.clone());
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received.task_id, "42");
+        assert_eq!(received.status, "done");
+        assert_eq!(received.agent, "claude");
+        assert_eq!(received.summary, "Completed successfully");
+    }
+
+    #[tokio::test]
+    async fn push_notification_multiple_subscribers() {
+        let transport = Transport::new();
+        let mut rx1 = transport.subscribe_notifications();
+        let mut rx2 = transport.subscribe_notifications();
+
+        transport.push_notification(TaskNotification {
+            task_id: "1".to_string(),
+            title: "Task".to_string(),
+            status: "done".to_string(),
+            agent: "codex".to_string(),
+            duration_seconds: 10.0,
+            summary: "Done".to_string(),
+        });
+
+        let n1 = rx1.recv().await.unwrap();
+        let n2 = rx2.recv().await.unwrap();
+        assert_eq!(n1.task_id, "1");
+        assert_eq!(n2.task_id, "1");
+    }
+
+    #[test]
+    fn push_notification_no_subscribers_does_not_panic() {
+        let transport = Transport::new();
+        // No subscribers — should not panic
+        transport.push_notification(TaskNotification {
+            task_id: "1".to_string(),
+            title: "Task".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 0.0,
+            summary: "Done".to_string(),
+        });
+    }
+
+    #[tokio::test]
+    async fn bind_and_route_to_session() {
+        let transport = Transport::new();
+        transport
+            .bind("42", "orch-42", "telegram", "12345")
+            .await;
+
+        let msg = IncomingMessage {
+            channel: "telegram".to_string(),
+            id: "msg1".to_string(),
+            thread_id: "12345".to_string(),
+            author: "user".to_string(),
+            body: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+        };
+
+        match transport.route(&msg).await {
+            MessageRoute::TaskSession { task_id } => assert_eq!(task_id, "42"),
+            _ => panic!("expected TaskSession"),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_command() {
+        let transport = Transport::new();
+
+        let msg = IncomingMessage {
+            channel: "telegram".to_string(),
+            id: "msg1".to_string(),
+            thread_id: "99".to_string(),
+            author: "user".to_string(),
+            body: "/status".to_string(),
+            timestamp: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+        };
+
+        match transport.route(&msg).await {
+            MessageRoute::Command { raw } => assert_eq!(raw, "/status"),
+            _ => panic!("expected Command"),
+        }
+    }
+}
