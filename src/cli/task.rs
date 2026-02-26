@@ -437,7 +437,8 @@ pub fn cost(id: &str) -> anyhow::Result<()> {
 
     if usage.total_tokens() == 0 {
         println!("No token data available for task #{}", id);
-        return Ok(println!("Run the task first to collect token usage."));
+        println!("Run the task first to collect token usage.");
+        return Ok(());
     }
 
     println!("Token usage for task #{}", id);
