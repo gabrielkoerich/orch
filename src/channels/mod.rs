@@ -13,6 +13,7 @@
 pub mod capture;
 pub mod discord;
 pub mod github;
+pub mod notification;
 pub mod telegram;
 pub mod tmux;
 pub mod transport;
