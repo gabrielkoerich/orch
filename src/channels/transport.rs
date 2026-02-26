@@ -26,6 +26,7 @@
 //!                  │ Broadcast │  ← fans out output to all connected channels
 //!                  └───────────┘
 
+use super::notification::TaskNotification;
 use super::{IncomingMessage, OutputChunk};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,14 +54,18 @@ pub struct Transport {
     thread_to_task: Arc<RwLock<HashMap<String, String>>>,
     /// The main chat session (for direct orchestrator commands)
     main_session: Arc<Mutex<Option<String>>>,
+    /// Broadcast sender for task completion notifications
+    notification_tx: broadcast::Sender<TaskNotification>,
 }
 
 impl Transport {
     pub fn new() -> Self {
+        let (notification_tx, _) = broadcast::channel(64);
         Self {
             bindings: Arc::new(RwLock::new(HashMap::new())),
             thread_to_task: Arc::new(RwLock::new(HashMap::new())),
             main_session: Arc::new(Mutex::new(None)),
+            notification_tx,
         }
     }
 
@@ -151,6 +156,17 @@ impl Transport {
     /// List all active bindings.
     pub async fn active_sessions(&self) -> Vec<SessionBinding> {
         self.bindings.read().await.values().cloned().collect()
+    }
+
+    /// Push a task completion notification to all subscribers.
+    pub fn push_notification(&self, notification: TaskNotification) {
+        // Ignore send errors (no active receivers)
+        let _ = self.notification_tx.send(notification);
+    }
+
+    /// Subscribe to task completion notifications.
+    pub fn subscribe_notifications(&self) -> broadcast::Receiver<TaskNotification> {
+        self.notification_tx.subscribe()
     }
 }
 
