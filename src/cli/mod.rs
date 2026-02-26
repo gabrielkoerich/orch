@@ -192,6 +192,65 @@ pub fn agents() {
     }
 }
 
+/// Show task metrics summary.
+pub async fn metrics() -> anyhow::Result<()> {
+    use crate::db::Db;
+
+    let db = Db::open(&crate::db::default_path()?)?;
+    db.migrate().await?;
+
+    let summary = db.get_metrics_summary_24h().await?;
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!("║              Orch Metrics (Last 24 Hours)               ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+    println!();
+
+    // Task counts
+    println!(" Tasks:");
+    println!("   {:>6} completed", summary.tasks_completed_24h);
+    println!("   {:>6} failed", summary.tasks_failed_24h);
+    println!();
+
+    // Average duration by complexity
+    println!(" Average Duration by Complexity:");
+    if let Some(d) = summary.avg_duration_simple {
+        println!("   {:>6.1}s (simple)", d);
+    } else {
+        println!("   {:>6} (simple)", "-");
+    }
+    if let Some(d) = summary.avg_duration_medium {
+        println!("   {:>6.1}s (medium)", d);
+    } else {
+        println!("   {:>6} (medium)", "-");
+    }
+    if let Some(d) = summary.avg_duration_complex {
+        println!("   {:>6.1}s (complex)", d);
+    } else {
+        println!("   {:>6} (complex)", "-");
+    }
+    println!();
+
+    // Agent success rates
+    if !summary.agent_stats.is_empty() {
+        println!(" Agent Success Rates:");
+        for stat in &summary.agent_stats {
+            println!(
+                "   {:<12} {:>4} runs, {:>5.1}% success",
+                stat.agent, stat.total_runs, stat.success_rate
+            );
+        }
+        println!();
+    }
+
+    // Rate limits
+    println!(" Rate Limit Events: {:>6}", summary.rate_limits_24h);
+    println!();
+
+    Ok(())
+}
+
 /// Stream live output from a running task.
 pub async fn stream_task(task_id: &str) -> anyhow::Result<()> {
     let transport = Arc::new(Transport::new());

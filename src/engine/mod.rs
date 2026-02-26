@@ -129,14 +129,15 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         }
         tracing::info!(repo = %repo, backend = backend.name(), "backend connected");
 
-        // Initialize task manager (placeholder db, will be replaced with shared db)
-        let task_manager = Arc::new(TaskManager::new(
-            Arc::new(Db::open(&crate::db::default_path()?)?),
-            backend.clone(),
-        ));
+        // Initialize database (shared between task manager and runner for metrics)
+        let db = Arc::new(Db::open(&crate::db::default_path()?)?);
+        db.migrate().await?;
 
-        // Task runner
-        let runner = Arc::new(TaskRunner::new(repo.clone()));
+        // Initialize task manager
+        let task_manager = Arc::new(TaskManager::new(db.clone(), backend.clone()));
+
+        // Task runner (with db for metrics)
+        let runner = Arc::new(TaskRunner::new(repo.clone()).with_db(db.clone()));
 
         engines.push(ProjectEngine {
             repo,
@@ -498,7 +499,10 @@ async fn tick(
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
 ) -> anyhow::Result<()> {
+    let _tick_span = tracing::info_span!("engine.tick").entered();
+
     // Phase 1: Check active tmux sessions for completions
+    let _phase1 = tracing::info_span!("engine.tick.phase1.sessions").entered();
     let session_snapshot = tmux.snapshot().await;
     for (task_id, active) in &session_snapshot {
         if !active {
@@ -517,8 +521,10 @@ async fn tick(
             }
         }
     }
+    drop(_phase1);
 
     // Phase 2: Recover stuck tasks
+    let _phase2 = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
     let in_progress = task_manager
         .list_external_by_status(Status::InProgress)
         .await?;
@@ -562,8 +568,10 @@ async fn tick(
             }
         }
     }
+    drop(_phase2);
 
     // Phase 3a: Route new tasks
+    let _phase3a = tracing::info_span!("engine.tick.phase3a.route").entered();
     let new_tasks = task_manager.list_external_by_status(Status::New).await?;
     let routable: Vec<&ExternalTask> = new_tasks
         .iter()
@@ -571,6 +579,7 @@ async fn tick(
         .collect();
 
     for task in routable {
+        let _task_span = tracing::info_span!("engine.route", task_id = %task.id.0).entered();
         match router.route(task).await {
             Ok(result) => {
                 // Store route result in sidecar
@@ -609,10 +618,12 @@ async fn tick(
             }
         }
     }
+    drop(_phase3a);
 
     // Phase 3b: Dispatch routed tasks.
     // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
     // but we keep this filter as defense-in-depth.
+    let _phase3b = tracing::info_span!("engine.tick.phase3b.dispatch").entered();
     let routed_tasks = task_manager.list_external_by_status(Status::Routed).await?;
     let dispatchable: Vec<&ExternalTask> = routed_tasks
         .iter()
@@ -664,6 +675,8 @@ async fn tick(
         let route_result = get_route_result(&task_id).ok();
 
         tokio::spawn(async move {
+            // Note: Using tracing::info_span directly without holding across await
+            // to avoid Send issues with EnteredSpan
             tracing::info!(task_id, "dispatching task");
 
             match runner
