@@ -292,5 +292,47 @@ pub fn build_agent_message(
         ));
     }
 
+    // Memory from previous attempts
+    if !context.memory.is_empty() {
+        msg.push_str("\n## Previous Attempts Memory\n\n");
+        msg.push_str("Learnings from previous task attempts (to help you avoid repeating mistakes):\n\n");
+
+        for entry in &context.memory {
+            msg.push_str(&format!(
+                "### Attempt #{} (Agent: {})",
+                entry.attempt, entry.agent
+            ));
+
+            if let Some(ref model) = entry.model {
+                msg.push_str(&format!(", Model: {}", model));
+            }
+            msg.push('\n');
+
+            if !entry.approach.is_empty() {
+                msg.push_str(&format!("**Approach**: {}\n", entry.approach));
+            }
+
+            if !entry.learnings.is_empty() {
+                msg.push_str("**Key Learnings**:\n");
+                for learning in &entry.learnings {
+                    msg.push_str(&format!("- {}\n", learning));
+                }
+            }
+
+            if let Some(ref error) = entry.error {
+                msg.push_str(&format!("**Error**: {}\n", error));
+            }
+
+            if !entry.files_modified.is_empty() {
+                msg.push_str(&format!(
+                    "**Files Modified**: {}\n",
+                    entry.files_modified.join(", ")
+                ));
+            }
+
+            msg.push('\n');
+        }
+    }
+
     msg
 }

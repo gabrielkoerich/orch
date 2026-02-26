@@ -28,6 +28,9 @@ pub struct AgentResponse {
     /// Output token count (if available from agent).
     #[serde(default)]
     pub output_tokens: Option<u64>,
+    /// Key learnings from this attempt (for memory persistence across retries).
+    #[serde(default)]
+    pub learnings: Vec<String>,
 }
 
 /// Parse an agent response from a file path (or stdin if "-").
@@ -76,6 +79,7 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
         error: None,
         input_tokens: None,
         output_tokens: None,
+        learnings: vec![],
     })
 }
 
@@ -110,6 +114,7 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
     let remaining = extract_string_array(obj.get("remaining"));
     let files = extract_string_array(obj.get("files"));
     let error = obj.get("error").and_then(|v| v.as_str()).map(String::from);
+    let learnings = extract_string_array(obj.get("learnings"));
 
     // Extract token counts if available
     let input_tokens = extract_u64(obj.get("input_tokens"))
@@ -128,6 +133,7 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
         error,
         input_tokens,
         output_tokens,
+        learnings,
     })
 }
 
@@ -244,5 +250,23 @@ Done.
         let resp = parse(input).unwrap();
         assert_eq!(resp.status, "done");
         assert_eq!(resp.summary, "");
+    }
+
+    #[test]
+    fn parse_with_learnings() {
+        let input = r#"{"status":"needs_review","summary":"Need to fix imports","accomplished":[],"remaining":["fix imports"],"files":["src/main.rs"],"learnings":["Use std::sync::Arc for shared state","Check imports before committing"]}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "needs_review");
+        assert_eq!(resp.summary, "Need to fix imports");
+        assert_eq!(resp.learnings.len(), 2);
+        assert_eq!(resp.learnings[0], "Use std::sync::Arc for shared state");
+        assert_eq!(resp.learnings[1], "Check imports before committing");
+    }
+
+    #[test]
+    fn parse_learnings_empty_by_default() {
+        let input = r#"{"status":"done","summary":"Completed","accomplished":["done"],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert!(resp.learnings.is_empty());
     }
 }
