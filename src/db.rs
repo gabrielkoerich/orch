@@ -30,6 +30,22 @@ pub struct TaskMetric {
     pub created_at: DateTime<Utc>,
 }
 
+/// Parameters for inserting a new task metric record.
+#[derive(Debug, Clone)]
+pub struct InsertTaskMetric<'a> {
+    pub task_id: &'a str,
+    pub agent: &'a str,
+    pub model: Option<&'a str>,
+    pub complexity: Option<&'a str>,
+    pub outcome: &'a str,
+    pub duration_seconds: f64,
+    pub started_at: &'a DateTime<Utc>,
+    pub completed_at: &'a DateTime<Utc>,
+    pub attempts: i32,
+    pub files_changed: i32,
+    pub error_type: Option<&'a str>,
+}
+
 /// Rate limit event record — tracks rate limit occurrences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
@@ -341,36 +357,23 @@ impl Db {
     }
 
     /// Insert a new task metric record.
-    pub async fn insert_task_metric(
-        &self,
-        task_id: &str,
-        agent: &str,
-        model: Option<&str>,
-        complexity: Option<&str>,
-        outcome: &str,
-        duration_seconds: f64,
-        started_at: &DateTime<Utc>,
-        completed_at: &DateTime<Utc>,
-        attempts: i32,
-        files_changed: i32,
-        error_type: Option<&str>,
-    ) -> anyhow::Result<i64> {
+    pub async fn insert_task_metric(&self, metric: InsertTaskMetric<'_>) -> anyhow::Result<i64> {
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO task_metrics (task_id, agent, model, complexity, outcome, duration_seconds, started_at, completed_at, attempts, files_changed, error_type)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
-                task_id,
-                agent,
-                model,
-                complexity,
-                outcome,
-                duration_seconds,
-                started_at.to_rfc3339(),
-                completed_at.to_rfc3339(),
-                attempts,
-                files_changed,
-                error_type,
+                metric.task_id,
+                metric.agent,
+                metric.model,
+                metric.complexity,
+                metric.outcome,
+                metric.duration_seconds,
+                metric.started_at.to_rfc3339(),
+                metric.completed_at.to_rfc3339(),
+                metric.attempts,
+                metric.files_changed,
+                metric.error_type,
             ],
         )?;
         Ok(conn.last_insert_rowid())

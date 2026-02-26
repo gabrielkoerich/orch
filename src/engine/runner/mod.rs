@@ -17,7 +17,7 @@ pub mod worktree;
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::config;
-use crate::db::Db;
+use crate::db::{Db, InsertTaskMetric};
 use crate::engine::router::{get_route_result, RouteResult};
 use crate::security;
 use crate::sidecar;
@@ -476,21 +476,21 @@ impl TaskRunner {
 
         // Record metrics if db is available
         if let Some(ref db) = self.db {
-            let metric_result = db
-                .insert_task_metric(
-                    task_id,
-                    &agent_name,
-                    model_name.as_deref(),
-                    complexity.as_deref(),
-                    outcome,
-                    duration_seconds,
-                    &started_at,
-                    &completed_at,
-                    attempts as i32 + 1,
-                    files_changed as i32,
-                    sidecar::get(task_id, "last_error").ok().as_deref(),
-                )
-                .await;
+            let error_type: Option<String> = sidecar::get(task_id, "last_error").ok();
+            let metric = InsertTaskMetric {
+                task_id,
+                agent: &agent_name,
+                model: model_name.as_deref(),
+                complexity: complexity.as_deref(),
+                outcome,
+                duration_seconds,
+                started_at: &started_at,
+                completed_at: &completed_at,
+                attempts: attempts as i32 + 1,
+                files_changed: files_changed as i32,
+                error_type: error_type.as_deref(),
+            };
+            let metric_result = db.insert_task_metric(metric).await;
 
             if let Err(e) = metric_result {
                 tracing::warn!(task_id, ?e, "failed to record task metrics");
