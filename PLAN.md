@@ -628,7 +628,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 
 ### Phase 1: Foundation (replace internal tools) ✅ DONE
 
-**Goal:** Single Rust binary (`orch-core`) that replaces jq/python3/yq calls.
+**Goal:** Single Rust binary (`orch`) that replaces jq/python3/yq calls.
 
 - [x] Config loading (config.yml, .orchestrator.yml) — `src/config.rs` (hot-reload via `notify`)
 - [x] Sidecar JSON I/O (read/write/merge) — `src/sidecar.rs`
@@ -637,7 +637,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Agent response parser — `src/parser.rs`
 - [x] Cron matcher — `src/cron.rs`
 - [x] Template renderer — `src/template.rs`
-- [x] CLI: `orch-core config`, `orch-core sidecar`, `orch-core parse`, `orch-core cron`, `orch-core template`, `orch-core stream`
+- [x] CLI: `orch config`, `orch sidecar`, `orch parse`, `orch cron`, `orch template`, `orch stream`
 
 ### Phase 2: Engine (replace serve.sh/poll.sh) ✅ MOSTLY DONE
 
@@ -647,7 +647,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] GitHub backend — `src/backends/github.rs` (implements ExternalBackend via `gh api`)
 - [x] Engine main loop — `src/engine/mod.rs` (tokio::select! with 10s tick + 120s sync)
 - [x] Task polling (GitHub API via gh CLI + serde) — Phase 3 of tick()
-- [x] Task runner (spawns `run_task.sh`, monitors tmux, 30-min timeout) — `src/engine/runner.rs`
+- [x] Task runner — `src/engine/runner/` (context, worktree, agent, response, git_ops)
 - [x] Stuck task recovery — Phase 2 of tick()
 - [x] Parent/child unblocking — Phase 4 of tick()
 - [x] Job scheduler (native cron with catch-up) — `src/engine/jobs.rs`
@@ -660,15 +660,15 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Output capture service (2s polling loop) — `src/channels/capture.rs`
 - [x] Transport layer (pub/sub broadcast) — `src/channels/transport.rs`
 - [x] Graceful shutdown (SIGTERM/SIGINT handlers)
-- [x] CLI: `orch-core serve`
+- [x] CLI: `orch serve`
 - [x] Sync tick: cleanup done worktrees — `cleanup_done_worktrees()` in Rust
 - [x] Sync tick: check merged PRs — `check_merged_prs()` in Rust
 - [x] Sync tick: scan @mentions — `scan_mentions()` in Rust
 - [x] Sync tick: review open PRs — `review_open_prs()` in Rust
-- [x] Task CRUD CLI commands — `orch-core task list/add/get/publish`
+- [x] Task CRUD CLI commands — `orch task list/add/get/publish`
 - [x] Security module — `src/security.rs`
-- [ ] **Rewrite run_task.sh in Rust** — agent invocation, worktree, git, prompt, PR creation
-- [ ] **Rewrite route_task.sh in Rust** — currently delegated to bash via run_task.sh
+- [x] **Rewrite run_task.sh in Rust** — `src/engine/runner/` (context, worktree, agent, response, git_ops)
+- [x] **Route task in Rust** — router wired into dispatch loop, `run_with_context()` calls runner
 - [ ] Multi-project support — serve.sh iterates PROJECT_DIRS, engine needs this
 - [ ] Config hot-reload wired into engine (notify watcher exists but not connected)
 
@@ -691,32 +691,39 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 
 **Goal:** Replace justfile → bash script routing with native `orch` CLI.
 
-- [x] `orch-core serve` — start engine
-- [x] `orch-core config <key>` — read config
-- [x] `orch-core sidecar get/set` — task metadata
-- [x] `orch-core parse <path>` — parse agent response
-- [x] `orch-core cron <expr>` — cron matching
-- [x] `orch-core template <path>` — render templates
-- [x] `orch-core stream <id>` — live output streaming
-- [x] `orch-core task list/add/get/publish` — task CRUD
-- [ ] `orch task status` — task status overview (replaces scripts/status.sh)
-- [ ] `orch task route <id>` — route task to agent
-- [ ] `orch task run <id>` — execute task
-- [ ] `orch task retry <id>` — retry failed task
-- [ ] `orch task attach <id>` — attach to tmux session
-- [ ] `orch task kill <id>` — kill agent session
-- [ ] `orch job list/add/remove/enable/disable` — job management
-- [ ] `orch init` — project initialization
-- [ ] `orch agents` — list available agent CLIs
-- [ ] Rename binary from `orch-core` to `orch`
-- [ ] Absorb justfile routing into native CLI
+- [x] `orch serve` — start engine
+- [x] `orch config <key>` — read config
+- [x] `orch sidecar get/set` — task metadata
+- [x] `orch parse <path>` — parse agent response
+- [x] `orch cron <expr>` — cron matching
+- [x] `orch template <path>` — render templates
+- [x] `orch stream <id>` — live output streaming
+- [x] `orch task list/add/get/publish` — task CRUD
+- [x] `orch task status` — task status overview
+- [x] `orch task route <id>` — route task to agent
+- [x] `orch task run <id>` — execute task
+- [x] `orch task retry <id>` — retry failed task
+- [x] `orch task attach <id>` — attach to tmux session
+- [x] `orch task kill <id>` — kill agent session
+- [x] `orch task live` — list active sessions
+- [x] `orch task unblock <id|all>` — unblock tasks
+- [x] `orch job list/add/remove/enable/disable/tick` — job management
+- [x] `orch init` — project initialization
+- [x] `orch agents` — list available agent CLIs
+- [x] `orch version` — show version info
+- [x] `orch log` — tail logs
+- [x] `orch service start/stop/restart/status` — service management
+- [x] `orch completions <shell>` — shell completions
+- [x] Rename binary from `orch-core` to `orch`
+- [x] Absorb justfile routing into native CLI (justfile deleted)
 
 ### Phase 5: Polish & Migration
 
 - [ ] Rename `~/.orchestrator/` → `~/.orch/` (with backward compat)
 - [ ] Rename `.orchestrator.yml` → `.orch.yml`
-- [ ] Update brew formula (from `orchestrator` to `orch`)
-- [ ] Update AGENTS.md with Rust engine docs
+- [x] Update brew formula (from `orchestrator` to `orch`) — `Formula/orch.rb`
+- [x] Update AGENTS.md with Rust engine docs
+- [x] Jobs config consolidated into `.orchestrator.yml` (no separate `jobs.yml`)
 - [ ] Metrics / observability (tracing, prometheus)
 - [ ] Cross-compile CI pipeline (macOS arm64 + x86_64)
 - [ ] Unified notification system (events → all channels)

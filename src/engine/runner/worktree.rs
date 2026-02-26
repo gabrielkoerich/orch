@@ -283,6 +283,7 @@ pub async fn setup_worktree(
 }
 
 /// Find an existing worktree by task ID prefix.
+#[allow(dead_code)]
 fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<PathBuf> {
     let prefix = format!("gh-task-{task_id}-");
 
@@ -296,4 +297,70 @@ fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<PathBu
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_name_basic() {
+        let name = branch_name("42", "Fix login bug");
+        assert_eq!(name, "gh-task-42-fix-login-bug");
+    }
+
+    #[test]
+    fn branch_name_special_chars() {
+        let name = branch_name("7", "Add OAuth2/OIDC (Google & GitHub)");
+        assert_eq!(name, "gh-task-7-add-oauth2-oidc--google---github");
+    }
+
+    #[test]
+    fn branch_name_truncates_long_slug() {
+        let title =
+            "This is a very long task title that should be truncated to forty characters maximum";
+        let name = branch_name("1", title);
+        // slug part should be max 40 chars
+        let slug = name.strip_prefix("gh-task-1-").unwrap();
+        assert!(slug.len() <= 40, "slug length {} > 40", slug.len());
+    }
+
+    #[test]
+    fn branch_name_trims_trailing_dashes() {
+        let name = branch_name("5", "Fix bug---");
+        assert!(
+            !name.ends_with('-'),
+            "branch name should not end with dash: {name}"
+        );
+    }
+
+    #[test]
+    fn branch_name_empty_title() {
+        let name = branch_name("99", "");
+        assert_eq!(name, "gh-task-99-");
+    }
+
+    #[test]
+    fn find_existing_worktree_returns_none_for_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(find_existing_worktree(dir.path(), "42").is_none());
+    }
+
+    #[test]
+    fn find_existing_worktree_matches_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt_dir = dir.path().join("gh-task-42-fix-login-bug");
+        std::fs::create_dir(&wt_dir).unwrap();
+
+        let result = find_existing_worktree(dir.path(), "42");
+        assert_eq!(result, Some(wt_dir));
+    }
+
+    #[test]
+    fn find_existing_worktree_ignores_other_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("gh-task-43-other-task")).unwrap();
+
+        assert!(find_existing_worktree(dir.path(), "42").is_none());
+    }
 }
