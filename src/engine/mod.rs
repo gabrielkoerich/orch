@@ -286,8 +286,7 @@ pub async fn serve() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8080);
-        let secret = crate::config::get("webhook.secret")
-            .unwrap_or_default();
+        let secret = crate::config::get("webhook.secret").unwrap_or_default();
         let webhook_repo = project_engines
             .first()
             .map(|e| e.repo.clone())

@@ -777,11 +777,7 @@ mod tests {
         assert_eq!(msg.author, "reviewer");
         assert_eq!(msg.body, "Please fix the tests");
         assert_eq!(
-            msg.metadata
-                .get("review_state")
-                .unwrap()
-                .as_str()
-                .unwrap(),
+            msg.metadata.get("review_state").unwrap().as_str().unwrap(),
             "changes_requested"
         );
     }
@@ -980,11 +976,7 @@ mod tests {
         assert_eq!(msg.thread_id, "77");
         assert_eq!(msg.author, "maintainer");
         assert_eq!(
-            msg.metadata
-                .get("review_state")
-                .unwrap()
-                .as_str()
-                .unwrap(),
+            msg.metadata.get("review_state").unwrap().as_str().unwrap(),
             "changes_requested"
         );
     }
