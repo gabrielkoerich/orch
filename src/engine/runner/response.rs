@@ -26,6 +26,20 @@ pub enum RunResult {
     Failed(String),
 }
 
+/// Outcome signal for the engine to update router weights.
+///
+/// Returned by the task runner so the engine can feed rate limit
+/// and success signals back to the router's weighted round-robin.
+#[derive(Debug, Clone)]
+pub enum WeightSignal {
+    /// Agent completed a task successfully.
+    Success { agent: String },
+    /// Agent hit a rate limit / usage limit.
+    RateLimited { agent: String },
+    /// No weight-relevant signal (timeout, auth error, etc.)
+    None,
+}
+
 /// Collect and classify the agent's response.
 pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> RunResult {
     // Read stderr (check new state dir, fall back to legacy)
@@ -398,5 +412,21 @@ mod tests {
     fn snippet_preserves_short_text() {
         let short = "hello";
         assert_eq!(snippet(short), "hello");
+    }
+
+    #[test]
+    fn weight_signal_variants() {
+        let success = WeightSignal::Success {
+            agent: "claude".to_string(),
+        };
+        let limited = WeightSignal::RateLimited {
+            agent: "codex".to_string(),
+        };
+        let none = WeightSignal::None;
+
+        // Verify Debug trait
+        assert!(format!("{success:?}").contains("claude"));
+        assert!(format!("{limited:?}").contains("codex"));
+        assert!(format!("{none:?}").contains("None"));
     }
 }

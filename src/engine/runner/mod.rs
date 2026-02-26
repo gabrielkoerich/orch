@@ -21,6 +21,7 @@ use crate::engine::router::{get_route_result, RouteResult};
 use crate::security;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
+pub use response::WeightSignal;
 use response::RunResult;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -418,15 +419,17 @@ impl TaskRunner {
     /// Run a task with full engine context (backend, tmux, capture).
     ///
     /// Called by the engine dispatch loop with richer context.
+    /// Returns a `WeightSignal` for the engine to feed back to the router.
     pub async fn run_with_context(
         &self,
         task: &ExternalTask,
         backend: &Arc<dyn ExternalBackend>,
         _tmux: &Arc<TmuxManager>,
         route_result: Option<&RouteResult>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<WeightSignal> {
         let task_id = &task.id.0;
         let agent = route_result.map(|r| r.agent.as_str());
+        let agent_name = agent.unwrap_or("claude").to_string();
         let model = route_result.and_then(|r| r.model.as_deref());
 
         // Store task info in sidecar for prompt building
@@ -445,6 +448,18 @@ impl TaskRunner {
         let status = sidecar::get(task_id, "status").unwrap_or_default();
         let summary = sidecar::get(task_id, "summary").unwrap_or_default();
         let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
+
+        // Determine weight signal based on outcome
+        let is_rate_limited = last_error.contains("usage")
+            || last_error.contains("rate limit")
+            || last_error.contains("rerouted");
+        let weight_signal = if status == "new" && is_rate_limited {
+            WeightSignal::RateLimited { agent: agent_name.clone() }
+        } else if status == "done" || status == "in_progress" || status == "in_review" {
+            WeightSignal::Success { agent: agent_name.clone() }
+        } else {
+            WeightSignal::None
+        };
 
         // Update GitHub status
         let new_status = match status.as_str() {
@@ -484,7 +499,7 @@ impl TaskRunner {
         };
         backend.post_comment(&task.id, &comment).await?;
 
-        Ok(())
+        Ok(weight_signal)
     }
 
     /// Resolve the project directory for this repo.
