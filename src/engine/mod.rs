@@ -32,6 +32,8 @@ use crate::config;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::{get_route_result, Router};
 use crate::engine::tasks::TaskManager;
+use crate::github::cli::GhCli;
+use crate::github::types::{GitHubReviewComment, PullRequestReview};
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use runner::{TaskRunner, WeightSignal};
@@ -847,8 +849,8 @@ async fn sync_tick(
         tracing::warn!(err = %e, "mention scan failed");
     }
 
-    // 4. Review open PRs (optional - if enabled in config)
-    if let Err(e) = review_open_prs(backend).await {
+    // 4. Review open PRs (parse review comments, create follow-ups)
+    if let Err(e) = review_open_prs(backend, db, repo).await {
         tracing::warn!(err = %e, "PR review failed");
     }
 
@@ -1115,24 +1117,28 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
     Ok(())
 }
 
-/// Review open PRs (optional feature).
+/// Review open PRs - parse review comments and create follow-up tasks.
 ///
-/// Lists tasks in review and triggers review agent if configured.
-async fn review_open_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<()> {
-    // Check if review agent is enabled
-    let review_enabled = crate::config::get("workflow.enable_review_agent")
-        .map(|v| v == "true")
-        .unwrap_or(false);
+/// Lists tasks in review, fetches PR reviews, and creates follow-up tasks
+/// for each review comment that requests changes.
+async fn review_open_prs(
+    backend: &Arc<dyn ExternalBackend>,
+    db: &Arc<Db>,
+    repo: &str,
+) -> anyhow::Result<()> {
+    // Get tasks that are in review (have open PRs)
+    let in_review_tasks = backend.list_by_status(Status::InReview).await?;
 
-    if !review_enabled {
-        tracing::debug!("review agent disabled, skipping");
+    if in_review_tasks.is_empty() {
         return Ok(());
     }
 
-    tracing::info!("review agent enabled, listing in_review tasks");
+    tracing::info!(
+        count = in_review_tasks.len(),
+        "checking in_review tasks for PR reviews"
+    );
 
-    // Get tasks that are in review (have open PRs)
-    let in_review_tasks = backend.list_by_status(Status::InReview).await?;
+    let gh = GhCli::new();
 
     for task in in_review_tasks {
         let task_id = &task.id.0;
@@ -1143,10 +1149,264 @@ async fn review_open_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<(
             _ => continue,
         };
 
-        // TODO: Trigger review agent for each PR
-        // For now, just log
-        tracing::debug!(task_id, branch = %branch, "would trigger review agent");
+        // Get the agent that created this PR (for routing follow-ups)
+        let original_agent = task
+            .labels
+            .iter()
+            .find(|l| l.starts_with("agent:"))
+            .map(|l| l.strip_prefix("agent:").unwrap_or(l).to_string());
+
+        // Get PR number from branch
+        let pr_number = match gh.get_pr_number(repo, &branch).await {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                tracing::debug!(task_id, branch = %branch, "no open PR found");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(task_id, branch = %branch, err = %e, "failed to get PR number");
+                continue;
+            }
+        };
+
+        // Store PR number in sidecar for follow-up tasks
+        if let Err(e) = sidecar::set(task_id, &[format!("pr_number={}", pr_number)]) {
+            tracing::warn!(task_id, err = %e, "failed to store PR number in sidecar");
+        }
+
+        // Check for existing review follow-up tasks for this PR
+        let existing_reviews = get_existing_review_tasks(db, task_id).await?;
+
+        // Fetch PR reviews
+        let reviews = match gh.get_pr_reviews(repo, pr_number).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(task_id, pr_number, err = %e, "failed to get PR reviews");
+                continue;
+            }
+        };
+
+        // Get all review comments for this PR (more efficient than per-review)
+        let all_comments = match gh.get_pr_comments(repo, pr_number).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(task_id, pr_number, err = %e, "failed to get PR comments");
+                continue;
+            }
+        };
+
+        // Process each review
+        for review in reviews {
+            // Only process reviews that request changes
+            if review.state != "CHANGES_REQUESTED" {
+                continue;
+            }
+
+            // Get comments for this review
+            let review_comments: Vec<GitHubReviewComment> = all_comments
+                .iter()
+                .filter(|c| {
+                    // Comments are associated with reviews via the review_id field
+                    // The GitHub API includes this in the response
+                    c.user.login == review.user.login
+                        && c.created_at >= review.submitted_at
+                })
+                .cloned()
+                .collect();
+
+            let pr_review = PullRequestReview {
+                review: review.clone(),
+                comments: review_comments.clone(),
+            };
+
+            // Process actionable comments
+            for comment in pr_review.actionable_comments() {
+                // Create a unique ID for this review comment
+                let review_comment_id = format!("review_comment_{}_{}", pr_number, comment.id);
+
+                // Skip if we already created a task for this comment
+                if existing_reviews.contains(&review_comment_id) {
+                    tracing::debug!(
+                        task_id,
+                        comment_id = comment.id,
+                        "review comment already has follow-up task"
+                    );
+                    continue;
+                }
+
+                // Create follow-up task
+                if let Err(e) = create_review_follow_up_task(
+                    backend,
+                    db,
+                    task_id,
+                    &review_comment_id,
+                    &pr_review,
+                    comment,
+                    pr_number,
+                    &branch,
+                    original_agent.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        task_id,
+                        comment_id = comment.id,
+                        err = %e,
+                        "failed to create follow-up task"
+                    );
+                }
+            }
+        }
     }
+
+    Ok(())
+}
+
+/// Get existing review tasks for a parent task.
+async fn get_existing_review_tasks(
+    db: &Arc<Db>,
+    parent_task_id: &str,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let mut existing = std::collections::HashSet::new();
+
+    // Check internal tasks for review follow-ups
+    for status in &[
+        TaskStatus::New,
+        TaskStatus::InProgress,
+        TaskStatus::Done,
+        TaskStatus::Blocked,
+    ] {
+        let tasks = db.list_internal_tasks_by_status(*status).await?;
+        for t in tasks {
+            if t.source == "pr_review" && t.source_id.starts_with(parent_task_id) {
+                // Extract the review comment ID from source_id (format: "{parent_id}:{review_comment_id}")
+                if let Some(idx) = t.source_id.find(':') {
+                    existing.insert(t.source_id[idx + 1..].to_string());
+                }
+            }
+        }
+    }
+
+    Ok(existing)
+}
+
+/// Create a follow-up task for a review comment.
+#[allow(clippy::too_many_arguments)]
+async fn create_review_follow_up_task(
+    backend: &Arc<dyn ExternalBackend>,
+    db: &Arc<Db>,
+    parent_task_id: &str,
+    review_comment_id: &str,
+    review: &PullRequestReview,
+    comment: &GitHubReviewComment,
+    pr_number: u64,
+    branch: &str,
+    original_agent: Option<&str>,
+) -> anyhow::Result<()> {
+    let reviewer = &review.review.user.login;
+
+    // Build task title
+    let title = format!("Address review comment on {} by @{}", comment.path, reviewer);
+
+    // Build task body with context
+    let mut body = format!(
+        "## PR Review Comment
+
+**File:** `{}`\n",
+        comment.path
+    );
+
+    if let Some(line) = comment.line {
+        body.push_str(&format!("**Line:** {}\n", line));
+    }
+
+    body.push_str(&format!(
+        "**Reviewer:** @{}\n**PR:** #{}\n**Branch:** `{}`\n\n",
+        reviewer, pr_number, branch
+    ));
+
+    // Add diff context if available
+    if let Some(ref diff_hunk) = comment.diff_hunk {
+        body.push_str("### Diff Context\n```diff\n");
+        // Truncate very long diffs
+        let diff_preview = if diff_hunk.len() > 2000 {
+            format!("{}...", &diff_hunk[..2000])
+        } else {
+            diff_hunk.clone()
+        };
+        body.push_str(&diff_preview);
+        body.push_str("\n```\n\n");
+    }
+
+    body.push_str("### Review Comment\n> ");
+    body.push_str(&comment.body.replace('\n', "\n> "));
+    body.push_str("\n\n");
+
+    // Add review body if present
+    if let Some(ref review_body) = review.review.body {
+        if !review_body.trim().is_empty() {
+            body.push_str("### Overall Review Notes\n");
+            body.push_str(review_body);
+            body.push_str("\n\n");
+        }
+    }
+
+    body.push_str("---\n**Parent Task:** #");
+    body.push_str(parent_task_id);
+    body.push_str("\n");
+
+    // Create labels
+    let mut labels = vec![
+        "pr-review-followup".to_string(),
+        "status:new".to_string(),
+    ];
+
+    // Route to the same agent that created the PR
+    if let Some(agent) = original_agent {
+        labels.push(format!("agent:{}", agent));
+    }
+
+    // Create as internal task (can be promoted to GitHub issue if needed)
+    let source_id = format!("{}:{}", parent_task_id, review_comment_id);
+
+    let task_id = db
+        .create_internal_task(&title, &body, "pr_review", &source_id)
+        .await?;
+
+    // Store PR info in sidecar for the follow-up task
+    let _ = sidecar::set(
+        &task_id.to_string(),
+        &[
+            format!("pr_number={}", pr_number),
+            format!("branch={}", branch),
+            format!("reviewer={}", reviewer),
+            format!("file_path={}", comment.path),
+            format!("parent_task_id={}", parent_task_id),
+        ],
+    );
+
+    // Set the agent if we know it
+    if let Some(agent) = original_agent {
+        let _ = db.set_internal_task_agent(task_id, Some(agent)).await;
+    }
+
+    tracing::info!(
+        parent_task_id,
+        follow_up_task_id = task_id,
+        pr_number,
+        file_path = %comment.path,
+        "created follow-up task for review comment"
+    );
+
+    // Post comment on the original GitHub issue about the follow-up
+    let comment_body = format!(
+        "[{}] Created follow-up task #{} to address review comment on `{}` by @{}.",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+        task_id,
+        comment.path,
+        reviewer
+    );
+    let _ = backend.post_comment(&ExternalId(parent_task_id.to_string()), &comment_body).await;
 
     Ok(())
 }
@@ -1154,6 +1414,7 @@ async fn review_open_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::types::{GitHubReview, GitHubReviewComment, GitHubUser, PullRequestReview};
 
     #[test]
     fn engine_config_defaults() {
@@ -1172,5 +1433,122 @@ mod tests {
         assert_eq!(config.sync_interval, std::time::Duration::from_secs(120));
         assert_eq!(config.max_parallel, 4);
         assert_eq!(config.stuck_timeout, 1800);
+    }
+
+    #[test]
+    fn test_pull_request_review_requests_changes() {
+        let review = PullRequestReview {
+            review: GitHubReview {
+                id: 1,
+                user: GitHubUser {
+                    login: "reviewer".to_string(),
+                },
+                body: Some("Please fix".to_string()),
+                state: "CHANGES_REQUESTED".to_string(),
+                html_url: None,
+                submitted_at: "2024-01-01T00:00:00Z".to_string(),
+                commit_id: None,
+            },
+            comments: vec![],
+        };
+
+        assert!(review.requests_changes());
+    }
+
+    #[test]
+    fn test_pull_request_review_does_not_request_changes() {
+        let review = PullRequestReview {
+            review: GitHubReview {
+                id: 1,
+                user: GitHubUser {
+                    login: "reviewer".to_string(),
+                },
+                body: Some("LGTM".to_string()),
+                state: "APPROVED".to_string(),
+                html_url: None,
+                submitted_at: "2024-01-01T00:00:00Z".to_string(),
+                commit_id: None,
+            },
+            comments: vec![],
+        };
+
+        assert!(!review.requests_changes());
+    }
+
+    #[test]
+    fn test_pull_request_review_actionable_comments_filters_empty_and_replies() {
+        let review = PullRequestReview {
+            review: GitHubReview {
+                id: 1,
+                user: GitHubUser {
+                    login: "reviewer".to_string(),
+                },
+                body: None,
+                state: "CHANGES_REQUESTED".to_string(),
+                html_url: None,
+                submitted_at: "2024-01-01T00:00:00Z".to_string(),
+                commit_id: None,
+            },
+            comments: vec![
+                GitHubReviewComment {
+                    id: 1,
+                    user: GitHubUser {
+                        login: "reviewer".to_string(),
+                    },
+                    body: "Fix this issue".to_string(),
+                    path: "src/main.rs".to_string(),
+                    line: Some(10),
+                    original_line: Some(10),
+                    commit_id: "abc".to_string(),
+                    original_commit_id: "abc".to_string(),
+                    html_url: "url".to_string(),
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    updated_at: "2024-01-01T00:00:00Z".to_string(),
+                    in_reply_to_id: None,
+                    diff_hunk: Some("@@ -8,5 +8,5 @@ fn main() {\n-    let x = 1;\n+    let x = 2;".to_string()),
+                },
+                GitHubReviewComment {
+                    id: 2,
+                    user: GitHubUser {
+                        login: "reviewer".to_string(),
+                    },
+                    body: "".to_string(), // Empty - should be filtered out
+                    path: "src/lib.rs".to_string(),
+                    line: Some(20),
+                    original_line: Some(20),
+                    commit_id: "abc".to_string(),
+                    original_commit_id: "abc".to_string(),
+                    html_url: "url".to_string(),
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    updated_at: "2024-01-01T00:00:00Z".to_string(),
+                    in_reply_to_id: None,
+                    diff_hunk: None,
+                },
+                GitHubReviewComment {
+                    id: 3,
+                    user: GitHubUser {
+                        login: "reviewer".to_string(),
+                    },
+                    body: "Reply to this".to_string(),
+                    path: "src/lib.rs".to_string(),
+                    line: Some(30),
+                    original_line: Some(30),
+                    commit_id: "abc".to_string(),
+                    original_commit_id: "abc".to_string(),
+                    html_url: "url".to_string(),
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    updated_at: "2024-01-01T00:00:00Z".to_string(),
+                    in_reply_to_id: Some(1), // Reply - should be filtered out
+                    diff_hunk: None,
+                },
+            ],
+        };
+
+        let actionable = review.actionable_comments();
+        assert_eq!(actionable.len(), 1);
+        assert_eq!(actionable[0].id, 1);
+        assert_eq!(actionable[0].body, "Fix this issue");
+        assert_eq!(actionable[0].path, "src/main.rs");
+        assert_eq!(actionable[0].diff_hunk.as_ref().unwrap(), "@@ -8,5 +8,5 @@ fn main() {\n-    let x = 1;\n+    let x = 2;");
     }
 }

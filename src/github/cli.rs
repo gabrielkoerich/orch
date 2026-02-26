@@ -3,7 +3,7 @@
 //! All GitHub API calls go through `gh api`. Auth is handled by `gh`.
 //! We build the command args in Rust and deserialize the JSON output via serde.
 
-use super::types::{GitHubComment, GitHubIssue};
+use super::types::{GitHubComment, GitHubIssue, GitHubReview, GitHubReviewComment};
 use tokio::process::Command;
 use urlencoding;
 
@@ -354,6 +354,73 @@ impl GhCli {
             .and_then(|v| v.as_str())
             .map(String::from)
             .ok_or_else(|| anyhow::anyhow!("failed to get current user"))
+    }
+
+    /// Get PR number by branch name.
+    ///
+    /// Returns the PR number if an open PR exists for the branch, None otherwise.
+    pub async fn get_pr_number(&self, repo: &str, branch: &str) -> anyhow::Result<Option<u64>> {
+        let owner = repo
+            .split('/')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+        let head = format!("{}:{}", owner, branch);
+
+        let endpoint = format!("repos/{repo}/pulls");
+        let json = self
+            .api(&[
+                &endpoint,
+                "-f",
+                &format!("head={}", head),
+                "-f",
+                "state=open",
+                "-f",
+                "per_page=1",
+            ])
+            .await?;
+
+        let prs: Vec<serde_json::Value> = serde_json::from_slice(&json)?;
+        if prs.is_empty() {
+            return Ok(None);
+        }
+
+        prs[0]
+            .get("number")
+            .and_then(|n| n.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("PR missing number field"))
+            .map(Some)
+    }
+
+    /// Get reviews for a PR.
+    ///
+    /// Uses `gh api` to fetch all reviews for a given PR number.
+    pub async fn get_pr_reviews(&self, repo: &str, pr_number: u64) -> anyhow::Result<Vec<GitHubReview>> {
+        let endpoint = format!("repos/{repo}/pulls/{pr_number}/reviews");
+        let json = self.api(&[&endpoint]).await?;
+        Ok(serde_json::from_slice(&json)?)
+    }
+
+    /// Get review comments for a PR review.
+    ///
+    /// Uses `gh api` to fetch all comments for a specific review.
+    pub async fn get_pr_review_comments(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        review_id: u64,
+    ) -> anyhow::Result<Vec<GitHubReviewComment>> {
+        let endpoint = format!("repos/{repo}/pulls/{pr_number}/reviews/{review_id}/comments");
+        let json = self.api(&[&endpoint]).await?;
+        Ok(serde_json::from_slice(&json)?)
+    }
+
+    /// Get all review comments for a PR.
+    ///
+    /// Uses `gh api` to fetch all review comments (across all reviews) for a PR.
+    pub async fn get_pr_comments(&self, repo: &str, pr_number: u64) -> anyhow::Result<Vec<GitHubReviewComment>> {
+        let endpoint = format!("repos/{repo}/pulls/{pr_number}/comments");
+        let json = self.api(&[&endpoint]).await?;
+        Ok(serde_json::from_slice(&json)?)
     }
 
     pub async fn get_sub_issues(&self, repo: &str, number: &str) -> anyhow::Result<Vec<u64>> {
