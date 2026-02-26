@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Result of routing a task to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -233,7 +233,14 @@ impl AgentWeights {
 /// Simple deterministic-ish fraction [0.0, 1.0) based on Instant::now().
 /// Not cryptographic, but sufficient for load distribution.
 fn simple_hash_fraction() -> f64 {
-    let nanos = Instant::now().elapsed().as_nanos() as u64;
+    // Use SystemTime since Instant::now().elapsed() measures time since
+    // the instant was created and is nearly always ~0 here. SystemTime
+    // gives a clock relative to the UNIX epoch which varies across calls.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
     // Mix bits using a simple hash
     let hash = nanos
         .wrapping_mul(6364136223846793005)
@@ -246,7 +253,13 @@ fn simple_hash_index(len: usize) -> usize {
     if len == 0 {
         return 0;
     }
-    let nanos = Instant::now().elapsed().as_nanos() as u64;
+
+    // Use SystemTime for a variable seed instead of Instant::now().elapsed().
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
     let hash = nanos
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
