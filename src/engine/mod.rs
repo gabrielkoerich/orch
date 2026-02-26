@@ -22,8 +22,11 @@ pub mod tasks;
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
+use crate::channels::discord::DiscordChannel;
+use crate::channels::telegram::TelegramChannel;
+use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
-use crate::channels::ChannelRegistry;
+use crate::channels::{Channel, ChannelRegistry, IncomingMessage};
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::{get_route_result, Router};
 use crate::engine::tasks::TaskManager;
@@ -33,7 +36,7 @@ use anyhow::Context;
 use runner::TaskRunner;
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 
 /// Engine configuration.
 pub struct EngineConfig {
@@ -58,18 +61,50 @@ impl Default for EngineConfig {
     }
 }
 
+impl EngineConfig {
+    /// Load engine configuration from config files, falling back to defaults.
+    pub fn from_config() -> Self {
+        let mut config = Self::default();
+
+        if let Ok(val) = crate::config::get("engine.tick_interval") {
+            if let Ok(secs) = val.parse::<u64>() {
+                config.tick_interval = std::time::Duration::from_secs(secs);
+            }
+        }
+
+        if let Ok(val) = crate::config::get("engine.sync_interval") {
+            if let Ok(secs) = val.parse::<u64>() {
+                config.sync_interval = std::time::Duration::from_secs(secs);
+            }
+        }
+
+        if let Ok(val) = crate::config::get("engine.max_parallel") {
+            if let Ok(n) = val.parse::<usize>() {
+                config.max_parallel = n;
+            }
+        }
+
+        if let Ok(val) = crate::config::get("engine.stuck_timeout") {
+            if let Ok(secs) = val.parse::<u64>() {
+                config.stuck_timeout = secs;
+            }
+        }
+
+        config
+    }
+}
+
 /// Start the orchestrator service.
 ///
 /// This is the main entry point — called by `orch serve`.
 pub async fn serve() -> anyhow::Result<()> {
     tracing::info!("orch engine starting");
 
-    let config = EngineConfig::default();
+    let mut config = EngineConfig::from_config();
 
     // Load config — repo is required
-    let repo = crate::config::get("repo").context(
-        "'repo' not set in config — run `orch init` or set repo in ~/.orch/config.yml",
-    )?;
+    let repo = crate::config::get("repo")
+        .context("'repo' not set in config — run `orch init` or set repo in ~/.orch/config.yml")?;
 
     // Initialize backend
     let backend: Arc<dyn ExternalBackend> =
@@ -101,25 +136,102 @@ pub async fn serve() -> anyhow::Result<()> {
     });
 
     // Initialize channel registry
-    let _channels = ChannelRegistry::new();
+    let mut channel_registry = ChannelRegistry::new();
+
+    // Try to initialize Telegram channel
+    if let Ok(token) = crate::config::get("channels.telegram.bot_token") {
+        if !token.is_empty() {
+            let chat_id = crate::config::get("channels.telegram.chat_id").ok();
+            let telegram = TelegramChannel::new(token, chat_id);
+            if let Err(e) = telegram.health_check().await {
+                tracing::warn!(?e, "telegram channel health check failed, skipping");
+            } else {
+                channel_registry.register(Box::new(telegram));
+                tracing::info!("telegram channel registered");
+            }
+        }
+    }
+
+    // Try to initialize Discord channel
+    if let Ok(token) = crate::config::get("channels.discord.bot_token") {
+        if !token.is_empty() {
+            let channel_id = crate::config::get("channels.discord.channel_id").ok();
+            let discord = DiscordChannel::new(token, channel_id);
+            if let Err(e) = discord.health_check().await {
+                tracing::warn!(?e, "discord channel health check failed, skipping");
+            } else {
+                channel_registry.register(Box::new(discord));
+                tracing::info!("discord channel registered");
+            }
+        }
+    }
+
+    // Initialize tmux channel with transport for output streaming
+    let tmux_channel = TmuxChannel::with_transport(transport.clone());
+    channel_registry.register(Box::new(tmux_channel));
+    tracing::info!("tmux channel registered");
+
+    // Start all channels and collect their message receivers
+    let mut channel_receivers: Vec<tokio::sync::mpsc::Receiver<IncomingMessage>> = Vec::new();
+    for channel in channel_registry.iter() {
+        match channel.start().await {
+            Ok(rx) => {
+                tracing::info!(channel = channel.name(), "channel started");
+                channel_receivers.push(rx);
+            }
+            Err(e) => {
+                tracing::warn!(channel = channel.name(), ?e, "failed to start channel");
+            }
+        }
+    }
+
+    // Spawn tasks to handle incoming channel messages (if any channels are active)
+    let transport_for_messages = transport.clone();
+    for mut rx in channel_receivers {
+        let transport = transport_for_messages.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received message from channel");
+
+                // Route the message through transport
+                match transport.route(&msg).await {
+                    crate::channels::transport::MessageRoute::TaskSession { task_id } => {
+                        tracing::debug!(task_id = %task_id, "message routed to existing session");
+                    }
+                    crate::channels::transport::MessageRoute::Command { raw } => {
+                        tracing::debug!(command = %raw, "message is a command");
+                    }
+                    crate::channels::transport::MessageRoute::NewTask => {
+                        tracing::debug!("message would create new task");
+                    }
+                }
+            }
+        });
+    }
 
     // Task runner
     let runner = Arc::new(TaskRunner::new(repo.clone()));
 
     // Agent router (selects agent + model per task)
-    let router = Arc::new(Router::from_config());
-    tracing::info!(
-        mode = %router.config.mode,
-        agents = ?router.available_agents,
-        fallback = %router.config.fallback_executor,
-        "router initialized"
-    );
+    let router = Arc::new(RwLock::new(Router::from_config()));
+    {
+        let r = router.read().await;
+        tracing::info!(
+            mode = %r.config.mode,
+            agents = ?r.available_agents,
+            fallback = %r.config.fallback_executor,
+            "router initialized"
+        );
+    }
 
     // Jobs config path (from .orchestrator.yml or global config)
-    let jobs_path = jobs::resolve_jobs_path();
+    let mut jobs_path = jobs::resolve_jobs_path();
 
     // Concurrency limiter
     let semaphore = Arc::new(Semaphore::new(config.max_parallel));
+
+    // Subscribe to config file changes for hot reload
+    let mut config_rx = crate::config::subscribe();
 
     // Track sync interval
     let mut last_sync = std::time::Instant::now();
@@ -140,6 +252,7 @@ pub async fn serve() -> anyhow::Result<()> {
         tokio::select! {
             _ = interval.tick() => {
                 // Core tick: poll tasks, check sessions
+                let router_guard = router.read().await;
                 if let Err(e) = tick(
                     &backend,
                     &tmux,
@@ -149,11 +262,12 @@ pub async fn serve() -> anyhow::Result<()> {
                     &config,
                     &jobs_path,
                     &db,
-                    &router,
+                    &router_guard,
                     &task_manager,
                 ).await {
                     tracing::error!(?e, "tick failed");
                 }
+                drop(router_guard);
 
                 // Periodic sync (less frequent)
                 if last_sync.elapsed() >= config.sync_interval {
@@ -161,6 +275,54 @@ pub async fn serve() -> anyhow::Result<()> {
                         tracing::error!(?e, "sync tick failed");
                     }
                     last_sync = std::time::Instant::now();
+                }
+            }
+            result = config_rx.recv() => {
+                match result {
+                    Ok(path) => {
+                        tracing::info!(path = %path.display(), "config file changed, reloading");
+
+                        // Reload engine config
+                        let new_config = EngineConfig::from_config();
+                        let tick_changed = new_config.tick_interval != config.tick_interval;
+                        config = new_config;
+
+                        // Reset tick interval if it changed
+                        if tick_changed {
+                            interval = tokio::time::interval(config.tick_interval);
+                            tracing::info!(tick = ?config.tick_interval, "tick interval updated");
+                        }
+
+                        // Reload router config
+                        {
+                            let mut router_guard = router.write().await;
+                            router_guard.reload();
+                        }
+
+                        // Reload jobs path
+                        jobs_path = jobs::resolve_jobs_path();
+
+                        tracing::info!(
+                            tick = ?config.tick_interval,
+                            sync = ?config.sync_interval,
+                            parallel = config.max_parallel,
+                            "config reloaded"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(missed = n, "config change receiver lagged, reloading");
+                        // Reload everything since we missed events
+                        config = EngineConfig::from_config();
+                        interval = tokio::time::interval(config.tick_interval);
+                        {
+                            let mut router_guard = router.write().await;
+                            router_guard.reload();
+                        }
+                        jobs_path = jobs::resolve_jobs_path();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::warn!("config change channel closed");
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -797,4 +959,28 @@ async fn review_open_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_config_defaults() {
+        let config = EngineConfig::default();
+        assert_eq!(config.tick_interval, std::time::Duration::from_secs(10));
+        assert_eq!(config.sync_interval, std::time::Duration::from_secs(120));
+        assert_eq!(config.max_parallel, 4);
+        assert_eq!(config.stuck_timeout, 1800);
+    }
+
+    #[test]
+    fn engine_config_from_config_uses_defaults_when_no_config() {
+        // Without config files, from_config() should return defaults
+        let config = EngineConfig::from_config();
+        assert_eq!(config.tick_interval, std::time::Duration::from_secs(10));
+        assert_eq!(config.sync_interval, std::time::Duration::from_secs(120));
+        assert_eq!(config.max_parallel, 4);
+        assert_eq!(config.stuck_timeout, 1800);
+    }
 }

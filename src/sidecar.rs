@@ -1,21 +1,69 @@
 //! Sidecar file management — JSON metadata files alongside tasks.
 //!
-//! Each task gets a `.orch/{task_id}.json` sidecar file that stores
+//! Each task gets a `state/{task_id}.json` sidecar file that stores
 //! runtime metadata (model, prompt hash, timing, token counts, etc.).
 //! This is the authoritative source for data that doesn't belong in GitHub labels.
+//!
+//! State directory: `~/.orchestrator/state/`
+//! Legacy fallback: `~/.orchestrator/.orchestrator/` (read-only)
 
 use anyhow::Context;
 use serde_json::Value;
 use std::path::PathBuf;
 
-/// Get the sidecar directory path.
-fn sidecar_dir() -> anyhow::Result<PathBuf> {
-    crate::home::sidecar_dir()
+/// Get the runtime state directory path.
+///
+/// New location: `~/.orch/state/`
+/// Legacy fallback: `~/.orchestrator/state/` then `~/.orchestrator/.orchestrator/`
+///
+/// On first call, creates the new directory.
+pub fn state_dir() -> anyhow::Result<PathBuf> {
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let dir = home.join(".orch").join("state");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Legacy state directories for backward-compatible reads.
+///
+/// Checks `~/.orchestrator/state/` first, then `~/.orchestrator/.orchestrator/`.
+/// Never writes to these locations.
+fn legacy_state_dir() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    // Check ~/.orchestrator/state/ (intermediate migration path)
+    let mid = home.join(".orchestrator").join("state");
+    if mid.is_dir() {
+        return Some(mid);
+    }
+    // Check ~/.orchestrator/.orchestrator/ (original nested path)
+    let old = home.join(".orchestrator").join(".orchestrator");
+    if old.is_dir() {
+        return Some(old);
+    }
+    None
+}
+
+/// Resolve a file inside the state directory, falling back to the legacy
+/// location when the file doesn't exist at the new path yet.
+pub fn state_file(name: &str) -> anyhow::Result<PathBuf> {
+    let new_path = state_dir()?.join(name);
+    if new_path.exists() {
+        return Ok(new_path);
+    }
+    // Check legacy location
+    if let Some(legacy) = legacy_state_dir() {
+        let old_path = legacy.join(name);
+        if old_path.exists() {
+            return Ok(old_path);
+        }
+    }
+    // Return new path even if it doesn't exist yet (for writes)
+    Ok(new_path)
 }
 
 /// Get the path to a task's sidecar file.
 fn sidecar_path(task_id: &str) -> anyhow::Result<PathBuf> {
-    Ok(sidecar_dir()?.join(format!("{task_id}.json")))
+    state_file(&format!("{task_id}.json"))
 }
 
 /// Read a field from a sidecar file.

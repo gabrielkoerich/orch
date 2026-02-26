@@ -18,6 +18,7 @@ pub mod worktree;
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::config;
 use crate::engine::router::{get_route_result, RouteResult};
+use crate::security;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use response::RunResult;
@@ -35,8 +36,8 @@ pub struct TaskRunner {
 
 impl TaskRunner {
     pub fn new(repo: String) -> Self {
-        let orch_home = crate::home::orch_home()
-            .unwrap_or_else(|_| PathBuf::from("/tmp").join(".orch"));
+        let orch_home =
+            crate::home::orch_home().unwrap_or_else(|_| PathBuf::from("/tmp").join(".orch"));
 
         Self { repo, orch_home }
     }
@@ -225,9 +226,13 @@ impl TaskRunner {
             }
         }
 
-        // Read exit code
-        let state_dir = crate::home::state_dir()?;
-        let status_file = state_dir.join(format!("exit-{task_id}.txt"));
+        // Read exit code (check new state dir, fall back to legacy)
+        let status_file =
+            sidecar::state_file(&format!("exit-{task_id}.txt")).unwrap_or_else(|_| {
+                self.orch_home
+                    .join("state")
+                    .join(format!("exit-{task_id}.txt"))
+            });
         let exit_code: i32 = std::fs::read_to_string(&status_file)
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -453,14 +458,29 @@ impl TaskRunner {
         };
         backend.update_status(&task.id, new_status).await?;
 
-        // Post comment
+        // Post comment (scan for secrets before posting to GitHub)
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let comment = if !summary.is_empty() {
+        let raw_comment = if !summary.is_empty() {
             format!("[{now}] {status}: {summary}")
         } else if !last_error.is_empty() {
             format!("[{now}] {status}: {last_error}")
         } else {
             format!("[{now}] {status}")
+        };
+
+        // Scan for leaked secrets and redact if needed
+        let comment = if security::has_leaks(&raw_comment) {
+            let leaks = security::scan(&raw_comment);
+            let rules: Vec<&str> = leaks.iter().map(|l| l.rule).collect();
+            let warning = format!(
+                "\n\n> ⚠️ **Security Notice**: {} potential secret(s) detected and redacted: {}",
+                leaks.len(),
+                rules.join(", ")
+            );
+            let redacted = security::redact(&raw_comment);
+            format!("{redacted}{warning}")
+        } else {
+            raw_comment
         };
         backend.post_comment(&task.id, &comment).await?;
 

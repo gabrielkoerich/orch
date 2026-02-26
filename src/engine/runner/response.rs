@@ -28,10 +28,9 @@ pub enum RunResult {
 
 /// Collect and classify the agent's response.
 pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> RunResult {
-    let state_dir = crate::home::state_dir().unwrap_or_default();
-
-    // Read stderr
-    let stderr_path = state_dir.join(format!("stderr-{task_id}.txt"));
+    // Read stderr (check new state dir, fall back to legacy)
+    let stderr_path = sidecar::state_file(&format!("stderr-{task_id}.txt"))
+        .unwrap_or_else(|_| PathBuf::from(format!("/tmp/stderr-{task_id}.txt")));
     let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
 
     // Read response from output file
@@ -125,12 +124,19 @@ fn read_output_file(task_id: &str, primary_path: &Path) -> String {
     }
 
     // Fallback locations
-    let state_dir = crate::home::state_dir().unwrap_or_default();
+    let state_dir = sidecar::state_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
 
-    let fallbacks = [
+    let mut fallbacks = vec![
         PathBuf::from(format!("/tmp/output-{task_id}.json")),
         state_dir.join(format!("output-{task_id}.json")),
     ];
+
+    // Also check legacy location
+    if let Ok(legacy_path) = sidecar::state_file(&format!("output-{task_id}.json")) {
+        if !fallbacks.contains(&legacy_path) {
+            fallbacks.push(legacy_path);
+        }
+    }
 
     for path in &fallbacks {
         if let Ok(content) = std::fs::read_to_string(path) {

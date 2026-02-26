@@ -114,7 +114,8 @@ pub fn skills_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Get the path to the sidecar directory (~/.orch/.orch/).
+/// Alias for state_dir (backward compat).
+#[allow(dead_code)]
 pub fn sidecar_dir() -> anyhow::Result<PathBuf> {
     state_dir()
 }
@@ -122,7 +123,6 @@ pub fn sidecar_dir() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::TempDir;
 
     #[test]

@@ -10,7 +10,7 @@ mod github;
 mod home;
 mod parser;
 #[allow(dead_code)] // security module ready for use, not integrated yet
-mod security;
+pub mod security;
 mod sidecar;
 mod template;
 mod tmux;

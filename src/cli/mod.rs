@@ -245,9 +245,8 @@ pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
     use crate::backends::ExternalBackend;
     use crate::db::Db;
 
-    let repo = config::get("repo").context(
-        "'repo' not set in config — run `orch init` or set repo in ~/.orch/config.yml",
-    )?;
+    let repo = config::get("repo")
+        .context("'repo' not set in config — run `orch init` or set repo in ~/.orch/config.yml")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
     let db = Arc::new(Db::open(&crate::db::default_path()?)?);
     db.migrate().await?;

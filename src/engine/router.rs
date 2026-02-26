@@ -307,6 +307,23 @@ impl Router {
         Self::new(RouterConfig::from_config())
     }
 
+    /// Reload router configuration from config files.
+    ///
+    /// Re-reads all router settings and re-discovers available agents.
+    /// Called when config files change on disk.
+    pub fn reload(&mut self) {
+        let new_config = RouterConfig::from_config();
+        let new_agents = Self::discover_agents(&new_config.agents);
+        tracing::info!(
+            mode = %new_config.mode,
+            agents = ?new_agents,
+            fallback = %new_config.fallback_executor,
+            "router reloaded"
+        );
+        self.config = new_config;
+        self.available_agents = new_agents;
+    }
+
     /// Discover available agent CLIs in PATH.
     /// Checks all agents from the configured list.
     fn discover_agents(configured_agents: &[String]) -> Vec<String> {
@@ -1278,5 +1295,28 @@ Hope that helps!"#;
         let task = create_test_task("1", "Fix bug", vec!["bug".to_string()]);
         let warning = router.check_routing_sanity(&task, "codex", &profile);
         assert!(warning.is_none());
+    }
+
+    #[test]
+    fn router_reload_preserves_structure() {
+        let config = RouterConfig::default();
+        let mut router = Router {
+            config,
+            available_agents: vec!["claude".to_string()],
+        };
+
+        // Reload — should re-read config and remain valid
+        router.reload();
+
+        // After reload, mode should be a valid value (llm or round_robin)
+        assert!(
+            router.config.mode == "llm" || router.config.mode == "round_robin",
+            "mode should be 'llm' or 'round_robin', got '{}'",
+            router.config.mode
+        );
+        // Fallback executor should always be set
+        assert!(!router.config.fallback_executor.is_empty());
+        // Tools should always be populated
+        assert!(!router.config.allowed_tools.is_empty());
     }
 }
