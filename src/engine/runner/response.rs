@@ -10,7 +10,8 @@ use crate::parser::{self, AgentResponse};
 use crate::sidecar;
 use std::path::{Path, PathBuf};
 
-/// Classification of agent execution result.
+/// Classification of agent execution result (legacy, used in tests).
+#[allow(dead_code)]
 pub enum RunResult {
     /// Agent completed successfully with a parsed response.
     Success(AgentResponse),
@@ -40,7 +41,8 @@ pub enum WeightSignal {
     None,
 }
 
-/// Collect and classify the agent's response.
+/// Collect and classify the agent's response (legacy, kept for backward compat).
+#[allow(dead_code)]
 pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> RunResult {
     // Read stderr (check new state dir, fall back to legacy)
     let stderr_path = sidecar::state_file(&format!("stderr-{task_id}.txt"))
@@ -129,7 +131,7 @@ pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> Ru
 }
 
 /// Read the agent's output file, trying multiple locations.
-fn read_output_file(task_id: &str, primary_path: &Path) -> String {
+pub fn read_output_file(task_id: &str, primary_path: &Path) -> String {
     // Primary: explicit output file
     if let Ok(content) = std::fs::read_to_string(primary_path) {
         if !content.is_empty() {
@@ -164,7 +166,8 @@ fn read_output_file(task_id: &str, primary_path: &Path) -> String {
     String::new()
 }
 
-/// Check if output indicates a usage/rate limit error.
+/// Check if output indicates a usage/rate limit error (legacy helper).
+#[allow(dead_code)]
 fn is_usage_limit_error(text: &str) -> bool {
     let lower = text.to_lowercase();
     let patterns = [
@@ -186,7 +189,8 @@ fn is_usage_limit_error(text: &str) -> bool {
     patterns.iter().any(|p| lower.contains(p))
 }
 
-/// Check if output indicates an auth/billing error.
+/// Check if output indicates an auth/billing error (legacy helper).
+#[allow(dead_code)]
 fn is_auth_error(text: &str) -> bool {
     let lower = text.to_lowercase();
     let patterns = [
@@ -209,7 +213,8 @@ fn is_auth_error(text: &str) -> bool {
     patterns.iter().any(|p| lower.contains(p))
 }
 
-/// Detect missing tooling from agent output.
+/// Detect missing tooling from agent output (legacy helper).
+#[allow(dead_code)]
 fn detect_missing_tooling(text: &str) -> Option<String> {
     let known_tools = [
         "bun",
@@ -270,12 +275,123 @@ fn detect_missing_tooling(text: &str) -> Option<String> {
     None
 }
 
-/// Pick a fallback agent, avoiding agents already in the reroute chain.
+/// Cooldown duration for failed agents (30 minutes).
+const AGENT_COOLDOWN_SECS: i64 = 30 * 60;
+
+/// Cooldown duration for model-specific failures (1 hour).
+/// When a specific agent+model combo fails (e.g., model not available,
+/// model-specific rate limit), we ban that combo for longer.
+const MODEL_COOLDOWN_SECS: i64 = 60 * 60;
+
+/// Path to the agent cooldowns file.
+fn cooldowns_path() -> std::path::PathBuf {
+    crate::sidecar::state_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+        .join("agent_cooldowns.json")
+}
+
+/// Record that an agent has failed and should be temporarily avoided.
+pub fn record_agent_failure(agent_name: &str) {
+    record_failure_with_reason(agent_name, "agent_error");
+}
+
+/// Record that a specific agent+model combo has failed.
+///
+/// The cooldown key is `"agent:model"` so we can track model-specific
+/// failures separately (e.g., codex with o3-mini fails but gpt-4o works).
+pub fn record_model_failure(agent_name: &str, model: &str) {
+    let key = format!("{agent_name}:{model}");
+    record_failure_with_reason(&key, "model_error");
+}
+
+/// Check if a specific agent+model combo is in cooldown.
+pub fn is_model_in_cooldown(agent_name: &str, model: &str) -> bool {
+    let key = format!("{agent_name}:{model}");
+    is_key_in_cooldown(&key, MODEL_COOLDOWN_SECS)
+}
+
+/// Check if an agent is currently in cooldown period.
+pub fn is_agent_in_cooldown(agent_name: &str) -> bool {
+    is_key_in_cooldown(agent_name, AGENT_COOLDOWN_SECS)
+}
+
+/// Shared helper: check if a given key is in cooldown within `max_age_secs`.
+fn is_key_in_cooldown(key: &str, max_age_secs: i64) -> bool {
+    let cooldowns = read_cooldowns_file();
+    if let Some(entry) = cooldowns.get(key) {
+        if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
+            let now = chrono::Utc::now().timestamp();
+            return (now - failed_at) < max_age_secs;
+        }
+    }
+    false
+}
+
+/// Read and parse the cooldowns JSON file. Returns empty map on any error.
+fn read_cooldowns_file() -> serde_json::Map<String, serde_json::Value> {
+    let path = cooldowns_path();
+    if !path.exists() {
+        return serde_json::Map::new();
+    }
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn record_failure_with_reason(key: &str, reason: &str) {
+    let path = cooldowns_path();
+    let mut cooldowns = read_cooldowns_file();
+
+    // Record failure with current timestamp
+    let timestamp = chrono::Utc::now().timestamp();
+    cooldowns.insert(
+        key.to_string(),
+        serde_json::json!({ "failed_at": timestamp, "reason": reason }),
+    );
+
+    // Write back
+    if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns)) {
+        std::fs::write(&path, content).ok();
+    }
+}
+
+/// Clear expired cooldowns from the file.
+pub fn clear_expired_cooldowns() {
+    let path = cooldowns_path();
+    if !path.exists() {
+        return;
+    }
+
+    let mut cooldowns = read_cooldowns_file();
+
+    let now = chrono::Utc::now().timestamp();
+    let mut to_remove = Vec::new();
+
+    for (agent, entry) in &cooldowns {
+        if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
+            if (now - failed_at) >= AGENT_COOLDOWN_SECS {
+                to_remove.push(agent.clone());
+            }
+        }
+    }
+
+    for agent in to_remove {
+        cooldowns.remove(&agent);
+    }
+
+    if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns)) {
+        std::fs::write(&path, content).ok();
+    }
+}
+
+/// Pick a fallback agent, avoiding agents already in the reroute chain and agents in cooldown.
 pub fn pick_fallback_agent(
     current_agent: &str,
     chain: &str,
     available_agents: &[String],
 ) -> Option<String> {
+    // Clear expired cooldowns first
+    clear_expired_cooldowns();
+
     let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
         std::collections::HashSet::new()
     } else {
@@ -283,7 +399,10 @@ pub fn pick_fallback_agent(
     };
 
     for agent in available_agents {
-        if agent != current_agent && !chain_set.contains(agent.as_str()) {
+        if agent != current_agent
+            && !chain_set.contains(agent.as_str())
+            && !is_agent_in_cooldown(agent)
+        {
             return Some(agent.clone());
         }
     }
@@ -291,13 +410,126 @@ pub fn pick_fallback_agent(
     None
 }
 
-/// Get a truncated snippet for error messages (last 300 chars).
-fn snippet(text: &str) -> String {
-    if text.len() > 300 {
-        text[text.len() - 300..].to_string()
+/// Retryable error types that should trigger agent failover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryableError {
+    /// Agent timed out.
+    Timeout,
+    /// Usage/rate limit hit.
+    UsageLimit,
+    /// Auth/billing error.
+    AuthError,
+    /// General failure (non-retryable but we still try fallback agents).
+    Failed,
+    /// Missing tooling - fallback might help if another agent has the tool.
+    MissingTooling,
+}
+
+/// Handle failover for any retryable error type.
+/// Returns true if the task was rerouted, false if it should be marked needs_review.
+///
+/// Note: DB recording of rate limit events is handled by the caller (mod.rs)
+/// which has async context. This function only handles sidecar state + cooldowns.
+pub fn handle_failover(
+    task_id: &str,
+    agent_name: &str,
+    error_type: RetryableError,
+    error_message: &str,
+) -> bool {
+    // Get the reroute chain
+    let chain = get_reroute_chain(task_id);
+    let chain = update_reroute_chain(task_id, agent_name, &chain);
+
+    // Get all available agents
+    let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
+        .iter()
+        .filter(|a| which::which(a).is_ok())
+        .map(|s| s.to_string())
+        .collect();
+
+    // Check if we've exhausted all agents (build chain_set once)
+    let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
+        std::collections::HashSet::new()
     } else {
-        text.to_string()
+        chain.split(',').collect()
+    };
+    let is_exhausted = available.iter().all(|a| chain_set.contains(a.as_str()));
+
+    if is_exhausted {
+        tracing::warn!(
+            task_id,
+            agent = agent_name,
+            "all agents exhausted, marking needs_review"
+        );
+        if let Err(e) = sidecar::set(
+            task_id,
+            &[
+                "status=needs_review".to_string(),
+                format!("last_error={error_message} (all agents exhausted)"),
+            ],
+        ) {
+            tracing::error!(task_id, ?e, "failed to update task status during failover");
+        }
+        return false;
     }
+
+    // Pick a fallback agent
+    if let Some(next) = pick_fallback_agent(agent_name, &chain, &available) {
+        tracing::info!(
+            task_id,
+            from = agent_name,
+            to = next,
+            error_type = ?error_type,
+            "failover: switching to fallback agent"
+        );
+
+        // Record agent failure for cooldown tracking
+        // Skip cooldown for MissingTooling — it's permanent, not transient
+        if !matches!(error_type, RetryableError::MissingTooling) {
+            record_agent_failure(agent_name);
+        }
+
+        if let Err(e) = sidecar::set(
+            task_id,
+            &[
+                format!("agent={next}"),
+                "agent_model=".to_string(),
+                "status=new".to_string(),
+                format!("last_error={error_message}, rerouted to {next}"),
+            ],
+        ) {
+            tracing::error!(task_id, ?e, "failed to update task status during failover");
+        }
+        return true;
+    }
+
+    // No fallback available
+    tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
+    if let Err(e) = sidecar::set(
+        task_id,
+        &[
+            "status=needs_review".to_string(),
+            format!("last_error={error_message}, no fallback agents"),
+        ],
+    ) {
+        tracing::error!(task_id, ?e, "failed to update task status during failover");
+    }
+    false
+}
+
+/// Get a truncated snippet for error messages (last 300 chars, UTF-8 safe).
+#[allow(dead_code)]
+fn snippet(text: &str) -> String {
+    if text.len() <= 300 {
+        return text.to_string();
+    }
+    let start = text.len() - 300;
+    // Walk forward to find a char boundary
+    let mut idx = start;
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    text[idx..].to_string()
 }
 
 /// Get the reroute chain from sidecar.

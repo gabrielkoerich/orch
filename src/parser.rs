@@ -12,9 +12,13 @@ use std::io::Read;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentResponse {
     pub status: String,
+    #[serde(default)]
     pub summary: String,
+    #[serde(default)]
     pub accomplished: Vec<String>,
+    #[serde(default)]
     pub remaining: Vec<String>,
+    #[serde(default)]
     pub files: Vec<String>,
     #[serde(default)]
     pub error: Option<String>,

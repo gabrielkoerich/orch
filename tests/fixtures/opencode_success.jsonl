@@ -1,0 +1,4 @@
+{"type":"step_start","timestamp":1706300000,"part":{"type":"step-start","snapshot":"Starting task..."}}
+{"type":"text","timestamp":1706300001,"part":{"type":"text","text":"Looking at the codebase..."}}
+{"type":"text","timestamp":1706300002,"part":{"type":"text","text":"{\"status\":\"done\",\"summary\":\"Fixed the bug\",\"accomplished\":[\"Identified root cause\",\"Applied fix\"],\"remaining\":[],\"files\":[\"src/lib.rs\"]}"}}
+{"type":"step_finish","timestamp":1706300010,"part":{"type":"step-finish","reason":"stop","cost":0.015,"tokens":{"total":18000,"input":17500,"output":500}}}
