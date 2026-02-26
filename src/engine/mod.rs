@@ -67,8 +67,6 @@ pub struct EngineConfig {
     pub max_parallel: usize,
     /// Stuck task timeout (seconds)
     pub stuck_timeout: u64,
-    /// Whether webhooks are currently healthy
-    pub webhook_healthy: bool,
 }
 
 impl Default for EngineConfig {
@@ -80,7 +78,6 @@ impl Default for EngineConfig {
             webhook_health_check_interval: Some(std::time::Duration::from_secs(60)),
             max_parallel: 4,
             stuck_timeout: 1800,
-            webhook_healthy: false,
         }
     }
 }
@@ -122,22 +119,17 @@ impl EngineConfig {
                     config.fallback_sync_interval = None;
                 }
             }
-        } else {
-            // Default fallback sync interval is 30 seconds
-            config.fallback_sync_interval = Some(std::time::Duration::from_secs(30));
         }
 
         if let Ok(val) = crate::config::get("engine.webhook_health_check_interval") {
             if let Ok(secs) = val.parse::<u64>() {
                 if secs > 0 {
-                    config.webhook_health_check_interval = Some(std::time::Duration::from_secs(secs));
+                    config.webhook_health_check_interval =
+                        Some(std::time::Duration::from_secs(secs));
                 } else {
                     config.webhook_health_check_interval = None;
                 }
             }
-        } else {
-            // Default health check interval is 60 seconds
-            config.webhook_health_check_interval = Some(std::time::Duration::from_secs(60));
         }
 
         config
@@ -386,11 +378,13 @@ pub async fn serve() -> anyhow::Result<()> {
     // Notify used by webhook events to wake up the engine tick immediately
     let webhook_notify = Arc::new(Notify::new());
 
-    // Track webhook state for health checks and fallback
+    // Track webhook state for health checks and fallback.
+    // When webhooks are disabled, `in_fallback_mode` stays true so sync
+    // uses the faster fallback interval for polling.
     let webhook_port: Option<u16>;
-    let mut webhook_healthy = false;
+    let mut webhook_healthy: bool;
     let mut last_webhook_health_check = std::time::Instant::now();
-    let mut in_fallback_mode = false;
+    let mut in_fallback_mode: bool;
 
     // Start webhook server if configured
     let webhook_enabled = crate::config::get("webhook.enabled")
@@ -436,10 +430,14 @@ pub async fn serve() -> anyhow::Result<()> {
             }
         });
 
+        webhook_healthy = true;
+        in_fallback_mode = false;
         tracing::info!(port, "webhook server started");
     } else {
         webhook_port = None;
-        tracing::info!("webhook server disabled (set webhook.enabled: true to enable)");
+        webhook_healthy = false;
+        in_fallback_mode = true;
+        tracing::info!("webhook server disabled, using polling fallback mode");
     }
 
     // Agent router (selects agent + model per task) - shared across projects

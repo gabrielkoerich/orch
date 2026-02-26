@@ -67,9 +67,9 @@ The orchestrator has two modes for receiving GitHub events:
 
 ### Polling Fallback
 
-When webhooks are enabled but become unavailable (port conflict, GitHub downtime, auth issues), the orchestrator automatically switches to polling fallback mode:
+When webhooks are enabled but the local server becomes unavailable (e.g. port conflict, crash), the orchestrator automatically switches to polling fallback mode. When webhooks are disabled entirely, polling mode is used from the start.
 
-- **Health check**: Pings the webhook server's `/health` endpoint every 60 seconds (configurable)
+- **Health check**: Pings the local webhook server's `/health` endpoint every 60 seconds (configurable). This verifies the local HTTP listener is running — it does not verify GitHub-side reachability or webhook secret validity.
 - **Faster polling**: When in fallback mode, sync operations run every 30 seconds (configurable) instead of 120s
 - **Logging**: Clear log messages when entering/exiting fallback mode:
   - `entering polling fallback mode` — webhook health check failed
