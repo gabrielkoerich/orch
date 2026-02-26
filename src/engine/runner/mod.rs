@@ -477,6 +477,23 @@ impl TaskRunner {
         let summary = sidecar::get(task_id, "summary").unwrap_or_default();
         let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
 
+        // Write status to sidecar BEFORE updating GitHub (ensures atomicity)
+        // This way sidecar always leads GitHub - on crash/retry:
+        // - If sidecar shows "done" but GitHub doesn't, we retry the GitHub update
+        // - If sidecar shows old status, we redo the work (safe)
+        sidecar::set(
+            task_id,
+            &[
+                format!("status={}", status),
+                format!("summary={}", summary),
+                format!("last_error={}", last_error),
+                format!(
+                    "status_confirmed_at={}",
+                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+                ),
+            ],
+        )?;
+
         // Update GitHub status
         let new_status = match status.as_str() {
             "done" => Status::Done,
