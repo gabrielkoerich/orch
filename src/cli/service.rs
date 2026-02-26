@@ -12,7 +12,7 @@ fn pid_file() -> PathBuf {
     sidecar::state_file("orch.pid").unwrap_or_else(|_| {
         dirs::home_dir()
             .unwrap_or_default()
-            .join(".orchestrator")
+            .join(".orch")
             .join("state")
             .join("orch.pid")
     })
@@ -33,8 +33,8 @@ pub fn start() -> anyhow::Result<()> {
         let orch_bin = std::env::current_exe()?;
         let log_dir = sidecar::state_dir()?;
 
-        let stdout_log = std::fs::File::create(log_dir.join("orchestrator.log"))?;
-        let stderr_log = std::fs::File::create(log_dir.join("orchestrator.error.log"))?;
+        let stdout_log = std::fs::File::create(log_dir.join("orch.log"))?;
+        let stderr_log = std::fs::File::create(log_dir.join("orch.error.log"))?;
 
         let child = std::process::Command::new(orch_bin)
             .arg("serve")

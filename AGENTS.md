@@ -27,7 +27,7 @@ orch task unblock all
 
 ## Logs
 
-- Service log: `~/.orchestrator/state/orch.log`
+- Service log: `~/.orch/state/orch.log`
 - Brew stdout: `/opt/homebrew/var/log/orch.log` (startup messages only)
 - Brew stderr: `/opt/homebrew/var/log/orch.error.log`
 
@@ -186,20 +186,20 @@ The routing prompt template is at `prompts/route.md`. It includes:
 ## Directory layout
 
 ```
-~/.orchestrator/
+~/.orch/
   tasks.yml              # task database (all projects, filtered by dir)
   config.yml             # global config
   jobs.yml               # scheduled jobs
   projects/              # bare clones added via `orch project add`
-    owner/repo.git       #   each has .orchestrator.yml inside
+    owner/repo.git       #   each has .orch.yml inside
   worktrees/             # agent worktrees (all projects)
     repo/branch/         #   created by the runner, one per task
   state/                 # runtime state (logs, prompts, pid, locks)
 ```
 
 - **User-managed projects** (e.g. `~/Projects/foo`): user clones, runs `orch init`. Project dir stays where the user put it.
-- **Orch-managed projects** (`orch project add owner/repo`): bare clone at `~/.orchestrator/projects/<owner>/<repo>.git`.
-- **Worktrees**: always at `~/.orchestrator/worktrees/<project>/<branch>/` regardless of project type.
+- **Orch-managed projects** (`orch project add owner/repo`): bare clone at `~/.orch/projects/<owner>/<repo>.git`.
+- **Worktrees**: always at `~/.orch/worktrees/<project>/<branch>/` regardless of project type.
 - `ORCH_WORKTREES` env var overrides the worktrees base directory.
 
 ## Specs & Roadmap

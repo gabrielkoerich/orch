@@ -69,7 +69,7 @@ fn default_external() -> bool {
     true // Default to external (GitHub) for backward compatibility
 }
 
-/// Top-level config structure (for reading jobs from .orchestrator.yml / config.yml).
+/// Top-level config structure (for reading jobs from .orch.yml / config.yml).
 #[derive(Debug, Serialize, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
@@ -82,23 +82,20 @@ struct ConfigFile {
 /// Resolve the config file that contains jobs.
 ///
 /// Priority:
-/// 1. `.orchestrator.yml` in the current directory (project config)
-/// 2. `~/.orchestrator/config.yml` (global config)
+/// 1. `.orch.yml` in the current directory (project config)
+/// 2. `~/.orch/config.yml` (global config)
 pub fn resolve_jobs_path() -> PathBuf {
-    let project = PathBuf::from(".orchestrator.yml");
+    let project = PathBuf::from(".orch.yml");
     if project.exists() {
         return project;
     }
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".orchestrator")
-        .join("config.yml")
+    crate::home::config_path().unwrap_or_else(|_| PathBuf::from(".orch/config.yml"))
 }
 
 /// Load jobs from the orchestrator config file.
 ///
-/// Reads the `jobs` key from `.orchestrator.yml` (project) or
-/// `~/.orchestrator/config.yml` (global).
+/// Reads the `jobs` key from `.orch.yml` (project) or
+/// `~/.orch/config.yml` (global).
 pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
     if !path.exists() {
         return Ok(vec![]);

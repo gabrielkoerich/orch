@@ -45,7 +45,7 @@ pub fn build_runner_script(inv: &AgentInvocation) -> String {
     let state_dir = sidecar::state_dir().unwrap_or_else(|_| {
         dirs::home_dir()
             .unwrap_or_default()
-            .join(".orchestrator")
+            .join(".orch")
             .join("state")
     });
 

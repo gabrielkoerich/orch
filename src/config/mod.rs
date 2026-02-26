@@ -1,6 +1,6 @@
 //! Config reader — loads YAML config files and resolves dot-separated keys.
 //!
-//! Reads `~/.orchestrator/config.yml` (global) and `.orchestrator.yml` (project).
+//! Reads `~/.orch/config.yml` (global) and `.orch.yml` (project).
 //! Project config overrides global config for the same key.
 //!
 //! Features:
@@ -72,7 +72,7 @@ fn ensure_watcher() {
                     // Check if it's a config file we care about
                     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-                    if filename == "config.yml" || filename == ".orchestrator.yml" {
+                    if filename == "config.yml" || filename == ".orch.yml" {
                         invalidate_cache(&path);
                     }
                 }
@@ -107,23 +107,22 @@ fn watch_file(path: &PathBuf) {
     }
 }
 
-/// Resolve the global config path: `~/.orchestrator/config.yml`
+/// Resolve the global config path: `~/.orch/config.yml`
 fn global_config_path() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    Ok(home.join(".orchestrator").join("config.yml"))
+    crate::home::config_path()
 }
 
 /// Get a config value by dot-separated key (e.g. "agents.claude.model").
 ///
 /// Lookup order:
-/// 1. `.orchestrator.yml` in the current directory (project config)
-/// 2. `~/.orchestrator/config.yml` (global config)
+/// 1. `.orch.yml` in the current directory (project config)
+/// 2. `~/.orch/config.yml` (global config)
 ///
 /// Returns the first match as a string.
 /// Files are parsed once and cached for the process lifetime.
 pub fn get(key: &str) -> anyhow::Result<String> {
     // Try project config first
-    let project_path = PathBuf::from(".orchestrator.yml");
+    let project_path = PathBuf::from(".orch.yml");
     if project_path.exists() {
         if let Ok(val) = resolve_key(&project_path, key) {
             return Ok(val);

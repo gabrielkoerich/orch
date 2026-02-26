@@ -13,30 +13,34 @@ use std::path::PathBuf;
 
 /// Get the runtime state directory path.
 ///
-/// New location: `~/.orchestrator/state/`
-/// Legacy location: `~/.orchestrator/.orchestrator/`
+/// New location: `~/.orch/state/`
+/// Legacy fallback: `~/.orchestrator/state/` then `~/.orchestrator/.orchestrator/`
 ///
-/// On first call, creates the new directory. If files exist only at the
-/// legacy path, callers should check both (see [`state_dir_with_fallback`]).
+/// On first call, creates the new directory.
 pub fn state_dir() -> anyhow::Result<PathBuf> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
-    let dir = home.join(".orchestrator").join("state");
+    let dir = home.join(".orch").join("state");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Legacy state directory (`~/.orchestrator/.orchestrator/`).
+/// Legacy state directories for backward-compatible reads.
 ///
-/// Used only for backward-compatible reads — never write here.
+/// Checks `~/.orchestrator/state/` first, then `~/.orchestrator/.orchestrator/`.
+/// Never writes to these locations.
 fn legacy_state_dir() -> Option<PathBuf> {
-    let dir = dirs::home_dir()?
-        .join(".orchestrator")
-        .join(".orchestrator");
-    if dir.is_dir() {
-        Some(dir)
-    } else {
-        None
+    let home = dirs::home_dir()?;
+    // Check ~/.orchestrator/state/ (intermediate migration path)
+    let mid = home.join(".orchestrator").join("state");
+    if mid.is_dir() {
+        return Some(mid);
     }
+    // Check ~/.orchestrator/.orchestrator/ (original nested path)
+    let old = home.join(".orchestrator").join(".orchestrator");
+    if old.is_dir() {
+        return Some(old);
+    }
+    None
 }
 
 /// Resolve a file inside the state directory, falling back to the legacy

@@ -702,9 +702,8 @@ impl Router {
             }
         }
 
-        // Try ~/.orchestrator/skills
-        if let Some(home) = dirs::home_dir() {
-            let skills_dir = home.join(".orchestrator").join("skills");
+        // Try ~/.orch/skills
+        if let Ok(skills_dir) = crate::home::skills_dir() {
             if let Ok(catalog) = self.build_skills_catalog_from_dir(&skills_dir) {
                 return catalog;
             }
@@ -923,11 +922,9 @@ impl Router {
 
     /// Get the path for saving route prompts.
     fn route_prompt_path(&self, task_id: &str) -> PathBuf {
-        let orch_home = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".orchestrator")
-            .join(".orchestrator");
-        orch_home.join(format!("route-prompt-{task_id}.txt"))
+        crate::home::state_dir()
+            .unwrap_or_else(|_| PathBuf::from("/tmp").join(".orch").join(".orch"))
+            .join(format!("route-prompt-{task_id}.txt"))
     }
 
     /// Store routing result in sidecar file.

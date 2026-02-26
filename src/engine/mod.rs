@@ -170,7 +170,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
     if project_engines.is_empty() {
         anyhow::bail!(
-            "no valid projects configured — run `orch init` or add repos to ~/.orchestrator/config.yml"
+            "no valid projects configured — run `orch init` or add repos to ~/.orch/config.yml"
         );
     }
 
@@ -745,9 +745,8 @@ async fn cleanup_done_worktrees(
     let repo_root = resolve_repo_root().await?;
 
     // Get worktrees base path
-    let worktrees_base = dirs::home_dir()
-        .map(|h| h.join(".orchestrator").join("worktrees"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".orchestrator/worktrees"));
+    let worktrees_base = crate::home::worktrees_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from(".orch/worktrees"));
 
     for task in done_tasks {
         let task_id = &task.id.0;

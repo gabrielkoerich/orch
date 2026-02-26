@@ -36,9 +36,8 @@ pub struct TaskRunner {
 
 impl TaskRunner {
     pub fn new(repo: String) -> Self {
-        let orch_home = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".orchestrator");
+        let orch_home =
+            crate::home::orch_home().unwrap_or_else(|_| PathBuf::from("/tmp").join(".orch"));
 
         Self { repo, orch_home }
     }
