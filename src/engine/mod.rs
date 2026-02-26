@@ -24,10 +24,11 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
 use crate::channels::discord::DiscordChannel;
 use crate::channels::github::start_webhook_server;
+use crate::channels::notification::{NotificationLevel, TaskNotification};
 use crate::channels::telegram::TelegramChannel;
 use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
-use crate::channels::{Channel, ChannelRegistry, IncomingMessage};
+use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use crate::config;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::{get_route_result, Router};
@@ -249,6 +250,9 @@ pub async fn serve() -> anyhow::Result<()> {
         }
     }
 
+    // Wrap channel registry in Arc for shared access (notification dispatcher needs it)
+    let channel_registry = Arc::new(channel_registry);
+
     // Spawn tasks to handle incoming channel messages (if any channels are active)
     let transport_for_messages = transport.clone();
     for mut rx in channel_receivers {
@@ -271,6 +275,75 @@ pub async fn serve() -> anyhow::Result<()> {
                 }
             }
         });
+    }
+
+    // Spawn notification dispatcher — reads task completion notifications
+    // from transport and broadcasts to all configured channels.
+    {
+        let mut notification_rx = transport.subscribe_notifications();
+        let channels = channel_registry.clone();
+        tokio::spawn(async move {
+            loop {
+                match notification_rx.recv().await {
+                    Ok(notification) => {
+                        let level = NotificationLevel::from_config();
+                        if !level.should_notify(&notification.status) {
+                            tracing::debug!(
+                                task_id = %notification.task_id,
+                                status = %notification.status,
+                                "notification suppressed by level={:?}",
+                                level
+                            );
+                            continue;
+                        }
+
+                        tracing::info!(
+                            task_id = %notification.task_id,
+                            status = %notification.status,
+                            "broadcasting notification to channels"
+                        );
+
+                        for channel in channels.iter() {
+                            let (body, should_send) = match channel.name() {
+                                "telegram" => (notification.format_telegram(), true),
+                                "discord" => (notification.format_discord(), true),
+                                // GitHub is already handled by backend.post_comment()
+                                // tmux doesn't need task completion notifications
+                                _ => (String::new(), false),
+                            };
+
+                            if !should_send {
+                                continue;
+                            }
+
+                            let msg = OutgoingMessage {
+                                thread_id: notification.task_id.clone(),
+                                body,
+                                reply_to: None,
+                                metadata: serde_json::json!({}),
+                            };
+
+                            if let Err(e) = channel.send(&msg).await {
+                                tracing::warn!(
+                                    channel = channel.name(),
+                                    task_id = %notification.task_id,
+                                    ?e,
+                                    "failed to send notification"
+                                );
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(missed = n, "notification receiver lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::debug!("notification channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+        tracing::info!("notification dispatcher started");
     }
 
     // Notify used by webhook events to wake up the engine tick immediately
@@ -401,6 +474,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         &router_guard,
                         &engine.task_manager,
                         &weight_tx,
+                        &transport,
                     ).await {
                         tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
                     }
@@ -435,6 +509,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         &router_guard,
                         &engine.task_manager,
                         &weight_tx,
+                        &transport,
                     ).await {
                         tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
                     }
@@ -538,6 +613,7 @@ async fn tick(
     router: &Router,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
+    transport: &Arc<Transport>,
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
 
@@ -707,17 +783,24 @@ async fn tick(
         let backend = backend.clone();
         let tmux = tmux.clone();
         let capture = capture.clone();
+        let transport = transport.clone();
         let task_id_for_cleanup = task_id.clone();
         let task_owned = task.clone();
         let weight_tx = weight_tx.clone();
 
         // Load routing result from sidecar (stored during Phase 3a)
         let route_result = get_route_result(&task_id).ok();
+        let agent_name = route_result
+            .as_ref()
+            .map(|r| r.agent.clone())
+            .unwrap_or_else(|| "claude".to_string());
 
         tokio::spawn(async move {
             // Note: Using tracing::info_span directly without holding across await
             // to avoid Send issues with EnteredSpan
             tracing::info!(task_id, "dispatching task");
+
+            let dispatch_start = std::time::Instant::now();
 
             match runner
                 .run_with_context(&task_owned, &backend, &tmux, route_result.as_ref())
@@ -727,6 +810,20 @@ async fn tick(
                     tracing::info!(task_id, "task runner completed");
                     // Send weight signal back to the router
                     let _ = weight_tx.send(signal).await;
+
+                    // Send task completion notification
+                    let status = sidecar::get(&task_id, "status").unwrap_or_default();
+                    let summary = sidecar::get(&task_id, "summary").unwrap_or_default();
+                    let duration = dispatch_start.elapsed().as_secs_f64();
+
+                    transport.push_notification(TaskNotification {
+                        task_id: task_id.clone(),
+                        title: task_owned.title.clone(),
+                        status,
+                        agent: agent_name.clone(),
+                        duration_seconds: duration,
+                        summary,
+                    });
                 }
                 Err(e) => {
                     tracing::error!(task_id, ?e, "task runner failed");
@@ -746,6 +843,17 @@ async fn tick(
                             "failed to post error comment to GitHub"
                         );
                     }
+
+                    // Send error notification
+                    let duration = dispatch_start.elapsed().as_secs_f64();
+                    transport.push_notification(TaskNotification {
+                        task_id: task_id.clone(),
+                        title: task_owned.title.clone(),
+                        status: "failed".to_string(),
+                        agent: agent_name.clone(),
+                        duration_seconds: duration,
+                        summary: format!("Task runner failed: {e}"),
+                    });
                 }
             }
 
