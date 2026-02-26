@@ -1,9 +1,20 @@
-# Per-project orchestrator config (.orchestrator.yml)
+# Per-project orch config (.orch.yml)
 # Place this file in your project root directory.
-# Values here override the global config (~/.orchestrator/config.yml).
+# Values here override the global config (~/.orch/config.yml).
 #
 # Only include the keys you want to override — everything else
 # falls through to the global config.
+
+# Required — identifies this project on GitHub
+gh:
+  repo: "myorg/myproject"
+#   project_id: "PVT_..."
+#   project_status_field_id: ""
+#   project_status_map:
+#     backlog: ""
+#     in_progress: ""
+#     review: ""
+#     done: ""
 
 # Tools that must be available on PATH before an agent is launched.
 # If any are missing, the task is blocked immediately with a clear reason.
@@ -12,24 +23,6 @@
 #   - bun
 #   - anchor
 #   - solana-test-validator
-
-# gh:
-#   repo: "myorg/myproject"
-#   project_id: "PVT_..."
-#   sync_label: ""
-#   project_status_field_id: ""
-#   # Optional: set these if your Project "Status" options aren't
-#   # exactly: Backlog, In Progress, Review, Done
-#   project_status_names:
-#     backlog: "Todo"
-#     in_progress: "Doing"
-#     review: ["In Review", "Needs Review"]
-#     done: "Done"
-#   project_status_map:
-#     backlog: ""
-#     in_progress: ""
-#     review: ""
-#     done: ""
 
 # workflow:
 #   auto_close: false
@@ -41,7 +34,8 @@
 #   model: "haiku"
 #   fallback_executor: "codex"
 
-# Example job:
+# Scheduled jobs for this project
+# jobs:
 #   - id: daily-sync
 #     schedule: "0 9 * * *"         # cron expression (min hour dom month dow)
 #     task:
@@ -50,13 +44,9 @@
 #       labels: [sync]
 #       agent: ""                   # empty = let router decide
 #     enabled: true
-#     last_run: null
-#     last_task_status: null
-#     active_task_id: null
 #
 # Schedule shortcuts: @hourly @daily @weekly @monthly @yearly
 #
 # Dedup: if active_task_id points to a task that isn't "done",
 # the job waits. Tasks can delegate, retry, get reviewed — the
 # job won't create a duplicate until the previous run finishes.
-# jobs: []

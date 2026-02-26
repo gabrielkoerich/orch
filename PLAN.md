@@ -344,7 +344,7 @@ In v1, the tmux bridge changes this completely:
 | Agent invocation | **Hybrid** | Rust builds the command, generates a runner script, tmux executes it |
 | ~~`justfile`~~ | **Deleted** | All recipes ported to native `orch` CLI subcommands |
 | Prompt templates | **Unchanged** | Markdown files in `prompts/`, rendered by Rust `template.rs` |
-| Config | **Consolidated** | Single `.orchestrator.yml` per project + `~/.orchestrator/config.yml` global |
+| Config | **Consolidated** | Per-project `.orch.yml` + `~/.orch/config.yml` global (see [Config Architecture](#config-architecture)) |
 
 **Principle:** Rust owns the entire lifecycle. The only bash left is the thin runner scripts that tmux executes (agents need a real TTY). All orchestration logic, git operations, and API calls are native Rust.
 
@@ -725,6 +725,8 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] `orch log` — tail logs
 - [x] `orch service start/stop/restart/status` — service management
 - [x] `orch completions <shell>` — shell completions
+- [x] `orch board list/link/sync/info` — GitHub Projects V2 board management
+- [ ] `orch project add/remove/list` — multi-project management
 - [x] Rename binary from `orch-core` to `orch`
 - [x] Absorb justfile routing into native CLI (justfile deleted)
 
@@ -753,7 +755,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 src/
 ├── main.rs                  # CLI entrypoint (clap) + all subcommand dispatch
 ├── config/
-│   └── mod.rs               # Config loading (.orchestrator.yml + ~/.orchestrator/config.yml)
+│   └── mod.rs               # Config loading (.orch.yml + ~/.orch/config.yml, multi-project)
 │
 ├── cli/
 │   ├── mod.rs               # CLI utilities (agents, init, log, version)
@@ -797,7 +799,8 @@ src/
 ├── github/
 │   ├── mod.rs               # GitHub helpers (shared by backend + channel)
 │   ├── cli.rs               # `gh api` wrapper — structured args in, serde out
-│   └── types.rs             # GitHubIssue, GitHubComment, GitHubLabel, etc.
+│   ├── types.rs             # GitHubIssue, GitHubComment, GitHubLabel, etc.
+│   └── projects.rs          # GitHub Projects V2 GraphQL operations
 │
 ├── db.rs                    # SQLite for internal tasks (schema + migrations)
 ├── sidecar.rs               # JSON sidecar file I/O + agent memory persistence
@@ -1037,6 +1040,106 @@ The binary rename (`orch-core` → `orch`) is complete. Directory rename (`~/.or
 
 ---
 
+## Config Architecture
+
+### Design
+
+Two layers: **global defaults** + **per-project overrides**.
+
+**Global config: `~/.orch/config.yml`** — shared defaults and project registry.
+
+```yaml
+# Project registry — list of local paths
+# Each path must contain a .orch.yml with gh.repo
+projects:
+  - /Users/gb/Projects/orch
+  - /Users/gb/Projects/my-other-project
+
+# Shared defaults (apply to all projects unless overridden)
+workflow:
+  auto_close: true
+  review_owner: "@owner"
+  max_attempts: 10
+  timeout_seconds: 1800
+
+router:
+  mode: "round_robin"
+  timeout_seconds: 60
+  fallback_executor: "minimax"
+  allowed_tools: [yq, jq, bash, just, git, rg, ...]
+
+model_map:
+  simple: { claude: haiku, codex: gpt-5.1-codex-mini }
+  medium: { claude: opus, codex: gpt-5.2 }
+  complex: { claude: opus, codex: gpt-5.3-codex }
+
+agents:
+  claude: { allowed_tools: [...] }
+  opencode: { permission: {...}, models: [...] }
+
+git:
+  name: "orchestrator[bot]"
+  email: "orchestrator@orchestrator.bot"
+```
+
+**Per-project config: `{project_path}/.orch.yml`** — project-specific settings.
+
+```yaml
+# REQUIRED — identifies this project on GitHub
+gh:
+  repo: "owner/repo"
+  project_id: "PVT_..."           # optional: GitHub Projects V2
+  project_status_field_id: "..."   # optional
+  project_status_map: { ... }      # optional
+
+# Optional overrides (merge on top of global defaults)
+workflow:
+  auto_close: false
+
+router:
+  fallback_executor: "codex"
+
+required_tools:
+  - cargo
+
+# Per-project scheduled jobs
+jobs:
+  - id: code-review
+    schedule: "0 4,17 * * *"
+    task: { title: "Code review", body: "...", labels: [review] }
+    enabled: true
+```
+
+### Resolution order
+
+1. Read `projects:` from `~/.orch/config.yml` → list of paths
+2. For each path, read `{path}/.orch.yml` → get `gh.repo`, overrides, jobs
+3. Per-project values override global defaults for the same key
+4. CLI commands resolve project from CWD (find nearest `.orch.yml` walking up)
+
+### What was removed
+
+| Old key | Where it was | Replacement |
+|---------|-------------|-------------|
+| `project_dir` (global) | `~/.orch/config.yml` | `projects:` list (paths) |
+| `gh.repo` (global) | `~/.orch/config.yml` | Per-project `.orch.yml` |
+| `projects.yml` | `~/.orch/projects.yml` | `projects:` in `config.yml` |
+| `repo` (top-level) | `~/.orch/config.yml` | Per-project `gh.repo` |
+
+### CLI naming
+
+| Command | Purpose |
+|---------|---------|
+| `orch project add <path>` | Register a project path in global config |
+| `orch project remove <path>` | Unregister a project from global config |
+| `orch project list` | List all registered projects with repo + status |
+| `orch board list/link/sync/info` | GitHub Projects V2 board management |
+| `orch init` | Initialize `.orch.yml` in current directory |
+
+Note: `orch board` manages GitHub Projects V2 boards. `orch project` manages the multi-project registry in global config.
+
+---
+
 ## Parity Audit — Feature Gaps
 
 Features identified in the bash `orchestrator` → Rust `orch` parity audit:
@@ -1046,17 +1149,27 @@ Features identified in the bash `orchestrator` → Rust `orch` parity audit:
 | GitHub Projects V2 integration | **Implemented** | `src/github/projects.rs` |
 | Per-task artifact folders | **Implemented** | `src/home.rs`, `src/engine/runner/` |
 | Per-repo state isolation | **Implemented** | `~/.orch/state/{owner}/{repo}/tasks/{id}/` |
-| Context file per issue | Planned | — |
-| `orch project list/link/sync/info` CLI | **Implemented** | `src/cli/mod.rs` |
+| Config architecture (multi-project) | **In Progress** | `src/config/mod.rs` |
+| `orch board list/link/sync/info` CLI | **Implemented** | `src/cli/mod.rs` |
 | Project board auto-sync on status change | **Implemented** | `src/backends/github.rs` |
+| Owner commands (feedback via issue comments) | Planned | — |
+| Context file per issue | Planned | — |
+
+### Config Architecture
+
+Redesigned from single-global to multi-project:
+- Global `~/.orch/config.yml`: shared defaults + `projects:` list of local paths
+- Per-project `.orch.yml`: `gh.repo`, jobs, project-specific overrides
+- No more `project_dir`, `gh.repo`, or `projects.yml` at global level
+- CLI resolves project context from CWD
 
 ### GitHub Projects V2
 
 The old orchestrator had 4 dedicated scripts for project board management. `orch` now has:
 - `ProjectSync` struct with GraphQL operations (discover fields, add items, update status)
 - Automatic project board column sync when task status changes (non-fatal)
-- CLI: `orch project list`, `orch project link <id>`, `orch project sync`, `orch project info`
-- Config stored in `~/.orch/config.yml` under `gh.project_id`, `gh.project_status_field_id`, `gh.project_status_map`
+- CLI: `orch board list`, `orch board link <id>`, `orch board sync`, `orch board info`
+- Config stored in per-project `.orch.yml` under `gh.project_id`, `gh.project_status_field_id`, `gh.project_status_map`
 
 ### Per-Task Artifact Folders
 

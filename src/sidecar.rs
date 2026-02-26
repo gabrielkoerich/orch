@@ -118,7 +118,7 @@ fn sidecar_path_for_repo(task_id: &str, repo: Option<&str>) -> anyhow::Result<Pa
     // Try to resolve repo
     let repo_slug = repo
         .map(String::from)
-        .or_else(|| crate::config::get("repo").ok());
+        .or_else(|| crate::config::get_current_repo().ok());
 
     if let Some(ref repo) = repo_slug {
         if !repo.is_empty() {

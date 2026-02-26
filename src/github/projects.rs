@@ -157,7 +157,7 @@ impl ProjectSync {
         }
 
         // Try org projects for the repo owner (if different from user)
-        if let Ok(repo) = config::get("repo") {
+        if let Ok(repo) = config::get_current_repo() {
             if let Some(owner) = repo.split('/').next() {
                 if owner != user {
                     let query = format!(

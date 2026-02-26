@@ -794,7 +794,20 @@ impl TaskRunner {
             }
         }
 
-        // Check config
+        // Check projects list in global config — find path for this repo
+        if let Ok(paths) = config::get_project_paths() {
+            for path_str in &paths {
+                let path = PathBuf::from(path_str);
+                // Check if this project's .orch.yml has matching repo
+                if let Ok(repo) = config::get_repo_for_project(&path) {
+                    if repo == self.repo && path.exists() {
+                        return Ok(path);
+                    }
+                }
+            }
+        }
+
+        // Legacy: check config project_dir
         if let Ok(dir) = config::get("project_dir") {
             if !dir.is_empty() {
                 let path = PathBuf::from(&dir);

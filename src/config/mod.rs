@@ -138,25 +138,167 @@ pub fn get(key: &str) -> anyhow::Result<String> {
     anyhow::bail!("config key not found: {key}")
 }
 
-/// Get all projects configured in the global config.
+/// Get all project paths from the global config `projects:` list.
 ///
-/// Returns a list of project repo slugs (owner/repo).
-/// Falls back to the single `repo` key if `projects` is not defined.
-pub fn get_projects() -> anyhow::Result<Vec<String>> {
+/// Returns a list of absolute paths to project directories.
+/// Each directory should contain a `.orch.yml` with `gh.repo`.
+pub fn get_project_paths() -> anyhow::Result<Vec<String>> {
     let global_path = global_config_path()?;
 
-    // Try to get projects list first
     if global_path.exists() {
-        if let Ok(projects) = resolve_projects_list(&global_path, "projects") {
-            if !projects.is_empty() {
-                return Ok(projects);
+        if let Ok(paths) = resolve_projects_list(&global_path, "projects") {
+            if !paths.is_empty() {
+                return Ok(paths);
             }
         }
     }
 
-    // Fall back to single repo key
-    let repo = get("repo")?;
-    Ok(vec![repo])
+    Ok(vec![])
+}
+
+/// Get all project repo slugs (owner/repo) from the registered projects.
+///
+/// Reads `projects:` paths from global config, then reads `gh.repo` from
+/// each project's `.orch.yml`. Falls back to the global `gh.repo` key
+/// for backward compatibility.
+pub fn get_projects() -> anyhow::Result<Vec<String>> {
+    let paths = get_project_paths()?;
+
+    if !paths.is_empty() {
+        let mut repos = Vec::new();
+        for path_str in &paths {
+            let path = std::path::PathBuf::from(path_str);
+            let orch_yml = path.join(".orch.yml");
+
+            // Try .orch.yml first, then .orchestrator.yml for backward compat
+            let config_file = if orch_yml.exists() {
+                orch_yml
+            } else {
+                let legacy = path.join(".orchestrator.yml");
+                if legacy.exists() {
+                    legacy
+                } else {
+                    tracing::warn!(
+                        path = %path_str,
+                        "project has no .orch.yml, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            if let Ok(content) = std::fs::read_to_string(&config_file) {
+                if let Ok(doc) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                    if let Some(repo) = doc
+                        .get("gh")
+                        .and_then(|gh| gh.get("repo"))
+                        .and_then(|r| r.as_str())
+                    {
+                        repos.push(repo.to_string());
+                        continue;
+                    }
+                }
+            }
+
+            tracing::warn!(
+                path = %path_str,
+                "could not read gh.repo from project config"
+            );
+        }
+
+        if !repos.is_empty() {
+            return Ok(repos);
+        }
+    }
+
+    // Fall back to global gh.repo for backward compatibility
+    if let Ok(repo) = get("gh.repo") {
+        if !repo.is_empty() {
+            return Ok(vec![repo]);
+        }
+    }
+
+    // Try legacy top-level repo key
+    if let Ok(repo) = get("repo") {
+        if !repo.is_empty() {
+            return Ok(vec![repo]);
+        }
+    }
+
+    anyhow::bail!("no projects configured — run `orch project add <path>` or set projects in ~/.orch/config.yml")
+}
+
+/// Resolve the repo slug for a specific project path.
+///
+/// Reads `gh.repo` from the project's `.orch.yml`.
+pub fn get_repo_for_project(project_path: &std::path::Path) -> anyhow::Result<String> {
+    let orch_yml = project_path.join(".orch.yml");
+    let config_file = if orch_yml.exists() {
+        orch_yml
+    } else {
+        let legacy = project_path.join(".orchestrator.yml");
+        if legacy.exists() {
+            legacy
+        } else {
+            anyhow::bail!("no .orch.yml found in {}", project_path.display());
+        }
+    };
+
+    let content = std::fs::read_to_string(&config_file)?;
+    let doc: serde_yml::Value = serde_yml::from_str(&content)?;
+
+    doc.get("gh")
+        .and_then(|gh| gh.get("repo"))
+        .and_then(|r| r.as_str())
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("gh.repo not set in {}", config_file.display()))
+}
+
+/// Resolve project path from CWD by finding the nearest `.orch.yml`.
+///
+/// Walks up from the current directory looking for `.orch.yml` or `.orchestrator.yml`.
+pub fn find_project_root() -> anyhow::Result<std::path::PathBuf> {
+    let mut dir = std::env::current_dir()?;
+
+    loop {
+        if dir.join(".orch.yml").exists() || dir.join(".orchestrator.yml").exists() {
+            return Ok(dir);
+        }
+
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    anyhow::bail!("no .orch.yml found in current directory or parents — run `orch init`")
+}
+
+/// Resolve the repo slug for the current project (from CWD).
+///
+/// Walks up from CWD to find `.orch.yml`, reads `gh.repo` from it.
+/// Falls back to global `gh.repo` for backward compatibility.
+pub fn get_current_repo() -> anyhow::Result<String> {
+    // Try to find project root from CWD
+    if let Ok(project_root) = find_project_root() {
+        if let Ok(repo) = get_repo_for_project(&project_root) {
+            return Ok(repo);
+        }
+    }
+
+    // Fall back to per-project config in CWD (.orch.yml)
+    if let Ok(repo) = get("gh.repo") {
+        if !repo.is_empty() {
+            return Ok(repo);
+        }
+    }
+
+    // Legacy fallback
+    if let Ok(repo) = get("repo") {
+        if !repo.is_empty() {
+            return Ok(repo);
+        }
+    }
+
+    anyhow::bail!("could not determine repo — ensure .orch.yml has gh.repo set")
 }
 
 /// Resolve a projects list from a config file.

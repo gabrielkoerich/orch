@@ -50,48 +50,42 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
         }
     };
 
-    if config_path.exists() {
-        // Update repo in existing config
-        let content = std::fs::read_to_string(&config_path)?;
-        if content.contains("repo:") {
-            let updated = regex::Regex::new(r"(?m)^repo:.*$")?
-                .replace(&content, &format!("repo: {repo_value}"))
-                .to_string();
-            std::fs::write(&config_path, updated)?;
-        } else {
-            let mut content = content;
-            content.push_str(&format!("\nrepo: {repo_value}\n"));
-            std::fs::write(&config_path, content)?;
-        }
-    } else {
-        let content = format!(
-            "# Orch configuration\nrepo: {repo_value}\n\nrouter:\n  mode: llm\n  agent: claude\n  model: haiku\n"
-        );
+    // Ensure global config exists
+    if !config_path.exists() {
+        let content = "# Orch global configuration\n# See: https://github.com/gabrielkoerich/orch\n\nprojects: []\n\nrouter:\n  mode: llm\n  agent: claude\n  model: haiku\n";
         std::fs::write(&config_path, content)?;
     }
 
     println!("Initialized orch for {repo_value}");
-    println!("Config: {}", config_path.display());
+    println!("Global config: {}", config_path.display());
 
     // Create project-local .orch.yml if not exists
     let local_config = std::path::Path::new(".orch.yml");
     if !local_config.exists() {
         std::fs::write(
             local_config,
-            format!("# Project-specific orch config\nrepo: {repo_value}\n"),
+            format!("# Project-specific orch config\ngh:\n  repo: \"{repo_value}\"\n"),
         )?;
         println!("Created .orch.yml");
     }
 
-    // Auto-setup GitHub Projects V2 (non-blocking)
-    if config::get("gh.project_id").is_err()
-        || config::get("gh.project_id").unwrap_or_default().is_empty()
-    {
-        println!("Setting up GitHub Projects V2...");
-        // Run project setup in a blocking tokio context if available,
-        // but init is sync so we just print guidance
-        println!("  Run `orch project sync` to link a project board");
+    // Register project in global config
+    let cwd = std::env::current_dir()?;
+    let cwd_str = cwd.to_string_lossy().to_string();
+
+    // Check if already registered
+    let paths = config::get_project_paths().unwrap_or_default();
+    if !paths.iter().any(|p| p == &cwd_str) {
+        project_add(".")?;
+    } else {
+        println!("Project already registered in global config");
     }
+
+    // Guidance for board setup
+    println!();
+    println!("Next steps:");
+    println!("  orch board list     — find GitHub Projects V2 boards");
+    println!("  orch board link <id> — link a board for status tracking");
 
     Ok(())
 }
@@ -308,14 +302,14 @@ pub async fn stream_task(task_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// List accessible GitHub projects.
-pub async fn project_list() -> anyhow::Result<()> {
+/// List accessible GitHub Projects V2 boards.
+pub async fn board_list() -> anyhow::Result<()> {
     use crate::github::projects::ProjectSync;
 
     let projects = ProjectSync::list_projects().await?;
 
     if projects.is_empty() {
-        println!("No projects found");
+        println!("No GitHub Projects V2 boards found");
         return Ok(());
     }
 
@@ -328,16 +322,16 @@ pub async fn project_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Link current repo to a project by ID and discover fields.
-pub async fn project_link(project_id: &str) -> anyhow::Result<()> {
+/// Link current repo to a GitHub Projects V2 board by ID and discover fields.
+pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
     use crate::github::projects::{write_project_config, ProjectSync};
 
-    println!("Discovering project fields...");
+    println!("Discovering board fields...");
     let sync = ProjectSync::discover_fields(project_id).await?;
 
     write_project_config(&sync)?;
 
-    println!("Linked project: {}", project_id);
+    println!("Linked board: {}", project_id);
     println!("Status field: {}", sync.status_field_id());
     println!("Column mappings:");
     for (col, opt_id) in sync.status_map() {
@@ -347,19 +341,18 @@ pub async fn project_link(project_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Re-discover field IDs from configured project and update config.
-pub async fn project_sync() -> anyhow::Result<()> {
+/// Re-discover field IDs from configured board and update config.
+pub async fn board_sync() -> anyhow::Result<()> {
     use crate::github::projects::{write_project_config, ProjectSync};
 
-    let project_id = config::get("gh.project_id").map_err(|_| {
-        anyhow::anyhow!("no project configured — run `orch project link <id>` first")
-    })?;
+    let project_id = config::get("gh.project_id")
+        .map_err(|_| anyhow::anyhow!("no board configured — run `orch board link <id>` first"))?;
 
     if project_id.is_empty() {
-        anyhow::bail!("no project configured — run `orch project link <id>` first");
+        anyhow::bail!("no board configured — run `orch board link <id>` first");
     }
 
-    println!("Syncing project fields for {}...", project_id);
+    println!("Syncing board fields for {}...", project_id);
     let sync = ProjectSync::discover_fields(&project_id).await?;
 
     write_project_config(&sync)?;
@@ -373,18 +366,18 @@ pub async fn project_sync() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Show current project configuration.
-pub fn project_info() -> anyhow::Result<()> {
+/// Show current board configuration.
+pub fn board_info() -> anyhow::Result<()> {
     let project_id = config::get("gh.project_id").unwrap_or_default();
 
     if project_id.is_empty() {
-        println!("No project configured");
-        println!("  Run `orch project list` to see available projects");
-        println!("  Run `orch project link <id>` to link one");
+        println!("No board configured");
+        println!("  Run `orch board list` to see available boards");
+        println!("  Run `orch board link <id>` to link one");
         return Ok(());
     }
 
-    println!("Project ID: {}", project_id);
+    println!("Board ID: {}", project_id);
 
     if let Ok(field_id) = config::get("gh.project_status_field_id") {
         println!("Status field: {}", field_id);
@@ -399,14 +392,180 @@ pub fn project_info() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Add a project path to the global registry.
+pub fn project_add(path: &str) -> anyhow::Result<()> {
+    let abs_path = if path == "." {
+        std::env::current_dir()?
+    } else {
+        std::path::PathBuf::from(path).canonicalize()?
+    };
+
+    // Verify .orch.yml exists in the project
+    let orch_yml = abs_path.join(".orch.yml");
+    if !orch_yml.exists() {
+        // Check for legacy .orchestrator.yml
+        let legacy = abs_path.join(".orchestrator.yml");
+        if legacy.exists() {
+            println!("Found .orchestrator.yml — consider renaming to .orch.yml");
+        } else {
+            anyhow::bail!(
+                "no .orch.yml found in {} — run `orch init` in the project first",
+                abs_path.display()
+            );
+        }
+    }
+
+    let path_str = abs_path.to_string_lossy().to_string();
+
+    // Read current global config
+    let config_path = crate::home::config_path()?;
+    let content = if config_path.exists() {
+        std::fs::read_to_string(&config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: serde_yml::Value = if content.is_empty() {
+        serde_yml::Value::Mapping(serde_yml::Mapping::new())
+    } else {
+        serde_yml::from_str(&content)?
+    };
+
+    let root = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("config is not a YAML mapping"))?;
+
+    // Get or create projects list
+    let projects_key = serde_yml::Value::String("projects".to_string());
+    if !root.contains_key(&projects_key) {
+        root.insert(projects_key.clone(), serde_yml::Value::Sequence(Vec::new()));
+    }
+
+    let projects = root
+        .get_mut(&projects_key)
+        .and_then(|v| v.as_sequence_mut())
+        .ok_or_else(|| anyhow::anyhow!("projects is not a list"))?;
+
+    // Check for duplicates
+    let already_exists = projects
+        .iter()
+        .any(|p| p.as_str().map(|s| s == path_str).unwrap_or(false));
+
+    if already_exists {
+        println!("Project already registered: {}", path_str);
+        return Ok(());
+    }
+
+    projects.push(serde_yml::Value::String(path_str.clone()));
+    std::fs::write(&config_path, serde_yml::to_string(&doc)?)?;
+
+    println!("Added project: {}", path_str);
+
+    // Show the repo from .orch.yml if available
+    if orch_yml.exists() {
+        let project_content = std::fs::read_to_string(&orch_yml)?;
+        let project_doc: serde_yml::Value = serde_yml::from_str(&project_content)?;
+        if let Some(repo) = project_doc
+            .get("gh")
+            .and_then(|gh| gh.get("repo"))
+            .and_then(|r| r.as_str())
+        {
+            println!("  repo: {}", repo);
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove a project from the global registry.
+pub fn project_remove(path: &str) -> anyhow::Result<()> {
+    let abs_path = std::path::PathBuf::from(path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let path_str = abs_path.to_string_lossy().to_string();
+
+    let config_path = crate::home::config_path()?;
+    if !config_path.exists() {
+        anyhow::bail!("no global config found");
+    }
+
+    let content = std::fs::read_to_string(&config_path)?;
+    let mut doc: serde_yml::Value = serde_yml::from_str(&content)?;
+
+    let root = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("config is not a YAML mapping"))?;
+
+    let projects_key = serde_yml::Value::String("projects".to_string());
+    let projects = root
+        .get_mut(&projects_key)
+        .and_then(|v| v.as_sequence_mut())
+        .ok_or_else(|| anyhow::anyhow!("no projects list in config"))?;
+
+    let before_len = projects.len();
+    projects.retain(|p| {
+        p.as_str()
+            .map(|s| s != path_str && s != path)
+            .unwrap_or(true)
+    });
+
+    if projects.len() == before_len {
+        println!("Project not found: {}", path);
+        return Ok(());
+    }
+
+    std::fs::write(&config_path, serde_yml::to_string(&doc)?)?;
+    println!("Removed project: {}", path_str);
+
+    Ok(())
+}
+
+/// List all registered projects.
+pub fn project_list() -> anyhow::Result<()> {
+    let projects = config::get_project_paths()?;
+
+    if projects.is_empty() {
+        println!("No projects registered");
+        println!("  Run `orch project add <path>` to register a project");
+        return Ok(());
+    }
+
+    println!("{:<50} REPO", "PATH");
+    println!("{}", "-".repeat(80));
+
+    for path_str in &projects {
+        let path = std::path::Path::new(path_str);
+
+        // Try to read repo from .orch.yml
+        let repo = read_project_repo(path).unwrap_or_else(|| "(.orch.yml not found)".to_string());
+
+        let status = if path.exists() { "" } else { " (missing)" };
+
+        println!("{:<50} {}{}", path_str, repo, status);
+    }
+
+    Ok(())
+}
+
+/// Read gh.repo from a project's .orch.yml.
+fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
+    let orch_yml = project_path.join(".orch.yml");
+    let content = std::fs::read_to_string(&orch_yml).ok()?;
+    let doc: serde_yml::Value = serde_yml::from_str(&content).ok()?;
+    doc.get("gh")
+        .and_then(|gh| gh.get("repo"))
+        .and_then(|r| r.as_str())
+        .map(String::from)
+}
+
 /// Initialize task manager with database and backend.
 pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
     use crate::db::Db;
 
-    let repo = config::get("gh.repo")
-        .context("'repo' not set in config — run `orch init` or set repo in ~/.orch/config.yml")?;
+    let repo = config::get_current_repo()
+        .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
     let db = Arc::new(Db::open(&crate::db::default_path()?)?);
     db.migrate().await?;

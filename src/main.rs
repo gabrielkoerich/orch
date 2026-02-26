@@ -97,7 +97,12 @@ enum Commands {
     },
     /// Show task metrics summary
     Metrics,
-    /// GitHub Projects V2 management
+    /// GitHub Projects V2 board management
+    Board {
+        #[command(subcommand)]
+        action: BoardAction,
+    },
+    /// Multi-project management
     Project {
         #[command(subcommand)]
         action: ProjectAction,
@@ -250,18 +255,35 @@ enum JobAction {
 }
 
 #[derive(Subcommand)]
-enum ProjectAction {
-    /// List accessible GitHub projects
+enum BoardAction {
+    /// List accessible GitHub Projects V2 boards
     List,
-    /// Link current repo to a project by ID
+    /// Link current repo to a project board by ID
     Link {
         /// Project node ID (PVT_...)
         id: String,
     },
     /// Re-discover field IDs and update config
     Sync,
-    /// Show current project config
+    /// Show current board config
     Info,
+}
+
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Add a project path to the global registry
+    Add {
+        /// Path to the project directory
+        #[arg(default_value = ".")]
+        path: String,
+    },
+    /// Remove a project from the global registry
+    Remove {
+        /// Path to the project directory
+        path: String,
+    },
+    /// List all registered projects
+    List,
 }
 
 #[derive(Subcommand)]
@@ -424,18 +446,29 @@ async fn main() -> anyhow::Result<()> {
         Commands::Metrics => {
             cli::metrics().await?;
         }
+        Commands::Board { action } => match action {
+            BoardAction::List => {
+                cli::board_list().await?;
+            }
+            BoardAction::Link { id } => {
+                cli::board_link(&id).await?;
+            }
+            BoardAction::Sync => {
+                cli::board_sync().await?;
+            }
+            BoardAction::Info => {
+                cli::board_info()?;
+            }
+        },
         Commands::Project { action } => match action {
+            ProjectAction::Add { path } => {
+                cli::project_add(&path)?;
+            }
+            ProjectAction::Remove { path } => {
+                cli::project_remove(&path)?;
+            }
             ProjectAction::List => {
-                cli::project_list().await?;
-            }
-            ProjectAction::Link { id } => {
-                cli::project_link(&id).await?;
-            }
-            ProjectAction::Sync => {
-                cli::project_sync().await?;
-            }
-            ProjectAction::Info => {
-                cli::project_info()?;
+                cli::project_list()?;
             }
         },
         Commands::Completions { shell } => {

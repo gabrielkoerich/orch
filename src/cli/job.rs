@@ -155,7 +155,8 @@ pub async fn tick() -> anyhow::Result<()> {
     use crate::backends::ExternalBackend;
     use crate::db::Db;
 
-    let repo = config::get("gh.repo").context("'repo' not set in config")?;
+    let repo =
+        config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
     let db = Arc::new(Db::open(&crate::db::default_path()?)?);
     db.migrate().await?;
