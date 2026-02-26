@@ -7,6 +7,7 @@
 //! - In-memory cache: parsed YAML is cached for the process lifetime
 //! - File watching: uses notify crate to watch for config file changes
 //! - Hot reload: cache is invalidated when config files change
+//! - Change notifications: subscribers receive events when config files change
 
 use anyhow::Context;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
@@ -14,6 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tokio::sync::broadcast;
 
 /// Cached YAML values — parsed once per file, reused for all key lookups.
 /// Protected by RwLock for concurrent read access.
@@ -28,12 +30,31 @@ static WATCHER: std::sync::LazyLock<RwLock<HashMap<PathBuf, ()>>> =
 static FILE_WATCHER: std::sync::LazyLock<Arc<Mutex<Option<RecommendedWatcher>>>> =
     std::sync::LazyLock::new(|| Arc::new(Mutex::new(None)));
 
-/// Invalidate the cache entry for a specific config file.
+/// Broadcast sender for config change notifications.
+/// Sends the path of the changed config file.
+static CHANGE_TX: std::sync::LazyLock<broadcast::Sender<PathBuf>> =
+    std::sync::LazyLock::new(|| {
+        let (tx, _) = broadcast::channel(16);
+        tx
+    });
+
+/// Subscribe to config change notifications.
+///
+/// Returns a receiver that fires whenever a watched config file changes.
+/// The receiver yields the path of the changed file.
+pub fn subscribe() -> broadcast::Receiver<PathBuf> {
+    CHANGE_TX.subscribe()
+}
+
+/// Invalidate the cache entry for a specific config file
+/// and notify subscribers of the change.
 fn invalidate_cache(path: &PathBuf) {
     if let Ok(mut cache) = CACHE.write() {
         cache.remove(path);
         tracing::debug!("config cache invalidated for: {}", path.display());
     }
+    // Notify subscribers (ignore error if no active receivers)
+    let _ = CHANGE_TX.send(path.clone());
 }
 
 /// Start the file watcher if not already running.
@@ -229,5 +250,33 @@ mod tests {
         let path = PathBuf::from("/nonexistent/config.yml");
         let result = resolve_key(&path, "repo");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn subscribe_receives_change_notifications() {
+        let mut rx = subscribe();
+        let path = PathBuf::from("/tmp/test-config.yml");
+
+        // Manually call invalidate_cache to simulate a file change
+        invalidate_cache(&path);
+
+        // The subscriber should receive the path
+        match rx.try_recv() {
+            Ok(received_path) => assert_eq!(received_path, path),
+            Err(e) => panic!("expected config change notification, got error: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn subscribe_multiple_receivers() {
+        let mut rx1 = subscribe();
+        let mut rx2 = subscribe();
+        let path = PathBuf::from("/tmp/test-config-multi.yml");
+
+        invalidate_cache(&path);
+
+        // Both receivers should get the notification
+        assert_eq!(rx1.try_recv().unwrap(), path);
+        assert_eq!(rx2.try_recv().unwrap(), path);
     }
 }
