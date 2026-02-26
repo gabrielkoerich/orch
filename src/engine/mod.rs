@@ -620,7 +620,11 @@ async fn tick(
                         )
                         .await
                     {
-                        tracing::warn!(task_id, ?comment_err, "failed to post error comment to GitHub");
+                        tracing::warn!(
+                            task_id,
+                            ?comment_err,
+                            "failed to post error comment to GitHub"
+                        );
                     }
                 }
             }
