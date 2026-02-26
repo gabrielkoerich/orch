@@ -236,7 +236,7 @@ Do not skip steps — the service runs from the Homebrew cellar, not the repo.
 - **`needs_review`** — requires human attention (max attempts, review rejection, agent failures, retry loops, timeouts)
 - `mark_needs_review()` sets `needs_review`, NOT `blocked`
 - Only parent tasks waiting on children should be `blocked`
-- `poll.sh` auto-unblocks parent tasks when all children are done
+- Engine auto-unblocks parent tasks when all children are done (Phase 4 of tick)
 
 ## Preferred tools
 

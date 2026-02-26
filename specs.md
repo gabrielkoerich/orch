@@ -2,52 +2,116 @@
 
 ## What It Does
 
-Orchestrator is an autonomous task management system that delegates work to AI coding agents (Claude, Codex, OpenCode). It runs as a background service, picking up tasks, routing them to agents with specialized profiles, managing worktrees for isolation, syncing state to GitHub issues/projects, and handling retries/failures.
+Orchestrator is an autonomous task management system that delegates work to AI coding agents (Claude, Codex, OpenCode, Kimi, MiniMax). It runs as a background service, picking up tasks, routing them to agents with specialized profiles, managing worktrees for isolation, syncing state to GitHub issues/projects, and handling retries/failures.
 
 ## Architecture
 
 ```
-serve.sh (10s tick loop)
-  ├── poll.sh              — pick new/routed tasks, detect stuck, unblock parents
-  │     ├── route_task.sh  — LLM router assigns agent + complexity + profile
-  │     └── run_task.sh    — build prompt, invoke agent, parse response, push branch, create PR
-  ├── jobs_tick.sh         — run scheduled jobs (cron-like)
-  ├── cleanup_worktrees.sh — remove merged worktrees + local branches
-  └── review_prs.sh        — auto-review open PRs
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           orch serve (Rust)                              │
+│                                                                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │   Engine     │  │   Router     │  │    Task      │  │   GitHub     │  │
+│  │   Loop       │  │   (LLM/RR)   │  │   Manager    │  │   Backend    │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  │
+│         │                 │                 │                 │          │
+│         ▼                 ▼                 ▼                 ▼          │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                        Task Lifecycle                             │  │
+│  │  new → routed → in_progress → done/blocked/needs_review          │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │  Job         │  │  Capture     │  │  Transport   │  │  SQLite      │  │
+│  │  Scheduler   │  │  Service     │  │  Layer       │  │  (Internal)  │  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         External Systems                                 │
+│                                                                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │ GitHub API   │  │   tmux       │  │ Agent CLIs   │  │   git        │  │
+│  │ (gh CLI)     │  │ (sessions)   │  │ (claude/     │  │ (worktrees)  │  │
+│  │              │  │              │  │  codex/etc)  │  │              │  │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Core Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **Engine** | `src/engine/mod.rs` | Main async event loop (10s tick + 120s sync) |
+| **Router** | `src/engine/router.rs` | LLM-based agent selection + complexity |
+| **Task Manager** | `src/engine/tasks.rs` | Unified internal + external task CRUD |
+| **Runner** | `src/engine/runner.rs` | Agent invocation, worktree, git, PR creation |
+| **GitHub Backend** | `src/backends/github.rs` | GitHub Issues via `gh api` |
+| **Job Scheduler** | `src/engine/jobs.rs` | Cron-like scheduled tasks |
+| **Capture Service** | `src/channels/capture.rs` | tmux output streaming |
+| **Transport** | `src/channels/transport.rs` | Broadcast to subscribers |
+| **SQLite DB** | `src/db.rs` | Internal tasks + state |
 
 ### Backend Architecture
 
-Tasks are stored directly in **GitHub Issues** — no local database. A pluggable backend interface (`backend.sh`) sources the GitHub implementation (`backend_github.sh`), which maps task fields to issue properties:
+Tasks are stored in **GitHub Issues** (external) or **SQLite** (internal). A pluggable backend interface (`src/backends/mod.rs`) with GitHub implementation (`src/backends/github.rs`):
 
 - **Status** → prefixed labels (`status:new`, `status:in_progress`, etc.)
 - **Agent/Complexity** → prefixed labels (`agent:claude`, `complexity:medium`)
 - **History/Response** → structured issue comments with `<!-- orch:* -->` markers
-- **Ephemeral fields** (branch, worktree, attempts) → local sidecar JSON (`$STATE_DIR/tasks/{id}.json`)
+- **Ephemeral fields** (branch, worktree, attempts) → local sidecar JSON (`~/.orchestrator/.orchestrator/{id}.json`)
 
 ### Key Design Decisions
-- **GitHub Issues as source of truth** — no sync layer, no local DB
+
+- **GitHub Issues as source of truth (external tasks)** — no sync layer, no local DB for these
+- **SQLite for internal tasks** — cron jobs, mentions, maintenance without issue clutter
 - **One worktree per task** — agents never work in the main repo directory
 - **Complexity-based model routing** — router returns `simple|medium|complex`, config maps to agent-specific models
 - **Plan label for decomposition** — only manual `plan` label triggers subtask creation, not router
 - **Parent/child linking** — GitHub sub-issues API
-- **Lock-based concurrency** — mkdir locks for per-task locks to prevent double-runs
-- **Config-driven** — `~/.orchestrator/config.yml` + per-project `orchestrator.yml` (merged)
+- **Rust-native everything** — no jq/yq/python3 forks, async I/O with tokio
+- **Config-driven** — `~/.orchestrator/config.yml` + per-project `.orchestrator.yml` (merged)
 
 ## What's Working
 
-- **Core loop**: serve → poll → route → run → push/PR is solid
-- **GitHub sync**: bidirectional, with backoff, comment dedup, project board status
+### Phase 1-2 Complete (Rust Foundation + Engine)
+
+- **Core engine**: async tokio loop replacing `serve.sh` + `poll.sh`
+- **GitHub sync**: bidirectional via `gh api` with backoff
+- **Agent router**: LLM classification + label overrides + round-robin fallback
 - **Agent profiles**: router generates role/skills/tools/constraints per task
-- **Retry & recovery**: stuck detection, max attempts, exponential backoff, agent switching on auth errors
+- **Task runner**: full workflow (worktree, agent, git push, PR creation)
+- **Retry & recovery**: stuck detection, max attempts, exponential backoff
 - **Worktree lifecycle**: create branch, create worktree, agent works, auto-commit, push, create PR
-- **Review agent**: optional post-completion review with reject (auto-close PR) support
+- **Review agent**: optional post-completion review with reject support
 - **Sub-issues**: child tasks linked as GitHub sub-issues via GraphQL
 - **Catch-all PR creation**: detects pushed branches without PRs and creates them
-- **Skills system**: SKILL.md-based catalog, required/reference skills injected into prompts
-- **Jobs**: cron-like scheduled tasks (bash commands or task creation)
-- **150 tests**: comprehensive bats test suite, all passing
-- **Release pipeline**: push → CI → auto-tag → GitHub release → Homebrew tap update
+- **Jobs**: cron-like scheduled tasks (native Rust cron, no python3)
+- **Internal tasks**: SQLite-backed, no GitHub issue needed
+- **Output streaming**: `orch stream <task_id>` for live agent output
+- **Live session listing**: `orch task live` shows active tmux sessions
+- **Mention detection**: scans for @orchestrator mentions, creates internal tasks
+- **Merged PR detection**: auto-closes tasks when PRs merge
+- **Worktree cleanup**: removes merged worktrees and branches
+- **Release pipeline**: push → CI → auto-tag → GitHub release → Homebrew tap
+
+### CLI Commands (All Implemented)
+
+```bash
+# Service
+orch serve                    # Run service (foreground)
+orch service start|stop|restart|status
+
+# Tasks
+orch task list|get|add|route|run|retry|unblock|attach|live|kill|publish
+
+# Jobs
+orch job list|add|remove|enable|disable|tick
+
+# Utilities
+orch init|agents|stream|log|version|config|sidecar|cron|template|parse
+```
 
 ## Agent Sandbox
 
@@ -58,174 +122,183 @@ Agents are sandboxed to their worktree directory. The orchestrator creates the w
 | Layer | Mechanism | Status |
 |-------|-----------|--------|
 | **Prompt** | System prompt tells agents the main project dir is read-only | Done |
-| **Disallowed tools** | Dynamic `--disallowedTools` patterns block Read/Write/Edit/Bash on main dir | Done (v0.19) |
-| **Codex sandbox** | `--full-auto` runs in Docker container | Built-in but too restrictive |
-| **Container** | Full Docker isolation with worktree mounted | Not planned — auth problem |
+| **Disallowed tools** | Dynamic `--disallowedTools` patterns block Read/Write/Edit/Bash on main dir | Done |
+| **Worktree isolation** | Each task gets its own git worktree | Done |
 
 ### How It Works
-1. `run_task.sh` saves `MAIN_PROJECT_DIR` before creating the worktree
-2. If `workflow.sandbox` is `true` (default), sandbox patterns are added to `--disallowedTools`:
-   - `Read($MAIN_PROJECT_DIR/*)` — blocks reading main repo files
-   - `Write($MAIN_PROJECT_DIR/*)` — blocks writing main repo files
-   - `Edit($MAIN_PROJECT_DIR/*)` — blocks editing main repo files
-   - `Bash(cd $MAIN_PROJECT_DIR*)` — blocks navigating to main repo
-3. These patterns are added to the configured `workflow.disallowed_tools` list
-4. Config: `workflow.sandbox: false` to disable (not recommended)
 
-### Codex Limitations
-Codex's `--full-auto` mode runs in a Docker sandbox that blocks network access and external tools. This means:
-- No `gh` CLI (GitHub API calls fail with "error connecting to api.github.com")
-- No `bun` (missing from container PATH)
-- No `solana-test-validator` or other system tools
-- Codex can only do pure code changes — no CI, no API calls, no package installs
-
-Container-based sandboxing for other agents (Claude, OpenCode) is impractical because:
-- Agents require authenticated subscriptions (Claude Code login, API keys)
-- Interactive auth flows (1Password, biometric) don't work in containers
-- Each agent would need its own container image with auth pre-configured
+1. `TaskRunner` saves `MAIN_PROJECT_DIR` before creating the worktree
+2. Sandbox patterns are added to agent invocation to block access to main repo
+3. Agents work in `~/.orchestrator/worktrees/<project>/<branch>/`
 
 ### Task Status Semantics
-- **`blocked`** — waiting on a dependency (children not done, or infrastructure issue like missing worktree)
-- **`needs_review`** — requires human attention (max attempts, review rejection, agent failures, retry loops)
-- `mark_needs_review()` in lib.sh sets `needs_review`, not `blocked`
-- Only parent tasks waiting on children should be `blocked`
-- `poll.sh` auto-unblocks parent tasks when all children are done; `needs_review` tasks require manual action
 
-## GitHub App (Investigation)
+- **`blocked`** — waiting on a dependency (children not done, or infrastructure issue like missing worktree)
+- **`needs_review`** — requires human attention (max attempts, review rejection, agent failures, retry loops, timeouts)
+- `mark_needs_review()` sets `needs_review`, NOT `blocked`
+- Only parent tasks waiting on children should be `blocked`
+- Engine auto-unblocks parent tasks when all children are done
+
+## GitHub App (Future)
 
 ### What It Would Do
+
 A GitHub App could replace the current `gh` CLI-based API calls with proper app authentication. Benefits:
+
 - **No personal access token needed** — app generates its own installation tokens
 - **Fine-grained permissions** — only the permissions the app needs (issues, PRs, projects)
 - **Webhooks** — instant event delivery instead of 60s polling
 - **Rate limits** — higher API rate limits than personal tokens
 - **Multi-user** — anyone can install the app on their repo, no shared credentials
 
-### What It Needs
-- A server to receive webhooks (or use GitHub Actions as a relay)
-- App registration on GitHub (name, description, permissions, webhook URL)
-- Private key for JWT signing (stored securely)
-- Installation token refresh logic (tokens expire every hour)
-
-### Permissions Required
-- **Issues**: read/write (create, update, comment, close)
-- **Pull requests**: read/write (create, review, merge)
-- **Contents**: read/write (push branches)
-- **Projects**: read/write (board status updates)
-- **Metadata**: read (repo info)
-
-### Installation
-- Anyone can install via "Install App" button on the GitHub App page
-- One-click install per repo or org-wide
-- No coding required for the installer — just approve permissions
-
-### Architecture Options
-1. **Hosted app**: Run a small server (Cloudflare Worker, Vercel, etc.) that receives webhooks and calls orchestrator APIs
-2. **GitHub Actions relay**: App triggers a workflow, workflow runs orchestrator commands
-3. **Hybrid**: App handles webhooks for instant sync, orchestrator still runs locally for agent execution
-
 ### Decision
-Optional enhancement. The current `gh` CLI approach works fine for single-user setups. A GitHub App makes sense when:
+
+Optional future enhancement. The current `gh` CLI approach works fine for single-user setups. A GitHub App makes sense when:
+
 - Multiple users need to install orchestrator on their repos
 - Webhook-based instant sync is needed (eliminates 60s polling delay)
 - Higher API rate limits are required (heavy sync workloads)
 
 ## What's Not Working / Known Issues
 
-### PR Creation Gaps
-- PR creation only happens inside `run_task.sh` for `done|in_progress` status. If the script crashes between push and PR creation, the branch is orphaned.
+### Phase 3+ (Channels) — Scaffolding Done
 
-### Agent Reliability
-- Agents sometimes produce empty or malformed responses, especially on timeout. Current fallback is `needs_review` but no automatic retry with a different model.
-- No token budget enforcement — agents can burn unlimited tokens on a single task.
-- SSH/1Password interactive prompts can block agents silently. Detection exists but recovery is just a log warning.
+- **Telegram bot** — stub only (`src/channels/telegram.rs`)
+- **Discord bot** — stub only (`src/channels/discord.rs`)
+- **GitHub webhooks** — stub only (`src/channels/github.rs`)
+- **HTTP webhook server** — not implemented (needs axum)
+
+These require webhook servers and async channel traits to be wired into the engine.
 
 ### Observability
-- Dashboard (`dashboard.sh`) exists but is basic. No web UI.
-- No metrics collection (success rate, avg duration, tokens per task, cost tracking).
-- Error log exists but no alerting.
+
+- **Metrics collection** — success rate, avg duration, tokens per task, cost tracking
+- **Web dashboard** — simple HTTP server showing task tree, status, logs
+- **Alerting** — error log exists but no proactive alerting
 
 ## Improvement Ideas
 
 ### Short Term
-- [ ] **Worktree janitor**: poll.sh cleans up merged worktrees + branches on `done` tasks
-- [ ] **Token budget**: config `max_tokens_per_task`, abort agent if exceeded
-- [ ] **Batch closed-issue check**: single API call in gh_pull instead of N+1
-- [ ] **Issue reopen handling**: gh_pull detects reopened issues → reset task to `new`
-- [ ] **Review model in config**: already in `model_map.review`, wire up to config UI in `init.sh`
-- [ ] **Cost tracking**: estimate cost from input/output tokens + model pricing table
+
+- [ ] **Config hot-reload** — `notify` watcher exists but not connected to engine
+- [ ] **Multi-project support** — engine currently handles one repo
+- [ ] **Token budget** — config `max_tokens_per_task`, abort agent if exceeded
+- [ ] **Cost tracking** — estimate cost from input/output tokens + model pricing table
 
 ### Medium Term
-- [ ] **Web dashboard**: simple HTTP server showing task tree, status, logs, token usage
-- [ ] **Webhook receiver**: GitHub webhook for instant issue sync instead of 60s polling
-- [ ] **Agent memory**: persist agent learnings across retries (what worked, what didn't)
-- [ ] **PR review integration**: parse GitHub PR review comments, create follow-up tasks
-- [ ] **Multi-repo orchestration**: single orchestrator managing tasks across multiple repos
-- [ ] **Parallel task execution**: currently sequential within a poll tick, could use job queue
+
+- [ ] **Webhook receiver** — GitHub webhook for instant issue sync instead of 60s polling
+- [ ] **Agent memory** — persist agent learnings across retries (what worked, what didn't)
+- [ ] **PR review integration** — parse GitHub PR review comments, create follow-up tasks
+- [ ] **Parallel task execution** — currently limited by semaphore (4), could be dynamic
 
 ### Long Term
-- [ ] **Self-improvement loop**: orchestrator creates issues for its own improvements, agents implement them
-- [ ] **Cost optimization**: track spend per task, auto-downgrade complexity for retries
-- [ ] **Agent benchmarking**: A/B test agents on similar tasks, track success rates
-- [ ] **Plugin system**: custom hooks for pre/post task execution
-- [ ] **Team mode**: multiple users, role-based access, task assignment
+
+- [ ] **Self-improvement loop** — orchestrator creates issues for its own improvements
+- [ ] **Cost optimization** — track spend per task, auto-downgrade complexity for retries
+- [ ] **Agent benchmarking** — A/B test agents on similar tasks, track success rates
+- [ ] **Plugin system** — custom hooks for pre/post task execution
+- [ ] **Team mode** — multiple users, role-based access, task assignment
 
 ## CLI Reference
 
 ```
-orchestrator init                    # interactive setup
-orchestrator status                  # task counts overview
-orchestrator dashboard               # full TUI dashboard
+orch serve                    # Run the orchestrator service (foreground)
+orch version                  # Show version
+orch init [--repo O/R]        # Initialize for a project
+orch agents                   # List installed agent CLIs
+orch stream <task_id>         # Stream live output from a running task
+orch log [N|watch]            # View logs (default 50 lines, or watch)
+orch config <key>             # Read config value
+orch sidecar get|set          # Read/write task metadata
+orch cron <expression>        # Check if cron matches now
+orch template <path>          # Render template with env vars
+orch parse <path>             # Parse agent JSON response
 
 # Tasks
-orchestrator task list|tree|add|plan|route|run|next|poll
-orchestrator task retry|unblock|agent|stream|watch|unlock
-
-# Service
-orchestrator start|stop|restart|info
-orchestrator service install|uninstall
-
-# GitHub
-orchestrator gh pull|push|sync
-
-# Projects
-orchestrator project info|create|list
+orch task list [--status] [--source]
+orch task add <title> [--body] [--labels] [--source]
+orch task get <id>
+orch task status [--json]
+orch task route <id>
+orch task run [<id>]
+orch task retry <id>
+orch task unblock <id>|all
+orch task attach <id>
+orch task live
+orch task kill <id>
+orch task publish <id> [--labels]
 
 # Jobs
-orchestrator job add|list|remove|enable|disable|tick
+orch job list
+orch job add <schedule> <title> [--body] [--type] [--command]
+orch job remove <id>
+orch job enable <id>
+orch job disable <id>
+orch job tick
 
-# Skills
-orchestrator skills list|sync
-
-# Other
-orchestrator chat                    # interactive chat with context
-orchestrator log [watch]             # view logs
-orchestrator agents                  # list available agents
-orchestrator version                 # current version
+# Service
+orch service start
+orch service stop
+orch service restart
+orch service status
 ```
 
 ## Config Structure
 
 ```yaml
 # ~/.orchestrator/config.yml
+repo: owner/repo
+
 workflow:
   auto_close: true
   review_owner: "@owner"
   enable_review_agent: false
-  review_agent: "claude"
   max_attempts: 10
 
 router:
-  agent: "claude"
-  model: "haiku"              # model for the router itself
+  mode: "llm"              # "llm" (default) or "round_robin"
+  agent: "claude"          # which LLM performs routing
+  model: "haiku"           # fast/cheap model for classification
   timeout_seconds: 120
   fallback_executor: "codex"
+  max_route_attempts: 3
+  agents:
+    - claude
+    - codex
+    - opencode
+    - kimi
+    - minimax
+  allowed_tools:
+    - yq
+    - jq
+    - bash
+    - just
+    - git
+    - rg
+    - sed
+    - awk
+    - python3
+    - node
+    - npm
+    - bun
+  default_skills:
+    - gh
+    - git-worktree
 
 model_map:
-  simple:   { claude: haiku, codex: gpt-5.1-codex-mini }
-  medium:   { claude: sonnet, codex: gpt-5.2 }
-  complex:  { claude: opus, codex: gpt-5.3-codex }
-  review:   { claude: sonnet, codex: gpt-5.2 }
+  simple:
+    claude: haiku
+    codex: gpt-5.1-codex-mini
+  medium:
+    claude: sonnet
+    codex: gpt-5.2
+  complex:
+    claude: opus
+    codex: gpt-5.3-codex
+  review:
+    claude: sonnet
+    codex: gpt-5.2
 
 gh:
   repo: "owner/repo"
@@ -237,19 +310,29 @@ gh:
 
 | File | Purpose |
 |------|---------|
-| `justfile` | CLI entrypoint, dispatches to scripts |
-| `scripts/lib.sh` | Shared helpers (log, lock, yq, config, model_for_complexity) |
-| `scripts/backend.sh` | Backend interface loader + jobs CRUD (YAML-backed) |
-| `scripts/backend_github.sh` | GitHub Issues backend implementation |
-| `scripts/serve.sh` | Main loop (10s tick) |
-| `scripts/poll.sh` | Pick tasks, detect stuck, unblock parents |
-| `scripts/route_task.sh` | LLM router → agent + complexity + profile |
-| `scripts/run_task.sh` | Invoke agent, parse response, push, PR |
-| `scripts/output.sh` | Shared formatting (tables, sections) |
-| `prompts/route.md` | Router prompt template |
-| `prompts/system.md` | Agent system prompt template |
-| `prompts/agent.md` | Agent message template |
-| `prompts/review.md` | Review agent prompt template |
-| `prompts/plan.md` | Plan/decompose prompt template |
-| `tests/orchestrator.bats` | 200 bats tests |
-| `tests/gh_mock.sh` | Comprehensive gh CLI mock for testing |
+| `Cargo.toml` | Rust dependencies |
+| `src/main.rs` | CLI entrypoint (clap) |
+| `src/config.rs` | Config loading (config.yml + .orchestrator.yml) |
+| `src/db.rs` | SQLite for internal tasks |
+| `src/sidecar.rs` | JSON sidecar I/O |
+| `src/parser.rs` | Agent response normalization |
+| `src/cron.rs` | Native cron matching |
+| `src/template.rs` | Template rendering |
+| `src/tmux.rs` | tmux session management |
+| `src/backends/mod.rs` | ExternalBackend trait |
+| `src/backends/github.rs` | GitHub Issues implementation |
+| `src/channels/mod.rs` | Channel trait + registry |
+| `src/channels/transport.rs` | Broadcast transport layer |
+| `src/channels/capture.rs` | tmux output capture |
+| `src/channels/tmux.rs` | tmux channel |
+| `src/engine/mod.rs` | Main engine loop |
+| `src/engine/tasks.rs` | Task manager |
+| `src/engine/router.rs` | Agent router |
+| `src/engine/runner.rs` | Task runner |
+| `src/engine/jobs.rs` | Job scheduler |
+| `src/cli/mod.rs` | CLI utilities |
+| `src/cli/task.rs` | Task commands |
+| `src/cli/job.rs` | Job commands |
+| `src/cli/service.rs` | Service commands |
+| `prompts/*.md` | Prompt templates |
+| `.github/workflows/release.yml` | CI/CD pipeline |
