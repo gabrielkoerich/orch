@@ -695,7 +695,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Webhook HTTP server (axum) — PR #93 merged
 - [x] Wire webhook server into engine — PR #123 merged
 - [ ] Mention detection via webhooks (#112)
-- [ ] Polling fallback when webhooks not configured (mentions, PR reviews, issue status)
+- [x] Polling fallback when webhooks not configured — PR #131 merged
 - [x] Wire channels into engine event loop — PR #81 merged
 
 ### Phase 4: CLI & User-Facing Commands
@@ -742,7 +742,8 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Agent memory (persist learnings across retries) — PR #122 merged
 - [x] PR review integration (parse review comments → follow-up tasks) — PR #125 merged
 - [x] Self-improvement loop (auto-create issues from metrics) — PR #120 merged
-- [ ] Polling fallback for webhooks (mentions, PR reviews, issue status) — #TBD
+- [x] Polling fallback for webhooks (health check, fallback mode) — PR #131 merged
+- [x] Updated default model map to current identifiers — PR #130 merged
 
 ---
 

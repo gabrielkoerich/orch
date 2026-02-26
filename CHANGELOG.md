@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-02-26 (cont.) — Model Map Fix, Polling Fallback & Cleanup
+
+### Summary
+
+Fixed the last open issue (#100), unstuck and merged the polling fallback PR (#131),
+and closed all remaining open issues. Zero open issues, zero open PRs.
+
+### Bug Fixes
+
+- **Updated default model map** (#100, PR #130): Replaced placeholder/outdated model names:
+  - Claude: `haiku` → `claude-haiku-4-5-20251001`, `sonnet` → `claude-sonnet-4-6`, `opus` → `claude-opus-4-6`
+  - Codex: `gpt-5.x` placeholders → `o4-mini`, `gpt-4.1`, `o3`
+  - OpenCode: `github-copilot/gpt-5.x` → `openai/gpt-4.1-mini`, `anthropic/claude-sonnet-4-6`, `anthropic/claude-opus-4-6`
+  - Updated `pricing_for_model()` to match new model names
+
+### Features
+
+- **Polling fallback for webhooks** (#127, PR #131): When webhooks are disabled or fail,
+  the engine automatically uses faster polling (30s instead of 120s):
+  - Webhook health check pings local `/health` endpoint every 60s (with 5s timeout)
+  - Automatic fallback mode switching with clear log messages
+  - When webhooks disabled, starts in polling mode immediately
+  - Configurable intervals via `engine.fallback_sync_interval` and `engine.webhook_health_check_interval`
+
+### Review Fixes (PR #131)
+
+- Removed `webhook_healthy` from `EngineConfig` (was runtime state on a config struct)
+- Set `webhook_healthy = true` after server starts (prevents false fallback log)
+- Added 5s timeout to health check HTTP request (prevents blocking engine loop)
+- Removed redundant default assignments in `from_config()` else branches
+- Updated AGENTS.md to accurately describe health check scope (local server only)
+
+### Housekeeping
+
+- Closed issue #126 (scheduled job marked done but still open)
+- All 244 tests passing, zero clippy warnings, clean `cargo fmt`
+- Zero open issues, zero open PRs
+
+---
+
 ## 2026-02-26 — Per-Agent Runners, Error Mapping & PR Maintenance
 
 ### Summary
