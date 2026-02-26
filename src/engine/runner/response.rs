@@ -26,6 +26,20 @@ pub enum RunResult {
     Failed(String),
 }
 
+/// Outcome signal for the engine to update router weights.
+///
+/// Returned by the task runner so the engine can feed rate limit
+/// and success signals back to the router's weighted round-robin.
+#[derive(Debug, Clone)]
+pub enum WeightSignal {
+    /// Agent completed a task successfully.
+    Success { agent: String },
+    /// Agent hit a rate limit / usage limit.
+    RateLimited { agent: String },
+    /// No weight-relevant signal (timeout, auth error, etc.)
+    None,
+}
+
 /// Collect and classify the agent's response.
 pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> RunResult {
     // Read stderr (check new state dir, fall back to legacy)
@@ -385,6 +399,7 @@ pub enum RetryableError {
     MissingTooling,
 }
 
+#[allow(dead_code)]
 impl RetryableError {
     /// Check if this error type should be retried with the same agent first.
     pub fn should_retry_same_agent(&self) -> bool {
@@ -498,11 +513,7 @@ pub fn handle_failover(
     }
 
     // No fallback available
-    tracing::warn!(
-        task_id,
-        agent = agent_name,
-        "no fallback agents available"
-    );
+    tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
     sidecar::set(
         task_id,
         &[
@@ -532,7 +543,6 @@ pub fn get_reroute_chain(task_id: &str) -> String {
 }
 
 /// Update the reroute chain in sidecar.
-#[allow(dead_code)]
 pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: &str) -> String {
     let mut chain = existing_chain.to_string();
     if chain.is_empty() {
@@ -541,7 +551,9 @@ pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: 
         chain = format!("{chain},{current_agent}");
     }
 
-    sidecar::set(task_id, &[format!("limit_reroute_chain={chain}")]).ok();
+    if let Err(e) = sidecar::set(task_id, &[format!("limit_reroute_chain={chain}")]) {
+        tracing::warn!(task_id, error = ?e, "failed to update reroute chain");
+    }
     chain
 }
 
@@ -635,5 +647,21 @@ mod tests {
     fn snippet_preserves_short_text() {
         let short = "hello";
         assert_eq!(snippet(short), "hello");
+    }
+
+    #[test]
+    fn weight_signal_variants() {
+        let success = WeightSignal::Success {
+            agent: "claude".to_string(),
+        };
+        let limited = WeightSignal::RateLimited {
+            agent: "codex".to_string(),
+        };
+        let none = WeightSignal::None;
+
+        // Verify Debug trait
+        assert!(format!("{success:?}").contains("claude"));
+        assert!(format!("{limited:?}").contains("codex"));
+        assert!(format!("{none:?}").contains("None"));
     }
 }

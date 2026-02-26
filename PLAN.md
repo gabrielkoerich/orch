@@ -606,12 +606,12 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Auto-update job SIGTERM — fixed (backgrounded restart)
 - [x] 88 orphaned branches — cleaned up (96 deleted)
 - [x] Stale job `active_task_id` — fixed
-- [ ] PR #190 owner slash commands — rebased, auto-merge pending CI
-- [ ] PR #191 auto-reroute on usage limits — rebased, auto-merge pending CI
-- [ ] README is outdated — needs full refresh
-- [ ] Internal tasks design (for cron jobs, mentions) — design before implementation
-- [ ] Weighted round-robin for agent routing — scale based on rate limit capacity
-- [ ] Worktree cleanup for stuck/failed tasks — prevent branch orphaning
+- [x] PR #190 owner slash commands — merged (in orchestrator repo)
+- [x] PR #191 auto-reroute on usage limits — merged (in orchestrator repo)
+- [x] README is outdated — refreshed (#70)
+- [x] Internal tasks design — implemented (SQLite + engine integration)
+- [x] Weighted round-robin for agent routing — PR #94 merged
+- [x] Worktree cleanup for stuck/failed tasks — implemented in sync_tick
 
 ### Metrics to Collect Before v1
 
@@ -633,7 +633,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Run clean for 2+ weeks
 - [x] Collect baseline metrics
 - [x] Grow test suite to cover all edge cases
-- [ ] Update README
+- [x] Update README — refreshed (#70)
 
 ### Phase 1: Foundation (replace internal tools) ✅ DONE
 
@@ -678,8 +678,8 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Security module — `src/security.rs`
 - [x] **Rewrite run_task.sh in Rust** — `src/engine/runner/` (context, worktree, agent, response, git_ops)
 - [x] **Route task in Rust** — router wired into dispatch loop, `run_with_context()` calls runner
-- [ ] Multi-project support — serve.sh iterates PROJECT_DIRS, engine needs this
-- [ ] Config hot-reload wired into engine (notify watcher exists but not connected)
+- [x] Multi-project support — PR #82 merged
+- [x] Config hot-reload wired into engine — PR #78 merged
 
 ### Phase 3: Channels (scaffolding done, not wired)
 
@@ -689,12 +689,12 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Transport layer — `src/channels/transport.rs` (session bindings, broadcast)
 - [x] Tmux channel — `src/channels/tmux.rs` (pane monitoring)
 - [x] Capture service — `src/channels/capture.rs` (output diffing + streaming)
-- [ ] GitHub channel (webhooks via axum) — `src/channels/github.rs` (stub only)
-- [ ] Telegram channel — `src/channels/telegram.rs` (stub only)
-- [ ] Discord channel — `src/channels/discord.rs` (stub only)
-- [ ] Webhook HTTP server (axum)
-- [ ] Mention detection via webhooks (instant, no polling)
-- [ ] Wire channels into engine event loop
+- [x] GitHub channel (polling implementation) — PR #81 merged
+- [x] Telegram channel (long-poll implementation) — PR #81 merged
+- [x] Discord channel (polling implementation) — PR #81 merged
+- [x] Webhook HTTP server (axum) — PR #93 merged
+- [ ] Mention detection via webhooks (#112 — wire webhook into engine)
+- [x] Wire channels into engine event loop — PR #81 merged
 
 ### Phase 4: CLI & User-Facing Commands
 
@@ -728,14 +728,14 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 
 ### Phase 5: Polish & Migration
 
-- [ ] Rename `~/.orchestrator/` → `~/.orch/` (with backward compat)
-- [ ] Rename `.orchestrator.yml` → `.orch.yml`
+- [x] Rename `~/.orchestrator/` → `~/.orch/` (with backward compat) — PR #83
+- [x] Rename `.orchestrator.yml` → `.orch.yml` — issue #74
 - [x] Update brew formula (from `orchestrator` to `orch`) — `Formula/orch.rb`
 - [x] Update AGENTS.md with Rust engine docs
 - [x] Jobs config consolidated into `.orchestrator.yml` (no separate `jobs.yml`)
-- [ ] Metrics / observability (tracing, prometheus)
-- [ ] Cross-compile CI pipeline (macOS arm64 + x86_64)
-- [ ] Unified notification system (events → all channels)
+- [x] Cross-compile CI pipeline (macOS arm64 + x86_64) — PR #92 merged
+- [ ] Metrics / observability (tracing, prometheus) — PR #95 pending
+- [ ] Unified notification system (events → all channels) — #113
 
 ---
 

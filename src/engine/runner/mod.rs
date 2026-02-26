@@ -24,6 +24,7 @@ use crate::sidecar;
 use crate::tmux::TmuxManager;
 use chrono::Utc;
 use response::RunResult;
+pub use response::WeightSignal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
@@ -92,7 +93,7 @@ impl TaskRunner {
         }
 
         // Check max attempts
-        let max_attempts: u32 = config::get("max_attempts")
+        let max_attempts: u32 = config::get("workflow.max_attempts")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
@@ -174,8 +175,14 @@ impl TaskRunner {
         let git_email = config::get("git.email")
             .unwrap_or_else(|_| format!("{agent_name}[bot]@users.noreply.github.com"));
 
-        // Output file
-        let output_file = PathBuf::from(format!("/tmp/output-{task_id}.json"));
+        // Output file in state directory with restricted permissions (0600)
+        let state_dir = sidecar::state_dir().unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".orch")
+                .join("state")
+        });
+        let output_file = state_dir.join(format!("output-{task_id}.json"));
 
         // Build sandbox disallowed tools
         let mut disallowed_tools = vec!["Bash(rm *)".to_string(), "Bash(rm -*)".to_string()];
@@ -198,9 +205,10 @@ impl TaskRunner {
             .unwrap_or(1800);
 
         // Build agent invocation
+        let model_for_invocation = model_name.clone();
         let invocation = agent::AgentInvocation {
             agent: agent_name.clone(),
-            model: model_name.clone(),
+            model: model_for_invocation,
             work_dir: wt.work_dir.clone(),
             system_prompt,
             agent_message,
@@ -270,7 +278,7 @@ impl TaskRunner {
 
                 // Auto-commit
                 if resp.status == "done" || resp.status == "in_progress" {
-                    git_ops::auto_commit(
+                    if let Err(e) = git_ops::auto_commit(
                         &wt.work_dir,
                         task_id,
                         &task_title,
@@ -278,13 +286,19 @@ impl TaskRunner {
                         new_attempts,
                     )
                     .await
-                    .ok();
+                    {
+                        tracing::error!(task_id, error = ?e, "auto commit failed");
+                        sidecar::set(task_id, &[format!("last_error=auto commit failed: {e}")])?;
+                    }
 
                     // Push
-                    git_ops::push_branch(&wt.work_dir, &wt.branch).await.ok();
+                    if let Err(e) = git_ops::push_branch(&wt.work_dir, &wt.branch).await {
+                        tracing::error!(task_id, error = ?e, "push failed");
+                        sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
+                    }
 
                     // Create PR
-                    git_ops::create_pr_if_needed(
+                    if let Err(e) = git_ops::create_pr_if_needed(
                         &wt.work_dir,
                         &wt.branch,
                         &task_title,
@@ -296,7 +310,10 @@ impl TaskRunner {
                         &agent_name,
                     )
                     .await
-                    .ok();
+                    {
+                        tracing::error!(task_id, error = ?e, "create PR failed");
+                        sidecar::set(task_id, &[format!("last_error=create PR failed: {e}")])?;
+                    }
                 }
 
                 // Store result in sidecar
@@ -308,6 +325,36 @@ impl TaskRunner {
                     ],
                 )?;
 
+                // Store token usage if available
+                if let (Some(input), Some(output)) = (resp.input_tokens, resp.output_tokens) {
+                    let model = model_name.as_deref().unwrap_or("haiku");
+                    if let Err(e) = sidecar::store_token_usage(task_id, input, output, model) {
+                        tracing::warn!(task_id, ?e, "failed to store token usage");
+                    }
+                }
+
+                // Check token budget
+                let max_tokens: u64 = config::get("max_tokens_per_task")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(100_000);
+
+                let total_tokens = sidecar::get_total_tokens(task_id);
+                if total_tokens > max_tokens {
+                    tracing::warn!(task_id, total_tokens, max_tokens, "exceeded token budget");
+                    sidecar::set(
+                        task_id,
+                        &[
+                            "status=needs_review".to_string(),
+                            format!(
+                                "last_error=token budget exceeded: {}/{} tokens",
+                                total_tokens, max_tokens
+                            ),
+                        ],
+                    )?;
+                    return Ok(());
+                }
+
                 // Check PR override: done → in_review
                 if resp.status == "done"
                     && git_ops::check_pr_override(&wt.work_dir, &wt.branch).await
@@ -317,7 +364,11 @@ impl TaskRunner {
                 }
             }
             RunResult::Timeout => {
-                tracing::warn!(task_id, agent = agent_name, "agent timed out, attempting failover");
+                tracing::warn!(
+                    task_id,
+                    agent = agent_name,
+                    "agent timed out, attempting failover"
+                );
                 response::handle_failover(
                     task_id,
                     &agent_name,
@@ -327,7 +378,19 @@ impl TaskRunner {
                 );
             }
             RunResult::UsageLimit(snippet) => {
-                tracing::warn!(task_id, agent = agent_name, "usage/rate limit hit, attempting failover");
+                tracing::warn!(
+                    task_id,
+                    agent = agent_name,
+                    "usage/rate limit hit, attempting failover"
+                );
+
+                // Record rate limit event if db is available
+                if let Some(ref db) = self.db {
+                    let _ = db
+                        .record_rate_limit(&agent_name, "rate", Some(task_id))
+                        .await;
+                }
+
                 response::handle_failover(
                     task_id,
                     &agent_name,
@@ -337,7 +400,19 @@ impl TaskRunner {
                 );
             }
             RunResult::AuthError(snippet) => {
-                tracing::warn!(task_id, agent = agent_name, "auth/billing error, attempting failover");
+                tracing::warn!(
+                    task_id,
+                    agent = agent_name,
+                    "auth/billing error, attempting failover"
+                );
+
+                // Record rate limit event (auth errors are a form of limit) if db is available
+                if let Some(ref db) = self.db {
+                    let _ = db
+                        .record_rate_limit(&agent_name, "budget", Some(task_id))
+                        .await;
+                }
+
                 response::handle_failover(
                     task_id,
                     &agent_name,
@@ -370,7 +445,63 @@ impl TaskRunner {
 
         // Kill tmux session if still alive
         if tmux.session_exists(&session).await {
-            tmux.kill_session(&session).await.ok();
+            if let Err(e) = tmux.kill_session(&session).await {
+                tracing::warn!(task_id, error = ?e, "failed to kill tmux session");
+            }
+        }
+
+        // Record metrics after task completion
+        let completed_at = Utc::now();
+        let duration_seconds = (completed_at - started_at).num_milliseconds() as f64 / 1000.0;
+
+        // Determine outcome based on final status
+        let final_status = sidecar::get(task_id, "status").unwrap_or_default();
+        let outcome = match final_status.as_str() {
+            "done" | "in_progress" | "in_review" => "success",
+            "needs_review" => {
+                let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
+                if last_error.contains("timeout") {
+                    "timeout"
+                } else if last_error.contains("rate limit") || last_error.contains("usage") {
+                    "rate_limit"
+                } else if last_error.contains("auth") || last_error.contains("billing") {
+                    "auth_error"
+                } else {
+                    "failed"
+                }
+            }
+            _ => "success",
+        };
+
+        // Get complexity from route result
+        let complexity = route_result.as_ref().map(|r| r.complexity.clone());
+
+        // Get files changed count (approximate from git status)
+        let files_changed = git_ops::count_changed_files(&wt.work_dir)
+            .await
+            .unwrap_or(0);
+
+        // Record metrics if db is available
+        if let Some(ref db) = self.db {
+            let error_type: Option<String> = sidecar::get(task_id, "last_error").ok();
+            let metric = InsertTaskMetric {
+                task_id,
+                agent: &agent_name,
+                model: model_name.as_deref(),
+                complexity: complexity.as_deref(),
+                outcome,
+                duration_seconds,
+                started_at: &started_at,
+                completed_at: &completed_at,
+                attempts: attempts as i32 + 1,
+                files_changed: files_changed as i32,
+                error_type: error_type.as_deref(),
+            };
+            let metric_result = db.insert_task_metric(metric).await;
+
+            if let Err(e) = metric_result {
+                tracing::warn!(task_id, ?e, "failed to record task metrics");
+            }
         }
 
         // Record metrics after task completion
@@ -433,15 +564,17 @@ impl TaskRunner {
     /// Run a task with full engine context (backend, tmux, capture).
     ///
     /// Called by the engine dispatch loop with richer context.
+    /// Returns a `WeightSignal` for the engine to feed back to the router.
     pub async fn run_with_context(
         &self,
         task: &ExternalTask,
         backend: &Arc<dyn ExternalBackend>,
         _tmux: &Arc<TmuxManager>,
         route_result: Option<&RouteResult>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<WeightSignal> {
         let task_id = &task.id.0;
         let agent = route_result.map(|r| r.agent.as_str());
+        let agent_name = agent.unwrap_or("claude").to_string();
         let model = route_result.and_then(|r| r.model.as_deref());
 
         // Store task info in sidecar for prompt building
@@ -460,6 +593,36 @@ impl TaskRunner {
         let status = sidecar::get(task_id, "status").unwrap_or_default();
         let summary = sidecar::get(task_id, "summary").unwrap_or_default();
         let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
+
+        // Determine weight signal based on outcome
+        let is_rate_limited = last_error.contains("usage")
+            || last_error.contains("rate limit")
+            || last_error.contains("rerouted");
+        let weight_signal = if status == "new" && is_rate_limited {
+            WeightSignal::RateLimited {
+                agent: agent_name.clone(),
+            }
+        } else if status == "done" || status == "in_progress" || status == "in_review" {
+            WeightSignal::Success {
+                agent: agent_name.clone(),
+            }
+        } else {
+            WeightSignal::None
+        };
+
+        // Write status to sidecar BEFORE updating GitHub (ensures atomicity)
+        sidecar::set(
+            task_id,
+            &[
+                format!("status={}", status),
+                format!("summary={}", summary),
+                format!("last_error={}", last_error),
+                format!(
+                    "status_confirmed_at={}",
+                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+                ),
+            ],
+        )?;
 
         // Update GitHub status
         let new_status = match status.as_str() {
@@ -499,7 +662,7 @@ impl TaskRunner {
         };
         backend.post_comment(&task.id, &comment).await?;
 
-        Ok(())
+        Ok(weight_signal)
     }
 
     /// Resolve the project directory for this repo.
