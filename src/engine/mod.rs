@@ -509,6 +509,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         &router_guard,
                         &engine.task_manager,
                         &weight_tx,
+                        &transport,
                     ).await {
                         tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
                     }
