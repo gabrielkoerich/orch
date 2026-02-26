@@ -1208,8 +1208,7 @@ async fn review_open_prs(
                 .filter(|c| {
                     // Comments are associated with reviews via the review_id field
                     // The GitHub API includes this in the response
-                    c.user.login == review.user.login
-                        && c.created_at >= review.submitted_at
+                    c.user.login == review.user.login && c.created_at >= review.submitted_at
                 })
                 .cloned()
                 .collect();
@@ -1306,7 +1305,10 @@ async fn create_review_follow_up_task(
     let reviewer = &review.review.user.login;
 
     // Build task title
-    let title = format!("Address review comment on {} by @{}", comment.path, reviewer);
+    let title = format!(
+        "Address review comment on {} by @{}",
+        comment.path, reviewer
+    );
 
     // Build task body with context
     let mut body = format!(
@@ -1356,10 +1358,7 @@ async fn create_review_follow_up_task(
     body.push_str("\n");
 
     // Create labels
-    let mut labels = vec![
-        "pr-review-followup".to_string(),
-        "status:new".to_string(),
-    ];
+    let mut labels = vec!["pr-review-followup".to_string(), "status:new".to_string()];
 
     // Route to the same agent that created the PR
     if let Some(agent) = original_agent {
@@ -1406,7 +1405,9 @@ async fn create_review_follow_up_task(
         comment.path,
         reviewer
     );
-    let _ = backend.post_comment(&ExternalId(parent_task_id.to_string()), &comment_body).await;
+    let _ = backend
+        .post_comment(&ExternalId(parent_task_id.to_string()), &comment_body)
+        .await;
 
     Ok(())
 }
@@ -1505,7 +1506,9 @@ mod tests {
                     created_at: "2024-01-01T00:00:00Z".to_string(),
                     updated_at: "2024-01-01T00:00:00Z".to_string(),
                     in_reply_to_id: None,
-                    diff_hunk: Some("@@ -8,5 +8,5 @@ fn main() {\n-    let x = 1;\n+    let x = 2;".to_string()),
+                    diff_hunk: Some(
+                        "@@ -8,5 +8,5 @@ fn main() {\n-    let x = 1;\n+    let x = 2;".to_string(),
+                    ),
                 },
                 GitHubReviewComment {
                     id: 2,
@@ -1549,6 +1552,9 @@ mod tests {
         assert_eq!(actionable[0].id, 1);
         assert_eq!(actionable[0].body, "Fix this issue");
         assert_eq!(actionable[0].path, "src/main.rs");
-        assert_eq!(actionable[0].diff_hunk.as_ref().unwrap(), "@@ -8,5 +8,5 @@ fn main() {\n-    let x = 1;\n+    let x = 2;");
+        assert_eq!(
+            actionable[0].diff_hunk.as_ref().unwrap(),
+            "@@ -8,5 +8,5 @@ fn main() {\n-    let x = 1;\n+    let x = 2;"
+        );
     }
 }

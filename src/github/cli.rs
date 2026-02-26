@@ -394,7 +394,11 @@ impl GhCli {
     /// Get reviews for a PR.
     ///
     /// Uses `gh api` to fetch all reviews for a given PR number.
-    pub async fn get_pr_reviews(&self, repo: &str, pr_number: u64) -> anyhow::Result<Vec<GitHubReview>> {
+    pub async fn get_pr_reviews(
+        &self,
+        repo: &str,
+        pr_number: u64,
+    ) -> anyhow::Result<Vec<GitHubReview>> {
         let endpoint = format!("repos/{repo}/pulls/{pr_number}/reviews");
         let json = self.api(&[&endpoint]).await?;
         Ok(serde_json::from_slice(&json)?)
@@ -417,7 +421,11 @@ impl GhCli {
     /// Get all review comments for a PR.
     ///
     /// Uses `gh api` to fetch all review comments (across all reviews) for a PR.
-    pub async fn get_pr_comments(&self, repo: &str, pr_number: u64) -> anyhow::Result<Vec<GitHubReviewComment>> {
+    pub async fn get_pr_comments(
+        &self,
+        repo: &str,
+        pr_number: u64,
+    ) -> anyhow::Result<Vec<GitHubReviewComment>> {
         let endpoint = format!("repos/{repo}/pulls/{pr_number}/comments");
         let json = self.api(&[&endpoint]).await?;
         Ok(serde_json::from_slice(&json)?)
