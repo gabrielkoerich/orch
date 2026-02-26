@@ -22,8 +22,11 @@ pub mod tasks;
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
+use crate::channels::discord::DiscordChannel;
+use crate::channels::telegram::TelegramChannel;
+use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
-use crate::channels::ChannelRegistry;
+use crate::channels::{Channel, ChannelRegistry, IncomingMessage};
 use crate::config;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::{get_route_result, Router};
@@ -195,7 +198,78 @@ pub async fn serve() -> anyhow::Result<()> {
     });
 
     // Initialize channel registry
-    let _channels = ChannelRegistry::new();
+    let mut channel_registry = ChannelRegistry::new();
+
+    // Try to initialize Telegram channel
+    if let Ok(token) = crate::config::get("channels.telegram.bot_token") {
+        if !token.is_empty() {
+            let chat_id = crate::config::get("channels.telegram.chat_id").ok();
+            let telegram = TelegramChannel::new(token, chat_id);
+            if let Err(e) = telegram.health_check().await {
+                tracing::warn!(?e, "telegram channel health check failed, skipping");
+            } else {
+                channel_registry.register(Box::new(telegram));
+                tracing::info!("telegram channel registered");
+            }
+        }
+    }
+
+    // Try to initialize Discord channel
+    if let Ok(token) = crate::config::get("channels.discord.bot_token") {
+        if !token.is_empty() {
+            let channel_id = crate::config::get("channels.discord.channel_id").ok();
+            let discord = DiscordChannel::new(token, channel_id);
+            if let Err(e) = discord.health_check().await {
+                tracing::warn!(?e, "discord channel health check failed, skipping");
+            } else {
+                channel_registry.register(Box::new(discord));
+                tracing::info!("discord channel registered");
+            }
+        }
+    }
+
+    // Initialize tmux channel with transport for output streaming
+    let tmux_channel = TmuxChannel::with_transport(transport.clone());
+    channel_registry.register(Box::new(tmux_channel));
+    tracing::info!("tmux channel registered");
+
+    // Start all channels and collect their message receivers
+    let mut channel_receivers: Vec<tokio::sync::mpsc::Receiver<IncomingMessage>> = Vec::new();
+    for channel in channel_registry.iter() {
+        match channel.start().await {
+            Ok(rx) => {
+                tracing::info!(channel = channel.name(), "channel started");
+                channel_receivers.push(rx);
+            }
+            Err(e) => {
+                tracing::warn!(channel = channel.name(), ?e, "failed to start channel");
+            }
+        }
+    }
+
+    // Spawn tasks to handle incoming channel messages (if any channels are active)
+    let transport_for_messages = transport.clone();
+    for mut rx in channel_receivers {
+        let transport = transport_for_messages.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received message from channel");
+
+                // Route the message through transport
+                match transport.route(&msg).await {
+                    crate::channels::transport::MessageRoute::TaskSession { task_id } => {
+                        tracing::debug!(task_id = %task_id, "message routed to existing session");
+                    }
+                    crate::channels::transport::MessageRoute::Command { raw } => {
+                        tracing::debug!(command = %raw, "message is a command");
+                    }
+                    crate::channels::transport::MessageRoute::NewTask => {
+                        tracing::debug!("message would create new task");
+                    }
+                }
+            }
+        });
+    }
 
     // Agent router (selects agent + model per task) - shared across projects
     let router = Arc::new(RwLock::new(Router::from_config()));
