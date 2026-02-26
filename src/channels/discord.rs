@@ -10,10 +10,10 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 
 pub struct DiscordChannel {
-    token: String,
-    client: Client,
-    channel_id: Option<String>,
-    last_message_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    pub token: String,
+    pub client: Client,
+    pub channel_id: Option<String>,
+    pub last_message_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -66,12 +66,12 @@ impl DiscordChannel {
     async fn get_messages(
         &self,
         channel_id: &str,
-        before: Option<&str>,
+        after: Option<&str>,
     ) -> anyhow::Result<Vec<DiscordMessage>> {
         let mut url = self.api_url(&format!("/channels/{}/messages", channel_id));
 
-        if let Some(before_id) = before {
-            url = format!("{}?before={}&limit=50", url, before_id);
+        if let Some(after_id) = after {
+            url = format!("{}?after={}&limit=50", url, after_id);
         }
 
         let response = self
@@ -122,7 +122,7 @@ impl Channel for DiscordChannel {
     async fn start(&self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let token = self.token.clone();
-        let _client = self.client.clone();
+        let client = self.client.clone();
         let channel_id = self.channel_id.clone();
         let last_message_id = self.last_message_id.clone();
 
@@ -142,15 +142,19 @@ impl Channel for DiscordChannel {
             loop {
                 tokio::time::sleep(polling_interval).await;
 
-                let before = {
+                let after = {
                     let last = last_message_id.lock().unwrap();
                     last.clone()
                 };
 
-                let messages = match DiscordChannel::new(token.clone(), Some(channel_id.clone()))
-                    .get_messages(&channel_id, before.as_deref())
-                    .await
-                {
+                // Use self.client directly instead of creating a new channel
+                let channel = DiscordChannel {
+                    token: token.clone(),
+                    client: client.clone(),
+                    channel_id: Some(channel_id.clone()),
+                    last_message_id: last_message_id.clone(),
+                };
+                let messages = match channel.get_messages(&channel_id, after.as_deref()).await {
                     Ok(m) => m,
                     Err(e) => {
                         tracing::warn!(?e, "failed to get discord messages");
@@ -158,17 +162,19 @@ impl Channel for DiscordChannel {
                     }
                 };
 
-                // Messages come in reverse chronological order
-                for msg in messages.into_iter().rev() {
+                // Messages come in reverse chronological order (newest first)
+                // Track the maximum (newest) message ID
+                for msg in messages {
                     // Skip bot messages (we don't want to react to ourselves)
                     if msg.author.bot.unwrap_or(false) {
                         continue;
                     }
 
-                    // Update last message id
+                    // Update last message id to track the maximum (newest) ID
+                    // Discord snowflakes are monotonically increasing
                     {
                         let mut last = last_message_id.lock().unwrap();
-                        if last.as_ref().map(|s| s.as_str()) != Some(&msg.id) {
+                        if last.as_ref().is_none_or(|s| msg.id > *s) {
                             *last = Some(msg.id.clone());
                         }
                     }
