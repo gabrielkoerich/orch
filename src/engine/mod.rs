@@ -993,7 +993,7 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
 /// Lists tasks in review and triggers review agent if configured.
 async fn review_open_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<()> {
     // Check if review agent is enabled
-    let review_enabled = crate::config::get("enable_review_agent")
+    let review_enabled = crate::config::get("workflow.enable_review_agent")
         .map(|v| v == "true")
         .unwrap_or(false);
 
