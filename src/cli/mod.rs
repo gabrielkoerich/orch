@@ -84,7 +84,9 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     }
 
     // Auto-setup GitHub Projects V2 (non-blocking)
-    if config::get("gh.project_id").is_err() || config::get("gh.project_id").unwrap_or_default().is_empty() {
+    if config::get("gh.project_id").is_err()
+        || config::get("gh.project_id").unwrap_or_default().is_empty()
+    {
         println!("Setting up GitHub Projects V2...");
         // Run project setup in a blocking tokio context if available,
         // but init is sync so we just print guidance
@@ -349,8 +351,9 @@ pub async fn project_link(project_id: &str) -> anyhow::Result<()> {
 pub async fn project_sync() -> anyhow::Result<()> {
     use crate::github::projects::{write_project_config, ProjectSync};
 
-    let project_id = config::get("gh.project_id")
-        .map_err(|_| anyhow::anyhow!("no project configured — run `orch project link <id>` first"))?;
+    let project_id = config::get("gh.project_id").map_err(|_| {
+        anyhow::anyhow!("no project configured — run `orch project link <id>` first")
+    })?;
 
     if project_id.is_empty() {
         anyhow::bail!("no project configured — run `orch project link <id>` first");

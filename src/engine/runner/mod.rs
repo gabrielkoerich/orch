@@ -253,11 +253,12 @@ impl TaskRunner {
         // Read exit code — check per-task attempt dir first, fall back to legacy
         let exit_code: i32 = {
             let attempt_exit = attempt_dir.join("exit.txt");
-            let legacy_exit = sidecar::state_file(&format!("exit-{task_id}.txt")).unwrap_or_else(|_| {
-                self.orch_home
-                    .join("state")
-                    .join(format!("exit-{task_id}.txt"))
-            });
+            let legacy_exit =
+                sidecar::state_file(&format!("exit-{task_id}.txt")).unwrap_or_else(|_| {
+                    self.orch_home
+                        .join("state")
+                        .join(format!("exit-{task_id}.txt"))
+                });
 
             std::fs::read_to_string(&attempt_exit)
                 .or_else(|_| std::fs::read_to_string(&legacy_exit))

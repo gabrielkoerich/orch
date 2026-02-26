@@ -210,10 +210,7 @@ impl ProjectSync {
         let gh = GhCli::new();
 
         // Try user first
-        let query = format!(
-            r#"{{ user(login: "{}") {{ id }} }}"#,
-            login
-        );
+        let query = format!(r#"{{ user(login: "{}") {{ id }} }}"#, login);
         if let Ok(result) = gh.graphql(&query).await {
             if let Some(id) = result.pointer("/data/user/id").and_then(|v| v.as_str()) {
                 return Ok(id.to_string());
@@ -221,10 +218,7 @@ impl ProjectSync {
         }
 
         // Try org
-        let query = format!(
-            r#"{{ organization(login: "{}") {{ id }} }}"#,
-            login
-        );
+        let query = format!(r#"{{ organization(login: "{}") {{ id }} }}"#, login);
         let result = gh.graphql(&query).await?;
         result
             .pointer("/data/organization/id")
@@ -355,7 +349,10 @@ pub fn write_project_config(sync: &ProjectSync) -> anyhow::Result<()> {
     // Ensure gh section exists
     let gh_key = serde_yml::Value::String("gh".to_string());
     if !root.contains_key(&gh_key) {
-        root.insert(gh_key.clone(), serde_yml::Value::Mapping(serde_yml::Mapping::new()));
+        root.insert(
+            gh_key.clone(),
+            serde_yml::Value::Mapping(serde_yml::Mapping::new()),
+        );
     }
     let gh = root
         .get_mut(&gh_key)
