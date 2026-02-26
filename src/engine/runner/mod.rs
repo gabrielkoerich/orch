@@ -148,6 +148,7 @@ impl TaskRunner {
             repo_tree,
             git_diff,
             issue_comments: String::new(), // Requires backend
+            memory: vec![],                // Will be loaded on retries
         };
 
         // Build a minimal ExternalTask for prompt building
@@ -351,6 +352,16 @@ impl TaskRunner {
                         tracing::warn!(task_id, ?e, "failed to store token usage");
                     }
                 }
+
+                // Store learnings for memory (for future retries)
+                response::store_learnings_from_response(
+                    task_id,
+                    new_attempts,
+                    &agent_name,
+                    model_name.as_deref(),
+                    &resp,
+                    resp.error.as_deref(),
+                );
 
                 // Check token budget
                 let max_tokens: u64 = config::get("max_tokens_per_task")
@@ -570,6 +581,15 @@ impl TaskRunner {
                 if !rerouted {
                     tracing::warn!(task_id, "failover exhausted, task marked needs_review");
                 }
+
+                // Store failure memory for retry learning
+                response::store_failure_memory(
+                    task_id,
+                    new_attempts,
+                    &agent_name,
+                    model_name.as_deref(),
+                    &error_msg,
+                );
             }
         }
 

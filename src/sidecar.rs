@@ -8,6 +8,7 @@
 //! Legacy fallback: `~/.orchestrator/.orchestrator/` (read-only)
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -235,6 +236,112 @@ pub fn get_total_tokens(task_id: &str) -> u64 {
     usage.total_tokens()
 }
 
+/// A single memory entry from a task attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryEntry {
+    /// Attempt number (1-indexed)
+    pub attempt: u32,
+    /// Agent that made this attempt
+    pub agent: String,
+    /// Model used for this attempt
+    pub model: Option<String>,
+    /// Key learnings from this attempt
+    pub learnings: Vec<String>,
+    /// Error message if the attempt failed
+    pub error: Option<String>,
+    /// Files modified in this attempt
+    pub files_modified: Vec<String>,
+    /// Approach taken (from summary)
+    pub approach: String,
+    /// Timestamp of the attempt
+    pub timestamp: String,
+}
+
+/// Store a memory entry for a task attempt.
+pub fn store_memory(task_id: &str, entry: &MemoryEntry) -> anyhow::Result<()> {
+    let path = sidecar_path(task_id)?;
+
+    // Load existing or create new
+    let mut obj: serde_json::Map<String, Value> = if path.exists() {
+        let content = std::fs::read_to_string(&path)?;
+        serde_json::from_str(&content)?
+    } else {
+        serde_json::Map::new()
+    };
+
+    // Get existing memory array or create new
+    let mut memory: Vec<MemoryEntry> = obj
+        .get("memory")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    // Add new entry
+    memory.push(entry.clone());
+
+    // Store back
+    obj.insert("memory".to_string(), serde_json::to_value(&memory)?);
+
+    // Write back
+    let content = serde_json::to_string_pretty(&Value::Object(obj))?;
+    std::fs::write(&path, content)?;
+
+    Ok(())
+}
+
+/// Get all memory entries for a task.
+pub fn get_memory(task_id: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+    let path = sidecar_path(task_id)?;
+
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let obj: serde_json::Map<String, Value> = serde_json::from_str(&content)?;
+
+    obj.get("memory")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .map(Ok)
+        .unwrap_or_else(|| Ok(vec![]))
+}
+
+/// Get recent memory entries for a task, capped at N attempts.
+/// Returns the last N attempts in chronological order.
+pub fn get_recent_memory(task_id: &str, max_entries: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+    let mut memory = get_memory(task_id)?;
+
+    // Sort by attempt number to ensure chronological order
+    memory.sort_by_key(|m| m.attempt);
+
+    // Take last N entries (most recent)
+    if memory.len() > max_entries {
+        memory = memory.split_off(memory.len() - max_entries);
+    }
+
+    Ok(memory)
+}
+
+/// Clear all memory entries for a task.
+#[allow(dead_code)]
+pub fn clear_memory(task_id: &str) -> anyhow::Result<()> {
+    let path = sidecar_path(task_id)?;
+
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let mut obj: serde_json::Map<String, Value> = serde_json::from_str(&content)?;
+
+    obj.remove("memory");
+
+    // Write back
+    let content = serde_json::to_string_pretty(&Value::Object(obj))?;
+    std::fs::write(&path, content)?;
+
+    Ok(())
+}
+
 /// Resolve model pricing using a built-in table and normalized model aliases.
 pub fn pricing_for_model(model: &str) -> ModelPricing {
     let normalized = model.trim().to_lowercase();
@@ -395,5 +502,32 @@ mod tests {
         assert!((cost.input_cost_usd - 0.1).abs() < 1e-9);
         assert!((cost.output_cost_usd - 0.08).abs() < 1e-9);
         assert!((cost.total_cost_usd - 0.18).abs() < 1e-9);
+    }
+
+    #[test]
+    fn memory_entry_serialization() {
+        let entry = MemoryEntry {
+            attempt: 1,
+            agent: "claude".to_string(),
+            model: Some("sonnet".to_string()),
+            learnings: vec!["Use format! macro for string formatting".to_string()],
+            error: Some("compilation failed".to_string()),
+            files_modified: vec!["src/main.rs".to_string()],
+            approach: "Fixed the formatting issue".to_string(),
+            timestamp: "2025-02-26T10:00:00Z".to_string(),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"attempt\":1"));
+        assert!(json.contains("\"agent\":\"claude\""));
+        assert!(json.contains("\"model\":\"sonnet\""));
+
+        let deserialized: MemoryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.attempt, 1);
+        assert_eq!(deserialized.agent, "claude");
+        assert_eq!(
+            deserialized.learnings,
+            vec!["Use format! macro for string formatting"]
+        );
     }
 }

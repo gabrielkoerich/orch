@@ -555,6 +555,60 @@ pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: 
     chain
 }
 
+/// Extract learnings and store as memory for future attempts.
+pub fn store_learnings_from_response(
+    task_id: &str,
+    attempt: u32,
+    agent: &str,
+    model: Option<&str>,
+    response: &crate::parser::AgentResponse,
+    error: Option<&str>,
+) {
+    // Build the memory entry
+    let entry = crate::sidecar::MemoryEntry {
+        attempt,
+        agent: agent.to_string(),
+        model: model.map(String::from),
+        learnings: response.learnings.clone(),
+        error: error.map(String::from),
+        files_modified: response.files.clone(),
+        approach: response.summary.clone(),
+        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    };
+
+    if let Err(e) = crate::sidecar::store_memory(task_id, &entry) {
+        tracing::warn!(task_id, error = ?e, "failed to store memory");
+    } else {
+        tracing::debug!(task_id, attempt, "stored memory for attempt");
+    }
+}
+
+/// Store a memory entry for a failed attempt (without a full AgentResponse).
+pub fn store_failure_memory(
+    task_id: &str,
+    attempt: u32,
+    agent: &str,
+    model: Option<&str>,
+    error: &str,
+) {
+    let entry = crate::sidecar::MemoryEntry {
+        attempt,
+        agent: agent.to_string(),
+        model: model.map(String::from),
+        learnings: vec![],
+        error: Some(error.to_string()),
+        files_modified: vec![],
+        approach: String::new(),
+        timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    };
+
+    if let Err(e) = crate::sidecar::store_memory(task_id, &entry) {
+        tracing::warn!(task_id, error = ?e, "failed to store failure memory");
+    } else {
+        tracing::debug!(task_id, attempt, "stored failure memory");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
