@@ -471,19 +471,25 @@ fn parse_github_event(
 async fn handle_webhook(
     State(state): State<WebhookState>,
     headers: axum::http::HeaderMap,
-    raw_body: axum::extract::Json<WebhookPayload>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let payload = raw_body.0;
     let signature = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let body_bytes = serde_json::to_vec(&payload).unwrap_or_default();
-    if !state.secret.is_empty() && !verify_signature(&state.secret, &body_bytes, signature) {
+    if !state.secret.is_empty() && !verify_signature(&state.secret, &body, signature) {
         tracing::warn!("webhook signature verification failed");
         return (StatusCode::UNAUTHORIZED, "Invalid signature");
     }
+
+    let payload: WebhookPayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(?e, "failed to parse webhook payload");
+            return (StatusCode::BAD_REQUEST, "Invalid JSON");
+        }
+    };
 
     let event_type = headers
         .get("x-github-event")
