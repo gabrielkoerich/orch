@@ -295,7 +295,6 @@ pub fn get_reroute_chain(task_id: &str) -> String {
 }
 
 /// Update the reroute chain in sidecar.
-#[allow(dead_code)]
 pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: &str) -> String {
     let mut chain = existing_chain.to_string();
     if chain.is_empty() {
