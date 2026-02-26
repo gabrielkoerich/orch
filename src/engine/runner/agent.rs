@@ -50,8 +50,8 @@ pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
     // Use per-task attempt directory for artifacts (per-repo isolation)
     let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
 
-    let sys_file = attempt_dir.join("prompt-sys.txt");
-    let msg_file = attempt_dir.join("prompt-msg.txt");
+    let sys_file = attempt_dir.join("prompt-sys.md");
+    let msg_file = attempt_dir.join("prompt-msg.md");
     let status_file = attempt_dir.join("exit.txt");
 
     // Write prompt files - fail if we can't write them

@@ -328,8 +328,8 @@ Task artifacts are organized per-repo, per-task, per-attempt:
   sidecar.json              # Task metadata
   attempts/
     1/
-      prompt-sys.txt        # System prompt
-      prompt-msg.txt        # Task prompt
+      prompt-sys.md         # System prompt
+      prompt-msg.md         # Task prompt
       runner.sh             # Runner script
       exit.txt              # Exit code
       stderr.txt            # Agent stderr

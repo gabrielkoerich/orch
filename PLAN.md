@@ -1181,8 +1181,8 @@ New layout (per-repo, per-task, per-attempt):
   sidecar.json
   attempts/
     1/
-      prompt-sys.txt
-      prompt-msg.txt
+      prompt-sys.md
+      prompt-msg.md
       runner.sh
       exit.txt
       stderr.txt
