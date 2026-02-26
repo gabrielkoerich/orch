@@ -394,15 +394,19 @@ mod tests {
     #[test]
     fn subscribe_receives_change_notifications() {
         let mut rx = subscribe();
-        let path = PathBuf::from("/tmp/test-config.yml");
+        // Use a unique path to avoid interference from parallel tests
+        let path = PathBuf::from(format!("/tmp/test-config-{}.yml", std::process::id()));
 
         // Manually call invalidate_cache to simulate a file change
         invalidate_cache(&path);
 
-        // The subscriber should receive the path
-        match rx.try_recv() {
-            Ok(received_path) => assert_eq!(received_path, path),
-            Err(e) => panic!("expected config change notification, got error: {e:?}"),
+        // Drain until we find our path (other tests may send on the shared channel)
+        loop {
+            match rx.try_recv() {
+                Ok(received_path) if received_path == path => break,
+                Ok(_) => continue, // skip notifications from other tests
+                Err(e) => panic!("expected config change notification, got error: {e:?}"),
+            }
         }
     }
 
@@ -410,12 +414,25 @@ mod tests {
     fn subscribe_multiple_receivers() {
         let mut rx1 = subscribe();
         let mut rx2 = subscribe();
-        let path = PathBuf::from("/tmp/test-config-multi.yml");
+        // Use a unique path to avoid interference from parallel tests
+        let path = PathBuf::from(format!(
+            "/tmp/test-config-multi-{}.yml",
+            std::process::id()
+        ));
 
         invalidate_cache(&path);
 
-        // Both receivers should get the notification
-        assert_eq!(rx1.try_recv().unwrap(), path);
-        assert_eq!(rx2.try_recv().unwrap(), path);
+        // Drain until we find our path on both receivers
+        let find_path = |rx: &mut tokio::sync::broadcast::Receiver<PathBuf>, expected: &PathBuf| {
+            loop {
+                match rx.try_recv() {
+                    Ok(p) if &p == expected => return,
+                    Ok(_) => continue,
+                    Err(e) => panic!("expected config change notification, got error: {e:?}"),
+                }
+            }
+        };
+        find_path(&mut rx1, &path);
+        find_path(&mut rx2, &path);
     }
 }
