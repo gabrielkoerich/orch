@@ -503,6 +503,15 @@ async fn webhook_health() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
 
+/// Check if the webhook server is healthy by pinging its health endpoint.
+pub async fn check_webhook_health(port: u16) -> bool {
+    let url = format!("http://localhost:{}/health", port);
+    match reqwest::get(&url).await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
 pub async fn start_webhook_server(
     port: u16,
     secret: String,
