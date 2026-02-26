@@ -345,22 +345,23 @@ pub fn clear_memory(task_id: &str) -> anyhow::Result<()> {
 /// Resolve model pricing using a built-in table and normalized model aliases.
 pub fn pricing_for_model(model: &str) -> ModelPricing {
     let normalized = model.trim().to_lowercase();
-    if normalized.contains("gpt-5.3-codex") {
-        return ModelPricing {
-            input_per_million_usd: 5.0,
-            output_per_million_usd: 20.0,
-        };
-    }
-    if normalized.contains("gpt-5.2") {
+    // OpenAI models
+    if normalized == "o3" {
         return ModelPricing {
             input_per_million_usd: 2.0,
             output_per_million_usd: 8.0,
         };
     }
-    if normalized.contains("gpt-5.1-codex-mini") || normalized.contains("gpt-5-mini") {
+    if normalized == "o4-mini" || normalized.contains("gpt-4.1-mini") {
         return ModelPricing {
-            input_per_million_usd: 0.25,
-            output_per_million_usd: 2.0,
+            input_per_million_usd: 0.15,
+            output_per_million_usd: 0.6,
+        };
+    }
+    if normalized.contains("gpt-4.1") && !normalized.contains("mini") {
+        return ModelPricing {
+            input_per_million_usd: 2.0,
+            output_per_million_usd: 8.0,
         };
     }
     if normalized.contains("opus") {
@@ -468,21 +469,30 @@ mod tests {
 
     #[test]
     fn pricing_lookup_known_models() {
-        let codex = pricing_for_model("gpt-5.3-codex");
+        let o3 = pricing_for_model("o3");
         assert_eq!(
-            codex,
+            o3,
             ModelPricing {
-                input_per_million_usd: 5.0,
-                output_per_million_usd: 20.0
+                input_per_million_usd: 2.0,
+                output_per_million_usd: 8.0
             }
         );
 
-        let haiku = pricing_for_model("haiku");
+        let haiku = pricing_for_model("claude-haiku-4-5-20251001");
         assert_eq!(
             haiku,
             ModelPricing {
                 input_per_million_usd: 0.8,
                 output_per_million_usd: 4.0
+            }
+        );
+
+        let o4mini = pricing_for_model("o4-mini");
+        assert_eq!(
+            o4mini,
+            ModelPricing {
+                input_per_million_usd: 0.15,
+                output_per_million_usd: 0.6
             }
         );
     }
