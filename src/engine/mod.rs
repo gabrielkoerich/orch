@@ -23,6 +23,7 @@ pub mod tasks;
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
 use crate::channels::discord::DiscordChannel;
+use crate::channels::github::start_webhook_server;
 use crate::channels::telegram::TelegramChannel;
 use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
@@ -270,6 +271,44 @@ pub async fn serve() -> anyhow::Result<()> {
                 }
             }
         });
+    }
+
+    // Start webhook server if configured
+    let webhook_handle = if let (Ok(port_str), Ok(secret)) = (
+        crate::config::get("webhook.port"),
+        crate::config::get("webhook.secret"),
+    ) {
+        let port: u16 = port_str.parse().unwrap_or(8080);
+        if !secret.is_empty() && !port_str.is_empty() {
+            let webhook_tx = transport.clone();
+            let webhook_repo = project_engines
+                .first()
+                .map(|e| e.repo.clone())
+                .unwrap_or_default();
+
+            Some(tokio::spawn(async move {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
+
+                // Start the webhook server
+                if let Err(e) = start_webhook_server(port, secret, webhook_repo, tx).await {
+                    tracing::error!(?e, "webhook server failed");
+                }
+
+                // Forward webhook messages to transport
+                while let Some(msg) = rx.recv().await {
+                    tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received webhook event");
+                    let _ = webhook_tx.route(&msg).await;
+                }
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if webhook_handle.is_some() {
+        tracing::info!("webhook server enabled");
     }
 
     // Agent router (selects agent + model per task) - shared across projects
@@ -624,7 +663,7 @@ async fn tick(
                 }
                 Err(e) => {
                     tracing::error!(task_id, ?e, "task runner failed");
-                    let _ = backend
+                    if let Err(comment_err) = backend
                         .post_comment(
                             &crate::backends::ExternalId(task_id.clone()),
                             &format!(
@@ -632,7 +671,14 @@ async fn tick(
                                 chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
                             ),
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            task_id,
+                            ?comment_err,
+                            "failed to post error comment to GitHub"
+                        );
+                    }
                 }
             }
 
@@ -1007,7 +1053,7 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
 /// Lists tasks in review and triggers review agent if configured.
 async fn review_open_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<()> {
     // Check if review agent is enabled
-    let review_enabled = crate::config::get("enable_review_agent")
+    let review_enabled = crate::config::get("workflow.enable_review_agent")
         .map(|v| v == "true")
         .unwrap_or(false);
 

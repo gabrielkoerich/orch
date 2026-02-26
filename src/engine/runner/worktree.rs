@@ -284,7 +284,6 @@ pub async fn setup_worktree(
 }
 
 /// Find an existing worktree by task ID prefix.
-#[allow(dead_code)]
 fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<PathBuf> {
     let prefix = format!("gh-task-{task_id}-");
 

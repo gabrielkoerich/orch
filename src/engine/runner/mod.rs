@@ -92,7 +92,7 @@ impl TaskRunner {
         }
 
         // Check max attempts
-        let max_attempts: u32 = config::get("max_attempts")
+        let max_attempts: u32 = config::get("workflow.max_attempts")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
@@ -174,8 +174,14 @@ impl TaskRunner {
         let git_email = config::get("git.email")
             .unwrap_or_else(|_| format!("{agent_name}[bot]@users.noreply.github.com"));
 
-        // Output file
-        let output_file = PathBuf::from(format!("/tmp/output-{task_id}.json"));
+        // Output file in state directory with restricted permissions (0600)
+        let state_dir = sidecar::state_dir().unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".orch")
+                .join("state")
+        });
+        let output_file = state_dir.join(format!("output-{task_id}.json"));
 
         // Build sandbox disallowed tools
         let mut disallowed_tools = vec!["Bash(rm *)".to_string(), "Bash(rm -*)".to_string()];
@@ -198,9 +204,10 @@ impl TaskRunner {
             .unwrap_or(1800);
 
         // Build agent invocation
+        let model_for_invocation = model_name.clone();
         let invocation = agent::AgentInvocation {
             agent: agent_name.clone(),
-            model: model_name.clone(),
+            model: model_for_invocation,
             work_dir: wt.work_dir.clone(),
             system_prompt,
             agent_message,
@@ -270,7 +277,7 @@ impl TaskRunner {
 
                 // Auto-commit
                 if resp.status == "done" || resp.status == "in_progress" {
-                    git_ops::auto_commit(
+                    if let Err(e) = git_ops::auto_commit(
                         &wt.work_dir,
                         task_id,
                         &task_title,
@@ -278,13 +285,19 @@ impl TaskRunner {
                         new_attempts,
                     )
                     .await
-                    .ok();
+                    {
+                        tracing::error!(task_id, error = ?e, "auto commit failed");
+                        sidecar::set(task_id, &[format!("last_error=auto commit failed: {e}")])?;
+                    }
 
                     // Push
-                    git_ops::push_branch(&wt.work_dir, &wt.branch).await.ok();
+                    if let Err(e) = git_ops::push_branch(&wt.work_dir, &wt.branch).await {
+                        tracing::error!(task_id, error = ?e, "push failed");
+                        sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
+                    }
 
                     // Create PR
-                    git_ops::create_pr_if_needed(
+                    if let Err(e) = git_ops::create_pr_if_needed(
                         &wt.work_dir,
                         &wt.branch,
                         &task_title,
@@ -296,7 +309,10 @@ impl TaskRunner {
                         &agent_name,
                     )
                     .await
-                    .ok();
+                    {
+                        tracing::error!(task_id, error = ?e, "create PR failed");
+                        sidecar::set(task_id, &[format!("last_error=create PR failed: {e}")])?;
+                    }
                 }
 
                 // Store result in sidecar
@@ -307,6 +323,36 @@ impl TaskRunner {
                         format!("summary={}", resp.summary),
                     ],
                 )?;
+
+                // Store token usage if available
+                if let (Some(input), Some(output)) = (resp.input_tokens, resp.output_tokens) {
+                    let model = model_name.as_deref().unwrap_or("haiku");
+                    if let Err(e) = sidecar::store_token_usage(task_id, input, output, model) {
+                        tracing::warn!(task_id, ?e, "failed to store token usage");
+                    }
+                }
+
+                // Check token budget
+                let max_tokens: u64 = config::get("max_tokens_per_task")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(100_000);
+
+                let total_tokens = sidecar::get_total_tokens(task_id);
+                if total_tokens > max_tokens {
+                    tracing::warn!(task_id, total_tokens, max_tokens, "exceeded token budget");
+                    sidecar::set(
+                        task_id,
+                        &[
+                            "status=needs_review".to_string(),
+                            format!(
+                                "last_error=token budget exceeded: {}/{} tokens",
+                                total_tokens, max_tokens
+                            ),
+                        ],
+                    )?;
+                    return Ok(());
+                }
 
                 // Check PR override: done → in_review
                 if resp.status == "done"
@@ -440,7 +486,9 @@ impl TaskRunner {
 
         // Kill tmux session if still alive
         if tmux.session_exists(&session).await {
-            tmux.kill_session(&session).await.ok();
+            if let Err(e) = tmux.kill_session(&session).await {
+                tracing::warn!(task_id, error = ?e, "failed to kill tmux session");
+            }
         }
 
         // Record metrics after task completion
@@ -530,6 +578,23 @@ impl TaskRunner {
         let status = sidecar::get(task_id, "status").unwrap_or_default();
         let summary = sidecar::get(task_id, "summary").unwrap_or_default();
         let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
+
+        // Write status to sidecar BEFORE updating GitHub (ensures atomicity)
+        // This way sidecar always leads GitHub - on crash/retry:
+        // - If sidecar shows "done" but GitHub doesn't, we retry the GitHub update
+        // - If sidecar shows old status, we redo the work (safe)
+        sidecar::set(
+            task_id,
+            &[
+                format!("status={}", status),
+                format!("summary={}", summary),
+                format!("last_error={}", last_error),
+                format!(
+                    "status_confirmed_at={}",
+                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+                ),
+            ],
+        )?;
 
         // Update GitHub status
         let new_status = match status.as_str() {

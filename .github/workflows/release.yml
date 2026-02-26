@@ -2,6 +2,9 @@ name: CI
 
 on:
   push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch: {}
 
 permissions:
@@ -12,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,212 +59,412 @@ jobs:
         with:
           args: detect --source . --config .gitleaks.toml --no-banner --redact --exit-code=1
 
-  # release:
-  #   needs: [rust, secrets]
-  #   if: github.ref == 'refs/heads/main'
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #       with:
-  #         fetch-depth: 0
+  # Cross-compile build jobs for macOS targets
+  build-macos:
+    needs: [test, secrets]
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            arch: arm64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
 
-  #     - name: Check for new commits since last tag
-  #       id: check
-  #       run: |
-  #         LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-  #         echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-  #         if [ -n "$LAST_TAG" ]; then
-  #           COMMIT_COUNT=$(git rev-list "$LAST_TAG"..HEAD --count)
-  #         else
-  #           COMMIT_COUNT=$(git rev-list HEAD --count)
-  #         fi
-  #         echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-  #         if [ "$COMMIT_COUNT" -eq 0 ]; then
-  #           echo "No new commits since $LAST_TAG — skipping release."
-  #           echo "skip=true" >> "$GITHUB_OUTPUT"
-  #         else
-  #           # Skip release if ALL commits are chore-only
-  #           if [ -n "$LAST_TAG" ]; then
-  #             SUBJECTS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
-  #           else
-  #             SUBJECTS=$(git log --pretty=format:"%s")
-  #           fi
-  #           NON_CHORE=$(echo "$SUBJECTS" | grep -cvE '^chore(\(.*\))?:' || true)
-  #           if [ "$NON_CHORE" -eq 0 ]; then
-  #             echo "All $COMMIT_COUNT commits are chore — skipping release."
-  #             echo "skip=true" >> "$GITHUB_OUTPUT"
-  #           else
-  #             echo "$COMMIT_COUNT new commits since ${LAST_TAG:-beginning} ($NON_CHORE non-chore)"
-  #             echo "skip=false" >> "$GITHUB_OUTPUT"
-  #           fi
-  #         fi
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
 
-  #     - name: Determine version bump from conventional commits
-  #       if: steps.check.outputs.skip == 'false'
-  #       id: version
-  #       run: |
-  #         LAST_TAG="${{ steps.check.outputs.last_tag }}"
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/orch dist/orch-${{ matrix.arch }}
+          chmod +x dist/orch-${{ matrix.arch }}
 
-  #         if [ -n "$LAST_TAG" ]; then
-  #           COMMITS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
-  #         else
-  #           COMMITS=$(git log --pretty=format:"%s")
-  #         fi
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orch-${{ matrix.arch }}
+          path: dist/orch-${{ matrix.arch }}
+          retention-days: 1
 
-  #         # Determine bump from commit prefixes: breaking: → major, feat: → minor, everything else → patch
-  #         BUMP="patch"
-  #         if echo "$COMMITS" | grep -qE '^feat(\(.*\))?:'; then
-  #           BUMP="minor"
-  #         fi
-  #         if echo "$COMMITS" | grep -qE '^breaking(\(.*\))?:'; then
-  #           BUMP="major"
-  #         fi
+  # Create universal binary from arm64 and x86_64 builds
+  create-universal:
+    needs: [build-macos]
+    runs-on: macos-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Download arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: orch-arm64
+          path: dist/arm64
 
-  #         if [ -z "$LAST_TAG" ]; then
-  #           NEW_VERSION="v0.1.0"
-  #         else
-  #           CURRENT="${LAST_TAG#v}"
-  #           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-  #           case "$BUMP" in
-  #             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-  #             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-  #             patch) PATCH=$((PATCH + 1)) ;;
-  #           esac
-  #           NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
-  #         fi
+      - name: Download x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: orch-x86_64
+          path: dist/x86_64
 
-  #         echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
-  #         echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-  #         echo "Version: $NEW_VERSION (${BUMP} bump)"
+      - name: Create universal binary with lipo
+        run: |
+          mkdir -p dist/universal
+          lipo -create \
+            dist/arm64/orch-arm64 \
+            dist/x86_64/orch-x86_64 \
+            -output dist/universal/orch
+          chmod +x dist/universal/orch
 
-  #     - name: Install Rust toolchain
-  #       if: steps.check.outputs.skip == 'false'
-  #       uses: dtolnay/rust-toolchain@stable
+          # Verify universal binary
+          echo "Universal binary architectures:"
+          lipo -archs dist/universal/orch
+          echo ""
+          echo "Binary info:"
+          file dist/universal/orch
+          echo ""
+          echo "Binary size:"
+          ls -lh dist/universal/orch
 
-  #     - name: Build release binary
-  #       if: steps.check.outputs.skip == 'false'
-  #       run: cargo build --release
+      - name: Test universal binary
+        run: |
+          # Test that the binary runs
+          ./dist/universal/orch --version
 
-  #     - name: Create tag
-  #       if: steps.check.outputs.skip == 'false'
-  #       env:
-  #         GH_TOKEN: ${{ github.token }}
-  #       run: |
-  #         VERSION="${{ steps.version.outputs.version }}"
-  #         git config user.name "github-actions[bot]"
-  #         git config user.email "github-actions[bot]@users.noreply.github.com"
-  #         git tag -a "$VERSION" -m "$VERSION"
-  #         git push origin "$VERSION"
+      - name: Package for release
+        run: |
+          cd dist/universal
+          tar czf ../orch-macos-universal.tar.gz orch
+          cd ..
+          echo "Archive contents:"
+          tar tzf orch-macos-universal.tar.gz
+          ls -lh orch-macos-universal.tar.gz
 
-  #     - name: Create release
-  #       if: steps.check.outputs.skip == 'false'
-  #       env:
-  #         GH_TOKEN: ${{ github.token }}
-  #       run: |
-  #         VERSION="${{ steps.version.outputs.version }}"
-  #         LAST_TAG="${{ steps.check.outputs.last_tag }}"
+      - name: Upload universal binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orch-macos-universal
+          path: dist/orch-macos-universal.tar.gz
+          retention-days: 1
 
-  #         # Build changelog from commit subjects
-  #         if [ -n "$LAST_TAG" ]; then
-  #           RAW=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s (%h)")
-  #         else
-  #           RAW=$(git log --pretty=format:"%s (%h)")
-  #         fi
+  # Determine if a release is needed and what version to use
+  check-release:
+    needs: [test, secrets]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      version: ${{ steps.version.outputs.version }}
+      bump: ${{ steps.version.outputs.bump }}
+      last_tag: ${{ steps.check.outputs.last_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-  #         FEATURES=""
-  #         FIXES=""
-  #         OTHER=""
-  #         while IFS= read -r line; do
-  #           [ -n "$line" ] || continue
-  #           if echo "$line" | grep -qE '^feat(\(.*\))?:'; then
-  #             FEATURES+="- ${line}"$'\n'
-  #           elif echo "$line" | grep -qE '^fix(\(.*\))?:'; then
-  #             FIXES+="- ${line}"$'\n'
-  #           elif echo "$line" | grep -qE '^chore(\(.*\))?:'; then
-  #             continue
-  #           else
-  #             OTHER+="- ${line}"$'\n'
-  #           fi
-  #         done <<< "$RAW"
+      - name: Check for new commits since last tag
+        id: check
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
 
-  #         BODY="## ${VERSION}"$'\n\n'
-  #         [ -n "$FEATURES" ] && BODY+="### Features"$'\n'"${FEATURES}"$'\n'
-  #         [ -n "$FIXES" ] && BODY+="### Bug Fixes"$'\n'"${FIXES}"$'\n'
-  #         [ -n "$OTHER" ] && BODY+="### Other"$'\n'"${OTHER}"$'\n'
+          if [ -n "$LAST_TAG" ]; then
+            COMMIT_COUNT=$(git rev-list "$LAST_TAG"..HEAD --count)
+          else
+            COMMIT_COUNT=$(git rev-list HEAD --count)
+          fi
+          echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
 
-  #         if [ -n "$LAST_TAG" ]; then
-  #           BODY+="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${LAST_TAG}...${VERSION}"
-  #         fi
+          if [ "$COMMIT_COUNT" -eq 0 ]; then
+            echo "No new commits since $LAST_TAG — skipping release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            # Skip release if ALL commits are chore-only
+            if [ -n "$LAST_TAG" ]; then
+              SUBJECTS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
+            else
+              SUBJECTS=$(git log --pretty=format:"%s")
+            fi
+            NON_CHORE=$(echo "$SUBJECTS" | grep -cvE '^chore(\(.*\))?:' || true)
+            if [ "$NON_CHORE" -eq 0 ]; then
+              echo "All $COMMIT_COUNT commits are chore — skipping release."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$COMMIT_COUNT new commits since ${LAST_TAG:-beginning} ($NON_CHORE non-chore)"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
-  #         gh release create "$VERSION" \
-  #           --title "$VERSION" \
-  #           --notes "$BODY"
+      - name: Determine version bump from conventional commits
+        if: steps.check.outputs.skip == 'false'
+        id: version
+        run: |
+          LAST_TAG="${{ steps.check.outputs.last_tag }}"
 
-  #         echo "Created release $VERSION"
+          if [ -n "$LAST_TAG" ]; then
+            COMMITS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
+          else
+            COMMITS=$(git log --pretty=format:"%s")
+          fi
 
-  #     - name: Update Homebrew formula
-  #       if: steps.check.outputs.skip == 'false'
-  #       env:
-  #         TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-  #       run: |
-  #         VERSION="${{ steps.version.outputs.version }}"
-  #         REPO="gabrielkoerich/orch"
-  #         URL="https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz"
-  #         TAP_REPO="gabrielkoerich/homebrew-tap"
+          # Determine bump from commit prefixes: BREAKING CHANGE: → major, feat: → minor, everything else → patch
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qE '^feat(\(.*\))?:'; then
+            BUMP="minor"
+          fi
+          if echo "$COMMITS" | grep -qE '^BREAKING CHANGE:|^breaking(\(.*\))?:'; then
+            BUMP="major"
+          fi
 
-  #         # Download archive and compute sha256
-  #         SHA256=$(curl -sL "$URL" | sha256sum | awk '{print $1}')
-  #         echo "SHA256: $SHA256"
+          if [ -z "$LAST_TAG" ]; then
+            NEW_VERSION="v0.1.0"
+          else
+            CURRENT="${LAST_TAG#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "$BUMP" in
+              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+              patch) PATCH=$((PATCH + 1)) ;;
+            esac
+            NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          fi
 
-  #         if [ -z "${TAP_TOKEN}" ]; then
-  #           echo "HOMEBREW_TAP_TOKEN secret is required to push to ${TAP_REPO}"
-  #           exit 1
-  #         fi
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $NEW_VERSION (${BUMP} bump)"
 
-  #         git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap-repo
-  #         mkdir -p tap-repo/Formula
+  # Create GitHub release with binaries
+  release:
+    needs: [check-release, create-universal]
+    if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-  #         # Use the Formula from the repo, updating url and sha256
-  #         sed -e "s|url \"[^\"]*\"|url \"${URL}\"|" \
-  #             -e "s|sha256 \"[^\"]*\"|sha256 \"${SHA256}\"|" \
-  #             Formula/orch.rb > tap-repo/Formula/orch.rb
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: orch-*
 
-  #         git config user.name "github-actions[bot]"
-  #         git config user.email "github-actions[bot]@users.noreply.github.com"
-  #         git -C tap-repo config user.name "github-actions[bot]"
-  #         git -C tap-repo config user.email "github-actions[bot]@users.noreply.github.com"
-  #         git -C tap-repo add Formula/orch.rb
-  #         if git -C tap-repo diff --cached --quiet; then
-  #           echo "Homebrew formula unchanged"
-  #           exit 0
-  #         fi
-  #         git -C tap-repo commit -m "chore: update orch formula for ${VERSION}"
-  #         git -C tap-repo push origin main
+      - name: Display artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          find artifacts -type f -ls
 
-  # deploy:
-  #   needs: [rust, secrets]
-  #   if: github.ref == 'refs/heads/main'
-  #   concurrency:
-  #     group: pages
-  #     cancel-in-progress: false
-  #   permissions:
-  #     contents: read
-  #     pages: write
-  #     id-token: write
-  #   environment:
-  #     name: github-pages
-  #     url: ${{ steps.deployment.outputs.page_url }}
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: taiki-e/install-action@v2
-  #       with:
-  #         tool: zola@0.22.1
-  #     - run: zola --root docs build
-  #     - uses: actions/upload-pages-artifact@v3
-  #       with:
-  #         path: docs/public
-  #     - id: deployment
-  #       uses: actions/deploy-pages@v4
+      - name: Create tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "$VERSION"
+          git push origin "$VERSION"
+
+      - name: Build changelog
+        id: changelog
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          LAST_TAG="${{ needs.check-release.outputs.last_tag }}"
+
+          # Build changelog from commit subjects
+          if [ -n "$LAST_TAG" ]; then
+            RAW=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s (%h)")
+          else
+            RAW=$(git log --pretty=format:"%s (%h)")
+          fi
+
+          FEATURES=""
+          FIXES=""
+          OTHER=""
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            if echo "$line" | grep -qE '^feat(\(.*\))?:'; then
+              FEATURES+="- ${line}"$'\n'
+            elif echo "$line" | grep -qE '^fix(\(.*\))?:'; then
+              FIXES+="- ${line}"$'\n'
+            elif echo "$line" | grep -qE '^chore(\(.*\))?:'; then
+              continue
+            else
+              OTHER+="- ${line}"$'\n'
+            fi
+          done <<< "$RAW"
+
+          BODY="## ${VERSION}"$'\n\n'
+          [ -n "$FEATURES" ] && BODY+="### Features"$'\n'"${FEATURES}"$'\n'
+          [ -n "$FIXES" ] && BODY+="### Bug Fixes"$'\n'"${FIXES}"$'\n'
+          [ -n "$OTHER" ] && BODY+="### Other"$'\n'"${OTHER}"$'\n'
+
+          if [ -n "$LAST_TAG" ]; then
+            BODY+="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${LAST_TAG}...${VERSION}"
+          fi
+
+          # Write to file for use in release creation
+          echo "$BODY" > release_notes.md
+          cat release_notes.md
+
+      - name: Compute SHA256 checksums
+        id: checksums
+        run: |
+          cd artifacts
+
+          # Compute checksums for all artifacts
+          for file in orch-*/orch*; do
+            if [ -f "$file" ]; then
+              sha256sum "$file" >> ../checksums.txt
+            fi
+          done
+
+          cd ..
+          cat checksums.txt
+
+          # Get the universal binary checksum for Homebrew
+          UNIVERSAL_SHA=$(grep "orch-macos-universal.tar.gz" checksums.txt | awk '{print $1}')
+          echo "universal_sha=$UNIVERSAL_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes-file release_notes.md \
+            artifacts/orch-arm64/orch-arm64 \
+            artifacts/orch-x86_64/orch-x86_64 \
+            artifacts/orch-macos-universal/orch-macos-universal.tar.gz \
+            checksums.txt
+
+          echo "Created release $VERSION"
+
+      - name: Update Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          VERSION_NO_V="${VERSION#v}"
+          REPO="${{ github.repository }}"
+          TAP_REPO="gabrielkoerich/homebrew-tap"
+          UNIVERSAL_SHA="${{ steps.checksums.outputs.universal_sha }}"
+
+          # URL for the universal binary tarball
+          URL="https://github.com/${REPO}/releases/download/${VERSION}/orch-macos-universal.tar.gz"
+
+          echo "Updating formula with:"
+          echo "  Version: $VERSION_NO_V"
+          echo "  URL: $URL"
+          echo "  SHA256: $UNIVERSAL_SHA"
+
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_TOKEN secret is required to push to ${TAP_REPO}"
+            exit 1
+          fi
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap-repo
+          mkdir -p tap-repo/Formula
+
+          # Create updated formula using the template
+          cat > tap-repo/Formula/orch.rb << 'FORMULA_EOF'
+          class Orch < Formula
+            desc "Multi-agent task orchestrator for AI coding agents (claude, codex, opencode)"
+            homepage "https://github.com/gabrielkoerich/orch"
+            version "VERSION_PLACEHOLDER"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "URL_PLACEHOLDER"
+                sha256 "SHA256_PLACEHOLDER"
+              else
+                url "URL_PLACEHOLDER"
+                sha256 "SHA256_PLACEHOLDER"
+              end
+            end
+
+            depends_on "gh"
+            depends_on "tmux"
+
+            def install
+              bin.install "orch"
+
+              # Install additional resources
+              (libexec/"prompts").install Dir["prompts/*"] if (buildpath/"prompts").exist?
+              libexec.install Dir["*.example.yml"] if Dir.glob("*.example.yml").any?
+              libexec.install "skills.yml" if (buildpath/"skills.yml").exist?
+            end
+
+            service do
+              run [opt_bin/"orch", "serve"]
+              keep_alive true
+              log_path var/"log/orch.log"
+              error_log_path var/"log/orch.error.log"
+            end
+
+            def caveats
+              <<~EOS
+                To get started:
+                  cd ~/your-project
+                  orch init                     # configure project
+                  orch task add "title"         # add a task
+                  brew services start orch      # start background server
+
+                Required agent CLIs (install at least one):
+                  brew install --cask claude-code   # Claude
+                  brew install --cask codex         # Codex
+                  brew install opencode             # OpenCode
+
+                GitHub CLI (installed automatically):
+                  gh auth login   # authenticate if not already logged in
+              EOS
+            end
+
+            test do
+              assert_match "orch", shell_output("#{bin}/orch --version 2>&1", 0)
+            end
+          end
+          FORMULA_EOF
+
+          # Replace placeholders
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION_NO_V}/g" tap-repo/Formula/orch.rb
+          sed -i "s|URL_PLACEHOLDER|${URL}|g" tap-repo/Formula/orch.rb
+          sed -i "s/SHA256_PLACEHOLDER/${UNIVERSAL_SHA}/g" tap-repo/Formula/orch.rb
+
+          # Display the formula
+          echo "--- Generated Formula ---"
+          cat tap-repo/Formula/orch.rb
+          echo "--- End Formula ---"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C tap-repo config user.name "github-actions[bot]"
+          git -C tap-repo config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C tap-repo add Formula/orch.rb
+          if git -C tap-repo diff --cached --quiet; then
+            echo "Homebrew formula unchanged"
+            exit 0
+          fi
+          git -C tap-repo commit -m "chore: update orch formula to ${VERSION}"
+          git -C tap-repo push origin main
