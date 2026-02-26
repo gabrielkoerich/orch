@@ -97,6 +97,11 @@ enum Commands {
     },
     /// Show task metrics summary
     Metrics,
+    /// GitHub Projects V2 management
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
     /// Generate shell completions
     Completions {
         /// Shell type
@@ -242,6 +247,21 @@ enum JobAction {
     },
     /// Run one job scheduler tick
     Tick,
+}
+
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// List accessible GitHub projects
+    List,
+    /// Link current repo to a project by ID
+    Link {
+        /// Project node ID (PVT_...)
+        id: String,
+    },
+    /// Re-discover field IDs and update config
+    Sync,
+    /// Show current project config
+    Info,
 }
 
 #[derive(Subcommand)]
@@ -404,6 +424,20 @@ async fn main() -> anyhow::Result<()> {
         Commands::Metrics => {
             cli::metrics().await?;
         }
+        Commands::Project { action } => match action {
+            ProjectAction::List => {
+                cli::project_list().await?;
+            }
+            ProjectAction::Link { id } => {
+                cli::project_link(&id).await?;
+            }
+            ProjectAction::Sync => {
+                cli::project_sync().await?;
+            }
+            ProjectAction::Info => {
+                cli::project_info()?;
+            }
+        },
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "orch", &mut std::io::stdout());

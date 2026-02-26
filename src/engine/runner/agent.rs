@@ -3,7 +3,6 @@
 //! Supports Claude, Codex, OpenCode (plus Kimi/MiniMax as Claude aliases).
 //! Generates a runner shell script that tmux executes — agents need a real terminal.
 
-use crate::sidecar;
 use crate::tmux::TmuxManager;
 use std::path::PathBuf;
 
@@ -36,6 +35,10 @@ pub struct AgentInvocation {
     pub output_file: PathBuf,
     /// Timeout in seconds (0 = no timeout)
     pub timeout_seconds: u64,
+    /// Repository slug (owner/repo) for per-repo state isolation
+    pub repo: String,
+    /// Current attempt number (1-indexed)
+    pub attempt: u32,
 }
 
 /// Build the runner script content that tmux will execute.
@@ -44,19 +47,15 @@ pub struct AgentInvocation {
 /// Delegates agent-specific command building to the `AgentRunner` trait, which
 /// translates unified `PermissionRules` into each agent's native CLI flags.
 pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
-    let state_dir = sidecar::state_dir().unwrap_or_else(|_| {
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".orch")
-            .join("state")
-    });
+    // Use per-task attempt directory for artifacts (per-repo isolation)
+    let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
 
-    let sys_file = state_dir.join(format!("prompt-{}-sys.txt", inv.task_id));
-    let msg_file = state_dir.join(format!("prompt-{}-msg.txt", inv.task_id));
-    let status_file = state_dir.join(format!("exit-{}.txt", inv.task_id));
+    let sys_file = attempt_dir.join("prompt-sys.txt");
+    let msg_file = attempt_dir.join("prompt-msg.txt");
+    let status_file = attempt_dir.join("exit.txt");
 
     // Write prompt files - fail if we can't write them
-    std::fs::create_dir_all(&state_dir)?;
+    std::fs::create_dir_all(&attempt_dir)?;
     std::fs::write(&sys_file, &inv.system_prompt)?;
     std::fs::write(&msg_file, &inv.agent_message)?;
 
@@ -109,7 +108,7 @@ export OUTPUT_FILE="{output_file}"
 cd "{work_dir}"
 
 # Run agent
-RESPONSE=$({agent_cmd} 2>"{state_dir}/stderr-{task_id}.txt") || CMD_STATUS=$?
+RESPONSE=$({agent_cmd} 2>"{attempt_dir}/stderr.txt") || CMD_STATUS=$?
 CMD_STATUS=${{CMD_STATUS:-0}}
 
 # Save response
@@ -126,7 +125,7 @@ exit $CMD_STATUS
         output_file = inv.output_file.display(),
         work_dir = inv.work_dir.display(),
         agent_cmd = agent_cmd,
-        state_dir = state_dir.display(),
+        attempt_dir = attempt_dir.display(),
         status_file = status_file.display(),
     ))
 }
@@ -137,10 +136,9 @@ exit $CMD_STATUS
 pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow::Result<String> {
     let script_content = build_runner_script(inv)?;
 
-    // Write runner script
-    let state_dir = sidecar::state_dir()?;
-
-    let script_path = state_dir.join(format!("runner-{}.sh", inv.task_id));
+    // Write runner script to per-task attempt dir
+    let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
+    let script_path = attempt_dir.join("runner.sh");
     std::fs::write(&script_path, &script_content)?;
 
     // Make executable

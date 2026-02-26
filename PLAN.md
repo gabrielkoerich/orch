@@ -1037,6 +1037,51 @@ The binary rename (`orch-core` → `orch`) is complete. Directory rename (`~/.or
 
 ---
 
+## Parity Audit — Feature Gaps
+
+Features identified in the bash `orchestrator` → Rust `orch` parity audit:
+
+| Feature | Status | Module |
+|---------|--------|--------|
+| GitHub Projects V2 integration | **Implemented** | `src/github/projects.rs` |
+| Per-task artifact folders | **Implemented** | `src/home.rs`, `src/engine/runner/` |
+| Per-repo state isolation | **Implemented** | `~/.orch/state/{owner}/{repo}/tasks/{id}/` |
+| Context file per issue | Planned | — |
+| `orch project list/link/sync/info` CLI | **Implemented** | `src/cli/mod.rs` |
+| Project board auto-sync on status change | **Implemented** | `src/backends/github.rs` |
+
+### GitHub Projects V2
+
+The old orchestrator had 4 dedicated scripts for project board management. `orch` now has:
+- `ProjectSync` struct with GraphQL operations (discover fields, add items, update status)
+- Automatic project board column sync when task status changes (non-fatal)
+- CLI: `orch project list`, `orch project link <id>`, `orch project sync`, `orch project info`
+- Config stored in `~/.orch/config.yml` under `gh.project_id`, `gh.project_status_field_id`, `gh.project_status_map`
+
+### Per-Task Artifact Folders
+
+Old layout (flat): `~/.orch/state/prompt-42-sys.txt`, `runner-42.sh`, etc.
+
+New layout (per-repo, per-task, per-attempt):
+```
+~/.orch/state/{owner}/{repo}/tasks/{id}/
+  sidecar.json
+  attempts/
+    1/
+      prompt-sys.txt
+      prompt-msg.txt
+      runner.sh
+      exit.txt
+      stderr.txt
+      output.json
+    2/  (retry)
+      ...
+```
+
+Benefits: per-repo isolation (no issue number collisions), per-attempt separation (retries don't overwrite), easy cleanup. Legacy flat paths still work as fallback for reads.
+
+---
+
 ## Key Dependencies
 
 | Crate | Purpose | Status |
