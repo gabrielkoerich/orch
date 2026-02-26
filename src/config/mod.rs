@@ -415,21 +415,16 @@ mod tests {
         let mut rx1 = subscribe();
         let mut rx2 = subscribe();
         // Use a unique path to avoid interference from parallel tests
-        let path = PathBuf::from(format!(
-            "/tmp/test-config-multi-{}.yml",
-            std::process::id()
-        ));
+        let path = PathBuf::from(format!("/tmp/test-config-multi-{}.yml", std::process::id()));
 
         invalidate_cache(&path);
 
         // Drain until we find our path on both receivers
-        let find_path = |rx: &mut tokio::sync::broadcast::Receiver<PathBuf>, expected: &PathBuf| {
-            loop {
-                match rx.try_recv() {
-                    Ok(p) if &p == expected => return,
-                    Ok(_) => continue,
-                    Err(e) => panic!("expected config change notification, got error: {e:?}"),
-                }
+        let find_path = |rx: &mut tokio::sync::broadcast::Receiver<PathBuf>, expected: &PathBuf| loop {
+            match rx.try_recv() {
+                Ok(p) if &p == expected => return,
+                Ok(_) => continue,
+                Err(e) => panic!("expected config change notification, got error: {e:?}"),
             }
         };
         find_path(&mut rx1, &path);
