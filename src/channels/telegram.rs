@@ -71,7 +71,7 @@ impl TelegramChannel {
 
     async fn get_updates(&self, offset: i64) -> anyhow::Result<Vec<Update>> {
         let url = self.api_url("getUpdates");
-        
+
         let params = serde_json::json!({
             "offset": offset,
             "timeout": 30,
@@ -96,7 +96,7 @@ impl TelegramChannel {
 
     async fn send_message(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
         let url = self.api_url("sendMessage");
-        
+
         let params = serde_json::json!({
             "chat_id": chat_id,
             "text": text,

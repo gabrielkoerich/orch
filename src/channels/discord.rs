@@ -63,9 +63,13 @@ impl DiscordChannel {
         format!("https://discord.com/api/v10{}", endpoint)
     }
 
-    async fn get_messages(&self, channel_id: &str, before: Option<&str>) -> anyhow::Result<Vec<DiscordMessage>> {
+    async fn get_messages(
+        &self,
+        channel_id: &str,
+        before: Option<&str>,
+    ) -> anyhow::Result<Vec<DiscordMessage>> {
         let mut url = self.api_url(&format!("/channels/{}/messages", channel_id));
-        
+
         if let Some(before_id) = before {
             url = format!("{}?before={}&limit=50", url, before_id);
         }

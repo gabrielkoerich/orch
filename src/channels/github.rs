@@ -54,7 +54,12 @@ impl GitHubChannel {
         ));
 
         let output = Command::new("gh")
-            .args(["api", &url, "--header", "Accept: application/vnd.github.v3+json"])
+            .args([
+                "api",
+                &url,
+                "--header",
+                "Accept: application/vnd.github.v3+json",
+            ])
             .output()?;
 
         if !output.status.success() {
@@ -73,7 +78,12 @@ impl GitHubChannel {
         ));
 
         let output = Command::new("gh")
-            .args(["api", &url, "--header", "Accept: application/vnd.github.v3+json"])
+            .args([
+                "api",
+                &url,
+                "--header",
+                "Accept: application/vnd.github.v3+json",
+            ])
             .output()?;
 
         if !output.status.success() {
@@ -135,7 +145,10 @@ impl Channel for GitHubChannel {
             loop {
                 tokio::time::sleep(polling_interval).await;
 
-                let issues = match GitHubChannel::new(repo_clone.clone()).fetch_in_progress_issues().await {
+                let issues = match GitHubChannel::new(repo_clone.clone())
+                    .fetch_in_progress_issues()
+                    .await
+                {
                     Ok(i) => i,
                     Err(e) => {
                         tracing::warn!(?e, "failed to fetch in_progress issues");
@@ -144,7 +157,10 @@ impl Channel for GitHubChannel {
                 };
 
                 for issue in issues {
-                    let comments = match GitHubChannel::new(repo_clone.clone()).fetch_comments(issue.number).await {
+                    let comments = match GitHubChannel::new(repo_clone.clone())
+                        .fetch_comments(issue.number)
+                        .await
+                    {
                         Ok(c) => c,
                         Err(e) => {
                             tracing::warn!(issue = issue.number, ?e, "failed to fetch comments");
@@ -154,7 +170,8 @@ impl Channel for GitHubChannel {
 
                     let comment_ids: Vec<String> = {
                         let mut seen_ids = last_comment_ids.lock().unwrap();
-                        let ids: Vec<String> = comments.iter()
+                        let ids: Vec<String> = comments
+                            .iter()
                             .map(|c| c.id.to_string())
                             .filter(|id| !seen_ids.contains(id))
                             .collect();
@@ -259,9 +276,7 @@ impl Channel for GitHubChannel {
     }
 
     async fn health_check(&self) -> anyhow::Result<()> {
-        let output = Command::new("gh")
-            .args(["auth", "status"])
-            .output()?;
+        let output = Command::new("gh").args(["auth", "status"]).output()?;
 
         if !output.status.success() {
             anyhow::bail!("gh auth not logged in");
