@@ -610,7 +610,7 @@ async fn tick(
                 }
                 Err(e) => {
                     tracing::error!(task_id, ?e, "task runner failed");
-                    let _ = backend
+                    if let Err(comment_err) = backend
                         .post_comment(
                             &crate::backends::ExternalId(task_id.clone()),
                             &format!(
@@ -618,7 +618,10 @@ async fn tick(
                                 chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
                             ),
                         )
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(task_id, ?comment_err, "failed to post error comment to GitHub");
+                    }
                 }
             }
 

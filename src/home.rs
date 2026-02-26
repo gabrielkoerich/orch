@@ -65,12 +65,13 @@ pub fn orch_home() -> anyhow::Result<PathBuf> {
     Ok(new_path)
 }
 
-/// Get the orch state directory path (~/.orch/.orch/ or ~/.orch/state/).
+/// Get the orch state directory path (~/.orch/state/).
 ///
 /// This is where runtime state like logs, prompts, and PID files are stored.
+/// Note: This unifies with sidecar::state_dir() to avoid scattering files.
 pub fn state_dir() -> anyhow::Result<PathBuf> {
     let home = orch_home()?;
-    let state = home.join(".orch");
+    let state = home.join("state");
     std::fs::create_dir_all(&state)?;
     Ok(state)
 }
@@ -144,7 +145,7 @@ mod tests {
         let home = temp.path().join("home");
         std::fs::create_dir(&home).unwrap();
 
-        let state = home.join(NEW_DIR).join(".orch");
+        let state = home.join(NEW_DIR).join("state");
         std::fs::create_dir_all(&state).unwrap();
 
         assert!(state.exists());

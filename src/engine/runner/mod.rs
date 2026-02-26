@@ -157,8 +157,14 @@ impl TaskRunner {
         let git_email = config::get("git.email")
             .unwrap_or_else(|_| format!("{agent_name}[bot]@users.noreply.github.com"));
 
-        // Output file
-        let output_file = PathBuf::from(format!("/tmp/output-{task_id}.json"));
+        // Output file in state directory with restricted permissions (0600)
+        let state_dir = sidecar::state_dir().unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".orch")
+                .join("state")
+        });
+        let output_file = state_dir.join(format!("output-{task_id}.json"));
 
         // Build sandbox disallowed tools
         let mut disallowed_tools = vec!["Bash(rm *)".to_string(), "Bash(rm -*)".to_string()];
@@ -253,7 +259,7 @@ impl TaskRunner {
 
                 // Auto-commit
                 if resp.status == "done" || resp.status == "in_progress" {
-                    git_ops::auto_commit(
+                    if let Err(e) = git_ops::auto_commit(
                         &wt.work_dir,
                         task_id,
                         &task_title,
@@ -261,13 +267,19 @@ impl TaskRunner {
                         new_attempts,
                     )
                     .await
-                    .ok();
+                    {
+                        tracing::error!(task_id, error = ?e, "auto commit failed");
+                        sidecar::set(task_id, &[format!("last_error=auto commit failed: {e}")])?;
+                    }
 
                     // Push
-                    git_ops::push_branch(&wt.work_dir, &wt.branch).await.ok();
+                    if let Err(e) = git_ops::push_branch(&wt.work_dir, &wt.branch).await {
+                        tracing::error!(task_id, error = ?e, "push failed");
+                        sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
+                    }
 
                     // Create PR
-                    git_ops::create_pr_if_needed(
+                    if let Err(e) = git_ops::create_pr_if_needed(
                         &wt.work_dir,
                         &wt.branch,
                         &task_title,
@@ -279,7 +291,10 @@ impl TaskRunner {
                         &agent_name,
                     )
                     .await
-                    .ok();
+                    {
+                        tracing::error!(task_id, error = ?e, "create PR failed");
+                        sidecar::set(task_id, &[format!("last_error=create PR failed: {e}")])?;
+                    }
                 }
 
                 // Store result in sidecar
@@ -409,7 +424,9 @@ impl TaskRunner {
 
         // Kill tmux session if still alive
         if tmux.session_exists(&session).await {
-            tmux.kill_session(&session).await.ok();
+            if let Err(e) = tmux.kill_session(&session).await {
+                tracing::warn!(task_id, error = ?e, "failed to kill tmux session");
+            }
         }
 
         Ok(())

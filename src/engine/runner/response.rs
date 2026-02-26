@@ -303,7 +303,9 @@ pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: 
         chain = format!("{chain},{current_agent}");
     }
 
-    sidecar::set(task_id, &[format!("limit_reroute_chain={chain}")]).ok();
+    if let Err(e) = sidecar::set(task_id, &[format!("limit_reroute_chain={chain}")]) {
+        tracing::warn!(task_id, error = ?e, "failed to update reroute chain");
+    }
     chain
 }
 

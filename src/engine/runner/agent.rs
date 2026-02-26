@@ -41,7 +41,7 @@ pub struct AgentInvocation {
 /// Build the runner script content that tmux will execute.
 ///
 /// The script sets up environment, runs the agent, captures output and exit code.
-pub fn build_runner_script(inv: &AgentInvocation) -> String {
+pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
     let state_dir = sidecar::state_dir().unwrap_or_else(|_| {
         dirs::home_dir()
             .unwrap_or_default()
@@ -53,10 +53,10 @@ pub fn build_runner_script(inv: &AgentInvocation) -> String {
     let msg_file = state_dir.join(format!("prompt-{}-msg.txt", inv.task_id));
     let status_file = state_dir.join(format!("exit-{}.txt", inv.task_id));
 
-    // Write prompt files
-    std::fs::create_dir_all(&state_dir).ok();
-    std::fs::write(&sys_file, &inv.system_prompt).ok();
-    std::fs::write(&msg_file, &inv.agent_message).ok();
+    // Write prompt files - fail if we can't write them
+    std::fs::create_dir_all(&state_dir)?;
+    std::fs::write(&sys_file, &inv.system_prompt)?;
+    std::fs::write(&msg_file, &inv.agent_message)?;
 
     let model_flag = inv
         .model
@@ -136,7 +136,7 @@ pub fn build_runner_script(inv: &AgentInvocation) -> String {
         }
     };
 
-    format!(
+    Ok(format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
 
@@ -171,14 +171,14 @@ exit $CMD_STATUS
         agent_cmd = agent_cmd,
         state_dir = state_dir.display(),
         status_file = status_file.display(),
-    )
+    ))
 }
 
 /// Spawn the agent in a tmux session.
 ///
 /// Returns the tmux session name.
 pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow::Result<String> {
-    let script_content = build_runner_script(inv);
+    let script_content = build_runner_script(inv)?;
 
     // Write runner script
     let state_dir = sidecar::state_dir()?;
