@@ -154,10 +154,7 @@ impl Channel for DiscordChannel {
                     channel_id: Some(channel_id.clone()),
                     last_message_id: last_message_id.clone(),
                 };
-                let messages = match channel
-                    .get_messages(&channel_id, after.as_deref())
-                    .await
-                {
+                let messages = match channel.get_messages(&channel_id, after.as_deref()).await {
                     Ok(m) => m,
                     Err(e) => {
                         tracing::warn!(?e, "failed to get discord messages");
@@ -177,7 +174,7 @@ impl Channel for DiscordChannel {
                     // Discord snowflakes are monotonically increasing
                     {
                         let mut last = last_message_id.lock().unwrap();
-                        if last.as_ref().map_or(true, |s| msg.id > *s) {
+                        if last.as_ref().is_none_or(|s| msg.id > *s) {
                             *last = Some(msg.id.clone());
                         }
                     }
