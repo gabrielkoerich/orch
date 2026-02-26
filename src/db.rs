@@ -20,8 +20,8 @@ pub struct TaskMetric {
     pub agent: String,
     pub model: Option<String>,
     pub complexity: Option<String>,
-    pub outcome: String,         // "success", "failed", "timeout", "rate_limit", "auth_error"
-    pub duration_seconds: f64,   // task execution duration in seconds
+    pub outcome: String, // "success", "failed", "timeout", "rate_limit", "auth_error"
+    pub duration_seconds: f64, // task execution duration in seconds
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
     pub attempts: i32,
@@ -458,16 +458,23 @@ impl Db {
              WHERE completed_at >= datetime('now', '-24 hours')
              GROUP BY agent",
         )?;
-        let agent_stats: Vec<AgentStat> = stmt.query_map([], |row| {
-            let total: i64 = row.get(1)?;
-            let success: i64 = row.get(2)?;
-            Ok(AgentStat {
-                agent: row.get(0)?,
-                total_runs: total,
-                success_count: success,
-                success_rate: if total > 0 { (success as f64 / total as f64) * 100.0 } else { 0.0 },
-            })
-        })?.filter_map(|r| r.ok()).collect();
+        let agent_stats: Vec<AgentStat> = stmt
+            .query_map([], |row| {
+                let total: i64 = row.get(1)?;
+                let success: i64 = row.get(2)?;
+                Ok(AgentStat {
+                    agent: row.get(0)?,
+                    total_runs: total,
+                    success_count: success,
+                    success_rate: if total > 0 {
+                        (success as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         // Rate limit events in last 24h
         let rate_limit_count: i64 = conn.query_row(

@@ -133,10 +133,7 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         db.migrate().await?;
 
         // Initialize task manager
-        let task_manager = Arc::new(TaskManager::new(
-            db.clone(),
-            backend.clone(),
-        ));
+        let task_manager = Arc::new(TaskManager::new(db.clone(), backend.clone()));
 
         // Task runner (with db for metrics)
         let runner = Arc::new(TaskRunner::new(repo.clone()).with_db(db.clone()));

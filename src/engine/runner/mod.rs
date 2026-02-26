@@ -331,7 +331,9 @@ impl TaskRunner {
 
                 // Record rate limit event if db is available
                 if let Some(ref db) = self.db {
-                    let _ = db.record_rate_limit(&agent_name, "rate", Some(task_id)).await;
+                    let _ = db
+                        .record_rate_limit(&agent_name, "rate", Some(task_id))
+                        .await;
                 }
 
                 let chain = response::get_reroute_chain(task_id);
@@ -375,7 +377,9 @@ impl TaskRunner {
 
                 // Record rate limit event (auth errors are a form of limit) if db is available
                 if let Some(ref db) = self.db {
-                    let _ = db.record_rate_limit(&agent_name, "budget", Some(task_id)).await;
+                    let _ = db
+                        .record_rate_limit(&agent_name, "budget", Some(task_id))
+                        .await;
                 }
 
                 let available: Vec<String> = ["claude", "codex", "opencode"]
@@ -466,23 +470,27 @@ impl TaskRunner {
         let complexity = route_result.as_ref().map(|r| r.complexity.clone());
 
         // Get files changed count (approximate from git status)
-        let files_changed = git_ops::count_changed_files(&wt.work_dir).await.unwrap_or(0);
+        let files_changed = git_ops::count_changed_files(&wt.work_dir)
+            .await
+            .unwrap_or(0);
 
         // Record metrics if db is available
         if let Some(ref db) = self.db {
-            let metric_result = db.insert_task_metric(
-                task_id,
-                &agent_name,
-                model_name.as_deref(),
-                complexity.as_deref(),
-                outcome,
-                duration_seconds,
-                &started_at,
-                &completed_at,
-                attempts as i32 + 1,
-                files_changed as i32,
-                sidecar::get(task_id, "last_error").ok().as_deref(),
-            ).await;
+            let metric_result = db
+                .insert_task_metric(
+                    task_id,
+                    &agent_name,
+                    model_name.as_deref(),
+                    complexity.as_deref(),
+                    outcome,
+                    duration_seconds,
+                    &started_at,
+                    &completed_at,
+                    attempts as i32 + 1,
+                    files_changed as i32,
+                    sidecar::get(task_id, "last_error").ok().as_deref(),
+                )
+                .await;
 
             if let Err(e) = metric_result {
                 tracing::warn!(task_id, ?e, "failed to record task metrics");
