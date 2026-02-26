@@ -133,7 +133,7 @@ impl AgentWeights {
         for agent in agents {
             self.states
                 .entry(agent.clone())
-                .or_insert_with(RateLimitState::default);
+                .or_default();
         }
     }
 
@@ -141,7 +141,7 @@ impl AgentWeights {
     pub fn record_rate_limit(&mut self, agent: &str) {
         self.states
             .entry(agent.to_string())
-            .or_insert_with(RateLimitState::default)
+            .or_default()
             .record_rate_limit();
         tracing::info!(
             agent,
@@ -155,7 +155,7 @@ impl AgentWeights {
     pub fn record_success(&mut self, agent: &str) {
         self.states
             .entry(agent.to_string())
-            .or_insert_with(RateLimitState::default)
+            .or_default()
             .record_success();
     }
 
