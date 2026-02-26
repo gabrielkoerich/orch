@@ -23,6 +23,10 @@ router:
   timeout_seconds: 120
   fallback_executor: "codex"
   max_route_attempts: 3  # After N LLM routing failures, fall back to round-robin
+  # Enable weighted round-robin: deprioritize agents hitting rate limits.
+  # Agents that return 429/rate limit errors get reduced routing weight,
+  # which gradually recovers as rate limit windows expire.
+  weighted_round_robin: false
   # Agents to discover in PATH (checked at startup)
   agents:
     - claude

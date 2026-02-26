@@ -34,10 +34,10 @@ use crate::engine::router::{get_route_result, Router};
 use crate::engine::tasks::TaskManager;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
-use runner::TaskRunner;
+use runner::{TaskRunner, WeightSignal};
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 
 /// Per-project engine state.
 ///
@@ -334,6 +334,9 @@ pub async fn serve() -> anyhow::Result<()> {
     // Track sync interval
     let mut last_sync = std::time::Instant::now();
 
+    // Channel for weight signals from task runners back to the router
+    let (weight_tx, mut weight_rx) = mpsc::channel::<WeightSignal>(64);
+
     // Main loop
     tracing::info!(
         tick = ?config.tick_interval,
@@ -349,6 +352,26 @@ pub async fn serve() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // Drain any pending weight signals from completed tasks
+                while let Ok(signal) = weight_rx.try_recv() {
+                    let mut rw = router.write().await;
+                    match signal {
+                        WeightSignal::RateLimited { ref agent } => {
+                            rw.record_rate_limit(agent);
+                        }
+                        WeightSignal::Success { ref agent } => {
+                            rw.record_success(agent);
+                        }
+                        WeightSignal::None => {}
+                    }
+                }
+
+                // Tick weight recovery for rate-limited agents
+                {
+                    let mut rw = router.write().await;
+                    rw.tick_weight_recovery();
+                }
+
                 // Core tick: poll tasks for all projects
                 let router_guard = router.read().await;
                 for engine in &project_engines {
@@ -363,6 +386,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         &db,
                         &router_guard,
                         &engine.task_manager,
+                        &weight_tx,
                     ).await {
                         tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
                     }
@@ -472,6 +496,7 @@ async fn tick(
     db: &Arc<Db>,
     router: &Router,
     task_manager: &Arc<TaskManager>,
+    weight_tx: &mpsc::Sender<WeightSignal>,
 ) -> anyhow::Result<()> {
     // Phase 1: Check active tmux sessions for completions
     let session_snapshot = tmux.snapshot().await;
@@ -633,6 +658,7 @@ async fn tick(
         let capture = capture.clone();
         let task_id_for_cleanup = task_id.clone();
         let task_owned = task.clone();
+        let weight_tx = weight_tx.clone();
 
         // Load routing result from sidecar (stored during Phase 3a)
         let route_result = get_route_result(&task_id).ok();
@@ -644,8 +670,10 @@ async fn tick(
                 .run_with_context(&task_owned, &backend, &tmux, route_result.as_ref())
                 .await
             {
-                Ok(()) => {
+                Ok(signal) => {
                     tracing::info!(task_id, "task runner completed");
+                    // Send weight signal back to the router
+                    let _ = weight_tx.send(signal).await;
                 }
                 Err(e) => {
                     tracing::error!(task_id, ?e, "task runner failed");
