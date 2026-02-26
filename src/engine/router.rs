@@ -131,9 +131,7 @@ impl AgentWeights {
     /// Ensure all available agents have an entry.
     pub fn ensure_agents(&mut self, agents: &[String]) {
         for agent in agents {
-            self.states
-                .entry(agent.clone())
-                .or_default();
+            self.states.entry(agent.clone()).or_default();
         }
     }
 
