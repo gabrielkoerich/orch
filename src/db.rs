@@ -12,6 +12,36 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Task metrics record — stores execution metrics for each task run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskMetric {
+    pub id: i64,
+    pub task_id: String,
+    pub agent: String,
+    pub model: Option<String>,
+    pub complexity: Option<String>,
+    pub outcome: String,         // "success", "failed", "timeout", "rate_limit", "auth_error"
+    pub duration_seconds: f64,   // task execution duration in seconds
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub attempts: i32,
+    pub files_changed: i32,
+    pub error_type: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Rate limit event record — tracks rate limit occurrences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct RateLimitEvent {
+    pub id: i64,
+    pub agent: String,
+    pub limit_type: String, // "rate", "tokens", "budget"
+    pub occurred_at: DateTime<Utc>,
+    pub task_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -110,6 +140,11 @@ impl Db {
         if version < 1 {
             conn.execute_batch(SCHEMA_V1)?;
             conn.pragma_update(None, "user_version", 1)?;
+        }
+
+        if version < 2 {
+            conn.execute_batch(SCHEMA_V2)?;
+            conn.pragma_update(None, "user_version", 2)?;
         }
 
         Ok(())
@@ -304,6 +339,189 @@ impl Db {
         let result: Vec<InternalTask> = tasks.filter_map(|t| t.ok()).collect();
         Ok(result)
     }
+
+    /// Insert a new task metric record.
+    pub async fn insert_task_metric(
+        &self,
+        task_id: &str,
+        agent: &str,
+        model: Option<&str>,
+        complexity: Option<&str>,
+        outcome: &str,
+        duration_seconds: f64,
+        started_at: &DateTime<Utc>,
+        completed_at: &DateTime<Utc>,
+        attempts: i32,
+        files_changed: i32,
+        error_type: Option<&str>,
+    ) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO task_metrics (task_id, agent, model, complexity, outcome, duration_seconds, started_at, completed_at, attempts, files_changed, error_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                task_id,
+                agent,
+                model,
+                complexity,
+                outcome,
+                duration_seconds,
+                started_at.to_rfc3339(),
+                completed_at.to_rfc3339(),
+                attempts,
+                files_changed,
+                error_type,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get task metrics for a specific task.
+    pub async fn get_task_metrics(&self, task_id: &str) -> anyhow::Result<Vec<TaskMetric>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, task_id, agent, model, complexity, outcome, duration_seconds, started_at, completed_at, attempts, files_changed, error_type, created_at
+             FROM task_metrics WHERE task_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let metrics = stmt.query_map([task_id], |row| {
+            let started_str: String = row.get(7)?;
+            let completed_str: String = row.get(8)?;
+            let created_str: String = row.get(12)?;
+            Ok(TaskMetric {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                agent: row.get(2)?,
+                model: row.get(3)?,
+                complexity: row.get(4)?,
+                outcome: row.get(5)?,
+                duration_seconds: row.get(6)?,
+                started_at: DateTime::parse_from_rfc3339(&started_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                completed_at: DateTime::parse_from_rfc3339(&completed_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                attempts: row.get(9)?,
+                files_changed: row.get(10)?,
+                error_type: row.get(11)?,
+                created_at: DateTime::parse_from_rfc3339(&created_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        let result: Vec<TaskMetric> = metrics.filter_map(|m| m.ok()).collect();
+        Ok(result)
+    }
+
+    /// Get aggregated metrics for the last 24 hours.
+    pub async fn get_metrics_summary_24h(&self) -> anyhow::Result<MetricsSummary> {
+        let conn = self.conn.lock().await;
+
+        // Tasks completed/failed in last 24h
+        let completed_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND outcome = 'success'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let failed_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND outcome != 'success'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        // Average duration by complexity
+        let avg_duration_simple: Option<f64> = conn.query_row(
+            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND complexity = 'simple'",
+            [],
+            |row| row.get(0),
+        ).ok().flatten();
+
+        let avg_duration_medium: Option<f64> = conn.query_row(
+            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND complexity = 'medium'",
+            [],
+            |row| row.get(0),
+        ).ok().flatten();
+
+        let avg_duration_complex: Option<f64> = conn.query_row(
+            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND complexity = 'complex'",
+            [],
+            |row| row.get(0),
+        ).ok().flatten();
+
+        // Agent success rates
+        let mut stmt = conn.prepare(
+            "SELECT agent,
+                    COUNT(*) as total,
+                    SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as success_count
+             FROM task_metrics
+             WHERE completed_at >= datetime('now', '-24 hours')
+             GROUP BY agent",
+        )?;
+        let agent_stats: Vec<AgentStat> = stmt.query_map([], |row| {
+            let total: i64 = row.get(1)?;
+            let success: i64 = row.get(2)?;
+            Ok(AgentStat {
+                agent: row.get(0)?,
+                total_runs: total,
+                success_count: success,
+                success_rate: if total > 0 { (success as f64 / total as f64) * 100.0 } else { 0.0 },
+            })
+        })?.filter_map(|r| r.ok()).collect();
+
+        // Rate limit events in last 24h
+        let rate_limit_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rate_limits WHERE occurred_at >= datetime('now', '-24 hours')",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(MetricsSummary {
+            tasks_completed_24h: completed_count,
+            tasks_failed_24h: failed_count,
+            avg_duration_simple,
+            avg_duration_medium,
+            avg_duration_complex,
+            agent_stats,
+            rate_limits_24h: rate_limit_count,
+        })
+    }
+
+    /// Record a rate limit event.
+    pub async fn record_rate_limit(
+        &self,
+        agent: &str,
+        limit_type: &str,
+        task_id: Option<&str>,
+    ) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO rate_limits (agent, limit_type, occurred_at, task_id) VALUES (?1, ?2, datetime('now'), ?3)",
+            rusqlite::params![agent, limit_type, task_id],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+}
+
+/// Metrics summary for the CLI output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsSummary {
+    pub tasks_completed_24h: i64,
+    pub tasks_failed_24h: i64,
+    pub avg_duration_simple: Option<f64>,
+    pub avg_duration_medium: Option<f64>,
+    pub avg_duration_complex: Option<f64>,
+    pub agent_stats: Vec<AgentStat>,
+    pub rate_limits_24h: i64,
+}
+
+/// Agent statistics from metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStat {
+    pub agent: String,
+    pub total_runs: i64,
+    pub success_count: i64,
+    pub success_rate: f64,
 }
 
 /// Schema v1 — initial tables for internal tasks and jobs.
@@ -355,6 +573,41 @@ CREATE INDEX IF NOT EXISTS idx_internal_tasks_status ON internal_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_internal_tasks_source ON internal_tasks(source);
 CREATE INDEX IF NOT EXISTS idx_internal_task_results_task_id ON internal_task_results(task_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_enabled ON jobs(enabled);
+"#;
+
+/// Schema v2 — adds task_metrics and rate_limits tables for observability.
+const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS task_metrics (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT NOT NULL,
+    agent           TEXT NOT NULL,
+    model           TEXT DEFAULT NULL,
+    complexity      TEXT DEFAULT NULL,
+    outcome         TEXT NOT NULL,         -- "success", "failed", "timeout", "rate_limit", "auth_error"
+    duration_seconds REAL DEFAULT 0,
+    started_at      TEXT NOT NULL,
+    completed_at    TEXT NOT NULL,
+    attempts        INTEGER DEFAULT 1,
+    files_changed   INTEGER DEFAULT 0,
+    error_type      TEXT DEFAULT NULL,
+    created_at      TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent           TEXT NOT NULL,
+    limit_type      TEXT NOT NULL,  -- "rate", "tokens", "budget"
+    occurred_at     TEXT NOT NULL,
+    task_id         TEXT DEFAULT NULL,
+    created_at      TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_metrics_task_id ON task_metrics(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_metrics_agent ON task_metrics(agent);
+CREATE INDEX IF NOT EXISTS idx_task_metrics_completed_at ON task_metrics(completed_at);
+CREATE INDEX IF NOT EXISTS idx_task_metrics_outcome ON task_metrics(outcome);
+CREATE INDEX IF NOT EXISTS idx_rate_limits_agent ON rate_limits(agent);
+CREATE INDEX IF NOT EXISTS idx_rate_limits_occurred_at ON rate_limits(occurred_at);
 "#;
 
 #[cfg(test)]

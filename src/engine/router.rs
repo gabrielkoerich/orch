@@ -371,6 +371,7 @@ impl Router {
                     constraints: vec![],
                 };
 
+                tracing::debug!(task_id = %task.id.0, agent = %agent, complexity = %complexity, "routed via label");
                 return Ok(RouteResult {
                     agent: agent.clone(),
                     model,
@@ -385,6 +386,7 @@ impl Router {
 
         // 2. Round-robin mode — use stateful round-robin
         if self.config.mode == "round_robin" {
+            tracing::debug!(task_id = %task.id.0, "routing via round-robin mode");
             return self.route_round_robin_stateful(task);
         }
 
@@ -401,10 +403,14 @@ impl Router {
             return self.route_round_robin_stateful(task);
         }
 
+        // Log routing start (before await)
+        tracing::debug!(task_id = %task.id.0, "starting LLM routing");
+
         match self.route_with_llm(task).await {
             Ok(result) => {
                 // Reset attempts on success
                 let _ = self.set_route_attempts(&task.id.0, 0);
+                tracing::info!(task_id = %task.id.0, agent = %result.agent, complexity = %result.complexity, "routed via LLM");
                 Ok(result)
             }
             Err(e) => {

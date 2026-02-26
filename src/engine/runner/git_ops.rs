@@ -44,9 +44,12 @@ pub async fn auto_commit(
     agent: &str,
     attempt: u32,
 ) -> anyhow::Result<bool> {
+    // Check for changes first (before creating span to avoid Send issues)
     if !has_changes(dir).await {
         return Ok(false);
     }
+
+    tracing::info!(task_id, "auto-committing uncommitted changes");
 
     let commit_msg =
         format!("feat: {title}\n\nTask #{task_id}\nAgent: {agent}\nAttempt: {attempt}");
@@ -140,7 +143,7 @@ pub async fn create_pr_if_needed(
     task_id: &str,
     agent: &str,
 ) -> anyhow::Result<Option<String>> {
-    // Check if PR already exists
+    // Check if PR already exists (before creating span to avoid Send issues)
     let existing = Command::new("gh")
         .args([
             "pr",
@@ -256,6 +259,32 @@ async fn get_current_branch(dir: &Path) -> String {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => String::new(),
     }
+}
+
+/// Count the number of changed files in the working directory.
+pub async fn count_changed_files(dir: &Path) -> anyhow::Result<usize> {
+    // Count modified and new files (excluding deleted)
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(dir)
+        .output()
+        .await?;
+
+    let status_output = String::from_utf8_lossy(&output.stdout);
+    let count = status_output
+        .lines()
+        .filter(|line| {
+            let prefix = line.get(0..2).unwrap_or("");
+            // Count modified (M), added (A), renamed (R), copied (C), untracked (??)
+            prefix.starts_with('M')
+                || prefix.starts_with('A')
+                || prefix.starts_with('R')
+                || prefix.starts_with('C')
+                || prefix.starts_with('?')
+        })
+        .count();
+
+    Ok(count)
 }
 
 /// Check if there are unpushed commits.

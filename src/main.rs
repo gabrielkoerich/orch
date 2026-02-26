@@ -95,6 +95,8 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Show task metrics summary
+    Metrics,
     /// Generate shell completions
     Completions {
         /// Shell type
@@ -391,6 +393,9 @@ async fn main() -> anyhow::Result<()> {
                 cli::service::status()?;
             }
         },
+        Commands::Metrics => {
+            cli::metrics().await?;
+        }
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "orch", &mut std::io::stdout());

@@ -17,10 +17,12 @@ pub mod worktree;
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::config;
+use crate::db::Db;
 use crate::engine::router::{get_route_result, RouteResult};
 use crate::security;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
+use chrono::Utc;
 use response::RunResult;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,6 +34,8 @@ pub struct TaskRunner {
     repo: String,
     /// Path to the orchestrator home directory
     orch_home: PathBuf,
+    /// Database for storing metrics
+    db: Option<Arc<Db>>,
 }
 
 impl TaskRunner {
@@ -39,7 +43,17 @@ impl TaskRunner {
         let orch_home =
             crate::home::orch_home().unwrap_or_else(|_| PathBuf::from("/tmp").join(".orch"));
 
-        Self { repo, orch_home }
+        Self {
+            repo,
+            orch_home,
+            db: None,
+        }
+    }
+
+    /// Set the database reference for metrics recording.
+    pub fn with_db(mut self, db: Arc<Db>) -> Self {
+        self.db = Some(db);
+        self
     }
 
     /// Maximum task execution time (30 minutes).
@@ -54,6 +68,9 @@ impl TaskRunner {
         agent: Option<&str>,
         model: Option<&str>,
     ) -> anyhow::Result<()> {
+        // Record start time for metrics
+        let started_at = Utc::now();
+
         tracing::info!(
             task_id,
             agent = agent.unwrap_or("default"),
@@ -183,7 +200,7 @@ impl TaskRunner {
         // Build agent invocation
         let invocation = agent::AgentInvocation {
             agent: agent_name.clone(),
-            model: model_name,
+            model: model_name.clone(),
             work_dir: wt.work_dir.clone(),
             system_prompt,
             agent_message,
@@ -312,6 +329,11 @@ impl TaskRunner {
             RunResult::UsageLimit(_snippet) => {
                 tracing::warn!(task_id, "usage/rate limit hit");
 
+                // Record rate limit event if db is available
+                if let Some(ref db) = self.db {
+                    let _ = db.record_rate_limit(&agent_name, "rate", Some(task_id)).await;
+                }
+
                 let chain = response::get_reroute_chain(task_id);
                 let chain = response::update_reroute_chain(task_id, &agent_name, &chain);
 
@@ -350,6 +372,11 @@ impl TaskRunner {
             }
             RunResult::AuthError(_snippet) => {
                 tracing::warn!(task_id, agent = agent_name, "auth/billing error");
+
+                // Record rate limit event (auth errors are a form of limit) if db is available
+                if let Some(ref db) = self.db {
+                    let _ = db.record_rate_limit(&agent_name, "budget", Some(task_id)).await;
+                }
 
                 let available: Vec<String> = ["claude", "codex", "opencode"]
                     .iter()
@@ -410,6 +437,56 @@ impl TaskRunner {
         // Kill tmux session if still alive
         if tmux.session_exists(&session).await {
             tmux.kill_session(&session).await.ok();
+        }
+
+        // Record metrics after task completion
+        let completed_at = Utc::now();
+        let duration_seconds = (completed_at - started_at).num_milliseconds() as f64 / 1000.0;
+
+        // Determine outcome based on final status
+        let final_status = sidecar::get(task_id, "status").unwrap_or_default();
+        let outcome = match final_status.as_str() {
+            "done" | "in_progress" | "in_review" => "success",
+            "needs_review" => {
+                let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
+                if last_error.contains("timeout") {
+                    "timeout"
+                } else if last_error.contains("rate limit") || last_error.contains("usage") {
+                    "rate_limit"
+                } else if last_error.contains("auth") || last_error.contains("billing") {
+                    "auth_error"
+                } else {
+                    "failed"
+                }
+            }
+            _ => "success",
+        };
+
+        // Get complexity from route result
+        let complexity = route_result.as_ref().map(|r| r.complexity.clone());
+
+        // Get files changed count (approximate from git status)
+        let files_changed = git_ops::count_changed_files(&wt.work_dir).await.unwrap_or(0);
+
+        // Record metrics if db is available
+        if let Some(ref db) = self.db {
+            let metric_result = db.insert_task_metric(
+                task_id,
+                &agent_name,
+                model_name.as_deref(),
+                complexity.as_deref(),
+                outcome,
+                duration_seconds,
+                &started_at,
+                &completed_at,
+                attempts as i32 + 1,
+                files_changed as i32,
+                sidecar::get(task_id, "last_error").ok().as_deref(),
+            ).await;
+
+            if let Err(e) = metric_result {
+                tracing::warn!(task_id, ?e, "failed to record task metrics");
+            }
         }
 
         Ok(())
