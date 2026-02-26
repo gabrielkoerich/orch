@@ -295,7 +295,9 @@ pub fn build_agent_message(
     // Memory from previous attempts
     if !context.memory.is_empty() {
         msg.push_str("\n## Previous Attempts Memory\n\n");
-        msg.push_str("Learnings from previous task attempts (to help you avoid repeating mistakes):\n\n");
+        msg.push_str(
+            "Learnings from previous task attempts (to help you avoid repeating mistakes):\n\n",
+        );
 
         for entry in &context.memory {
             msg.push_str(&format!(

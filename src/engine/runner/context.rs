@@ -244,8 +244,7 @@ pub fn build_memory_context(task_id: &str) -> (String, Vec<crate::sidecar::Memor
     for entry in &memory {
         context.push_str(&format!(
             "### Attempt #{} (Agent: {})",
-            entry.attempt,
-            entry.agent
+            entry.attempt, entry.agent
         ));
 
         if let Some(ref model) = entry.model {

@@ -148,7 +148,7 @@ impl TaskRunner {
             repo_tree,
             git_diff,
             issue_comments: String::new(), // Requires backend
-            memory: vec![], // Will be loaded on retries
+            memory: vec![],                // Will be loaded on retries
         };
 
         // Build a minimal ExternalTask for prompt building
