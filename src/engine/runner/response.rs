@@ -49,8 +49,8 @@ pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> Ru
         .unwrap_or_else(|_| PathBuf::from(format!("/tmp/stderr-{task_id}.txt")));
     let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
 
-    // Read response from output file
-    let response_content = read_output_file(task_id, output_file);
+    // Read response from output file (legacy path — no repo context)
+    let response_content = read_output_file(task_id, output_file, "");
 
     let combined = format!("{response_content}{stderr}");
 
@@ -131,15 +131,40 @@ pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> Ru
 }
 
 /// Read the agent's output file, trying multiple locations.
-pub fn read_output_file(task_id: &str, primary_path: &Path) -> String {
-    // Primary: explicit output file
+///
+/// Checks per-task attempt directory first, then legacy flat paths.
+pub fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> String {
+    // Primary: explicit output file (already points to attempt dir)
     if let Ok(content) = std::fs::read_to_string(primary_path) {
         if !content.is_empty() {
             return content;
         }
     }
 
-    // Fallback locations
+    // Fallback: check all attempt dirs for this task (newest first)
+    if let Ok(task_dir) = crate::home::task_dir(repo, task_id) {
+        let attempts_dir = task_dir.join("attempts");
+        if attempts_dir.is_dir() {
+            let mut attempt_nums: Vec<u32> = std::fs::read_dir(&attempts_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
+                .collect();
+            attempt_nums.sort_unstable_by(|a, b| b.cmp(a)); // newest first
+            for n in attempt_nums {
+                let p = attempts_dir.join(n.to_string()).join("output.json");
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    if !content.is_empty() {
+                        tracing::info!(task_id, path = %p.display(), "read output from attempt dir");
+                        return content;
+                    }
+                }
+            }
+        }
+    }
+
+    // Legacy fallback locations
     let state_dir = sidecar::state_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
 
     let mut fallbacks = vec![
@@ -147,7 +172,6 @@ pub fn read_output_file(task_id: &str, primary_path: &Path) -> String {
         state_dir.join(format!("output-{task_id}.json")),
     ];
 
-    // Also check legacy location
     if let Ok(legacy_path) = sidecar::state_file(&format!("output-{task_id}.json")) {
         if !fallbacks.contains(&legacy_path) {
             fallbacks.push(legacy_path);
@@ -157,7 +181,7 @@ pub fn read_output_file(task_id: &str, primary_path: &Path) -> String {
     for path in &fallbacks {
         if let Ok(content) = std::fs::read_to_string(path) {
             if !content.is_empty() {
-                tracing::info!(task_id, path = %path.display(), "read output from fallback");
+                tracing::info!(task_id, path = %path.display(), "read output from legacy fallback");
                 return content;
             }
         }

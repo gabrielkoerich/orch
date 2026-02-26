@@ -103,7 +103,41 @@ pub fn state_file(name: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Get the path to a task's sidecar file.
+///
+/// New location: `~/.orch/state/{owner}/{repo}/tasks/{id}/sidecar.json`
+/// Legacy fallback: `~/.orch/state/{id}.json`
+///
+/// Uses the repo from config if available. Falls back to flat state dir
+/// for backward compatibility.
 fn sidecar_path(task_id: &str) -> anyhow::Result<PathBuf> {
+    sidecar_path_for_repo(task_id, None)
+}
+
+/// Get the path to a task's sidecar file, optionally scoped to a repo.
+fn sidecar_path_for_repo(task_id: &str, repo: Option<&str>) -> anyhow::Result<PathBuf> {
+    // Try to resolve repo
+    let repo_slug = repo
+        .map(String::from)
+        .or_else(|| crate::config::get("repo").ok());
+
+    if let Some(ref repo) = repo_slug {
+        if !repo.is_empty() {
+            let task_dir = crate::home::task_dir(repo, task_id)?;
+            let new_path = task_dir.join("sidecar.json");
+            if new_path.exists() {
+                return Ok(new_path);
+            }
+            // Check legacy flat path
+            let legacy = state_file(&format!("{task_id}.json"))?;
+            if legacy.exists() {
+                return Ok(legacy);
+            }
+            // New file — use per-task dir
+            return Ok(new_path);
+        }
+    }
+
+    // No repo context — use legacy flat path
     state_file(&format!("{task_id}.json"))
 }
 

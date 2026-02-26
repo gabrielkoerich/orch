@@ -176,14 +176,10 @@ impl TaskRunner {
         let git_email = config::get("git.email")
             .unwrap_or_else(|_| format!("{agent_name}[bot]@users.noreply.github.com"));
 
-        // Output file in state directory with restricted permissions (0600)
-        let state_dir = sidecar::state_dir().unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".orch")
-                .join("state")
-        });
-        let output_file = state_dir.join(format!("output-{task_id}.json"));
+        // Output file in per-task attempt directory (attempt = attempts + 1, set below)
+        let next_attempt = attempts + 1;
+        let attempt_dir = crate::home::task_attempt_dir(&self.repo, task_id, next_attempt)?;
+        let output_file = attempt_dir.join("output.json");
 
         // Build sandbox disallowed tools
         let mut disallowed_tools = vec!["Bash(rm *)".to_string(), "Bash(rm -*)".to_string()];
@@ -221,6 +217,8 @@ impl TaskRunner {
             git_author_email: git_email,
             output_file: output_file.clone(),
             timeout_seconds,
+            repo: self.repo.clone(),
+            attempt: next_attempt,
         };
 
         // Increment attempts
@@ -252,26 +250,34 @@ impl TaskRunner {
             }
         }
 
-        // Read exit code (check new state dir, fall back to legacy)
-        let status_file =
-            sidecar::state_file(&format!("exit-{task_id}.txt")).unwrap_or_else(|_| {
-                self.orch_home
-                    .join("state")
-                    .join(format!("exit-{task_id}.txt"))
-            });
-        let exit_code: i32 = std::fs::read_to_string(&status_file)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(-1);
+        // Read exit code — check per-task attempt dir first, fall back to legacy
+        let exit_code: i32 = {
+            let attempt_exit = attempt_dir.join("exit.txt");
+            let legacy_exit =
+                sidecar::state_file(&format!("exit-{task_id}.txt")).unwrap_or_else(|_| {
+                    self.orch_home
+                        .join("state")
+                        .join(format!("exit-{task_id}.txt"))
+                });
+
+            std::fs::read_to_string(&attempt_exit)
+                .or_else(|_| std::fs::read_to_string(&legacy_exit))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(-1)
+        };
 
         // Get per-agent runner for parsing
         let agent_runner = agents::get_runner(&agent_name);
 
         // Read raw output + stderr
-        let raw_stdout = response::read_output_file(task_id, &output_file);
-        let stderr_path = sidecar::state_file(&format!("stderr-{task_id}.txt"))
+        let raw_stdout = response::read_output_file(task_id, &output_file, &self.repo);
+        let stderr_path_attempt = attempt_dir.join("stderr.txt");
+        let stderr_path_legacy = sidecar::state_file(&format!("stderr-{task_id}.txt"))
             .unwrap_or_else(|_| PathBuf::from(format!("/tmp/stderr-{task_id}.txt")));
-        let raw_stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let raw_stderr = std::fs::read_to_string(&stderr_path_attempt)
+            .or_else(|_| std::fs::read_to_string(&stderr_path_legacy))
+            .unwrap_or_default();
 
         // Use agent-specific parsing when exit code is 0, fall back to classify_error
         let parse_result = if exit_code == 0 && !raw_stdout.is_empty() {

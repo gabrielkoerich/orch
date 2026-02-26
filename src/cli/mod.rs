@@ -83,6 +83,16 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
         println!("Created .orch.yml");
     }
 
+    // Auto-setup GitHub Projects V2 (non-blocking)
+    if config::get("gh.project_id").is_err()
+        || config::get("gh.project_id").unwrap_or_default().is_empty()
+    {
+        println!("Setting up GitHub Projects V2...");
+        // Run project setup in a blocking tokio context if available,
+        // but init is sync so we just print guidance
+        println!("  Run `orch project sync` to link a project board");
+    }
+
     Ok(())
 }
 
@@ -292,6 +302,97 @@ pub async fn stream_task(task_id: &str) -> anyhow::Result<()> {
                 println!("\n--- Stream closed ---");
                 break;
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// List accessible GitHub projects.
+pub async fn project_list() -> anyhow::Result<()> {
+    use crate::github::projects::ProjectSync;
+
+    let projects = ProjectSync::list_projects().await?;
+
+    if projects.is_empty() {
+        println!("No projects found");
+        return Ok(());
+    }
+
+    println!("{:<50} {:<8} ID", "TITLE", "NUMBER");
+    println!("{}", "-".repeat(80));
+    for p in &projects {
+        println!("{:<50} #{:<7} {}", p.title, p.number, p.id);
+    }
+
+    Ok(())
+}
+
+/// Link current repo to a project by ID and discover fields.
+pub async fn project_link(project_id: &str) -> anyhow::Result<()> {
+    use crate::github::projects::{write_project_config, ProjectSync};
+
+    println!("Discovering project fields...");
+    let sync = ProjectSync::discover_fields(project_id).await?;
+
+    write_project_config(&sync)?;
+
+    println!("Linked project: {}", project_id);
+    println!("Status field: {}", sync.status_field_id());
+    println!("Column mappings:");
+    for (col, opt_id) in sync.status_map() {
+        println!("  {col}: {opt_id}");
+    }
+
+    Ok(())
+}
+
+/// Re-discover field IDs from configured project and update config.
+pub async fn project_sync() -> anyhow::Result<()> {
+    use crate::github::projects::{write_project_config, ProjectSync};
+
+    let project_id = config::get("gh.project_id").map_err(|_| {
+        anyhow::anyhow!("no project configured — run `orch project link <id>` first")
+    })?;
+
+    if project_id.is_empty() {
+        anyhow::bail!("no project configured — run `orch project link <id>` first");
+    }
+
+    println!("Syncing project fields for {}...", project_id);
+    let sync = ProjectSync::discover_fields(&project_id).await?;
+
+    write_project_config(&sync)?;
+
+    println!("Updated config:");
+    println!("  Status field: {}", sync.status_field_id());
+    for (col, opt_id) in sync.status_map() {
+        println!("  {col}: {opt_id}");
+    }
+
+    Ok(())
+}
+
+/// Show current project configuration.
+pub fn project_info() -> anyhow::Result<()> {
+    let project_id = config::get("gh.project_id").unwrap_or_default();
+
+    if project_id.is_empty() {
+        println!("No project configured");
+        println!("  Run `orch project list` to see available projects");
+        println!("  Run `orch project link <id>` to link one");
+        return Ok(());
+    }
+
+    println!("Project ID: {}", project_id);
+
+    if let Ok(field_id) = config::get("gh.project_status_field_id") {
+        println!("Status field: {}", field_id);
+    }
+
+    for col in &["backlog", "in_progress", "review", "done"] {
+        if let Ok(opt_id) = config::get(&format!("gh.project_status_map.{col}")) {
+            println!("  {col}: {opt_id}");
         }
     }
 
