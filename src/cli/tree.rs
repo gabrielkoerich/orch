@@ -64,10 +64,14 @@ pub fn build_forest(tasks: Vec<Task>) -> Vec<TreeNode> {
     for task in &tasks {
         let (id, parent_id, node) = match task {
             Task::External(ext) => {
-                let parent = ext.labels.iter().find(|l| l.starts_with("parent:")).map(|l| {
-                    let parent_num = l.trim_start_matches("parent:");
-                    parent_num.to_string()
-                });
+                let parent = ext
+                    .labels
+                    .iter()
+                    .find(|l| l.starts_with("parent:"))
+                    .map(|l| {
+                        let parent_num = l.trim_start_matches("parent:");
+                        parent_num.to_string()
+                    });
                 let node = TreeNode::from_external(ext);
                 (ext.id.0.clone(), parent, node)
             }
@@ -108,7 +112,11 @@ pub fn build_forest(tasks: Vec<Task>) -> Vec<TreeNode> {
     }
 
     // Third pass: recursively build the tree
-    fn build_node(id: &str, nodes: &HashMap<String, TreeNode>, children_map: &HashMap<String, Vec<String>>) -> Option<TreeNode> {
+    fn build_node(
+        id: &str,
+        nodes: &HashMap<String, TreeNode>,
+        children_map: &HashMap<String, Vec<String>>,
+    ) -> Option<TreeNode> {
         let mut node = nodes.get(id)?.clone();
 
         if let Some(children_ids) = children_map.get(id) {
@@ -118,6 +126,13 @@ pub fn build_forest(tasks: Vec<Task>) -> Vec<TreeNode> {
                 }
             }
         }
+
+        // Sort children by numeric ID for deterministic output
+        node.children.sort_by(|a, b| {
+            let a_num = a.id.parse::<i64>().unwrap_or(0);
+            let b_num = b.id.parse::<i64>().unwrap_or(0);
+            a_num.cmp(&b_num)
+        });
 
         Some(node)
     }
@@ -154,7 +169,10 @@ fn render_node(node: &TreeNode, output: &mut String, prefix: &str, is_last: bool
             "#{} [{}] {}{}\n",
             node.id,
             node.status,
-            node.agent.as_ref().map(|a| format!("({}) ", a)).unwrap_or_default(),
+            node.agent
+                .as_ref()
+                .map(|a| format!("({}) ", a))
+                .unwrap_or_default(),
             node.title
         ));
     } else {
@@ -166,7 +184,10 @@ fn render_node(node: &TreeNode, output: &mut String, prefix: &str, is_last: bool
             branch,
             node.id,
             node.status,
-            node.agent.as_ref().map(|a| format!("({}) ", a)).unwrap_or_default(),
+            node.agent
+                .as_ref()
+                .map(|a| format!("({}) ", a))
+                .unwrap_or_default(),
             node.title
         ));
     }
@@ -339,15 +360,13 @@ mod tests {
 
     #[test]
     fn test_render_forest() {
-        let roots = vec![
-            TreeNode {
-                id: "35".to_string(),
-                title: "Refactor database".to_string(),
-                status: "in_progress".to_string(),
-                agent: None,
-                children: vec![],
-            },
-        ];
+        let roots = vec![TreeNode {
+            id: "35".to_string(),
+            title: "Refactor database".to_string(),
+            status: "in_progress".to_string(),
+            agent: None,
+            children: vec![],
+        }];
 
         let output = render_forest(&roots);
         assert!(output.contains("#35 [in_progress] Refactor database"));
