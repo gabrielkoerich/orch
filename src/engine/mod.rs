@@ -918,11 +918,11 @@ async fn tick(
                         summary: summary.clone(),
                     });
 
-                    // Trigger review agent if task is done
+                    // Trigger review agent if task is done (enabled by default)
                     if status == "done" {
                         let enable_review = config::get("workflow.enable_review_agent")
-                            .map(|v| v == "true")
-                            .unwrap_or(false);
+                            .map(|v| v != "false")
+                            .unwrap_or(true);
                         // Guard against duplicate review spawns
                         let already_reviewing = sidecar::get(&task_id, "review_started")
                             .map(|v| v == "true")
