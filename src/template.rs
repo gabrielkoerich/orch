@@ -12,9 +12,8 @@ static IF_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Matches `{{VAR}}` variable placeholders.
-static VAR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\{\{(\w+)\}\}").expect("BUG: var_pattern regex is invalid")
-});
+static VAR_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{\{(\w+)\}\}").expect("BUG: var_pattern regex is invalid"));
 
 pub fn render_template(template_path: &str, extra_vars: &[String]) -> Result<String, String> {
     if !fs::metadata(template_path)
