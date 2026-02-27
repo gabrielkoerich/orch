@@ -742,28 +742,29 @@ mod tests {
         assert!(patterns::detect_missing_tool("").is_none());
     }
 
+    // Use fake agent names so real cooldowns on disk don't affect tests.
     #[test]
     fn pick_fallback_skips_current_agent() {
-        let available = vec!["claude".to_string(), "codex".to_string()];
-        let result = pick_fallback_agent("claude", "", &available);
-        assert_eq!(result, Some("codex".to_string()));
+        let available = vec!["test_agent_a".to_string(), "test_agent_b".to_string()];
+        let result = pick_fallback_agent("test_agent_a", "", &available);
+        assert_eq!(result, Some("test_agent_b".to_string()));
     }
 
     #[test]
     fn pick_fallback_skips_chain_agents() {
         let available = vec![
-            "claude".to_string(),
-            "codex".to_string(),
-            "opencode".to_string(),
+            "test_agent_a".to_string(),
+            "test_agent_b".to_string(),
+            "test_agent_c".to_string(),
         ];
-        let result = pick_fallback_agent("claude", "claude,codex", &available);
-        assert_eq!(result, Some("opencode".to_string()));
+        let result = pick_fallback_agent("test_agent_a", "test_agent_a,test_agent_b", &available);
+        assert_eq!(result, Some("test_agent_c".to_string()));
     }
 
     #[test]
     fn pick_fallback_returns_none_when_exhausted() {
-        let available = vec!["claude".to_string(), "codex".to_string()];
-        let result = pick_fallback_agent("claude", "claude,codex", &available);
+        let available = vec!["test_agent_a".to_string(), "test_agent_b".to_string()];
+        let result = pick_fallback_agent("test_agent_a", "test_agent_a,test_agent_b", &available);
         assert!(result.is_none());
     }
 

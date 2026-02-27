@@ -466,6 +466,23 @@ impl RouterConfig {
             config.weighted_round_robin = val == "true" || val == "1";
         }
 
+        // Load model_map overrides from config (model_map.{complexity}.{agent})
+        let known_agents = ["claude", "codex", "opencode", "kimi", "minimax"];
+        for complexity in config.model_map.keys().cloned().collect::<Vec<_>>() {
+            for agent in &known_agents {
+                let key = format!("model_map.{complexity}.{agent}");
+                if let Ok(model) = crate::config::get(&key) {
+                    if !model.is_empty() {
+                        config
+                            .model_map
+                            .entry(complexity.clone())
+                            .or_default()
+                            .insert(agent.to_string(), model);
+                    }
+                }
+            }
+        }
+
         // Parse default_skills
         if let Ok(skills_str) = crate::config::get("router.default_skills") {
             if !skills_str.is_empty() && skills_str != "[]" {
