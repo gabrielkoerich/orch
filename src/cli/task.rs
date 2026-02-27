@@ -379,7 +379,9 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
 /// Attach to a running agent's tmux session.
 pub fn attach(id: &str) -> anyhow::Result<()> {
-    let session = format!("orch-{}", id);
+    let tmux = TmuxManager::new();
+    let repo = crate::config::get_current_repo().unwrap_or_default();
+    let session = tmux.session_name(&repo, id);
     let status = std::process::Command::new("tmux")
         .args(["attach-session", "-t", &session])
         .status()?;
@@ -420,7 +422,8 @@ pub async fn live() -> anyhow::Result<()> {
 /// Kill a running agent tmux session.
 pub async fn kill(id: &str) -> anyhow::Result<()> {
     let tmux = TmuxManager::new();
-    let session = tmux.session_name(id);
+    let repo = crate::config::get_current_repo().unwrap_or_default();
+    let session = tmux.session_name(&repo, id);
     tmux.kill_session(&session).await?;
     println!("Killed session for task #{}", id);
     Ok(())

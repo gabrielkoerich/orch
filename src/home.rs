@@ -1,68 +1,21 @@
-//! Home directory utilities with backward compatibility.
+//! Home directory utilities.
 //!
-//! This module provides a centralized way to get the orch home directory path.
-//! It handles the migration from ~/.orchestrator/ to ~/.orch/ with backward compatibility:
-//! - If ~/.orch/ exists, use it
-//! - If ~/.orchestrator/ exists but ~/.orch/ doesn't, create a symlink
-//! - Otherwise, create ~/.orch/
+//! All orch state lives under `~/.orch/`. This is completely separate from
+//! the bash orchestrator's `~/.orchestrator/` directory — both tools can
+//! run side by side without conflicts.
 
 use std::path::PathBuf;
 
-/// The new home directory name.
-const NEW_DIR: &str = ".orch";
-
-/// The old home directory name (for backward compatibility).
-const OLD_DIR: &str = ".orchestrator";
+/// The home directory name.
+const HOME_DIR: &str = ".orch";
 
 /// Get the orch home directory path (~/.orch/).
-///
-/// This function handles backward compatibility:
-/// - If ~/.orch/ exists, returns it
-/// - If ~/.orchestrator/ exists but ~/.orch/ doesn't, creates a symlink and returns ~/.orch/
-/// - Otherwise, creates ~/.orch/ and returns it
 pub fn orch_home() -> anyhow::Result<PathBuf> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    let new_path = home.join(NEW_DIR);
-    let old_path = home.join(OLD_DIR);
-
-    // If new path exists, use it
-    if new_path.exists() {
-        return Ok(new_path);
-    }
-
-    // If old path exists but new doesn't, create a symlink for backward compatibility
-    if old_path.exists() {
-        // Try to create a symlink from new to old
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            if let Err(e) = symlink(&old_path, &new_path) {
-                tracing::warn!(
-                    old_path = %old_path.display(),
-                    new_path = %new_path.display(),
-                    error = %e,
-                    "failed to create symlink for backward compatibility"
-                );
-                // Fall back to using the old path directly
-                return Ok(old_path);
-            }
-            tracing::info!(
-                old_path = %old_path.display(),
-                new_path = %new_path.display(),
-                "created symlink for backward compatibility"
-            );
-        }
-        #[cfg(not(unix))]
-        {
-            // On non-Unix systems, just use the old path
-            return Ok(old_path);
-        }
-    }
-
-    // Create the new directory
-    std::fs::create_dir_all(&new_path)?;
-    Ok(new_path)
+    let path = home.join(HOME_DIR);
+    std::fs::create_dir_all(&path)?;
+    Ok(path)
 }
 
 /// Get the orch state directory path (~/.orch/state/).
@@ -161,11 +114,10 @@ mod tests {
         let home = temp.path().join("home");
         std::fs::create_dir(&home).unwrap();
 
-        // Temporarily override home dir
-        let new_path = home.join(NEW_DIR);
-        std::fs::create_dir_all(&new_path).unwrap();
+        let orch_path = home.join(HOME_DIR);
+        std::fs::create_dir_all(&orch_path).unwrap();
 
-        assert!(new_path.exists());
+        assert!(orch_path.exists());
     }
 
     #[test]
@@ -174,7 +126,7 @@ mod tests {
         let home = temp.path().join("home");
         std::fs::create_dir(&home).unwrap();
 
-        let state = home.join(NEW_DIR).join("state");
+        let state = home.join(HOME_DIR).join("state");
         std::fs::create_dir_all(&state).unwrap();
 
         assert!(state.exists());

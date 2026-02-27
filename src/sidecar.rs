@@ -4,8 +4,8 @@
 //! runtime metadata (model, prompt hash, timing, token counts, etc.).
 //! This is the authoritative source for data that doesn't belong in GitHub labels.
 //!
-//! State directory: `~/.orchestrator/state/`
-//! Legacy fallback: `~/.orchestrator/.orchestrator/` (read-only)
+//! State directory: `~/.orch/state/`
+//! Legacy fallback: `~/.orchestrator/state/` (read-only)
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};

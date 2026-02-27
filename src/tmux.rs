@@ -23,7 +23,7 @@ pub struct Session {
 
 /// Manage tmux sessions for agent tasks.
 pub struct TmuxManager {
-    /// Prefix for session names
+    /// Prefix for session names (e.g. "orch-")
     prefix: String,
 }
 
@@ -34,9 +34,17 @@ impl TmuxManager {
         }
     }
 
-    /// Session name for a task.
-    pub fn session_name(&self, task_id: &str) -> String {
-        format!("{}{task_id}", self.prefix)
+    /// Session name for a task: `orch-{project}-{task_id}`.
+    ///
+    /// The project name is derived from the repo slug (e.g. `owner/repo` → `repo`).
+    /// This prevents collisions between projects with the same issue number.
+    pub fn session_name(&self, project: &str, task_id: &str) -> String {
+        let project_name = project
+            .rsplit('/')
+            .next()
+            .unwrap_or(project)
+            .trim_end_matches(".git");
+        format!("{}{project_name}-{task_id}", self.prefix)
     }
 
     /// Check if tmux server is running.
@@ -57,11 +65,12 @@ impl TmuxManager {
     #[allow(dead_code)]
     pub async fn create_session(
         &self,
+        repo: &str,
         task_id: &str,
         working_dir: &str,
         command: &str,
     ) -> anyhow::Result<String> {
-        let name = self.session_name(task_id);
+        let name = self.session_name(repo, task_id);
 
         let output = Command::new("tmux")
             .args([
@@ -223,7 +232,13 @@ impl TmuxManager {
             let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() >= 2 && parts[0].starts_with(&self.prefix) {
                 let name = parts[0].to_string();
-                let task_id = name.strip_prefix(&self.prefix).unwrap_or("").to_string();
+                // Extract task_id: "orch-{project}-{id}" → last segment after final '-'
+                let after_prefix = name.strip_prefix(&self.prefix).unwrap_or("");
+                let task_id = after_prefix
+                    .rsplit('-')
+                    .next()
+                    .unwrap_or(after_prefix)
+                    .to_string();
                 let created_ts = parts[1].parse::<i64>().unwrap_or(0);
                 let pane_pid = parts.get(2).and_then(|p| p.parse().ok());
 

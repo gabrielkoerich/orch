@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 /// Buffer for tracking session output state.
 #[derive(Debug, Clone)]
 pub struct OutputBuffer {
-    /// The tmux session name (e.g., "orch-42")
+    /// The tmux session name (e.g., "orch-myproject-42")
     pub session: String,
     /// The task ID this session belongs to
     pub task_id: String,

@@ -43,7 +43,7 @@ graph TB
     subgraph "Task Execution — run_task.sh"
         ROUTE["route_task.sh<br/>LLM router"]
         RUN["run_task.sh<br/>agent orchestration"]
-        TMUX["tmux sessions<br/>orch-{id}"]
+        TMUX["tmux sessions<br/>orch-{project}-{id}"]
     end
 
     subgraph "Agent CLIs"
@@ -118,10 +118,10 @@ sequenceDiagram
         R->>GH: POST /issues/{id}/labels (status:in_progress)
         R->>GIT: git worktree add
         R->>PY: python3 render_template (prompt)
-        R->>T: tmux new-session -d -s orch-{id}
+        R->>T: tmux new-session -d -s orch-{project}-{id}
         T->>A: claude/codex/opencode
         loop Every 5 seconds
-            R->>T: tmux has-session -t orch-{id}?
+            R->>T: tmux has-session -t orch-{project}-{id}?
         end
         A-->>T: JSON response
         R->>PY: python3 normalize_json.py
@@ -236,8 +236,8 @@ graph TB
     end
 
     subgraph "tmux Sessions (unchanged)"
-        T1["orch-42 (claude)"]
-        T2["orch-43 (codex)"]
+        T1["orch-myproject-42 (claude)"]
+        T2["orch-myproject-43 (codex)"]
         T3["orch-main (chat)"]
     end
 
@@ -321,12 +321,12 @@ In v1, the tmux bridge changes this completely:
                        │
                        ▼
               ┌─────────────────┐
-              │  tmux:orch-42   │
+              │  tmux:orch-*-42 │
               │  (claude agent) │
               └─────────────────┘
 ```
 
-**v0 workaround:** You can already attach to any session with `TMUX= tmux attach-session -t orch-{id}` and interact directly — it's just not connected to external channels yet.
+**v0 workaround:** You can already attach to any session with `TMUX= tmux attach-session -t orch-{project}-{id}` and interact directly — it's just not connected to external channels yet.
 
 ---
 
@@ -746,6 +746,25 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Self-improvement loop (auto-create issues from metrics) — PR #120 merged
 - [x] Polling fallback for webhooks (health check, fallback mode) — PR #131 merged
 - [x] Updated default model map to current identifiers — PR #130 merged
+- [x] Auto-clone GitHub repos during `orch init` — PR #141 merged
+- [x] Separate `~/.orch/` from `~/.orchestrator/` (real directory, no symlink)
+- [x] Project-aware tmux session naming (`orch-{project}-{id}`)
+- [x] Simplified service management (pure `brew services` wrapper)
+- [x] Permission rules per-agent translation (PermissionRules → native CLI flags)
+
+### Phase 6: Remaining Gaps
+
+**Goal:** Close remaining feature gaps with bash orchestrator.
+
+- [ ] `orch project add/remove/list` — multi-project management CLI
+- [ ] Wire Telegram/Discord channels into engine event loop
+- [ ] Mention detection via webhooks (#112)
+- [ ] Owner commands (feedback via issue comments: `/retry`, `/reroute`)
+- [ ] Merge detection (auto-close after PR merge)
+- [ ] Dashboard/reporting CLI command
+- [ ] Graceful shutdown with session handoff
+- [ ] Slack channel integration
+- [ ] Context file per issue (persistent context accumulation)
 
 ---
 
@@ -808,7 +827,7 @@ src/
 ├── template.rs              # Template rendering (env var substitution)
 ├── tmux.rs                  # TmuxManager (session create/kill/list/capture)
 ├── security.rs              # Secret scanning + redaction
-├── home.rs                  # Home directory resolution (~/.orch/ with ~/.orchestrator/ compat)
+├── home.rs                  # Home directory resolution (~/.orch/)
 └── cron.rs                  # Native cron expression matching
 ```
 
@@ -927,8 +946,8 @@ Telegram msg: "add a login page with OAuth"
   → Engine.create_task(title, body, type=github)
   → GitHub Issues API: POST /repos/owner/repo/issues
   → Engine.route_task() → agent=claude, complexity=medium
-  → Engine.run_with_context() → Rust runner (worktree → agent → tmux session orch-42)
-  → Transport.bind("42", "orch-42", "telegram", chat_id)
+  → Engine.run_with_context() → Rust runner (worktree → agent → tmux session orch-myproject-42)
+  → Transport.bind("42", "orch-myproject-42", "telegram", chat_id)
   → tmux bridge captures output → Transport.push_output()
   → Telegram channel streams output to chat
   → Agent finishes → runner posts result comment → all channels notified
@@ -940,8 +959,8 @@ Telegram msg: "add a login page with OAuth"
 Discord msg in task thread: "use shadcn instead of material ui"
   → DiscordChannel receives IncomingMessage
   → Transport.route() → MessageRoute::TaskSession { task_id: "42" }
-  → Transport.tmux_session_for("42") → "orch-42"
-  → tmux.send_keys("orch-42", "use shadcn instead of material ui\n")
+  → Transport.tmux_session_for("42") → "orch-myproject-42"
+  → tmux.send_keys("orch-myproject-42", "use shadcn instead of material ui\n")
   → Agent receives input, continues working
   → Output streams back to Discord thread
 ```
@@ -1036,7 +1055,7 @@ If a release has issues: `brew switch orch 0.x.y`. The binary is self-contained 
 | `ORCH_HOME` | `ORCH_HOME` (unchanged) |
 | `.orchestrator.yml` | `.orch.yml` (with backward compat) |
 
-The binary rename (`orch-core` → `orch`) is complete. Directory rename (`~/.orchestrator/` → `~/.orch/`) and config rename (`.orchestrator.yml` → `.orch.yml`) are in progress (Phase 5).
+All renames are complete. Binary (`orch-core` → `orch`), directory (`~/.orchestrator/` → `~/.orch/` as separate real directory), and config (`.orchestrator.yml` → `.orch.yml`) are all done. The two tools (`orchestrator` and `orch`) run fully independently with separate home dirs, tmux sessions, and config.
 
 ---
 
@@ -1142,18 +1161,42 @@ Note: `orch board` manages GitHub Projects V2 boards. `orch project` manages the
 
 ## Parity Audit — Feature Gaps
 
-Features identified in the bash `orchestrator` → Rust `orch` parity audit:
+Last updated: 2026-02-26 (276 tests, ~90% parity)
 
-| Feature | Status | Module |
-|---------|--------|--------|
-| GitHub Projects V2 integration | **Implemented** | `src/github/projects.rs` |
-| Per-task artifact folders | **Implemented** | `src/home.rs`, `src/engine/runner/` |
-| Per-repo state isolation | **Implemented** | `~/.orch/state/{owner}/{repo}/tasks/{id}/` |
-| Config architecture (multi-project) | **In Progress** | `src/config/mod.rs` |
-| `orch board list/link/sync/info` CLI | **Implemented** | `src/cli/mod.rs` |
-| Project board auto-sync on status change | **Implemented** | `src/backends/github.rs` |
-| Owner commands (feedback via issue comments) | Planned | — |
-| Context file per issue | Planned | — |
+### Completed
+
+| Feature | Module | PR |
+|---------|--------|----|
+| GitHub Projects V2 integration | `src/github/projects.rs` | — |
+| Per-task artifact folders (per-repo, per-attempt) | `src/home.rs`, `src/engine/runner/` | — |
+| Per-repo state isolation | `~/.orch/state/{owner}/{repo}/tasks/{id}/` | — |
+| Config architecture (multi-project) | `src/config/mod.rs` | PR #82, #78 |
+| `orch board list/link/sync/info` CLI | `src/cli/mod.rs` | — |
+| Project board auto-sync on status change | `src/backends/github.rs` | — |
+| Auto-clone repos during `orch init` | `src/cli/mod.rs` | PR #141 |
+| Separate `~/.orch/` from `~/.orchestrator/` | `src/home.rs` | — |
+| Project-aware tmux naming (`orch-{project}-{id}`) | `src/tmux.rs`, `src/engine/mod.rs` | — |
+| Simplified service management (brew wrapper) | `src/cli/service.rs` | — |
+| Permission rules per-agent translation | `src/engine/runner/agents/` | — |
+| PR review integration | `src/engine/mod.rs` | PR #125 |
+| Agent memory across retries | `src/sidecar.rs` | PR #122 |
+| Self-improvement loop | `src/engine/jobs.rs` | PR #120 |
+| Polling fallback for webhooks | `src/channels/github.rs` | PR #131 |
+
+### Remaining Gaps
+
+| Feature | Status | Priority |
+|---------|--------|----------|
+| `orch project add/remove/list` CLI | Scaffolded | Medium |
+| Wire Telegram/Discord into engine loop | Scaffolded (types + stubs exist) | Medium |
+| Mention detection via webhooks | Polling works, webhook path missing (#112) | Medium |
+| Owner commands (issue comment commands) | Planned | Medium |
+| Merge detection (auto-close after PR merge) | Missing | Medium |
+| Child task delegation (auto-spawn subtasks) | DB ready, no engine logic | Low |
+| Dashboard/reporting CLI | Missing | Low |
+| Graceful shutdown with session handoff | Partial | Low |
+| Slack channel integration | Missing | Low |
+| Context file per issue | Planned | Low |
 
 ### Config Architecture
 

@@ -508,6 +508,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     if let Err(e) = tick(
                         &engine.backend,
                         &tmux,
+                        &engine.repo,
                         &engine.runner,
                         &capture_for_tick,
                         &semaphore,
@@ -573,6 +574,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     if let Err(e) = tick(
                         &engine.backend,
                         &tmux,
+                        &engine.repo,
                         &engine.runner,
                         &capture_for_tick,
                         &semaphore,
@@ -677,6 +679,7 @@ pub async fn serve() -> anyhow::Result<()> {
 async fn tick(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
+    repo: &str,
     runner: &Arc<TaskRunner>,
     capture: &Arc<CaptureService>,
     semaphore: &Arc<Semaphore>,
@@ -700,7 +703,7 @@ async fn tick(
             capture.unregister_session(task_id).await;
             // The runner handles status updates and GitHub comment posting.
             // We just clean up the session.
-            let session_name = tmux.session_name(task_id);
+            let session_name = tmux.session_name(repo, task_id);
             if let Err(e) = tmux.kill_session(&session_name).await {
                 tracing::debug!(
                     task_id,
@@ -718,7 +721,7 @@ async fn tick(
         .list_external_by_status(Status::InProgress)
         .await?;
     for task in &in_progress {
-        let session_name = tmux.session_name(&task.id.0);
+        let session_name = tmux.session_name(repo, &task.id.0);
         let has_session = tmux.session_exists(&session_name).await;
 
         if !has_session {
@@ -825,7 +828,7 @@ async fn tick(
 
     for task in dispatchable {
         // Check if already running (has active session)
-        let session_name = tmux.session_name(&task.id.0);
+        let session_name = tmux.session_name(repo, &task.id.0);
         if tmux.session_exists(&session_name).await {
             continue;
         }
@@ -848,7 +851,7 @@ async fn tick(
         }
 
         // Register session for capture
-        let session_name = tmux.session_name(&task_id);
+        let session_name = tmux.session_name(repo, &task_id);
         capture.register_session(&task_id, &session_name).await;
 
         // Dispatch task

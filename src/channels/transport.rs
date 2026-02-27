@@ -37,7 +37,7 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 pub struct SessionBinding {
     /// The task ID (issue number)
     pub task_id: String,
-    /// tmux session name (e.g. "orch-42")
+    /// tmux session name (e.g. "orch-myproject-42")
     pub tmux_session: String,
     /// Channel threads connected to this session.
     /// Key: "channel:thread_id" (e.g. "telegram:12345", "github:42")
@@ -246,7 +246,9 @@ mod tests {
     #[tokio::test]
     async fn bind_and_route_to_session() {
         let transport = Transport::new();
-        transport.bind("42", "orch-42", "telegram", "12345").await;
+        transport
+            .bind("42", "orch-myproject-42", "telegram", "12345")
+            .await;
 
         let msg = IncomingMessage {
             channel: "telegram".to_string(),

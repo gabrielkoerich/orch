@@ -205,9 +205,10 @@ async fn capture_loop(transport: Arc<crate::channels::transport::Transport>) -> 
         };
 
         for session_name in sessions_to_capture {
-            // Extract task_id from session name (e.g., "orch-42" -> "42")
+            // Extract task_id from session name (e.g., "orch-myproject-42" -> "42")
             let task_id = session_name
                 .strip_prefix("orch-")
+                .and_then(|s| s.rsplit('-').next())
                 .unwrap_or(&session_name)
                 .to_string();
 

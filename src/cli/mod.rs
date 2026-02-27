@@ -259,7 +259,9 @@ pub async fn metrics() -> anyhow::Result<()> {
 pub async fn stream_task(task_id: &str) -> anyhow::Result<()> {
     let transport = Arc::new(Transport::new());
 
-    let session_name = format!("orch-{}", task_id);
+    let tmux = crate::tmux::TmuxManager::new();
+    let repo = crate::config::get_current_repo().unwrap_or_default();
+    let session_name = tmux.session_name(&repo, task_id);
     transport
         .bind(task_id, &session_name, "cli", "stream")
         .await;

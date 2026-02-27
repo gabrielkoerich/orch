@@ -150,7 +150,12 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
 
     let command = format!("bash {}", script_path.display());
     let session = tmux
-        .create_session(&inv.task_id, &inv.work_dir.to_string_lossy(), &command)
+        .create_session(
+            &inv.repo,
+            &inv.task_id,
+            &inv.work_dir.to_string_lossy(),
+            &command,
+        )
         .await?;
 
     tracing::info!(
