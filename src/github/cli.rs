@@ -126,7 +126,14 @@ impl GhCli {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
-        Ok(serde_json::from_slice(&output.stdout)?)
+        // --jq '.[]' produces newline-delimited JSON objects (NDJSON)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let items: Vec<GitHubIssue> = stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(items)
     }
 
     /// Add labels to an issue (appends to existing labels).
@@ -349,7 +356,14 @@ impl GhCli {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
-        Ok(serde_json::from_slice(&output.stdout)?)
+        // --jq '.[]' produces newline-delimited JSON objects (NDJSON)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let items: Vec<Comment> = stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(items)
     }
 
     /// Get the current authenticated username.
@@ -496,9 +510,20 @@ impl GhCli {
         let mut all_numbers: Vec<u64> = Vec::new();
         let mut cursor: Option<String> = None;
         let page_size = 100;
+        let max_pages = 50;
+        let mut page_count = 0;
 
         // GraphQL query to get sub-issues with pagination cursor
         loop {
+            page_count += 1;
+            if page_count > max_pages {
+                tracing::warn!(
+                    repo,
+                    number,
+                    "get_sub_issues hit max page limit ({max_pages})"
+                );
+                break;
+            }
             let query = if let Some(ref after_cursor) = cursor {
                 format!(
                     r#"{{
