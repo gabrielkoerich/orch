@@ -190,6 +190,34 @@ pub async fn build_git_diff(project_dir: &Path, default_branch: &str) -> String 
     }
 }
 
+/// Build git log from base branch to HEAD.
+/// Shows commit history for the feature branch.
+pub async fn build_git_log(project_dir: &Path, default_branch: &str) -> String {
+    let output = Command::new("git")
+        .args(["log", "--oneline", &format!("{}..HEAD", default_branch)])
+        .current_dir(project_dir)
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let log = String::from_utf8_lossy(&o.stdout);
+            // Cap log at 100 lines to avoid blowing up context
+            let lines: Vec<&str> = log.lines().take(100).collect();
+            if log.lines().count() > 100 {
+                format!(
+                    "{}\n... (truncated, {} total commits)",
+                    lines.join("\n"),
+                    log.lines().count()
+                )
+            } else {
+                lines.join("\n")
+            }
+        }
+        _ => String::new(),
+    }
+}
+
 /// Fetch recent issue comments for agent context.
 #[allow(dead_code)]
 pub async fn fetch_issue_comments(

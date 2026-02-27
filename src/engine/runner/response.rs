@@ -653,6 +653,57 @@ pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: 
     chain
 }
 
+/// Review response from the review agent.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ReviewResponse {
+    /// Decision: "approve" | "request_changes"
+    pub decision: String,
+    /// Detailed review feedback.
+    pub notes: String,
+    /// Test results: "pass" | "fail" | "skipped"
+    pub test_results: Option<String>,
+    /// List of issues found.
+    pub issues: Vec<ReviewIssue>,
+}
+
+/// A single issue found during review.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct ReviewIssue {
+    /// File path.
+    pub file: String,
+    /// Line number (optional).
+    pub line: Option<u32>,
+    /// Severity: "error" | "warning"
+    pub severity: String,
+    /// Description of the issue.
+    pub description: String,
+}
+
+/// Parse a review response from JSON.
+pub fn parse_review_response(raw: &str) -> anyhow::Result<ReviewResponse> {
+    // Try direct JSON parse first
+    if let Ok(resp) = serde_json::from_str::<ReviewResponse>(raw) {
+        return Ok(resp);
+    }
+
+    // Try extracting JSON from markdown code blocks
+    if let Some(json_str) = extract_json_block(raw) {
+        if let Ok(resp) = serde_json::from_str::<ReviewResponse>(&json_str) {
+            return Ok(resp);
+        }
+    }
+
+    anyhow::bail!("failed to parse review response")
+}
+
+/// Extract the first JSON code block from markdown.
+fn extract_json_block(text: &str) -> Option<String> {
+    let start = text.find("```json")?;
+    let content_start = text[start..].find('\n')? + start + 1;
+    let end = text[content_start..].find("```")? + content_start;
+    Some(text[content_start..end].to_string())
+}
+
 /// Extract learnings and store as memory for future attempts.
 pub fn store_learnings_from_response(
     task_id: &str,
