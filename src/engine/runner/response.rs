@@ -377,6 +377,7 @@ fn record_failure_with_reason(key: &str, reason: &str) {
     // fs2 provides a simple cross-platform lock via File::try_lock_exclusive().
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)
