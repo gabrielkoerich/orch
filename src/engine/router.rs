@@ -724,7 +724,12 @@ impl Router {
     }
 
     /// Route using round-robin algorithm (task-ID based, stateless).
-    /// Kept for backward compatibility; prefer `route_round_robin_stateful`.
+    ///
+    /// Kept for backward compatibility and unit tests. The project prefers
+    /// the stateful `route_round_robin_stateful` (which persists an index),
+    /// but this stateless modulo-based implementation is intentionally
+    /// retained to allow deterministic selection based on task ID and for
+    /// existing tests that exercise the legacy behavior.
     #[allow(dead_code)]
     fn route_round_robin(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         let agents = &self.available_agents;
@@ -1284,6 +1289,9 @@ impl Router {
     }
 
     /// Get a snapshot of current agent weights for logging.
+    ///
+    /// Public helper kept for debugging and observability (useful when
+    /// inspecting router state from integration tests or admin tooling).
     #[allow(dead_code)]
     pub fn weight_snapshot(&self) -> Vec<(String, f64, u32)> {
         self.weights.snapshot()
@@ -1305,6 +1313,8 @@ impl Router {
 
     /// Route multiple tasks concurrently using FuturesUnordered.
     /// Returns results in completion order (not input order).
+    ///
+    /// Retained as a convenience for batch-processing callers and tests.
     #[allow(dead_code)]
     pub async fn route_batch(
         self: &Arc<Self>,
