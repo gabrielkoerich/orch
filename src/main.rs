@@ -25,8 +25,8 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand)]
-enum Commands {
+    #[derive(Subcommand)]
+    enum Commands {
     /// Start the orchestrator service
     Serve,
     /// Show version information
@@ -97,6 +97,8 @@ enum Commands {
     },
     /// Show task metrics summary
     Metrics,
+    /// Combined dashboard: tasks, sessions, recent activity
+    Dashboard,
     /// GitHub Projects V2 board management
     Board {
         #[command(subcommand)]

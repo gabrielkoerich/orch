@@ -1,6 +1,6 @@
 use crate::backends::Status;
-use crate::cli::init_task_manager;
 use crate::config;
+use anyhow::Context;
 use crate::tmux::TmuxManager;
 use crate::sidecar;
 use chrono::{DateTime, Duration, Utc};
@@ -11,7 +11,7 @@ pub async fn dashboard() -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
 
-    let repo = config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
+    let repo = config::get_current_repo().with_context(|| "'repo' not set — ensure .orch.yml has gh.repo")?;
     let backend: Box<dyn ExternalBackend> = Box::new(GitHubBackend::new(repo.clone()));
 
     let statuses = [
