@@ -84,11 +84,41 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
         println!("Project already registered in global config");
     }
 
+    // Install orch-review workflow
+    install_review_workflow(&cwd)?;
+
     // Guidance for board setup
     println!();
     println!("Next steps:");
     println!("  orch board list     — find GitHub Projects V2 boards");
     println!("  orch board link <id> — link a board for status tracking");
+
+    Ok(())
+}
+
+/// The orch review gate workflow template, loaded from the repo's own workflow file.
+/// Installed by `orch init` into `.github/workflows/orch-review.yml`.
+const ORCH_REVIEW_WORKFLOW: &str = include_str!("../../.github/workflows/orch-review.yml");
+
+/// Install the orch review gate workflow into the project.
+fn install_review_workflow(project_dir: &std::path::Path) -> anyhow::Result<()> {
+    let workflows_dir = project_dir.join(".github").join("workflows");
+    let workflow_path = workflows_dir.join("orch-review.yml");
+
+    if workflow_path.exists() {
+        println!(
+            "Review workflow already exists: {}",
+            workflow_path.display()
+        );
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&workflows_dir)?;
+    std::fs::write(&workflow_path, ORCH_REVIEW_WORKFLOW)?;
+    println!(
+        "Installed review gate workflow: {}",
+        workflow_path.display()
+    );
 
     Ok(())
 }

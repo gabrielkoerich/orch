@@ -918,11 +918,11 @@ async fn tick(
                         summary: summary.clone(),
                     });
 
-                    // Trigger review agent if task is done
+                    // Trigger review agent if task is done (enabled by default)
                     if status == "done" {
                         let enable_review = config::get("workflow.enable_review_agent")
-                            .map(|v| v == "true")
-                            .unwrap_or(false);
+                            .map(|v| v != "false")
+                            .unwrap_or(true);
                         // Guard against duplicate review spawns
                         let already_reviewing = sidecar::get(&task_id, "review_started")
                             .map(|v| v == "true")
@@ -1571,12 +1571,23 @@ async fn review_open_prs(
         let all_approved =
             !deduped_reviews.is_empty() && deduped_reviews.values().all(|r| r.state == "APPROVED");
 
-        // Handle fully-approved PRs
-        if all_approved && auto_close_task {
+        // Also check automated review comments on the PR (comment-based review workflow).
+        // This is the primary review mechanism since GitHub doesn't allow reviewing your own PRs.
+        let automated_review = gh
+            .get_automated_review_status(repo, pr_number)
+            .await
+            .unwrap_or(None);
+
+        let comment_approved = automated_review.as_deref() == Some("approve");
+        let comment_changes_requested = automated_review.as_deref() == Some("changes_requested");
+
+        // Handle fully-approved PRs (either via PR review API or comment-based review)
+        if (all_approved || comment_approved) && auto_close_task && !comment_changes_requested {
             tracing::info!(
                 task_id,
                 pr_number,
-                "PR approved by all reviewers, closing task (marking as done)"
+                comment_approved,
+                "PR approved, closing task (marking as done)"
             );
             if let Err(e) = backend.update_status(&task.id, Status::Done).await {
                 tracing::warn!(task_id, err = %e, "failed to update task status to done");
@@ -1584,8 +1595,8 @@ async fn review_open_prs(
             continue;
         }
 
-        // Process reviews that request changes
-        if !any_changes_requested {
+        // Process reviews that request changes (from either PR review API or comments)
+        if !any_changes_requested && !comment_changes_requested {
             continue;
         }
 
@@ -1652,6 +1663,38 @@ async fn review_open_prs(
                     }
 
                     review_context.push_str(&format!("> {}\n\n", comment.body));
+                }
+            }
+        }
+
+        // Also include comment-based review feedback (from "Automated Review — Changes Requested" comments)
+        if comment_changes_requested && review_context.is_empty() {
+            // The PR review API had no changes, but the comment-based review does.
+            // Fetch the latest "Automated Review — Changes Requested" comment body.
+            let last_comment_ts =
+                sidecar::get(task_id, "last_comment_review_ts").unwrap_or_default();
+            if let Ok(comments) = gh.list_comments(repo, &pr_number.to_string()).await {
+                for c in comments.iter().rev() {
+                    if c.body
+                        .starts_with("## Automated Review — Changes Requested")
+                    {
+                        // Skip if already processed
+                        if !last_comment_ts.is_empty() && c.created_at <= last_comment_ts {
+                            break;
+                        }
+                        // Extract the review body (skip the header line)
+                        let body: String = c.body.lines().skip(1).collect::<Vec<_>>().join("\n");
+                        review_context.push_str("### Automated Review (Changes Requested)\n\n");
+                        review_context.push_str(&body);
+                        review_context.push('\n');
+
+                        // Track the timestamp
+                        let _ = sidecar::set(
+                            task_id,
+                            &[format!("last_comment_review_ts={}", c.created_at)],
+                        );
+                        break; // Only the latest
+                    }
                 }
             }
         }
@@ -1847,7 +1890,10 @@ async fn review_and_merge(
         }
     };
 
-    // 10. Convert to ReviewDecision
+    // 10. Build automated review comment for the PR (before moving fields)
+    let review_notes_for_comment = review_response.notes.clone();
+
+    // 11. Convert to ReviewDecision
     let decision = match review_response.decision.as_str() {
         "approve" => ReviewDecision::Approve,
         "request_changes" => ReviewDecision::RequestChanges {
@@ -1863,7 +1909,56 @@ async fn review_and_merge(
         "review agent decision received"
     );
 
-    // 11. Handle the decision
+    // 12. Post automated review comment on the PR
+    let gh = GhCli::new();
+    let pr_number = gh.get_pr_number(repo, &branch_name).await.ok().flatten();
+
+    if let Some(pr_num) = pr_number {
+        let pr_comment = match &decision {
+            ReviewDecision::Approve => {
+                format!(
+                    "## Automated Review \u{2014} Approve\n\n{}",
+                    review_notes_for_comment
+                )
+            }
+            ReviewDecision::RequestChanges { notes, issues } => {
+                let mut body = format!(
+                    "## Automated Review \u{2014} Changes Requested\n\n{}\n",
+                    notes
+                );
+                if !issues.is_empty() {
+                    body.push_str("\n**Issues Found:**\n");
+                    for issue in issues {
+                        body.push_str(&format!(
+                            "- `{}` line {}: {} [{}]\n",
+                            issue.file,
+                            issue
+                                .line
+                                .map(|l| l.to_string())
+                                .unwrap_or_else(|| "?".to_string()),
+                            issue.description,
+                            issue.severity
+                        ));
+                    }
+                }
+                body
+            }
+            _ => String::new(),
+        };
+
+        if !pr_comment.is_empty() {
+            if let Err(e) = gh.add_comment(repo, &pr_num.to_string(), &pr_comment).await {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    pr_number = pr_num,
+                    error = %e,
+                    "failed to post automated review comment on PR"
+                );
+            }
+        }
+    }
+
+    // 12. Handle the decision
     match decision {
         ReviewDecision::Approve => {
             let auto_merge = config::get("workflow.auto_merge")
@@ -1890,6 +1985,10 @@ async fn review_and_merge(
 }
 
 /// Auto-merge a PR after review approval.
+///
+/// Checks that the automated review comment says "approve" and that CI checks
+/// are green before merging. If the review gate workflow failed, re-triggers it
+/// and polls until CI passes (up to a timeout).
 async fn auto_merge_pr(
     task: &ExternalTask,
     branch: &str,
@@ -1905,6 +2004,95 @@ async fn auto_merge_pr(
         }
     };
 
+    // 2. Verify the automated review comment says "approve"
+    let review_status = gh.get_automated_review_status(repo, pr_number).await?;
+    match review_status.as_deref() {
+        Some("approve") => {
+            tracing::info!(task_id = task.id.0, pr_number, "automated review approved");
+        }
+        Some("changes_requested") => {
+            tracing::warn!(
+                task_id = task.id.0,
+                pr_number,
+                "automated review says changes_requested — skipping merge"
+            );
+            return Ok(());
+        }
+        _ => {
+            tracing::info!(
+                task_id = task.id.0,
+                pr_number,
+                "no automated review comment found — proceeding with merge"
+            );
+        }
+    }
+
+    // 3. Re-trigger the review gate workflow so it picks up the approve comment
+    if let Err(e) = gh.dispatch_workflow(repo, "orch-review.yml", branch).await {
+        tracing::debug!(
+            task_id = task.id.0,
+            error = %e,
+            "failed to dispatch orch-review workflow (may not exist yet)"
+        );
+    }
+
+    // 4. Wait for CI checks to pass (poll up to 5 minutes)
+    let max_wait = std::time::Duration::from_secs(300);
+    let poll_interval = std::time::Duration::from_secs(15);
+    let start = std::time::Instant::now();
+
+    loop {
+        let (state, total, passing, failing, pending) =
+            gh.get_combined_status(repo, branch).await?;
+
+        tracing::info!(
+            task_id = task.id.0,
+            pr_number,
+            state = %state,
+            total,
+            passing,
+            failing,
+            pending,
+            "CI status check"
+        );
+
+        match state.as_str() {
+            "success" => break,
+            "failure" => {
+                // If there are failed runs, try re-running them once
+                if start.elapsed() < std::time::Duration::from_secs(30) {
+                    if let Ok(Some((run_id, _, _))) =
+                        gh.get_latest_run_for_branch(repo, branch).await
+                    {
+                        let _ = gh.rerun_failed_jobs(repo, run_id).await;
+                        tracing::info!(task_id = task.id.0, run_id, "re-triggered failed CI jobs");
+                    }
+                }
+
+                if start.elapsed() >= max_wait {
+                    tracing::warn!(task_id = task.id.0, "CI checks still failing after timeout");
+                    backend
+                        .post_comment(
+                            &task.id,
+                            "⚠️ Auto-merge: CI checks are failing. PR is approved but cannot be merged until CI passes.",
+                        )
+                        .await?;
+                    backend.update_status(&task.id, Status::NeedsReview).await?;
+                    return Ok(());
+                }
+            }
+            _ => {
+                // pending
+                if start.elapsed() >= max_wait {
+                    tracing::warn!(task_id = task.id.0, "CI checks still pending after timeout");
+                    break; // Try to merge anyway — checks might not be required
+                }
+            }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+
     tracing::info!(
         task_id = task.id.0,
         pr_number,
@@ -1912,7 +2100,7 @@ async fn auto_merge_pr(
         "merging PR"
     );
 
-    // 2. Merge via gh CLI
+    // 5. Merge via gh CLI
     if let Err(e) = gh.merge_pr(repo, pr_number, true).await {
         // Merge failed (conflicts, branch protection, etc.)
         tracing::error!(task_id = task.id.0, error = %e, "merge failed");
@@ -1923,10 +2111,10 @@ async fn auto_merge_pr(
         return Err(e);
     }
 
-    // 3. Update status to done
+    // 6. Update status to done
     backend.update_status(&task.id, Status::Done).await?;
 
-    // 4. Close issue if auto_close enabled
+    // 7. Close issue if auto_close enabled
     let auto_close = config::get("workflow.auto_close")
         .map(|v| v == "true")
         .unwrap_or(true);
@@ -1937,10 +2125,10 @@ async fn auto_merge_pr(
         }
     }
 
-    // 5. Mark worktree for cleanup
+    // 8. Mark worktree for cleanup
     let _ = sidecar::set(&task.id.0, &["worktree_cleaned=false".to_string()]);
 
-    // 6. Post final comment
+    // 9. Post final comment on task issue
     backend
         .post_comment(&task.id, "✅ PR reviewed, approved, and merged.")
         .await?;
