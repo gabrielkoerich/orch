@@ -44,14 +44,25 @@ impl std::fmt::Display for OwnerCommand {
 /// Parse a slash command from a comment body.
 ///
 /// Scans each line for a `/command` at the start. Returns the first valid
-/// command found. Unknown `/something` lines are skipped.
+/// command found. Unknown `/something` lines are skipped. Lines inside
+/// markdown fenced code blocks (``` or ~~~) are ignored to prevent
+/// accidental command execution from code examples.
 pub fn parse_command(body: &str) -> Option<OwnerCommand> {
+    let mut in_code_fence = false;
     for line in body.lines() {
-        let line = line.trim();
-        if !line.starts_with('/') {
+        let trimmed = line.trim();
+        // Toggle code fence state on ``` or ~~~ boundaries
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_fence = !in_code_fence;
             continue;
         }
-        let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
+        if in_code_fence {
+            continue;
+        }
+        if !trimmed.starts_with('/') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
         let cmd = parts[0];
         let args = parts
             .get(1)
@@ -150,6 +161,30 @@ pub async fn scan_commands(
                 continue;
             }
         };
+
+        // Only execute commands on open issues/PRs to prevent acting on
+        // closed/merged issues (e.g. review comments with code examples).
+        match gh.get_issue(repo, &issue_number).await {
+            Ok(issue) if issue.state == "open" => {}
+            Ok(issue) => {
+                tracing::debug!(
+                    issue = %issue_number,
+                    state = %issue.state,
+                    command = %command,
+                    "ignoring slash command on non-open issue"
+                );
+                new_processed.push(mention.id.clone());
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    issue = %issue_number,
+                    err = %e,
+                    "failed to check issue state, skipping command"
+                );
+                continue;
+            }
+        }
 
         // Validate author is repo owner or collaborator
         match gh.is_collaborator(repo, &mention.author).await {
@@ -406,6 +441,30 @@ mod tests {
     #[test]
     fn extract_issue_number_empty_url() {
         assert_eq!(extract_issue_number(""), None);
+    }
+
+    #[test]
+    fn parse_ignores_command_in_code_fence() {
+        let body = "Some context\n```\n/retry\n```\nMore text";
+        assert_eq!(parse_command(body), None);
+    }
+
+    #[test]
+    fn parse_ignores_command_in_tilde_fence() {
+        let body = "Some context\n~~~\n/close\n~~~\nMore text";
+        assert_eq!(parse_command(body), None);
+    }
+
+    #[test]
+    fn parse_finds_command_after_code_fence() {
+        let body = "```\n/retry\n```\n/close";
+        assert_eq!(parse_command(body), Some(OwnerCommand::Close));
+    }
+
+    #[test]
+    fn parse_ignores_command_in_code_fence_with_lang() {
+        let body = "```markdown\n/retry\n```";
+        assert_eq!(parse_command(body), None);
     }
 
     #[test]
