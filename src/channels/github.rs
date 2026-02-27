@@ -267,7 +267,7 @@ impl Channel for GitHubChannel {
                 }
             }
 
-                if last_post.elapsed() >= post_interval && !buffer.is_empty() {
+            if last_post.elapsed() >= post_interval && !buffer.is_empty() {
                 let _ = self.post_comment(issue_number, &buffer).await;
                 buffer.clear();
                 last_post = std::time::Instant::now();
@@ -279,7 +279,7 @@ impl Channel for GitHubChannel {
 
     async fn health_check(&self) -> anyhow::Result<()> {
         let output = tokio::process::Command::new("gh")
-            .args(["auth", "status"]) 
+            .args(["auth", "status"])
             .output()
             .await?;
 

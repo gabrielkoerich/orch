@@ -2,6 +2,7 @@ mod backends;
 #[allow(dead_code)] // channels are scaffolding — not wired into engine yet
 mod channels;
 mod cli;
+mod cmd_cache;
 mod config;
 mod cron;
 mod db;
@@ -9,7 +10,6 @@ mod engine;
 mod github;
 mod home;
 mod parser;
-mod cmd_cache;
 #[allow(dead_code)] // security module ready for use, not integrated yet
 pub mod security;
 mod sidecar;

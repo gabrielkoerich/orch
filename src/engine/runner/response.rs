@@ -381,12 +381,12 @@ fn record_failure_with_reason(key: &str, reason: &str) {
         .write(true)
         .open(&path)
     {
-        if f.try_lock_exclusive().is_ok() {
+        // Use blocking lock to avoid race conditions (try_lock + fallback is unsafe)
+        if f.lock_exclusive().is_ok() {
             let mut cooldowns = serde_json::Map::new();
             // Read existing content
             let mut content = String::new();
-            if let Ok(_) = std::io::Read::read_to_string(&mut &f, &mut content) {}
-            if !content.is_empty() {
+            if f.read_to_string(&mut content).is_ok() && !content.is_empty() {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
                     if let Some(map) = v.as_object() {
                         cooldowns = map.clone();
@@ -411,17 +411,7 @@ fn record_failure_with_reason(key: &str, reason: &str) {
 
             let _ = f.unlock();
         } else {
-            // Couldn't lock — best-effort fallback (serialize without lock).
-            let mut cooldowns = read_cooldowns_file();
-            let timestamp = chrono::Utc::now().timestamp();
-            cooldowns.insert(
-                key.to_string(),
-                serde_json::json!({ "failed_at": timestamp, "reason": reason }),
-            );
-            if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns))
-            {
-                std::fs::write(&path, content).ok();
-            }
+            tracing::warn!("could not acquire lock on cooldowns file, skipping write");
         }
     } else {
         // Can't open file — write directly
@@ -450,56 +440,42 @@ pub fn clear_expired_cooldowns() {
         .write(true)
         .open(&path)
     {
-        if f.try_lock_exclusive().is_ok() {
+        // Use blocking lock to avoid race conditions
+        if f.lock_exclusive().is_ok() {
             let mut content = String::new();
-            if let Ok(_) = f.read_to_string(&mut content) {}
-            let mut cooldowns = if !content.is_empty() {
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&content)
-                    .unwrap_or_default()
-            } else {
-                serde_json::Map::new()
-            };
+            if f.read_to_string(&mut content).is_ok() {
+                let mut cooldowns = if !content.is_empty() {
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&content)
+                        .unwrap_or_default()
+                } else {
+                    serde_json::Map::new()
+                };
 
-            let now = chrono::Utc::now().timestamp();
-            let mut to_remove = Vec::new();
-            for (agent, entry) in &cooldowns {
-                if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
-                    if (now - failed_at) >= AGENT_COOLDOWN_SECS {
-                        to_remove.push(agent.clone());
+                let now = chrono::Utc::now().timestamp();
+                let mut to_remove = Vec::new();
+                for (agent, entry) in &cooldowns {
+                    if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
+                        if (now - failed_at) >= AGENT_COOLDOWN_SECS {
+                            to_remove.push(agent.clone());
+                        }
                     }
                 }
-            }
-            for agent in to_remove {
-                cooldowns.remove(&agent);
-            }
+                for agent in to_remove {
+                    cooldowns.remove(&agent);
+                }
 
-            if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns))
-            {
-                let _ = f.set_len(0);
-                let _ = f.rewind();
-                let _ = f.write_all(content.as_bytes());
+                if let Ok(content) =
+                    serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns))
+                {
+                    let _ = f.set_len(0);
+                    let _ = f.rewind();
+                    let _ = f.write_all(content.as_bytes());
+                }
             }
 
             let _ = f.unlock();
         } else {
-            // Lock unavailable; best-effort fallback
-            let mut cooldowns = read_cooldowns_file();
-            let now = chrono::Utc::now().timestamp();
-            let mut to_remove = Vec::new();
-            for (agent, entry) in &cooldowns {
-                if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
-                    if (now - failed_at) >= AGENT_COOLDOWN_SECS {
-                        to_remove.push(agent.clone());
-                    }
-                }
-            }
-            for agent in to_remove {
-                cooldowns.remove(&agent);
-            }
-            if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns))
-            {
-                std::fs::write(&path, content).ok();
-            }
+            tracing::warn!("could not acquire lock on cooldowns file, skipping cleanup");
         }
     }
 }

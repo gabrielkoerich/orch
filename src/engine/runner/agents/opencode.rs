@@ -329,18 +329,14 @@ fn discover_free_models() -> Vec<String> {
         "opencode/trinity-large-preview-free".to_string(),
     ];
 
-    // Try to discover dynamically
-    // Prefer to run the command via a blocking spawn in a separate thread to
-    // avoid stalling async runtime threads. Use std::process::Command inside
-    // spawn_blocking.
-    let stdout = match std::thread::spawn(|| {
-        std::process::Command::new("opencode")
-            .args(["models"])
-            .output()
-    })
-    .join()
+    // Try to discover dynamically using blocking I/O.
+    // Note: this function is sync; callers in async contexts should wrap with
+    // tokio::task::spawn_blocking() at the call site.
+    let stdout = match std::process::Command::new("opencode")
+        .args(["models"])
+        .output()
     {
-        Ok(Ok(output)) if output.status.success() => {
+        Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).to_string()
         }
         _ => return known,
