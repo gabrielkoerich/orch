@@ -153,15 +153,16 @@ pub async fn build_repo_tree(project_dir: &Path) -> String {
     match output {
         Ok(o) if o.status.success() => {
             let full = String::from_utf8_lossy(&o.stdout);
-            let lines: Vec<&str> = full.lines().take(200).collect();
-            let result = lines.join("\n");
-            if full.lines().count() > 200 {
+            let all_lines: Vec<&str> = full.lines().collect();
+            let total = all_lines.len();
+            if total > 200 {
                 format!(
-                    "{result}\n... (truncated, {} total files)",
-                    full.lines().count()
+                    "{}\n... (truncated, {} total files)",
+                    all_lines[..200].join("\n"),
+                    total
                 )
             } else {
-                result
+                all_lines.join("\n")
             }
         }
         _ => String::new(),
@@ -181,7 +182,12 @@ pub async fn build_git_diff(project_dir: &Path, default_branch: &str) -> String 
             let diff = String::from_utf8_lossy(&o.stdout);
             // Cap diff at 10000 chars to avoid blowing up context
             if diff.len() > 10000 {
-                format!("{}...\n(diff truncated at 10000 chars)", &diff[..10000])
+                // Find safe UTF-8 boundary
+                let mut boundary = 10000;
+                while !diff.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                format!("{}...\n(diff truncated at 10000 chars)", &diff[..boundary])
             } else {
                 diff.to_string()
             }
@@ -202,16 +208,16 @@ pub async fn build_git_log(project_dir: &Path, default_branch: &str) -> String {
     match output {
         Ok(o) if o.status.success() => {
             let log = String::from_utf8_lossy(&o.stdout);
-            // Cap log at 100 lines to avoid blowing up context
-            let lines: Vec<&str> = log.lines().take(100).collect();
-            if log.lines().count() > 100 {
+            let all_lines: Vec<&str> = log.lines().collect();
+            let total = all_lines.len();
+            if total > 100 {
                 format!(
                     "{}\n... (truncated, {} total commits)",
-                    lines.join("\n"),
-                    log.lines().count()
+                    all_lines[..100].join("\n"),
+                    total
                 )
             } else {
-                lines.join("\n")
+                all_lines.join("\n")
             }
         }
         _ => String::new(),
@@ -371,6 +377,19 @@ mod tests {
         let (context, memory) = build_memory_context("nonexistent-task-12345");
         assert!(context.is_empty());
         assert!(memory.is_empty());
+    }
+
+    #[test]
+    fn test_build_project_instructions_empty_dir() {
+        let dir = std::env::temp_dir().join("orch_test_nonexistent");
+        let instructions = build_project_instructions(&dir);
+        assert!(instructions.is_empty());
+    }
+
+    #[test]
+    fn test_build_skills_docs_empty() {
+        let docs = build_skills_docs(&[]);
+        assert!(docs.is_empty());
     }
 
     #[test]

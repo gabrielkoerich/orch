@@ -696,12 +696,27 @@ pub fn parse_review_response(raw: &str) -> anyhow::Result<ReviewResponse> {
     anyhow::bail!("failed to parse review response")
 }
 
-/// Extract the first JSON code block from markdown.
+/// Extract the first valid JSON object from markdown code blocks.
+///
+/// Searches for ```json blocks and returns the first one whose content
+/// starts with `{`, skipping non-JSON code blocks.
 fn extract_json_block(text: &str) -> Option<String> {
-    let start = text.find("```json")?;
-    let content_start = text[start..].find('\n')? + start + 1;
-    let end = text[content_start..].find("```")? + content_start;
-    Some(text[content_start..end].to_string())
+    let mut search_from = 0;
+    while let Some(start) = text[search_from..].find("```json") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "```json".len();
+        let newline_pos = text[after_tag..].find('\n')?;
+        let content_start = after_tag + newline_pos + 1;
+        let end = text[content_start..]
+            .find("```")
+            .map(|e| content_start + e)?;
+        let content = text[content_start..end].trim();
+        if content.starts_with('{') {
+            return Some(content.to_string());
+        }
+        search_from = end + 3;
+    }
+    None
 }
 
 /// Extract learnings and store as memory for future attempts.
@@ -864,5 +879,56 @@ mod tests {
         assert!(format!("{success:?}").contains("claude"));
         assert!(format!("{limited:?}").contains("codex"));
         assert!(format!("{none:?}").contains("None"));
+    }
+
+    #[test]
+    fn parse_review_response_direct_json() {
+        let json = r#"{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#;
+        let resp = parse_review_response(json).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert_eq!(resp.notes, "LGTM");
+        assert!(resp.issues.is_empty());
+    }
+
+    #[test]
+    fn parse_review_response_from_markdown() {
+        let md = r#"Here is my review:
+
+```json
+{"decision":"request_changes","notes":"Fix the bug","issues":[{"file":"src/main.rs","line":10,"severity":"error","description":"null deref"}]}
+```
+
+That's all."#;
+        let resp = parse_review_response(md).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+        assert_eq!(resp.issues.len(), 1);
+        assert_eq!(resp.issues[0].file, "src/main.rs");
+    }
+
+    #[test]
+    fn parse_review_response_invalid() {
+        let result = parse_review_response("not json at all");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_json_block_basic() {
+        let md = "text\n```json\n{\"key\": \"value\"}\n```\nmore";
+        let result = extract_json_block(md);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("\"key\""));
+    }
+
+    #[test]
+    fn extract_json_block_skips_non_json_blocks() {
+        let md = "```json\nnot-json-array\n```\n\n```json\n{\"real\": true}\n```";
+        let result = extract_json_block(md);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("\"real\""));
+    }
+
+    #[test]
+    fn extract_json_block_none_when_missing() {
+        assert!(extract_json_block("no code blocks here").is_none());
     }
 }
