@@ -402,7 +402,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Serve => {
-            tracing::info!("starting orch serve");
+            tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting orch serve");
             engine::serve().await?;
         }
         Commands::Version => {
