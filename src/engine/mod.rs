@@ -1321,13 +1321,14 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
     Ok(())
 }
 
-/// Review open PRs - parse review comments and create follow-up tasks.
+/// Review open PRs - re-dispatch agent to address review feedback.
 ///
-/// Lists tasks in review, fetches PR reviews, and creates follow-up tasks
-/// for each review comment that requests changes.
+/// Lists tasks in review, fetches PR reviews, and re-dispatches the agent
+/// when a reviewer requests changes. The review context is stored in the
+/// sidecar and injected into the agent prompt.
 async fn review_open_prs(
     backend: &Arc<dyn ExternalBackend>,
-    db: &Arc<Db>,
+    _db: &Arc<Db>,
     repo: &str,
     config: &EngineConfig,
 ) -> anyhow::Result<()> {
@@ -1339,7 +1340,6 @@ async fn review_open_prs(
     }
 
     // Check if we should process reviews
-    let auto_create_followup = config.auto_create_followup_on_changes;
     let auto_close_task = config.auto_close_task_on_approval;
 
     tracing::info!(
@@ -1357,13 +1357,6 @@ async fn review_open_prs(
             Ok(b) if !b.is_empty() => b,
             _ => continue,
         };
-
-        // Get the agent that created this PR (for routing follow-ups)
-        let original_agent = task
-            .labels
-            .iter()
-            .find(|l| l.starts_with("agent:"))
-            .map(|l| l.strip_prefix("agent:").unwrap_or(l).to_string());
 
         // Get PR number from branch
         let pr_number = match gh.get_pr_number(repo, &branch).await {
@@ -1383,8 +1376,8 @@ async fn review_open_prs(
             tracing::warn!(task_id, err = %e, "failed to store PR number in sidecar");
         }
 
-        // Check for existing review follow-up tasks for this PR
-        let existing_reviews = get_existing_review_tasks(db, task_id).await?;
+        // Get the last processed review timestamp to avoid re-processing the same reviews
+        let last_review_ts = sidecar::get(task_id, "last_review_ts").unwrap_or_default();
 
         // Fetch PR reviews
         let reviews = match gh.get_pr_reviews(repo, pr_number).await {
@@ -1448,8 +1441,6 @@ async fn review_open_prs(
             if let Err(e) = backend.update_status(&task.id, Status::Done).await {
                 tracing::warn!(task_id, err = %e, "failed to update task status to done");
             }
-            // Note: this only marks the task as Done; actual PR merge
-            // is left to GitHub branch-protection / manual action.
             continue;
         }
 
@@ -1458,26 +1449,28 @@ async fn review_open_prs(
             continue;
         }
 
-        if !auto_create_followup {
-            tracing::debug!(
-                task_id,
-                pr_number,
-                "auto_create_followup_on_changes is disabled, skipping"
-            );
-            continue;
-        }
+        // Build review context for re-dispatch
+        let mut review_context = String::new();
+        let mut latest_review_ts = last_review_ts.clone();
 
         // Only process the latest CHANGES_REQUESTED reviews (already deduplicated)
         for review in deduped_reviews
             .values()
             .filter(|r| r.state == "CHANGES_REQUESTED")
         {
+            // Track the latest review timestamp
+            if review.submitted_at > latest_review_ts {
+                latest_review_ts = review.submitted_at.clone();
+            }
+
+            // Skip if we've already processed this review
+            if !last_review_ts.is_empty() && review.submitted_at <= last_review_ts {
+                continue;
+            }
             // Get comments for this review
             let review_comments: Vec<GitHubReviewComment> = all_comments
                 .iter()
                 .filter(|c| {
-                    // Comments are associated with reviews via the review_id field
-                    // The GitHub API includes this in the response
                     c.user.login == review.user.login && c.created_at >= review.submitted_at
                 })
                 .cloned()
@@ -1488,196 +1481,75 @@ async fn review_open_prs(
                 comments: review_comments.clone(),
             };
 
-            // Process actionable comments
-            for comment in pr_review.actionable_comments() {
-                // Create a unique ID for this review comment
-                let review_comment_id = format!("review_comment_{}_{}", pr_number, comment.id);
+            // Add review info
+            review_context.push_str(&format!(
+                "### Review by @{} (CHANGES REQUESTED)\n",
+                pr_review.review.user.login
+            ));
 
-                // Skip if we already created a task for this comment
-                if existing_reviews.contains(&review_comment_id) {
-                    tracing::debug!(
-                        task_id,
-                        comment_id = comment.id,
-                        "review comment already has follow-up task"
-                    );
-                    continue;
+            // Add overall review body if present
+            if let Some(ref body) = pr_review.review.body {
+                if !body.trim().is_empty() {
+                    review_context.push_str(&format!("**Overall Feedback:** {}\n\n", body));
                 }
+            }
 
-                // Create follow-up task
-                if let Err(e) = create_review_follow_up_task(
-                    backend,
-                    db,
-                    task_id,
-                    &review_comment_id,
-                    &pr_review,
-                    comment,
-                    pr_number,
-                    &branch,
-                    original_agent.as_deref(),
-                )
-                .await
-                {
-                    tracing::warn!(
-                        task_id,
-                        comment_id = comment.id,
-                        err = %e,
-                        "failed to create follow-up task"
-                    );
+            // Add actionable comments
+            let actionable = pr_review.actionable_comments();
+            if !actionable.is_empty() {
+                review_context.push_str("**Comments to address:**\n\n");
+                for comment in actionable {
+                    review_context.push_str(&format!(
+                        "#### File: `{}` (line {})\n",
+                        comment.path,
+                        comment.line.map(|l| l.to_string()).unwrap_or_default()
+                    ));
+
+                    if let Some(ref diff_hunk) = comment.diff_hunk {
+                        review_context.push_str("```diff\n");
+                        review_context.push_str(diff_hunk);
+                        review_context.push_str("\n```\n\n");
+                    }
+
+                    review_context.push_str(&format!("> {}\n\n", comment.body));
                 }
             }
         }
-    }
 
-    Ok(())
-}
+        // Cap review context to avoid oversized sidecar values
+        const MAX_REVIEW_CONTEXT_BYTES: usize = 16 * 1024;
+        if review_context.len() > MAX_REVIEW_CONTEXT_BYTES {
+            if let Some(pos) = review_context[..MAX_REVIEW_CONTEXT_BYTES].rfind('\n') {
+                review_context.truncate(pos);
+            } else {
+                review_context.truncate(MAX_REVIEW_CONTEXT_BYTES);
+            }
+            review_context.push_str("\n... (review context truncated)");
+        }
 
-/// Get existing review tasks for a parent task.
-async fn get_existing_review_tasks(
-    db: &Arc<Db>,
-    parent_task_id: &str,
-) -> anyhow::Result<std::collections::HashSet<String>> {
-    let mut existing = std::collections::HashSet::new();
+        // If we have new review feedback, store it and re-dispatch the task
+        if !review_context.is_empty() {
+            // Store the review context in the sidecar
+            if let Err(e) =
+                sidecar::set(task_id, &[format!("pr_review_context={}", review_context)])
+            {
+                tracing::warn!(task_id, err = %e, "failed to store pr_review_context");
+            }
 
-    // Check internal tasks for review follow-ups
-    for status in &[
-        TaskStatus::New,
-        TaskStatus::InProgress,
-        TaskStatus::Done,
-        TaskStatus::Blocked,
-    ] {
-        let tasks = db.list_internal_tasks_by_status(*status).await?;
-        for t in tasks {
-            if t.source == "pr_review" && t.source_id.starts_with(parent_task_id) {
-                // Extract the review comment ID from source_id (format: "{parent_id}:{review_comment_id}")
-                if let Some(idx) = t.source_id.find(':') {
-                    existing.insert(t.source_id[idx + 1..].to_string());
-                }
+            // Update the last review timestamp
+            if let Err(e) = sidecar::set(task_id, &[format!("last_review_ts={}", latest_review_ts)])
+            {
+                tracing::warn!(task_id, err = %e, "failed to update last_review_ts");
+            }
+
+            // Re-dispatch the task by setting status back to routed
+            if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
+                tracing::warn!(task_id, err = %e, "failed to set status to routed for re-dispatch");
+            } else {
+                tracing::info!(task_id, "re-dispatching task to address review feedback");
             }
         }
     }
-
-    Ok(existing)
-}
-
-/// Create a follow-up task for a review comment.
-#[allow(clippy::too_many_arguments)]
-async fn create_review_follow_up_task(
-    backend: &Arc<dyn ExternalBackend>,
-    db: &Arc<Db>,
-    parent_task_id: &str,
-    review_comment_id: &str,
-    review: &PullRequestReview,
-    comment: &GitHubReviewComment,
-    pr_number: u64,
-    branch: &str,
-    original_agent: Option<&str>,
-) -> anyhow::Result<()> {
-    let reviewer = &review.review.user.login;
-
-    // Build task title
-    let title = format!(
-        "Address review comment on {} by @{}",
-        comment.path, reviewer
-    );
-
-    // Build task body with context
-    let mut body = format!(
-        "## PR Review Comment
-
-**File:** `{}`\n",
-        comment.path
-    );
-
-    if let Some(line) = comment.line {
-        body.push_str(&format!("**Line:** {}\n", line));
-    }
-
-    body.push_str(&format!(
-        "**Reviewer:** @{}\n**PR:** #{}\n**Branch:** `{}`\n\n",
-        reviewer, pr_number, branch
-    ));
-
-    // Add diff context if available
-    if let Some(ref diff_hunk) = comment.diff_hunk {
-        body.push_str("### Diff Context\n```diff\n");
-        // Truncate very long diffs
-        let diff_preview = if diff_hunk.len() > 2000 {
-            format!("{}...", &diff_hunk[..2000])
-        } else {
-            diff_hunk.clone()
-        };
-        body.push_str(&diff_preview);
-        body.push_str("\n```\n\n");
-    }
-
-    body.push_str("### Review Comment\n> ");
-    body.push_str(&comment.body.replace('\n', "\n> "));
-    body.push_str("\n\n");
-
-    // Add review body if present
-    if let Some(ref review_body) = review.review.body {
-        if !review_body.trim().is_empty() {
-            body.push_str("### Overall Review Notes\n");
-            body.push_str(review_body);
-            body.push_str("\n\n");
-        }
-    }
-
-    body.push_str("---\n**Parent Task:** #");
-    body.push_str(parent_task_id);
-    body.push('\n');
-
-    // Create labels
-    let mut labels = vec!["pr-review-followup".to_string(), "status:new".to_string()];
-
-    // Route to the same agent that created the PR
-    if let Some(agent) = original_agent {
-        labels.push(format!("agent:{}", agent));
-    }
-
-    // Create as internal task (can be promoted to GitHub issue if needed)
-    let source_id = format!("{}:{}", parent_task_id, review_comment_id);
-
-    let task_id = db
-        .create_internal_task(&title, &body, "pr_review", &source_id)
-        .await?;
-
-    // Store PR info in sidecar for the follow-up task
-    let _ = sidecar::set(
-        &task_id.to_string(),
-        &[
-            format!("pr_number={}", pr_number),
-            format!("branch={}", branch),
-            format!("reviewer={}", reviewer),
-            format!("file_path={}", comment.path),
-            format!("parent_task_id={}", parent_task_id),
-        ],
-    );
-
-    // Set the agent if we know it
-    if let Some(agent) = original_agent {
-        let _ = db.set_internal_task_agent(task_id, Some(agent)).await;
-    }
-
-    tracing::info!(
-        parent_task_id,
-        follow_up_task_id = task_id,
-        pr_number,
-        file_path = %comment.path,
-        "created follow-up task for review comment"
-    );
-
-    // Post comment on the original GitHub issue about the follow-up
-    let comment_body = format!(
-        "[{}] Created follow-up task #{} to address review comment on `{}` by @{}.",
-        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-        task_id,
-        comment.path,
-        reviewer
-    );
-    let _ = backend
-        .post_comment(&ExternalId(parent_task_id.to_string()), &comment_body)
-        .await;
 
     Ok(())
 }

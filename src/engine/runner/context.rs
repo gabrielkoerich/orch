@@ -30,6 +30,8 @@ pub struct TaskContext {
     pub git_diff: String,
     /// Recent issue comments
     pub issue_comments: String,
+    /// PR review context (for re-dispatching after review changes requested)
+    pub pr_review_context: String,
     /// Memory from previous attempts (capped at last 3)
     pub memory: Vec<crate::sidecar::MemoryEntry>,
 }
@@ -280,6 +282,11 @@ pub fn build_memory_context(task_id: &str) -> (String, Vec<crate::sidecar::Memor
     (context, memory)
 }
 
+/// Load PR review context from sidecar (for re-dispatching after review changes requested).
+pub fn load_pr_review_context(task_id: &str) -> String {
+    sidecar::get(task_id, "pr_review_context").unwrap_or_default()
+}
+
 /// Build the full task context.
 #[allow(dead_code)]
 pub async fn build_full_context(
@@ -304,6 +311,9 @@ pub async fn build_full_context(
 
     let issue_comments = fetch_issue_comments(backend, &task.id.0, 10).await;
 
+    // Load PR review context from sidecar (for re-dispatch after review changes requested)
+    let pr_review_context = load_pr_review_context(&task.id.0);
+
     // Load memory from previous attempts (only on retries)
     let (_, memory) = if attempts > 0 {
         build_memory_context(&task.id.0)
@@ -319,6 +329,7 @@ pub async fn build_full_context(
         repo_tree,
         git_diff,
         issue_comments,
+        pr_review_context,
         memory,
     }
 }
@@ -344,6 +355,7 @@ mod tests {
             repo_tree: String::new(),
             git_diff: String::new(),
             issue_comments: String::new(),
+            pr_review_context: String::new(),
             memory: vec![],
         };
 
