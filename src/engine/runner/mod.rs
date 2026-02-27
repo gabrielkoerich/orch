@@ -340,6 +340,13 @@ impl TaskRunner {
                     }
                 }
 
+                // Store delegations in sidecar if present (processed by run_with_context)
+                if !resp.delegations.is_empty() {
+                    if let Ok(delegations_json) = serde_json::to_string(&resp.delegations) {
+                        sidecar::set(task_id, &[format!("delegations={delegations_json}")])?;
+                    }
+                }
+
                 // Store result in sidecar
                 sidecar::set(
                     task_id,
@@ -764,6 +771,21 @@ impl TaskRunner {
         // Run the task
         self.run(task_id, agent, model).await?;
 
+        // Process delegations if the agent requested subtasks
+        let delegations_raw = sidecar::get(task_id, "delegations").unwrap_or_default();
+        if !delegations_raw.is_empty() {
+            if let Ok(delegations) =
+                serde_json::from_str::<Vec<crate::parser::Delegation>>(&delegations_raw)
+            {
+                if !delegations.is_empty() {
+                    self.process_delegations(task, &delegations, backend)
+                        .await?;
+                    // Clear delegations from sidecar after processing
+                    sidecar::set(task_id, &["delegations=".to_string()])?;
+                }
+            }
+        }
+
         // Post result to GitHub
         let status = sidecar::get(task_id, "status").unwrap_or_default();
         let summary = sidecar::get(task_id, "summary").unwrap_or_default();
@@ -854,6 +876,79 @@ impl TaskRunner {
         backend.post_comment(&task.id, &comment).await?;
 
         Ok(weight_signal)
+    }
+
+    /// Process delegations from an agent response.
+    ///
+    /// Creates child GitHub issues for each delegation and marks the parent
+    /// as blocked. The engine's Phase 4 unblock mechanism will re-activate
+    /// the parent when all children are done.
+    async fn process_delegations(
+        &self,
+        parent_task: &ExternalTask,
+        delegations: &[crate::parser::Delegation],
+        backend: &Arc<dyn ExternalBackend>,
+    ) -> anyhow::Result<()> {
+        let parent_id = &parent_task.id;
+
+        for delegation in delegations {
+            // Build labels: status:new + any labels from the delegation
+            let mut labels = delegation.labels.clone();
+            labels.push("status:new".to_string());
+
+            // Build child body with delegation reference
+            let child_body = format!(
+                "{}\n\n---\n_Delegated from #{}_",
+                delegation.body, parent_id.0
+            );
+
+            match backend
+                .create_sub_task(parent_id, &delegation.title, &child_body, &labels)
+                .await
+            {
+                Ok(child_id) => {
+                    tracing::info!(
+                        parent = parent_id.0,
+                        child = child_id.0,
+                        title = delegation.title,
+                        "created delegated subtask"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        parent = parent_id.0,
+                        title = delegation.title,
+                        err = %e,
+                        "failed to create delegated subtask"
+                    );
+                }
+            }
+        }
+
+        // Mark parent as blocked
+        sidecar::set(&parent_id.0, &["status=blocked".to_string()])?;
+        backend.update_status(parent_id, Status::Blocked).await?;
+
+        // Post summary comment on parent
+        let summary = delegations
+            .iter()
+            .enumerate()
+            .map(|(i, d)| format!("{}. {}", i + 1, d.title))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        backend
+            .post_comment(
+                parent_id,
+                &format!(
+                    "Delegated {} subtask(s):\n\n{}\n\nParent task is blocked until all subtasks complete.",
+                    delegations.len(),
+                    summary
+                ),
+            )
+            .await?;
+
+        Ok(())
     }
 
     /// Resolve the project directory for this repo.
