@@ -31,6 +31,18 @@ pub struct AgentResponse {
     /// Key learnings from this attempt (for memory persistence across retries).
     #[serde(default)]
     pub learnings: Vec<String>,
+    /// Subtask delegations — agent requests child tasks to be created.
+    #[serde(default)]
+    pub delegations: Vec<Delegation>,
+}
+
+/// A subtask delegation requested by an agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Delegation {
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// Parse an agent response from a file path (or stdin if "-").
@@ -80,6 +92,7 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
         input_tokens: None,
         output_tokens: None,
         learnings: vec![],
+        delegations: vec![],
     })
 }
 
@@ -124,6 +137,12 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
         .or_else(|| extract_u64(obj.get("tokens_output")))
         .or_else(|| extract_usage_tokens(obj.get("usage"), false));
 
+    // Extract delegations
+    let delegations = obj
+        .get("delegations")
+        .and_then(|v| serde_json::from_value::<Vec<Delegation>>(v.clone()).ok())
+        .unwrap_or_default();
+
     Ok(AgentResponse {
         status,
         summary,
@@ -134,6 +153,7 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
         input_tokens,
         output_tokens,
         learnings,
+        delegations,
     })
 }
 
@@ -268,5 +288,53 @@ Done.
         let input = r#"{"status":"done","summary":"Completed","accomplished":["done"],"remaining":[],"files":[]}"#;
         let resp = parse(input).unwrap();
         assert!(resp.learnings.is_empty());
+    }
+
+    #[test]
+    fn parse_with_delegations() {
+        let input = r#"{
+            "status": "blocked",
+            "summary": "Task requires subtasks",
+            "accomplished": ["Analyzed requirements"],
+            "remaining": ["Waiting on subtasks"],
+            "files_changed": [],
+            "blockers": ["Waiting on delegated subtasks"],
+            "reason": "Decomposed into subtasks",
+            "delegations": [
+                {"title": "Implement login API", "body": "Create POST /api/login", "labels": ["backend"]},
+                {"title": "Add login form", "body": "Create React login component", "labels": ["frontend"]}
+            ]
+        }"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "blocked");
+        assert_eq!(resp.delegations.len(), 2);
+        assert_eq!(resp.delegations[0].title, "Implement login API");
+        assert_eq!(resp.delegations[0].body, "Create POST /api/login");
+        assert_eq!(resp.delegations[0].labels, vec!["backend"]);
+        assert_eq!(resp.delegations[1].title, "Add login form");
+        assert_eq!(resp.delegations[1].labels, vec!["frontend"]);
+    }
+
+    #[test]
+    fn parse_delegations_empty_by_default() {
+        let input =
+            r#"{"status":"done","summary":"Done","accomplished":[],"remaining":[],"files":[]}"#;
+        let resp = parse(input).unwrap();
+        assert!(resp.delegations.is_empty());
+    }
+
+    #[test]
+    fn parse_delegations_without_labels() {
+        let input = r#"{
+            "status": "blocked",
+            "summary": "Delegating",
+            "delegations": [
+                {"title": "Subtask", "body": "Do the thing"}
+            ]
+        }"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.delegations.len(), 1);
+        assert_eq!(resp.delegations[0].title, "Subtask");
+        assert!(resp.delegations[0].labels.is_empty());
     }
 }

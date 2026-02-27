@@ -340,6 +340,13 @@ impl TaskRunner {
                     }
                 }
 
+                // Store delegations in sidecar if present (processed by run_with_context)
+                if !resp.delegations.is_empty() {
+                    if let Ok(delegations_json) = serde_json::to_string(&resp.delegations) {
+                        sidecar::set(task_id, &[format!("delegations={delegations_json}")])?;
+                    }
+                }
+
                 // Store result in sidecar
                 sidecar::set(
                     task_id,
@@ -369,13 +376,16 @@ impl TaskRunner {
                     resp.error.as_deref(),
                 );
 
-                // Check token budget
+                // Check token budget with warning thresholds
                 let max_tokens: u64 = config::get("max_tokens_per_task")
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(100_000);
 
                 let total_tokens = sidecar::get_total_tokens(task_id);
+                let cost = sidecar::get_cost_estimate(task_id);
+                let warning_threshold = (max_tokens as f64 * 0.8) as u64;
+
                 if total_tokens > max_tokens {
                     tracing::warn!(task_id, total_tokens, max_tokens, "exceeded token budget");
                     sidecar::set(
@@ -383,12 +393,29 @@ impl TaskRunner {
                         &[
                             "status=needs_review".to_string(),
                             format!(
-                                "last_error=token budget exceeded: {}/{} tokens",
-                                total_tokens, max_tokens
+                                "last_error=token budget exceeded: {}/{} tokens (${:.4})",
+                                total_tokens, max_tokens, cost.total_cost_usd
                             ),
+                            "budget_exceeded=true".to_string(),
                         ],
                     )?;
                     return Ok(());
+                } else if total_tokens > warning_threshold {
+                    let pct = (total_tokens as f64 / max_tokens as f64 * 100.0) as u32;
+                    tracing::warn!(
+                        task_id,
+                        total_tokens,
+                        max_tokens,
+                        pct,
+                        "approaching token budget"
+                    );
+                    sidecar::set(
+                        task_id,
+                        &[format!(
+                            "budget_warning={}% of budget used ({}/{} tokens, ${:.4})",
+                            pct, total_tokens, max_tokens, cost.total_cost_usd
+                        )],
+                    )?;
                 }
 
                 // Check PR override: done → in_review
@@ -525,7 +552,7 @@ impl TaskRunner {
                 let chain = response::get_reroute_chain(task_id);
                 let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
                     .iter()
-                    .filter(|a| which::which(a).is_ok())
+                    .filter(|a| crate::cmd_cache::command_exists(a))
                     .map(|s| s.to_string())
                     .collect();
 
@@ -661,6 +688,36 @@ impl TaskRunner {
 
         if let Some(ref db) = self.db {
             let error_type: Option<String> = sidecar::get(task_id, "last_error").ok();
+
+            // Read cost data from sidecar
+            let usage = sidecar::get_token_usage(task_id);
+            let cost = sidecar::get_cost_estimate(task_id);
+            let input_tokens = if usage.input_tokens > 0 {
+                Some(usage.input_tokens as i64)
+            } else {
+                None
+            };
+            let output_tokens = if usage.output_tokens > 0 {
+                Some(usage.output_tokens as i64)
+            } else {
+                None
+            };
+            let input_cost = if cost.input_cost_usd > 0.0 {
+                Some(cost.input_cost_usd)
+            } else {
+                None
+            };
+            let output_cost = if cost.output_cost_usd > 0.0 {
+                Some(cost.output_cost_usd)
+            } else {
+                None
+            };
+            let total_cost = if cost.total_cost_usd > 0.0 {
+                Some(cost.total_cost_usd)
+            } else {
+                None
+            };
+
             let metric = InsertTaskMetric {
                 task_id,
                 agent: agent_name,
@@ -673,6 +730,11 @@ impl TaskRunner {
                 attempts: attempts as i32 + 1,
                 files_changed: files_changed as i32,
                 error_type: error_type.as_deref(),
+                input_tokens,
+                output_tokens,
+                input_cost_usd: input_cost,
+                output_cost_usd: output_cost,
+                total_cost_usd: total_cost,
             };
 
             if let Err(e) = db.insert_task_metric(metric).await {
@@ -708,6 +770,21 @@ impl TaskRunner {
 
         // Run the task
         self.run(task_id, agent, model).await?;
+
+        // Process delegations if the agent requested subtasks
+        let delegations_raw = sidecar::get(task_id, "delegations").unwrap_or_default();
+        if !delegations_raw.is_empty() {
+            if let Ok(delegations) =
+                serde_json::from_str::<Vec<crate::parser::Delegation>>(&delegations_raw)
+            {
+                if !delegations.is_empty() {
+                    self.process_delegations(task, &delegations, backend)
+                        .await?;
+                    // Clear delegations from sidecar after processing
+                    sidecar::set(task_id, &["delegations=".to_string()])?;
+                }
+            }
+        }
 
         // Post result to GitHub
         let status = sidecar::get(task_id, "status").unwrap_or_default();
@@ -756,15 +833,31 @@ impl TaskRunner {
         };
         backend.update_status(&task.id, new_status).await?;
 
+        // Check for budget warnings and append to comment
+        let budget_warning = sidecar::get(task_id, "budget_warning").unwrap_or_default();
+        let budget_exceeded = sidecar::get(task_id, "budget_exceeded").unwrap_or_default();
+
         // Post comment (scan for secrets before posting to GitHub)
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-        let raw_comment = if !summary.is_empty() {
+        let mut raw_comment = if !summary.is_empty() {
             format!("[{now}] {status}: {summary}")
         } else if !last_error.is_empty() {
             format!("[{now}] {status}: {last_error}")
         } else {
             format!("[{now}] {status}")
         };
+
+        // Append budget warnings to the GitHub comment
+        if budget_exceeded == "true" {
+            let cost = sidecar::get_cost_estimate(task_id);
+            let total_tokens = sidecar::get_total_tokens(task_id);
+            raw_comment.push_str(&format!(
+                "\n\n> **Budget exceeded**: {} tokens used (${:.4}). Task paused for review.",
+                total_tokens, cost.total_cost_usd
+            ));
+        } else if !budget_warning.is_empty() {
+            raw_comment.push_str(&format!("\n\n> **Budget warning**: {budget_warning}"));
+        }
 
         // Scan for leaked secrets and redact if needed
         let comment = if security::has_leaks(&raw_comment) {
@@ -783,6 +876,79 @@ impl TaskRunner {
         backend.post_comment(&task.id, &comment).await?;
 
         Ok(weight_signal)
+    }
+
+    /// Process delegations from an agent response.
+    ///
+    /// Creates child GitHub issues for each delegation and marks the parent
+    /// as blocked. The engine's Phase 4 unblock mechanism will re-activate
+    /// the parent when all children are done.
+    async fn process_delegations(
+        &self,
+        parent_task: &ExternalTask,
+        delegations: &[crate::parser::Delegation],
+        backend: &Arc<dyn ExternalBackend>,
+    ) -> anyhow::Result<()> {
+        let parent_id = &parent_task.id;
+
+        for delegation in delegations {
+            // Build labels: status:new + any labels from the delegation
+            let mut labels = delegation.labels.clone();
+            labels.push("status:new".to_string());
+
+            // Build child body with delegation reference
+            let child_body = format!(
+                "{}\n\n---\n_Delegated from #{}_",
+                delegation.body, parent_id.0
+            );
+
+            match backend
+                .create_sub_task(parent_id, &delegation.title, &child_body, &labels)
+                .await
+            {
+                Ok(child_id) => {
+                    tracing::info!(
+                        parent = parent_id.0,
+                        child = child_id.0,
+                        title = delegation.title,
+                        "created delegated subtask"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        parent = parent_id.0,
+                        title = delegation.title,
+                        err = %e,
+                        "failed to create delegated subtask"
+                    );
+                }
+            }
+        }
+
+        // Mark parent as blocked
+        sidecar::set(&parent_id.0, &["status=blocked".to_string()])?;
+        backend.update_status(parent_id, Status::Blocked).await?;
+
+        // Post summary comment on parent
+        let summary = delegations
+            .iter()
+            .enumerate()
+            .map(|(i, d)| format!("{}. {}", i + 1, d.title))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        backend
+            .post_comment(
+                parent_id,
+                &format!(
+                    "Delegated {} subtask(s):\n\n{}\n\nParent task is blocked until all subtasks complete.",
+                    delegations.len(),
+                    summary
+                ),
+            )
+            .await?;
+
+        Ok(())
     }
 
     /// Resolve the project directory for this repo.

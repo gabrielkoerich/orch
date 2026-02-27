@@ -14,6 +14,7 @@
 //! The engine owns the full loop: task polling, routing, agent invocation,
 //! git workflow, prompt building, and result handling — all in Rust.
 
+pub mod commands;
 pub mod internal_tasks;
 pub mod jobs;
 pub mod router;
@@ -67,6 +68,11 @@ pub struct EngineConfig {
     pub max_parallel: usize,
     /// Stuck task timeout (seconds)
     pub stuck_timeout: u64,
+    /// Auto-create follow-up tasks when PR reviews request changes
+    pub auto_create_followup_on_changes: bool,
+    /// Auto-close task (mark Done) when all PR reviews are approved.
+    /// Note: this does NOT merge the PR itself -- only updates the task status.
+    pub auto_close_task_on_approval: bool,
 }
 
 impl Default for EngineConfig {
@@ -78,6 +84,8 @@ impl Default for EngineConfig {
             webhook_health_check_interval: Some(std::time::Duration::from_secs(60)),
             max_parallel: 4,
             stuck_timeout: 1800,
+            auto_create_followup_on_changes: true,
+            auto_close_task_on_approval: false,
         }
     }
 }
@@ -130,6 +138,14 @@ impl EngineConfig {
                     config.webhook_health_check_interval = None;
                 }
             }
+        }
+
+        if let Ok(val) = crate::config::get("workflow.auto_create_followup_on_changes") {
+            config.auto_create_followup_on_changes = !val.eq_ignore_ascii_case("false");
+        }
+
+        if let Ok(val) = crate::config::get("workflow.auto_close_task_on_approval") {
+            config.auto_close_task_on_approval = val.eq_ignore_ascii_case("true");
         }
 
         config
@@ -535,7 +551,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
                 if last_sync.elapsed() >= current_sync_interval {
                     for engine in &project_engines {
-                        if let Err(e) = sync_tick(&engine.backend, &tmux, &engine.repo, &db).await {
+                        if let Err(e) = sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config).await {
                             tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
                         }
                     }
@@ -1013,6 +1029,7 @@ async fn sync_tick(
     _tmux: &Arc<TmuxManager>,
     repo: &str,
     db: &Arc<Db>,
+    config: &EngineConfig,
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
 
@@ -1032,8 +1049,13 @@ async fn sync_tick(
     }
 
     // 4. Review open PRs (parse review comments, create follow-ups)
-    if let Err(e) = review_open_prs(backend, db, repo).await {
+    if let Err(e) = review_open_prs(backend, db, repo, config).await {
         tracing::warn!(err = %e, "PR review failed");
+    }
+
+    // 5. Scan for owner /slash commands in issue comments
+    if let Err(e) = commands::scan_commands(backend, db, repo).await {
+        tracing::warn!(err = %e, "owner command scan failed");
     }
 
     Ok(())
@@ -1307,6 +1329,7 @@ async fn review_open_prs(
     backend: &Arc<dyn ExternalBackend>,
     db: &Arc<Db>,
     repo: &str,
+    config: &EngineConfig,
 ) -> anyhow::Result<()> {
     // Get tasks that are in review (have open PRs)
     let in_review_tasks = backend.list_by_status(Status::InReview).await?;
@@ -1314,6 +1337,10 @@ async fn review_open_prs(
     if in_review_tasks.is_empty() {
         return Ok(());
     }
+
+    // Check if we should process reviews
+    let auto_create_followup = config.auto_create_followup_on_changes;
+    let auto_close_task = config.auto_close_task_on_approval;
 
     tracing::info!(
         count = in_review_tasks.len(),
@@ -1377,13 +1404,74 @@ async fn review_open_prs(
             }
         };
 
-        // Process each review
-        for review in reviews {
-            // Only process reviews that request changes
-            if review.state != "CHANGES_REQUESTED" {
-                continue;
+        // Deduplicate reviews: keep only the latest review per reviewer.
+        // GitHub returns reviews chronologically; when a reviewer submits
+        // multiple reviews (e.g. CHANGES_REQUESTED then APPROVED), we only
+        // care about the most recent one.
+        let deduped_reviews = {
+            let mut by_reviewer: std::collections::HashMap<
+                String,
+                &crate::github::types::GitHubReview,
+            > = std::collections::HashMap::new();
+            for review in &reviews {
+                // Skip COMMENTED and DISMISSED — they don't express approval/rejection
+                if review.state != "APPROVED" && review.state != "CHANGES_REQUESTED" {
+                    continue;
+                }
+                let existing = by_reviewer.get(&review.user.login);
+                let dominated = match existing {
+                    Some(prev) => review.submitted_at > prev.submitted_at,
+                    None => true,
+                };
+                if dominated {
+                    by_reviewer.insert(review.user.login.clone(), review);
+                }
             }
+            by_reviewer
+        };
 
+        // Check aggregate state: if any reviewer still requests changes,
+        // the PR is not fully approved.
+        let any_changes_requested = deduped_reviews
+            .values()
+            .any(|r| r.state == "CHANGES_REQUESTED");
+        let all_approved =
+            !deduped_reviews.is_empty() && deduped_reviews.values().all(|r| r.state == "APPROVED");
+
+        // Handle fully-approved PRs
+        if all_approved && auto_close_task {
+            tracing::info!(
+                task_id,
+                pr_number,
+                "PR approved by all reviewers, closing task (marking as done)"
+            );
+            if let Err(e) = backend.update_status(&task.id, Status::Done).await {
+                tracing::warn!(task_id, err = %e, "failed to update task status to done");
+            }
+            // Note: this only marks the task as Done; actual PR merge
+            // is left to GitHub branch-protection / manual action.
+            continue;
+        }
+
+        // Process reviews that request changes
+        if !any_changes_requested {
+            continue;
+        }
+
+        if !auto_create_followup {
+            tracing::debug!(
+                task_id,
+                pr_number,
+                "auto_create_followup_on_changes is disabled, skipping"
+            );
+            continue;
+        }
+
+        // Only process the latest CHANGES_REQUESTED reviews (already deduplicated)
+        for review in deduped_reviews
+            .values()
+            .filter(|r| r.state == "CHANGES_REQUESTED")
+        {
             // Get comments for this review
             let review_comments: Vec<GitHubReviewComment> = all_comments
                 .iter()
@@ -1396,7 +1484,7 @@ async fn review_open_prs(
                 .collect();
 
             let pr_review = PullRequestReview {
-                review: review.clone(),
+                review: (*review).clone(),
                 comments: review_comments.clone(),
             };
 

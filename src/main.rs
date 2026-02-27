@@ -2,6 +2,7 @@ mod backends;
 #[allow(dead_code)] // channels are scaffolding — not wired into engine yet
 mod channels;
 mod cli;
+mod cmd_cache;
 mod config;
 mod cron;
 mod db;
@@ -106,6 +107,20 @@ enum Commands {
     Project {
         #[command(subcommand)]
         action: ProjectAction,
+    },
+    /// Show cost tracking and token usage
+    Cost {
+        /// Task ID to show cost for
+        task_id: Option<String>,
+        /// Show aggregate cost summary (24h, 7d, 30d)
+        #[arg(long)]
+        summary: bool,
+        /// Show costs grouped by agent
+        #[arg(long)]
+        agent: bool,
+        /// Show costs grouped by model
+        #[arg(long)]
+        model: bool,
     },
     /// Generate shell completions
     Completions {
@@ -471,6 +486,25 @@ async fn main() -> anyhow::Result<()> {
                 cli::project_list()?;
             }
         },
+        Commands::Cost {
+            task_id,
+            summary,
+            agent,
+            model,
+        } => {
+            if let Some(id) = task_id {
+                cli::cost::show_task(&id)?;
+            } else if agent {
+                cli::cost::show_by_agent().await?;
+            } else if model {
+                cli::cost::show_by_model().await?;
+            } else if summary {
+                cli::cost::show_summary().await?;
+            } else {
+                // Default: show summary
+                cli::cost::show_summary().await?;
+            }
+        }
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "orch", &mut std::io::stdout());

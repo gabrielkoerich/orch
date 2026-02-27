@@ -62,12 +62,21 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # Command discovery for agents
 which = "7"
 
+# File locking for cooldowns
+fs2 = "0.4"
+
+# Simple process availability cache
+once_cell = "1"
+
 # HTTP server for webhooks
 axum = "0.7"
 tower-http = { version = "0.5", features = ["trace"] }
 
 # HMAC for webhook signature verification
 hmac = "0.12"
+
+# Constant-time comparison for timing-safe signature verification
+subtle = "2"
 
 # Async combinators (FuturesUnordered for concurrent routing)
 futures = "0.3"

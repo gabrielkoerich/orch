@@ -192,6 +192,45 @@ impl ExternalBackend for GitHubBackend {
             .collect())
     }
 
+    async fn create_sub_task(
+        &self,
+        parent_id: &ExternalId,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> anyhow::Result<ExternalId> {
+        // Add parent label for metadata
+        let mut all_labels = labels.to_vec();
+        all_labels.push(format!("parent:{}", parent_id.0));
+
+        // Create the child issue
+        let child_issue = self
+            .gh
+            .create_issue(&self.repo, title, body, &all_labels)
+            .await?;
+
+        let child_id = ExternalId(child_issue.number.to_string());
+
+        // Try to establish native sub-issue relationship via GraphQL
+        if let (Some(child_node_id), Ok(parent_issue)) = (
+            child_issue.node_id,
+            self.gh.get_issue(&self.repo, &parent_id.0).await,
+        ) {
+            if let Some(parent_node_id) = parent_issue.node_id {
+                if let Err(e) = self.gh.add_sub_issue(&parent_node_id, &child_node_id).await {
+                    tracing::warn!(
+                        parent = parent_id.0,
+                        child = child_id.0,
+                        err = %e,
+                        "failed to add native sub-issue link (parent label still set)"
+                    );
+                }
+            }
+        }
+
+        Ok(child_id)
+    }
+
     async fn has_open_issue_with_title(&self, title: &str, label: &str) -> anyhow::Result<bool> {
         let issues = self.gh.list_issues(&self.repo, label).await?;
         Ok(issues.iter().any(|i| i.title == title))
@@ -218,6 +257,7 @@ impl ExternalBackend for GitHubBackend {
                 body: c.body,
                 author: c.user.login,
                 created_at: c.created_at,
+                issue_url: c.issue_url,
             })
             .collect())
     }
