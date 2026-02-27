@@ -49,7 +49,7 @@ pub async fn dashboard() -> anyhow::Result<()> {
     for s in sessions.iter() {
         // Try to read agent and title from sidecar using task id
         let agent = sidecar::get(&s.task_id, "agent").unwrap_or_default();
-        let title = sidecar::get(&s.task_id, "title").unwrap_or_default();
+        let _title = sidecar::get(&s.task_id, "title").unwrap_or_default();
         // Age
         let age = Utc::now() - s.created_at;
         let mins = age.num_minutes();
