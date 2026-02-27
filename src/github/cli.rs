@@ -17,11 +17,32 @@ fn parse_ndjson<T: serde::de::DeserializeOwned>(stdout: &[u8]) -> anyhow::Result
         .map_err(Into::into)
 }
 
-pub struct GhCli;
+pub struct GhCli {
+    /// Resolved absolute path to the `gh` binary (e.g. `/opt/homebrew/bin/gh`).
+    /// Needed because launchd services have a minimal PATH that excludes Homebrew.
+    gh_path: std::path::PathBuf,
+}
 
 impl GhCli {
     pub fn new() -> Self {
-        Self
+        let gh_path = which::which("gh").unwrap_or_else(|_| {
+            // launchd services have a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
+            // that excludes Homebrew — try common install locations as fallback.
+            let candidates = [
+                "/opt/homebrew/bin/gh", // macOS ARM
+                "/usr/local/bin/gh",    // macOS Intel / Linux
+            ];
+            candidates
+                .iter()
+                .map(std::path::PathBuf::from)
+                .find(|p| p.exists())
+                .unwrap_or_else(|| std::path::PathBuf::from("gh"))
+        });
+        Self { gh_path }
+    }
+
+    fn cmd(&self) -> Command {
+        Command::new(&self.gh_path)
     }
 
     pub async fn graphql(&self, query: &str) -> anyhow::Result<serde_json::Value> {
@@ -34,7 +55,7 @@ impl GhCli {
         query: &str,
         headers: &[&str],
     ) -> anyhow::Result<serde_json::Value> {
-        let mut cmd = Command::new("gh");
+        let mut cmd = self.cmd();
         cmd.arg("api").arg("graphql");
 
         for header in headers {
@@ -56,7 +77,7 @@ impl GhCli {
 
     /// Run `gh api` with args and return raw JSON bytes.
     async fn api(&self, args: &[&str]) -> anyhow::Result<Vec<u8>> {
-        let output = Command::new("gh").arg("api").args(args).output().await?;
+        let output = self.cmd().arg("api").args(args).output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -67,7 +88,11 @@ impl GhCli {
 
     /// Check `gh auth status`.
     pub async fn auth_status(&self) -> anyhow::Result<()> {
-        let output = Command::new("gh").args(["auth", "status"]).output().await?;
+        let output = self.cmd()
+            .args(["auth", "status"])
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to execute `{}`: {e}", self.gh_path.display()))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("gh auth failed: {stderr}");
@@ -91,7 +116,7 @@ impl GhCli {
             "body": body,
             "labels": labels,
         });
-        let output = Command::new("gh")
+        let output = self.cmd()
             .arg("api")
             .args([&endpoint, "-X", "POST", "--input", "-"])
             .stdin(std::process::Stdio::piped())
@@ -127,7 +152,7 @@ impl GhCli {
     pub async fn list_issues(&self, repo: &str, label: &str) -> anyhow::Result<Vec<GitHubIssue>> {
         let endpoint = format!("repos/{repo}/issues");
         let labels_field = format!("labels={label}");
-        let output = Command::new("gh")
+        let output = self.cmd()
             .arg("api")
             .arg("--paginate")
             .arg("--jq")
@@ -168,7 +193,7 @@ impl GhCli {
     ) -> anyhow::Result<()> {
         let endpoint = format!("repos/{repo}/issues/{number}/labels");
         let payload = serde_json::json!({ "labels": labels });
-        let mut child = Command::new("gh")
+        let mut child = self.cmd()
             .arg("api")
             .args([&endpoint, "-X", "POST", "--input", "-"])
             .stdin(std::process::Stdio::piped())
@@ -222,7 +247,7 @@ impl GhCli {
             "color": color,
             "description": description,
         });
-        let mut child = Command::new("gh")
+        let mut child = self.cmd()
             .arg("api")
             .args([&create_endpoint, "-X", "POST", "--input", "-"])
             .stdin(std::process::Stdio::piped())
@@ -274,7 +299,7 @@ impl GhCli {
     pub async fn add_comment(&self, repo: &str, number: &str, body: &str) -> anyhow::Result<()> {
         let endpoint = format!("repos/{repo}/issues/{number}/comments");
         let payload = serde_json::json!({ "body": body });
-        let mut child = Command::new("gh")
+        let mut child = self.cmd()
             .arg("api")
             .args([&endpoint, "-X", "POST", "--input", "-"])
             .stdin(std::process::Stdio::piped())
@@ -354,7 +379,7 @@ impl GhCli {
     ) -> anyhow::Result<Vec<GitHubComment>> {
         let endpoint = format!("repos/{repo}/issues/comments");
         let since_field = format!("since={}", since);
-        let output = Command::new("gh")
+        let output = self.cmd()
             .arg("api")
             .arg("--paginate")
             .arg("--jq")
@@ -467,7 +492,7 @@ impl GhCli {
     pub async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
         let endpoint = format!("repos/{repo}/issues/{number}");
         let payload = serde_json::json!({ "state": "closed" });
-        let mut child = Command::new("gh")
+        let mut child = self.cmd()
             .arg("api")
             .args([&endpoint, "-X", "PATCH", "--input", "-"])
             .stdin(std::process::Stdio::piped())
@@ -492,7 +517,7 @@ impl GhCli {
     /// Returns true if the user has collaborator access, false otherwise.
     pub async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
         let endpoint = format!("repos/{repo}/collaborators/{username}");
-        let output = Command::new("gh")
+        let output = self.cmd()
             .arg("api")
             .args([&endpoint, "-X", "GET"])
             .output()
@@ -556,7 +581,7 @@ impl GhCli {
             args.push("--delete-branch".to_string());
         }
 
-        let output = Command::new("gh").args(&args).output().await?;
+        let output = self.cmd().args(&args).output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -667,7 +692,7 @@ impl GhCli {
     ) -> anyhow::Result<(String, u64, u64, u64, u64)> {
         // Use the checks endpoint which combines both status checks and check runs
         let endpoint = format!("repos/{repo}/commits/{git_ref}/check-runs");
-        let output = Command::new("gh")
+        let output = self.cmd()
             .arg("api")
             .arg("--paginate")
             .arg("--jq")
@@ -717,7 +742,7 @@ impl GhCli {
     /// Re-run failed jobs for a GitHub Actions workflow run.
     pub async fn rerun_failed_jobs(&self, repo: &str, run_id: u64) -> anyhow::Result<()> {
         let endpoint = format!("repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs");
-        let output = Command::new("gh")
+        let output = self.cmd()
             .arg("api")
             .args([&endpoint, "-X", "POST"])
             .output()
@@ -784,7 +809,7 @@ impl GhCli {
     ) -> anyhow::Result<()> {
         let endpoint = format!("repos/{repo}/actions/workflows/{workflow}/dispatches");
         let payload = serde_json::json!({ "ref": branch });
-        let mut child = Command::new("gh")
+        let mut child = self.cmd()
             .arg("api")
             .args([&endpoint, "-X", "POST", "--input", "-"])
             .stdin(std::process::Stdio::piped())

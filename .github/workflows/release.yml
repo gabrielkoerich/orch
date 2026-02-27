@@ -418,6 +418,8 @@ jobs:
               keep_alive true
               log_path var/"log/orch.log"
               error_log_path var/"log/orch.error.log"
+              environment_variables PATH: "#{HOMEBREW_PREFIX}/bin:#{Dir.home}/.cargo/bin:#{Dir.home}/.local/bin:#{Dir.home}/.bun/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                                    HOME: Dir.home
             end
 
             def caveats

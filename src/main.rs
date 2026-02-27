@@ -19,6 +19,70 @@ mod tmux;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 
+/// Ensure common tool directories are on PATH.
+///
+/// Sources `$HOME/.path` if it exists (user-managed PATH exports), then adds
+/// well-known directories as a fallback. This is needed because launchd services
+/// inherit a minimal PATH that excludes Homebrew, Cargo, npm globals, etc.
+fn ensure_path() {
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    // Source ~/.path — a shell snippet that exports PATH entries.
+    // We parse `export PATH="..."` lines and extract the directories.
+    let dotpath = format!("{home}/.path");
+    if std::path::Path::new(&dotpath).is_file() {
+        if let Ok(contents) = std::fs::read_to_string(&dotpath) {
+            let current = std::env::var("PATH").unwrap_or_default();
+            let mut path = current.clone();
+            for line in contents.lines() {
+                let line = line.trim();
+                // Match: export PATH="...:$PATH" or export PATH="...$PATH"
+                if let Some(value) = line
+                    .strip_prefix("export PATH=\"")
+                    .and_then(|s| s.strip_suffix('"'))
+                {
+                    // Extract the new directory (everything before :$PATH or $PATH)
+                    let dir = value
+                        .replace("$PATH", "")
+                        .replace("$HOME", &home)
+                        .trim_end_matches(':')
+                        .to_string();
+                    if !dir.is_empty()
+                        && !path.split(':').any(|d| d == dir)
+                        && std::path::Path::new(&dir).is_dir()
+                    {
+                        path = format!("{dir}:{path}");
+                    }
+                }
+            }
+            if path != current {
+                std::env::set_var("PATH", &path);
+                return;
+            }
+        }
+    }
+
+    // Fallback: add well-known directories if ~/.path doesn't exist.
+    let extra = [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        &format!("{home}/.cargo/bin"),
+        &format!("{home}/.local/bin"),
+        &format!("{home}/.bun/bin"),
+    ];
+    let current = std::env::var("PATH").unwrap_or_default();
+    let mut new_path = current.clone();
+    for dir in &extra {
+        if !new_path.split(':').any(|d| d == *dir) && std::path::Path::new(dir).is_dir() {
+            new_path = format!("{dir}:{new_path}");
+        }
+    }
+    if new_path != current {
+        std::env::set_var("PATH", &new_path);
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "orch", version, about = "Orch — The Agent Orchestrator")]
 struct Cli {
@@ -322,6 +386,11 @@ enum ServiceAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Augment PATH with common tool locations.
+    // launchd services inherit a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
+    // that excludes Homebrew, Cargo, npm globals, etc.
+    ensure_path();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("orch=info".parse()?),
