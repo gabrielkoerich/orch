@@ -439,31 +439,6 @@ pub async fn publish(id: i64, labels: Vec<String>) -> anyhow::Result<()> {
 
 /// Show token cost breakdown for a task.
 pub fn cost(id: &str) -> anyhow::Result<()> {
-    let usage = sidecar::get_token_usage(id);
-    let cost_estimate = sidecar::get_cost_estimate(id);
-    let model = sidecar::get_model(id);
-
-    if usage.total_tokens() == 0 {
-        println!("No token data available for task #{}", id);
-        println!("Run the task first to collect token usage.");
-        return Ok(());
-    }
-
-    println!("Token usage for task #{}", id);
-    println!("{}", "-".repeat(40));
-    println!(
-        "Model: {}",
-        if model.is_empty() { "unknown" } else { &model }
-    );
-    println!("Input tokens:  {:>12}", usage.input_tokens);
-    println!("Output tokens: {:>12}", usage.output_tokens);
-    println!("{}", "-".repeat(40));
-    println!("Total tokens:  {:>12}", usage.total_tokens());
-    println!();
-    println!("Cost breakdown:");
-    println!("  Input:  ${:.6}", cost_estimate.input_cost_usd);
-    println!("  Output: ${:.6}", cost_estimate.output_cost_usd);
-    println!("  Total:  ${:.6}", cost_estimate.total_cost_usd);
-
-    Ok(())
+    // Delegate to cli::cost::show_task for consistent formatting
+    super::cost::show_task(id)
 }
