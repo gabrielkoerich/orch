@@ -1,21 +1,17 @@
+.claude
 .env*
+.lock
+.lock.*
 .orchestrator/
+/target
+__pycache__/
 config.yml
+contexts/
+docs/public/
+opencode.json
+orchestrator.db
 orchestrator.log
 orchestrator.pid
 skills/
 tasks.yml
 tasks.yml.lock*
-.lock
-.lock.*
-contexts/
-__pycache__/
-jobs.yml
-docs/public/
-orchestrator.db
-
-# Agent configs
-opencode.json
-
-# Rust
-/target
