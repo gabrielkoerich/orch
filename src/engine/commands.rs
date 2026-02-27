@@ -76,7 +76,11 @@ pub fn parse_command(body: &str) -> Option<OwnerCommand> {
 ///
 /// Expected format: `https://api.github.com/repos/owner/repo/issues/123`
 fn extract_issue_number(issue_url: &str) -> Option<String> {
-    issue_url.rsplit('/').next().map(String::from)
+    issue_url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .map(String::from)
 }
 
 /// Scan recent comments for owner slash commands and execute them.
@@ -108,9 +112,7 @@ pub async fn scan_commands(
 
     if comments.is_empty() {
         // Still advance cursor even if no comments
-        let now = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         db.kv_set("owner_commands_last_checked", &now).await.ok();
         return Ok(());
     }
@@ -138,21 +140,16 @@ pub async fn scan_commands(
         };
 
         // Extract issue number from the comment's issue URL
-        let issue_number =
-            match mention
-                .issue_url
-                .as_deref()
-                .and_then(extract_issue_number)
-            {
-                Some(n) => n,
-                None => {
-                    tracing::warn!(
-                        comment_id = %mention.id,
-                        "slash command without issue_url, skipping"
-                    );
-                    continue;
-                }
-            };
+        let issue_number = match mention.issue_url.as_deref().and_then(extract_issue_number) {
+            Some(n) => n,
+            None => {
+                tracing::warn!(
+                    comment_id = %mention.id,
+                    "slash command without issue_url, skipping"
+                );
+                continue;
+            }
+        };
 
         // Validate author is repo owner or collaborator
         match gh.is_collaborator(repo, &mention.author).await {
@@ -179,9 +176,7 @@ pub async fn scan_commands(
 
         // Execute the command
         let task_id = ExternalId(issue_number.clone());
-        let now = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
         let result = execute_command(backend, &gh, repo, &task_id, &command).await;
 
@@ -218,6 +213,7 @@ pub async fn scan_commands(
     // Persist processed IDs (keep last 500 to avoid unbounded growth)
     if !new_processed.is_empty() {
         let mut all: Vec<String> = processed_ids.into_iter().collect();
+        all.sort();
         all.extend(new_processed);
         if all.len() > 500 {
             all = all.split_off(all.len() - 500);
@@ -228,9 +224,7 @@ pub async fn scan_commands(
     }
 
     // Advance cursor
-    let now = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     if let Err(e) = db.kv_set("owner_commands_last_checked", &now).await {
         tracing::warn!(err = %e, "failed to persist owner commands cursor");
     }
@@ -304,8 +298,10 @@ async fn execute_command(
 
         OwnerCommand::Review => {
             backend.update_status(task_id, Status::InReview).await?;
-            Ok("`/review` — set `status:in_review`, review agent will pick up on next sync"
-                .to_string())
+            Ok(
+                "`/review` — set `status:in_review`, review agent will pick up on next sync"
+                    .to_string(),
+            )
         }
     }
 }
@@ -341,10 +337,7 @@ mod tests {
 
     #[test]
     fn parse_reroute_no_agent() {
-        assert_eq!(
-            parse_command("/reroute"),
-            Some(OwnerCommand::Reroute(None))
-        );
+        assert_eq!(parse_command("/reroute"), Some(OwnerCommand::Reroute(None)));
     }
 
     #[test]
@@ -364,9 +357,7 @@ mod tests {
     fn parse_block_with_reason() {
         assert_eq!(
             parse_command("/block waiting on upstream fix"),
-            Some(OwnerCommand::Block(Some(
-                "waiting on upstream fix".into()
-            )))
+            Some(OwnerCommand::Block(Some("waiting on upstream fix".into())))
         );
     }
 
@@ -414,7 +405,7 @@ mod tests {
 
     #[test]
     fn extract_issue_number_empty_url() {
-        assert_eq!(extract_issue_number(""), Some("".into()));
+        assert_eq!(extract_issue_number(""), None);
     }
 
     #[test]
