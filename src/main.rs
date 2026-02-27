@@ -98,6 +98,8 @@ enum Commands {
     },
     /// Show task metrics summary
     Metrics,
+    /// Combined dashboard: tasks, sessions, recent activity
+    Dashboard,
     /// GitHub Projects V2 board management
     Board {
         #[command(subcommand)]
@@ -460,6 +462,10 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Metrics => {
             cli::metrics().await?;
+        }
+        // Combined dashboard view: tasks, sessions, recent activity
+        Commands::Dashboard => {
+            cli::dashboard::dashboard().await?;
         }
         Commands::Board { action } => match action {
             BoardAction::List => {
