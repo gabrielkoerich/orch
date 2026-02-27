@@ -21,19 +21,10 @@ pub struct CreateTaskRequest {
     pub source_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskFilter {
     pub status: Option<String>,
     pub source: Option<String>,
-}
-
-impl Default for TaskFilter {
-    fn default() -> Self {
-        Self {
-            status: None,
-            source: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
