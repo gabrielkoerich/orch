@@ -23,6 +23,9 @@ pub struct Mention {
     pub author: String,
     /// When the mention was created (RFC 3339).
     pub created_at: String,
+    /// API URL of the issue/PR this comment belongs to.
+    /// Format: https://api.github.com/repos/owner/repo/issues/123
+    pub issue_url: Option<String>,
 }
 
 /// A task as represented in the external system.

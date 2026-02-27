@@ -432,6 +432,53 @@ impl GhCli {
         Ok(serde_json::from_slice(&json)?)
     }
 
+    /// Close a GitHub issue.
+    pub async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
+        let endpoint = format!("repos/{repo}/issues/{number}");
+        let payload = serde_json::json!({ "state": "closed" });
+        let mut child = Command::new("gh")
+            .arg("api")
+            .args([&endpoint, "-X", "PATCH", "--input", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(payload.to_string().as_bytes()).await?;
+            drop(stdin);
+        }
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api failed: {stderr}");
+        }
+        Ok(())
+    }
+
+    /// Check if a user is a collaborator on a repo.
+    ///
+    /// Returns true if the user has collaborator access, false otherwise.
+    pub async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
+        let endpoint = format!("repos/{repo}/collaborators/{username}");
+        let output = Command::new("gh")
+            .arg("api")
+            .args([&endpoint, "-X", "GET"])
+            .output()
+            .await?;
+        // 204 = is collaborator, 404 = not a collaborator
+        if output.status.success() {
+            Ok(true)
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("404") {
+                Ok(false)
+            } else {
+                anyhow::bail!("gh api failed: {stderr}");
+            }
+        }
+    }
+
     pub async fn get_sub_issues(&self, repo: &str, number: &str) -> anyhow::Result<Vec<u64>> {
         // Parse owner and repo from "owner/repo" format
         let parts: Vec<&str> = repo.split('/').collect();
