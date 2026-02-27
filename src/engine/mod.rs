@@ -169,9 +169,13 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         let backend: Arc<dyn ExternalBackend> =
             Arc::new(crate::backends::github::GitHubBackend::new(repo.clone()));
 
-        // Health check
+        // Health check — verifies `gh auth status` succeeds
         if let Err(e) = backend.health_check().await {
-            tracing::warn!(repo = %repo, ?e, "backend health check failed, skipping project");
+            tracing::warn!(
+                repo = %repo,
+                error = %e,
+                "backend health check failed (`gh auth status`), skipping project"
+            );
             continue;
         }
         tracing::info!(repo = %repo, backend = backend.name(), "backend connected");
@@ -195,7 +199,13 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     }
 
     if engines.is_empty() {
-        anyhow::bail!("no valid projects configured");
+        let config_path = crate::home::config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "~/.orch/config.yml".to_string());
+        anyhow::bail!(
+            "no valid projects configured — all backends failed health checks. \
+             Config: {config_path}. Run `orch init` to set up a project."
+        );
     }
 
     Ok(engines)
@@ -216,12 +226,6 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // Initialize project engines
     let mut project_engines = init_project_engines().await?;
-
-    if project_engines.is_empty() {
-        anyhow::bail!(
-            "no valid projects configured — run `orch init` or add repos to ~/.orch/config.yml"
-        );
-    }
 
     tracing::info!(
         project_count = project_engines.len(),

@@ -179,8 +179,9 @@ pub fn get_projects() -> anyhow::Result<Vec<String>> {
                     legacy
                 } else {
                     tracing::warn!(
-                        path = %path_str,
-                        "project has no .orch.yml, skipping"
+                        project_dir = %path_str,
+                        tried = %orch_yml.display(),
+                        "project config not found (expected .orch.yml with gh.repo key), skipping"
                     );
                     continue;
                 }
@@ -200,8 +201,8 @@ pub fn get_projects() -> anyhow::Result<Vec<String>> {
             }
 
             tracing::warn!(
-                path = %path_str,
-                "could not read gh.repo from project config"
+                config_file = %config_file.display(),
+                "project config exists but missing `gh.repo` key (expected gh: {{ repo: owner/name }})"
             );
         }
 
@@ -224,7 +225,12 @@ pub fn get_projects() -> anyhow::Result<Vec<String>> {
         }
     }
 
-    anyhow::bail!("no projects configured — run `orch project add <path>` or set projects in ~/.orch/config.yml")
+    let config_path = global_config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~/.orch/config.yml".to_string());
+    anyhow::bail!(
+        "no projects configured. Add projects to {config_path} or run `orch project add <path>`"
+    )
 }
 
 /// Resolve the repo slug for a specific project path.
