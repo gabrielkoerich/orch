@@ -3,6 +3,7 @@ pub mod dashboard;
 pub mod job;
 pub mod service;
 pub mod task;
+pub mod tree;
 
 use crate::channels::transport::Transport;
 use crate::config;

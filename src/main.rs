@@ -230,6 +230,11 @@ enum TaskAction {
         /// Task ID
         id: String,
     },
+    /// Show task tree view (parent-child relationships)
+    Tree {
+        /// Task ID (if omitted, shows all root tasks)
+        id: Option<i64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -412,6 +417,9 @@ async fn main() -> anyhow::Result<()> {
             }
             TaskAction::Cost { id } => {
                 cli::task::cost(&id)?;
+            }
+            TaskAction::Tree { id } => {
+                cli::task::tree(id).await?;
             }
         },
         Commands::Job { action } => match action {

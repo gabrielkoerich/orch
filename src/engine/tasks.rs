@@ -21,7 +21,7 @@ pub struct CreateTaskRequest {
     pub source_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskFilter {
     pub status: Option<String>,
     pub source: Option<String>,
