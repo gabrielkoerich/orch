@@ -27,6 +27,15 @@ pub struct TaskFilter {
     pub source: Option<String>,
 }
 
+impl Default for TaskFilter {
+    fn default() -> Self {
+        Self {
+            status: None,
+            source: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Task {

@@ -442,3 +442,73 @@ pub fn cost(id: &str) -> anyhow::Result<()> {
     // Delegate to cli::cost::show_task for consistent formatting
     super::cost::show_task(id)
 }
+
+/// Show task tree view (parent-child relationships).
+pub async fn tree(id: Option<i64>) -> anyhow::Result<()> {
+    use crate::cli::tree::{build_forest, render_forest, render_single_tree};
+    use crate::engine::tasks::TaskFilter;
+
+    let task_manager = init_task_manager().await?;
+
+    // If a specific task ID is provided, show just that tree
+    if let Some(task_id) = id {
+        let task = task_manager.get_task(task_id).await?;
+
+        // For a single task, we need to find its children
+        // First get all tasks to build the full hierarchy
+        let all_tasks = task_manager.list_tasks(TaskFilter::default()).await?;
+        let forest = build_forest(all_tasks);
+
+        // Find the requested task in the forest
+        fn find_node_in_forest<'a>(
+            forest: &'a [crate::cli::tree::TreeNode],
+            id: &str,
+        ) -> Option<&'a crate::cli::tree::TreeNode> {
+            for root in forest {
+                if root.id == id {
+                    return Some(root);
+                }
+                if let Some(found) = find_node_in_forest(&root.children, id) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let target_id = task_id.to_string();
+        if let Some(node) = find_node_in_forest(&forest, &target_id) {
+            let output = render_single_tree(node, true);
+            print!("{}", output);
+        } else {
+            // Task exists but not in any tree - show as standalone
+            match &task {
+                Task::External(ext) => {
+                    let node = crate::cli::tree::TreeNode::from_external(ext);
+                    let output = render_single_tree(&node, true);
+                    print!("{}", output);
+                }
+                Task::Internal(int) => {
+                    let node = crate::cli::tree::TreeNode::from_internal(int);
+                    let output = render_single_tree(&node, true);
+                    print!("{}", output);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // No ID provided - show all root tasks
+    let filter = TaskFilter::default();
+    let tasks = task_manager.list_tasks(filter).await?;
+
+    if tasks.is_empty() {
+        println!("No tasks found.");
+        return Ok(());
+    }
+
+    let forest = build_forest(tasks);
+    let output = render_forest(&forest);
+    print!("{}", output);
+
+    Ok(())
+}
