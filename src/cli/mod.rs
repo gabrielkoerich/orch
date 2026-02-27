@@ -2,6 +2,7 @@ pub mod cost;
 pub mod job;
 pub mod service;
 pub mod task;
+pub mod dashboard;
 
 use crate::channels::transport::Transport;
 use crate::config;

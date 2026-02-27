@@ -457,8 +457,12 @@ async fn main() -> anyhow::Result<()> {
                 cli::service::status()?;
             }
         },
-        Commands::Metrics => {
+    Commands::Metrics => {
             cli::metrics().await?;
+        }
+        /// Combined dashboard view: tasks, sessions, recent activity
+        Commands::Dashboard => {
+            cli::dashboard::dashboard().await?;
         }
         Commands::Board { action } => match action {
             BoardAction::List => {
