@@ -303,6 +303,7 @@ pub fn get_current_repo() -> anyhow::Result<String> {
 
 /// Skill repository configuration.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SkillConfig {
     /// GitHub repository in "owner/repo" format.
     pub repo: String,
