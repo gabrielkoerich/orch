@@ -14,6 +14,7 @@
 //! The engine owns the full loop: task polling, routing, agent invocation,
 //! git workflow, prompt building, and result handling — all in Rust.
 
+pub mod commands;
 pub mod internal_tasks;
 pub mod jobs;
 pub mod router;
@@ -1034,6 +1035,11 @@ async fn sync_tick(
     // 4. Review open PRs (parse review comments, create follow-ups)
     if let Err(e) = review_open_prs(backend, db, repo).await {
         tracing::warn!(err = %e, "PR review failed");
+    }
+
+    // 5. Scan for owner /slash commands in issue comments
+    if let Err(e) = commands::scan_commands(backend, db, repo).await {
+        tracing::warn!(err = %e, "owner command scan failed");
     }
 
     Ok(())

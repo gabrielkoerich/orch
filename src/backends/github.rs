@@ -218,6 +218,7 @@ impl ExternalBackend for GitHubBackend {
                 body: c.body,
                 author: c.user.login,
                 created_at: c.created_at,
+                issue_url: c.issue_url,
             })
             .collect())
     }
