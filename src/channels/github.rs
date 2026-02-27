@@ -560,7 +560,7 @@ async fn handle_webhook(
 
     if let Some(msg) = parse_github_event(payload, event_type, &state.repo) {
         // Try to send immediately
-        if let Err(_) = state.tx.try_send(msg.clone()) {
+        if state.tx.try_send(msg.clone()).is_err() {
             // Channel full, queue for retry
             tracing::warn!("webhook channel full, queueing for retry");
             let entry = RetryEntry {
