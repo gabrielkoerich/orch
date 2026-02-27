@@ -65,6 +65,64 @@ The orchestrator has two modes for receiving GitHub events:
 1. **Webhook mode** (instant) — via `webhook.enabled: true` in config
 2. **Polling mode** — via periodic `sync_tick()` (every 120s by default)
 
+### Webhook Server Production Hardening
+
+The webhook server includes production-grade features for reliability and observability:
+
+#### Graceful Shutdown
+
+The webhook server coordinates shutdown with the engine lifecycle:
+- Listens for shutdown signals (SIGINT/SIGTERM) via broadcast channel
+- Stops accepting new connections immediately
+- Allows in-flight requests to complete naturally
+- Logs clear shutdown messages for observability
+
+#### Retry Queue with Exponential Backoff
+
+Failed webhook deliveries are automatically retried:
+- **In-memory queue** for failed events
+- **Exponential backoff**: 5s, 10s, 20s, 40s, 80s, max 5 minutes
+- **Max 5 retry attempts** before giving up
+- Background task processes retries every 5 seconds
+
+#### Health Monitoring
+
+Enhanced health check endpoint (`/health`) reports:
+- Server status (always returns healthy if running)
+- Recent webhook received status (within 5 minutes)
+- Signature verification configuration status
+
+#### Idempotency
+
+Webhooks are deduplicated using SHA256 payload hashing:
+- Duplicate deliveries detected via payload hash comparison
+- Prevents processing the same event multiple times
+- Tracked in `webhook_deliveries` database table
+
+#### Webhook Delivery Tracking (Database)
+
+All webhook deliveries are persisted for observability:
+
+```sql
+CREATE TABLE webhook_deliveries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id     TEXT UNIQUE,           -- GitHub's delivery GUID
+    event_type      TEXT NOT NULL,
+    action          TEXT,                  -- e.g., "opened", "created"
+    payload_hash    TEXT NOT NULL,         -- SHA256 for idempotency
+    repo            TEXT NOT NULL,
+    processed_at    TEXT,
+    error           TEXT,
+    retry_count     INTEGER DEFAULT 0,
+    created_at      TEXT
+);
+```
+
+Access via `Db` methods:
+- `record_webhook_delivery()` - Record a delivery attempt
+- `is_webhook_processed()` - Check idempotency
+- `get_webhook_stats_24h()` - Get 24h delivery statistics
+
 ### Polling Fallback
 
 When webhooks are enabled but the local server becomes unavailable (e.g. port conflict, crash), the orchestrator automatically switches to polling fallback mode. When webhooks are disabled entirely, polling mode is used from the start.

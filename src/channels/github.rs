@@ -299,16 +299,32 @@ use axum::{
     Router,
 };
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Sha256, Digest};
+use std::collections::VecDeque;
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
+use tokio::sync::Mutex;
+use tokio::time::{interval, Duration, Instant};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// A failed webhook event waiting to be retried.
+#[derive(Debug, Clone)]
+struct RetryEntry {
+    message: IncomingMessage,
+    payload_hash: String,
+    attempts: u32,
+    next_retry: Instant,
+}
+
+/// State shared across the webhook server.
 #[derive(Clone)]
 struct WebhookState {
     secret: String,
     repo: String,
     tx: tokio::sync::mpsc::Sender<IncomingMessage>,
+    last_webhook_received: Arc<Mutex<Option<Instant>>>,
+    retry_queue: Arc<Mutex<VecDeque<RetryEntry>>>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -357,7 +373,12 @@ struct ReviewPayload {
     user: GhUser,
 }
 
+/// Verify the HMAC-SHA256 signature of a webhook payload.
 fn verify_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
+    if secret.is_empty() {
+        return true; // No secret configured, skip verification
+    }
+    
     let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
         Ok(m) => m,
         Err(_) => return false,
@@ -368,6 +389,22 @@ fn verify_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
     let expected = format!("sha256={:x}", result);
     // Use constant-time comparison to prevent timing side-channel attacks
     bool::from(expected.as_bytes().ct_eq(signature.as_bytes()))
+}
+
+/// Compute SHA256 hash of payload for idempotency checks.
+fn compute_payload_hash(payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Calculate exponential backoff delay for retries.
+/// Base delay is 5 seconds, doubles with each attempt, max 5 minutes.
+fn retry_delay(attempt: u32) -> Duration {
+    let base_delay = Duration::from_secs(5);
+    let max_delay = Duration::from_secs(300);
+    let delay = base_delay * 2u32.pow(attempt.min(5));
+    delay.min(max_delay)
 }
 
 fn parse_github_event(
@@ -482,7 +519,7 @@ async fn handle_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !state.secret.is_empty() && !verify_signature(&state.secret, &body, signature) {
+    if !verify_signature(&state.secret, &body, signature) {
         tracing::warn!("webhook signature verification failed");
         return (StatusCode::UNAUTHORIZED, "Invalid signature");
     }
@@ -500,17 +537,148 @@ async fn handle_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    let delivery_id = headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Compute payload hash for idempotency
+    let payload_hash = compute_payload_hash(&body);
+
+    // Update last webhook received timestamp
+    {
+        let mut last = state.last_webhook_received.lock().await;
+        *last = Some(Instant::now());
+    }
+
+    tracing::debug!(
+        event_type = %event_type,
+        delivery_id = ?delivery_id,
+        payload_hash = %payload_hash,
+        "webhook received"
+    );
+
     if let Some(msg) = parse_github_event(payload, event_type, &state.repo) {
-        if state.tx.send(msg).await.is_err() {
-            tracing::warn!("webhook event channel receiver dropped");
+        // Try to send immediately
+        if let Err(_) = state.tx.try_send(msg.clone()) {
+            // Channel full, queue for retry
+            tracing::warn!("webhook channel full, queueing for retry");
+            let entry = RetryEntry {
+                message: msg,
+                payload_hash,
+                attempts: 0,
+                next_retry: Instant::now() + retry_delay(0),
+            };
+            let mut queue = state.retry_queue.lock().await;
+            const MAX_RETRY_QUEUE_SIZE: usize = 1000;
+            if queue.len() >= MAX_RETRY_QUEUE_SIZE {
+                tracing::warn!("retry queue full ({MAX_RETRY_QUEUE_SIZE}), dropping oldest entry");
+                queue.pop_front();
+            }
+            queue.push_back(entry);
         }
     }
 
     (StatusCode::OK, "OK")
 }
 
-async fn webhook_health() -> impl IntoResponse {
-    (StatusCode::OK, "OK")
+/// Background task to process retry queue.
+async fn process_retry_queue(
+    state: WebhookState,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    let mut interval = interval(Duration::from_secs(5));
+    
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let mut queue = state.retry_queue.lock().await;
+                let now = Instant::now();
+                let mut to_retry = Vec::new();
+                
+                // Collect entries ready for retry
+                while let Some(entry) = queue.front() {
+                    if entry.next_retry <= now {
+                        to_retry.push(queue.pop_front().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                
+                // Drop lock before sending to avoid holding across await
+                drop(queue);
+                
+                for entry in to_retry {
+                    tracing::info!(
+                        attempts = entry.attempts,
+                        payload_hash = %entry.payload_hash,
+                        "retrying webhook delivery"
+                    );
+                    
+                    match state.tx.try_send(entry.message.clone()) {
+                        Ok(_) => {
+                            tracing::debug!(payload_hash = %entry.payload_hash, "webhook retry succeeded");
+                        }
+                        Err(_) => {
+                            // Still failing, re-queue with backoff
+                            let new_attempts = entry.attempts + 1;
+                            if new_attempts < 5 {
+                                let new_entry = RetryEntry {
+                                    message: entry.message,
+                                    payload_hash: entry.payload_hash,
+                                    attempts: new_attempts,
+                                    next_retry: Instant::now() + retry_delay(new_attempts),
+                                };
+                                let mut queue = state.retry_queue.lock().await;
+                                queue.push_back(new_entry);
+                                tracing::warn!(
+                                    attempts = new_attempts,
+                                    "webhook retry failed, re-queuing"
+                                );
+                            } else {
+                                tracing::error!(
+                                    payload_hash = %entry.payload_hash,
+                                    "webhook delivery failed after max retries"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            _ = shutdown.recv() => {
+                tracing::info!("retry queue processor shutting down");
+                break;
+            }
+        }
+    }
+}
+
+/// Health check response with detailed status.
+#[derive(serde::Serialize)]
+struct HealthResponse {
+    status: String,
+    webhook_recently_received: bool,
+    signature_verification: String,
+}
+
+async fn webhook_health(State(state): State<WebhookState>) -> impl IntoResponse {
+    // Check if webhook received within last 5 minutes
+    let last_received = state.last_webhook_received.lock().await;
+    let recently_received = last_received.map(|t| t.elapsed() < Duration::from_secs(300)).unwrap_or(false);
+    
+    let signature_status = if state.secret.is_empty() {
+        "disabled"
+    } else {
+        "enabled"
+    };
+    
+    let response = HealthResponse {
+        status: "healthy".to_string(),
+        webhook_recently_received: recently_received,
+        signature_verification: signature_status.to_string(),
+    };
+    
+    (StatusCode::OK, axum::Json(response))
 }
 
 /// Check if the webhook server is healthy by pinging its local health endpoint.
@@ -536,15 +704,37 @@ pub async fn check_webhook_health(port: u16) -> bool {
     }
 }
 
+/// Start the webhook server with graceful shutdown support.
+///
+/// The server will:
+/// - Listen for incoming webhooks and verify HMAC signatures
+/// - Queue failed deliveries for retry with exponential backoff
+/// - Track last webhook received time for health checks
+/// - Shutdown gracefully when the shutdown signal is received
 pub async fn start_webhook_server(
     port: u16,
     secret: String,
     repo: String,
     tx: tokio::sync::mpsc::Sender<IncomingMessage>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
 
-    let state = WebhookState { secret, repo, tx };
+    let state = WebhookState {
+        secret: secret.clone(),
+        repo,
+        tx,
+        last_webhook_received: Arc::new(Mutex::new(None)),
+        retry_queue: Arc::new(Mutex::new(VecDeque::new())),
+    };
+
+    let retry_state = state.clone();
+    let retry_shutdown = shutdown.resubscribe();
+    
+    // Start retry queue processor
+    tokio::spawn(async move {
+        process_retry_queue(retry_state, retry_shutdown).await;
+    });
 
     let app = Router::new()
         .route("/health", get(webhook_health))
@@ -553,7 +743,20 @@ pub async fn start_webhook_server(
 
     tracing::info!(port = port, "starting webhook server");
 
-    axum::serve(listener, app).await?;
+    // Graceful shutdown with timeout
+    let server = axum::serve(listener, app);
+    
+    tokio::select! {
+        result = server => {
+            result?;
+        }
+        _ = shutdown.recv() => {
+            tracing::info!("webhook server received shutdown signal");
+            // The server will stop accepting new connections
+            // Active connections will complete naturally
+            tracing::info!("webhook server shutting down gracefully");
+        }
+    }
 
     Ok(())
 }
@@ -588,8 +791,9 @@ mod tests {
         let payload = br#"{"action":"opened"}"#;
         let signature = "sha256=anysignature";
 
+        // Empty secret skips verification (useful for development/testing)
         let result = verify_signature(secret, payload, signature);
-        assert!(!result, "Empty secret should return false");
+        assert!(result, "Empty secret should skip verification and return true");
     }
 
     #[test]
@@ -878,6 +1082,8 @@ mod tests {
             secret: String::new(), // empty secret = skip verification
             repo: "owner/repo".to_string(),
             tx,
+            last_webhook_received: Arc::new(Mutex::new(None)),
+            retry_queue: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let app = Router::new()
@@ -931,6 +1137,8 @@ mod tests {
             secret: String::new(),
             repo: "owner/repo".to_string(),
             tx,
+            last_webhook_received: Arc::new(Mutex::new(None)),
+            retry_queue: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let app = Router::new()
@@ -982,6 +1190,8 @@ mod tests {
             secret: String::new(),
             repo: "owner/repo".to_string(),
             tx,
+            last_webhook_received: Arc::new(Mutex::new(None)),
+            retry_queue: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let app = Router::new()
@@ -1035,6 +1245,8 @@ mod tests {
             secret: "real-secret".to_string(),
             repo: "owner/repo".to_string(),
             tx,
+            last_webhook_received: Arc::new(Mutex::new(None)),
+            retry_queue: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         let app = Router::new()

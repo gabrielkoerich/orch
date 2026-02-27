@@ -394,6 +394,9 @@ pub async fn serve() -> anyhow::Result<()> {
     // Notify used by webhook events to wake up the engine tick immediately
     let webhook_notify = Arc::new(Notify::new());
 
+    // Shutdown broadcast channel for graceful shutdown
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
     // Track webhook state for health checks and fallback.
     // When webhooks are disabled, `in_fallback_mode` stays true so sync
     // uses the faster fallback interval for polling.
@@ -421,9 +424,12 @@ pub async fn serve() -> anyhow::Result<()> {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
 
-        // Spawn the HTTP server (runs until shutdown)
+        // Get shutdown receiver for webhook server
+        let webhook_shutdown = shutdown_tx.subscribe();
+
+        // Spawn the HTTP server with graceful shutdown
         tokio::spawn(async move {
-            if let Err(e) = start_webhook_server(port, secret, webhook_repo, tx).await {
+            if let Err(e) = start_webhook_server(port, secret, webhook_repo, tx, webhook_shutdown).await {
                 tracing::error!(?e, "webhook server failed");
             }
         });
@@ -448,7 +454,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
         webhook_healthy = true;
         in_fallback_mode = false;
-        tracing::info!(port, "webhook server started");
+        tracing::info!(port, "webhook server started with graceful shutdown support");
     } else {
         webhook_port = None;
         webhook_healthy = false;
@@ -670,6 +676,16 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Graceful shutdown
+    tracing::info!("initiating graceful shutdown...");
+    
+    // Signal webhook server to shut down
+    if webhook_enabled {
+        tracing::info!("signaling webhook server to shut down...");
+        let _ = shutdown_tx.send(());
+        // Give webhook server time to shut down gracefully
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    
     tracing::info!("draining active sessions...");
     let sessions = tmux.list_sessions().await?;
     if !sessions.is_empty() {

@@ -178,6 +178,11 @@ impl Db {
             conn.pragma_update(None, "user_version", 3)?;
         }
 
+        if version < 4 {
+            conn.execute_batch(SCHEMA_V4)?;
+            conn.pragma_update(None, "user_version", 4)?;
+        }
+
         Ok(())
     }
 
@@ -766,6 +771,64 @@ impl Db {
             .collect();
         Ok(groups)
     }
+
+    /// Record a webhook delivery attempt.
+    pub async fn record_webhook_delivery(
+        &self,
+        delivery_id: Option<&str>,
+        event_type: &str,
+        action: Option<&str>,
+        payload_hash: &str,
+        repo: &str,
+        error: Option<&str>,
+    ) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO webhook_deliveries (delivery_id, event_type, action, payload_hash, repo, error) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![delivery_id, event_type, action, payload_hash, repo, error],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Check if a webhook with the given payload hash was already processed (idempotency check).
+    pub async fn is_webhook_processed(&self, payload_hash: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM webhook_deliveries WHERE payload_hash = ?1 AND error IS NULL",
+            [payload_hash],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Get webhook delivery stats for the last 24 hours.
+    pub async fn get_webhook_stats_24h(&self) -> anyhow::Result<WebhookStats> {
+        let conn = self.conn.lock().await;
+
+        let total_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM webhook_deliveries WHERE created_at >= datetime('now', '-24 hours')",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let success_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM webhook_deliveries WHERE created_at >= datetime('now', '-24 hours') AND error IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let failure_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM webhook_deliveries WHERE created_at >= datetime('now', '-24 hours') AND error IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(WebhookStats {
+            total_24h: total_count,
+            success_24h: success_count,
+            failure_24h: failure_count,
+        })
+    }
 }
 
 /// Metrics summary for the CLI output.
@@ -840,6 +903,14 @@ pub struct CostByGroup {
     pub output_tokens: i64,
     pub total_cost_usd: f64,
     pub task_count: i64,
+}
+
+/// Webhook delivery statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookStats {
+    pub total_24h: i64,
+    pub success_24h: i64,
+    pub failure_24h: i64,
 }
 
 /// Schema v1 — initial tables for internal tasks and jobs.
@@ -935,6 +1006,28 @@ ALTER TABLE task_metrics ADD COLUMN output_tokens INTEGER DEFAULT NULL;
 ALTER TABLE task_metrics ADD COLUMN input_cost_usd REAL DEFAULT NULL;
 ALTER TABLE task_metrics ADD COLUMN output_cost_usd REAL DEFAULT NULL;
 ALTER TABLE task_metrics ADD COLUMN total_cost_usd REAL DEFAULT NULL;
+"#;
+
+/// Schema v4 — adds webhook_deliveries table for tracking webhook events.
+const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_id     TEXT UNIQUE,           -- GitHub's delivery GUID
+    event_type      TEXT NOT NULL,
+    action          TEXT,                  -- e.g., "opened", "created", "submitted"
+    payload_hash    TEXT NOT NULL,         -- SHA256 hash for idempotency
+    repo            TEXT NOT NULL,
+    processed_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    error           TEXT DEFAULT NULL,
+    retry_count     INTEGER DEFAULT 0,
+    created_at      TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_delivery_id ON webhook_deliveries(delivery_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_event_type ON webhook_deliveries(event_type);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payload_hash ON webhook_deliveries(payload_hash);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_created_at ON webhook_deliveries(created_at);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_error ON webhook_deliveries(error);
 "#;
 
 #[cfg(test)]
