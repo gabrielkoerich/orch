@@ -69,6 +69,9 @@ tower-http = { version = "0.5", features = ["trace"] }
 # HMAC for webhook signature verification
 hmac = "0.12"
 
+# Constant-time comparison for timing-safe signature verification
+subtle = "2"
+
 # Async combinators (FuturesUnordered for concurrent routing)
 futures = "0.3"
 
