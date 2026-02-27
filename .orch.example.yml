@@ -29,7 +29,7 @@ gh:
 #   review_owner: "@myhandle"
 #   enable_review_agent: true
 #   auto_create_followup_on_changes: true
-#   auto_merge_on_approval: false
+#   auto_close_task_on_approval: false
 
 # router:
 #   agent: "claude"

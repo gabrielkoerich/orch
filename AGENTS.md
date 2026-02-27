@@ -121,8 +121,9 @@ The orchestrator automatically creates follow-up tasks when PR reviews request c
 workflow:
   # Auto-create follow-up tasks when PR reviews request changes (default: true)
   auto_create_followup_on_changes: true
-  # Auto-merge PRs when approved (default: false, future enhancement)
-  auto_merge_on_approval: false
+  # Auto-close task (mark Done) when all PR reviews are approved (default: false).
+  # Note: this does NOT merge the PR -- only updates the task status.
+  auto_close_task_on_approval: false
 ```
 
 ### Follow-up Task Content
@@ -137,7 +138,7 @@ Follow-up tasks include:
 ### Status Updates
 
 - Parent task remains in `in_review` while follow-ups are addressed
-- When a review is approved and `auto_merge_on_approval` is enabled, the parent task is marked as `done`
+- When a review is approved and `auto_close_task_on_approval` is enabled, the parent task is marked as `done`
 
 ## Complexity-based model routing
 

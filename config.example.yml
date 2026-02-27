@@ -18,8 +18,9 @@ workflow:
   #   complex: 3600
   # Auto-create follow-up tasks when PR reviews request changes (default: true)
   auto_create_followup_on_changes: true
-  # Auto-merge PRs when approved (default: false, future enhancement)
-  auto_merge_on_approval: false
+  # Auto-close task (mark Done) when all PR reviews are approved (default: false).
+  # Note: this does NOT merge the PR -- only updates the task status.
+  auto_close_task_on_approval: false
 router:
   mode: "llm"  # "llm" (default) or "round_robin"
   agent: "claude"
