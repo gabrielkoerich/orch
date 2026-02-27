@@ -22,7 +22,6 @@ pub mod runner;
 pub mod tasks;
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
-use crate::parser::Delegation;
 use crate::channels::capture::CaptureService;
 use crate::channels::discord::DiscordChannel;
 use crate::channels::github::start_webhook_server;
@@ -949,28 +948,6 @@ async fn tick(
                         }
                     }
 
-                    // Process delegations if status is blocked
-                    if status == "blocked" {
-                        let delegations_json = sidecar::get(&task_id, "delegations").unwrap_or_default();
-                        if !delegations_json.is_empty() {
-                            match serde_json::from_str::<Vec<Delegation>>(&delegations_json) {
-                                Ok(delegations) => {
-                                    if let Err(e) = process_delegations(
-                                        &*backend,
-                                        &task_owned,
-                                        &delegations,
-                                    )
-                                    .await
-                                    {
-                                        tracing::error!(task_id, error = %e, "failed to process delegations");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(task_id, error = %e, delegations_json, "failed to parse delegations");
-                                }
-                            }
-                        }
-                    }
                 }
                 Err(e) => {
                     tracing::error!(task_id, ?e, "task runner failed");
@@ -1069,67 +1046,6 @@ async fn tick(
     if let Err(e) = jobs::tick(jobs_path, backend, db).await {
         tracing::error!(?e, "job scheduler tick failed");
     }
-
-    Ok(())
-}
-
-/// Process delegations from an agent response — create child tasks, mark parent blocked.
-async fn process_delegations(
-    backend: &dyn ExternalBackend,
-    parent_task: &ExternalTask,
-    delegations: &[Delegation],
-) -> anyhow::Result<()> {
-    if delegations.is_empty() {
-        return Ok(());
-    }
-
-    // 1. Create child issues on GitHub
-    let mut child_ids = Vec::new();
-    for delegation in delegations {
-        let mut labels = delegation.labels.clone();
-        labels.push("status:new".to_string());
-        labels.push(format!("parent:{}", parent_task.id.0));
-
-        let child_body = format!(
-            "{}\n\n---\n_Delegated from #{}_",
-            delegation.body, parent_task.id.0
-        );
-
-        let child_id = backend
-            .create_task(&delegation.title, &child_body, &labels)
-            .await?;
-
-        child_ids.push(child_id.0.clone());
-        tracing::info!(
-            parent = parent_task.id.0,
-            child = child_id.0,
-            title = delegation.title,
-            "created delegated subtask"
-        );
-    }
-
-    // 2. Mark parent as blocked
-    backend.update_status(&parent_task.id, Status::Blocked).await?;
-    tracing::info!(
-        task_id = parent_task.id.0,
-        children = child_ids.len(),
-        "marked parent as blocked pending subtasks"
-    );
-
-    // 3. Post comment on parent listing delegated subtasks
-    let summary = delegations
-        .iter()
-        .enumerate()
-        .map(|(i, d)| format!("{}. {}", i + 1, d.title))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let comment = format!(
-        "Delegated {} subtask(s):\n\n{}\n\nParent task is blocked until all subtasks complete.",
-        delegations.len(),
-        summary
-    );
-    backend.post_comment(&parent_task.id, &comment).await?;
 
     Ok(())
 }
