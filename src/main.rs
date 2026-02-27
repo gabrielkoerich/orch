@@ -9,6 +9,7 @@ mod engine;
 mod github;
 mod home;
 mod parser;
+mod cmd_cache;
 #[allow(dead_code)] // security module ready for use, not integrated yet
 pub mod security;
 mod sidecar;

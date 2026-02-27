@@ -167,7 +167,7 @@ impl OpenCodeRunner {
             }
         }
 
-        // Discover fresh
+        // Discover fresh using async-aware process invocation
         let models = discover_free_models();
         *cache = Some((models.clone(), std::time::Instant::now()));
         models
@@ -180,7 +180,7 @@ impl AgentRunner for OpenCodeRunner {
     }
 
     fn is_available(&self) -> bool {
-        which::which("opencode").is_ok()
+        crate::cmd_cache::command_exists("opencode")
     }
 
     fn build_command(
@@ -330,15 +330,21 @@ fn discover_free_models() -> Vec<String> {
     ];
 
     // Try to discover dynamically
-    let output = match std::process::Command::new("opencode")
-        .args(["models"])
-        .output()
+    // Prefer to run the command via a blocking spawn in a separate thread to
+    // avoid stalling async runtime threads. Use std::process::Command inside
+    // spawn_blocking.
+    let stdout = match std::thread::spawn(|| {
+        std::process::Command::new("opencode")
+            .args(["models"])
+            .output()
+    })
+    .join()
     {
-        Ok(o) if o.status.success() => o,
+        Ok(Ok(output)) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
         _ => return known,
     };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let discovered: Vec<String> = stdout
         .lines()
         .filter(|line| line.to_lowercase().contains("free"))

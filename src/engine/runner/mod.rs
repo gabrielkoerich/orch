@@ -545,7 +545,7 @@ impl TaskRunner {
                 let chain = response::get_reroute_chain(task_id);
                 let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
                     .iter()
-                    .filter(|a| which::which(a).is_ok())
+                    .filter(|a| crate::cmd_cache::command_exists(a))
                     .map(|s| s.to_string())
                     .collect();
 
