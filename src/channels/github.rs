@@ -299,7 +299,7 @@ use axum::{
     Router,
 };
 use hmac::{Hmac, Mac};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -378,7 +378,7 @@ fn verify_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
     if secret.is_empty() {
         return true; // No secret configured, skip verification
     }
-    
+
     let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
         Ok(m) => m,
         Err(_) => return false,
@@ -588,14 +588,14 @@ async fn process_retry_queue(
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let mut interval = interval(Duration::from_secs(5));
-    
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 let mut queue = state.retry_queue.lock().await;
                 let now = Instant::now();
                 let mut to_retry = Vec::new();
-                
+
                 // Collect entries ready for retry
                 while let Some(entry) = queue.front() {
                     if entry.next_retry <= now {
@@ -604,17 +604,17 @@ async fn process_retry_queue(
                         break;
                     }
                 }
-                
+
                 // Drop lock before sending to avoid holding across await
                 drop(queue);
-                
+
                 for entry in to_retry {
                     tracing::info!(
                         attempts = entry.attempts,
                         payload_hash = %entry.payload_hash,
                         "retrying webhook delivery"
                     );
-                    
+
                     match state.tx.try_send(entry.message.clone()) {
                         Ok(_) => {
                             tracing::debug!(payload_hash = %entry.payload_hash, "webhook retry succeeded");
@@ -664,20 +664,22 @@ struct HealthResponse {
 async fn webhook_health(State(state): State<WebhookState>) -> impl IntoResponse {
     // Check if webhook received within last 5 minutes
     let last_received = state.last_webhook_received.lock().await;
-    let recently_received = last_received.map(|t| t.elapsed() < Duration::from_secs(300)).unwrap_or(false);
-    
+    let recently_received = last_received
+        .map(|t| t.elapsed() < Duration::from_secs(300))
+        .unwrap_or(false);
+
     let signature_status = if state.secret.is_empty() {
         "disabled"
     } else {
         "enabled"
     };
-    
+
     let response = HealthResponse {
         status: "healthy".to_string(),
         webhook_recently_received: recently_received,
         signature_verification: signature_status.to_string(),
     };
-    
+
     (StatusCode::OK, axum::Json(response))
 }
 
@@ -730,7 +732,7 @@ pub async fn start_webhook_server(
 
     let retry_state = state.clone();
     let retry_shutdown = shutdown.resubscribe();
-    
+
     // Start retry queue processor
     tokio::spawn(async move {
         process_retry_queue(retry_state, retry_shutdown).await;
@@ -745,7 +747,7 @@ pub async fn start_webhook_server(
 
     // Graceful shutdown with timeout
     let server = axum::serve(listener, app);
-    
+
     tokio::select! {
         result = server => {
             result?;
@@ -793,7 +795,10 @@ mod tests {
 
         // Empty secret skips verification (useful for development/testing)
         let result = verify_signature(secret, payload, signature);
-        assert!(result, "Empty secret should skip verification and return true");
+        assert!(
+            result,
+            "Empty secret should skip verification and return true"
+        );
     }
 
     #[test]

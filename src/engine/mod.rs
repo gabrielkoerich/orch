@@ -429,7 +429,9 @@ pub async fn serve() -> anyhow::Result<()> {
 
         // Spawn the HTTP server with graceful shutdown
         tokio::spawn(async move {
-            if let Err(e) = start_webhook_server(port, secret, webhook_repo, tx, webhook_shutdown).await {
+            if let Err(e) =
+                start_webhook_server(port, secret, webhook_repo, tx, webhook_shutdown).await
+            {
                 tracing::error!(?e, "webhook server failed");
             }
         });
@@ -454,7 +456,10 @@ pub async fn serve() -> anyhow::Result<()> {
 
         webhook_healthy = true;
         in_fallback_mode = false;
-        tracing::info!(port, "webhook server started with graceful shutdown support");
+        tracing::info!(
+            port,
+            "webhook server started with graceful shutdown support"
+        );
     } else {
         webhook_port = None;
         webhook_healthy = false;
@@ -677,7 +682,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // Graceful shutdown
     tracing::info!("initiating graceful shutdown...");
-    
+
     // Signal webhook server to shut down
     if webhook_enabled {
         tracing::info!("signaling webhook server to shut down...");
@@ -685,7 +690,7 @@ pub async fn serve() -> anyhow::Result<()> {
         // Give webhook server time to shut down gracefully
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-    
+
     tracing::info!("draining active sessions...");
     let sessions = tmux.list_sessions().await?;
     if !sessions.is_empty() {
