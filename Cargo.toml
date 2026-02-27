@@ -1,6 +1,6 @@
 [package]
 name = "orch"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 edition = "2021"
 description = "Orch — The Agent Orchestrator (Rust core)"
 license = "MIT"
