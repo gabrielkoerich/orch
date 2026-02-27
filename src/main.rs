@@ -25,8 +25,8 @@ struct Cli {
     command: Commands,
 }
 
-    #[derive(Subcommand)]
-    enum Commands {
+#[derive(Subcommand)]
+enum Commands {
     /// Start the orchestrator service
     Serve,
     /// Show version information
@@ -459,10 +459,10 @@ async fn main() -> anyhow::Result<()> {
                 cli::service::status()?;
             }
         },
-    Commands::Metrics => {
+        Commands::Metrics => {
             cli::metrics().await?;
         }
-        /// Combined dashboard view: tasks, sessions, recent activity
+        // Combined dashboard view: tasks, sessions, recent activity
         Commands::Dashboard => {
             cli::dashboard::dashboard().await?;
         }
