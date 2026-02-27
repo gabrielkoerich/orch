@@ -479,6 +479,26 @@ impl GhCli {
         }
     }
 
+    /// Add a sub-issue relationship using the GitHub GraphQL API.
+    pub async fn add_sub_issue(
+        &self,
+        parent_node_id: &str,
+        child_node_id: &str,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            r#"mutation {{
+                addSubIssue(input: {{issueId: "{}", subIssueId: "{}"}}) {{
+                    issue {{ number }}
+                    subIssue {{ number }}
+                }}
+            }}"#,
+            parent_node_id, child_node_id
+        );
+
+        self.graphql(&query).await?;
+        Ok(())
+    }
+
     pub async fn get_sub_issues(&self, repo: &str, number: &str) -> anyhow::Result<Vec<u64>> {
         // Parse owner and repo from "owner/repo" format
         let parts: Vec<&str> = repo.split('/').collect();

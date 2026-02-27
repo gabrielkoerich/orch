@@ -185,6 +185,24 @@ pub trait ExternalBackend: Send + Sync {
     /// Empty list means no sub-issues or sub-issues not supported.
     async fn get_sub_issues(&self, id: &ExternalId) -> anyhow::Result<Vec<ExternalId>>;
 
+    /// Create a child task and link it as a sub-issue of the parent.
+    ///
+    /// Creates the task via `create_task`, then attempts to establish
+    /// a native sub-issue relationship. Falls back to `parent:{id}` label
+    /// if the native link fails.
+    async fn create_sub_task(
+        &self,
+        parent_id: &ExternalId,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> anyhow::Result<ExternalId> {
+        // Default: create task with parent label, no native sub-issue link
+        let mut all_labels = labels.to_vec();
+        all_labels.push(format!("parent:{}", parent_id.0));
+        self.create_task(title, body, &all_labels).await
+    }
+
     /// Ensure a status label exists in the backend system.
     ///
     /// Called by the default `update_status` before applying labels.

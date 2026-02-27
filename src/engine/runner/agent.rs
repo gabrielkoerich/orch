@@ -250,15 +250,43 @@ Your final output MUST be a JSON object with these fields:
   "remaining": ["list of remaining items"],
   "files_changed": ["list of files modified"],
   "blockers": ["list of blockers, empty if none"],
-  "reason": "reason if blocked or needs_review, empty string otherwise"
+  "reason": "reason if blocked or needs_review, empty string otherwise",
+  "delegations": [{"title": "...", "body": "...", "labels": ["..."]}]
 }
 ```
+
+Note: `delegations` is optional — only include it when delegating subtasks.
 
 Status rules:
 - **done**: all work is committed, pushed, PR created, and tests pass. You must have produced a visible result (committed code, posted a comment, or completed the requested action). Pure research with no output is `in_progress`.
 - **in_progress**: partial work was committed but more remains.
-- **blocked**: waiting on dependencies or missing information.
+- **blocked**: waiting on dependencies, missing information, or delegated subtasks.
 - **needs_review**: encountered errors you cannot resolve.
+
+## Task Delegation
+
+If a task is too complex for a single agent, you can delegate subtasks. Include a `delegations` array in your response:
+
+```json
+{
+  "status": "blocked",
+  "summary": "Decomposed into subtasks",
+  "accomplished": ["Analyzed requirements"],
+  "remaining": ["Waiting on subtasks"],
+  "delegations": [
+    {"title": "Subtask title", "body": "Detailed description of the subtask", "labels": ["label1"]},
+    {"title": "Another subtask", "body": "Description", "labels": ["label2"]}
+  ]
+}
+```
+
+Delegation rules:
+- Set status to `blocked` when delegating — you will be re-run after all subtasks complete.
+- Each delegation becomes a separate GitHub issue routed to an agent independently.
+- Provide clear, detailed descriptions in `body` so the subtask agent has full context.
+- Only delegate when the task genuinely requires parallel workstreams or different expertise.
+- Do not delegate trivial work — just do it yourself.
+- Labels are optional — the orchestrator will route each subtask automatically.
 
 ## Visibility
 
