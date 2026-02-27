@@ -6,6 +6,7 @@
 //! 3. Classifies errors (timeout, usage limit, auth, tooling)
 //! 4. Determines next action (success, reroute, needs_review)
 
+use crate::engine::runner::agents::patterns;
 use crate::parser::{self, AgentResponse};
 use crate::sidecar;
 use fs2::FileExt; // for try_lock_exclusive / unlock
@@ -59,7 +60,9 @@ pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> Ru
     // Check exit code first
     if exit_code != 0 {
         // Check for missing tooling
-        if let Some(tool) = detect_missing_tooling(&combined) {
+        if let Some(crate::engine::runner::agents::AgentError::MissingTool { tool }) =
+            patterns::detect_missing_tool(&combined)
+        {
             return RunResult::MissingTooling(format!("missing tool: {tool}"));
         }
 
@@ -69,12 +72,12 @@ pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> Ru
         }
 
         // Usage/rate limit
-        if is_usage_limit_error(&combined) {
+        if patterns::detect_rate_limit(&combined).is_some() {
             return RunResult::UsageLimit(snippet(&combined));
         }
 
         // Auth/billing error
-        if is_auth_error(&combined) {
+        if patterns::detect_auth_error(&combined).is_some() {
             return RunResult::AuthError(snippet(&combined));
         }
 
@@ -85,10 +88,10 @@ pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> Ru
     // Exit 0 — try to parse response
     if response_content.is_empty() {
         // Empty response might be usage limit
-        if is_usage_limit_error(&stderr) {
+        if patterns::detect_rate_limit(&stderr).is_some() {
             return RunResult::UsageLimit(snippet(&stderr));
         }
-        if is_auth_error(&stderr) {
+        if patterns::detect_auth_error(&stderr).is_some() {
             return RunResult::AuthError(snippet(&stderr));
         }
         return RunResult::Failed("empty agent response".to_string());
@@ -100,7 +103,7 @@ pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> Ru
             // Check if agent self-reported usage limit
             if matches!(resp.status.as_str(), "needs_review" | "blocked") {
                 if let Some(ref reason) = resp.error {
-                    if is_usage_limit_error(reason) {
+                    if patterns::detect_rate_limit(reason).is_some() {
                         return RunResult::UsageLimit(snippet(reason));
                     }
                 }
@@ -113,7 +116,9 @@ pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> Ru
                 resp.summary,
                 resp.remaining.join(" "),
             );
-            if let Some(tool) = detect_missing_tooling(&check_text) {
+            if let Some(crate::engine::runner::agents::AgentError::MissingTool { tool }) =
+                patterns::detect_missing_tool(&check_text)
+            {
                 return RunResult::MissingTooling(format!("missing tool: {tool}"));
             }
 
@@ -121,10 +126,10 @@ pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> Ru
         }
         Err(_) => {
             // Failed to parse — check for known error patterns
-            if is_usage_limit_error(&combined) {
+            if patterns::detect_rate_limit(&combined).is_some() {
                 return RunResult::UsageLimit(snippet(&combined));
             }
-            if is_auth_error(&combined) {
+            if patterns::detect_auth_error(&combined).is_some() {
                 return RunResult::AuthError(snippet(&combined));
             }
             RunResult::Failed("invalid agent response JSON".to_string())
@@ -190,115 +195,6 @@ pub fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> Strin
     }
 
     String::new()
-}
-
-/// Check if output indicates a usage/rate limit error (legacy helper).
-#[allow(dead_code)]
-fn is_usage_limit_error(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    let patterns = [
-        "rate limit",
-        "rate_limit",
-        "ratelimit",
-        "too many requests",
-        "429",
-        "usage limit",
-        "quota exceeded",
-        "overloaded",
-        "capacity",
-        "throttled",
-        "credit balance too low",
-        "insufficient_quota",
-        "tokens_exceeded",
-        "context_length_exceeded",
-    ];
-    patterns.iter().any(|p| lower.contains(p))
-}
-
-/// Check if output indicates an auth/billing error (legacy helper).
-#[allow(dead_code)]
-fn is_auth_error(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    let patterns = [
-        "unauthorized",
-        "invalid api",
-        "invalid key",
-        "invalid token",
-        "auth fail",
-        "401",
-        "403",
-        "no api key",
-        "no token",
-        "expired key",
-        "expired token",
-        "expired plan",
-        "billing",
-        "insufficient credit",
-        "payment required",
-    ];
-    patterns.iter().any(|p| lower.contains(p))
-}
-
-/// Detect missing tooling from agent output (legacy helper).
-#[allow(dead_code)]
-fn detect_missing_tooling(text: &str) -> Option<String> {
-    let known_tools = [
-        "bun",
-        "node",
-        "npm",
-        "pnpm",
-        "yarn",
-        "deno",
-        "tsc",
-        "eslint",
-        "prettier",
-        "jest",
-        "vitest",
-        "cargo",
-        "rustc",
-        "go",
-        "python",
-        "python3",
-        "pip",
-        "pip3",
-        "uv",
-        "poetry",
-        "pytest",
-        "ruff",
-        "black",
-        "mypy",
-        "make",
-        "cmake",
-        "ninja",
-        "just",
-        "bats",
-        "docker",
-        "docker-compose",
-        "podman",
-        "kubectl",
-        "helm",
-        "terraform",
-        "anchor",
-        "avm",
-        "solana",
-        "solana-test-validator",
-    ];
-
-    let lower = text.to_lowercase();
-
-    for tool in &known_tools {
-        // Check "command not found" patterns
-        if lower.contains(&format!("{tool}: command not found"))
-            || lower.contains(&format!("command not found: {tool}"))
-            || lower.contains(&format!("{tool}: not found"))
-            || lower.contains(&format!("env: {tool}: no such file"))
-            || lower.contains(&format!("spawn {tool} enoent"))
-        {
-            return Some(tool.to_string());
-        }
-    }
-
-    None
 }
 
 /// Cooldown duration for failed agents (30 minutes).
@@ -776,55 +672,68 @@ pub fn store_failure_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::runner::agents::AgentError;
 
     #[test]
     fn is_usage_limit_detects_rate_limit() {
-        assert!(is_usage_limit_error("Error: rate limit exceeded"));
-        assert!(is_usage_limit_error("HTTP 429 Too Many Requests"));
-        assert!(is_usage_limit_error("quota exceeded for model"));
-        assert!(is_usage_limit_error("context_length_exceeded"));
+        assert!(patterns::detect_rate_limit("Error: rate limit exceeded").is_some());
+        assert!(patterns::detect_rate_limit("HTTP 429 Too Many Requests").is_some());
+        assert!(patterns::detect_rate_limit("quota exceeded for model").is_some());
+        // context_length_exceeded is handled by detect_context_overflow, not detect_rate_limit
+        assert!(patterns::detect_context_overflow("context_length_exceeded").is_some());
     }
 
     #[test]
     fn is_usage_limit_rejects_normal_text() {
-        assert!(!is_usage_limit_error("task completed successfully"));
-        assert!(!is_usage_limit_error(""));
+        assert!(patterns::detect_rate_limit("task completed successfully").is_none());
+        assert!(patterns::detect_rate_limit("").is_none());
     }
 
     #[test]
     fn is_auth_error_detects_common_patterns() {
-        assert!(is_auth_error("401 Unauthorized"));
-        assert!(is_auth_error("invalid api key provided"));
-        assert!(is_auth_error("Your billing plan has expired"));
-        assert!(is_auth_error("Error: 403 Forbidden"));
+        assert!(patterns::detect_auth_error("401 Unauthorized").is_some());
+        assert!(patterns::detect_auth_error("invalid api key provided").is_some());
+        assert!(patterns::detect_auth_error("Your billing plan has expired").is_some());
+        assert!(patterns::detect_auth_error("Error: 403 Forbidden").is_some());
     }
 
     #[test]
     fn is_auth_error_rejects_normal_text() {
-        assert!(!is_auth_error("task completed successfully"));
-        assert!(!is_auth_error(""));
+        assert!(patterns::detect_auth_error("task completed successfully").is_none());
+        assert!(patterns::detect_auth_error("").is_none());
     }
 
     #[test]
     fn detect_missing_tooling_finds_known_tools() {
-        assert_eq!(
-            detect_missing_tooling("bun: command not found"),
-            Some("bun".to_string())
-        );
-        assert_eq!(
-            detect_missing_tooling("env: anchor: no such file"),
-            Some("anchor".to_string())
-        );
-        assert_eq!(
-            detect_missing_tooling("spawn docker enoent"),
-            Some("docker".to_string())
-        );
+        let result = patterns::detect_missing_tool("bun: command not found");
+        assert!(result.is_some());
+        if let AgentError::MissingTool { tool } = result.unwrap() {
+            assert_eq!(tool, "bun");
+        } else {
+            panic!("expected MissingTool error");
+        }
+
+        let result = patterns::detect_missing_tool("env: anchor: no such file");
+        assert!(result.is_some());
+        if let AgentError::MissingTool { tool } = result.unwrap() {
+            assert_eq!(tool, "anchor");
+        } else {
+            panic!("expected MissingTool error");
+        }
+
+        let result = patterns::detect_missing_tool("spawn docker enoent");
+        assert!(result.is_some());
+        if let AgentError::MissingTool { tool } = result.unwrap() {
+            assert_eq!(tool, "docker");
+        } else {
+            panic!("expected MissingTool error");
+        }
     }
 
     #[test]
     fn detect_missing_tooling_returns_none_for_normal() {
-        assert!(detect_missing_tooling("everything works fine").is_none());
-        assert!(detect_missing_tooling("").is_none());
+        assert!(patterns::detect_missing_tool("everything works fine").is_none());
+        assert!(patterns::detect_missing_tool("").is_none());
     }
 
     #[test]
