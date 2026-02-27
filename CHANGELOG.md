@@ -1,5 +1,67 @@
 # Changelog
 
+## 2026-02-27 — Comment-Based Review Workflow & PR Maintenance
+
+### Summary
+
+Implemented a comment-based automated review workflow as the default merge path,
+since GitHub doesn't allow reviewing your own PRs via the review API. Also addressed
+review feedback across 13 previously merged PRs and rebased/merged 4 new agent PRs.
+
+### Features
+
+- **Comment-based review workflow** (PR #172): New review mechanism using PR issue comments
+  - Review agent posts `## Automated Review — Approve` or `## Automated Review — Changes Requested` on PRs
+  - `orch-review.yml` GitHub Actions workflow installed by `orch init` — gates merging based on review comments
+  - Triggers on `push`, checks latest review comment, passes/fails CI accordingly
+  - `auto_merge_pr` verifies review approval and polls CI status before merging
+  - Both comment-based and PR review API paths coexist (PR reviews kept for future use)
+  - `workflow.enable_review_agent` now defaults to `true` (set `"false"` to disable)
+
+### Bug Fixes
+
+- **Review feedback fixes** (PR #171): Addressed automated review comments across 9 merged PRs:
+  - Fixed UTF-8 boundary panic in review context truncation
+  - Fixed race condition guard for duplicate review agent spawns
+  - Added `GraphQL-Features: sub_issues` header for GitHub preview API
+  - Fixed `review_and_merge` to use passed TmuxManager instead of creating new one
+  - Fixed `auto_merge_pr` to use `GhCli::close_issue` instead of direct API call
+  - Improved `extract_json_block` to search all code blocks and validate JSON
+  - Deduplicated `get_sub_issues` GraphQL query and NDJSON parsing
+  - Fixed dashboard duplicate API calls and empty time-ago display
+- **Comment spoofing prevention**: `get_automated_review_status` now verifies comment author
+  is a repo collaborator before trusting review decisions
+- **Pending CI timeout**: No longer silently merges when CI checks are still pending —
+  sets task to `in_review` and retries on next engine tick
+- **Duplicate step numbering**: Fixed `// 12.` → `// 13.` in `review_and_merge`
+
+### New GhCli Methods
+
+- `get_combined_status` — aggregate CI check run status for a git ref
+- `rerun_failed_jobs` — re-run failed GitHub Actions jobs
+- `get_latest_run_for_branch` — get latest workflow run for a branch
+- `dispatch_workflow` — trigger a workflow dispatch
+- `get_automated_review_status` — check latest review comment with author verification
+
+### Tests
+
+- Added unit tests for review comment header parsing
+- Added `parse_ndjson` edge case tests (empty input, single/multiple objects)
+- **321+ tests** passing, zero clippy warnings, clean `cargo fmt`
+
+### PRs Merged
+
+| PR | Title | Notes |
+|----|-------|-------|
+| #171 | fix: address review feedback across merged PRs | UTF-8 panics, race conditions, API headers |
+| #172 | feat: comment-based review workflow with CI gate | Review via comments + CI gate |
+| #180 | docs: update PLAN.md with implementation status | PLAN.md audit by kimi |
+| #181 | chore: document retained unused router functions | Dead code documentation |
+| #182 | fix: replace unwrap() with expect() on regex patterns | LazyLock + expect() |
+| #183 | refactor: use patterns module for error detection | Deduplicate error patterns |
+
+---
+
 ## 2026-02-26 (cont.) — Model Map Fix, Polling Fallback & Cleanup
 
 ### Summary

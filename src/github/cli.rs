@@ -809,6 +809,9 @@ impl GhCli {
     /// Returns `Some("approve")` or `Some("changes_requested")` based on the
     /// latest PR issue comment starting with "## Automated Review".
     /// Returns `None` if no automated review comment exists.
+    ///
+    /// Only considers comments from collaborators on the repo to prevent
+    /// spoofing by unauthorized users.
     pub async fn get_automated_review_status(
         &self,
         repo: &str,
@@ -816,18 +819,43 @@ impl GhCli {
     ) -> anyhow::Result<Option<String>> {
         let comments = self.list_comments(repo, &pr_number.to_string()).await?;
 
-        // Find the latest "Automated Review" comment
-        let latest = comments
-            .iter()
-            .rev()
-            .find(|c| c.body.starts_with("## Automated Review"));
+        // Find the latest "Automated Review" comment from a collaborator
+        let mut latest: Option<&crate::github::types::GitHubComment> = None;
+        for c in comments.iter().rev() {
+            if !c.body.starts_with("## Automated Review") {
+                continue;
+            }
+            // Verify the comment author is a repo collaborator
+            match self.is_collaborator(repo, &c.user.login).await {
+                Ok(true) => {
+                    latest = Some(c);
+                    break;
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        user = %c.user.login,
+                        pr_number,
+                        "ignoring automated review comment from non-collaborator"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        user = %c.user.login,
+                        error = %e,
+                        "failed to check collaborator status, skipping comment"
+                    );
+                    continue;
+                }
+            }
+        }
 
         match latest {
             Some(c) => {
                 let first_line = c.body.lines().next().unwrap_or("");
-                if first_line.contains("Automated Review — Approve") {
+                if first_line.contains("Automated Review \u{2014} Approve") {
                     Ok(Some("approve".to_string()))
-                } else if first_line.contains("Automated Review — Changes Requested") {
+                } else if first_line.contains("Automated Review \u{2014} Changes Requested") {
                     Ok(Some("changes_requested".to_string()))
                 } else {
                     Ok(None)
@@ -875,5 +903,58 @@ mod tests {
         assert_eq!(status_label_color("agent:claude"), "c5def5");
         assert_eq!(status_label_color("enhancement"), "c5def5");
         assert_eq!(status_label_color(""), "c5def5");
+    }
+
+    #[test]
+    fn parse_ndjson_empty_input() {
+        let result: Vec<serde_json::Value> = parse_ndjson(b"").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_ndjson_single_object() {
+        let input = br#"{"id": 1, "name": "test"}"#;
+        let result: Vec<serde_json::Value> = parse_ndjson(input).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["id"], 1);
+    }
+
+    #[test]
+    fn parse_ndjson_multiple_objects() {
+        let input = b"{\"a\": 1}\n{\"a\": 2}\n{\"a\": 3}\n";
+        let result: Vec<serde_json::Value> = parse_ndjson(input).unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    /// Test the review comment header parsing logic used by
+    /// `get_automated_review_status` and the GitHub Actions workflow.
+    #[test]
+    fn review_comment_header_approve() {
+        let body = "## Automated Review \u{2014} Approve\n\nLooks good!";
+        let first_line = body.lines().next().unwrap_or("");
+        assert!(first_line.contains("Automated Review \u{2014} Approve"));
+        assert!(!first_line.contains("Changes Requested"));
+    }
+
+    #[test]
+    fn review_comment_header_changes_requested() {
+        let body = "## Automated Review \u{2014} Changes Requested\n\nPlease fix the issues below.";
+        let first_line = body.lines().next().unwrap_or("");
+        assert!(first_line.contains("Automated Review \u{2014} Changes Requested"));
+        assert!(!first_line.contains("Approve\n"));
+    }
+
+    #[test]
+    fn review_comment_header_unknown_format() {
+        let body = "## Automated Review\n\nSome other format";
+        let first_line = body.lines().next().unwrap_or("");
+        assert!(!first_line.contains("Approve"));
+        assert!(!first_line.contains("Changes Requested"));
+    }
+
+    #[test]
+    fn review_comment_non_review_comment_ignored() {
+        let body = "This is a regular comment, not a review.";
+        assert!(!body.starts_with("## Automated Review"));
     }
 }

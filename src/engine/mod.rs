@@ -1958,7 +1958,7 @@ async fn review_and_merge(
         }
     }
 
-    // 12. Handle the decision
+    // 13. Handle the decision
     match decision {
         ReviewDecision::Approve => {
             let auto_merge = config::get("workflow.auto_merge")
@@ -2085,7 +2085,16 @@ async fn auto_merge_pr(
                 // pending
                 if start.elapsed() >= max_wait {
                     tracing::warn!(task_id = task.id.0, "CI checks still pending after timeout");
-                    break; // Try to merge anyway — checks might not be required
+                    backend
+                        .post_comment(
+                            &task.id,
+                            "⚠️ Auto-merge: CI checks still pending after timeout. Will merge when checks complete.",
+                        )
+                        .await?;
+                    // Don't merge with unknown CI status — set status to in_review
+                    // so the next engine tick re-checks
+                    backend.update_status(&task.id, Status::InReview).await?;
+                    return Ok(());
                 }
             }
         }
