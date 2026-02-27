@@ -1220,7 +1220,7 @@ async fn cleanup_done_worktrees(
     // Resolve the main repository root for git operations.
     // We need this because worktree removal and branch deletion must run
     // from the main repo, not from the (soon-to-be-deleted) worktree dir.
-    let repo_root = resolve_repo_root().await?;
+    let repo_root = resolve_repo_root(repo).await?;
 
     // Get worktrees base path
     let worktrees_base = crate::home::worktrees_dir()
@@ -1320,16 +1320,53 @@ async fn cleanup_done_worktrees(
     Ok(())
 }
 
-/// Resolve the main git repository root path.
-async fn resolve_repo_root() -> anyhow::Result<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output_with_context()
-        .await?;
-    if !output.status.success() {
-        anyhow::bail!("failed to resolve git repo root");
+/// Resolve the main git repository root path for a project.
+///
+/// Looks up the local project path from config, then verifies it's a git repo.
+/// This avoids relying on cwd (which is undefined under launchd services).
+async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
+    // Look up the local path from registered projects
+    let paths = crate::config::get_project_paths().unwrap_or_default();
+    for path_str in &paths {
+        let path = std::path::Path::new(path_str);
+        let orch_yml = path.join(".orch.yml");
+        let legacy = path.join(".orchestrator.yml");
+        let config_file = if orch_yml.exists() {
+            orch_yml
+        } else if legacy.exists() {
+            legacy
+        } else {
+            continue;
+        };
+        if let Ok(content) = std::fs::read_to_string(&config_file) {
+            if let Ok(doc) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                if let Some(r) = doc
+                    .get("gh")
+                    .and_then(|gh| gh.get("repo"))
+                    .and_then(|r| r.as_str())
+                {
+                    if r == repo {
+                        return Ok(path_str.clone());
+                    }
+                }
+            }
+        }
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+
+    // Fallback: try bare clone in ~/.orch/projects/
+    let bare = crate::home::projects_dir()
+        .map(|d| d.join(repo.replace('/', "__")))
+        .unwrap_or_default();
+    if bare.exists() {
+        return Ok(bare.display().to_string());
+    }
+
+    anyhow::bail!(
+        "cannot find local path for project {repo} — \
+         checked {} registered project(s) and bare clone at {}",
+        paths.len(),
+        bare.display()
+    )
 }
 
 /// Check for merged PRs and update task status accordingly.
