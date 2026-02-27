@@ -683,11 +683,7 @@ impl Db {
     pub async fn get_cost_summary(&self) -> anyhow::Result<CostSummary> {
         let conn = self.conn.lock().await;
 
-        let windows = [
-            ("24 hours", "24h"),
-            ("7 days", "7d"),
-            ("30 days", "30d"),
-        ];
+        let windows = [("24 hours", "24h"), ("7 days", "7d"), ("30 days", "30d")];
 
         let mut periods = Vec::new();
         for (interval, label) in &windows {

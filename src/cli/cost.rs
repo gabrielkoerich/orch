@@ -16,7 +16,10 @@ pub fn show_task(id: &str) -> anyhow::Result<()> {
     let pricing = sidecar::pricing_for_model(&model);
 
     println!("Task #{}: cost breakdown", id);
-    println!("├── Input tokens:  {:>12}", format_tokens(usage.input_tokens));
+    println!(
+        "├── Input tokens:  {:>12}",
+        format_tokens(usage.input_tokens)
+    );
     println!(
         "├── Output tokens: {:>12}",
         format_tokens(usage.output_tokens)
@@ -113,7 +116,13 @@ pub async fn show_by_agent() -> anyhow::Result<()> {
         );
     }
     println!("{}", "-".repeat(60));
-    println!("{:<12} {:>10} {:>10} {:>10}", "", "", "", format!("${:.4}", total_cost));
+    println!(
+        "{:<12} {:>10} {:>10} {:>10}",
+        "",
+        "",
+        "",
+        format!("${:.4}", total_cost)
+    );
     println!();
 
     Ok(())
