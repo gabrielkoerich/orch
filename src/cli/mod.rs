@@ -84,11 +84,104 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
         println!("Project already registered in global config");
     }
 
+    // Install orch-review workflow
+    install_review_workflow(&cwd)?;
+
     // Guidance for board setup
     println!();
     println!("Next steps:");
     println!("  orch board list     — find GitHub Projects V2 boards");
     println!("  orch board link <id> — link a board for status tracking");
+
+    Ok(())
+}
+
+/// The orch review gate workflow template.
+/// Installed by `orch init` into `.github/workflows/orch-review.yml`.
+const ORCH_REVIEW_WORKFLOW: &str = r###"# Orch Review Gate - installed by `orch init`
+# Checks PR issue comments for automated review decisions.
+# "Automated Review - Approve" -> pass, "Automated Review - Changes Requested" -> fail.
+name: Orch Review Gate
+
+on:
+  push:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  review-gate:
+    runs-on: ubuntu-latest
+    # Skip the default branch - only gate feature branches with PRs
+    if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+    steps:
+      - name: Check automated review status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_REF#refs/heads/}"
+
+          # Find the open PR for this branch
+          PR_NUMBER=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" \
+            --state open --json number -q '.[0].number' 2>/dev/null || true)
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open PR for branch $BRANCH - skipping review gate."
+            exit 0
+          fi
+
+          echo "Checking review status for PR #${PR_NUMBER} (branch: $BRANCH)"
+
+          # Get the latest "Automated Review" comment body
+          LATEST_BODY=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --paginate \
+            --jq '[.[] | select(.body | startswith("## Automated Review"))] | sort_by(.created_at) | last | .body // empty' \
+            2>/dev/null || true)
+
+          if [ -z "$LATEST_BODY" ]; then
+            echo "No automated review comments found - review pending."
+            exit 0
+          fi
+
+          FIRST_LINE=$(echo "$LATEST_BODY" | head -1)
+
+          if echo "$FIRST_LINE" | grep -q "Approve"; then
+            echo "Automated review: approved"
+            exit 0
+          elif echo "$FIRST_LINE" | grep -q "Changes Requested"; then
+            echo "Automated review: changes requested"
+            echo ""
+            echo "$LATEST_BODY" | tail -n +3
+            exit 1
+          else
+            echo "Unrecognized review comment format - passing by default"
+            exit 0
+          fi
+"###;
+
+/// Install the orch review gate workflow into the project.
+fn install_review_workflow(project_dir: &std::path::Path) -> anyhow::Result<()> {
+    let workflows_dir = project_dir.join(".github").join("workflows");
+    let workflow_path = workflows_dir.join("orch-review.yml");
+
+    if workflow_path.exists() {
+        println!(
+            "Review workflow already exists: {}",
+            workflow_path.display()
+        );
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&workflows_dir)?;
+    std::fs::write(&workflow_path, ORCH_REVIEW_WORKFLOW)?;
+    println!(
+        "Installed review gate workflow: {}",
+        workflow_path.display()
+    );
 
     Ok(())
 }

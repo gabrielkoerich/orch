@@ -653,6 +653,187 @@ impl GhCli {
 
         Ok(all_numbers)
     }
+
+    /// Get the combined CI check status for a git ref (branch or SHA).
+    ///
+    /// Returns a tuple of `(state, total, passing, failing, pending)`.
+    /// `state` is one of "success", "failure", "pending".
+    pub async fn get_combined_status(
+        &self,
+        repo: &str,
+        git_ref: &str,
+    ) -> anyhow::Result<(String, u64, u64, u64, u64)> {
+        // Use the checks endpoint which combines both status checks and check runs
+        let endpoint = format!("repos/{repo}/commits/{git_ref}/check-runs");
+        let output = Command::new("gh")
+            .arg("api")
+            .arg("--paginate")
+            .arg("--jq")
+            .arg(".check_runs[]")
+            .args([&endpoint])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh api failed: {stderr}");
+        }
+
+        let runs: Vec<serde_json::Value> = parse_ndjson(&output.stdout)?;
+
+        let mut passing = 0u64;
+        let mut failing = 0u64;
+        let mut pending = 0u64;
+
+        for run in &runs {
+            let conclusion = run.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+            let status = run
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("queued");
+
+            match status {
+                "completed" => match conclusion {
+                    "success" | "neutral" | "skipped" => passing += 1,
+                    _ => failing += 1,
+                },
+                _ => pending += 1,
+            }
+        }
+
+        let total = runs.len() as u64;
+        let state = if failing > 0 {
+            "failure".to_string()
+        } else if pending > 0 || total == 0 {
+            "pending".to_string()
+        } else {
+            "success".to_string()
+        };
+
+        Ok((state, total, passing, failing, pending))
+    }
+
+    /// Re-run failed jobs for a GitHub Actions workflow run.
+    pub async fn rerun_failed_jobs(&self, repo: &str, run_id: u64) -> anyhow::Result<()> {
+        let endpoint = format!("repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs");
+        let output = Command::new("gh")
+            .arg("api")
+            .args([&endpoint, "-X", "POST"])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("rerun-failed-jobs failed: {stderr}");
+        }
+        Ok(())
+    }
+
+    /// Get the latest workflow run for a branch.
+    ///
+    /// Returns `(run_id, status, conclusion)` for the most recent run.
+    pub async fn get_latest_run_for_branch(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> anyhow::Result<Option<(u64, String, String)>> {
+        let endpoint = format!("repos/{repo}/actions/runs");
+        let json = self
+            .api(&[
+                &endpoint,
+                "-f",
+                &format!("branch={branch}"),
+                "-f",
+                "per_page=1",
+            ])
+            .await?;
+
+        let resp: serde_json::Value = serde_json::from_slice(&json)?;
+        let runs = resp
+            .get("workflow_runs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if runs.is_empty() {
+            return Ok(None);
+        }
+
+        let run = &runs[0];
+        let id = run.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let status = run
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let conclusion = run
+            .get("conclusion")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(Some((id, status, conclusion)))
+    }
+
+    /// Trigger a workflow dispatch for a specific branch.
+    pub async fn dispatch_workflow(
+        &self,
+        repo: &str,
+        workflow: &str,
+        branch: &str,
+    ) -> anyhow::Result<()> {
+        let endpoint = format!("repos/{repo}/actions/workflows/{workflow}/dispatches");
+        let payload = serde_json::json!({ "ref": branch });
+        let mut child = Command::new("gh")
+            .arg("api")
+            .args([&endpoint, "-X", "POST", "--input", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(payload.to_string().as_bytes()).await?;
+            drop(stdin);
+        }
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("workflow dispatch failed: {stderr}");
+        }
+        Ok(())
+    }
+
+    /// Check the latest automated review comment on a PR.
+    ///
+    /// Returns `Some("approve")` or `Some("changes_requested")` based on the
+    /// latest PR issue comment starting with "## Automated Review".
+    /// Returns `None` if no automated review comment exists.
+    pub async fn get_automated_review_status(
+        &self,
+        repo: &str,
+        pr_number: u64,
+    ) -> anyhow::Result<Option<String>> {
+        let comments = self.list_comments(repo, &pr_number.to_string()).await?;
+
+        // Find the latest "Automated Review" comment
+        let latest = comments
+            .iter()
+            .rev()
+            .find(|c| c.body.starts_with("## Automated Review"));
+
+        match latest {
+            Some(c) => {
+                let first_line = c.body.lines().next().unwrap_or("");
+                if first_line.contains("Automated Review — Approve") {
+                    Ok(Some("approve".to_string()))
+                } else if first_line.contains("Automated Review — Changes Requested") {
+                    Ok(Some("changes_requested".to_string()))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 /// Return the hex color string for a given `status:*` label.
