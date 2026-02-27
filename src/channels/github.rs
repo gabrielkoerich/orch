@@ -7,7 +7,6 @@ use super::{Channel, IncomingMessage, OutgoingMessage, OutputChunk};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
-use std::process::Command;
 use tokio::sync::broadcast;
 
 pub struct GitHubChannel {
@@ -53,14 +52,15 @@ impl GitHubChannel {
             self.repo
         ));
 
-        let output = Command::new("gh")
+        let output = tokio::process::Command::new("gh")
             .args([
                 "api",
                 &url,
                 "--header",
                 "Accept: application/vnd.github.v3+json",
             ])
-            .output()?;
+            .output()
+            .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -77,14 +77,15 @@ impl GitHubChannel {
             self.repo, issue_number
         ));
 
-        let output = Command::new("gh")
+        let output = tokio::process::Command::new("gh")
             .args([
                 "api",
                 &url,
                 "--header",
                 "Accept: application/vnd.github.v3+json",
             ])
-            .output()?;
+            .output()
+            .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -95,13 +96,13 @@ impl GitHubChannel {
         Ok(comments)
     }
 
-    fn post_comment(&self, issue_number: u64, body: &str) -> anyhow::Result<()> {
+    async fn post_comment(&self, issue_number: u64, body: &str) -> anyhow::Result<()> {
         let url = self.gh_api(&format!(
             "/repos/{}/issues/{}/comments",
             self.repo, issue_number
         ));
 
-        let output = Command::new("gh")
+        let output = tokio::process::Command::new("gh")
             .args([
                 "api",
                 &url,
@@ -112,7 +113,8 @@ impl GitHubChannel {
                 "--raw-field",
                 &format!("body={}", body),
             ])
-            .output()?;
+            .output()
+            .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -219,7 +221,7 @@ impl Channel for GitHubChannel {
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid issue number: {}", msg.thread_id))?;
 
-        self.post_comment(issue_number, &msg.body)
+        self.post_comment(issue_number, &msg.body).await
     }
 
     async fn stream_output(
@@ -240,15 +242,15 @@ impl Channel for GitHubChannel {
                 chunk = rx.recv() => {
                     match chunk {
                         Ok(chunk) => {
-                            if chunk.is_final {
-                                if !buffer.is_empty() {
-                                    let _ = self.post_comment(issue_number, &buffer);
-                                    buffer.clear();
-                                }
-                                let _ = self.post_comment(issue_number, "---");
-                                let _ = self.post_comment(issue_number, "Session complete.");
-                                break;
-                            }
+                                    if chunk.is_final {
+                                        if !buffer.is_empty() {
+                                            let _ = self.post_comment(issue_number, &buffer).await;
+                                            buffer.clear();
+                                        }
+                                        let _ = self.post_comment(issue_number, "---").await;
+                                        let _ = self.post_comment(issue_number, "Session complete.").await;
+                                        break;
+                                    }
 
                             buffer.push_str(&chunk.content);
                         }
@@ -266,7 +268,7 @@ impl Channel for GitHubChannel {
             }
 
             if last_post.elapsed() >= post_interval && !buffer.is_empty() {
-                let _ = self.post_comment(issue_number, &buffer);
+                let _ = self.post_comment(issue_number, &buffer).await;
                 buffer.clear();
                 last_post = std::time::Instant::now();
             }
@@ -276,7 +278,10 @@ impl Channel for GitHubChannel {
     }
 
     async fn health_check(&self) -> anyhow::Result<()> {
-        let output = Command::new("gh").args(["auth", "status"]).output()?;
+        let output = tokio::process::Command::new("gh")
+            .args(["auth", "status"])
+            .output()
+            .await?;
 
         if !output.status.success() {
             anyhow::bail!("gh auth not logged in");

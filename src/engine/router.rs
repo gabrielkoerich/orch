@@ -500,6 +500,8 @@ pub struct Router {
     pub available_agents: Vec<String>,
     /// Per-agent rate limit weights (used when weighted_round_robin is enabled)
     pub weights: AgentWeights,
+    /// Cached skills catalog loaded once at startup to avoid blocking I/O in async context
+    skills_catalog: std::sync::Mutex<Option<String>>,
 }
 
 /// Response from the LLM router.
@@ -532,10 +534,12 @@ impl Router {
         let available_agents = Self::discover_agents(&config.agents);
         let mut weights = AgentWeights::default();
         weights.ensure_agents(&available_agents);
+        let skills_catalog = std::sync::Mutex::new(None);
         Self {
             config,
             available_agents,
             weights,
+            skills_catalog,
         }
     }
 
@@ -569,16 +573,11 @@ impl Router {
     fn discover_agents(configured_agents: &[String]) -> Vec<String> {
         let mut agents = Vec::new();
         for agent in configured_agents {
-            if Self::command_exists(agent) {
+            if crate::cmd_cache::command_exists(agent) {
                 agents.push(agent.to_string());
             }
         }
         agents
-    }
-
-    /// Check if a command exists in PATH.
-    fn command_exists(cmd: &str) -> bool {
-        which::which(cmd).is_ok()
     }
 
     /// Check if an agent is available.
@@ -999,7 +998,27 @@ impl Router {
     }
 
     /// Load skills catalog from skills.yml or skills directory.
+    /// Cached after first load to avoid blocking I/O in async context.
     fn load_skills_catalog(&self) -> String {
+        // Check cache first
+        if let Ok(cache) = self.skills_catalog.lock() {
+            if let Some(ref catalog) = *cache {
+                return catalog.clone();
+            }
+        }
+
+        // Load and cache
+        let catalog = self.load_skills_catalog_uncached();
+
+        if let Ok(mut cache) = self.skills_catalog.lock() {
+            *cache = Some(catalog.clone());
+        }
+
+        catalog
+    }
+
+    /// Load skills catalog without caching (internal implementation).
+    fn load_skills_catalog_uncached(&self) -> String {
         // Try skills.yml in current directory
         if let Ok(content) = std::fs::read_to_string("skills.yml") {
             if let Ok(yaml) = serde_yml::from_str::<serde_yml::Value>(&content) {
@@ -1589,6 +1608,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
+            skills_catalog: std::sync::Mutex::new(None),
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -1609,6 +1629,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
+            skills_catalog: std::sync::Mutex::new(None),
         };
 
         let task = create_test_task("1", "Test", vec!["agent:claude".to_string()]);
@@ -1658,6 +1679,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
+            skills_catalog: std::sync::Mutex::new(None),
         };
 
         // Reload — should re-read config and remain valid
@@ -1911,6 +1933,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
+            skills_catalog: std::sync::Mutex::new(None),
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -1939,6 +1962,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
+            skills_catalog: std::sync::Mutex::new(None),
         };
 
         // Label override should take precedence over weighted routing

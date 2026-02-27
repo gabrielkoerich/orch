@@ -8,6 +8,8 @@
 
 use crate::parser::{self, AgentResponse};
 use crate::sidecar;
+use fs2::FileExt; // for try_lock_exclusive / unlock
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 /// Classification of agent execution result (legacy, used in tests).
@@ -314,6 +316,8 @@ fn cooldowns_path() -> std::path::PathBuf {
         .join("agent_cooldowns.json")
 }
 
+// Expose lockable file operations to tests or other modules if needed
+
 /// Record that an agent has failed and should be temporarily avoided.
 pub fn record_agent_failure(agent_name: &str) {
     record_failure_with_reason(agent_name, "agent_error");
@@ -357,24 +361,70 @@ fn read_cooldowns_file() -> serde_json::Map<String, serde_json::Value> {
     if !path.exists() {
         return serde_json::Map::new();
     }
+    // Read without locking; callers use locking where needed
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     serde_json::from_str(&content).unwrap_or_default()
 }
 
 fn record_failure_with_reason(key: &str, reason: &str) {
     let path = cooldowns_path();
-    let mut cooldowns = read_cooldowns_file();
+    // Ensure the directory exists
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
 
-    // Record failure with current timestamp
-    let timestamp = chrono::Utc::now().timestamp();
-    cooldowns.insert(
-        key.to_string(),
-        serde_json::json!({ "failed_at": timestamp, "reason": reason }),
-    );
+    // Use an advisory file lock to guard read-modify-write across processes.
+    // fs2 provides a simple cross-platform lock via File::try_lock_exclusive().
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        // Use blocking lock to avoid race conditions (try_lock + fallback is unsafe)
+        if f.lock_exclusive().is_ok() {
+            let mut cooldowns = serde_json::Map::new();
+            // Read existing content
+            let mut content = String::new();
+            if f.read_to_string(&mut content).is_ok() && !content.is_empty() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(map) = v.as_object() {
+                        cooldowns = map.clone();
+                    }
+                }
+            }
 
-    // Write back
-    if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns)) {
-        std::fs::write(&path, content).ok();
+            // Record failure with current timestamp
+            let timestamp = chrono::Utc::now().timestamp();
+            cooldowns.insert(
+                key.to_string(),
+                serde_json::json!({ "failed_at": timestamp, "reason": reason }),
+            );
+
+            if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns))
+            {
+                // Truncate then write
+                let _ = f.set_len(0);
+                let _ = f.rewind();
+                let _ = f.write_all(content.as_bytes());
+            }
+
+            let _ = f.unlock();
+        } else {
+            tracing::warn!("could not acquire lock on cooldowns file, skipping write");
+        }
+    } else {
+        // Can't open file — write directly
+        let mut cooldowns = read_cooldowns_file();
+        let timestamp = chrono::Utc::now().timestamp();
+        cooldowns.insert(
+            key.to_string(),
+            serde_json::json!({ "failed_at": timestamp, "reason": reason }),
+        );
+        if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns)) {
+            std::fs::write(&path, content).ok();
+        }
     }
 }
 
@@ -385,25 +435,49 @@ pub fn clear_expired_cooldowns() {
         return;
     }
 
-    let mut cooldowns = read_cooldowns_file();
+    // Use same file-locking strategy as record_failure_with_reason
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        // Use blocking lock to avoid race conditions
+        if f.lock_exclusive().is_ok() {
+            let mut content = String::new();
+            if f.read_to_string(&mut content).is_ok() {
+                let mut cooldowns = if !content.is_empty() {
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&content)
+                        .unwrap_or_default()
+                } else {
+                    serde_json::Map::new()
+                };
 
-    let now = chrono::Utc::now().timestamp();
-    let mut to_remove = Vec::new();
+                let now = chrono::Utc::now().timestamp();
+                let mut to_remove = Vec::new();
+                for (agent, entry) in &cooldowns {
+                    if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
+                        if (now - failed_at) >= AGENT_COOLDOWN_SECS {
+                            to_remove.push(agent.clone());
+                        }
+                    }
+                }
+                for agent in to_remove {
+                    cooldowns.remove(&agent);
+                }
 
-    for (agent, entry) in &cooldowns {
-        if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
-            if (now - failed_at) >= AGENT_COOLDOWN_SECS {
-                to_remove.push(agent.clone());
+                if let Ok(content) =
+                    serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns))
+                {
+                    let _ = f.set_len(0);
+                    let _ = f.rewind();
+                    let _ = f.write_all(content.as_bytes());
+                }
             }
+
+            let _ = f.unlock();
+        } else {
+            tracing::warn!("could not acquire lock on cooldowns file, skipping cleanup");
         }
-    }
-
-    for agent in to_remove {
-        cooldowns.remove(&agent);
-    }
-
-    if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns)) {
-        std::fs::write(&path, content).ok();
     }
 }
 
@@ -467,7 +541,7 @@ pub fn handle_failover(
     // Get all available agents
     let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
         .iter()
-        .filter(|a| which::which(a).is_ok())
+        .filter(|a| crate::cmd_cache::command_exists(a))
         .map(|s| s.to_string())
         .collect();
 
