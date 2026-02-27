@@ -76,6 +76,7 @@ pub enum TaskStatus {
     InProgress,
     Done,
     Blocked,
+    InReview,
     NeedsReview,
 }
 
@@ -88,6 +89,7 @@ impl TaskStatus {
             Self::InProgress => "in_progress",
             Self::Done => "done",
             Self::Blocked => "blocked",
+            Self::InReview => "in_review",
             Self::NeedsReview => "needs_review",
         }
     }
@@ -99,6 +101,7 @@ impl TaskStatus {
             "in_progress" => Some(Self::InProgress),
             "done" => Some(Self::Done),
             "blocked" => Some(Self::Blocked),
+            "in_review" => Some(Self::InReview),
             "needs_review" => Some(Self::NeedsReview),
             _ => None,
         }
