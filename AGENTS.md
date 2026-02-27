@@ -100,6 +100,45 @@ engine:
 | Issue close/reopen | Instant | Next sync |
 | PR merge events | Instant | Next sync |
 
+## PR Review Integration
+
+The orchestrator automatically creates follow-up tasks when PR reviews request changes, closing the feedback loop between code review and agent execution.
+
+### How It Works
+
+1. The engine periodically checks tasks in `in_review` status (every sync interval)
+2. For each task with an open PR, it fetches PR reviews from GitHub
+3. When a review requests changes (`CHANGES_REQUESTED`), it:
+   - Creates an internal follow-up task for each actionable review comment
+   - Links the follow-up to the parent task via `source_id`
+   - Stores PR context (PR number, branch, reviewer, file path) in the sidecar
+   - Routes the follow-up to the same agent that created the original PR
+   - Posts a comment on the original issue about the follow-up task
+
+### Configuration
+
+```yaml
+workflow:
+  # Auto-create follow-up tasks when PR reviews request changes (default: true)
+  auto_create_followup_on_changes: true
+  # Auto-merge PRs when approved (default: false, future enhancement)
+  auto_merge_on_approval: false
+```
+
+### Follow-up Task Content
+
+Follow-up tasks include:
+- File path and line number from the review comment
+- Diff context (truncated if > 2000 chars)
+- The reviewer's comment
+- Overall review notes from the review body
+- Link to the parent task
+
+### Status Updates
+
+- Parent task remains in `in_review` while follow-ups are addressed
+- When a review is approved and `auto_merge_on_approval` is enabled, the parent task is marked as `done`
+
 ## Complexity-based model routing
 
 The router assigns `complexity: simple|medium|complex` instead of specific model names. The actual model is resolved per agent from `config.yml`:
