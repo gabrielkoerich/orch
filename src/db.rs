@@ -27,6 +27,11 @@ pub struct TaskMetric {
     pub attempts: i32,
     pub files_changed: i32,
     pub error_type: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub input_cost_usd: Option<f64>,
+    pub output_cost_usd: Option<f64>,
+    pub total_cost_usd: Option<f64>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -44,6 +49,11 @@ pub struct InsertTaskMetric<'a> {
     pub attempts: i32,
     pub files_changed: i32,
     pub error_type: Option<&'a str>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub input_cost_usd: Option<f64>,
+    pub output_cost_usd: Option<f64>,
+    pub total_cost_usd: Option<f64>,
 }
 
 /// Rate limit event record — tracks rate limit occurrences.
@@ -161,6 +171,11 @@ impl Db {
         if version < 2 {
             conn.execute_batch(SCHEMA_V2)?;
             conn.pragma_update(None, "user_version", 2)?;
+        }
+
+        if version < 3 {
+            conn.execute_batch(SCHEMA_V3)?;
+            conn.pragma_update(None, "user_version", 3)?;
         }
 
         Ok(())
@@ -376,8 +391,8 @@ impl Db {
     pub async fn insert_task_metric(&self, metric: InsertTaskMetric<'_>) -> anyhow::Result<i64> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO task_metrics (task_id, agent, model, complexity, outcome, duration_seconds, started_at, completed_at, attempts, files_changed, error_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO task_metrics (task_id, agent, model, complexity, outcome, duration_seconds, started_at, completed_at, attempts, files_changed, error_type, input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             rusqlite::params![
                 metric.task_id,
                 metric.agent,
@@ -390,6 +405,11 @@ impl Db {
                 metric.attempts,
                 metric.files_changed,
                 metric.error_type,
+                metric.input_tokens,
+                metric.output_tokens,
+                metric.input_cost_usd,
+                metric.output_cost_usd,
+                metric.total_cost_usd,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -399,13 +419,13 @@ impl Db {
     pub async fn get_task_metrics(&self, task_id: &str) -> anyhow::Result<Vec<TaskMetric>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, agent, model, complexity, outcome, duration_seconds, started_at, completed_at, attempts, files_changed, error_type, created_at
+            "SELECT id, task_id, agent, model, complexity, outcome, duration_seconds, started_at, completed_at, attempts, files_changed, error_type, input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd, created_at
              FROM task_metrics WHERE task_id = ?1 ORDER BY created_at DESC",
         )?;
         let metrics = stmt.query_map([task_id], |row| {
             let started_str: String = row.get(7)?;
             let completed_str: String = row.get(8)?;
-            let created_str: String = row.get(12)?;
+            let created_str: String = row.get(17)?;
             Ok(TaskMetric {
                 id: row.get(0)?,
                 task_id: row.get(1)?,
@@ -423,6 +443,11 @@ impl Db {
                 attempts: row.get(9)?,
                 files_changed: row.get(10)?,
                 error_type: row.get(11)?,
+                input_tokens: row.get(12)?,
+                output_tokens: row.get(13)?,
+                input_cost_usd: row.get(14)?,
+                output_cost_usd: row.get(15)?,
+                total_cost_usd: row.get(16)?,
                 created_at: DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now()),
@@ -653,6 +678,94 @@ impl Db {
         self.kv_set(&key, &new_count.to_string()).await?;
         Ok(())
     }
+
+    /// Get cost summary over multiple time windows (24h, 7d, 30d).
+    pub async fn get_cost_summary(&self) -> anyhow::Result<CostSummary> {
+        let conn = self.conn.lock().await;
+
+        let windows = [("24 hours", "24h"), ("7 days", "7d"), ("30 days", "30d")];
+
+        let mut periods = Vec::new();
+        for (interval, label) in &windows {
+            let query = format!(
+                "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(input_cost_usd), 0.0), COALESCE(SUM(output_cost_usd), 0.0),
+                        COALESCE(SUM(total_cost_usd), 0.0), COUNT(*)
+                 FROM task_metrics
+                 WHERE completed_at >= datetime('now', '-{interval}')"
+            );
+            let row = conn.query_row(&query, [], |row| {
+                Ok(CostPeriod {
+                    label: label.to_string(),
+                    input_tokens: row.get(0)?,
+                    output_tokens: row.get(1)?,
+                    input_cost_usd: row.get(2)?,
+                    output_cost_usd: row.get(3)?,
+                    total_cost_usd: row.get(4)?,
+                    task_count: row.get(5)?,
+                })
+            })?;
+            periods.push(row);
+        }
+
+        Ok(CostSummary { periods })
+    }
+
+    /// Get cost breakdown by agent.
+    pub async fn get_cost_by_agent(&self) -> anyhow::Result<Vec<CostByGroup>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT agent,
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(total_cost_usd), 0.0),
+                    COUNT(*)
+             FROM task_metrics
+             GROUP BY agent
+             ORDER BY SUM(total_cost_usd) DESC",
+        )?;
+        let groups = stmt
+            .query_map([], |row| {
+                Ok(CostByGroup {
+                    name: row.get(0)?,
+                    input_tokens: row.get(1)?,
+                    output_tokens: row.get(2)?,
+                    total_cost_usd: row.get(3)?,
+                    task_count: row.get(4)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(groups)
+    }
+
+    /// Get cost breakdown by model.
+    pub async fn get_cost_by_model(&self) -> anyhow::Result<Vec<CostByGroup>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(model, 'unknown'),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(total_cost_usd), 0.0),
+                    COUNT(*)
+             FROM task_metrics
+             GROUP BY model
+             ORDER BY SUM(total_cost_usd) DESC",
+        )?;
+        let groups = stmt
+            .query_map([], |row| {
+                Ok(CostByGroup {
+                    name: row.get(0)?,
+                    input_tokens: row.get(1)?,
+                    output_tokens: row.get(2)?,
+                    total_cost_usd: row.get(3)?,
+                    task_count: row.get(4)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(groups)
+    }
 }
 
 /// Metrics summary for the CLI output.
@@ -699,6 +812,34 @@ pub struct SlowTaskInfo {
 pub struct ErrorStat {
     pub error_type: Option<String>,
     pub count: i64,
+}
+
+/// Cost summary across multiple time periods.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostSummary {
+    pub periods: Vec<CostPeriod>,
+}
+
+/// Cost data for a single time period.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostPeriod {
+    pub label: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub input_cost_usd: f64,
+    pub output_cost_usd: f64,
+    pub total_cost_usd: f64,
+    pub task_count: i64,
+}
+
+/// Cost breakdown by a grouping dimension (agent, model, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostByGroup {
+    pub name: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_cost_usd: f64,
+    pub task_count: i64,
 }
 
 /// Schema v1 — initial tables for internal tasks and jobs.
@@ -785,6 +926,15 @@ CREATE INDEX IF NOT EXISTS idx_task_metrics_completed_at ON task_metrics(complet
 CREATE INDEX IF NOT EXISTS idx_task_metrics_outcome ON task_metrics(outcome);
 CREATE INDEX IF NOT EXISTS idx_rate_limits_agent ON rate_limits(agent);
 CREATE INDEX IF NOT EXISTS idx_rate_limits_occurred_at ON rate_limits(occurred_at);
+"#;
+
+/// Schema v3 — adds cost tracking columns to task_metrics.
+const SCHEMA_V3: &str = r#"
+ALTER TABLE task_metrics ADD COLUMN input_tokens INTEGER DEFAULT NULL;
+ALTER TABLE task_metrics ADD COLUMN output_tokens INTEGER DEFAULT NULL;
+ALTER TABLE task_metrics ADD COLUMN input_cost_usd REAL DEFAULT NULL;
+ALTER TABLE task_metrics ADD COLUMN output_cost_usd REAL DEFAULT NULL;
+ALTER TABLE task_metrics ADD COLUMN total_cost_usd REAL DEFAULT NULL;
 "#;
 
 #[cfg(test)]
