@@ -22,69 +22,82 @@ static LEAK_PATTERNS: LazyLock<Vec<(&str, Regex, bool)>> = LazyLock::new(|| {
         // API keys and tokens
         (
             "aws_access_key",
-            Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
+            Regex::new(r"AKIA[0-9A-Z]{16}")
+                .expect("BUG: aws_access_key regex is invalid"),
             true,
         ),
         (
             "aws_secret_key",
-            Regex::new(r"(?i)aws[_\-]?secret[_\-]?access[_\-]?key\s*[=:]\s*\S+").unwrap(),
+            Regex::new(r"(?i)aws[_\-]?secret[_\-]?access[_\-]?key\s*[=:]\s*\S+")
+                .expect("BUG: aws_secret_key regex is invalid"),
             true,
         ),
         (
             "github_token",
-            Regex::new(r"gh[pousr]_[A-Za-z0-9_]{36,}").unwrap(),
+            Regex::new(r"gh[pousr]_[A-Za-z0-9_]{36,}")
+                .expect("BUG: github_token regex is invalid"),
             true,
         ),
         (
             "github_pat",
-            Regex::new(r"github_pat_[A-Za-z0-9_]{22,}").unwrap(),
+            Regex::new(r"github_pat_[A-Za-z0-9_]{22,}")
+                .expect("BUG: github_pat regex is invalid"),
             true,
         ),
         (
             "openai_api_key",
-            Regex::new(r"sk-[A-Za-z0-9\-]{20,}").unwrap(),
+            Regex::new(r"sk-[A-Za-z0-9\-]{20,}")
+                .expect("BUG: openai_api_key regex is invalid"),
             true,
         ),
         (
             "anthropic_api_key",
-            Regex::new(r"sk-ant-[A-Za-z0-9\-]{20,}").unwrap(),
+            Regex::new(r"sk-ant-[A-Za-z0-9\-]{20,}")
+                .expect("BUG: anthropic_api_key regex is invalid"),
             true,
         ),
         (
             "slack_token",
-            Regex::new(r"xox[baprs]-[0-9A-Za-z\-]{10,}").unwrap(),
+            Regex::new(r"xox[baprs]-[0-9A-Za-z\-]{10,}")
+                .expect("BUG: slack_token regex is invalid"),
             true,
         ),
         (
             "stripe_key",
-            Regex::new(r"[sr]k_(live|test)_[A-Za-z0-9]{20,}").unwrap(),
+            Regex::new(r"[sr]k_(live|test)_[A-Za-z0-9]{20,}")
+                .expect("BUG: stripe_key regex is invalid"),
             true,
         ),
         (
             "telegram_bot_token",
-            Regex::new(r"\d{8,10}:[A-Za-z0-9_-]{35}").unwrap(),
+            Regex::new(r"\d{8,10}:[A-Za-z0-9_-]{35}")
+                .expect("BUG: telegram_bot_token regex is invalid"),
             false, // lower confidence, could be other things
         ),
         // Private keys
         (
             "private_key",
-            Regex::new(r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----").unwrap(),
+            Regex::new(r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")
+                .expect("BUG: private_key regex is invalid"),
             true,
         ),
         // Generic patterns (lower confidence)
         (
             "generic_secret",
-            Regex::new(r#"(?i)(password|secret|token|api[_\-]?key)\s*[=:]\s*["']?[A-Za-z0-9+/=_\-]{16,}["']?"#).unwrap(),
+            Regex::new(r#"(?i)(password|secret|token|api[_\-]?key)\s*[=:]\s*["']?[A-Za-z0-9+/=_\-]{16,}["']?"#)
+                .expect("BUG: generic_secret regex is invalid"),
             false,
         ),
         (
             "connection_string",
-            Regex::new(r"(?i)(postgres|mysql|mongodb|redis)://[^\s]{10,}").unwrap(),
+            Regex::new(r"(?i)(postgres|mysql|mongodb|redis)://[^\s]{10,}")
+                .expect("BUG: connection_string regex is invalid"),
             true,
         ),
         (
             "bearer_token",
-            Regex::new(r"(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*").unwrap(),
+            Regex::new(r"(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*")
+                .expect("BUG: bearer_token regex is invalid"),
             false,
         ),
     ]
