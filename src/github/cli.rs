@@ -358,7 +358,7 @@ impl GhCli {
         }
         // --jq '.[]' produces newline-delimited JSON objects (NDJSON)
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let items: Vec<Comment> = stdout
+        let items: Vec<GitHubComment> = stdout
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line))
