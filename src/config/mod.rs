@@ -301,6 +301,88 @@ pub fn get_current_repo() -> anyhow::Result<String> {
     anyhow::bail!("could not determine repo — ensure .orch.yml has gh.repo set")
 }
 
+/// Skill repository configuration.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SkillConfig {
+    /// GitHub repository in "owner/repo" format.
+    pub repo: String,
+    /// Path within the repository to the skills directory.
+    pub path: String,
+}
+
+/// Get skills configuration from the global config.
+///
+/// Reads the `skills:` list from `~/.orch/config.yml`:
+/// ```yaml
+/// skills:
+///   - repo: "owner/skill-repo"
+///     path: "skills/"
+///   - repo: "owner/another-repo"
+///     path: "docs/skills/"
+/// ```
+///
+/// Returns an empty vector if no skills are configured.
+pub fn get_skills() -> anyhow::Result<Vec<SkillConfig>> {
+    let global_path = global_config_path()?;
+
+    if !global_path.exists() {
+        return Ok(vec![]);
+    }
+
+    let root = {
+        // Try to get from cache first (read lock)
+        if let Ok(cache) = CACHE.read() {
+            if let Some(cached) = cache.get(&global_path) {
+                return extract_skills_list(cached);
+            }
+        }
+
+        // Not in cache, load and cache it (write lock)
+        let content = std::fs::read_to_string(&global_path)
+            .with_context(|| format!("reading {}", global_path.display()))?;
+        let parsed: serde_yml::Value = serde_yml::from_str(&content)
+            .with_context(|| format!("parsing {}", global_path.display()))?;
+
+        if let Ok(mut cache) = CACHE.write() {
+            cache.insert(global_path.clone(), parsed.clone());
+        }
+
+        parsed
+    };
+
+    extract_skills_list(&root)
+}
+
+/// Extract skills list from a YAML tree.
+fn extract_skills_list(root: &serde_yml::Value) -> anyhow::Result<Vec<SkillConfig>> {
+    let Some(serde_yml::Value::Sequence(seq)) = root.get("skills") else {
+        return Ok(vec![]);
+    };
+
+    let mut skills = Vec::new();
+    for item in seq {
+        if let serde_yml::Value::Mapping(map) = item {
+            let repo = map
+                .get("repo")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_default();
+            let path = map
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| "skills".to_string());
+
+            if !repo.is_empty() {
+                skills.push(SkillConfig { repo, path });
+            }
+        }
+    }
+
+    Ok(skills)
+}
+
 /// Resolve a projects list from a config file.
 fn resolve_projects_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String>> {
     // First, ensure we're watching this file for changes
@@ -571,5 +653,36 @@ mod tests {
         };
         find_path(&mut rx1, &path);
         find_path(&mut rx2, &path);
+    }
+
+    #[test]
+    fn extract_skills_list_from_sequence() {
+        let yaml = serde_yml::from_str::<serde_yml::Value>(
+            "skills:\n  - repo: owner/skills1\n    path: skills/\n  - repo: owner/skills2\n    path: docs/\n",
+        )
+        .unwrap();
+        let skills = extract_skills_list(&yaml).unwrap();
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].repo, "owner/skills1");
+        assert_eq!(skills[0].path, "skills/");
+        assert_eq!(skills[1].repo, "owner/skills2");
+        assert_eq!(skills[1].path, "docs/");
+    }
+
+    #[test]
+    fn extract_skills_list_defaults_path() {
+        let yaml =
+            serde_yml::from_str::<serde_yml::Value>("skills:\n  - repo: owner/skills\n").unwrap();
+        let skills = extract_skills_list(&yaml).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].repo, "owner/skills");
+        assert_eq!(skills[0].path, "skills"); // default path
+    }
+
+    #[test]
+    fn extract_skills_list_empty_for_missing() {
+        let yaml = serde_yml::from_str::<serde_yml::Value>("foo: bar").unwrap();
+        let skills = extract_skills_list(&yaml).unwrap();
+        assert!(skills.is_empty());
     }
 }
