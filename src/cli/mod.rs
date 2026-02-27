@@ -1,3 +1,4 @@
+pub mod cost;
 pub mod job;
 pub mod service;
 pub mod task;
