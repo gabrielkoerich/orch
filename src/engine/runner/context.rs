@@ -10,6 +10,7 @@
 //! - Issue comments
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
+use crate::cmd::CommandErrorContext;
 use crate::sidecar;
 use std::path::Path;
 use tokio::process::Command;
@@ -147,7 +148,7 @@ pub async fn build_repo_tree(project_dir: &Path) -> String {
     let output = Command::new("git")
         .args(["ls-files"])
         .current_dir(project_dir)
-        .output()
+        .output_with_context()
         .await;
 
     match output {
@@ -174,7 +175,7 @@ pub async fn build_git_diff(project_dir: &Path, default_branch: &str) -> String 
     let output = Command::new("git")
         .args(["diff", default_branch])
         .current_dir(project_dir)
-        .output()
+        .output_with_context()
         .await;
 
     match output {
@@ -202,7 +203,7 @@ pub async fn build_git_log(project_dir: &Path, default_branch: &str) -> String {
     let output = Command::new("git")
         .args(["log", "--oneline", &format!("{}..HEAD", default_branch)])
         .current_dir(project_dir)
-        .output()
+        .output_with_context()
         .await;
 
     match output {

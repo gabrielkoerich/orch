@@ -4,6 +4,7 @@
 //! We build the command args in Rust and deserialize the JSON output via serde.
 
 use super::types::{GitHubComment, GitHubIssue, GitHubReview, GitHubReviewComment};
+use crate::cmd::CommandErrorContext;
 use tokio::process::Command;
 use urlencoding;
 
@@ -65,7 +66,7 @@ impl GhCli {
         cmd.arg("-f")
             .arg(format!("query={}", urlencoding::encode(query)));
 
-        let output = cmd.output().await?;
+        let output = cmd.output_with_context().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -77,7 +78,12 @@ impl GhCli {
 
     /// Run `gh api` with args and return raw JSON bytes.
     async fn api(&self, args: &[&str]) -> anyhow::Result<Vec<u8>> {
-        let output = self.cmd().arg("api").args(args).output().await?;
+        let output = self
+            .cmd()
+            .arg("api")
+            .args(args)
+            .output_with_context()
+            .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -88,7 +94,8 @@ impl GhCli {
 
     /// Check `gh auth status`.
     pub async fn auth_status(&self) -> anyhow::Result<()> {
-        let output = self.cmd()
+        let output = self
+            .cmd()
             .args(["auth", "status"])
             .output()
             .await
@@ -116,13 +123,14 @@ impl GhCli {
             "body": body,
             "labels": labels,
         });
-        let output = self.cmd()
+        let output = self
+            .cmd()
             .arg("api")
             .args([&endpoint, "-X", "POST", "--input", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .spawn_with_context()?;
         // Write payload to stdin
         let mut child = output;
         if let Some(mut stdin) = child.stdin.take() {
@@ -152,7 +160,8 @@ impl GhCli {
     pub async fn list_issues(&self, repo: &str, label: &str) -> anyhow::Result<Vec<GitHubIssue>> {
         let endpoint = format!("repos/{repo}/issues");
         let labels_field = format!("labels={label}");
-        let output = self.cmd()
+        let output = self
+            .cmd()
             .arg("api")
             .arg("--paginate")
             .arg("--jq")
@@ -168,7 +177,7 @@ impl GhCli {
                 "-f",
                 "per_page=100",
             ])
-            .output()
+            .output_with_context()
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -193,13 +202,14 @@ impl GhCli {
     ) -> anyhow::Result<()> {
         let endpoint = format!("repos/{repo}/issues/{number}/labels");
         let payload = serde_json::json!({ "labels": labels });
-        let mut child = self.cmd()
+        let mut child = self
+            .cmd()
             .arg("api")
             .args([&endpoint, "-X", "POST", "--input", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .spawn_with_context()?;
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             stdin.write_all(payload.to_string().as_bytes()).await?;
@@ -247,13 +257,14 @@ impl GhCli {
             "color": color,
             "description": description,
         });
-        let mut child = self.cmd()
+        let mut child = self
+            .cmd()
             .arg("api")
             .args([&create_endpoint, "-X", "POST", "--input", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .spawn_with_context()?;
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             stdin.write_all(payload.to_string().as_bytes()).await?;
@@ -299,13 +310,14 @@ impl GhCli {
     pub async fn add_comment(&self, repo: &str, number: &str, body: &str) -> anyhow::Result<()> {
         let endpoint = format!("repos/{repo}/issues/{number}/comments");
         let payload = serde_json::json!({ "body": body });
-        let mut child = self.cmd()
+        let mut child = self
+            .cmd()
             .arg("api")
             .args([&endpoint, "-X", "POST", "--input", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .spawn_with_context()?;
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             stdin.write_all(payload.to_string().as_bytes()).await?;
@@ -379,7 +391,8 @@ impl GhCli {
     ) -> anyhow::Result<Vec<GitHubComment>> {
         let endpoint = format!("repos/{repo}/issues/comments");
         let since_field = format!("since={}", since);
-        let output = self.cmd()
+        let output = self
+            .cmd()
             .arg("api")
             .arg("--paginate")
             .arg("--jq")
@@ -393,7 +406,7 @@ impl GhCli {
                 "-f",
                 "per_page=100",
             ])
-            .output()
+            .output_with_context()
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -492,13 +505,14 @@ impl GhCli {
     pub async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
         let endpoint = format!("repos/{repo}/issues/{number}");
         let payload = serde_json::json!({ "state": "closed" });
-        let mut child = self.cmd()
+        let mut child = self
+            .cmd()
             .arg("api")
             .args([&endpoint, "-X", "PATCH", "--input", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .spawn_with_context()?;
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             stdin.write_all(payload.to_string().as_bytes()).await?;
@@ -517,10 +531,11 @@ impl GhCli {
     /// Returns true if the user has collaborator access, false otherwise.
     pub async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
         let endpoint = format!("repos/{repo}/collaborators/{username}");
-        let output = self.cmd()
+        let output = self
+            .cmd()
             .arg("api")
             .args([&endpoint, "-X", "GET"])
-            .output()
+            .output_with_context()
             .await?;
         // 204 = is collaborator, 404 = not a collaborator
         if output.status.success() {
@@ -581,7 +596,7 @@ impl GhCli {
             args.push("--delete-branch".to_string());
         }
 
-        let output = self.cmd().args(&args).output().await?;
+        let output = self.cmd().args(&args).output_with_context().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -692,13 +707,14 @@ impl GhCli {
     ) -> anyhow::Result<(String, u64, u64, u64, u64)> {
         // Use the checks endpoint which combines both status checks and check runs
         let endpoint = format!("repos/{repo}/commits/{git_ref}/check-runs");
-        let output = self.cmd()
+        let output = self
+            .cmd()
             .arg("api")
             .arg("--paginate")
             .arg("--jq")
             .arg(".check_runs[]")
             .args([&endpoint])
-            .output()
+            .output_with_context()
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -742,10 +758,11 @@ impl GhCli {
     /// Re-run failed jobs for a GitHub Actions workflow run.
     pub async fn rerun_failed_jobs(&self, repo: &str, run_id: u64) -> anyhow::Result<()> {
         let endpoint = format!("repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs");
-        let output = self.cmd()
+        let output = self
+            .cmd()
             .arg("api")
             .args([&endpoint, "-X", "POST"])
-            .output()
+            .output_with_context()
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -809,13 +826,14 @@ impl GhCli {
     ) -> anyhow::Result<()> {
         let endpoint = format!("repos/{repo}/actions/workflows/{workflow}/dispatches");
         let payload = serde_json::json!({ "ref": branch });
-        let mut child = self.cmd()
+        let mut child = self
+            .cmd()
             .arg("api")
             .args([&endpoint, "-X", "POST", "--input", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()?;
+            .spawn_with_context()?;
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             stdin.write_all(payload.to_string().as_bytes()).await?;

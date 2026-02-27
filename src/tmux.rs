@@ -6,6 +6,7 @@
 //!
 //! This module is the foundation for live session streaming to any channel.
 
+use crate::cmd::CommandErrorContext;
 use anyhow::Context;
 use std::collections::HashMap;
 use tokio::process::Command;
@@ -52,7 +53,7 @@ impl TmuxManager {
     pub async fn is_server_running(&self) -> bool {
         Command::new("tmux")
             .args(["list-sessions"])
-            .output()
+            .output_with_context()
             .await
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -82,7 +83,7 @@ impl TmuxManager {
                 working_dir,
                 command,
             ])
-            .output()
+            .output_with_context()
             .await
             .context("spawning tmux session")?;
 
@@ -99,7 +100,7 @@ impl TmuxManager {
     pub async fn session_exists(&self, session: &str) -> bool {
         Command::new("tmux")
             .args(["has-session", "-t", session])
-            .output()
+            .output_with_context()
             .await
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -109,7 +110,7 @@ impl TmuxManager {
     pub async fn kill_session(&self, session: &str) -> anyhow::Result<()> {
         let output = Command::new("tmux")
             .args(["kill-session", "-t", session])
-            .output()
+            .output_with_context()
             .await?;
 
         if !output.status.success() {
@@ -125,7 +126,7 @@ impl TmuxManager {
         let start = format!("-{lines}");
         let output = Command::new("tmux")
             .args(["capture-pane", "-t", session, "-p", "-S", &start])
-            .output()
+            .output_with_context()
             .await?;
 
         if !output.status.success() {
@@ -145,7 +146,7 @@ impl TmuxManager {
         // Send literal text first
         let output = Command::new("tmux")
             .args(["send-keys", "-t", session, "-l", keys])
-            .output()
+            .output_with_context()
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -154,7 +155,7 @@ impl TmuxManager {
         // Then send Enter separately (as a key name, not literal)
         let output = Command::new("tmux")
             .args(["send-keys", "-t", session, "Enter"])
-            .output()
+            .output_with_context()
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -168,7 +169,7 @@ impl TmuxManager {
     pub async fn send_text(&self, session: &str, text: &str) -> anyhow::Result<()> {
         let output = Command::new("tmux")
             .args(["send-keys", "-t", session, "-l", text])
-            .output()
+            .output_with_context()
             .await?;
 
         if !output.status.success() {
@@ -183,7 +184,7 @@ impl TmuxManager {
     pub async fn pane_pid(&self, session: &str) -> anyhow::Result<Option<u32>> {
         let output = Command::new("tmux")
             .args(["list-panes", "-t", session, "-F", "#{pane_pid}"])
-            .output()
+            .output_with_context()
             .await?;
 
         if !output.status.success() {
@@ -200,7 +201,7 @@ impl TmuxManager {
         // Check pane_dead flag
         let output = Command::new("tmux")
             .args(["list-panes", "-t", session, "-F", "#{pane_dead}"])
-            .output()
+            .output_with_context()
             .await;
 
         match output {
@@ -220,7 +221,7 @@ impl TmuxManager {
                 "-F",
                 "#{session_name}\t#{session_created}\t#{pane_pid}",
             ])
-            .output()
+            .output_with_context()
             .await?;
 
         if !output.status.success() {

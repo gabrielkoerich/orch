@@ -9,6 +9,7 @@
 //! and even join/intervene by sending input through the transport.
 
 use super::{Channel, IncomingMessage, OutgoingMessage, OutputChunk};
+use crate::cmd::CommandErrorContext;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,7 +95,7 @@ impl Channel for TmuxChannel {
         // Check if tmux server is running
         let output = tokio::process::Command::new("tmux")
             .args(["list-sessions"])
-            .output()
+            .output_with_context()
             .await?;
         if !output.status.success() {
             anyhow::bail!("tmux server not running");
@@ -111,7 +112,7 @@ impl Channel for TmuxChannel {
 pub async fn send_keys(session: &str, text: &str) -> anyhow::Result<()> {
     let output = tokio::process::Command::new("tmux")
         .args(["send-keys", "-t", session, text, "Enter"])
-        .output()
+        .output_with_context()
         .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -124,7 +125,7 @@ pub async fn send_keys(session: &str, text: &str) -> anyhow::Result<()> {
 pub async fn capture_pane(session: &str) -> anyhow::Result<String> {
     let output = tokio::process::Command::new("tmux")
         .args(["capture-pane", "-t", session, "-p", "-S", "-100"])
-        .output()
+        .output_with_context()
         .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -137,7 +138,7 @@ pub async fn capture_pane(session: &str) -> anyhow::Result<String> {
 pub async fn list_orch_sessions() -> anyhow::Result<Vec<String>> {
     let output = tokio::process::Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
+        .output_with_context()
         .await?;
     if !output.status.success() {
         return Ok(vec![]);
@@ -157,7 +158,7 @@ pub async fn list_orch_sessions() -> anyhow::Result<Vec<String>> {
 pub async fn is_session_dead(session: &str) -> bool {
     let output = tokio::process::Command::new("tmux")
         .args(["has-session", "-t", session])
-        .output()
+        .output_with_context()
         .await;
 
     match output {

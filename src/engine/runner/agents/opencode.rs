@@ -27,6 +27,7 @@
 //! - `opencode/trinity-large-preview-free`
 
 use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
+use crate::cmd::SyncCommandErrorContext;
 use crate::parser;
 use std::sync::Mutex;
 
@@ -334,7 +335,7 @@ fn discover_free_models() -> Vec<String> {
     // tokio::task::spawn_blocking() at the call site.
     let stdout = match std::process::Command::new("opencode")
         .args(["models"])
-        .output()
+        .output_with_context()
     {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).to_string()

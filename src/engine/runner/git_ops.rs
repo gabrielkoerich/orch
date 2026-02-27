@@ -3,6 +3,7 @@
 //! These run after the agent completes to ensure all changes
 //! are committed, pushed, and a PR is created.
 
+use crate::cmd::CommandErrorContext;
 use std::path::Path;
 use tokio::process::Command;
 
@@ -24,7 +25,7 @@ pub async fn has_changes(dir: &Path) -> bool {
     let untracked = Command::new("git")
         .args(["ls-files", "--others", "--exclude-standard"])
         .current_dir(dir)
-        .output()
+        .output_with_context()
         .await;
 
     let has_diff = diff.map(|s| !s.success()).unwrap_or(false);
@@ -60,7 +61,7 @@ pub async fn auto_commit(
     let add = Command::new("git")
         .args(["add", "-A"])
         .current_dir(dir)
-        .output()
+        .output_with_context()
         .await?;
 
     if !add.status.success() {
@@ -72,7 +73,7 @@ pub async fn auto_commit(
     let commit = Command::new("git")
         .args(["commit", "-m", &commit_msg])
         .current_dir(dir)
-        .output()
+        .output_with_context()
         .await?;
 
     if !commit.status.success() {
@@ -117,7 +118,7 @@ pub async fn push_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> {
             branch_to_push,
         ])
         .current_dir(dir)
-        .output()
+        .output_with_context()
         .await?;
 
     if output.status.success() {
@@ -156,7 +157,7 @@ pub async fn create_pr_if_needed(
             ".[0].number",
         ])
         .current_dir(dir)
-        .output()
+        .output_with_context()
         .await?;
 
     let existing_number = String::from_utf8_lossy(&existing.stdout).trim().to_string();
@@ -203,7 +204,7 @@ pub async fn create_pr_if_needed(
             "pr", "create", "--title", pr_title, "--body", &body, "--head", branch,
         ])
         .current_dir(dir)
-        .output()
+        .output_with_context()
         .await?;
 
     if output.status.success() {
@@ -235,7 +236,7 @@ pub async fn check_pr_override(dir: &Path, branch: &str) -> bool {
             ".[] | select(.state == \"OPEN\") | .number",
         ])
         .current_dir(dir)
-        .output()
+        .output_with_context()
         .await;
 
     match output {
@@ -252,7 +253,7 @@ async fn get_current_branch(dir: &Path) -> String {
     let output = Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(dir)
-        .output()
+        .output_with_context()
         .await;
 
     match output {
@@ -267,7 +268,7 @@ pub async fn count_changed_files(dir: &Path) -> anyhow::Result<usize> {
     let output = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(dir)
-        .output()
+        .output_with_context()
         .await?;
 
     let status_output = String::from_utf8_lossy(&output.stdout);
@@ -293,7 +294,7 @@ async fn has_unpushed_commits(dir: &Path, branch: &str) -> bool {
     let remote_exists = Command::new("git")
         .args(["rev-parse", &format!("origin/{branch}")])
         .current_dir(dir)
-        .output()
+        .output_with_context()
         .await
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -309,7 +310,7 @@ async fn has_unpushed_commits(dir: &Path, branch: &str) -> bool {
     let output = Command::new("git")
         .args(["log", &compare_ref, "--oneline"])
         .current_dir(dir)
-        .output()
+        .output_with_context()
         .await;
 
     match output {

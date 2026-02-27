@@ -30,6 +30,7 @@ use crate::channels::telegram::TelegramChannel;
 use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
 use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
+use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::{get_route_result, Router};
@@ -1138,7 +1139,7 @@ async fn skills_sync() -> anyhow::Result<()> {
                 Command::new("git")
                     .args(["pull", "--ff-only", "--prune"])
                     .current_dir(&repo_dir)
-                    .output(),
+                    .output_with_context(),
             )
             .await;
 
@@ -1172,7 +1173,7 @@ async fn skills_sync() -> anyhow::Result<()> {
                 git_timeout,
                 Command::new("git")
                     .args(["clone", "--depth", "1", &repo_url, repo_dir_str])
-                    .output(),
+                    .output_with_context(),
             )
             .await;
 
@@ -1268,7 +1269,7 @@ async fn cleanup_done_worktrees(
             let wt_str = wt.to_string_lossy().to_string();
             let remove_result = Command::new("git")
                 .args(["-C", &repo_root, "worktree", "remove", &wt_str, "--force"])
-                .output()
+                .output_with_context()
                 .await;
 
             match remove_result {
@@ -1288,7 +1289,7 @@ async fn cleanup_done_worktrees(
             if let Some(ref br) = branch {
                 let branch_delete_result = Command::new("git")
                     .args(["-C", &repo_root, "branch", "-D", br])
-                    .output()
+                    .output_with_context()
                     .await;
 
                 match branch_delete_result {
@@ -1319,7 +1320,7 @@ async fn cleanup_done_worktrees(
 async fn resolve_repo_root() -> anyhow::Result<String> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
-        .output()
+        .output_with_context()
         .await?;
     if !output.status.success() {
         anyhow::bail!("failed to resolve git repo root");

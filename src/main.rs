@@ -2,6 +2,7 @@ mod backends;
 #[allow(dead_code)] // channels are scaffolding — not wired into engine yet
 mod channels;
 mod cli;
+mod cmd;
 mod cmd_cache;
 mod config;
 mod cron;

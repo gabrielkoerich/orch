@@ -13,6 +13,7 @@
 //! 6. Track last routed agent to distribute load across agents
 
 use crate::backends::ExternalTask;
+use crate::cmd::CommandErrorContext;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1109,7 +1110,7 @@ impl Router {
 
                 cmd.arg(prompt);
 
-                tokio::time::timeout(timeout_duration, cmd.output()).await
+                tokio::time::timeout(timeout_duration, cmd.output_with_context()).await
             }
             "codex" => {
                 let mut cmd = tokio::process::Command::new("codex");
@@ -1121,13 +1122,13 @@ impl Router {
 
                 cmd.arg(prompt);
 
-                tokio::time::timeout(timeout_duration, cmd.output()).await
+                tokio::time::timeout(timeout_duration, cmd.output_with_context()).await
             }
             "opencode" => {
                 let mut cmd = tokio::process::Command::new("opencode");
                 cmd.arg("run").arg("--format").arg("json").arg(prompt);
 
-                tokio::time::timeout(timeout_duration, cmd.output()).await
+                tokio::time::timeout(timeout_duration, cmd.output_with_context()).await
             }
             _ => {
                 anyhow::bail!("unknown router agent: {}", self.config.router_agent);
@@ -1142,7 +1143,7 @@ impl Router {
                 }
                 Ok(String::from_utf8_lossy(&output.stdout).to_string())
             }
-            Ok(Err(e)) => Err(e.into()),
+            Ok(Err(e)) => Err(e),
             Err(_) => anyhow::bail!("router LLM timed out after {timeout_secs}s"),
         }
     }

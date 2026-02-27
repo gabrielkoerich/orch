@@ -3,6 +3,7 @@
 //! Each task runs in an isolated worktree to prevent conflicts.
 //! Worktrees are stored at `~/.orch/worktrees/<project>/<branch>/`.
 
+use crate::cmd::CommandErrorContext;
 use crate::sidecar;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -43,7 +44,7 @@ pub async fn detect_default_branch(project_dir: &Path) -> String {
     let output = Command::new("git")
         .args(["symbolic-ref", "--short", "HEAD"])
         .current_dir(project_dir)
-        .output()
+        .output_with_context()
         .await;
 
     match output {
@@ -59,7 +60,7 @@ pub async fn resolve_main_repo(project_dir: &Path) -> PathBuf {
     let output = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(project_dir)
-        .output()
+        .output_with_context()
         .await;
 
     if let Ok(o) = output {
@@ -93,7 +94,7 @@ async fn is_bare_repo(dir: &Path) -> bool {
             "rev-parse",
             "--is-bare-repository",
         ])
-        .output()
+        .output_with_context()
         .await;
 
     matches!(output, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
@@ -173,7 +174,7 @@ pub async fn setup_worktree(
                     "--all",
                     "--prune",
                 ])
-                .output()
+                .output_with_context()
                 .await;
         }
 
@@ -186,7 +187,7 @@ pub async fn setup_worktree(
                 &branch_name_str,
                 &default_branch,
             ])
-            .output()
+            .output_with_context()
             .await;
 
         // Create worktree
@@ -203,7 +204,7 @@ pub async fn setup_worktree(
                 &worktree_dir.to_string_lossy(),
                 &branch_name_str,
             ])
-            .output()
+            .output_with_context()
             .await?;
 
         if !output.status.success() && !worktree_dir.exists() {
@@ -212,7 +213,7 @@ pub async fn setup_worktree(
 
             let _ = Command::new("git")
                 .args(["-C", &main_dir.to_string_lossy(), "worktree", "prune"])
-                .output()
+                .output_with_context()
                 .await;
 
             let _ = Command::new("git")
@@ -223,7 +224,7 @@ pub async fn setup_worktree(
                     "-D",
                     &branch_name_str,
                 ])
-                .output()
+                .output_with_context()
                 .await;
 
             let _ = Command::new("git")
@@ -234,7 +235,7 @@ pub async fn setup_worktree(
                     &branch_name_str,
                     &default_branch,
                 ])
-                .output()
+                .output_with_context()
                 .await;
 
             let _ = Command::new("git")
@@ -246,7 +247,7 @@ pub async fn setup_worktree(
                     &worktree_dir.to_string_lossy(),
                     &branch_name_str,
                 ])
-                .output()
+                .output_with_context()
                 .await;
 
             if !worktree_dir.exists() {

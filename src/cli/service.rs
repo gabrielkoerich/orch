@@ -1,9 +1,10 @@
+use crate::cmd::SyncCommandErrorContext;
+
 /// Run a `brew services` subcommand for orch.
 fn brew_services(action: &str) -> anyhow::Result<()> {
     let status = std::process::Command::new("brew")
         .args(["services", action, "orch"])
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to run `brew services {action} orch`: {e}"))?;
+        .status_with_context()?;
 
     if !status.success() {
         anyhow::bail!("brew services {action} orch failed");

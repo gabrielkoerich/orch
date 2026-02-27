@@ -1,5 +1,6 @@
 use crate::backends::{ExternalId, Status};
 use crate::cli::init_task_manager;
+use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
@@ -384,7 +385,7 @@ pub fn attach(id: &str) -> anyhow::Result<()> {
     let session = tmux.session_name(&repo, id);
     let status = std::process::Command::new("tmux")
         .args(["attach-session", "-t", &session])
-        .status()?;
+        .status_with_context()?;
 
     if !status.success() {
         anyhow::bail!("no active session for task {}", id);

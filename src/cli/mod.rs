@@ -6,6 +6,7 @@ pub mod task;
 pub mod tree;
 
 use crate::channels::transport::Transport;
+use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::tasks::TaskManager;
 use anyhow::Context;
@@ -39,7 +40,7 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
                     "-q",
                     ".nameWithOwner",
                 ])
-                .output();
+                .output_with_context();
 
             match output {
                 Ok(o) if o.status.success() => {
@@ -159,7 +160,9 @@ pub fn log(lines: &str) -> anyhow::Result<()> {
         let args: Vec<String> = std::iter::once("-f".to_string())
             .chain(log_files.iter().map(|p| p.to_string_lossy().to_string()))
             .collect();
-        let status = std::process::Command::new("tail").args(&args).status()?;
+        let status = std::process::Command::new("tail")
+            .args(&args)
+            .status_with_context()?;
         std::process::exit(status.code().unwrap_or(1));
     } else {
         let n = lines.parse::<usize>().unwrap_or(50);
@@ -197,7 +200,7 @@ pub fn agents() {
                 // Try to get version
                 let version = std::process::Command::new(agent)
                     .arg("--version")
-                    .output()
+                    .output_with_context()
                     .ok()
                     .and_then(|o| {
                         if o.status.success() {
@@ -552,8 +555,7 @@ fn project_add_github(owner: &str, repo: &str) -> anyhow::Result<()> {
                 "--",
                 "--bare",
             ])
-            .status()
-            .context("failed to run `gh repo clone` — is `gh` installed?")?;
+            .status_with_context()?;
 
         if !status.success() {
             anyhow::bail!("gh repo clone failed for {slug}");

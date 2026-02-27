@@ -4,6 +4,7 @@
 //! Posts task updates, agent output summaries, and status changes as comments.
 
 use super::{Channel, IncomingMessage, OutgoingMessage, OutputChunk};
+use crate::cmd::CommandErrorContext;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
@@ -59,7 +60,7 @@ impl GitHubChannel {
                 "--header",
                 "Accept: application/vnd.github.v3+json",
             ])
-            .output()
+            .output_with_context()
             .await?;
 
         if !output.status.success() {
@@ -84,7 +85,7 @@ impl GitHubChannel {
                 "--header",
                 "Accept: application/vnd.github.v3+json",
             ])
-            .output()
+            .output_with_context()
             .await?;
 
         if !output.status.success() {
@@ -113,7 +114,7 @@ impl GitHubChannel {
                 "--raw-field",
                 &format!("body={}", body),
             ])
-            .output()
+            .output_with_context()
             .await?;
 
         if !output.status.success() {
@@ -280,7 +281,7 @@ impl Channel for GitHubChannel {
     async fn health_check(&self) -> anyhow::Result<()> {
         let output = tokio::process::Command::new("gh")
             .args(["auth", "status"])
-            .output()
+            .output_with_context()
             .await?;
 
         if !output.status.success() {

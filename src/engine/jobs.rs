@@ -14,6 +14,7 @@
 //! - `external: false`: Creates an internal SQLite task
 
 use crate::backends::{ExternalBackend, ExternalId};
+use crate::cmd::CommandErrorContext;
 use crate::db::{Db, ErrorStat, MetricsSummary, SlowTaskInfo};
 use crate::engine::internal_tasks::{create_internal_task_with_source, get_internal_task};
 use anyhow::Context;
@@ -335,7 +336,7 @@ pub async fn tick(
                         .arg("-c")
                         .arg(cmd)
                         .current_dir(dir)
-                        .output()
+                        .output_with_context()
                         .await;
 
                     match output {
