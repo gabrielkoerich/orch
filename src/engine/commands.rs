@@ -277,25 +277,29 @@ async fn execute_command(
 ) -> anyhow::Result<String> {
     match command {
         OwnerCommand::Retry => {
-            // Remove agent labels, reset to new
+            // Remove agent labels, reset attempts, reset to new
             let task = backend.get_task(task_id).await?;
             for label in &task.labels {
                 if label.starts_with("agent:") {
                     backend.remove_label(task_id, label).await.ok();
                 }
             }
+            // Reset sidecar state so the task starts fresh
+            crate::sidecar::set(&task_id.0, &["attempts=0".to_string()]).ok();
             backend.update_status(task_id, Status::New).await?;
-            Ok("`/retry` — reset to `status:new`, will re-dispatch".to_string())
+            Ok("`/retry` — reset attempts, cleared agent, reset to `status:new`".to_string())
         }
 
         OwnerCommand::Reroute(agent) => {
-            // Remove existing agent labels
+            // Remove existing agent labels and reset attempts
             let task = backend.get_task(task_id).await?;
             for label in &task.labels {
                 if label.starts_with("agent:") {
                     backend.remove_label(task_id, label).await.ok();
                 }
             }
+            // Reset sidecar state so the task starts fresh
+            crate::sidecar::set(&task_id.0, &["attempts=0".to_string()]).ok();
             // Optionally set new agent
             if let Some(agent_name) = agent {
                 let label = format!("agent:{agent_name}");
@@ -304,10 +308,10 @@ async fn execute_command(
             backend.update_status(task_id, Status::New).await?;
             match agent {
                 Some(a) => Ok(format!(
-                    "`/reroute {a}` — cleared agent, forced `agent:{a}`, reset to `status:new`"
+                    "`/reroute {a}` — cleared agent, reset attempts, forced `agent:{a}`, reset to `status:new`"
                 )),
                 None => {
-                    Ok("`/reroute` — cleared agent, reset to `status:new`, will re-route".into())
+                    Ok("`/reroute` — cleared agent, reset attempts, reset to `status:new`, will re-route".into())
                 }
             }
         }

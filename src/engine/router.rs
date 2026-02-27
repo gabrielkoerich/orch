@@ -1208,7 +1208,17 @@ impl Router {
     }
 
     /// Fallback routing when LLM fails.
+    ///
+    /// If `fallback_executor` is "round_robin", uses round-robin selection.
+    /// Otherwise uses the named agent, falling back to first available.
     fn route_fallback(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
+        if self.config.fallback_executor == "round_robin" {
+            return self.route_round_robin(task).map(|mut r| {
+                r.reason = format!("router failed; fallback round_robin → {}", r.agent);
+                r
+            });
+        }
+
         let agent = if self.is_agent_available(&self.config.fallback_executor) {
             self.config.fallback_executor.clone()
         } else {
