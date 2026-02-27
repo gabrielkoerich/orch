@@ -306,6 +306,14 @@ pub fn build_agent_message(
         msg.push('\n');
     }
 
+    // PR review context (for re-dispatch after review changes requested)
+    if !context.pr_review_context.is_empty() {
+        msg.push_str("## PR Review Feedback\n\n");
+        msg.push_str("A reviewer has requested changes on your PR. Please address the following feedback:\n\n");
+        msg.push_str(&context.pr_review_context);
+        msg.push('\n');
+    }
+
     // Git diff for retries
     if attempts > 0 && !context.git_diff.is_empty() {
         msg.push_str("## Current Changes (from previous attempt)\n\n```diff\n");

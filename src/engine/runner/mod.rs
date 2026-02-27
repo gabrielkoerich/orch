@@ -140,6 +140,9 @@ impl TaskRunner {
             String::new()
         };
 
+        // Load PR review context from sidecar (for re-dispatch after review changes requested)
+        let pr_review_context = context::load_pr_review_context(task_id);
+
         let ctx = context::TaskContext {
             task_context,
             parent_context: String::new(), // Requires backend
@@ -148,7 +151,8 @@ impl TaskRunner {
             repo_tree,
             git_diff,
             issue_comments: String::new(), // Requires backend
-            memory: vec![],                // Will be loaded on retries
+            pr_review_context,
+            memory: vec![], // Will be loaded on retries
         };
 
         // Build a minimal ExternalTask for prompt building
