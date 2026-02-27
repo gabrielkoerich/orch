@@ -1340,7 +1340,6 @@ async fn review_open_prs(
     }
 
     // Check if we should process reviews
-    let auto_create_followup = config.auto_create_followup_on_changes;
     let auto_close_task = config.auto_close_task_on_approval;
 
     tracing::info!(
