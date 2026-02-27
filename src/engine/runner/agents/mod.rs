@@ -565,4 +565,377 @@ mod tests {
         let err = patterns::classify_from_text(1, "bun: command not found rate limit");
         assert!(matches!(err, AgentError::MissingTool { .. }));
     }
+
+    // ── PermissionRules defaults ────────────────────────────────
+
+    #[test]
+    fn permission_rules_default_is_autonomous() {
+        let rules = PermissionRules::default();
+        assert!(rules.autonomous);
+    }
+
+    #[test]
+    fn permission_rules_default_sandbox_is_workspace_write() {
+        let rules = PermissionRules::default();
+        assert_eq!(rules.sandbox, SandboxLevel::WorkspaceWrite);
+    }
+
+    #[test]
+    fn permission_rules_default_disallows_rm() {
+        let rules = PermissionRules::default();
+        assert!(rules.disallowed_tools.contains(&"Bash(rm *)".to_string()));
+        assert!(rules
+            .disallowed_tools
+            .contains(&"Bash(rm -*)".to_string()));
+    }
+
+    #[test]
+    fn permission_rules_default_no_blocked_paths() {
+        let rules = PermissionRules::default();
+        assert!(rules.blocked_paths.is_empty());
+    }
+
+    // ── Permission translation across all agents ────────────────
+
+    /// Test that all agents handle the default permission rules consistently.
+    #[test]
+    fn all_agents_handle_default_permissions() {
+        let perms = PermissionRules::default();
+        let sys = "/tmp/sys.md";
+        let msg = "/tmp/msg.md";
+
+        // Claude: should have bypassPermissions and rm disallowed
+        let claude = get_runner("claude");
+        let cmd = claude.build_command(None, "", sys, msg, &perms);
+        assert!(
+            cmd.contains("--permission-mode bypassPermissions"),
+            "claude default: expected bypassPermissions, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("Bash(rm *)"),
+            "claude default: expected rm disallowed, got: {cmd}"
+        );
+
+        // Codex: should have approval=never and sandbox=workspace-write
+        let codex = get_runner("codex");
+        let cmd = codex.build_command(None, "", sys, msg, &perms);
+        assert!(
+            cmd.contains("--ask-for-approval never"),
+            "codex default: expected approval never, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("--sandbox workspace-write"),
+            "codex default: expected workspace-write sandbox, got: {cmd}"
+        );
+
+        // OpenCode: should have no permission flags (relies on worktree isolation)
+        let opencode = get_runner("opencode");
+        let cmd = opencode.build_command(None, "", sys, msg, &perms);
+        assert!(
+            !cmd.contains("--permission"),
+            "opencode default: should have no permission flags, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--sandbox"),
+            "opencode default: should have no sandbox flags, got: {cmd}"
+        );
+    }
+
+    /// Test supervised mode translates correctly for each agent.
+    #[test]
+    fn all_agents_handle_supervised_mode() {
+        let perms = PermissionRules {
+            autonomous: false,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec![],
+            blocked_paths: vec![],
+        };
+        let sys = "/tmp/sys.md";
+        let msg = "/tmp/msg.md";
+
+        // Claude: supervised → acceptEdits
+        let claude = get_runner("claude");
+        let cmd = claude.build_command(None, "", sys, msg, &perms);
+        assert!(
+            cmd.contains("--permission-mode acceptEdits"),
+            "claude supervised: expected acceptEdits, got: {cmd}"
+        );
+
+        // Codex: supervised → suggest
+        let codex = get_runner("codex");
+        let cmd = codex.build_command(None, "", sys, msg, &perms);
+        assert!(
+            cmd.contains("--ask-for-approval suggest"),
+            "codex supervised: expected suggest, got: {cmd}"
+        );
+    }
+
+    /// Test full access sandbox translates correctly for each agent.
+    #[test]
+    fn all_agents_handle_full_access_sandbox() {
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::FullAccess,
+            disallowed_tools: vec![],
+            blocked_paths: vec![],
+        };
+        let sys = "/tmp/sys.md";
+        let msg = "/tmp/msg.md";
+
+        // Claude: ignores sandbox level (no --sandbox flag)
+        let claude = get_runner("claude");
+        let cmd = claude.build_command(None, "", sys, msg, &perms);
+        assert!(
+            !cmd.contains("--sandbox"),
+            "claude full_access: should have no sandbox flag, got: {cmd}"
+        );
+
+        // Codex: full access → danger-full-access
+        let codex = get_runner("codex");
+        let cmd = codex.build_command(None, "", sys, msg, &perms);
+        assert!(
+            cmd.contains("--sandbox danger-full-access"),
+            "codex full_access: expected danger-full-access, got: {cmd}"
+        );
+    }
+
+    /// Test SandboxLevel::None falls back to safe default for Codex.
+    #[test]
+    fn codex_sandbox_none_defaults_to_workspace_write() {
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::None,
+            disallowed_tools: vec![],
+            blocked_paths: vec![],
+        };
+        let codex = get_runner("codex");
+        let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
+        assert!(
+            cmd.contains("--sandbox workspace-write"),
+            "codex sandbox::none: should default to workspace-write, got: {cmd}"
+        );
+    }
+
+    /// Test blocked paths are translated to Claude disallowed tools.
+    #[test]
+    fn claude_blocked_paths_become_disallowed_tools() {
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec![],
+            blocked_paths: vec![
+                PathBuf::from("/home/user/project"),
+                PathBuf::from("/opt/other"),
+            ],
+        };
+        let claude = get_runner("claude");
+        let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
+
+        // Each blocked path should generate 4 disallowed tool patterns
+        assert!(cmd.contains("Bash(cd /home/user/project*)"), "missing Bash(cd) for first path");
+        assert!(cmd.contains("Read(/home/user/project/*)"), "missing Read for first path");
+        assert!(cmd.contains("Write(/home/user/project/*)"), "missing Write for first path");
+        assert!(cmd.contains("Edit(/home/user/project/*)"), "missing Edit for first path");
+        assert!(cmd.contains("Bash(cd /opt/other*)"), "missing Bash(cd) for second path");
+        assert!(cmd.contains("Read(/opt/other/*)"), "missing Read for second path");
+    }
+
+    /// Test that blocked paths don't affect Codex (it uses sandbox isolation).
+    #[test]
+    fn codex_ignores_blocked_paths() {
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec![],
+            blocked_paths: vec![PathBuf::from("/home/user/project")],
+        };
+        let codex = get_runner("codex");
+        let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
+        assert!(
+            !cmd.contains("/home/user/project"),
+            "codex: should not reference blocked paths, got: {cmd}"
+        );
+    }
+
+    /// Test that blocked paths don't affect OpenCode.
+    #[test]
+    fn opencode_ignores_blocked_paths() {
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec![],
+            blocked_paths: vec![PathBuf::from("/home/user/project")],
+        };
+        let opencode = get_runner("opencode");
+        let cmd = opencode.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
+        assert!(
+            !cmd.contains("/home/user/project"),
+            "opencode: should not reference blocked paths, got: {cmd}"
+        );
+    }
+
+    /// Test that disallowed tools merge correctly for Claude (defaults + custom).
+    #[test]
+    fn claude_merges_disallowed_tools() {
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec![
+                "Bash(rm *)".to_string(),
+                "Bash(sudo *)".to_string(),
+                "WebFetch".to_string(),
+            ],
+            blocked_paths: vec![],
+        };
+        let claude = get_runner("claude");
+        let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
+        assert!(cmd.contains("Bash(rm *)"), "missing rm disallow");
+        assert!(cmd.contains("Bash(sudo *)"), "missing sudo disallow");
+        assert!(cmd.contains("WebFetch"), "missing WebFetch disallow");
+    }
+
+    /// Test that Codex ignores disallowed tools (has no such flag).
+    #[test]
+    fn codex_ignores_disallowed_tools() {
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec!["Bash(rm *)".to_string(), "WebFetch".to_string()],
+            blocked_paths: vec![],
+        };
+        let codex = get_runner("codex");
+        let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
+        assert!(
+            !cmd.contains("disallow"),
+            "codex: should not have disallow flags, got: {cmd}"
+        );
+    }
+
+    /// Test Claude with empty disallowed tools produces no --disallowedTools flag.
+    #[test]
+    fn claude_no_disallowed_flag_when_empty() {
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec![],
+            blocked_paths: vec![],
+        };
+        let claude = get_runner("claude");
+        let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
+        assert!(
+            !cmd.contains("--disallowedTools"),
+            "claude: should have no disallowed flag when empty, got: {cmd}"
+        );
+    }
+
+    /// Test Kimi/MiniMax aliases inherit Claude permission translation.
+    #[test]
+    fn kimi_minimax_use_claude_permissions() {
+        let perms = PermissionRules {
+            autonomous: false,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec!["Bash(rm *)".to_string()],
+            blocked_paths: vec![PathBuf::from("/blocked")],
+        };
+        let sys = "/tmp/sys.md";
+        let msg = "/tmp/msg.md";
+
+        for agent in &["kimi", "minimax"] {
+            let runner = get_runner(agent);
+            let cmd = runner.build_command(None, "", sys, msg, &perms);
+            assert!(
+                cmd.contains("--permission-mode acceptEdits"),
+                "{agent}: expected acceptEdits"
+            );
+            assert!(cmd.contains("Bash(rm *)"), "{agent}: expected rm disallowed");
+            assert!(
+                cmd.contains("Read(/blocked/*)"),
+                "{agent}: expected blocked path Read"
+            );
+        }
+    }
+
+    // ── Integration: from_config() → agent translation ──────────
+
+    /// Integration test: verify from_config() loads real config and agents
+    /// translate it correctly. Requires ~/.orch/config.yml to exist.
+    #[test]
+    #[ignore]
+    fn integration_from_config_to_agent_commands() {
+        let perms = PermissionRules::from_config();
+
+        // Verify defaults are reasonable
+        assert!(
+            perms.autonomous,
+            "from_config: expected autonomous=true by default"
+        );
+
+        // Verify each agent can build a command from the config-loaded rules
+        for agent_name in &["claude", "codex", "opencode", "kimi", "minimax"] {
+            let runner = get_runner(agent_name);
+            let cmd = runner.build_command(
+                None,
+                "timeout 1800",
+                "/tmp/sys.md",
+                "/tmp/msg.md",
+                &perms,
+            );
+            assert!(
+                !cmd.is_empty(),
+                "{agent_name}: build_command returned empty string"
+            );
+            assert!(
+                cmd.contains(agent_name) || *agent_name == "kimi" || *agent_name == "minimax",
+                "{agent_name}: command should reference agent binary, got: {cmd}"
+            );
+        }
+    }
+
+    /// Integration test: verify from_config() handles supervised mode.
+    /// Requires config with workflow.permissions.mode = "supervised".
+    #[test]
+    #[ignore]
+    fn integration_supervised_config_translates_correctly() {
+        // This test requires config to have:
+        // workflow:
+        //   permissions:
+        //     mode: supervised
+        let perms = PermissionRules::from_config();
+
+        let claude = get_runner("claude");
+        let cmd = claude.build_command(
+            None,
+            "",
+            "/tmp/sys.md",
+            "/tmp/msg.md",
+            &perms,
+        );
+
+        if perms.autonomous {
+            assert!(
+                cmd.contains("bypassPermissions"),
+                "autonomous config → bypassPermissions"
+            );
+        } else {
+            assert!(
+                cmd.contains("acceptEdits"),
+                "supervised config → acceptEdits"
+            );
+        }
+
+        let codex = get_runner("codex");
+        let cmd = codex.build_command(
+            None,
+            "",
+            "/tmp/sys.md",
+            "/tmp/msg.md",
+            &perms,
+        );
+
+        if perms.autonomous {
+            assert!(cmd.contains("--ask-for-approval never"));
+        } else {
+            assert!(cmd.contains("--ask-for-approval suggest"));
+        }
+    }
 }
