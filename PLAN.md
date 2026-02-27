@@ -1262,3 +1262,40 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | `axum` | Webhook HTTP server | In use |
 | `teloxide` | Telegram bot | Future (Phase 3) |
 | `serenity` | Discord bot | Future (Phase 3) |
+
+---
+
+## TODO — Remaining Work
+
+### Open Issues
+
+| Issue | Title | Priority | Description |
+|-------|-------|----------|-------------|
+| #143 | PR Review Integration — Auto-create follow-up tasks | Medium | Process `changes_requested` reviews and auto-create sub-tasks with review context. See src/engine/mod.rs and src/channels/github.rs. |
+| #144 | Cost Tracking CLI and Budget Enforcement | Medium | Add `orch cost <task_id>` command, aggregate cost reporting, and visible budget warnings. See src/sidecar.rs (cost tracking), src/cli/mod.rs (add command). |
+| #145 | Webhook Server Production Hardening | Medium | Graceful shutdown coordination, webhook event persistence, retry logic with backoff. See src/channels/github.rs (webhook server), src/engine/mod.rs (lifecycle). |
+
+### Implementation Notes
+
+**Issue #143 - PR Review Integration:**
+- Location: `src/engine/mod.rs` (add handler in `process_message()`)
+- Detect review state and create follow-up tasks as sub-issues
+- Update task status appropriately when reviews are submitted
+
+**Issue #144 - Cost Tracking:**
+- Location: `src/cli/mod.rs` (new subcommand), `src/db.rs` (cost metrics)
+- Build on existing cost estimation in `src/sidecar.rs:208-260`
+- Add budget warnings at 80% threshold with GitHub comment posting
+
+**Issue #145 - Webhook Hardening:**
+- Location: `src/channels/github.rs` (shutdown signal handling)
+- Add graceful shutdown with engine lifecycle
+- Implement webhook delivery persistence table
+- Add retry queue for failed webhook processing
+
+### Documentation Updates Needed
+
+- [ ] Update `AGENTS.md` with PR review integration flow
+- [ ] Document `orch cost` command when implemented
+- [ ] Document webhook server configuration options
+- [ ] Update feature checklist in this PLAN.md as issues are closed
