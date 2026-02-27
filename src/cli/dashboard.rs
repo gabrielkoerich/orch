@@ -27,10 +27,14 @@ pub async fn dashboard() -> anyhow::Result<()> {
 
     let mut counts: Vec<(Status, usize)> = Vec::new();
     let mut total = 0usize;
+    let mut done_tasks = Vec::new();
     for s in &statuses {
         let list = backend.list_by_status(*s).await?;
         total += list.len();
         counts.push((*s, list.len()));
+        if *s == Status::Done {
+            done_tasks = list;
+        }
     }
 
     println!("Tasks ({} total)", total);
@@ -47,10 +51,7 @@ pub async fn dashboard() -> anyhow::Result<()> {
     let tmux = TmuxManager::new();
     let sessions = tmux.list_sessions().await.unwrap_or_default();
     for s in sessions.iter() {
-        // Try to read agent and title from sidecar using task id
         let agent = sidecar::get(&s.task_id, "agent").unwrap_or_default();
-        let _title = sidecar::get(&s.task_id, "title").unwrap_or_default();
-        // Age
         let age = Utc::now() - s.created_at;
         let mins = age.num_minutes();
         println!(
@@ -60,18 +61,17 @@ pub async fn dashboard() -> anyhow::Result<()> {
     }
 
     println!("\nRecent (last 24h)");
-    // Recent external tasks updated in last 24h — use metrics backend if available
-    let recent = backend.list_by_status(Status::Done).await?;
     let cutoff: DateTime<Utc> = Utc::now() - Duration::hours(24);
-    for r in recent.iter().take(10) {
-        // parse updated_at RFC3339
+    for r in done_tasks.iter().take(10) {
         if let Ok(dt) = DateTime::parse_from_rfc3339(&r.updated_at) {
             let dt_utc = dt.with_timezone(&Utc);
             if dt_utc >= cutoff {
                 let agent = sidecar::get(&r.id.0, "agent").unwrap_or_default();
+                let elapsed = Utc::now() - dt_utc;
+                let mins = elapsed.num_minutes();
                 println!(
-                    "  ✅ #{:<4} {:<30} {:<8} done {:>5} ago",
-                    r.id.0, r.title, agent, ""
+                    "  ✅ #{:<4} {:<30} {:<8} done {:>4}m ago",
+                    r.id.0, r.title, agent, mins
                 );
             }
         }

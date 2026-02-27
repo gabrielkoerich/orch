@@ -7,6 +7,16 @@ use super::types::{GitHubComment, GitHubIssue, GitHubReview, GitHubReviewComment
 use tokio::process::Command;
 use urlencoding;
 
+/// Parse NDJSON (newline-delimited JSON) output from `gh api --jq '.[]'`.
+fn parse_ndjson<T: serde::de::DeserializeOwned>(stdout: &[u8]) -> anyhow::Result<Vec<T>> {
+    let text = String::from_utf8_lossy(stdout);
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 pub struct GhCli;
 
 impl GhCli {
@@ -15,13 +25,26 @@ impl GhCli {
     }
 
     pub async fn graphql(&self, query: &str) -> anyhow::Result<serde_json::Value> {
-        let output = Command::new("gh")
-            .arg("api")
-            .arg("graphql")
-            .arg("-f")
-            .arg(format!("query={}", urlencoding::encode(query)))
-            .output()
-            .await?;
+        self.graphql_with_headers(query, &[]).await
+    }
+
+    /// Run a GraphQL query with optional extra HTTP headers.
+    pub async fn graphql_with_headers(
+        &self,
+        query: &str,
+        headers: &[&str],
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut cmd = Command::new("gh");
+        cmd.arg("api").arg("graphql");
+
+        for header in headers {
+            cmd.arg("-H").arg(header);
+        }
+
+        cmd.arg("-f")
+            .arg(format!("query={}", urlencoding::encode(query)));
+
+        let output = cmd.output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -126,14 +149,7 @@ impl GhCli {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
-        // --jq '.[]' produces newline-delimited JSON objects (NDJSON)
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let items: Vec<GitHubIssue> = stdout
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(serde_json::from_str)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(items)
+        parse_ndjson(&output.stdout)
     }
 
     /// Add labels to an issue (appends to existing labels).
@@ -356,14 +372,7 @@ impl GhCli {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
-        // --jq '.[]' produces newline-delimited JSON objects (NDJSON)
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let items: Vec<GitHubComment> = stdout
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(serde_json::from_str)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(items)
+        parse_ndjson(&output.stdout)
     }
 
     /// Get the current authenticated username.
@@ -500,6 +509,8 @@ impl GhCli {
     }
 
     /// Add a sub-issue relationship using the GitHub GraphQL API.
+    ///
+    /// Requires the `sub_issues` GraphQL preview feature header.
     pub async fn add_sub_issue(
         &self,
         parent_node_id: &str,
@@ -515,7 +526,8 @@ impl GhCli {
             parent_node_id, child_node_id
         );
 
-        self.graphql(&query).await?;
+        self.graphql_with_headers(&query, &["GraphQL-Features:sub_issues"])
+            .await?;
         Ok(())
     }
 
@@ -566,7 +578,6 @@ impl GhCli {
         let max_pages = 50;
         let mut page_count = 0;
 
-        // GraphQL query to get sub-issues with pagination cursor
         loop {
             page_count += 1;
             if page_count > max_pages {
@@ -577,58 +588,43 @@ impl GhCli {
                 );
                 break;
             }
-            let query = if let Some(ref after_cursor) = cursor {
-                format!(
-                    r#"{{
-                        repository(owner: "{}", name: "{}") {{
-                            issue(number: {}) {{
-                                subIssues(first: {}, after: "{}") {{
-                                    nodes {{
-                                        number
-                                    }}
-                                    pageInfo {{
-                                        hasNextPage
-                                        endCursor
-                                    }}
-                                }}
+
+            // Build query with optional cursor (single template, no duplication)
+            let after_clause = cursor
+                .as_ref()
+                .map(|c| format!(r#", after: "{}""#, c))
+                .unwrap_or_default();
+            let query = format!(
+                r#"{{
+                    repository(owner: "{}", name: "{}") {{
+                        issue(number: {}) {{
+                            subIssues(first: {}{}) {{
+                                nodes {{ number }}
+                                pageInfo {{ hasNextPage endCursor }}
                             }}
                         }}
-                    }}"#,
-                    owner, repo_name, number, page_size, after_cursor
-                )
-            } else {
-                format!(
-                    r#"{{
-                        repository(owner: "{}", name: "{}") {{
-                            issue(number: {}) {{
-                                subIssues(first: {}) {{
-                                    nodes {{
-                                        number
-                                    }}
-                                    pageInfo {{
-                                        hasNextPage
-                                        endCursor
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }}"#,
-                    owner, repo_name, number, page_size
-                )
-            };
+                    }}
+                }}"#,
+                owner, repo_name, number, page_size, after_clause
+            );
 
-            let result = self.graphql(&query).await?;
+            // Sub-issues API requires the preview feature header
+            let result = self
+                .graphql_with_headers(&query, &["GraphQL-Features:sub_issues"])
+                .await?;
 
-            // Parse the response to extract sub-issue numbers
-            let sub_issues = result
+            // Extract subIssues object once, reuse for nodes and pageInfo
+            let sub_issues_data = result
                 .get("data")
                 .and_then(|d| d.get("repository"))
                 .and_then(|r| r.get("issue"))
-                .and_then(|i| i.get("subIssues"))
+                .and_then(|i| i.get("subIssues"));
+
+            let nodes = sub_issues_data
                 .and_then(|s| s.get("nodes"))
                 .and_then(|n| n.as_array());
 
-            match sub_issues {
+            match nodes {
                 Some(nodes) => {
                     let numbers: Vec<u64> = nodes
                         .iter()
@@ -636,16 +632,11 @@ impl GhCli {
                         .collect();
                     all_numbers.extend(numbers);
                 }
-                None => break, // No sub-issues or issue not found
+                None => break,
             }
 
-            // Check if there are more pages
-            let has_next = result
-                .get("data")
-                .and_then(|d| d.get("repository"))
-                .and_then(|r| r.get("issue"))
-                .and_then(|i| i.get("subIssues"))
-                .and_then(|s| s.get("pageInfo"))
+            let page_info = sub_issues_data.and_then(|s| s.get("pageInfo"));
+            let has_next = page_info
                 .and_then(|p| p.get("hasNextPage"))
                 .and_then(|h| h.as_bool())
                 .unwrap_or(false);
@@ -654,13 +645,7 @@ impl GhCli {
                 break;
             }
 
-            // Get the cursor for the next page
-            cursor = result
-                .get("data")
-                .and_then(|d| d.get("repository"))
-                .and_then(|r| r.get("issue"))
-                .and_then(|i| i.get("subIssues"))
-                .and_then(|s| s.get("pageInfo"))
+            cursor = page_info
                 .and_then(|p| p.get("endCursor"))
                 .and_then(|c| c.as_str())
                 .map(|s| s.to_string());

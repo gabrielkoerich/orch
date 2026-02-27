@@ -923,7 +923,12 @@ async fn tick(
                         let enable_review = config::get("workflow.enable_review_agent")
                             .map(|v| v == "true")
                             .unwrap_or(false);
-                        if enable_review {
+                        // Guard against duplicate review spawns
+                        let already_reviewing = sidecar::get(&task_id, "review_started")
+                            .map(|v| v == "true")
+                            .unwrap_or(false);
+                        if enable_review && !already_reviewing {
+                            let _ = sidecar::set(&task_id, &["review_started=true".to_string()]);
                             let backend_clone = backend.clone();
                             let tmux_clone = tmux.clone();
                             let task_owned_clone = task_owned.clone();
@@ -1113,28 +1118,47 @@ async fn skills_sync() -> anyhow::Result<()> {
     }
 
     let skills_base = crate::home::skills_dir()?;
+    let git_timeout = std::time::Duration::from_secs(60);
 
     for skill in skills {
+        // Validate repo format to prevent path traversal
+        if skill.repo.contains("..") || skill.repo.matches('/').count() != 1 {
+            tracing::warn!(repo = %skill.repo, "invalid skill repo format, expected 'owner/repo'");
+            continue;
+        }
+
         let repo_dir = skills_base.join(&skill.repo);
         let repo_url = format!("https://github.com/{}.git", skill.repo);
 
         if repo_dir.exists() {
-            // Pull latest changes
+            // Pull latest changes with timeout
             tracing::debug!(repo = %skill.repo, "pulling skill repo");
-            let output = Command::new("git")
-                .args(["pull", "--ff-only", "--prune"])
-                .current_dir(&repo_dir)
-                .output()
-                .await?;
+            let pull_result = tokio::time::timeout(
+                git_timeout,
+                Command::new("git")
+                    .args(["pull", "--ff-only", "--prune"])
+                    .current_dir(&repo_dir)
+                    .output(),
+            )
+            .await;
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(repo = %skill.repo, err = %stderr, "git pull failed");
-            } else {
-                tracing::debug!(repo = %skill.repo, "skill repo updated");
+            match pull_result {
+                Ok(Ok(output)) if !output.status.success() => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(repo = %skill.repo, err = %stderr, "git pull failed");
+                }
+                Ok(Ok(_)) => {
+                    tracing::debug!(repo = %skill.repo, "skill repo updated");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(repo = %skill.repo, err = %e, "git pull error");
+                }
+                Err(_) => {
+                    tracing::warn!(repo = %skill.repo, "git pull timed out after 60s");
+                }
             }
         } else {
-            // Clone the repository
+            // Clone the repository (shallow for efficiency)
             tracing::debug!(repo = %skill.repo, "cloning skill repo");
             let parent = repo_dir
                 .parent()
@@ -1144,16 +1168,32 @@ async fn skills_sync() -> anyhow::Result<()> {
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("skill repo path is not valid UTF-8"))?;
 
-            let output = Command::new("git")
-                .args(["clone", &repo_url, repo_dir_str])
-                .output()
-                .await?;
+            let clone_result = tokio::time::timeout(
+                git_timeout,
+                Command::new("git")
+                    .args(["clone", "--depth", "1", &repo_url, repo_dir_str])
+                    .output(),
+            )
+            .await;
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(repo = %skill.repo, err = %stderr, "git clone failed");
-            } else {
-                tracing::info!(repo = %skill.repo, "skill repo cloned");
+            match clone_result {
+                Ok(Ok(output)) if !output.status.success() => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(repo = %skill.repo, err = %stderr, "git clone failed");
+                    // Clean up partial clone to allow retry on next tick
+                    let _ = std::fs::remove_dir_all(&repo_dir);
+                }
+                Ok(Ok(_)) => {
+                    tracing::info!(repo = %skill.repo, "skill repo cloned");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(repo = %skill.repo, err = %e, "git clone error");
+                    let _ = std::fs::remove_dir_all(&repo_dir);
+                }
+                Err(_) => {
+                    tracing::warn!(repo = %skill.repo, "git clone timed out after 60s");
+                    let _ = std::fs::remove_dir_all(&repo_dir);
+                }
             }
         }
     }
@@ -1619,10 +1659,15 @@ async fn review_open_prs(
         // Cap review context to avoid oversized sidecar values
         const MAX_REVIEW_CONTEXT_BYTES: usize = 16 * 1024;
         if review_context.len() > MAX_REVIEW_CONTEXT_BYTES {
-            if let Some(pos) = review_context[..MAX_REVIEW_CONTEXT_BYTES].rfind('\n') {
+            // Find safe UTF-8 char boundary
+            let mut boundary = MAX_REVIEW_CONTEXT_BYTES;
+            while !review_context.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            if let Some(pos) = review_context[..boundary].rfind('\n') {
                 review_context.truncate(pos);
             } else {
-                review_context.truncate(MAX_REVIEW_CONTEXT_BYTES);
+                review_context.truncate(boundary);
             }
             review_context.push_str("\n... (review context truncated)");
         }
@@ -1665,6 +1710,7 @@ enum ReviewDecision {
         issues: Vec<crate::engine::runner::response::ReviewIssue>,
     },
     /// Review agent is disabled, skip.
+    #[allow(dead_code)]
     Skip,
     /// Review agent failed or crashed (reason stored for logging).
     #[allow(dead_code)]
@@ -1679,18 +1725,9 @@ enum ReviewDecision {
 async fn review_and_merge(
     task: &ExternalTask,
     backend: &Arc<dyn ExternalBackend>,
-    _tmux: &Arc<TmuxManager>,
+    tmux: &Arc<TmuxManager>,
     repo: &str,
 ) -> anyhow::Result<ReviewDecision> {
-    // 1. Check config
-    let enabled = config::get("workflow.enable_review_agent")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    if !enabled {
-        tracing::info!(task_id = task.id.0, "review agent disabled");
-        return Ok(ReviewDecision::Skip);
-    }
-
     // 2. Load sidecar for worktree path, branch, agent
     let worktree = sidecar::get(&task.id.0, "worktree").ok();
     let branch = sidecar::get(&task.id.0, "branch").ok();
@@ -1713,8 +1750,9 @@ async fn review_and_merge(
     };
 
     // 3. Get git diff and log
-    let git_diff = runner::context::build_git_diff(&worktree_path, "main").await;
-    let git_log = runner::context::build_git_log(&worktree_path, "main").await;
+    let default_branch = config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+    let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
+    let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
 
     // 4. Build review prompt
     let review_prompt =
@@ -1762,8 +1800,7 @@ async fn review_and_merge(
     };
 
     // 7. Spawn review agent in tmux
-    let tmux_local = crate::tmux::TmuxManager::new();
-    let session = match runner::agent::spawn_in_tmux(&tmux_local, &invocation).await {
+    let session = match runner::agent::spawn_in_tmux(tmux, &invocation).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(task_id = task.id.0, error = %e, "failed to spawn review agent");
@@ -1777,22 +1814,24 @@ async fn review_and_merge(
 
     let wait_result = tokio::time::timeout(
         timeout_duration,
-        tmux_local.wait_for_completion(&session, poll_interval),
+        tmux.wait_for_completion(&session, poll_interval),
     )
     .await;
 
     match wait_result {
         Ok(Ok(_)) => {
             tracing::info!(task_id = task.id.0, "review agent completed");
+            // Clean up tmux session on success
+            let _ = tmux.kill_session(&session).await;
         }
         Ok(Err(e)) => {
             tracing::error!(task_id = task.id.0, error = %e, "review agent error");
-            let _ = tmux_local.kill_session(&session).await;
+            let _ = tmux.kill_session(&session).await;
             return Ok(ReviewDecision::Failed(format!("agent error: {e}")));
         }
         Err(_) => {
             tracing::error!(task_id = task.id.0, "review agent timed out");
-            let _ = tmux_local.kill_session(&session).await;
+            let _ = tmux.kill_session(&session).await;
             return Ok(ReviewDecision::Failed("timeout".to_string()));
         }
     }
@@ -1893,12 +1932,9 @@ async fn auto_merge_pr(
         .unwrap_or(true);
 
     if auto_close {
-        // Close the issue via gh api
-        let close_endpoint = format!("repos/{repo}/issues/{}", task.id.0);
-        let _ = Command::new("gh")
-            .args(["api", &close_endpoint, "-X", "PATCH", "-f", "state=closed"])
-            .output()
-            .await;
+        if let Err(e) = gh.close_issue(repo, &task.id.0).await {
+            tracing::warn!(task_id = task.id.0, error = %e, "failed to close issue after merge");
+        }
     }
 
     // 5. Mark worktree for cleanup
@@ -1975,12 +2011,19 @@ async fn handle_review_changes(
 
     backend.post_comment(&task.id, &comment).await?;
 
-    // 3. Update sidecar with review context
+    // 3. Update sidecar with review context (including pr_review_context so the
+    //    re-dispatched agent can see what the reviewer found wrong)
+    let review_context = format!(
+        "A reviewer has requested changes on your PR. Please address the following feedback:\n\n{}",
+        comment
+    );
     let _ = sidecar::set(
         &task.id.0,
         &[
             format!("review_cycles={}", review_cycles + 1),
             format!("review_notes={}", notes),
+            format!("pr_review_context={}", review_context),
+            "review_started=false".to_string(),
             "status=routed".to_string(),
         ],
     );
@@ -2168,5 +2211,21 @@ mod tests {
             actionable[0].diff_hunk.as_ref().unwrap(),
             "@@ -8,5 +8,5 @@ fn main() {\n-    let x = 1;\n+    let x = 2;"
         );
+    }
+
+    #[test]
+    fn test_get_model_for_complexity_returns_nonempty() {
+        // Should always return a non-empty model name (from config or defaults)
+        assert!(!get_model_for_complexity("simple", "claude").is_empty());
+        assert!(!get_model_for_complexity("medium", "claude").is_empty());
+        assert!(!get_model_for_complexity("complex", "claude").is_empty());
+        assert!(!get_model_for_complexity("review", "claude").is_empty());
+    }
+
+    #[test]
+    fn test_get_model_for_complexity_unknown_agent() {
+        // Unknown agents should still return a model name
+        let model = get_model_for_complexity("simple", "unknown_agent_xyz");
+        assert!(!model.is_empty());
     }
 }
