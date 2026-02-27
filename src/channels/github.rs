@@ -109,8 +109,8 @@ impl GitHubChannel {
                 "Accept: application/vnd.github.v3+json",
                 "--method",
                 "POST",
-                "--field",
-                &format!("body={}", body.replace('\n', "\\n")),
+                "--raw-field",
+                &format!("body={}", body),
             ])
             .output()?;
 
@@ -300,6 +300,7 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -342,6 +343,7 @@ struct PullRequestPayload {
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct CommentPayload {
+    id: u64,
     body: String,
     user: GhUser,
     created_at: Option<DateTime<Utc>>,
@@ -349,6 +351,7 @@ struct CommentPayload {
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct ReviewPayload {
+    id: u64,
     state: String,
     body: Option<String>,
     user: GhUser,
@@ -363,7 +366,8 @@ fn verify_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
     let result = mac.finalize().into_bytes();
 
     let expected = format!("sha256={:x}", result);
-    expected == signature
+    // Use constant-time comparison to prevent timing side-channel attacks
+    bool::from(expected.as_bytes().ct_eq(signature.as_bytes()))
 }
 
 fn parse_github_event(
@@ -423,7 +427,7 @@ fn parse_github_event(
                 if action == "created" {
                     return Some(IncomingMessage {
                         channel: "github".to_string(),
-                        id: format!("comment-{}-{}", issue.number, timestamp.timestamp()),
+                        id: format!("comment-{}", comment.id),
                         thread_id: issue.number.to_string(),
                         author: comment.user.login.clone(),
                         body: comment.body.clone(),
@@ -444,7 +448,7 @@ fn parse_github_event(
                 if action == "submitted" {
                     return Some(IncomingMessage {
                         channel: "github".to_string(),
-                        id: format!("review-{}-{}", pr.number, timestamp.timestamp()),
+                        id: format!("review-{}", review.id),
                         thread_id: pr.number.to_string(),
                         author: review.user.login.clone(),
                         body: review
@@ -515,10 +519,16 @@ async fn webhook_health() -> impl IntoResponse {
 /// that GitHub can reach the endpoint (NAT/firewall) or that the webhook
 /// secret is valid.
 pub async fn check_webhook_health(port: u16) -> bool {
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .unwrap_or_default();
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(?e, "failed to build HTTP client for webhook health check");
+            return false;
+        }
+    };
     let url = format!("http://localhost:{}/health", port);
     match client.get(&url).send().await {
         Ok(response) => response.status().is_success(),
@@ -725,6 +735,7 @@ mod tests {
             }),
             pr: None,
             comment: Some(CommentPayload {
+                id: 12345,
                 body: "This is a comment".to_string(),
                 user: GhUser {
                     login: "testuser".to_string(),
@@ -742,6 +753,7 @@ mod tests {
         assert!(msg.is_some());
 
         let msg = msg.unwrap();
+        assert_eq!(msg.id, "comment-12345", "ID should use actual comment ID");
         assert_eq!(msg.author, "testuser");
         assert_eq!(msg.body, "This is a comment");
         assert_eq!(msg.thread_id, "42");
@@ -758,6 +770,7 @@ mod tests {
             issue: None,
             pr: None,
             comment: Some(CommentPayload {
+                id: 12345,
                 body: "Orphan comment".to_string(),
                 user: GhUser {
                     login: "testuser".to_string(),
@@ -784,6 +797,7 @@ mod tests {
             }),
             comment: None,
             review: Some(ReviewPayload {
+                id: 98765,
                 state: "changes_requested".to_string(),
                 body: Some("Please fix the tests".to_string()),
                 user: GhUser {
@@ -796,6 +810,7 @@ mod tests {
         assert!(msg.is_some());
 
         let msg = msg.unwrap();
+        assert_eq!(msg.id, "review-98765", "ID should use actual review ID");
         assert_eq!(msg.thread_id, "55");
         assert_eq!(msg.author, "reviewer");
         assert_eq!(msg.body, "Please fix the tests");
@@ -818,6 +833,7 @@ mod tests {
             }),
             comment: None,
             review: Some(ReviewPayload {
+                id: 98765,
                 state: "dismissed".to_string(),
                 body: None,
                 user: GhUser {
@@ -929,6 +945,7 @@ mod tests {
                 "labels": []
             },
             "comment": {
+                "id": 12345,
                 "body": "@orchestrator please fix this",
                 "user": {"login": "contributor"},
                 "created_at": "2024-06-15T12:00:00Z"
@@ -978,6 +995,7 @@ mod tests {
                 "title": "Add feature X"
             },
             "review": {
+                "id": 98765,
                 "state": "changes_requested",
                 "body": "Fix the failing tests",
                 "user": {"login": "maintainer"}
