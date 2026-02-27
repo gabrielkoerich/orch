@@ -99,13 +99,16 @@ impl GhCli {
 
     /// List issues filtered by a label.
     ///
-    /// Uses `--paginate` to fetch all pages (not just the first 100).
+    /// Uses `--paginate` with `--jq '.[]'` to fetch all pages and flatten
+    /// the JSON arrays into a stream of objects that serde can parse.
     pub async fn list_issues(&self, repo: &str, label: &str) -> anyhow::Result<Vec<GitHubIssue>> {
         let endpoint = format!("repos/{repo}/issues");
         let labels_field = format!("labels={label}");
         let output = Command::new("gh")
             .arg("api")
             .arg("--paginate")
+            .arg("--jq")
+            .arg(".[]")
             .args([
                 &endpoint,
                 "-X",
@@ -317,7 +320,8 @@ impl GhCli {
 
     /// Get issue/PR comments since a given timestamp.
     ///
-    /// Uses `--paginate` to fetch all pages (not just the first 100).
+    /// Uses `--paginate` with `--jq '.[]'` to fetch all pages and flatten
+    /// the JSON arrays into a stream of objects that serde can parse.
     pub async fn get_mentions(
         &self,
         repo: &str,
@@ -328,6 +332,8 @@ impl GhCli {
         let output = Command::new("gh")
             .arg("api")
             .arg("--paginate")
+            .arg("--jq")
+            .arg(".[]")
             .args([
                 &endpoint,
                 "-X",
@@ -487,43 +493,102 @@ impl GhCli {
         }
         let (owner, repo_name) = (parts[0], parts[1]);
 
-        // GraphQL query to get sub-issues
-        let query = format!(
-            r#"{{
-                repository(owner: "{}", name: "{}") {{
-                    issue(number: {}) {{
-                        subIssues(first: 100) {{
-                            nodes {{
-                                number
+        let mut all_numbers: Vec<u64> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let page_size = 100;
+
+        // GraphQL query to get sub-issues with pagination cursor
+        loop {
+            let query = if let Some(ref after_cursor) = cursor {
+                format!(
+                    r#"{{
+                        repository(owner: "{}", name: "{}") {{
+                            issue(number: {}) {{
+                                subIssues(first: {}, after: "{}") {{
+                                    nodes {{
+                                        number
+                                    }}
+                                    pageInfo {{
+                                        hasNextPage
+                                        endCursor
+                                    }}
+                                }}
                             }}
                         }}
-                    }}
-                }}
-            }}"#,
-            owner, repo_name, number
-        );
+                    }}"#,
+                    owner, repo_name, number, page_size, after_cursor
+                )
+            } else {
+                format!(
+                    r#"{{
+                        repository(owner: "{}", name: "{}") {{
+                            issue(number: {}) {{
+                                subIssues(first: {}) {{
+                                    nodes {{
+                                        number
+                                    }}
+                                    pageInfo {{
+                                        hasNextPage
+                                        endCursor
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}"#,
+                    owner, repo_name, number, page_size
+                )
+            };
 
-        let result = self.graphql(&query).await?;
+            let result = self.graphql(&query).await?;
 
-        // Parse the response to extract sub-issue numbers
-        let sub_issues = result
-            .get("data")
-            .and_then(|d| d.get("repository"))
-            .and_then(|r| r.get("issue"))
-            .and_then(|i| i.get("subIssues"))
-            .and_then(|s| s.get("nodes"))
-            .and_then(|n| n.as_array());
+            // Parse the response to extract sub-issue numbers
+            let sub_issues = result
+                .get("data")
+                .and_then(|d| d.get("repository"))
+                .and_then(|r| r.get("issue"))
+                .and_then(|i| i.get("subIssues"))
+                .and_then(|s| s.get("nodes"))
+                .and_then(|n| n.as_array());
 
-        match sub_issues {
-            Some(nodes) => {
-                let numbers: Vec<u64> = nodes
-                    .iter()
-                    .filter_map(|n| n.get("number").and_then(|num| num.as_u64()))
-                    .collect();
-                Ok(numbers)
+            match sub_issues {
+                Some(nodes) => {
+                    let numbers: Vec<u64> = nodes
+                        .iter()
+                        .filter_map(|n| n.get("number").and_then(|num| num.as_u64()))
+                        .collect();
+                    all_numbers.extend(numbers);
+                }
+                None => break, // No sub-issues or issue not found
             }
-            None => Ok(vec![]), // No sub-issues or issue not found
+
+            // Check if there are more pages
+            let has_next = result
+                .get("data")
+                .and_then(|d| d.get("repository"))
+                .and_then(|r| r.get("issue"))
+                .and_then(|i| i.get("subIssues"))
+                .and_then(|s| s.get("pageInfo"))
+                .and_then(|p| p.get("hasNextPage"))
+                .and_then(|h| h.as_bool())
+                .unwrap_or(false);
+
+            if !has_next {
+                break;
+            }
+
+            // Get the cursor for the next page
+            cursor = result
+                .get("data")
+                .and_then(|d| d.get("repository"))
+                .and_then(|r| r.get("issue"))
+                .and_then(|i| i.get("subIssues"))
+                .and_then(|s| s.get("pageInfo"))
+                .and_then(|p| p.get("endCursor"))
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string());
         }
+
+        Ok(all_numbers)
     }
 }
 
@@ -536,7 +601,7 @@ pub fn status_label_color(label: &str) -> &'static str {
         "status:new" => "0e8a16",
         "status:routed" => "1d76db",
         "status:in_progress" => "fbca04",
-        "status:done" => "0e8a16",
+        "status:done" => "6f42c1",
         "status:blocked" => "d73a4a",
         "status:in_review" => "0075ca",
         "status:needs_review" => "e4e669",
@@ -553,7 +618,7 @@ mod tests {
         assert_eq!(status_label_color("status:new"), "0e8a16");
         assert_eq!(status_label_color("status:routed"), "1d76db");
         assert_eq!(status_label_color("status:in_progress"), "fbca04");
-        assert_eq!(status_label_color("status:done"), "0e8a16");
+        assert_eq!(status_label_color("status:done"), "6f42c1");
         assert_eq!(status_label_color("status:blocked"), "d73a4a");
         assert_eq!(status_label_color("status:in_review"), "0075ca");
         assert_eq!(status_label_color("status:needs_review"), "e4e669");

@@ -167,7 +167,7 @@ impl TaskManager {
                     Status::InProgress => TaskStatus::InProgress,
                     Status::Done => TaskStatus::Done,
                     Status::Blocked => TaskStatus::Blocked,
-                    Status::InReview => TaskStatus::Blocked,
+                    Status::InReview => TaskStatus::InReview,
                     Status::NeedsReview => TaskStatus::NeedsReview,
                 };
                 self.db.update_internal_task_status(id, task_status).await

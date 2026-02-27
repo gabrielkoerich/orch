@@ -49,7 +49,7 @@ impl GitHubChannel {
 
     async fn fetch_in_progress_issues(&self) -> anyhow::Result<Vec<GhIssue>> {
         let url = self.gh_api(&format!(
-            "/repos/{}/issues?labels=status:in_progress&state=all",
+            "/repos/{}/issues?labels=status:in_progress&state=open",
             self.repo
         ));
 
