@@ -156,7 +156,10 @@ impl GhCli {
     ///
     /// Uses `--input -` with a JSON payload — the `-f labels[]=` form doesn't
     /// map correctly to the GitHub JSON API.
-    #[allow(dead_code)] // available for backends, not all paths used yet
+    ///
+    /// Kept as a public helper for backends and integration tests that need to
+    /// programmatically append labels. Intentionally retained for API parity
+    /// with the original shell helper.
     pub async fn add_labels(
         &self,
         repo: &str,
@@ -252,7 +255,6 @@ impl GhCli {
     ///
     /// Returns Ok if the label was removed or didn't exist (404).
     /// Propagates all other errors to prevent silent state corruption.
-    #[allow(dead_code)]
     pub async fn remove_label(&self, repo: &str, number: &str, label: &str) -> anyhow::Result<()> {
         let encoded = urlencoding::encode(label);
         let endpoint = format!("repos/{repo}/issues/{number}/labels/{encoded}");

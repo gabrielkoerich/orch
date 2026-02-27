@@ -14,6 +14,12 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 /// Classification of agent execution result (legacy, used in tests).
+///
+/// This enum is kept for backwards compatibility with older call sites and
+/// unit tests that inspect detailed execution outcomes. Newer code prefers
+/// `WeightSignal` and the parsing helpers above, but removing this enum would
+/// require updating multiple modules and tests, so it remains intentionally
+/// available.
 #[allow(dead_code)]
 pub enum RunResult {
     /// Agent completed successfully with a parsed response.
@@ -32,8 +38,8 @@ pub enum RunResult {
 
 /// Outcome signal for the engine to update router weights.
 ///
-/// Returned by the task runner so the engine can feed rate limit
-/// and success signals back to the router's weighted round-robin.
+/// Returned by the task runner so the engine can feed rate limit and
+/// success signals back to the router's weighted round-robin implementation.
 #[derive(Debug, Clone)]
 pub enum WeightSignal {
     /// Agent completed a task successfully.
