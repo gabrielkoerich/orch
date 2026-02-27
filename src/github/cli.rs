@@ -131,7 +131,7 @@ impl GhCli {
         let items: Vec<GitHubIssue> = stdout
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line))
+            .map(serde_json::from_str)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(items)
     }
@@ -361,7 +361,7 @@ impl GhCli {
         let items: Vec<GitHubComment> = stdout
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line))
+            .map(serde_json::from_str)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(items)
     }
