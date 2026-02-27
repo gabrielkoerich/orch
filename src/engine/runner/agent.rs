@@ -402,3 +402,100 @@ pub fn build_agent_message(
 
     msg
 }
+
+/// Build the review prompt for the review agent.
+///
+/// This is called when a task completes and the review agent needs to
+/// review the changes before auto-merge.
+pub fn build_review_prompt(
+    task: &crate::backends::ExternalTask,
+    agent_summary: &str,
+    git_diff: &str,
+    git_log: &str,
+) -> String {
+    let mut msg = String::new();
+
+    msg.push_str(&format!(
+        "## Review Task #{}: {}\n\n",
+        task.id.0, task.title
+    ));
+
+    msg.push_str("You are reviewing a PR created by an AI agent. Check:\n\n");
+    msg.push_str("1. **Requirements met** — does the code satisfy the task description?\n");
+    msg.push_str("2. **Tests pass** — run the test suite, report failures\n");
+    msg.push_str("3. **Code quality** — no obvious bugs, security issues, or regressions\n");
+    msg.push_str("4. **Completeness** — all files committed, no TODOs left behind\n\n");
+
+    msg.push_str("### Task Description\n");
+    msg.push_str(&task.body);
+    msg.push_str("\n\n");
+
+    if !agent_summary.is_empty() {
+        msg.push_str("### Agent Summary\n");
+        msg.push_str(agent_summary);
+        msg.push_str("\n\n");
+    }
+
+    if !git_diff.is_empty() {
+        msg.push_str("### Changes\n```diff\n");
+        msg.push_str(git_diff);
+        msg.push_str("\n```\n\n");
+    }
+
+    if !git_log.is_empty() {
+        msg.push_str("### Commits\n");
+        msg.push_str(git_log);
+        msg.push('\n');
+    }
+
+    msg.push_str(
+        r#"
+## Output Format
+
+```json
+{
+  "decision": "approve|request_changes",
+  "notes": "Detailed review feedback",
+  "test_results": "pass|fail|skipped",
+  "issues": [
+    {
+      "file": "src/foo.rs",
+      "line": 42,
+      "severity": "error|warning",
+      "description": "What's wrong and how to fix it"
+    }
+  ]
+}
+```
+
+Decision rules:
+- **approve**: The code meets requirements, tests pass, no major issues
+- **request_changes**: There are bugs, test failures, or the code doesn't meet requirements
+
+Be thorough but practical. Don't block on minor style issues unless they indicate real problems.
+"#,
+    );
+
+    msg
+}
+
+/// Build the system prompt for the review agent.
+pub fn review_system_prompt() -> String {
+    r#"You are a code review agent. Your job is to review pull requests created by AI agents.
+
+Review criteria:
+1. Correctness — does the code do what the task asked for?
+2. Tests — run the test suite and report any failures
+3. Security — look for obvious security issues (SQL injection, XSS, etc.)
+4. Completeness — are all necessary files committed?
+
+Your output MUST be valid JSON with the exact format specified in the task.
+
+Rules:
+- NEVER use `rm` to delete files. Use `trash` (macOS) or `trash-put` (Linux).
+- NEVER commit directly to the main/master branch.
+- Run tests before making a decision.
+- Be specific about what needs to be fixed if requesting changes.
+"#
+    .to_string()
+}

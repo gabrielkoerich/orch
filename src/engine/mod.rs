@@ -879,6 +879,7 @@ async fn tick(
         let task_id_for_cleanup = task_id.clone();
         let task_owned = task.clone();
         let weight_tx = weight_tx.clone();
+        let repo_owned = repo.to_string();
 
         // Load routing result from sidecar (stored during Phase 3a)
         let route_result = get_route_result(&task_id).ok();
@@ -911,11 +912,35 @@ async fn tick(
                     transport.push_notification(TaskNotification {
                         task_id: task_id.clone(),
                         title: task_owned.title.clone(),
-                        status,
+                        status: status.clone(),
                         agent: agent_name.clone(),
                         duration_seconds: duration,
-                        summary,
+                        summary: summary.clone(),
                     });
+
+                    // Trigger review agent if task is done
+                    if status == "done" {
+                        let enable_review = config::get("workflow.enable_review_agent")
+                            .map(|v| v == "true")
+                            .unwrap_or(false);
+                        if enable_review {
+                            let backend_clone = backend.clone();
+                            let tmux_clone = tmux.clone();
+                            let task_owned_clone = task_owned.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = review_and_merge(
+                                    &task_owned_clone,
+                                    &backend_clone,
+                                    &tmux_clone,
+                                    &repo_owned,
+                                )
+                                .await
+                                {
+                                    tracing::error!(task_id, error = %e, "review_and_merge failed");
+                                }
+                            });
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::error!(task_id, ?e, "task runner failed");
@@ -1627,6 +1652,376 @@ async fn review_open_prs(
     }
 
     Ok(())
+}
+
+/// Review agent decision result.
+#[derive(Debug, Clone)]
+enum ReviewDecision {
+    /// Review approved, PR can be merged.
+    Approve,
+    /// Changes requested, PR needs fixes.
+    RequestChanges {
+        notes: String,
+        issues: Vec<crate::engine::runner::response::ReviewIssue>,
+    },
+    /// Review agent is disabled, skip.
+    Skip,
+    /// Review agent failed or crashed (reason stored for logging).
+    #[allow(dead_code)]
+    Failed(String),
+}
+
+/// Run the review agent on a completed task and handle the outcome.
+///
+/// This is called after a task completes with status:done and a PR is created.
+/// The review agent checks the changes and either approves (triggers auto-merge)
+/// or requests changes (re-dispatches the original agent).
+async fn review_and_merge(
+    task: &ExternalTask,
+    backend: &Arc<dyn ExternalBackend>,
+    _tmux: &Arc<TmuxManager>,
+    repo: &str,
+) -> anyhow::Result<ReviewDecision> {
+    // 1. Check config
+    let enabled = config::get("workflow.enable_review_agent")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if !enabled {
+        tracing::info!(task_id = task.id.0, "review agent disabled");
+        return Ok(ReviewDecision::Skip);
+    }
+
+    // 2. Load sidecar for worktree path, branch, agent
+    let worktree = sidecar::get(&task.id.0, "worktree").ok();
+    let branch = sidecar::get(&task.id.0, "branch").ok();
+    let agent_summary = sidecar::get(&task.id.0, "summary").unwrap_or_default();
+
+    let worktree_path = match worktree {
+        Some(w) if !w.is_empty() => std::path::PathBuf::from(w),
+        _ => {
+            tracing::warn!(task_id = task.id.0, "no worktree found for review");
+            return Ok(ReviewDecision::Failed("no worktree found".to_string()));
+        }
+    };
+
+    let branch_name = match branch {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            tracing::warn!(task_id = task.id.0, "no branch found for review");
+            return Ok(ReviewDecision::Failed("no branch found".to_string()));
+        }
+    };
+
+    // 3. Get git diff and log
+    let git_diff = runner::context::build_git_diff(&worktree_path, "main").await;
+    let git_log = runner::context::build_git_log(&worktree_path, "main").await;
+
+    // 4. Build review prompt
+    let review_prompt =
+        runner::agent::build_review_prompt(task, &agent_summary, &git_diff, &git_log);
+
+    // 5. Pick review agent (config: workflow.review_agent, default: claude)
+    let review_agent =
+        config::get("workflow.review_agent").unwrap_or_else(|_| "claude".to_string());
+    let review_model = get_model_for_complexity("review", &review_agent);
+
+    tracing::info!(
+        task_id = task.id.0,
+        agent = %review_agent,
+        model = %review_model,
+        "spawning review agent"
+    );
+
+    // 6. Build agent invocation for review
+    let review_task_id = format!("{}-review", task.id.0);
+    let review_attempt_dir = crate::home::task_attempt_dir(repo, &review_task_id, 1)?;
+    let output_file = review_attempt_dir.join("output.json");
+
+    let git_name = config::get("git.name").unwrap_or_else(|_| format!("{review_agent}[bot]"));
+    let git_email = config::get("git.email")
+        .unwrap_or_else(|_| format!("{review_agent}[bot]@users.noreply.github.com"));
+
+    let system_prompt = runner::agent::review_system_prompt();
+
+    let invocation = runner::agent::AgentInvocation {
+        agent: review_agent.clone(),
+        model: Some(review_model.clone()),
+        work_dir: worktree_path.clone(),
+        system_prompt,
+        agent_message: review_prompt,
+        task_id: review_task_id.clone(),
+        branch: branch_name.clone(),
+        main_project_dir: worktree_path.clone(), // Use worktree as main dir for review
+        disallowed_tools: vec![],
+        git_author_name: git_name,
+        git_author_email: git_email,
+        output_file: output_file.clone(),
+        timeout_seconds: 600, // 10 minute timeout for review
+        repo: repo.to_string(),
+        attempt: 1,
+    };
+
+    // 7. Spawn review agent in tmux
+    let tmux_local = crate::tmux::TmuxManager::new();
+    let session = match runner::agent::spawn_in_tmux(&tmux_local, &invocation).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(task_id = task.id.0, error = %e, "failed to spawn review agent");
+            return Ok(ReviewDecision::Failed(format!("spawn failed: {e}")));
+        }
+    };
+
+    // 8. Wait for completion
+    let poll_interval = std::time::Duration::from_secs(5);
+    let timeout_duration = std::time::Duration::from_secs(600);
+
+    let wait_result = tokio::time::timeout(
+        timeout_duration,
+        tmux_local.wait_for_completion(&session, poll_interval),
+    )
+    .await;
+
+    match wait_result {
+        Ok(Ok(_)) => {
+            tracing::info!(task_id = task.id.0, "review agent completed");
+        }
+        Ok(Err(e)) => {
+            tracing::error!(task_id = task.id.0, error = %e, "review agent error");
+            let _ = tmux_local.kill_session(&session).await;
+            return Ok(ReviewDecision::Failed(format!("agent error: {e}")));
+        }
+        Err(_) => {
+            tracing::error!(task_id = task.id.0, "review agent timed out");
+            let _ = tmux_local.kill_session(&session).await;
+            return Ok(ReviewDecision::Failed("timeout".to_string()));
+        }
+    }
+
+    // 9. Read and parse response
+    let raw_output = runner::response::read_output_file(&review_task_id, &output_file, repo);
+
+    let review_response = match runner::response::parse_review_response(&raw_output) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(task_id = task.id.0, error = %e, "failed to parse review response");
+            return Ok(ReviewDecision::Failed(format!("parse error: {e}")));
+        }
+    };
+
+    // 10. Convert to ReviewDecision
+    let decision = match review_response.decision.as_str() {
+        "approve" => ReviewDecision::Approve,
+        "request_changes" => ReviewDecision::RequestChanges {
+            notes: review_response.notes,
+            issues: review_response.issues,
+        },
+        _ => ReviewDecision::Failed(format!("unknown decision: {}", review_response.decision)),
+    };
+
+    tracing::info!(
+        task_id = task.id.0,
+        decision = ?decision,
+        "review agent decision received"
+    );
+
+    // 11. Handle the decision
+    match decision {
+        ReviewDecision::Approve => {
+            let auto_merge = config::get("workflow.auto_merge")
+                .map(|v| v == "true")
+                .unwrap_or(true);
+
+            if auto_merge {
+                if let Err(e) = auto_merge_pr(task, &branch_name, backend, repo).await {
+                    tracing::error!(task_id = task.id.0, error = %e, "auto-merge failed");
+                    return Ok(ReviewDecision::Failed(format!("merge failed: {e}")));
+                }
+            }
+            Ok(ReviewDecision::Approve)
+        }
+        ReviewDecision::RequestChanges {
+            ref notes,
+            ref issues,
+        } => {
+            handle_review_changes(task, notes, issues, backend, repo).await?;
+            Ok(decision)
+        }
+        _ => Ok(decision),
+    }
+}
+
+/// Auto-merge a PR after review approval.
+async fn auto_merge_pr(
+    task: &ExternalTask,
+    branch: &str,
+    backend: &Arc<dyn ExternalBackend>,
+    repo: &str,
+) -> anyhow::Result<()> {
+    // 1. Get PR number from branch
+    let gh = GhCli::new();
+    let pr_number = match gh.get_pr_number(repo, branch).await? {
+        Some(n) => n,
+        None => {
+            anyhow::bail!("no open PR found for branch {}", branch);
+        }
+    };
+
+    tracing::info!(
+        task_id = task.id.0,
+        pr_number,
+        branch = %branch,
+        "merging PR"
+    );
+
+    // 2. Merge via gh CLI
+    if let Err(e) = gh.merge_pr(repo, pr_number, true).await {
+        // Merge failed (conflicts, branch protection, etc.)
+        tracing::error!(task_id = task.id.0, error = %e, "merge failed");
+        backend.update_status(&task.id, Status::NeedsReview).await?;
+        backend
+            .post_comment(&task.id, &format!("Auto-merge failed: {}", e))
+            .await?;
+        return Err(e);
+    }
+
+    // 3. Update status to done
+    backend.update_status(&task.id, Status::Done).await?;
+
+    // 4. Close issue if auto_close enabled
+    let auto_close = config::get("workflow.auto_close")
+        .map(|v| v == "true")
+        .unwrap_or(true);
+
+    if auto_close {
+        // Close the issue via gh api
+        let close_endpoint = format!("repos/{repo}/issues/{}", task.id.0);
+        let _ = Command::new("gh")
+            .args(["api", &close_endpoint, "-X", "PATCH", "-f", "state=closed"])
+            .output()
+            .await;
+    }
+
+    // 5. Mark worktree for cleanup
+    let _ = sidecar::set(&task.id.0, &["worktree_cleaned=false".to_string()]);
+
+    // 6. Post final comment
+    backend
+        .post_comment(&task.id, "✅ PR reviewed, approved, and merged.")
+        .await?;
+
+    tracing::info!(task_id = task.id.0, "auto-merge completed");
+
+    Ok(())
+}
+
+/// Handle review changes request — re-dispatch the original agent.
+async fn handle_review_changes(
+    task: &ExternalTask,
+    notes: &str,
+    issues: &[crate::engine::runner::response::ReviewIssue],
+    backend: &Arc<dyn ExternalBackend>,
+    _repo: &str,
+) -> anyhow::Result<()> {
+    // 1. Check review cycle count (max 2 review rounds)
+    let review_cycles: u32 = sidecar::get(&task.id.0, "review_cycles")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let max_cycles: u32 = config::get("workflow.max_review_cycles")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+
+    if review_cycles >= max_cycles {
+        // Too many review cycles — escalate to human
+        tracing::warn!(
+            task_id = task.id.0,
+            review_cycles,
+            max_cycles,
+            "max review cycles exceeded, escalating to human"
+        );
+        backend.update_status(&task.id, Status::NeedsReview).await?;
+        backend.post_comment(&task.id, &format!(
+            "🔍 Review agent requested changes after {} cycles. Escalating to human.\n\n**Review Notes:**\n{}",
+            review_cycles, notes
+        )).await?;
+        return Ok(());
+    }
+
+    // 2. Post review feedback as comment
+    let mut comment = format!(
+        "🔍 Review agent requested changes (cycle {} of {}):\n\n{}",
+        review_cycles + 1,
+        max_cycles,
+        notes
+    );
+
+    if !issues.is_empty() {
+        comment.push_str("\n\n**Issues Found:**\n");
+        for issue in issues {
+            comment.push_str(&format!(
+                "- `{}` line {}: {} [{}]\n",
+                issue.file,
+                issue
+                    .line
+                    .map(|l| l.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                issue.description,
+                issue.severity
+            ));
+        }
+    }
+
+    backend.post_comment(&task.id, &comment).await?;
+
+    // 3. Update sidecar with review context
+    let _ = sidecar::set(
+        &task.id.0,
+        &[
+            format!("review_cycles={}", review_cycles + 1),
+            format!("review_notes={}", notes),
+            "status=routed".to_string(),
+        ],
+    );
+
+    // 4. Re-dispatch — set status back to routed (keeps same agent/branch/worktree)
+    backend.update_status(&task.id, Status::Routed).await?;
+
+    tracing::info!(
+        task_id = task.id.0,
+        review_cycles = review_cycles + 1,
+        "re-dispatched task for review changes"
+    );
+
+    Ok(())
+}
+
+/// Get the model for a given complexity and agent.
+fn get_model_for_complexity(complexity: &str, agent: &str) -> String {
+    // Read from config model_map
+    let config_key = format!("model_map.{}.{}", complexity, agent);
+    match config::get(&config_key) {
+        Ok(model) => model,
+        Err(_) => {
+            // Defaults
+            match agent {
+                "claude" => match complexity {
+                    "simple" => "haiku".to_string(),
+                    "medium" => "sonnet".to_string(),
+                    "complex" | "review" => "sonnet".to_string(),
+                    _ => "sonnet".to_string(),
+                },
+                "codex" => match complexity {
+                    "simple" => "gpt-5.1-codex-mini".to_string(),
+                    "medium" | "review" => "gpt-5.2".to_string(),
+                    "complex" => "gpt-5.3-codex".to_string(),
+                    _ => "gpt-5.2".to_string(),
+                },
+                _ => "sonnet".to_string(),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

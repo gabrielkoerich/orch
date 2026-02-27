@@ -519,6 +519,39 @@ impl GhCli {
         Ok(())
     }
 
+    /// Merge a PR using squash merge.
+    ///
+    /// Returns Ok(()) on success, or an error with stderr message on failure.
+    pub async fn merge_pr(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        delete_branch: bool,
+    ) -> anyhow::Result<()> {
+        let mut args = vec![
+            "pr".to_string(),
+            "merge".to_string(),
+            pr_number.to_string(),
+            "--squash".to_string(),
+            "--yes".to_string(),
+            "--repo".to_string(),
+            repo.to_string(),
+        ];
+
+        if delete_branch {
+            args.push("--delete-branch".to_string());
+        }
+
+        let output = Command::new("gh").args(&args).output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("gh pr merge failed: {}", stderr);
+        }
+
+        Ok(())
+    }
+
     pub async fn get_sub_issues(&self, repo: &str, number: &str) -> anyhow::Result<Vec<u64>> {
         // Parse owner and repo from "owner/repo" format
         let parts: Vec<&str> = repo.split('/').collect();
