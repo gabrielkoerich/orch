@@ -392,8 +392,69 @@ pub fn board_info() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Add a project path to the global registry.
-pub fn project_add(path: &str) -> anyhow::Result<()> {
+/// Try to parse a GitHub slug (owner/repo) from the input.
+///
+/// Accepts:
+/// - `owner/repo` — direct slug
+/// - `https://github.com/owner/repo` — GitHub URL (with optional .git suffix)
+///
+/// Returns `None` if the input looks like a local path.
+fn parse_github_slug(input: &str) -> Option<(String, String)> {
+    // GitHub URL format
+    if input.starts_with("https://github.com/") || input.starts_with("http://github.com/") {
+        let path = input
+            .trim_start_matches("https://github.com/")
+            .trim_start_matches("http://github.com/")
+            .trim_end_matches('/')
+            .trim_end_matches(".git");
+        let parts: Vec<&str> = path.splitn(3, '/').collect();
+        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+        return None;
+    }
+
+    // Skip anything that looks like a local path
+    if input.starts_with('/')
+        || input.starts_with('.')
+        || input.starts_with('~')
+        || (input.contains(std::path::MAIN_SEPARATOR) && std::path::MAIN_SEPARATOR != '/')
+    {
+        return None;
+    }
+
+    // owner/repo slug (exactly one slash, no path-like characters)
+    let parts: Vec<&str> = input.splitn(3, '/').collect();
+    if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        // Sanity check: slugs don't contain spaces or typical path characters
+        let owner = parts[0];
+        let repo = parts[1].trim_end_matches(".git");
+        if !owner.contains(' ') && !repo.contains(' ') && !repo.contains('/') {
+            return Some((owner.to_string(), repo.to_string()));
+        }
+    }
+
+    None
+}
+
+/// Add a project to the global registry.
+///
+/// Accepts:
+/// - A local path (existing behavior)
+/// - A GitHub slug (`owner/repo`) — auto-clones as a bare repo
+/// - A GitHub URL (`https://github.com/owner/repo`) — auto-clones as a bare repo
+pub fn project_add(input: &str) -> anyhow::Result<()> {
+    // Check if this is a GitHub slug or URL
+    if let Some((owner, repo)) = parse_github_slug(input) {
+        return project_add_github(&owner, &repo);
+    }
+
+    // Local path (existing behavior)
+    project_add_local(input)
+}
+
+/// Add a local project path to the global registry.
+fn project_add_local(path: &str) -> anyhow::Result<()> {
     let abs_path = if path == "." {
         std::env::current_dir()?
     } else {
@@ -416,8 +477,74 @@ pub fn project_add(path: &str) -> anyhow::Result<()> {
     }
 
     let path_str = abs_path.to_string_lossy().to_string();
+    register_project_path(&path_str)?;
 
-    // Read current global config
+    // Show the repo from .orch.yml if available
+    if orch_yml.exists() {
+        let project_content = std::fs::read_to_string(&orch_yml)?;
+        let project_doc: serde_yml::Value = serde_yml::from_str(&project_content)?;
+        if let Some(repo) = project_doc
+            .get("gh")
+            .and_then(|gh| gh.get("repo"))
+            .and_then(|r| r.as_str())
+        {
+            println!("  repo: {}", repo);
+        }
+    }
+
+    Ok(())
+}
+
+/// Clone a GitHub repo as a bare clone and register it.
+fn project_add_github(owner: &str, repo: &str) -> anyhow::Result<()> {
+    let projects_dir = crate::home::projects_dir()?;
+    let bare_path = projects_dir.join(owner).join(format!("{repo}.git"));
+    let slug = format!("{owner}/{repo}");
+
+    if bare_path.exists() {
+        println!("Bare clone already exists: {}", bare_path.display());
+    } else {
+        // Create parent directory
+        std::fs::create_dir_all(bare_path.parent().unwrap())?;
+
+        println!("Cloning {slug} as bare repo...");
+        let status = std::process::Command::new("gh")
+            .args([
+                "repo",
+                "clone",
+                &slug,
+                &bare_path.to_string_lossy(),
+                "--",
+                "--bare",
+            ])
+            .status()
+            .context("failed to run `gh repo clone` — is `gh` installed?")?;
+
+        if !status.success() {
+            anyhow::bail!("gh repo clone failed for {slug}");
+        }
+
+        println!("Cloned to {}", bare_path.display());
+    }
+
+    // Create .orch.yml inside the bare clone if it doesn't exist
+    let orch_yml = bare_path.join(".orch.yml");
+    if !orch_yml.exists() {
+        let content = format!("# Project-specific orch config\ngh:\n  repo: \"{slug}\"\n");
+        std::fs::write(&orch_yml, content)?;
+        println!("Created .orch.yml with gh.repo: {slug}");
+    }
+
+    // Register in global config
+    let path_str = bare_path.to_string_lossy().to_string();
+    register_project_path(&path_str)?;
+    println!("  repo: {slug}");
+
+    Ok(())
+}
+
+/// Register a project path in the global config (shared by local and GitHub flows).
+fn register_project_path(path_str: &str) -> anyhow::Result<()> {
     let config_path = crate::home::config_path()?;
     let content = if config_path.exists() {
         std::fs::read_to_string(&config_path)?
@@ -456,23 +583,10 @@ pub fn project_add(path: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    projects.push(serde_yml::Value::String(path_str.clone()));
+    projects.push(serde_yml::Value::String(path_str.to_string()));
     std::fs::write(&config_path, serde_yml::to_string(&doc)?)?;
 
     println!("Added project: {}", path_str);
-
-    // Show the repo from .orch.yml if available
-    if orch_yml.exists() {
-        let project_content = std::fs::read_to_string(&orch_yml)?;
-        let project_doc: serde_yml::Value = serde_yml::from_str(&project_content)?;
-        if let Some(repo) = project_doc
-            .get("gh")
-            .and_then(|gh| gh.get("repo"))
-            .and_then(|r| r.as_str())
-        {
-            println!("  repo: {}", repo);
-        }
-    }
 
     Ok(())
 }
@@ -556,6 +670,78 @@ fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
         .and_then(|gh| gh.get("repo"))
         .and_then(|r| r.as_str())
         .map(String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_slug_owner_repo() {
+        let result = parse_github_slug("gabrielkoerich/orch");
+        assert_eq!(
+            result,
+            Some(("gabrielkoerich".to_string(), "orch".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_slug_https_url() {
+        let result = parse_github_slug("https://github.com/gabrielkoerich/orch");
+        assert_eq!(
+            result,
+            Some(("gabrielkoerich".to_string(), "orch".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_slug_https_url_with_git_suffix() {
+        let result = parse_github_slug("https://github.com/gabrielkoerich/orch.git");
+        assert_eq!(
+            result,
+            Some(("gabrielkoerich".to_string(), "orch".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_slug_https_url_trailing_slash() {
+        let result = parse_github_slug("https://github.com/gabrielkoerich/orch/");
+        assert_eq!(
+            result,
+            Some(("gabrielkoerich".to_string(), "orch".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_slug_absolute_path_returns_none() {
+        assert_eq!(parse_github_slug("/Users/gb/Projects/my-app"), None);
+    }
+
+    #[test]
+    fn parse_slug_relative_path_returns_none() {
+        assert_eq!(parse_github_slug("./my-app"), None);
+    }
+
+    #[test]
+    fn parse_slug_dot_returns_none() {
+        assert_eq!(parse_github_slug("."), None);
+    }
+
+    #[test]
+    fn parse_slug_tilde_path_returns_none() {
+        assert_eq!(parse_github_slug("~/Projects/my-app"), None);
+    }
+
+    #[test]
+    fn parse_slug_single_word_returns_none() {
+        assert_eq!(parse_github_slug("my-app"), None);
+    }
+
+    #[test]
+    fn parse_slug_three_segments_returns_none() {
+        // Three segments like a deep path shouldn't match as a slug
+        assert_eq!(parse_github_slug("a/b/c"), None);
+    }
 }
 
 /// Initialize task manager with database and backend.

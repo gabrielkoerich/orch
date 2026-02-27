@@ -271,9 +271,9 @@ enum BoardAction {
 
 #[derive(Subcommand)]
 enum ProjectAction {
-    /// Add a project path to the global registry
+    /// Add a project to the global registry (local path or GitHub slug)
     Add {
-        /// Path to the project directory
+        /// Local path, GitHub slug (owner/repo), or GitHub URL
         #[arg(default_value = ".")]
         path: String,
     },

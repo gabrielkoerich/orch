@@ -101,7 +101,6 @@ pub fn contexts_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// Get the path to the projects directory (~/.orch/projects/).
-#[allow(dead_code)]
 pub fn projects_dir() -> anyhow::Result<PathBuf> {
     let dir = orch_home()?.join("projects");
     std::fs::create_dir_all(&dir)?;

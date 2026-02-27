@@ -584,9 +584,7 @@ mod tests {
     fn permission_rules_default_disallows_rm() {
         let rules = PermissionRules::default();
         assert!(rules.disallowed_tools.contains(&"Bash(rm *)".to_string()));
-        assert!(rules
-            .disallowed_tools
-            .contains(&"Bash(rm -*)".to_string()));
+        assert!(rules.disallowed_tools.contains(&"Bash(rm -*)".to_string()));
     }
 
     #[test]
@@ -732,12 +730,30 @@ mod tests {
         let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
 
         // Each blocked path should generate 4 disallowed tool patterns
-        assert!(cmd.contains("Bash(cd /home/user/project*)"), "missing Bash(cd) for first path");
-        assert!(cmd.contains("Read(/home/user/project/*)"), "missing Read for first path");
-        assert!(cmd.contains("Write(/home/user/project/*)"), "missing Write for first path");
-        assert!(cmd.contains("Edit(/home/user/project/*)"), "missing Edit for first path");
-        assert!(cmd.contains("Bash(cd /opt/other*)"), "missing Bash(cd) for second path");
-        assert!(cmd.contains("Read(/opt/other/*)"), "missing Read for second path");
+        assert!(
+            cmd.contains("Bash(cd /home/user/project*)"),
+            "missing Bash(cd) for first path"
+        );
+        assert!(
+            cmd.contains("Read(/home/user/project/*)"),
+            "missing Read for first path"
+        );
+        assert!(
+            cmd.contains("Write(/home/user/project/*)"),
+            "missing Write for first path"
+        );
+        assert!(
+            cmd.contains("Edit(/home/user/project/*)"),
+            "missing Edit for first path"
+        );
+        assert!(
+            cmd.contains("Bash(cd /opt/other*)"),
+            "missing Bash(cd) for second path"
+        );
+        assert!(
+            cmd.contains("Read(/opt/other/*)"),
+            "missing Read for second path"
+        );
     }
 
     /// Test that blocked paths don't affect Codex (it uses sandbox isolation).
@@ -847,7 +863,10 @@ mod tests {
                 cmd.contains("--permission-mode acceptEdits"),
                 "{agent}: expected acceptEdits"
             );
-            assert!(cmd.contains("Bash(rm *)"), "{agent}: expected rm disallowed");
+            assert!(
+                cmd.contains("Bash(rm *)"),
+                "{agent}: expected rm disallowed"
+            );
             assert!(
                 cmd.contains("Read(/blocked/*)"),
                 "{agent}: expected blocked path Read"
@@ -873,13 +892,8 @@ mod tests {
         // Verify each agent can build a command from the config-loaded rules
         for agent_name in &["claude", "codex", "opencode", "kimi", "minimax"] {
             let runner = get_runner(agent_name);
-            let cmd = runner.build_command(
-                None,
-                "timeout 1800",
-                "/tmp/sys.md",
-                "/tmp/msg.md",
-                &perms,
-            );
+            let cmd =
+                runner.build_command(None, "timeout 1800", "/tmp/sys.md", "/tmp/msg.md", &perms);
             assert!(
                 !cmd.is_empty(),
                 "{agent_name}: build_command returned empty string"
@@ -903,13 +917,7 @@ mod tests {
         let perms = PermissionRules::from_config();
 
         let claude = get_runner("claude");
-        let cmd = claude.build_command(
-            None,
-            "",
-            "/tmp/sys.md",
-            "/tmp/msg.md",
-            &perms,
-        );
+        let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
 
         if perms.autonomous {
             assert!(
@@ -924,13 +932,7 @@ mod tests {
         }
 
         let codex = get_runner("codex");
-        let cmd = codex.build_command(
-            None,
-            "",
-            "/tmp/sys.md",
-            "/tmp/msg.md",
-            &perms,
-        );
+        let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
 
         if perms.autonomous {
             assert!(cmd.contains("--ask-for-approval never"));
