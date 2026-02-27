@@ -1058,6 +1058,81 @@ async fn sync_tick(
         tracing::warn!(err = %e, "owner command scan failed");
     }
 
+    // 6. Sync skill repositories
+    if let Err(e) = skills_sync().await {
+        tracing::warn!(err = %e, "skills sync failed");
+    }
+
+    Ok(())
+}
+
+/// Sync skill repositories from config.
+///
+/// Reads the `skills:` list from config and clones/pulls each repository
+/// to `~/.orch/skills/{repo}/`. This keeps skill documentation up-to-date
+/// for agents.
+async fn skills_sync() -> anyhow::Result<()> {
+    use tokio::process::Command;
+
+    let skills = match crate::config::get_skills() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(err = %e, "no skills configured");
+            return Ok(());
+        }
+    };
+
+    if skills.is_empty() {
+        tracing::debug!("no skills configured, skipping sync");
+        return Ok(());
+    }
+
+    let skills_base = crate::home::skills_dir()?;
+
+    for skill in skills {
+        let repo_dir = skills_base.join(&skill.repo);
+        let repo_url = format!("https://github.com/{}.git", skill.repo);
+
+        if repo_dir.exists() {
+            // Pull latest changes
+            tracing::debug!(repo = %skill.repo, "pulling skill repo");
+            let output = Command::new("git")
+                .args(["pull", "--ff-only", "--prune"])
+                .current_dir(&repo_dir)
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(repo = %skill.repo, err = %stderr, "git pull failed");
+            } else {
+                tracing::debug!(repo = %skill.repo, "skill repo updated");
+            }
+        } else {
+            // Clone the repository
+            tracing::debug!(repo = %skill.repo, "cloning skill repo");
+            let parent = repo_dir
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("skill repo path has no parent directory"))?;
+            std::fs::create_dir_all(parent)?;
+            let repo_dir_str = repo_dir
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("skill repo path is not valid UTF-8"))?;
+
+            let output = Command::new("git")
+                .args(["clone", &repo_url, repo_dir_str])
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(repo = %skill.repo, err = %stderr, "git clone failed");
+            } else {
+                tracing::info!(repo = %skill.repo, "skill repo cloned");
+            }
+        }
+    }
+
     Ok(())
 }
 
