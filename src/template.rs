@@ -3,6 +3,17 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::sync::LazyLock;
+
+/// Matches `{{#if VAR}}...{{/if}}` blocks (non-greedy, dotall).
+static IF_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)\{\{#if\s+(\w+)\}\}(.*?)\{\{/if\}\}")
+        .expect("BUG: if_pattern regex is invalid")
+});
+
+/// Matches `{{VAR}}` variable placeholders.
+static VAR_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{\{(\w+)\}\}").expect("BUG: var_pattern regex is invalid"));
 
 pub fn render_template(template_path: &str, extra_vars: &[String]) -> Result<String, String> {
     if !fs::metadata(template_path)
@@ -23,11 +34,9 @@ pub fn render_template(template_path: &str, extra_vars: &[String]) -> Result<Str
         }
     }
 
-    let if_pattern = Regex::new(r"(?s)\{\{#if\s+(\w+)\}\}(.*?)\{\{/if\}\}").unwrap();
-
     loop {
         let mut changed = false;
-        let new_data = if_pattern
+        let new_data = IF_PATTERN
             .replace_all(&data, |caps: &regex::Captures| {
                 changed = true;
                 let var_name = &caps[1];
@@ -45,8 +54,7 @@ pub fn render_template(template_path: &str, extra_vars: &[String]) -> Result<Str
         }
     }
 
-    let var_pattern = Regex::new(r"\{\{(\w+)\}\}").unwrap();
-    let result = var_pattern
+    let result = VAR_PATTERN
         .replace_all(&data, |caps: &regex::Captures| {
             let var_name = &caps[1];
             vars.get(var_name).cloned().unwrap_or_default()
