@@ -952,9 +952,9 @@ async fn tick(
                         summary: summary.clone(),
                     });
 
-                    // Trigger review agent if task is done (enabled by default)
+                    // Trigger review agent for in_review tasks (PR exists, needs review)
                     tracing::debug!(task_id, %status, "checking review trigger");
-                    if status == "done" {
+                    if status == "in_review" {
                         let enable_review = config::get("workflow.enable_review_agent")
                             .map(|v| v != "false")
                             .unwrap_or(true);
@@ -969,23 +969,7 @@ async fn tick(
                             "review gate check"
                         );
                         if enable_review && !already_reviewing {
-                            // Transition to in_review BEFORE spawning the review agent
-                            let _ = sidecar::set(
-                                &task_id,
-                                &[
-                                    "review_started=true".to_string(),
-                                    "status=in_review".to_string(),
-                                ],
-                            );
-                            if let Err(e) = backend
-                                .update_status(
-                                    &crate::backends::ExternalId(task_id.clone()),
-                                    Status::InReview,
-                                )
-                                .await
-                            {
-                                tracing::warn!(task_id, err = %e, "failed to set in_review");
-                            }
+                            let _ = sidecar::set(&task_id, &["review_started=true".to_string()]);
                             let backend_clone = backend.clone();
                             let tmux_clone = tmux.clone();
                             let task_owned_clone = task_owned.clone();

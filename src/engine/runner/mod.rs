@@ -399,7 +399,8 @@ impl TaskRunner {
                     "agent completed successfully"
                 );
 
-                // Auto-commit
+                // Auto-commit, push, create PR
+                let mut has_pr = false;
                 if resp.status == "done" || resp.status == "in_progress" {
                     if let Err(e) = git_ops::auto_commit(
                         &wt.work_dir,
@@ -423,7 +424,7 @@ impl TaskRunner {
                     }
 
                     // Create PR
-                    if let Err(e) = git_ops::create_pr_if_needed(
+                    match git_ops::create_pr_if_needed(
                         &wt.work_dir,
                         &wt.branch,
                         &task_title,
@@ -436,8 +437,15 @@ impl TaskRunner {
                     )
                     .await
                     {
-                        tracing::error!(task_id, error = ?e, "create PR failed");
-                        sidecar::set(task_id, &[format!("last_error=create PR failed: {e}")])?;
+                        Ok(Some(_url)) => has_pr = true,
+                        Ok(None) => {
+                            // PR already existed
+                            has_pr = true;
+                        }
+                        Err(e) => {
+                            tracing::error!(task_id, error = ?e, "create PR failed");
+                            sidecar::set(task_id, &[format!("last_error=create PR failed: {e}")])?;
+                        }
                     }
                 }
 
@@ -449,10 +457,16 @@ impl TaskRunner {
                 }
 
                 // Store result in sidecar
+                // If agent said "done" and a PR exists, set in_review instead
+                let final_status = if resp.status == "done" && has_pr {
+                    "in_review"
+                } else {
+                    &resp.status
+                };
                 sidecar::set(
                     task_id,
                     &[
-                        format!("status={}", resp.status),
+                        format!("status={final_status}"),
                         format!("summary={}", resp.summary),
                     ],
                 )?;
