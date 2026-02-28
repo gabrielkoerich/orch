@@ -208,16 +208,26 @@ impl AgentRunner for OpenCodeRunner {
         timeout_cmd: &str,
         _sys_file: &str,
         msg_file: &str,
-        _permissions: &PermissionRules,
+        permissions: &PermissionRules,
     ) -> String {
-        // OpenCode has no permission/sandbox flags — it relies on its own
-        // built-in safety. Permission rules are enforced by the orchestrator
-        // at the worktree level (filesystem isolation).
         let model_flag = model.map(|m| format!("--model {m}")).unwrap_or_default();
 
+        // OpenCode permission control via opencode.json config file.
+        // Translate allowed_tools into OpenCode permission keys.
+        let config_setup = if permissions.autonomous {
+            let permission_json = translate_permissions_to_opencode(&permissions.allowed_tools);
+            format!(
+                r#"mkdir -p .opencode && echo '{permission_json}' > .opencode/config.json
+"#
+            )
+        } else {
+            String::new()
+        };
+
         format!(
-            r#"{timeout_cmd} opencode run {model_flag} \
+            r#"{config_setup}{timeout_cmd} opencode run {model_flag} \
   --format json - < "{msg_file}""#,
+            config_setup = config_setup,
             timeout_cmd = timeout_cmd,
             model_flag = model_flag,
             msg_file = msg_file,
@@ -298,6 +308,83 @@ impl AgentRunner for OpenCodeRunner {
             "openai/gpt-4.1".to_string(),
         ]
     }
+}
+
+/// Map from unified allowed_tools names to OpenCode permission keys.
+const TOOL_TO_OPENCODE: &[(&str, &str)] = &[
+    ("Edit", "edit"),
+    ("Write", "edit"),
+    ("Read", "read"),
+    ("Bash", "bash"),
+    ("Grep", "grep"),
+    ("Glob", "glob"),
+    ("WebFetch", "webfetch"),
+    ("WebSearch", "websearch"),
+    ("Task", "task"),
+    ("Skill", "skill"),
+];
+
+/// All OpenCode permission keys that can be controlled.
+const OPENCODE_PERMISSION_KEYS: &[&str] = &[
+    "read",
+    "edit",
+    "glob",
+    "grep",
+    "bash",
+    "task",
+    "skill",
+    "webfetch",
+    "websearch",
+    "list",
+    "todowrite",
+    "todoread",
+    "question",
+    "codesearch",
+];
+
+/// Translate allowed_tools into an OpenCode config JSON string.
+///
+/// Maps Claude tool names to OpenCode permission keys.
+/// Tools in the allowed list get "allow", others get "deny".
+/// CLI commands (git, npm, etc.) are covered by the "bash" permission.
+fn translate_permissions_to_opencode(allowed_tools: &[String]) -> String {
+    if allowed_tools.is_empty() {
+        // No restrictions: allow everything
+        return r#"{"permission":"allow"}"#.to_string();
+    }
+
+    // Collect which opencode keys should be "allow"
+    let mut allowed_keys: Vec<&str> = Vec::new();
+    for tool in allowed_tools {
+        for (from, to) in TOOL_TO_OPENCODE {
+            if tool == *from && !allowed_keys.contains(to) {
+                allowed_keys.push(to);
+            }
+        }
+        // CLI commands (lowercase) are all bash commands
+        if tool
+            .chars()
+            .next()
+            .map(|c| c.is_lowercase())
+            .unwrap_or(false)
+            && !allowed_keys.contains(&"bash")
+        {
+            allowed_keys.push("bash");
+        }
+    }
+
+    // Build permission object
+    let mut entries = Vec::new();
+    for key in OPENCODE_PERMISSION_KEYS {
+        let action = if allowed_keys.contains(key) {
+            "allow"
+        } else {
+            "deny"
+        };
+        entries.push(format!(r#""{key}":"{action}""#));
+    }
+
+    format!(r#"{{"permission":{{{}}}}}"#, entries.join(","))
 }
 
 /// Classify an OpenCode error message.
@@ -475,6 +562,54 @@ mod tests {
         assert!(cmd.contains("opencode run"));
         assert!(cmd.contains("--model anthropic/claude-sonnet-4-20250514"));
         assert!(cmd.contains("--format json"));
+        // Autonomous mode should write permission config
+        assert!(
+            cmd.contains("config.json"),
+            "expected permission config setup, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn translate_permissions_with_allowed_tools() {
+        let tools = vec![
+            "Edit".to_string(),
+            "Read".to_string(),
+            "Bash".to_string(),
+            "Grep".to_string(),
+            "git".to_string(), // CLI command → "bash" key
+        ];
+        let json = translate_permissions_to_opencode(&tools);
+        assert!(
+            json.contains(r#""edit":"allow""#),
+            "Edit should map to edit:allow"
+        );
+        assert!(
+            json.contains(r#""read":"allow""#),
+            "Read should map to read:allow"
+        );
+        assert!(
+            json.contains(r#""bash":"allow""#),
+            "Bash should map to bash:allow"
+        );
+        assert!(
+            json.contains(r#""grep":"allow""#),
+            "Grep should map to grep:allow"
+        );
+        // Tools not in allowed list should be denied
+        assert!(
+            json.contains(r#""webfetch":"deny""#),
+            "webfetch should be deny"
+        );
+        assert!(
+            json.contains(r#""websearch":"deny""#),
+            "websearch should be deny"
+        );
+    }
+
+    #[test]
+    fn translate_permissions_empty_allows_all() {
+        let json = translate_permissions_to_opencode(&[]);
+        assert_eq!(json, r#"{"permission":"allow"}"#);
     }
 
     #[test]

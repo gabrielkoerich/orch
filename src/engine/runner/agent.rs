@@ -54,10 +54,7 @@ pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
     let msg_file = attempt_dir.join("prompt-msg.md");
     let status_file = attempt_dir.join("exit.txt");
 
-    // Write prompt files - fail if we can't write them
     std::fs::create_dir_all(&attempt_dir)?;
-    std::fs::write(&sys_file, &inv.system_prompt)?;
-    std::fs::write(&msg_file, &inv.agent_message)?;
 
     let timeout_cmd = if inv.timeout_seconds > 0 {
         format!("timeout {}", inv.timeout_seconds)
@@ -77,10 +74,27 @@ pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
         }
     }
 
-    // Block main project dir when running in a worktree
-    if inv.work_dir != inv.main_project_dir {
-        permissions.blocked_paths.push(inv.main_project_dir.clone());
-    }
+    // Restrict edits to the working directory (worktree)
+    permissions.allowed_edit_paths.push(inv.work_dir.clone());
+
+    // Write prompt files with allowed tools appended to system prompt
+    let sys_content = if !permissions.allowed_tools.is_empty() {
+        let tools_list = permissions
+            .allowed_tools
+            .iter()
+            .map(|t| format!("- {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "{}\n\n## Allowed Tools\nYou may ONLY use the following tools and commands:\n{tools_list}",
+            inv.system_prompt
+        )
+    } else {
+        inv.system_prompt.clone()
+    };
+
+    std::fs::write(&sys_file, &sys_content)?;
+    std::fs::write(&msg_file, &inv.agent_message)?;
 
     // Get the per-agent runner and delegate command building
     let runner = super::agents::get_runner(&inv.agent);

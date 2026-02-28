@@ -244,30 +244,33 @@ impl AgentRunner for CodexRunner {
     ) -> String {
         let model_flag = model.map(|m| format!("--model {m}")).unwrap_or_default();
 
-        // Codex approval: autonomous → never, supervised → suggest
-        let approval = if permissions.autonomous {
-            "never"
+        // Codex permission mode:
+        // - autonomous → --full-auto (auto-approval + workspace-write sandbox)
+        // - supervised → --ask-for-approval suggest
+        // - full access → --dangerously-bypass-approvals-and-sandbox
+        let permission_flags = if permissions.autonomous {
+            match permissions.sandbox {
+                SandboxLevel::FullAccess => {
+                    "--dangerously-bypass-approvals-and-sandbox".to_string()
+                }
+                _ => "--full-auto".to_string(),
+            }
         } else {
-            "suggest"
-        };
-
-        // Codex sandbox: map from unified SandboxLevel
-        let sandbox = match permissions.sandbox {
-            SandboxLevel::WorkspaceWrite => "workspace-write",
-            SandboxLevel::FullAccess => "danger-full-access",
-            SandboxLevel::None => "workspace-write", // default safe
+            let sandbox = match permissions.sandbox {
+                SandboxLevel::WorkspaceWrite | SandboxLevel::None => "workspace-write",
+                SandboxLevel::FullAccess => "danger-full-access",
+            };
+            format!("--ask-for-approval suggest --sandbox {sandbox}")
         };
 
         format!(
             r#"cat "{msg_file}" | {timeout_cmd} codex {model_flag} \
-  --ask-for-approval {approval} \
-  --sandbox {sandbox} \
+  {permission_flags} \
   exec --json -"#,
             msg_file = msg_file,
             timeout_cmd = timeout_cmd,
             model_flag = model_flag,
-            approval = approval,
-            sandbox = sandbox,
+            permission_flags = permission_flags,
         )
     }
 
@@ -447,8 +450,10 @@ mod tests {
         assert!(cmd.contains("codex"));
         assert!(cmd.contains("--model gpt-4o"));
         assert!(cmd.contains("exec --json -"));
-        assert!(cmd.contains("--ask-for-approval never"));
-        assert!(cmd.contains("--sandbox workspace-write"));
+        assert!(
+            cmd.contains("--full-auto"),
+            "default autonomous codex should use --full-auto, got: {cmd}"
+        );
     }
 
     #[test]
@@ -457,10 +462,14 @@ mod tests {
             autonomous: true,
             sandbox: SandboxLevel::FullAccess,
             disallowed_tools: vec![],
-            blocked_paths: vec![],
+            allowed_tools: vec![],
+            allowed_edit_paths: vec![],
         };
         let cmd = runner().build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
-        assert!(cmd.contains("--sandbox danger-full-access"));
+        assert!(
+            cmd.contains("--dangerously-bypass-approvals-and-sandbox"),
+            "full access codex should use dangerously-bypass, got: {cmd}"
+        );
     }
 
     // ── Fixture-based tests ─────────────────────────────────────

@@ -112,6 +112,95 @@ fn global_config_path() -> anyhow::Result<PathBuf> {
     crate::home::config_path()
 }
 
+/// Get a config value as a list of strings by dot-separated key.
+///
+/// Supports both YAML sequences and comma-separated strings:
+/// ```yaml
+/// workflow:
+///   allowed_tools:
+///     - Edit
+///     - Write
+///     - git
+/// ```
+/// or:
+/// ```yaml
+/// workflow:
+///   allowed_tools: "Edit,Write,git"
+/// ```
+///
+/// Returns empty vec if key not found.
+pub fn get_list(key: &str) -> anyhow::Result<Vec<String>> {
+    // Try project config first
+    let project_path = PathBuf::from(".orch.yml");
+    if project_path.exists() {
+        if let Ok(val) = resolve_list(&project_path, key) {
+            if !val.is_empty() {
+                return Ok(val);
+            }
+        }
+    }
+
+    // Fall back to global config
+    let global_path = global_config_path()?;
+    if global_path.exists() {
+        return resolve_list(&global_path, key);
+    }
+
+    Ok(vec![])
+}
+
+/// Resolve a dot-separated key as a list from a YAML file.
+fn resolve_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String>> {
+    watch_file(path);
+
+    let root = {
+        if let Ok(cache) = CACHE.read() {
+            if let Some(cached) = cache.get(path) {
+                return extract_list(cached, key);
+            }
+        }
+
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let parsed: serde_yml::Value =
+            serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+
+        if let Ok(mut cache) = CACHE.write() {
+            cache.insert(path.clone(), parsed.clone());
+        }
+
+        parsed
+    };
+
+    extract_list(&root, key)
+}
+
+/// Extract a list of strings from a YAML tree by dot-separated key.
+fn extract_list(root: &serde_yml::Value, key: &str) -> anyhow::Result<Vec<String>> {
+    let mut current = root;
+    for part in key.split('.') {
+        match current.get(part) {
+            Some(v) => current = v,
+            None => return Ok(vec![]),
+        }
+    }
+
+    match current {
+        serde_yml::Value::Sequence(seq) => Ok(seq
+            .iter()
+            .filter_map(|item| item.as_str().map(String::from))
+            .collect()),
+        serde_yml::Value::String(s) => {
+            // Support comma-separated string format
+            Ok(s.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect())
+        }
+        _ => Ok(vec![]),
+    }
+}
+
 /// Get a config value by dot-separated key (e.g. "agents.claude.model").
 ///
 /// Lookup order:
@@ -659,6 +748,38 @@ mod tests {
         };
         find_path(&mut rx1, &path);
         find_path(&mut rx2, &path);
+    }
+
+    #[test]
+    fn resolve_list_from_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_yaml(
+            dir.path(),
+            "config.yml",
+            "workflow:\n  allowed_tools:\n    - Edit\n    - Write\n    - git\n    - npm\n",
+        );
+        let list = resolve_list(&path, "workflow.allowed_tools").unwrap();
+        assert_eq!(list, vec!["Edit", "Write", "git", "npm"]);
+    }
+
+    #[test]
+    fn resolve_list_from_comma_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_yaml(
+            dir.path(),
+            "config.yml",
+            "workflow:\n  allowed_tools: \"Edit,Write,git,npm\"\n",
+        );
+        let list = resolve_list(&path, "workflow.allowed_tools").unwrap();
+        assert_eq!(list, vec!["Edit", "Write", "git", "npm"]);
+    }
+
+    #[test]
+    fn resolve_list_missing_key_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_yaml(dir.path(), "config.yml", "foo: bar\n");
+        let list = resolve_list(&path, "workflow.allowed_tools").unwrap();
+        assert!(list.is_empty());
     }
 
     #[test]

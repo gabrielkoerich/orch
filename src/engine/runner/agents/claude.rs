@@ -198,36 +198,38 @@ impl AgentRunner for ClaudeRunner {
             "acceptEdits"
         };
 
-        // Build disallowed tools list from unified rules + blocked paths
-        let mut all_disallowed = permissions.disallowed_tools.clone();
-        for path in &permissions.blocked_paths {
-            let p = path.to_string_lossy();
-            all_disallowed.extend([
-                format!("Bash(cd {p}*)"),
-                format!("Read({p}/*)"),
-                format!("Write({p}/*)"),
-                format!("Edit({p}/*)"),
-            ]);
-        }
-
-        let disallowed_flag = if !all_disallowed.is_empty() {
-            format!("--disallowedTools '{}'", all_disallowed.join(","))
+        // Build tool restriction flags.
+        // If allowed_tools is set (whitelist), use --allowedTools and ignore disallowed_tools.
+        // Otherwise fall back to --disallowedTools (deny list).
+        let tool_flag = if !permissions.allowed_tools.is_empty() {
+            let tools = translate_allowed_tools(
+                &permissions.allowed_tools,
+                &permissions.allowed_edit_paths,
+            );
+            format!("--allowedTools '{}'", tools.join(","))
         } else {
-            String::new()
+            if !permissions.disallowed_tools.is_empty() {
+                format!(
+                    "--disallowedTools '{}'",
+                    permissions.disallowed_tools.join(",")
+                )
+            } else {
+                String::new()
+            }
         };
 
         format!(
             r#"{timeout_cmd} {binary} -p {model_flag} \
   --permission-mode {permission_mode} \
   --output-format json \
-  {disallowed_flag} \
+  {tool_flag} \
   --append-system-prompt "{sys_file}" \
   < "{msg_file}""#,
             timeout_cmd = timeout_cmd,
             binary = self.binary,
             model_flag = model_flag,
             permission_mode = permission_mode,
-            disallowed_flag = disallowed_flag,
+            tool_flag = tool_flag,
             sys_file = sys_file,
             msg_file = msg_file,
         )
@@ -246,6 +248,54 @@ impl AgentRunner for ClaudeRunner {
         let combined = format!("{stdout}\n{stderr}");
         super::patterns::classify_from_text(exit_code, &combined)
     }
+}
+
+/// Known Claude Code native tool names.
+/// These are passed as-is to `--allowedTools`.
+const CLAUDE_NATIVE_TOOLS: &[&str] = &[
+    "Edit",
+    "Write",
+    "Read",
+    "Bash",
+    "Grep",
+    "Glob",
+    "WebFetch",
+    "WebSearch",
+    "Task",
+    "Skill",
+    "NotebookEdit",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "AskUserQuestion",
+    "TodoWrite",
+    "TodoRead",
+];
+
+/// Translate a unified allowed_tools list into Claude `--allowedTools` patterns.
+///
+/// - Items matching known Claude tool names pass through as-is
+/// - Edit/Write are scoped to `allowed_edit_paths` when set
+/// - Other items are treated as CLI commands and become `Bash(<cmd> *)` patterns
+fn translate_allowed_tools(
+    allowed: &[String],
+    allowed_edit_paths: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut tools = Vec::new();
+    for item in allowed {
+        if (item == "Edit" || item == "Write") && !allowed_edit_paths.is_empty() {
+            // Scope Edit/Write to allowed paths only
+            for path in allowed_edit_paths {
+                tools.push(format!("{}({}/*)", item, path.display()));
+            }
+        } else if CLAUDE_NATIVE_TOOLS.contains(&item.as_str()) {
+            tools.push(item.clone());
+        } else {
+            // CLI command → Bash(<cmd> *) pattern
+            tools.push(format!("Bash({item} *)"));
+        }
+    }
+    tools
 }
 
 /// Extract input/output tokens from the Claude envelope's usage objects.
@@ -424,7 +474,8 @@ mod tests {
             autonomous: true,
             sandbox: SandboxLevel::WorkspaceWrite,
             disallowed_tools: vec!["Bash(rm *)".to_string()],
-            blocked_paths: vec![],
+            allowed_tools: vec![],
+            allowed_edit_paths: vec![],
         };
         let cmd = r.build_command(
             Some("opus"),
@@ -447,24 +498,49 @@ mod tests {
             autonomous: false,
             sandbox: SandboxLevel::WorkspaceWrite,
             disallowed_tools: vec![],
-            blocked_paths: vec![],
+            allowed_tools: vec![],
+            allowed_edit_paths: vec![],
         };
         let cmd = r.build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
         assert!(cmd.contains("--permission-mode acceptEdits"));
     }
 
     #[test]
-    fn build_command_with_blocked_paths() {
+    fn build_command_allowed_edit_paths_scopes_edit_write() {
         let r = runner();
         let perms = PermissionRules {
             autonomous: true,
             sandbox: SandboxLevel::WorkspaceWrite,
             disallowed_tools: vec![],
-            blocked_paths: vec![std::path::PathBuf::from("/home/user/project")],
+            allowed_tools: vec![
+                "Edit".to_string(),
+                "Write".to_string(),
+                "Read".to_string(),
+                "Bash".to_string(),
+            ],
+            allowed_edit_paths: vec![std::path::PathBuf::from("/home/user/worktree")],
         };
         let cmd = r.build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
-        assert!(cmd.contains("Bash(cd /home/user/project*)"));
-        assert!(cmd.contains("Read(/home/user/project/*)"));
+
+        // Edit/Write should be scoped to the worktree path
+        assert!(
+            cmd.contains("Edit(/home/user/worktree/*)"),
+            "expected scoped Edit, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("Write(/home/user/worktree/*)"),
+            "expected scoped Write, got: {cmd}"
+        );
+
+        // Read and Bash should not be scoped
+        assert!(
+            cmd.contains(",Read,") || cmd.contains("'Read,") || cmd.contains(",Read'"),
+            "expected unrestricted Read, got: {cmd}"
+        );
+        assert!(
+            cmd.contains(",Bash,") || cmd.contains("'Bash,") || cmd.contains(",Bash'"),
+            "expected unrestricted Bash, got: {cmd}"
+        );
     }
 
     #[test]
@@ -536,7 +612,8 @@ mod tests {
             autonomous: true,
             sandbox: SandboxLevel::WorkspaceWrite,
             disallowed_tools: vec![],
-            blocked_paths: vec![],
+            allowed_tools: vec![],
+            allowed_edit_paths: vec![],
         };
         let cmd = r.build_command(
             Some("sonnet"),
@@ -547,6 +624,110 @@ mod tests {
         );
         assert!(cmd.contains("kimi -p"), "expected kimi binary, got: {cmd}");
         assert!(cmd.contains("--model sonnet"));
+    }
+
+    #[test]
+    fn build_command_with_allowed_tools() {
+        let r = runner();
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec!["Bash(rm *)".to_string()], // should be ignored
+            allowed_tools: vec![
+                "Edit".to_string(),
+                "Write".to_string(),
+                "Read".to_string(),
+                "Bash".to_string(),
+                "Grep".to_string(),
+                "git".to_string(),
+                "npm".to_string(),
+            ],
+            allowed_edit_paths: vec![],
+        };
+        let cmd = r.build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+
+        // Should use --allowedTools instead of --disallowedTools
+        assert!(
+            cmd.contains("--allowedTools"),
+            "expected --allowedTools flag, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--disallowedTools"),
+            "should not have --disallowedTools when allowed_tools is set, got: {cmd}"
+        );
+
+        // Native tools pass through as-is
+        assert!(cmd.contains("Edit"), "missing Edit tool");
+        assert!(cmd.contains("Write"), "missing Write tool");
+        assert!(cmd.contains("Bash"), "missing Bash tool");
+
+        // CLI commands become Bash(<cmd> *) patterns
+        assert!(
+            cmd.contains("Bash(git *)"),
+            "missing Bash(git *) pattern, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("Bash(npm *)"),
+            "missing Bash(npm *) pattern, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn build_command_allowed_tools_empty_falls_back_to_disallowed() {
+        let r = runner();
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec!["Bash(rm *)".to_string()],
+            allowed_tools: vec![], // empty = use disallowed_tools
+            allowed_edit_paths: vec![],
+        };
+        let cmd = r.build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+
+        assert!(
+            cmd.contains("--disallowedTools"),
+            "should fall back to --disallowedTools when allowed_tools is empty, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--allowedTools"),
+            "should not have --allowedTools when empty, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn translate_allowed_tools_categorizes_correctly() {
+        let allowed = vec![
+            "Edit".to_string(),
+            "Bash".to_string(),
+            "Grep".to_string(),
+            "git".to_string(),
+            "cargo".to_string(),
+            "WebFetch".to_string(),
+        ];
+        // No allowed_edit_paths → Edit passes through as-is
+        let result = translate_allowed_tools(&allowed, &[]);
+        assert_eq!(
+            result,
+            vec![
+                "Edit",
+                "Bash",
+                "Grep",
+                "Bash(git *)",
+                "Bash(cargo *)",
+                "WebFetch"
+            ]
+        );
+    }
+
+    #[test]
+    fn translate_allowed_tools_scopes_edit_write() {
+        let allowed = vec!["Edit".to_string(), "Write".to_string(), "Read".to_string()];
+        let paths = vec![std::path::PathBuf::from("/tmp/worktree")];
+        let result = translate_allowed_tools(&allowed, &paths);
+        assert_eq!(
+            result,
+            vec!["Edit(/tmp/worktree/*)", "Write(/tmp/worktree/*)", "Read"]
+        );
     }
 
     #[test]
