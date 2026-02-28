@@ -947,7 +947,6 @@ async fn tick(
                             });
                         }
                     }
-
                 }
                 Err(e) => {
                     tracing::error!(task_id, ?e, "task runner failed");
