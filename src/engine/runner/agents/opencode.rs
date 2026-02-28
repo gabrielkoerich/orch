@@ -415,6 +415,15 @@ fn classify_opencode_message(message: &str) -> AgentError {
         };
     }
 
+    if lower.contains("rejected permission")
+        || lower.contains("permission denied")
+        || lower.contains("permissionerror")
+    {
+        return AgentError::PermissionDenied {
+            message: message.to_string(),
+        };
+    }
+
     if lower.contains("model") && (lower.contains("not found") || lower.contains("not supported")) {
         // Try to extract model name from patterns like "Model not found: anthropic/claude-sonnet-4-6."
         let model = message
@@ -606,10 +615,71 @@ mod tests {
         );
     }
 
+    /// Test with the full real tool list from workflow.allowed_tools config.
+    #[test]
+    fn translate_permissions_full_config_list() {
+        let tools: Vec<String> = vec![
+            "Edit",
+            "Write",
+            "Read",
+            "Bash",
+            "Grep",
+            "Glob",
+            "WebFetch",
+            "WebSearch",
+            "Task",
+            "Skill",
+            "yq",
+            "jq",
+            "bash",
+            "just",
+            "git",
+            "rg",
+            "sed",
+            "awk",
+            "python3",
+            "node",
+            "npm",
+            "bun",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let json = translate_permissions_to_opencode(&tools);
+
+        // All major permissions should be allowed
+        for key in &[
+            "edit",
+            "read",
+            "bash",
+            "grep",
+            "glob",
+            "webfetch",
+            "websearch",
+            "task",
+            "skill",
+        ] {
+            assert!(
+                json.contains(&format!(r#""{key}":"allow""#)),
+                "{key} should be allow, got: {json}"
+            );
+        }
+    }
+
     #[test]
     fn translate_permissions_empty_allows_all() {
         let json = translate_permissions_to_opencode(&[]);
         assert_eq!(json, r#"{"permission":"allow"}"#);
+    }
+
+    #[test]
+    fn classify_opencode_permission_denied() {
+        let err = classify_opencode_message("user rejected permission for tool bash: cargo test");
+        assert!(
+            matches!(err, AgentError::PermissionDenied { .. }),
+            "expected PermissionDenied, got: {err:?}"
+        );
     }
 
     #[test]
@@ -632,6 +702,30 @@ mod tests {
         assert_eq!(parsed.response.accomplished.len(), 2);
         assert_eq!(parsed.input_tokens, Some(17500));
         assert_eq!(parsed.output_tokens, Some(500));
+    }
+
+    /// Real failure: OpenCode rejects a tool permission in non-interactive mode.
+    /// The error has `{"error":{"name":"PermissionError","data":{"message":"user rejected permission..."}}}`.
+    /// Parser must extract the nested message and classify as PermissionDenied.
+    #[test]
+    fn fixture_opencode_permission_denied() {
+        let raw = include_str!("../../../../tests/fixtures/opencode_permission_denied.jsonl");
+        let err = runner().parse_response(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::PermissionDenied { .. }),
+            "expected PermissionDenied, got: {err:?}"
+        );
+    }
+
+    /// Real failure: OpenCode rate limit via top-level message field.
+    #[test]
+    fn fixture_opencode_rate_limit() {
+        let raw = include_str!("../../../../tests/fixtures/opencode_rate_limit.jsonl");
+        let err = runner().parse_response(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "expected RateLimit, got: {err:?}"
+        );
     }
 
     /// Real failure: OpenCode returns nested error for unknown model.
