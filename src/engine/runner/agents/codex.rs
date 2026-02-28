@@ -238,7 +238,7 @@ impl AgentRunner for CodexRunner {
         &self,
         model: Option<&str>,
         timeout_cmd: &str,
-        _sys_file: &str,
+        sys_file: &str,
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
@@ -260,12 +260,14 @@ impl AgentRunner for CodexRunner {
 
         format!(
             r#"cat "{msg_file}" | {timeout_cmd} codex {model_flag} \
+  --instructions "{sys_file}" \
   --ask-for-approval {approval} \
   --sandbox {sandbox} \
   exec --json -"#,
             msg_file = msg_file,
             timeout_cmd = timeout_cmd,
             model_flag = model_flag,
+            sys_file = sys_file,
             approval = approval,
             sandbox = sandbox,
         )

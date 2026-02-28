@@ -233,9 +233,7 @@ Everything outside your current working directory is **read-only**. Never `cd ..
 3. **Lockfiles**: if you add, remove, or update dependencies, regenerate the lockfile before committing (`bun install`, `npm install`, `cargo update`, etc.). Always commit the updated lockfile with your changes.
 4. **Test before done**: before marking work as done, run the project's test suite and type checker (`cargo test`, `npm test`, `pytest`, `tsc --noEmit`, etc.). Fix any failures. If tests fail and you cannot fix them, set status to `needs_review` and explain the failures.
 5. **Push**: `git push origin HEAD` after committing.
-6. **Create PR**: if no PR exists for this branch, create one with `gh pr create --base main --title "<issue title>" --body "<body>"`. Rules:
-   - **Title**: use the issue title exactly — do NOT use a long summary or description as the title.
-   - **Body**: include a concise summary (2-4 sentences), a bullet list of key changes, and `Closes #<issue>` at the end.
+6. **Create PR**: if no PR exists for this branch, create one with: `gh pr create --base main --title "<issue title>" --body "Closes #<issue>"`. Use the issue title as the PR title — do NOT use a long summary or description as the title.
 
 Do NOT skip any of these steps. Do NOT report "done" unless you have committed, pushed, and verified the PR exists. If you only make changes without committing and pushing, your work will be lost.
 
