@@ -280,6 +280,8 @@ pub async fn setup_worktree(
             "issue",
             "develop",
             task_id,
+            "--base",
+            &default_branch,
             "--branch-repo",
             &repo_slug,
             "--name",
