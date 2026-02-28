@@ -53,7 +53,7 @@ pub async fn auto_commit(
     tracing::info!(task_id, "auto-committing uncommitted changes");
 
     let commit_msg =
-        format!("feat: {title}\n\nTask #{task_id}\nAgent: {agent}\nAttempt: {attempt}");
+        format!("{title}\n\nTask #{task_id}\nAgent: {agent}\nAttempt: {attempt}");
 
     tracing::info!(task_id, "auto-committing uncommitted changes");
 
