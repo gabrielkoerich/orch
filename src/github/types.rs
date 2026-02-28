@@ -14,6 +14,8 @@ pub struct GitHubIssue {
     pub updated_at: String,
     pub html_url: String,
     pub node_id: Option<String>,
+    /// Present when the item is actually a pull request (GitHub API returns PRs in /issues).
+    pub pull_request: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

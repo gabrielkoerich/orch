@@ -241,7 +241,11 @@ impl GhCli {
             anyhow::bail!("gh api failed: {stderr}");
         }
         Self::record_api_success();
-        parse_ndjson(&output.stdout)
+        let issues: Vec<GitHubIssue> = parse_ndjson(&output.stdout)?;
+        Ok(issues
+            .into_iter()
+            .filter(|i| i.pull_request.is_none())
+            .collect())
     }
 
     /// List all open issues (no label filter).
@@ -271,7 +275,11 @@ impl GhCli {
             anyhow::bail!("gh api failed: {stderr}");
         }
         Self::record_api_success();
-        parse_ndjson(&output.stdout)
+        let issues: Vec<GitHubIssue> = parse_ndjson(&output.stdout)?;
+        Ok(issues
+            .into_iter()
+            .filter(|i| i.pull_request.is_none())
+            .collect())
     }
 
     /// Add labels to an issue (appends to existing labels).
