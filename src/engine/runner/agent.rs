@@ -97,6 +97,8 @@ pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
 set -euo pipefail
 
 # Environment
+[ -f "$HOME/.path" ] && source "$HOME/.path"
+[ -f "$HOME/.private" ] && source "$HOME/.private"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 export GIT_AUTHOR_NAME="{git_name}"
 export GIT_COMMITTER_NAME="{git_name}"
