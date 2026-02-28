@@ -525,10 +525,14 @@ pub struct Router {
 /// Response from the LLM router.
 #[derive(Debug, Deserialize)]
 struct LlmRouteResponse {
+    /// The selected agent. Accepts both "executor" and "agent" from the LLM.
+    #[serde(alias = "agent")]
     executor: String,
     #[serde(default)]
     complexity: String,
+    #[serde(default)]
     reason: String,
+    #[serde(default)]
     profile: LlmAgentProfile,
     #[serde(default)]
     selected_skills: Vec<String>,
@@ -1224,12 +1228,16 @@ impl Router {
                         anyhow::bail!("router LLM returned error: {msg}");
                     }
                 }
-                match val.get("result").and_then(|v| v.as_str()) {
-                    Some(r) => {
-                        tracing::debug!(result_len = r.len(), "unwrapped Claude JSON envelope");
-                        r.to_string()
-                    }
-                    None => trimmed.to_string(),
+                if let Some(r) = val.get("result").and_then(|v| v.as_str()) {
+                    // result is a string — unwrap it
+                    tracing::debug!(result_len = r.len(), "unwrapped Claude JSON envelope (string)");
+                    r.to_string()
+                } else if let Some(obj) = val.get("result").filter(|v| v.is_object()) {
+                    // result is a JSON object — serialize it back for parsing
+                    tracing::debug!("unwrapped Claude JSON envelope (object)");
+                    obj.to_string()
+                } else {
+                    trimmed.to_string()
                 }
             } else {
                 trimmed.to_string()
@@ -1757,6 +1765,107 @@ Hope that helps!"#;
 
         let err = router.parse_llm_response("").unwrap_err();
         assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    /// Claude envelope where result is a JSON object, not a string.
+    /// Some Claude versions may return the result as a nested object.
+    #[test]
+    fn parse_llm_response_claude_envelope_result_as_object() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+
+        let response = r#"{"type":"result","subtype":"success","is_error":false,"result":{"executor":"claude","complexity":"medium","reason":"multi-file feature","profile":{"role":"developer","skills":[],"tools":[],"constraints":[]},"selected_skills":[]},"usage":{"input_tokens":100,"output_tokens":50}}"#;
+
+        let parsed = router.parse_llm_response(response);
+        assert!(parsed.is_ok(), "should handle result-as-object: {}", parsed.unwrap_err());
+        assert_eq!(parsed.unwrap().executor, "claude");
+    }
+
+    /// LLM returns "agent" instead of "executor" — common hallucination.
+    #[test]
+    fn parse_llm_response_agent_instead_of_executor() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+
+        let response = r#"{"agent":"claude","complexity":"medium","reason":"multi-file feature","profile":{"role":"developer","skills":[],"tools":[],"constraints":[]},"selected_skills":[]}"#;
+
+        let parsed = router.parse_llm_response(response);
+        assert!(parsed.is_ok(), "should accept 'agent' alias: {}", parsed.unwrap_err());
+        assert_eq!(parsed.unwrap().executor, "claude");
+    }
+
+    /// LLM returns minimal JSON without profile or reason.
+    #[test]
+    fn parse_llm_response_minimal_json() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+
+        let response = r#"{"executor":"codex","complexity":"simple"}"#;
+
+        let parsed = router.parse_llm_response(response);
+        assert!(parsed.is_ok(), "should accept minimal JSON: {}", parsed.unwrap_err());
+        assert_eq!(parsed.unwrap().executor, "codex");
+    }
+
+    // ── Real fixture tests: route prompt → response → parsed result ──
+
+    /// Real Claude envelope with result as escaped JSON string.
+    #[test]
+    fn fixture_route_response_string() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+
+        let response = include_str!("../../tests/fixtures/route-response-string.json");
+        let parsed = router.parse_llm_response(response).unwrap();
+        assert_eq!(parsed.executor, "codex");
+        assert_eq!(parsed.complexity, "medium");
+        assert!(!parsed.reason.is_empty());
+        assert!(!parsed.profile.role.is_empty());
+    }
+
+    /// Real Claude envelope with result as JSON object (not string).
+    /// This was the root cause of all router failures on 2026-02-27.
+    #[test]
+    fn fixture_route_response_object() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+
+        let response = include_str!("../../tests/fixtures/route-response-object.json");
+        let parsed = router.parse_llm_response(response).unwrap();
+        assert_eq!(parsed.executor, "claude");
+        assert_eq!(parsed.complexity, "complex");
+    }
+
+    /// Real Claude envelope with result as string containing markdown + JSON.
+    #[test]
+    fn fixture_route_response_markdown() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+
+        let response = include_str!("../../tests/fixtures/route-response-markdown.json");
+        let parsed = router.parse_llm_response(response).unwrap();
+        assert_eq!(parsed.executor, "codex");
+        assert_eq!(parsed.complexity, "medium");
+    }
+
+    /// Claude envelope with escaped JSON string containing newlines and markdown.
+    #[test]
+    fn parse_llm_response_claude_envelope_with_prose() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+
+        let inner = "Based on the task description, here's my routing decision:\n\n```json\n{\"executor\":\"codex\",\"complexity\":\"medium\",\"reason\":\"standard feature work\",\"profile\":{\"role\":\"developer\",\"skills\":[\"rust\"],\"tools\":[\"git\",\"cargo\"],\"constraints\":[]},\"selected_skills\":[]}\n```\n\nThis task involves adding slash commands which is standard development work.";
+        let envelope = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": inner,
+            "usage": {"input_tokens": 100, "output_tokens": 80}
+        });
+
+        let parsed = router.parse_llm_response(&envelope.to_string());
+        assert!(parsed.is_ok(), "should handle prose + code block in envelope: {}", parsed.unwrap_err());
+        assert_eq!(parsed.unwrap().executor, "codex");
     }
 
     #[tokio::test]

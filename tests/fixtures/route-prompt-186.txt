@@ -1,0 +1,59 @@
+You are a routing and profiling agent. Decide which executor should handle the task, assess its complexity, create a specialized agent profile, and select relevant skills.
+
+Installed executors (only pick from these):
+claude, codex, opencode, kimi, minimax
+
+Executor descriptions:
+- claude: best for complex coding, Solana/Anchor programs, architecture changes, cross-system debugging, analysis, planning, and writing. Prefer claude for tasks requiring anchor, solana-test-validator, or deep multi-file reasoning.
+- codex: best for coding, repo changes, automation, tooling, shell scripts, frontend, and general feature work. Fast and efficient for most standard development tasks.
+- opencode: lightweight agent with access to multiple model providers (GitHub Copilot, Kimi, MiniMax). Good for quick iterations, simple features, docs, and as fallback when other agents hit usage limits.
+
+If only one executor is installed, always use it.
+
+Skills catalog:
+[]
+
+Task:
+ID: 186
+Title: feat: add /reopen and /rebase slash commands
+Labels: status:new, complexity:medium
+Body:
+## Summary
+
+Add two new owner slash commands:
+
+### `/reopen`
+- Reopens a closed issue/PR
+- Should only work on **closed** issues (inverse of the open-only check for other commands)
+- Reset status to `status:new` so it gets re-dispatched
+- Post confirmation comment
+
+### `/rebase`
+- Rebase the PR branch onto the base branch (usually `main`)
+- Should only work on **open PRs** (not issues)
+- Run `git rebase` in the PR's worktree or checkout, force-push the updated branch
+- Post confirmation comment with success/failure
+
+## Implementation notes
+
+- Add variants to `OwnerCommand` enum in `src/engine/commands.rs`
+- Add cases to `parse_command()` and `execute_command()`
+- `/reopen`: use `gh api repos/{repo}/issues/{number} -X PATCH -f state=open`
+- `/rebase`: need to fetch PR head branch, rebase onto base, force-push
+- Update state check in `scan_commands()`: `/reopen` requires `state == "closed"`, `/rebase` requires open PR
+- Add unit tests for parsing
+- Add `reopen_issue()` method to `GhCli` in `src/github/cli.rs`
+
+## Labels
+- `status:new`
+
+Return ONLY JSON with the following keys:
+executor: codex|claude|opencode
+complexity: simple|medium|complex
+reason: short reason
+profile:
+  role: short role name
+  skills: list of focus skills
+  tools: list of tools allowed
+  constraints: list of constraints
+selected_skills: list of skill ids from the catalog
