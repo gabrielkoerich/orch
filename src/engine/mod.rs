@@ -1097,7 +1097,7 @@ async fn tick(
 /// - Scan for @mentions
 async fn sync_tick(
     backend: &Arc<dyn ExternalBackend>,
-    _tmux: &Arc<TmuxManager>,
+    tmux: &Arc<TmuxManager>,
     repo: &str,
     db: &Arc<Db>,
     config: &EngineConfig,
@@ -1124,12 +1124,46 @@ async fn sync_tick(
         tracing::warn!(err = %e, "PR review failed");
     }
 
-    // 5. Scan for owner /slash commands in issue comments
+    // 5. Trigger review agent for in_review tasks not yet reviewed
+    let enable_review = config::get("workflow.enable_review_agent")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    if enable_review {
+        if let Ok(in_review) = backend.list_by_status(Status::InReview).await {
+            for task in in_review {
+                let task_id = &task.id.0;
+                let already = sidecar::get(task_id, "review_started")
+                    .map(|v| v == "true")
+                    .unwrap_or(false);
+                if !already {
+                    tracing::info!(task_id, "triggering review agent for in_review task");
+                    let _ = sidecar::set(task_id, &["review_started=true".to_string()]);
+                    let backend_c = backend.clone();
+                    let tmux_c = tmux.clone();
+                    let task_c = task.clone();
+                    let repo_s = repo.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s).await
+                        {
+                            tracing::error!(
+                                task_id = task_c.id.0,
+                                error = %e,
+                                "review_and_merge failed"
+                            );
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    // 6. Scan for owner /slash commands in issue comments
     if let Err(e) = commands::scan_commands(backend, db, repo).await {
         tracing::warn!(err = %e, "owner command scan failed");
     }
 
-    // 6. Sync skill repositories
+    // 7. Sync skill repositories
     if let Err(e) = skills_sync().await {
         tracing::warn!(err = %e, "skills sync failed");
     }
