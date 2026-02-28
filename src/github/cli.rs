@@ -708,7 +708,7 @@ impl GhCli {
             "merge".to_string(),
             pr_number.to_string(),
             "--squash".to_string(),
-            "--yes".to_string(),
+            "--auto".to_string(),
             "--repo".to_string(),
             repo.to_string(),
         ];

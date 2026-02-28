@@ -1893,8 +1893,43 @@ async fn review_and_merge(
         }
     };
 
-    // 3. Get git diff and log
+    // 3. Rebase with main to resolve conflicts before review
     let default_branch = config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+    {
+        let wt = &worktree_path;
+        // Fetch latest main
+        let fetch = tokio::process::Command::new("git")
+            .args(["fetch", "origin", &default_branch])
+            .current_dir(wt)
+            .output()
+            .await;
+        if let Ok(out) = fetch {
+            if out.status.success() {
+                let rebase = tokio::process::Command::new("git")
+                    .args(["rebase", &format!("origin/{default_branch}")])
+                    .current_dir(wt)
+                    .output()
+                    .await;
+                match rebase {
+                    Ok(out) if out.status.success() => {
+                        tracing::info!(task_id = task.id.0, "rebased with {default_branch}");
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        tracing::warn!(task_id = task.id.0, stderr = %stderr, "rebase failed, aborting");
+                        let _ = tokio::process::Command::new("git")
+                            .args(["rebase", "--abort"])
+                            .current_dir(wt)
+                            .output()
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id = task.id.0, error = %e, "rebase command failed");
+                    }
+                }
+            }
+        }
+    }
     let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
 
@@ -1983,13 +2018,39 @@ async fn review_and_merge(
         }
     }
 
-    // 9. Read and parse response
+    // 9. Read and parse response using the same pipeline as normal tasks
     let raw_output = runner::response::read_output_file(&review_task_id, &output_file, repo);
+    let agent_runner = runner::agents::get_runner(&review_agent);
 
-    let review_response = match runner::response::parse_review_response(&raw_output) {
+    // Read exit code
+    let exit_code = std::fs::read_to_string(review_attempt_dir.join("exit.txt"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(-1);
+
+    let stderr = std::fs::read_to_string(review_attempt_dir.join("stderr.txt")).unwrap_or_default();
+
+    // Use agent-specific parsing (handles envelope, is_error, auth, rate limit)
+    let parse_result = if exit_code == 0 && !raw_output.is_empty() {
+        agent_runner.parse_response(&raw_output)
+    } else {
+        Err(agent_runner.classify_error(exit_code, &raw_output, &stderr))
+    };
+
+    let parsed = match parse_result {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(task_id = task.id.0, error = %e, "review agent error: {}", e);
+            return Ok(ReviewDecision::Failed(format!("agent error: {e}")));
+        }
+    };
+
+    // The agent's summary contains the review JSON (or markdown with JSON block)
+    let review_text = &parsed.response.summary;
+    let review_response = match runner::response::parse_review_response(review_text) {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(task_id = task.id.0, error = %e, "failed to parse review response");
+            tracing::error!(task_id = task.id.0, error = %e, review_text = %review_text, "failed to parse review response");
             return Ok(ReviewDecision::Failed(format!("parse error: {e}")));
         }
     };

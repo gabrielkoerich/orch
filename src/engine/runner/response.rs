@@ -581,59 +581,25 @@ pub struct ReviewIssue {
     pub description: String,
 }
 
-/// Parse a review response from JSON.
-pub fn parse_review_response(raw: &str) -> anyhow::Result<ReviewResponse> {
-    // Extract result text from agent envelope (works for all agents)
-    let text = unwrap_agent_result(raw);
-
+/// Parse a review response from already-unwrapped text.
+///
+/// Expects the raw result text (already extracted from the agent envelope
+/// by the agent-specific parser). Tries direct JSON parse, then markdown
+/// code block extraction.
+pub fn parse_review_response(text: &str) -> anyhow::Result<ReviewResponse> {
     // Try direct JSON parse
-    if let Ok(resp) = serde_json::from_str::<ReviewResponse>(&text) {
+    if let Ok(resp) = serde_json::from_str::<ReviewResponse>(text) {
         return Ok(resp);
     }
 
     // Try extracting JSON from markdown code blocks
-    if let Some(json_str) = extract_json_block(&text) {
+    if let Some(json_str) = extract_json_block(text) {
         if let Ok(resp) = serde_json::from_str::<ReviewResponse>(&json_str) {
             return Ok(resp);
         }
     }
 
     anyhow::bail!("failed to parse review response")
-}
-
-/// Extract the result text from an agent output envelope.
-///
-/// All agents (claude, codex, opencode) wrap output in a JSON envelope
-/// with a "result" field. This extracts that text. If the input isn't
-/// an envelope, returns it as-is.
-pub fn unwrap_agent_result(raw: &str) -> String {
-    // Try single JSON object first (claude)
-    if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(raw) {
-        match envelope.get("result") {
-            Some(serde_json::Value::String(s)) => return s.clone(),
-            Some(serde_json::Value::Object(obj)) => {
-                return serde_json::to_string(obj).unwrap_or_else(|_| raw.to_string());
-            }
-            _ => {}
-        }
-    }
-    // Try NDJSON: last line with a "result" field (codex, opencode)
-    for line in raw.lines().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
-            match obj.get("result") {
-                Some(serde_json::Value::String(s)) => return s.clone(),
-                Some(serde_json::Value::Object(o)) => {
-                    return serde_json::to_string(o).unwrap_or_else(|_| line.to_string());
-                }
-                _ => {}
-            }
-        }
-    }
-    raw.to_string()
 }
 
 /// Extract the first valid JSON object from markdown code blocks.
