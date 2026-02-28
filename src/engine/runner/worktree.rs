@@ -273,6 +273,34 @@ pub async fn setup_worktree(
         ],
     )?;
 
+    // Link branch to GitHub issue (non-fatal)
+    let repo_slug = crate::config::get_current_repo().unwrap_or_default();
+    let link_output = Command::new("gh")
+        .args([
+            "issue",
+            "develop",
+            task_id,
+            "--branch-repo",
+            &repo_slug,
+            "--name",
+            &branch_name_str,
+        ])
+        .current_dir(&main_dir)
+        .output_with_context()
+        .await;
+    match link_output {
+        Ok(o) if o.status.success() => {
+            tracing::info!(task_id, branch = %branch_name_str, "linked branch to issue");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::debug!(task_id, err = %stderr, "gh issue develop failed (non-fatal)");
+        }
+        Err(e) => {
+            tracing::debug!(task_id, err = %e, "gh issue develop failed (non-fatal)");
+        }
+    }
+
     tracing::info!(
         task_id,
         worktree = %worktree_dir.display(),
