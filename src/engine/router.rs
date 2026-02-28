@@ -630,6 +630,21 @@ impl Router {
         self.available_agents.first().cloned()
     }
 
+    /// Pick next agent via round-robin (for review or other non-task routing).
+    pub fn next_round_robin_agent(&self) -> Option<String> {
+        if self.available_agents.is_empty() {
+            return None;
+        }
+        let idx: usize = crate::sidecar::get("_review_rr", "index")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let agent = self.available_agents[idx % self.available_agents.len()].clone();
+        let next = (idx + 1) % self.available_agents.len();
+        let _ = crate::sidecar::set("_review_rr", &[format!("index={next}")]);
+        Some(agent)
+    }
+
     /// Route a task to the best agent.
     ///
     /// Routing logic (in priority order):

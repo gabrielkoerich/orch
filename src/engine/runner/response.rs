@@ -583,19 +583,40 @@ pub struct ReviewIssue {
 
 /// Parse a review response from JSON.
 pub fn parse_review_response(raw: &str) -> anyhow::Result<ReviewResponse> {
-    // Try direct JSON parse first
-    if let Ok(resp) = serde_json::from_str::<ReviewResponse>(raw) {
+    // Extract result text from agent envelope (works for all agents)
+    let text = unwrap_agent_result(raw);
+
+    // Try direct JSON parse
+    if let Ok(resp) = serde_json::from_str::<ReviewResponse>(&text) {
         return Ok(resp);
     }
 
     // Try extracting JSON from markdown code blocks
-    if let Some(json_str) = extract_json_block(raw) {
+    if let Some(json_str) = extract_json_block(&text) {
         if let Ok(resp) = serde_json::from_str::<ReviewResponse>(&json_str) {
             return Ok(resp);
         }
     }
 
     anyhow::bail!("failed to parse review response")
+}
+
+/// Extract the result text from an agent output envelope.
+///
+/// All agents (claude, codex, opencode) wrap output in a JSON envelope
+/// with a "result" field. This extracts that text. If the input isn't
+/// an envelope, returns it as-is.
+pub fn unwrap_agent_result(raw: &str) -> String {
+    if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(raw) {
+        match envelope.get("result") {
+            Some(serde_json::Value::String(s)) => return s.clone(),
+            Some(serde_json::Value::Object(obj)) => {
+                return serde_json::to_string(obj).unwrap_or_else(|_| raw.to_string());
+            }
+            _ => {}
+        }
+    }
+    raw.to_string()
 }
 
 /// Extract the first valid JSON object from markdown code blocks.

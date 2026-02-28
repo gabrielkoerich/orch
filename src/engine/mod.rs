@@ -61,8 +61,6 @@ pub struct EngineConfig {
     pub tick_interval: std::time::Duration,
     /// GitHub sync interval (cleanup, PR review, mentions)
     pub sync_interval: std::time::Duration,
-    /// Fallback sync interval when webhooks are unavailable (seconds)
-    pub fallback_sync_interval: Option<std::time::Duration>,
     /// Webhook health check interval (seconds)
     pub webhook_health_check_interval: Option<std::time::Duration>,
     /// Maximum parallel task executions
@@ -81,7 +79,6 @@ impl Default for EngineConfig {
         Self {
             tick_interval: std::time::Duration::from_secs(10),
             sync_interval: std::time::Duration::from_secs(120),
-            fallback_sync_interval: Some(std::time::Duration::from_secs(30)),
             webhook_health_check_interval: Some(std::time::Duration::from_secs(60)),
             max_parallel: 4,
             stuck_timeout: 1800,
@@ -117,16 +114,6 @@ impl EngineConfig {
         if let Ok(val) = crate::config::get("engine.stuck_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.stuck_timeout = secs;
-            }
-        }
-
-        if let Ok(val) = crate::config::get("engine.fallback_sync_interval") {
-            if let Ok(secs) = val.parse::<u64>() {
-                if secs > 0 {
-                    config.fallback_sync_interval = Some(std::time::Duration::from_secs(secs));
-                } else {
-                    config.fallback_sync_interval = None;
-                }
             }
         }
 
@@ -405,8 +392,6 @@ pub async fn serve() -> anyhow::Result<()> {
     let webhook_port: Option<u16>;
     let mut webhook_healthy: bool;
     let mut last_webhook_health_check = std::time::Instant::now();
-    let mut in_fallback_mode: bool;
-
     // Start webhook server if configured
     let webhook_enabled = crate::config::get("webhook.enabled")
         .map(|v| v == "true")
@@ -452,12 +437,10 @@ pub async fn serve() -> anyhow::Result<()> {
         });
 
         webhook_healthy = true;
-        in_fallback_mode = false;
         tracing::info!(port, "webhook server started");
     } else {
         webhook_port = None;
         webhook_healthy = false;
-        in_fallback_mode = true;
         tracing::info!("webhook server disabled, using polling fallback mode");
     }
 
@@ -544,6 +527,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             &jobs_path,
                             &db,
                             &router_guard,
+                            &router,
                             &engine.task_manager,
                             &weight_tx,
                             &transport,
@@ -554,16 +538,9 @@ pub async fn serve() -> anyhow::Result<()> {
                     drop(router_guard);
 
                     // Periodic sync (less frequent)
-                    // Use fallback interval if in fallback mode
-                    let current_sync_interval = if in_fallback_mode {
-                        config.fallback_sync_interval.unwrap_or(config.sync_interval)
-                    } else {
-                        config.sync_interval
-                    };
-
-                    if last_sync.elapsed() >= current_sync_interval {
+                    if last_sync.elapsed() >= config.sync_interval {
                         for engine in &project_engines {
-                            if let Err(e) = sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config).await {
+                            if let Err(e) = sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config, &router).await {
                                 tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
                             }
                         }
@@ -582,11 +559,9 @@ pub async fn serve() -> anyhow::Result<()> {
                             if health != webhook_healthy {
                                 webhook_healthy = health;
                                 if webhook_healthy {
-                                    in_fallback_mode = false;
-                                    tracing::info!(port, "webhook health restored, exiting polling fallback mode");
+                                    tracing::info!(port, "webhook health restored");
                                 } else {
-                                    in_fallback_mode = true;
-                                    tracing::warn!(port, "webhook health check failed, entering polling fallback mode");
+                                    tracing::warn!(port, "webhook health check failed");
                                 }
                             }
                         }
@@ -617,6 +592,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             &jobs_path,
                             &db,
                             &router_guard,
+                            &router,
                             &engine.task_manager,
                             &weight_tx,
                             &transport,
@@ -723,6 +699,7 @@ async fn tick(
     jobs_path: &std::path::PathBuf,
     db: &Arc<Db>,
     router: &Router,
+    router_arc: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
     transport: &Arc<Transport>,
@@ -910,6 +887,7 @@ async fn tick(
         let tmux = tmux.clone();
         let capture = capture.clone();
         let transport = transport.clone();
+        let router_clone = router_arc.clone();
         let task_id_for_cleanup = task_id.clone();
         let task_owned = task.clone();
         let weight_tx = weight_tx.clone();
@@ -973,12 +951,14 @@ async fn tick(
                             let backend_clone = backend.clone();
                             let tmux_clone = tmux.clone();
                             let task_owned_clone = task_owned.clone();
+                            let router_for_review = router_clone.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = review_and_merge(
                                     &task_owned_clone,
                                     &backend_clone,
                                     &tmux_clone,
                                     &repo_owned,
+                                    &router_for_review,
                                 )
                                 .await
                                 {
@@ -1101,6 +1081,7 @@ async fn sync_tick(
     repo: &str,
     db: &Arc<Db>,
     config: &EngineConfig,
+    router: &Arc<RwLock<Router>>,
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
 
@@ -1142,9 +1123,10 @@ async fn sync_tick(
                     let tmux_c = tmux.clone();
                     let task_c = task.clone();
                     let repo_s = repo.to_string();
+                    let router_c = router.clone();
                     tokio::spawn(async move {
                         if let Err(e) =
-                            review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s).await
+                            review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c).await
                         {
                             tracing::error!(
                                 task_id = task_c.id.0,
@@ -1888,6 +1870,7 @@ async fn review_and_merge(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
     repo: &str,
+    router: &Arc<RwLock<Router>>,
 ) -> anyhow::Result<ReviewDecision> {
     // 2. Load sidecar for worktree path, branch, agent
     let worktree = sidecar::get(&task.id.0, "worktree").ok();
@@ -1919,9 +1902,12 @@ async fn review_and_merge(
     let review_prompt =
         runner::agent::build_review_prompt(task, &agent_summary, &git_diff, &git_log);
 
-    // 5. Pick review agent (config: workflow.review_agent, default: claude)
-    let review_agent =
-        config::get("workflow.review_agent").unwrap_or_else(|_| "claude".to_string());
+    // 5. Pick review agent via round-robin
+    let review_agent = {
+        let r = router.read().await;
+        r.next_round_robin_agent()
+            .unwrap_or_else(|| "claude".to_string())
+    };
     let review_model = get_model_for_complexity("review", &review_agent);
 
     tracing::info!(
