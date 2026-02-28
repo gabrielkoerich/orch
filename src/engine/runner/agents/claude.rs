@@ -207,15 +207,13 @@ impl AgentRunner for ClaudeRunner {
                 &permissions.allowed_edit_paths,
             );
             format!("--allowedTools '{}'", tools.join(","))
+        } else if !permissions.disallowed_tools.is_empty() {
+            format!(
+                "--disallowedTools '{}'",
+                permissions.disallowed_tools.join(",")
+            )
         } else {
-            if !permissions.disallowed_tools.is_empty() {
-                format!(
-                    "--disallowedTools '{}'",
-                    permissions.disallowed_tools.join(",")
-                )
-            } else {
-                String::new()
-            }
+            String::new()
         };
 
         format!(

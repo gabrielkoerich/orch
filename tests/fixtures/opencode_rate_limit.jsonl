@@ -1,0 +1,2 @@
+{"type":"step_start","timestamp":1706300000,"part":{"type":"step-start","snapshot":"Starting task..."}}
+{"type":"error","timestamp":1706300001,"message":"rate limit exceeded: too many requests, please try again later"}

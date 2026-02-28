@@ -189,15 +189,7 @@ fn codex_responds_with_ndjson() {
     }
 
     let output = agent_cmd("codex")
-        .args([
-            "--ask-for-approval",
-            "never",
-            "--sandbox",
-            "workspace-write",
-            "exec",
-            "--json",
-            SIMPLE_PROMPT,
-        ])
+        .args(["--full-auto", "exec", "--json", SIMPLE_PROMPT])
         .output()
         .expect("failed to execute codex");
 
@@ -258,15 +250,7 @@ fn codex_stdin_pipe_mode() {
 
     // Test piped stdin — matches real task invocation: cat msg | codex ... exec --json -
     let output = agent_cmd("codex")
-        .args([
-            "--ask-for-approval",
-            "never",
-            "--sandbox",
-            "workspace-write",
-            "exec",
-            "--json",
-            "-",
-        ])
+        .args(["--full-auto", "exec", "--json", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
