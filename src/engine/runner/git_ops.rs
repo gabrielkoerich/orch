@@ -201,7 +201,8 @@ pub async fn create_pr_if_needed(
         "\n\nCloses #{task_id}\n\n---\n*Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch)*"
     ));
 
-    let pr_title = if summary.is_empty() { title } else { summary };
+    // Always use the short task title for the PR title (summary goes in body)
+    let pr_title = title;
 
     let output = Command::new("gh")
         .args([
