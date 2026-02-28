@@ -24,13 +24,27 @@ pub struct WorktreeSetup {
 ///
 /// Format: `gh-task-{issue}-{slug}` where slug is lowercase, non-alphanum→`-`, max 40 chars.
 pub fn branch_name(task_id: &str, title: &str) -> String {
-    let slug: String = title
+    let raw: String = title
         .to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
+        .collect();
+
+    // Collapse consecutive dashes and trim
+    let mut slug = String::with_capacity(raw.len());
+    let mut prev_dash = false;
+    for c in raw.chars() {
+        if c == '-' {
+            if !prev_dash {
+                slug.push('-');
+            }
+            prev_dash = true;
+        } else {
+            slug.push(c);
+            prev_dash = false;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
 
     // Truncate slug to 40 chars
     let slug = if slug.len() > 40 { &slug[..40] } else { &slug };
@@ -347,7 +361,7 @@ mod tests {
     #[test]
     fn branch_name_special_chars() {
         let name = branch_name("7", "Add OAuth2/OIDC (Google & GitHub)");
-        assert_eq!(name, "gh-task-7-add-oauth2-oidc--google---github");
+        assert_eq!(name, "gh-task-7-add-oauth2-oidc-google-github");
     }
 
     #[test]

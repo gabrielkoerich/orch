@@ -457,6 +457,8 @@ impl GhCli {
         let json = self
             .api(&[
                 &endpoint,
+                "--method",
+                "GET",
                 "-f",
                 &format!("head={}", head),
                 "-f",
@@ -540,6 +542,8 @@ impl GhCli {
         let json = self
             .api(&[
                 &endpoint,
+                "--method",
+                "GET",
                 "-f",
                 &format!("head={}", head),
                 "-f",
@@ -899,6 +903,8 @@ impl GhCli {
         let json = self
             .api(&[
                 &endpoint,
+                "--method",
+                "GET",
                 "-f",
                 &format!("branch={branch}"),
                 "-f",
