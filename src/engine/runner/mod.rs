@@ -122,8 +122,11 @@ impl TaskRunner {
         // Resolve project directory
         let project_dir = self.resolve_project_dir()?;
 
+        // Load title from sidecar for branch naming (set by run_with_context before run())
+        let title_for_branch = sidecar::get(task_id, "title").unwrap_or_default();
+
         // Set up worktree
-        let wt = worktree::setup_worktree(task_id, "", &project_dir).await?;
+        let wt = worktree::setup_worktree(task_id, &title_for_branch, &project_dir).await?;
 
         // Get routing result
         let route_result = get_route_result(task_id).ok();

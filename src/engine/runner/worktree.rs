@@ -36,7 +36,11 @@ pub fn branch_name(task_id: &str, title: &str) -> String {
     let slug = if slug.len() > 40 { &slug[..40] } else { &slug };
     let slug = slug.trim_end_matches('-');
 
-    format!("gh-task-{task_id}-{slug}")
+    if slug.is_empty() {
+        format!("gh-task-{task_id}")
+    } else {
+        format!("gh-task-{task_id}-{slug}")
+    }
 }
 
 /// Detect the default branch of a repository.
@@ -338,7 +342,7 @@ mod tests {
     #[test]
     fn branch_name_empty_title() {
         let name = branch_name("99", "");
-        assert_eq!(name, "gh-task-99-");
+        assert_eq!(name, "gh-task-99");
     }
 
     #[test]
