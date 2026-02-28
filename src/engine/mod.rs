@@ -788,16 +788,30 @@ async fn tick(
                         backend.remove_label(&task.id, label).await.ok();
                     }
                 }
-                sidecar::set(
+                if let Err(e) = sidecar::set(
                     &task.id.0,
                     &[
                         "agent=".to_string(),
                         "model=".to_string(),
                         "route_attempts=0".to_string(),
                     ],
-                )?;
-                backend.update_status(&task.id, Status::New).await?;
-                backend
+                ) {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        ?e,
+                        "failed to reset sidecar for stuck task"
+                    );
+                    continue;
+                }
+                if let Err(e) = backend.update_status(&task.id, Status::New).await {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        ?e,
+                        "failed to reset stuck task status"
+                    );
+                    continue;
+                }
+                if let Err(e) = backend
                     .post_comment(
                         &task.id,
                         &format!(
@@ -806,7 +820,15 @@ async fn tick(
                             age.num_minutes()
                         ),
                     )
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        ?e,
+                        "failed to post stuck-task recovery comment"
+                    );
+                    continue;
+                }
             }
         }
     }

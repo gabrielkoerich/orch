@@ -415,29 +415,41 @@ impl TaskRunner {
                     }
 
                     // Push
-                    if let Err(e) =
-                        git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await
-                    {
-                        tracing::error!(task_id, error = ?e, "push failed");
-                        sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
-                    }
-
-                    // Create PR
-                    if let Err(e) = git_ops::create_pr_if_needed(
+                    let allow_pr = match git_ops::push_branch(
                         &wt.work_dir,
                         &wt.branch,
-                        &task_title,
-                        &resp.summary,
-                        &resp.accomplished,
-                        &resp.remaining,
-                        &resp.files,
-                        task_id,
-                        &agent_name,
+                        &wt.default_branch,
                     )
                     .await
                     {
-                        tracing::error!(task_id, error = ?e, "create PR failed");
-                        sidecar::set(task_id, &[format!("last_error=create PR failed: {e}")])?;
+                        Ok(_) => true,
+                        Err(e) => {
+                            tracing::error!(task_id, error = ?e, "push failed");
+                            sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
+                            false
+                        }
+                    };
+
+                    // Create PR (skip if push failed)
+                    if allow_pr {
+                        if let Err(e) = git_ops::create_pr_if_needed(
+                            &wt.work_dir,
+                            &wt.branch,
+                            &task_title,
+                            &resp.summary,
+                            &resp.accomplished,
+                            &resp.remaining,
+                            &resp.files,
+                            task_id,
+                            &agent_name,
+                        )
+                        .await
+                        {
+                            tracing::error!(task_id, error = ?e, "create PR failed");
+                            sidecar::set(task_id, &[format!("last_error=create PR failed: {e}")])?;
+                        }
+                    } else {
+                        tracing::warn!(task_id, "skipping PR creation due to push failure");
                     }
                 }
 
