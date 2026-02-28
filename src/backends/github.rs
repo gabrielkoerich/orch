@@ -1,23 +1,22 @@
-//! GitHub Issues backend — uses `gh` CLI for all API calls.
+//! GitHub Issues backend — native HTTP via `reqwest` with connection pooling.
 //!
-//! Auth is handled by `gh` (OAuth, tokens, SSO). No JWT, no token refresh,
-//! no credential storage. Everyone who has `gh` installed can use orch.
+//! Auth is resolved once at startup: `GH_TOKEN` env → `GITHUB_TOKEN` env → `gh auth token`.
 
 use super::{ExternalBackend, ExternalId, ExternalTask, Mention, Status};
-use crate::github::cli::{status_label_color, GhCli};
+use crate::github::http::{status_label_color, GhHttp};
 use crate::github::projects::ProjectSync;
 use async_trait::async_trait;
 
 pub struct GitHubBackend {
     repo: String,
-    gh: GhCli,
+    gh: GhHttp,
 }
 
 impl GitHubBackend {
     pub fn new(repo: String) -> Self {
         Self {
             repo,
-            gh: GhCli::new(),
+            gh: GhHttp::new(),
         }
     }
 }

@@ -200,7 +200,7 @@ new → routed → in_progress → in_review → done
 | 25+ subprocess forks per quiet tick | ~200ms overhead, adds up | Yes — native JSON/YAML/cron |
 | `yq` called ~10x per tick for config | 10 forks for config reads | Yes — in-memory config |
 | `python3` for cron/parse/render | 4-8 forks per tick | Yes — native cron/parser |
-| `gh` CLI startup time (~150ms each) | 5+ calls just for status checks | Yes — direct HTTP with connection pooling |
+| `gh` CLI startup time (~150ms each) | 5+ calls just for status checks | ✅ Done — `src/github/http.rs` (reqwest, connection pooling, ~100ms/call) |
 | 10s polling loop (sleep in bash) | Tasks wait up to 10s to start | Yes — async event loop |
 | Sequential label operations | 3-5 API calls per status change | Yes — batch API calls |
 
@@ -397,9 +397,9 @@ In v1, the tmux bridge changes this completely:
 
 | Scenario | v0 (subprocesses/tick) | v1 (subprocesses/tick) | Savings |
 |----------|----------------------|----------------------|---------|
-| Quiet tick (no tasks) | ~25 | ~2 (git status check) | **92%** |
-| Per active task | ~30 | ~5 (git + agent CLI) | **83%** |
-| Busy tick (4 tasks) | ~150+ | ~22 | **85%** |
+| Quiet tick (no tasks) | ~25 | ~0 (native HTTP, no subprocesses) | **100%** |
+| Per active task | ~30 | ~3 (git + agent CLI only) | **90%** |
+| Busy tick (4 tasks) | ~150+ | ~14 (git + agent only) | **91%** |
 
 ---
 
@@ -664,7 +664,8 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Config loading (config.yml, .orchestrator.yml) — `src/config.rs` (hot-reload via `notify`)
 - [x] Sidecar JSON I/O (read/write/merge) — `src/sidecar.rs`
 - [x] GitHub API client (gh CLI wrapper with serde parsing) — `src/github/cli.rs`, `src/github/types.rs`
-- [ ] GitHub App auth (JWT, token refresh, GH_TOKEN export) — using `gh` CLI auth instead
+- [x] Native HTTP client (reqwest, connection pooling, header-based rate limiting) — `src/github/http.rs` (supersedes `cli.rs`)
+- [ ] ~~GitHub App auth (JWT, token refresh, GH_TOKEN export)~~ — using `gh auth token` / `GH_TOKEN` env instead
 - [x] Agent response parser — `src/parser.rs`
 - [x] Cron matcher — `src/cron.rs`
 - [x] Template renderer — `src/template.rs`
@@ -675,7 +676,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 **Goal:** Tokio event loop replaces the bash 10s tick loop.
 
 - [x] ExternalBackend trait — `src/backends/mod.rs` (Status, ExternalTask, ExternalId)
-- [x] GitHub backend — `src/backends/github.rs` (implements ExternalBackend via `gh api`)
+- [x] GitHub backend — `src/backends/github.rs` (implements ExternalBackend via native reqwest HTTP)
 - [x] Engine main loop — `src/engine/mod.rs` (tokio::select! with 10s tick + 120s sync)
 - [x] Task polling (GitHub API via gh CLI + serde) — Phase 3 of tick()
 - [x] Task runner — `src/engine/runner/` (context, worktree, agent, response, git_ops)

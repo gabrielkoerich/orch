@@ -1,7 +1,8 @@
-//! `gh` CLI wrapper — structured args in, serde out.
+//! `gh` CLI wrapper — structured args in, serde out (legacy fallback).
 //!
-//! All GitHub API calls go through `gh api`. Auth is handled by `gh`.
-//! We build the command args in Rust and deserialize the JSON output via serde.
+//! Superseded by `http.rs` (native reqwest client with connection pooling).
+//! Kept as a fallback; all production callers have migrated to `GhHttp`.
+#![allow(dead_code)]
 
 use super::backoff::{self, GhBackoff};
 use super::types::{GitHubComment, GitHubIssue, GitHubReview, GitHubReviewComment};

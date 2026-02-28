@@ -35,7 +35,7 @@ use crate::config;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::{get_route_result, Router};
 use crate::engine::tasks::TaskManager;
-use crate::github::cli::GhCli;
+use crate::github::http::GhHttp;
 use crate::github::types::{GitHubReviewComment, PullRequestReview};
 use crate::sidecar;
 use crate::tmux::TmuxManager;
@@ -523,7 +523,7 @@ pub async fn serve() -> anyhow::Result<()> {
                 }
 
                 // Skip tick/sync entirely if GitHub API is rate-limited
-                if let Some(remaining) = GhCli::is_rate_limited() {
+                if let Some(remaining) = GhHttp::is_rate_limited() {
                     tracing::warn!(
                         remaining_secs = remaining.as_secs(),
                         "GitHub API rate-limited, skipping tick"
@@ -587,7 +587,7 @@ pub async fn serve() -> anyhow::Result<()> {
             }
             // Webhook events trigger an immediate tick (bypass polling interval)
             _ = webhook_notify.notified() => {
-                if let Some(remaining) = GhCli::is_rate_limited() {
+                if let Some(remaining) = GhHttp::is_rate_limited() {
                     tracing::warn!(
                         remaining_secs = remaining.as_secs(),
                         "GitHub API rate-limited, skipping webhook-triggered tick"
@@ -1600,7 +1600,7 @@ async fn review_open_prs(
         "checking in_review tasks for PR reviews"
     );
 
-    let gh = GhCli::new();
+    let gh = GhHttp::new();
 
     for task in in_review_tasks {
         let task_id = &task.id.0;
@@ -2091,7 +2091,7 @@ async fn review_and_merge(
     );
 
     // 12. Post automated review comment on the PR
-    let gh = GhCli::new();
+    let gh = GhHttp::new();
     let pr_number = gh.get_pr_number(repo, &branch_name).await.ok().flatten();
 
     if let Some(pr_num) = pr_number {
@@ -2177,7 +2177,7 @@ async fn auto_merge_pr(
     repo: &str,
 ) -> anyhow::Result<()> {
     // 1. Get PR number from branch
-    let gh = GhCli::new();
+    let gh = GhHttp::new();
     let pr_number = match gh.get_pr_number(repo, branch).await? {
         Some(n) => n,
         None => {

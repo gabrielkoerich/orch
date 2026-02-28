@@ -6,7 +6,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::db::Db;
-use crate::github::cli::GhCli;
+use crate::github::http::GhHttp;
 use std::sync::Arc;
 
 /// Parsed owner command from an issue comment.
@@ -103,7 +103,7 @@ pub async fn scan_commands(
     db: &Arc<Db>,
     repo: &str,
 ) -> anyhow::Result<()> {
-    let gh = GhCli::new();
+    let gh = GhHttp::new();
 
     // Use persisted cursor, fall back to 24h ago
     let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
@@ -270,7 +270,7 @@ pub async fn scan_commands(
 /// Execute a single owner command against a task.
 async fn execute_command(
     backend: &Arc<dyn ExternalBackend>,
-    gh: &GhCli,
+    gh: &GhHttp,
     repo: &str,
     task_id: &ExternalId,
     command: &OwnerCommand,

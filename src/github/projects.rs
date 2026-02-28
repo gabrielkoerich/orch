@@ -1,11 +1,11 @@
 //! GitHub Projects V2 integration — keeps project board columns in sync with task status.
 //!
-//! Uses GitHub's Projects V2 GraphQL API via the existing `GhCli::graphql()` wrapper.
+//! Uses GitHub's Projects V2 GraphQL API via the native `GhHttp` reqwest client.
 //! All operations are best-effort: failures are logged but never block task execution.
 
 use crate::backends::Status;
 use crate::config;
-use crate::github::cli::GhCli;
+use crate::github::http::GhHttp;
 use std::collections::HashMap;
 
 /// Project board info returned by list queries.
@@ -33,7 +33,7 @@ pub struct ProjectSync {
     project_id: String,
     status_field_id: String,
     status_map: HashMap<String, String>,
-    gh: GhCli,
+    gh: GhHttp,
 }
 
 impl ProjectSync {
@@ -56,7 +56,7 @@ impl ProjectSync {
             project_id,
             status_field_id,
             status_map,
-            gh: GhCli::new(),
+            gh: GhHttp::new(),
         })
     }
 
@@ -65,7 +65,7 @@ impl ProjectSync {
     /// Queries the project's fields via GraphQL and finds the single-select
     /// "Status" field, returning a `ProjectSync` populated with field/option IDs.
     pub async fn discover_fields(project_id: &str) -> anyhow::Result<Self> {
-        let gh = GhCli::new();
+        let gh = GhHttp::new();
         let query = format!(
             r#"{{ node(id: "{}") {{ ... on ProjectV2 {{ fields(first: 100) {{ nodes {{ ... on ProjectV2SingleSelectField {{ id name options {{ id name }} }} }} }} }} }} }}"#,
             project_id
@@ -132,7 +132,7 @@ impl ProjectSync {
 
     /// List all accessible projects for the authenticated user and their orgs.
     pub async fn list_projects() -> anyhow::Result<Vec<ProjectInfo>> {
-        let gh = GhCli::new();
+        let gh = GhHttp::new();
         let mut projects = Vec::new();
 
         // Get current user login
@@ -188,7 +188,7 @@ impl ProjectSync {
     /// `owner_id` is the GraphQL node ID of the user or org.
     #[allow(dead_code)]
     pub async fn create_project(owner_id: &str, title: &str) -> anyhow::Result<ProjectInfo> {
-        let gh = GhCli::new();
+        let gh = GhHttp::new();
         let query = format!(
             r#"mutation {{ createProjectV2(input: {{ownerId: "{}", title: "{}"}}) {{ projectV2 {{ id number title }} }} }}"#,
             owner_id,
@@ -207,7 +207,7 @@ impl ProjectSync {
     /// Get the GraphQL node ID for a user or org login.
     #[allow(dead_code)]
     pub async fn get_owner_id(login: &str) -> anyhow::Result<String> {
-        let gh = GhCli::new();
+        let gh = GhHttp::new();
 
         // Try user first
         let query = format!(r#"{{ user(login: "{}") {{ id }} }}"#, login);
