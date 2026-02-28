@@ -924,6 +924,13 @@ impl Router {
         // Call the LLM router
         let response = self.call_router_llm(&prompt).await?;
 
+        tracing::info!(
+            task_id = task.id.0,
+            response_len = response.len(),
+            response_preview = %if response.len() > 500 { &response[..500] } else { &response },
+            "LLM router raw response"
+        );
+
         // Parse the response
         let llm_response: LlmRouteResponse = self.parse_llm_response(&response)?;
 
@@ -1154,11 +1161,30 @@ impl Router {
 
         match output {
             Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                tracing::debug!(
+                    exit_code = output.status.code().unwrap_or(-1),
+                    stdout_len = stdout.len(),
+                    stderr_len = stderr.len(),
+                    "router LLM command completed"
+                );
                 if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(
+                        stderr = %stderr,
+                        stdout = %stdout,
+                        "router LLM command failed"
+                    );
                     anyhow::bail!("router LLM failed: {stderr}");
                 }
-                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+                if stdout.is_empty() {
+                    tracing::warn!(
+                        stderr = %stderr,
+                        "router LLM returned empty stdout"
+                    );
+                    anyhow::bail!("router LLM returned empty response");
+                }
+                Ok(stdout)
             }
             Ok(Err(e)) => Err(e),
             Err(_) => anyhow::bail!("router LLM timed out after {timeout_secs}s"),
@@ -1166,15 +1192,53 @@ impl Router {
     }
 
     /// Parse the LLM response into a structured format.
+    ///
+    /// Handles: direct JSON, Claude `--output-format json` envelopes,
+    /// markdown code blocks, and raw text with embedded JSON.
     fn parse_llm_response(&self, response: &str) -> anyhow::Result<LlmRouteResponse> {
-        // First, try to parse directly as JSON
-        if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(response) {
+        let trimmed = response.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("empty LLM response");
+        }
+
+        // Step 1: Unwrap Claude JSON envelope if present.
+        // Claude --output-format json returns {"type":"result","result":"...","usage":{...}}
+        // The inner "result" field contains the actual LLM text.
+        let inner = if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if val.get("type").and_then(|v| v.as_str()) == Some("result") {
+                if let Some(is_error) = val.get("is_error").and_then(|v| v.as_bool()) {
+                    if is_error {
+                        let msg = val
+                            .get("result")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown error");
+                        anyhow::bail!("router LLM returned error: {msg}");
+                    }
+                }
+                match val.get("result").and_then(|v| v.as_str()) {
+                    Some(r) => {
+                        tracing::debug!(result_len = r.len(), "unwrapped Claude JSON envelope");
+                        r.to_string()
+                    }
+                    None => trimmed.to_string(),
+                }
+            } else {
+                trimmed.to_string()
+            }
+        } else {
+            trimmed.to_string()
+        };
+
+        let text = inner.trim();
+
+        // Step 2: Try to parse directly as JSON
+        if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(text) {
             return Ok(parsed);
         }
 
-        // Try to extract JSON from markdown code blocks
-        if let Some(json_start) = response.find("```json") {
-            let after_start = &response[json_start + 7..];
+        // Step 3: Try to extract JSON from markdown code blocks
+        if let Some(json_start) = text.find("```json") {
+            let after_start = &text[json_start + 7..];
             if let Some(json_end) = after_start.find("```") {
                 let json_str = &after_start[..json_end].trim();
                 if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
@@ -1184,8 +1248,8 @@ impl Router {
         }
 
         // Try without json specifier
-        if let Some(json_start) = response.find("```") {
-            let after_start = &response[json_start + 3..];
+        if let Some(json_start) = text.find("```") {
+            let after_start = &text[json_start + 3..];
             if let Some(json_end) = after_start.find("```") {
                 let json_str = &after_start[..json_end].trim();
                 if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
@@ -1194,17 +1258,17 @@ impl Router {
             }
         }
 
-        // Try to find JSON object between curly braces
-        if let Some(start) = response.find('{') {
-            if let Some(end) = response.rfind('}') {
-                let json_str = &response[start..=end];
+        // Step 4: Try to find JSON object between curly braces
+        if let Some(start) = text.find('{') {
+            if let Some(end) = text.rfind('}') {
+                let json_str = &text[start..=end];
                 if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
                     return Ok(parsed);
                 }
             }
         }
 
-        anyhow::bail!("could not parse LLM response as JSON")
+        anyhow::bail!("could not parse LLM response as JSON: {}", &text[..text.len().min(200)])
     }
 
     /// Fallback routing when LLM fails.
@@ -1627,6 +1691,60 @@ Hope that helps!"#;
         let parsed = router.parse_llm_response(response).unwrap();
         assert_eq!(parsed.executor, "codex");
         assert_eq!(parsed.complexity, "medium");
+    }
+
+    #[test]
+    fn parse_llm_response_claude_envelope() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+
+        // Claude --output-format json wraps the response in an envelope
+        let response = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1500,"result":"{\"executor\":\"claude\",\"complexity\":\"complex\",\"reason\":\"requires deep analysis\",\"profile\":{\"role\":\"architect\",\"skills\":[],\"tools\":[],\"constraints\":[]},\"selected_skills\":[]}","usage":{"input_tokens":100,"output_tokens":50}}"#;
+
+        let parsed = router.parse_llm_response(response).unwrap();
+        assert_eq!(parsed.executor, "claude");
+        assert_eq!(parsed.complexity, "complex");
+        assert_eq!(parsed.reason, "requires deep analysis");
+    }
+
+    #[test]
+    fn parse_llm_response_claude_envelope_with_code_block() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+
+        // Claude may return the JSON inside a code block within the envelope
+        let inner = "```json\n{\"executor\":\"codex\",\"complexity\":\"simple\",\"reason\":\"simple fix\",\"profile\":{\"role\":\"developer\",\"skills\":[],\"tools\":[],\"constraints\":[]},\"selected_skills\":[]}\n```";
+        let envelope = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": inner,
+            "usage": {"input_tokens": 50, "output_tokens": 30}
+        });
+
+        let parsed = router.parse_llm_response(&envelope.to_string()).unwrap();
+        assert_eq!(parsed.executor, "codex");
+        assert_eq!(parsed.complexity, "simple");
+    }
+
+    #[test]
+    fn parse_llm_response_claude_envelope_error() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+
+        let response = r#"{"type":"result","subtype":"error","is_error":true,"result":"rate limit exceeded","usage":{}}"#;
+
+        let err = router.parse_llm_response(response).unwrap_err();
+        assert!(err.to_string().contains("error"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_llm_response_empty() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+
+        let err = router.parse_llm_response("").unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
     }
 
     #[tokio::test]

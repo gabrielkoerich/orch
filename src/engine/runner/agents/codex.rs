@@ -98,31 +98,31 @@ impl CodexRunner {
 
     /// Check for error events in the NDJSON stream.
     ///
-    /// Looks for `turn.failed` and `error` type events.
+    /// Scans ALL error events and returns the most specific one.
+    /// Priority: RateLimit > ModelUnavailable > Auth > ContextOverflow > AgentFailed
     fn detect_error(&self, events: &[serde_json::Value]) -> Option<AgentError> {
+        let mut best: Option<AgentError> = None;
+
         for event in events {
             let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-            match event_type {
+            let classified = match event_type {
                 "turn.failed" => {
                     let message = event
                         .get("error")
                         .and_then(|e| e.get("message"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("turn failed");
-
-                    return Some(self.classify_message(message));
+                    Some(self.classify_message(message))
                 }
                 "error" => {
                     let message = event
                         .get("message")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown error");
-
-                    return Some(self.classify_message(message));
+                    Some(self.classify_message(message))
                 }
                 "item.completed" => {
-                    // Check for error items
                     if let Some(item) = event.get("item") {
                         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         if item_type == "error" {
@@ -130,16 +130,29 @@ impl CodexRunner {
                                 .get("message")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("item error");
-
-                            return Some(self.classify_message(message));
+                            Some(self.classify_message(message))
+                        } else {
+                            None
                         }
+                    } else {
+                        None
                     }
                 }
-                _ => {}
+                _ => None,
+            };
+
+            if let Some(err) = classified {
+                best = Some(match (&best, &err) {
+                    // Prefer specific errors over generic AgentFailed
+                    (Some(AgentError::AgentFailed { .. }), _) => err,
+                    (None, _) => err,
+                    // Keep existing specific error
+                    _ => best.unwrap(),
+                });
             }
         }
 
-        None
+        best
     }
 
     /// Classify an error message into an AgentError variant.
@@ -190,6 +203,19 @@ impl CodexRunner {
             return AgentError::ContextOverflow {
                 message: message.to_string(),
                 max_tokens: None,
+            };
+        }
+
+        // Connection/network errors — treat as transient, worth retrying
+        if lower.contains("reconnecting")
+            || lower.contains("stream disconnected")
+            || lower.contains("connection closed")
+            || lower.contains("websocket")
+            || lower.contains("econnreset")
+            || lower.contains("econnrefused")
+        {
+            return AgentError::AgentFailed {
+                message: format!("codex failed: {message}"),
             };
         }
 
@@ -454,5 +480,65 @@ mod tests {
         let raw = include_str!("../../../../tests/fixtures/codex_rate_limit.jsonl");
         let err = runner().parse_response(raw).unwrap_err();
         assert!(matches!(err, AgentError::RateLimit { .. }), "got: {err:?}");
+    }
+
+    // ── Connection / transient error tests ────────────────────────
+
+    #[test]
+    fn classify_codex_stream_disconnected() {
+        let err = runner().classify_message("Reconnecting 3/5... stream disconnected");
+        assert!(matches!(err, AgentError::AgentFailed { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn classify_codex_websocket_error() {
+        let err = runner().classify_message("WebSocket connection closed unexpectedly");
+        assert!(matches!(err, AgentError::AgentFailed { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn classify_codex_econnreset() {
+        let err = runner().classify_message("ECONNRESET: connection reset by peer");
+        assert!(matches!(err, AgentError::AgentFailed { .. }), "got: {err:?}");
+    }
+
+    // ── Production error patterns ─────────────────────────────────
+
+    #[test]
+    fn parse_codex_chatgpt_model_unsupported() {
+        // Real error: "The 'gpt-4.1' model is not supported when using Codex with a ChatGPT account."
+        let raw = r#"{"type":"error","message":"The 'gpt-4.1' model is not supported when using Codex with a ChatGPT account."}
+{"type":"turn.failed","error":{"message":"Model not supported"}}"#;
+
+        let err = runner().parse_response(raw).unwrap_err();
+        assert!(matches!(err, AgentError::ModelUnavailable { .. }), "got: {err:?}");
+        if let AgentError::ModelUnavailable { model, .. } = &err {
+            assert_eq!(model, "gpt-4.1");
+        }
+    }
+
+    #[test]
+    fn parse_codex_usage_limit_after_reconnect() {
+        // Real failure: stream disconnects, then usage limit hit.
+        // detect_error scans ALL events and prefers RateLimit over AgentFailed.
+        let raw = r#"{"type":"error","message":"Reconnecting 2/5"}
+{"type":"error","message":"Falling back from WebSockets to HTTPS transport"}
+{"type":"error","message":"You've hit your usage limit. Upgrade to Pro at https://..."}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit"}}"#;
+
+        let err = runner().parse_response(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "expected RateLimit (most specific), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_error_chatgpt_model_unsupported() {
+        let stdout = r#"{"type":"error","message":"The 'gpt-4.1' model is not supported when using Codex with a ChatGPT account."}
+{"type":"turn.failed","error":{"message":"Model not supported"}}"#;
+
+        let err = runner().classify_error(1, stdout, "");
+        assert!(matches!(err, AgentError::ModelUnavailable { .. }), "got: {err:?}");
     }
 }

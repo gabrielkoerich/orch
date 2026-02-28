@@ -99,7 +99,18 @@ impl TaskRunner {
             .unwrap_or(5);
 
         if attempts >= max_attempts {
-            tracing::warn!(task_id, attempts, max_attempts, "exceeded max attempts");
+            tracing::warn!(task_id, attempts, max_attempts, "exceeded max attempts, blocking task");
+            // Set sidecar status to blocked — run_with_context() will propagate
+            // to GitHub. Owner can /retry to reset attempts and re-dispatch.
+            sidecar::set(
+                task_id,
+                &[
+                    "status=blocked".to_string(),
+                    format!(
+                        "last_error=exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset."
+                    ),
+                ],
+            )?;
             return Ok(());
         }
 
@@ -282,6 +293,21 @@ impl TaskRunner {
         let raw_stderr = std::fs::read_to_string(&stderr_path_attempt)
             .or_else(|_| std::fs::read_to_string(&stderr_path_legacy))
             .unwrap_or_default();
+
+        // Log raw output for debugging agent failures
+        let stdout_len = raw_stdout.len();
+        let stderr_len = raw_stderr.len();
+        let stdout_tail: String = raw_stdout.chars().rev().take(500).collect::<String>().chars().rev().collect();
+        let stderr_tail: String = raw_stderr.chars().rev().take(500).collect::<String>().chars().rev().collect();
+        tracing::info!(
+            task_id,
+            exit_code,
+            stdout_len,
+            stderr_len,
+            stdout_tail = %stdout_tail,
+            stderr_tail = %stderr_tail,
+            "agent raw output"
+        );
 
         // Use agent-specific parsing when exit code is 0, fall back to classify_error
         let parse_result = if exit_code == 0 && !raw_stdout.is_empty() {
@@ -824,6 +850,25 @@ impl TaskRunner {
                 ),
             ],
         )?;
+
+        // If task was rerouted (status=new after run), update GitHub agent label
+        // so the router doesn't re-route back to the same failed agent.
+        if status == "new" {
+            let new_agent = sidecar::get(task_id, "agent").unwrap_or_default();
+            if !new_agent.is_empty() && new_agent != agent_name {
+                // Remove old agent label, add new one
+                let old_label = format!("agent:{agent_name}");
+                backend.remove_label(&task.id, &old_label).await.ok();
+                let new_label = format!("agent:{new_agent}");
+                backend.set_labels(&task.id, &[new_label]).await.ok();
+                tracing::info!(
+                    task_id,
+                    from = %agent_name,
+                    to = %new_agent,
+                    "updated GitHub agent label after failover"
+                );
+            }
+        }
 
         // Update GitHub status
         let new_status = match status.as_str() {

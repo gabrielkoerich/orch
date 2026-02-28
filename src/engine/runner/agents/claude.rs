@@ -493,4 +493,66 @@ mod tests {
         let err = runner().parse_response(raw).unwrap_err();
         assert!(matches!(err, AgentError::RateLimit { .. }), "got: {err:?}");
     }
+
+    // ── Kimi / MiniMax (Claude-compatible wrappers) ───────────────
+
+    #[test]
+    fn kimi_parses_claude_envelope() {
+        let r = ClaudeRunner::new("kimi");
+        let raw = r#"{
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "duration_ms": 3000,
+            "result": "{\"status\":\"done\",\"summary\":\"kimi did it\",\"accomplished\":[\"task\"],\"remaining\":[],\"files\":[\"a.rs\"]}",
+            "usage": {"input_tokens": 200, "output_tokens": 100}
+        }"#;
+
+        let parsed = r.parse_response(raw).unwrap();
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(parsed.response.summary, "kimi did it");
+    }
+
+    #[test]
+    fn minimax_parses_claude_envelope() {
+        let r = ClaudeRunner::new("minimax");
+        assert_eq!(r.name(), "minimax");
+        let raw = r#"{
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "{\"status\":\"done\",\"summary\":\"minimax did it\",\"accomplished\":[],\"remaining\":[],\"files\":[]}",
+            "usage": {}
+        }"#;
+
+        let parsed = r.parse_response(raw).unwrap();
+        assert_eq!(parsed.response.status, "done");
+    }
+
+    #[test]
+    fn kimi_build_command_uses_kimi_binary() {
+        let r = ClaudeRunner::new("kimi");
+        let perms = PermissionRules {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec![],
+            blocked_paths: vec![],
+        };
+        let cmd = r.build_command(Some("sonnet"), "timeout 1800", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+        assert!(cmd.contains("kimi -p"), "expected kimi binary, got: {cmd}");
+        assert!(cmd.contains("--model sonnet"));
+    }
+
+    #[test]
+    fn classify_error_overloaded_529() {
+        // Claude 529 overloaded error
+        let err = runner().classify_error(1, "", "overloaded_error: 529");
+        assert!(matches!(err, AgentError::RateLimit { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn classify_error_context_length() {
+        let err = runner().classify_error(1, "", "context_length_exceeded: max 200000 tokens");
+        assert!(matches!(err, AgentError::ContextOverflow { .. }), "got: {err:?}");
+    }
 }
