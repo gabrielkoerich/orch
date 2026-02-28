@@ -104,6 +104,7 @@ export GIT_AUTHOR_EMAIL="{git_email}"
 export GIT_COMMITTER_EMAIL="{git_email}"
 export TASK_ID="{task_id}"
 export OUTPUT_FILE="{output_file}"
+unset CLAUDECODE  # allow nested claude invocations from orchestrator
 
 cd "{work_dir}"
 

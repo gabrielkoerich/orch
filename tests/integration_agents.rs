@@ -28,6 +28,14 @@ fn is_available(binary: &str) -> bool {
     which::which(binary).is_ok()
 }
 
+/// Build a Command with CLAUDECODE unset so claude-based agents don't
+/// refuse to run when tests are launched from inside a Claude Code session.
+fn agent_cmd(binary: &str) -> Command {
+    let mut cmd = Command::new(binary);
+    cmd.env_remove("CLAUDECODE");
+    cmd
+}
+
 /// Assert a Claude JSON envelope is valid and extract the inner result.
 fn assert_claude_envelope(stdout: &str) -> String {
     let val: serde_json::Value = serde_json::from_str(stdout.trim())
@@ -83,7 +91,7 @@ fn claude_responds_with_json_envelope() {
         return;
     }
 
-    let output = Command::new("claude")
+    let output = agent_cmd("claude")
         .args([
             "--output-format",
             "json",
@@ -132,7 +140,7 @@ fn claude_stdin_pipe_mode() {
     }
 
     // Test -p with stdin redirect — matches real task agent invocation
-    let output = Command::new("claude")
+    let output = agent_cmd("claude")
         .args(["-p", "--model", "haiku", "--output-format", "json"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -180,7 +188,7 @@ fn codex_responds_with_ndjson() {
         return;
     }
 
-    let output = Command::new("codex")
+    let output = agent_cmd("codex")
         .args([
             "--ask-for-approval",
             "never",
@@ -249,7 +257,7 @@ fn codex_stdin_pipe_mode() {
     }
 
     // Test piped stdin — matches real task invocation: cat msg | codex ... exec --json -
-    let output = Command::new("codex")
+    let output = agent_cmd("codex")
         .args([
             "--ask-for-approval",
             "never",
@@ -303,7 +311,7 @@ fn opencode_responds_with_ndjson() {
         return;
     }
 
-    let output = Command::new("opencode")
+    let output = agent_cmd("opencode")
         .args(["run", "--format", "json", SIMPLE_PROMPT])
         .output()
         .expect("failed to execute opencode");
@@ -338,7 +346,7 @@ fn kimi_responds_like_claude() {
         return;
     }
 
-    let output = Command::new("kimi")
+    let output = agent_cmd("kimi")
         .args([
             "-p",
             "--output-format",
@@ -382,7 +390,7 @@ fn minimax_responds_like_claude() {
         return;
     }
 
-    let output = Command::new("minimax")
+    let output = agent_cmd("minimax")
         .args([
             "-p",
             "--output-format",
@@ -433,7 +441,7 @@ Task: "Fix typo in README.md"
 Required JSON format:
 {"executor":"claude","complexity":"simple","reason":"trivial text fix","profile":{"role":"editor","skills":[],"tools":[],"constraints":[]},"selected_skills":[]}"#;
 
-    let output = Command::new("claude")
+    let output = agent_cmd("claude")
         .args([
             "--output-format",
             "json",

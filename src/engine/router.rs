@@ -1126,6 +1126,7 @@ impl Router {
         let output = match self.config.router_agent.as_str() {
             "claude" => {
                 let mut cmd = tokio::process::Command::new("claude");
+                cmd.env_remove("CLAUDECODE"); // allow nested invocation
                 cmd.arg("--output-format").arg("json").arg("--print");
 
                 if !self.config.router_model.is_empty() {
