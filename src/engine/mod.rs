@@ -782,12 +782,19 @@ async fn tick(
                     age_mins = age.num_minutes(),
                     "recovering stuck task → new"
                 );
+                // Remove stale agent label so the LLM router re-routes properly
+                for label in &task.labels {
+                    if label.starts_with("agent:") {
+                        backend.remove_label(&task.id, label).await.ok();
+                    }
+                }
+                sidecar::set(&task.id.0, &["agent=".to_string(), "model=".to_string()])?;
                 backend.update_status(&task.id, Status::New).await?;
                 backend
                     .post_comment(
                         &task.id,
                         &format!(
-                            "[{}] recovered: stuck in_progress for {}m with no active session",
+                            "[{}] recovered: stuck in_progress for {}m with no active session (cleared agent for re-routing)",
                             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
                             age.num_minutes()
                         ),
