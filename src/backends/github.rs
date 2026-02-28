@@ -171,6 +171,31 @@ impl ExternalBackend for GitHubBackend {
             .collect())
     }
 
+    /// List open issues that have no `status:*` label (unprocessed) or have `status:new`.
+    async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+        let issues = self.gh.list_all_open_issues(&self.repo).await?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| {
+                let labels: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
+                // Include if: has status:new, OR has no status:* label at all
+                let has_status = labels.iter().any(|l| l.starts_with("status:"));
+                !has_status || labels.contains(&"status:new")
+            })
+            .map(|issue| ExternalTask {
+                id: ExternalId(issue.number.to_string()),
+                title: issue.title,
+                body: issue.body.unwrap_or_default(),
+                state: issue.state,
+                labels: issue.labels.into_iter().map(|l| l.name).collect(),
+                author: issue.user.login,
+                created_at: issue.created_at,
+                updated_at: issue.updated_at,
+                url: issue.html_url,
+            })
+            .collect())
+    }
+
     async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()> {
         self.gh.add_comment(&self.repo, &id.0, body).await
     }

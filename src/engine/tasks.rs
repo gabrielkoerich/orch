@@ -148,6 +148,11 @@ impl TaskManager {
         self.backend.list_by_status(status).await
     }
 
+    /// Get open tasks that are routable (no status:* label or status:new).
+    pub async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+        self.backend.list_routable().await
+    }
+
     /// Get internal tasks by status (for engine use)
     #[allow(dead_code)]
     pub async fn list_internal_by_status(

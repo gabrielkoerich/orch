@@ -812,9 +812,9 @@ async fn tick(
     }
     drop(_phase2);
 
-    // Phase 3a: Route new tasks
+    // Phase 3a: Route new tasks (includes issues with status:new or no status:* label)
     let _phase3a = tracing::info_span!("engine.tick.phase3a.route").entered();
-    let new_tasks = task_manager.list_external_by_status(Status::New).await?;
+    let new_tasks = task_manager.list_routable().await?;
     let routable: Vec<&ExternalTask> = new_tasks
         .iter()
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))

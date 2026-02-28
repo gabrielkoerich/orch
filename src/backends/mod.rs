@@ -166,6 +166,13 @@ pub trait ExternalBackend: Send + Sync {
     /// List tasks by status.
     async fn list_by_status(&self, status: Status) -> anyhow::Result<Vec<ExternalTask>>;
 
+    /// List open tasks that are routable — no `status:*` label yet, or `status:new`.
+    ///
+    /// Default implementation falls back to `list_by_status(New)`.
+    async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+        self.list_by_status(Status::New).await
+    }
+
     /// Post a comment / activity note.
     async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()>;
 

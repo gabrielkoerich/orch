@@ -244,6 +244,36 @@ impl GhCli {
         parse_ndjson(&output.stdout)
     }
 
+    /// List all open issues (no label filter).
+    pub async fn list_all_open_issues(&self, repo: &str) -> anyhow::Result<Vec<GitHubIssue>> {
+        Self::check_backoff()?;
+        let endpoint = format!("repos/{repo}/issues");
+        let output = self
+            .cmd()
+            .arg("api")
+            .arg("--paginate")
+            .arg("--jq")
+            .arg(".[]")
+            .args([
+                &endpoint,
+                "-X",
+                "GET",
+                "-f",
+                "state=open",
+                "-f",
+                "per_page=100",
+            ])
+            .output_with_context()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
+            anyhow::bail!("gh api failed: {stderr}");
+        }
+        Self::record_api_success();
+        parse_ndjson(&output.stdout)
+    }
+
     /// Add labels to an issue (appends to existing labels).
     ///
     /// Uses `--input -` with a JSON payload — the `-f labels[]=` form doesn't
