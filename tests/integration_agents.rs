@@ -320,6 +320,74 @@ fn opencode_responds_with_ndjson() {
     assert_ndjson(&stdout);
 }
 
+/// OpenCode with `.opencode/config.json` permission config — the same
+/// prompt that fails with "user rejected permission" without the config
+/// should succeed when permissions are pre-allowed (as orch's runner does).
+#[test]
+#[ignore]
+fn opencode_with_permission_config_succeeds() {
+    if !is_available("opencode") {
+        eprintln!("SKIP: opencode not in PATH");
+        return;
+    }
+
+    // Create a temp workdir with .opencode/config.json (same as build_command generates)
+    let workdir = tempfile::tempdir().expect("failed to create tempdir");
+    let config_dir = workdir.path().join(".opencode");
+    std::fs::create_dir_all(&config_dir).expect("failed to create .opencode dir");
+    std::fs::write(
+        config_dir.join("config.json"),
+        r#"{"permission":{"read":"allow","edit":"allow","glob":"allow","grep":"allow","bash":"allow","task":"allow","skill":"allow","webfetch":"allow","websearch":"allow","list":"allow","todowrite":"allow","todoread":"allow","question":"allow","codesearch":"allow"}}"#,
+    )
+    .expect("failed to write config.json");
+
+    let output = agent_cmd("opencode")
+        .current_dir(workdir.path())
+        .args(["run", "--format", "json", SIMPLE_PROMPT])
+        .output()
+        .expect("failed to execute opencode");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    eprintln!("exit: {}", output.status.code().unwrap_or(-1));
+    eprintln!(
+        "stdout ({} bytes):\n{}",
+        stdout.len(),
+        &stdout[..stdout.len().min(1000)]
+    );
+    eprintln!(
+        "stderr ({} bytes): {}",
+        stderr.len(),
+        &stderr[..stderr.len().min(500)]
+    );
+
+    assert!(
+        output.status.success(),
+        "opencode with permission config failed: {stderr}"
+    );
+    assert!(
+        !stdout.is_empty(),
+        "opencode with permission config returned empty stdout"
+    );
+
+    let events = assert_ndjson(&stdout);
+
+    // Should NOT have permission denial errors
+    let has_permission_error = events.iter().any(|e| {
+        let msg = e
+            .get("error")
+            .and_then(|err| err.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        msg.contains("Permission")
+    });
+    assert!(
+        !has_permission_error,
+        "opencode still denied permissions despite config"
+    );
+}
+
 // ── Kimi ──────────────────────────────────────────────────────────
 
 #[test]

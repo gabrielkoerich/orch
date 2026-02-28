@@ -1,0 +1,59 @@
+name: Integration Tests
+
+on:
+  # Disabled until API keys are configured as secrets
+  # schedule:
+  #   - cron: '0 0 * * *'   # 00:00 UTC daily
+  #   - cron: '0 12 * * *'  # 12:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-tests
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install agent CLIs
+        run: |
+          # Claude Code
+          if ! command -v claude &>/dev/null; then
+            brew install --cask claude-code || echo "claude-code not available"
+          fi
+
+          # Codex
+          if ! command -v codex &>/dev/null; then
+            npm install -g @openai/codex || echo "codex not available"
+          fi
+
+          # OpenCode
+          if ! command -v opencode &>/dev/null; then
+            brew install opencode || echo "opencode not available"
+          fi
+
+      - name: Run integration tests
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: cargo test --test integration_agents -- --ignored --nocapture
