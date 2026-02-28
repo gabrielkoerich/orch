@@ -682,6 +682,7 @@ impl Router {
                 tracing::warn!(
                     task_id = %task.id.0,
                     error = %e,
+                    error_chain = ?e,
                     attempt = new_attempts,
                     max = self.config.max_route_attempts,
                     "LLM routing failed"
@@ -930,6 +931,13 @@ impl Router {
             response_preview = %if response.len() > 500 { &response[..500] } else { &response },
             "LLM router raw response"
         );
+
+        // Save raw response for debugging (next to the prompt file)
+        let response_path =
+            crate::home::state_dir().map(|d| d.join(format!("route-response-{}.txt", task.id.0)));
+        if let Ok(path) = response_path {
+            let _ = std::fs::write(&path, &response);
+        }
 
         // Parse the response
         let llm_response: LlmRouteResponse = self.parse_llm_response(&response)?;

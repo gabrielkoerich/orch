@@ -788,7 +788,14 @@ async fn tick(
                         backend.remove_label(&task.id, label).await.ok();
                     }
                 }
-                sidecar::set(&task.id.0, &["agent=".to_string(), "model=".to_string()])?;
+                sidecar::set(
+                    &task.id.0,
+                    &[
+                        "agent=".to_string(),
+                        "model=".to_string(),
+                        "route_attempts=0".to_string(),
+                    ],
+                )?;
                 backend.update_status(&task.id, Status::New).await?;
                 backend
                     .post_comment(

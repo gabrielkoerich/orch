@@ -285,7 +285,11 @@ async fn execute_command(
                 }
             }
             // Reset sidecar state so the task starts fresh
-            crate::sidecar::set(&task_id.0, &["attempts=0".to_string()]).ok();
+            crate::sidecar::set(
+                &task_id.0,
+                &["attempts=0".to_string(), "route_attempts=0".to_string()],
+            )
+            .ok();
             backend.update_status(task_id, Status::New).await?;
             Ok("`/retry` — reset attempts, cleared agent, reset to `status:new`".to_string())
         }
@@ -299,7 +303,11 @@ async fn execute_command(
                 }
             }
             // Reset sidecar state so the task starts fresh
-            crate::sidecar::set(&task_id.0, &["attempts=0".to_string()]).ok();
+            crate::sidecar::set(
+                &task_id.0,
+                &["attempts=0".to_string(), "route_attempts=0".to_string()],
+            )
+            .ok();
             // Optionally set new agent
             if let Some(agent_name) = agent {
                 let label = format!("agent:{agent_name}");
