@@ -519,13 +519,8 @@ impl TaskRunner {
                     )?;
                 }
 
-                // Check PR override: done → in_review
-                if resp.status == "done"
-                    && git_ops::check_pr_override(&wt.work_dir, &wt.branch).await
-                {
-                    tracing::info!(task_id, "overriding done → in_review (PR open)");
-                    sidecar::set(task_id, &["status=in_review".to_string()])?;
-                }
+                // Note: done → in_review transition is handled by the engine
+                // after triggering the review agent (engine/mod.rs)
             }
             Err(agent_err) => {
                 tracing::warn!(

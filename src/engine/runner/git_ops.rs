@@ -222,36 +222,6 @@ pub async fn create_pr_if_needed(
     }
 }
 
-/// Check if there's an open PR for the branch and override done→in_review.
-pub async fn check_pr_override(dir: &Path, branch: &str) -> bool {
-    if branch == "main" || branch == "master" {
-        return false;
-    }
-
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--json",
-            "number,state",
-            "-q",
-            ".[] | select(.state == \"OPEN\") | .number",
-        ])
-        .current_dir(dir)
-        .output_with_context()
-        .await;
-
-    match output {
-        Ok(o) if o.status.success() => {
-            let number = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            !number.is_empty()
-        }
-        _ => false,
-    }
-}
-
 /// Get the current branch name.
 async fn get_current_branch(dir: &Path) -> String {
     let output = Command::new("git")
