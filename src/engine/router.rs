@@ -18,6 +18,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -67,6 +68,9 @@ const RECOVERY_DELAY: Duration = Duration::from_secs(60);
 
 /// Per-tick weight recovery amount (additive, applied each routing call).
 const RECOVERY_RATE: f64 = 0.1;
+
+/// Global sequence counter to decorrelate hash inputs across rapid calls.
+static HASH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Rate limit state for a single agent.
 #[derive(Debug, Clone)]
@@ -174,7 +178,7 @@ impl AgentWeights {
     /// Uses a simple weighted random selection: each agent's probability is
     /// proportional to its weight. If all weights are zero (shouldn't happen
     /// due to MIN_WEIGHT), falls back to uniform selection.
-    pub fn weighted_select(&self, agents: &[String]) -> Option<String> {
+    pub fn weighted_select(&self, agents: &[String], task_id: &str) -> Option<String> {
         if agents.is_empty() {
             return None;
         }
@@ -192,13 +196,13 @@ impl AgentWeights {
         let total: f64 = weights.iter().sum();
         if total <= 0.0 {
             // Safety fallback: uniform random
-            let idx = simple_hash_index(agents.len());
+            let idx = simple_hash_index_for(agents.len(), task_id);
             return Some(agents[idx].clone());
         }
 
         // Deterministic-ish selection using a hash of the current time
         // to avoid requiring rand crate. Good enough for load distribution.
-        let pick = simple_hash_fraction() * total;
+        let pick = simple_hash_fraction_for(task_id) * total;
         let mut cumulative = 0.0;
         for (i, w) in weights.iter().enumerate() {
             cumulative += w;
@@ -231,9 +235,9 @@ impl AgentWeights {
     }
 }
 
-/// Simple deterministic-ish fraction [0.0, 1.0) based on Instant::now().
+/// Simple deterministic-ish fraction [0.0, 1.0) based on time + task data.
 /// Not cryptographic, but sufficient for load distribution.
-fn simple_hash_fraction() -> f64 {
+fn simple_hash_fraction_for(task_id: &str) -> f64 {
     // Use SystemTime since Instant::now().elapsed() measures time since
     // the instant was created and is nearly always ~0 here. SystemTime
     // gives a clock relative to the UNIX epoch which varies across calls.
@@ -242,15 +246,19 @@ fn simple_hash_fraction() -> f64 {
         .unwrap_or_default()
         .as_nanos() as u64;
 
+    let seq = HASH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let task_hash = hash_task_id(task_id);
+    let seed = nanos ^ seq ^ task_hash;
+
     // Mix bits using a simple hash
-    let hash = nanos
+    let hash = seed
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
     (hash % 10000) as f64 / 10000.0
 }
 
 /// Simple index selection using instant-based hash.
-fn simple_hash_index(len: usize) -> usize {
+fn simple_hash_index_for(len: usize, task_id: &str) -> usize {
     if len == 0 {
         return 0;
     }
@@ -261,10 +269,20 @@ fn simple_hash_index(len: usize) -> usize {
         .unwrap_or_default()
         .as_nanos() as u64;
 
-    let hash = nanos
+    let seq = HASH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let task_hash = hash_task_id(task_id);
+    let seed = nanos ^ seq ^ task_hash;
+
+    let hash = seed
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
     (hash as usize) % len
+}
+
+fn hash_task_id(task_id: &str) -> u64 {
+    task_id
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
 }
 
 /// Router configuration.
@@ -861,7 +879,7 @@ impl Router {
 
         let agent = self
             .weights
-            .weighted_select(agents)
+            .weighted_select(agents, &task.id.0)
             .unwrap_or_else(|| agents[0].clone());
 
         let weight = self.weights.get_weight(&agent);
@@ -2147,7 +2165,7 @@ Hope that helps!"#;
         let mut claude_count = 0;
         let mut codex_count = 0;
         for _ in 0..100 {
-            match weights.weighted_select(&agents) {
+            match weights.weighted_select(&agents, "task-1") {
                 Some(ref a) if a == "claude" => claude_count += 1,
                 Some(ref a) if a == "codex" => codex_count += 1,
                 _ => {}
@@ -2165,7 +2183,32 @@ Hope that helps!"#;
     #[test]
     fn agent_weights_weighted_select_empty_returns_none() {
         let weights = AgentWeights::default();
-        assert!(weights.weighted_select(&[]).is_none());
+        assert!(weights.weighted_select(&[], "task-1").is_none());
+    }
+
+    #[test]
+    fn agent_weights_batch_routing_produces_varied_selections() {
+        // Regression test: when routing a batch of tasks in the same tick,
+        // different task IDs should not all select the same agent.
+        let mut weights = AgentWeights::default();
+        let agents = vec!["claude".to_string(), "codex".to_string()];
+        weights.ensure_agents(&agents);
+
+        // Simulate batch routing: 20 different task IDs called in rapid succession
+        let task_ids: Vec<String> = (1..=20).map(|i| format!("task-{i}")).collect();
+        let selections: Vec<String> = task_ids
+            .iter()
+            .filter_map(|id| weights.weighted_select(&agents, id))
+            .collect();
+
+        // With 20 tasks and 2 agents of equal weight, we should see both agents selected.
+        // The probability of all 20 selecting the same agent by chance is (0.5)^19 < 1e-6.
+        let claude_count = selections.iter().filter(|a| a.as_str() == "claude").count();
+        let codex_count = selections.iter().filter(|a| a.as_str() == "codex").count();
+        assert!(
+            claude_count > 0 && codex_count > 0,
+            "batch routing should distribute across agents; got claude={claude_count} codex={codex_count}"
+        );
     }
 
     #[test]
@@ -2174,7 +2217,7 @@ Hope that helps!"#;
         let agents = vec!["claude".to_string()];
         weights.ensure_agents(&agents);
 
-        let selected = weights.weighted_select(&agents);
+        let selected = weights.weighted_select(&agents, "task-1");
         assert_eq!(selected, Some("claude".to_string()));
     }
 

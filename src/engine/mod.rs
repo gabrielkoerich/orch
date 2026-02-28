@@ -1493,6 +1493,9 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
         TaskStatus::InProgress,
         TaskStatus::Done,
         TaskStatus::Blocked,
+        TaskStatus::Routed,
+        TaskStatus::InReview,
+        TaskStatus::NeedsReview,
     ] {
         let tasks = db.list_internal_tasks_by_status(*status).await?;
         for t in tasks {
