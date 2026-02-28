@@ -349,7 +349,10 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
     // Reset to new
     backend.update_status(&ext_id, Status::New).await?;
 
-    println!("Task #{} reset to new (attempts reset, will be re-routed)", id);
+    println!(
+        "Task #{} reset to new (attempts reset, will be re-routed)",
+        id
+    );
     Ok(())
 }
 
