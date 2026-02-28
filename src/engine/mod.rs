@@ -952,9 +952,10 @@ async fn tick(
                         summary: summary.clone(),
                     });
 
-                    // Trigger review agent if task is done (enabled by default)
+                    // Trigger review agent if task is done/in_review (enabled by default)
+                    // Note: "in_review" means the runner already overrode "done" because a PR exists
                     tracing::debug!(task_id, %status, "checking review trigger");
-                    if status == "done" {
+                    if status == "done" || status == "in_review" {
                         let enable_review = config::get("workflow.enable_review_agent")
                             .map(|v| v != "false")
                             .unwrap_or(true);
