@@ -1268,7 +1268,10 @@ impl Router {
             }
         }
 
-        anyhow::bail!("could not parse LLM response as JSON: {}", &text[..text.len().min(200)])
+        anyhow::bail!(
+            "could not parse LLM response as JSON: {}",
+            &text[..text.len().min(200)]
+        )
     }
 
     /// Fallback routing when LLM fails.

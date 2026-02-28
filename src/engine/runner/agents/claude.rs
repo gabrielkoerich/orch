@@ -538,7 +538,13 @@ mod tests {
             disallowed_tools: vec![],
             blocked_paths: vec![],
         };
-        let cmd = r.build_command(Some("sonnet"), "timeout 1800", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
+        let cmd = r.build_command(
+            Some("sonnet"),
+            "timeout 1800",
+            "/tmp/sys.txt",
+            "/tmp/msg.txt",
+            &perms,
+        );
         assert!(cmd.contains("kimi -p"), "expected kimi binary, got: {cmd}");
         assert!(cmd.contains("--model sonnet"));
     }
@@ -553,6 +559,9 @@ mod tests {
     #[test]
     fn classify_error_context_length() {
         let err = runner().classify_error(1, "", "context_length_exceeded: max 200000 tokens");
-        assert!(matches!(err, AgentError::ContextOverflow { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, AgentError::ContextOverflow { .. }),
+            "got: {err:?}"
+        );
     }
 }

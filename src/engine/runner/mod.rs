@@ -99,7 +99,12 @@ impl TaskRunner {
             .unwrap_or(5);
 
         if attempts >= max_attempts {
-            tracing::warn!(task_id, attempts, max_attempts, "exceeded max attempts, blocking task");
+            tracing::warn!(
+                task_id,
+                attempts,
+                max_attempts,
+                "exceeded max attempts, blocking task"
+            );
             // Set sidecar status to blocked — run_with_context() will propagate
             // to GitHub. Owner can /retry to reset attempts and re-dispatch.
             sidecar::set(
@@ -297,8 +302,22 @@ impl TaskRunner {
         // Log raw output for debugging agent failures
         let stdout_len = raw_stdout.len();
         let stderr_len = raw_stderr.len();
-        let stdout_tail: String = raw_stdout.chars().rev().take(500).collect::<String>().chars().rev().collect();
-        let stderr_tail: String = raw_stderr.chars().rev().take(500).collect::<String>().chars().rev().collect();
+        let stdout_tail: String = raw_stdout
+            .chars()
+            .rev()
+            .take(500)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let stderr_tail: String = raw_stderr
+            .chars()
+            .rev()
+            .take(500)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         tracing::info!(
             task_id,
             exit_code,

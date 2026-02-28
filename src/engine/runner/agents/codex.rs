@@ -487,19 +487,28 @@ mod tests {
     #[test]
     fn classify_codex_stream_disconnected() {
         let err = runner().classify_message("Reconnecting 3/5... stream disconnected");
-        assert!(matches!(err, AgentError::AgentFailed { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, AgentError::AgentFailed { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]
     fn classify_codex_websocket_error() {
         let err = runner().classify_message("WebSocket connection closed unexpectedly");
-        assert!(matches!(err, AgentError::AgentFailed { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, AgentError::AgentFailed { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]
     fn classify_codex_econnreset() {
         let err = runner().classify_message("ECONNRESET: connection reset by peer");
-        assert!(matches!(err, AgentError::AgentFailed { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, AgentError::AgentFailed { .. }),
+            "got: {err:?}"
+        );
     }
 
     // ── Production error patterns ─────────────────────────────────
@@ -511,7 +520,10 @@ mod tests {
 {"type":"turn.failed","error":{"message":"Model not supported"}}"#;
 
         let err = runner().parse_response(raw).unwrap_err();
-        assert!(matches!(err, AgentError::ModelUnavailable { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, AgentError::ModelUnavailable { .. }),
+            "got: {err:?}"
+        );
         if let AgentError::ModelUnavailable { model, .. } = &err {
             assert_eq!(model, "gpt-4.1");
         }
@@ -539,6 +551,9 @@ mod tests {
 {"type":"turn.failed","error":{"message":"Model not supported"}}"#;
 
         let err = runner().classify_error(1, stdout, "");
-        assert!(matches!(err, AgentError::ModelUnavailable { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, AgentError::ModelUnavailable { .. }),
+            "got: {err:?}"
+        );
     }
 }

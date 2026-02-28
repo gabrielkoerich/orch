@@ -39,7 +39,10 @@ fn assert_claude_envelope(stdout: &str) -> String {
         "expected Claude envelope with type=result, got: {val}"
     );
 
-    let is_error = val.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_error = val
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     assert!(!is_error, "Claude envelope has is_error=true: {val}");
 
     val.get("result")
@@ -82,7 +85,11 @@ fn claude_responds_with_json_envelope() {
 
     let output = Command::new("claude")
         .args([
-            "--output-format", "json", "--print", "--model", "haiku",
+            "--output-format",
+            "json",
+            "--print",
+            "--model",
+            "haiku",
             SIMPLE_PROMPT,
         ])
         .output()
@@ -92,8 +99,16 @@ fn claude_responds_with_json_envelope() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     eprintln!("exit: {}", output.status.code().unwrap_or(-1));
-    eprintln!("stdout ({} bytes): {}", stdout.len(), &stdout[..stdout.len().min(500)]);
-    eprintln!("stderr ({} bytes): {}", stderr.len(), &stderr[..stderr.len().min(500)]);
+    eprintln!(
+        "stdout ({} bytes): {}",
+        stdout.len(),
+        &stdout[..stdout.len().min(500)]
+    );
+    eprintln!(
+        "stderr ({} bytes): {}",
+        stderr.len(),
+        &stderr[..stderr.len().min(500)]
+    );
 
     assert!(output.status.success(), "claude failed: {stderr}");
     assert!(!stdout.is_empty(), "claude returned empty stdout");
@@ -137,8 +152,16 @@ fn claude_stdin_pipe_mode() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     eprintln!("exit: {}", output.status.code().unwrap_or(-1));
-    eprintln!("stdout ({} bytes): {}", stdout.len(), &stdout[..stdout.len().min(500)]);
-    eprintln!("stderr ({} bytes): {}", stderr.len(), &stderr[..stderr.len().min(500)]);
+    eprintln!(
+        "stdout ({} bytes): {}",
+        stdout.len(),
+        &stdout[..stdout.len().min(500)]
+    );
+    eprintln!(
+        "stderr ({} bytes): {}",
+        stderr.len(),
+        &stderr[..stderr.len().min(500)]
+    );
 
     assert!(output.status.success(), "claude -p failed: {stderr}");
     assert!(!stdout.is_empty(), "claude -p returned empty stdout");
@@ -159,9 +182,13 @@ fn codex_responds_with_ndjson() {
 
     let output = Command::new("codex")
         .args([
-            "--ask-for-approval", "never",
-            "--sandbox", "workspace-write",
-            "exec", "--json", SIMPLE_PROMPT,
+            "--ask-for-approval",
+            "never",
+            "--sandbox",
+            "workspace-write",
+            "exec",
+            "--json",
+            SIMPLE_PROMPT,
         ])
         .output()
         .expect("failed to execute codex");
@@ -170,8 +197,16 @@ fn codex_responds_with_ndjson() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     eprintln!("exit: {}", output.status.code().unwrap_or(-1));
-    eprintln!("stdout ({} bytes):\n{}", stdout.len(), &stdout[..stdout.len().min(1000)]);
-    eprintln!("stderr ({} bytes): {}", stderr.len(), &stderr[..stderr.len().min(500)]);
+    eprintln!(
+        "stdout ({} bytes):\n{}",
+        stdout.len(),
+        &stdout[..stdout.len().min(1000)]
+    );
+    eprintln!(
+        "stderr ({} bytes): {}",
+        stderr.len(),
+        &stderr[..stderr.len().min(500)]
+    );
 
     assert!(output.status.success(), "codex failed: {stderr}");
     assert!(!stdout.is_empty(), "codex returned empty stdout");
@@ -179,10 +214,13 @@ fn codex_responds_with_ndjson() {
     let events = assert_ndjson(&stdout);
 
     // Check for error events
-    let errors: Vec<_> = events.iter().filter(|e| {
-        let t = e.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        t == "error" || t == "turn.failed"
-    }).collect();
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            let t = e.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            t == "error" || t == "turn.failed"
+        })
+        .collect();
 
     if !errors.is_empty() {
         for err in &errors {
@@ -213,9 +251,13 @@ fn codex_stdin_pipe_mode() {
     // Test piped stdin — matches real task invocation: cat msg | codex ... exec --json -
     let output = Command::new("codex")
         .args([
-            "--ask-for-approval", "never",
-            "--sandbox", "workspace-write",
-            "exec", "--json", "-",
+            "--ask-for-approval",
+            "never",
+            "--sandbox",
+            "workspace-write",
+            "exec",
+            "--json",
+            "-",
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -235,8 +277,16 @@ fn codex_stdin_pipe_mode() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     eprintln!("exit: {}", output.status.code().unwrap_or(-1));
-    eprintln!("stdout ({} bytes):\n{}", stdout.len(), &stdout[..stdout.len().min(1000)]);
-    eprintln!("stderr ({} bytes): {}", stderr.len(), &stderr[..stderr.len().min(500)]);
+    eprintln!(
+        "stdout ({} bytes):\n{}",
+        stdout.len(),
+        &stdout[..stdout.len().min(1000)]
+    );
+    eprintln!(
+        "stderr ({} bytes): {}",
+        stderr.len(),
+        &stderr[..stderr.len().min(500)]
+    );
 
     assert!(output.status.success(), "codex stdin failed: {stderr}");
     assert!(!stdout.is_empty(), "codex stdin returned empty stdout");
@@ -262,8 +312,16 @@ fn opencode_responds_with_ndjson() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     eprintln!("exit: {}", output.status.code().unwrap_or(-1));
-    eprintln!("stdout ({} bytes):\n{}", stdout.len(), &stdout[..stdout.len().min(1000)]);
-    eprintln!("stderr ({} bytes): {}", stderr.len(), &stderr[..stderr.len().min(500)]);
+    eprintln!(
+        "stdout ({} bytes):\n{}",
+        stdout.len(),
+        &stdout[..stdout.len().min(1000)]
+    );
+    eprintln!(
+        "stderr ({} bytes): {}",
+        stderr.len(),
+        &stderr[..stderr.len().min(500)]
+    );
 
     assert!(output.status.success(), "opencode failed: {stderr}");
     assert!(!stdout.is_empty(), "opencode returned empty stdout");
@@ -282,7 +340,11 @@ fn kimi_responds_like_claude() {
 
     let output = Command::new("kimi")
         .args([
-            "-p", "--output-format", "json", "--model", "haiku",
+            "-p",
+            "--output-format",
+            "json",
+            "--model",
+            "haiku",
             SIMPLE_PROMPT,
         ])
         .output()
@@ -292,8 +354,16 @@ fn kimi_responds_like_claude() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     eprintln!("exit: {}", output.status.code().unwrap_or(-1));
-    eprintln!("stdout ({} bytes): {}", stdout.len(), &stdout[..stdout.len().min(500)]);
-    eprintln!("stderr ({} bytes): {}", stderr.len(), &stderr[..stderr.len().min(500)]);
+    eprintln!(
+        "stdout ({} bytes): {}",
+        stdout.len(),
+        &stdout[..stdout.len().min(500)]
+    );
+    eprintln!(
+        "stderr ({} bytes): {}",
+        stderr.len(),
+        &stderr[..stderr.len().min(500)]
+    );
 
     assert!(output.status.success(), "kimi failed: {stderr}");
     assert!(!stdout.is_empty(), "kimi returned empty stdout");
@@ -314,7 +384,11 @@ fn minimax_responds_like_claude() {
 
     let output = Command::new("minimax")
         .args([
-            "-p", "--output-format", "json", "--model", "haiku",
+            "-p",
+            "--output-format",
+            "json",
+            "--model",
+            "haiku",
             SIMPLE_PROMPT,
         ])
         .output()
@@ -324,8 +398,16 @@ fn minimax_responds_like_claude() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     eprintln!("exit: {}", output.status.code().unwrap_or(-1));
-    eprintln!("stdout ({} bytes): {}", stdout.len(), &stdout[..stdout.len().min(500)]);
-    eprintln!("stderr ({} bytes): {}", stderr.len(), &stderr[..stderr.len().min(500)]);
+    eprintln!(
+        "stdout ({} bytes): {}",
+        stdout.len(),
+        &stdout[..stdout.len().min(500)]
+    );
+    eprintln!(
+        "stderr ({} bytes): {}",
+        stderr.len(),
+        &stderr[..stderr.len().min(500)]
+    );
 
     assert!(output.status.success(), "minimax failed: {stderr}");
     assert!(!stdout.is_empty(), "minimax returned empty stdout");
@@ -353,7 +435,11 @@ Required JSON format:
 
     let output = Command::new("claude")
         .args([
-            "--output-format", "json", "--print", "--model", "haiku",
+            "--output-format",
+            "json",
+            "--print",
+            "--model",
+            "haiku",
             router_prompt,
         ])
         .output()
@@ -363,8 +449,16 @@ Required JSON format:
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     eprintln!("exit: {}", output.status.code().unwrap_or(-1));
-    eprintln!("stdout ({} bytes): {}", stdout.len(), &stdout[..stdout.len().min(500)]);
-    eprintln!("stderr ({} bytes): {}", stderr.len(), &stderr[..stderr.len().min(500)]);
+    eprintln!(
+        "stdout ({} bytes): {}",
+        stdout.len(),
+        &stdout[..stdout.len().min(500)]
+    );
+    eprintln!(
+        "stderr ({} bytes): {}",
+        stderr.len(),
+        &stderr[..stderr.len().min(500)]
+    );
 
     assert!(output.status.success(), "router failed: {stderr}");
     assert!(!stdout.is_empty(), "router returned empty stdout");
@@ -398,7 +492,13 @@ Required JSON format:
 
     eprintln!(
         "route: executor={}, complexity={}",
-        route.get("executor").and_then(|v| v.as_str()).unwrap_or("?"),
-        route.get("complexity").and_then(|v| v.as_str()).unwrap_or("?"),
+        route
+            .get("executor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?"),
+        route
+            .get("complexity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?"),
     );
 }
