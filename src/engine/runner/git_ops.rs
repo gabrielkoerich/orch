@@ -87,7 +87,7 @@ pub async fn auto_commit(
 }
 
 /// Push the branch to origin.
-pub async fn push_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> {
+pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyhow::Result<bool> {
     let current = get_current_branch(dir).await;
     let branch_to_push = if !current.is_empty() {
         &current
@@ -101,8 +101,12 @@ pub async fn push_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> {
     }
 
     // Check if there are commits to push
-    let has_unpushed = has_unpushed_commits(dir, branch_to_push).await;
+    let has_unpushed = has_unpushed_commits(dir, branch_to_push, default_branch).await;
     if !has_unpushed {
+        tracing::debug!(
+            branch = branch_to_push,
+            "no unpushed commits detected, skipping push"
+        );
         return Ok(false);
     }
 
@@ -289,7 +293,7 @@ pub async fn count_changed_files(dir: &Path) -> anyhow::Result<usize> {
 }
 
 /// Check if there are unpushed commits.
-async fn has_unpushed_commits(dir: &Path, branch: &str) -> bool {
+async fn has_unpushed_commits(dir: &Path, branch: &str, default_branch: &str) -> bool {
     // Check if remote tracking branch exists
     let remote_exists = Command::new("git")
         .args(["rev-parse", &format!("origin/{branch}")])
@@ -302,10 +306,17 @@ async fn has_unpushed_commits(dir: &Path, branch: &str) -> bool {
     let compare_ref = if remote_exists {
         format!("origin/{branch}..HEAD")
     } else {
-        // Compare against default branch
-        let default = super::worktree::detect_default_branch(dir).await;
-        format!("{default}..HEAD")
+        // Compare against default branch (passed in, NOT detected from
+        // current HEAD — in a worktree HEAD is the feature branch itself)
+        format!("{default_branch}..HEAD")
     };
+
+    tracing::debug!(
+        branch,
+        compare_ref,
+        remote_exists,
+        "checking unpushed commits"
+    );
 
     let output = Command::new("git")
         .args(["log", &compare_ref, "--oneline"])
@@ -314,7 +325,17 @@ async fn has_unpushed_commits(dir: &Path, branch: &str) -> bool {
         .await;
 
     match output {
-        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
-        _ => false,
+        Ok(o) if o.status.success() => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let has = !out.trim().is_empty();
+            tracing::debug!(branch, has_unpushed = has, "unpushed commits check result");
+            has
+        }
+        _ => {
+            tracing::debug!(branch, "git log failed for compare ref, assuming unpushed");
+            // If we can't determine, assume there ARE commits to push
+            // (better to attempt push and let it fail than silently skip)
+            true
+        }
     }
 }

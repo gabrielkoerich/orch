@@ -412,7 +412,9 @@ impl TaskRunner {
                     }
 
                     // Push
-                    if let Err(e) = git_ops::push_branch(&wt.work_dir, &wt.branch).await {
+                    if let Err(e) =
+                        git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await
+                    {
                         tracing::error!(task_id, error = ?e, "push failed");
                         sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
                     }
