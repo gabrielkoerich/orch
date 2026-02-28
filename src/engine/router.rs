@@ -1230,7 +1230,10 @@ impl Router {
                 }
                 if let Some(r) = val.get("result").and_then(|v| v.as_str()) {
                     // result is a string — unwrap it
-                    tracing::debug!(result_len = r.len(), "unwrapped Claude JSON envelope (string)");
+                    tracing::debug!(
+                        result_len = r.len(),
+                        "unwrapped Claude JSON envelope (string)"
+                    );
                     r.to_string()
                 } else if let Some(obj) = val.get("result").filter(|v| v.is_object()) {
                     // result is a JSON object — serialize it back for parsing
@@ -1777,7 +1780,11 @@ Hope that helps!"#;
         let response = r#"{"type":"result","subtype":"success","is_error":false,"result":{"executor":"claude","complexity":"medium","reason":"multi-file feature","profile":{"role":"developer","skills":[],"tools":[],"constraints":[]},"selected_skills":[]},"usage":{"input_tokens":100,"output_tokens":50}}"#;
 
         let parsed = router.parse_llm_response(response);
-        assert!(parsed.is_ok(), "should handle result-as-object: {}", parsed.unwrap_err());
+        assert!(
+            parsed.is_ok(),
+            "should handle result-as-object: {}",
+            parsed.unwrap_err()
+        );
         assert_eq!(parsed.unwrap().executor, "claude");
     }
 
@@ -1790,7 +1797,11 @@ Hope that helps!"#;
         let response = r#"{"agent":"claude","complexity":"medium","reason":"multi-file feature","profile":{"role":"developer","skills":[],"tools":[],"constraints":[]},"selected_skills":[]}"#;
 
         let parsed = router.parse_llm_response(response);
-        assert!(parsed.is_ok(), "should accept 'agent' alias: {}", parsed.unwrap_err());
+        assert!(
+            parsed.is_ok(),
+            "should accept 'agent' alias: {}",
+            parsed.unwrap_err()
+        );
         assert_eq!(parsed.unwrap().executor, "claude");
     }
 
@@ -1803,7 +1814,11 @@ Hope that helps!"#;
         let response = r#"{"executor":"codex","complexity":"simple"}"#;
 
         let parsed = router.parse_llm_response(response);
-        assert!(parsed.is_ok(), "should accept minimal JSON: {}", parsed.unwrap_err());
+        assert!(
+            parsed.is_ok(),
+            "should accept minimal JSON: {}",
+            parsed.unwrap_err()
+        );
         assert_eq!(parsed.unwrap().executor, "codex");
     }
 
@@ -1864,7 +1879,11 @@ Hope that helps!"#;
         });
 
         let parsed = router.parse_llm_response(&envelope.to_string());
-        assert!(parsed.is_ok(), "should handle prose + code block in envelope: {}", parsed.unwrap_err());
+        assert!(
+            parsed.is_ok(),
+            "should handle prose + code block in envelope: {}",
+            parsed.unwrap_err()
+        );
         assert_eq!(parsed.unwrap().executor, "codex");
     }
 
