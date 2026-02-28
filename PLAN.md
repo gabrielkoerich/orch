@@ -138,6 +138,28 @@ sequenceDiagram
     Note over S,GH: Every 120s: mentions + review_prs + cleanup_worktrees
 ```
 
+### Task Lifecycle (Status Flow)
+
+```
+new → routed → in_progress → in_review → done
+                    ↑              │
+                    └──────────────┘
+                  (changes requested)
+```
+
+| Transition | Owner | Location | Trigger |
+|---|---|---|---|
+| new → routed | engine tick | `engine/mod.rs` | LLM router assigns agent + complexity |
+| routed → in_progress | engine dispatch | `engine/mod.rs` | Agent spawned in tmux |
+| in_progress → in_review | runner | `runner/mod.rs` | Agent completes + PR exists |
+| in_progress → done | runner | `runner/mod.rs` | Agent completes, no PR created |
+| in_review → done | sync tick | `engine/mod.rs` (review_open_prs / auto_merge) | PR approved + merged |
+| in_review → routed | sync tick | `engine/mod.rs` (review_open_prs) | Changes requested → re-dispatch (resets `review_started`) |
+
+**Review agent**: triggered by engine when runner completes with `in_review`. Guarded by `review_started=true` sidecar flag to prevent duplicates. Reset on re-dispatch.
+
+**Key invariant**: `done` means task is finished (PR merged or no code changes). `in_review` means PR exists and awaits review. The runner decides: if agent said "done" AND a PR exists → `in_review`; otherwise → agent's reported status.
+
 ### Subprocess Cost Per Tick (Measured)
 
 | Operation | Subprocesses | Tools |
