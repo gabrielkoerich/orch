@@ -2245,8 +2245,19 @@ async fn auto_merge_pr(
                     if let Ok(Some((run_id, _, _))) =
                         gh.get_latest_run_for_branch(repo, branch).await
                     {
-                        let _ = gh.rerun_failed_jobs(repo, run_id).await;
-                        tracing::info!(task_id = task.id.0, run_id, "re-triggered failed CI jobs");
+                        match gh.rerun_failed_jobs(repo, run_id).await {
+                            Ok(()) => tracing::info!(
+                                task_id = task.id.0,
+                                run_id,
+                                "re-triggered failed CI jobs"
+                            ),
+                            Err(e) => tracing::warn!(
+                                task_id = task.id.0,
+                                run_id,
+                                error = %e,
+                                "failed to re-trigger CI jobs"
+                            ),
+                        }
                     }
                 }
 
