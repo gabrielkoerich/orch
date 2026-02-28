@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"019ca160-5c08-7da2-bda0-a70e1db8b098"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `gpt-4.1` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"error","message":"{\"detail\":\"The 'gpt-4.1' model is not supported when using Codex with a ChatGPT account.\"}"}
+{"type":"turn.failed","error":{"message":"{\"detail\":\"The 'gpt-4.1' model is not supported when using Codex with a ChatGPT account.\"}"}}

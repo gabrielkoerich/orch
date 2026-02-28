@@ -162,6 +162,24 @@ impl std::fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
+/// Return the variant name of an `AgentError` as a static string,
+/// for structured logging and `result.json` output.
+pub fn error_class_name(err: &AgentError) -> &'static str {
+    match err {
+        AgentError::RateLimit { .. } => "RateLimit",
+        AgentError::Auth { .. } => "Auth",
+        AgentError::ModelUnavailable { .. } => "ModelUnavailable",
+        AgentError::ContextOverflow { .. } => "ContextOverflow",
+        AgentError::Timeout { .. } => "Timeout",
+        AgentError::MissingTool { .. } => "MissingTool",
+        AgentError::PermissionDenied { .. } => "PermissionDenied",
+        AgentError::WaitingForInput { .. } => "WaitingForInput",
+        AgentError::InvalidResponse { .. } => "InvalidResponse",
+        AgentError::AgentFailed { .. } => "AgentFailed",
+        AgentError::Unknown { .. } => "Unknown",
+    }
+}
+
 /// Find the largest byte index <= `max_bytes` that lies on a UTF-8 char
 /// boundary.  Used for safe string truncation in error messages.
 fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {

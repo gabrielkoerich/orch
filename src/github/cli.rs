@@ -3,10 +3,19 @@
 //! All GitHub API calls go through `gh api`. Auth is handled by `gh`.
 //! We build the command args in Rust and deserialize the JSON output via serde.
 
+use super::backoff::{self, GhBackoff};
 use super::types::{GitHubComment, GitHubIssue, GitHubReview, GitHubReviewComment};
 use crate::cmd::CommandErrorContext;
+use std::sync::Mutex;
 use tokio::process::Command;
 use urlencoding;
+
+/// Global backoff state shared across all `GhCli` instances.
+///
+/// `GhCli::new()` is called in many places (backend, engine, projects, commands),
+/// so the backoff must be process-global to protect the single GitHub token.
+static BACKOFF: std::sync::LazyLock<Mutex<GhBackoff>> =
+    std::sync::LazyLock::new(|| Mutex::new(GhBackoff::new()));
 
 /// Parse NDJSON (newline-delimited JSON) output from `gh api --jq '.[]'`.
 fn parse_ndjson<T: serde::de::DeserializeOwned>(stdout: &[u8]) -> anyhow::Result<Vec<T>> {
@@ -46,6 +55,41 @@ impl GhCli {
         Command::new(&self.gh_path)
     }
 
+    /// Check if the GitHub API is currently rate-limited.
+    ///
+    /// Returns the remaining backoff duration if active, None otherwise.
+    /// Used by the engine loop to skip ticks entirely during backoff.
+    pub fn is_rate_limited() -> Option<std::time::Duration> {
+        BACKOFF.lock().ok().and_then(|b| b.is_active())
+    }
+
+    /// Return an error if backoff is active. Called at the top of every API method.
+    fn check_backoff() -> anyhow::Result<()> {
+        if let Some(remaining) = Self::is_rate_limited() {
+            anyhow::bail!(
+                "GitHub API rate-limited, backoff active for {}s",
+                remaining.as_secs()
+            );
+        }
+        Ok(())
+    }
+
+    /// Check stderr for rate-limit signals and record if found.
+    fn maybe_record_rate_limit(stderr: &str) {
+        if backoff::is_rate_limit_error(stderr) {
+            if let Ok(mut b) = BACKOFF.lock() {
+                b.record_rate_limit();
+            }
+        }
+    }
+
+    /// Record a successful API call.
+    fn record_api_success() {
+        if let Ok(mut b) = BACKOFF.lock() {
+            b.record_success();
+        }
+    }
+
     pub async fn graphql(&self, query: &str) -> anyhow::Result<serde_json::Value> {
         self.graphql_with_headers(query, &[]).await
     }
@@ -56,6 +100,8 @@ impl GhCli {
         query: &str,
         headers: &[&str],
     ) -> anyhow::Result<serde_json::Value> {
+        Self::check_backoff()?;
+
         let mut cmd = self.cmd();
         cmd.arg("api").arg("graphql");
 
@@ -70,14 +116,18 @@ impl GhCli {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("gh api graphql failed: {stderr}");
         }
 
+        Self::record_api_success();
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
     /// Run `gh api` with args and return raw JSON bytes.
     async fn api(&self, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+        Self::check_backoff()?;
+
         let output = self
             .cmd()
             .arg("api")
@@ -87,8 +137,10 @@ impl GhCli {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
+        Self::record_api_success();
         Ok(output.stdout)
     }
 
@@ -117,6 +169,7 @@ impl GhCli {
         body: &str,
         labels: &[String],
     ) -> anyhow::Result<GitHubIssue> {
+        Self::check_backoff()?;
         let endpoint = format!("repos/{repo}/issues");
         let payload = serde_json::json!({
             "title": title,
@@ -141,8 +194,10 @@ impl GhCli {
         let output = child.wait_with_output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
+        Self::record_api_success();
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
@@ -158,6 +213,7 @@ impl GhCli {
     /// Uses `--paginate` with `--jq '.[]'` to fetch all pages and flatten
     /// the JSON arrays into a stream of objects that serde can parse.
     pub async fn list_issues(&self, repo: &str, label: &str) -> anyhow::Result<Vec<GitHubIssue>> {
+        Self::check_backoff()?;
         let endpoint = format!("repos/{repo}/issues");
         let labels_field = format!("labels={label}");
         let output = self
@@ -181,8 +237,10 @@ impl GhCli {
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
+        Self::record_api_success();
         parse_ndjson(&output.stdout)
     }
 
@@ -200,6 +258,7 @@ impl GhCli {
         number: &str,
         labels: &[String],
     ) -> anyhow::Result<()> {
+        Self::check_backoff()?;
         let endpoint = format!("repos/{repo}/issues/{number}/labels");
         let payload = serde_json::json!({ "labels": labels });
         let mut child = self
@@ -218,8 +277,10 @@ impl GhCli {
         let output = child.wait_with_output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
+        Self::record_api_success();
         Ok(())
     }
 
@@ -281,8 +342,12 @@ impl GhCli {
                 tracing::debug!(repo, name, "ensure_label: label already exists (race)");
                 return Ok(());
             }
+            // Rate-limit errors should still be recorded for backoff.
+            Self::maybe_record_rate_limit(&stderr);
             // All other creation failures are tolerated (matches bash `|| true`).
             tracing::warn!(repo, name, stderr = %stderr, "ensure_label: create failed, continuing");
+        } else {
+            Self::record_api_success();
         }
         Ok(())
     }
@@ -308,6 +373,7 @@ impl GhCli {
     ///
     /// Uses `--input -` for safe multiline body handling.
     pub async fn add_comment(&self, repo: &str, number: &str, body: &str) -> anyhow::Result<()> {
+        Self::check_backoff()?;
         let endpoint = format!("repos/{repo}/issues/{number}/comments");
         let payload = serde_json::json!({ "body": body });
         let mut child = self
@@ -326,8 +392,10 @@ impl GhCli {
         let output = child.wait_with_output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
+        Self::record_api_success();
         Ok(())
     }
 
@@ -389,6 +457,7 @@ impl GhCli {
         repo: &str,
         since: &str,
     ) -> anyhow::Result<Vec<GitHubComment>> {
+        Self::check_backoff()?;
         let endpoint = format!("repos/{repo}/issues/comments");
         let since_field = format!("since={}", since);
         let output = self
@@ -410,8 +479,10 @@ impl GhCli {
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
+        Self::record_api_success();
         parse_ndjson(&output.stdout)
     }
 
@@ -503,6 +574,7 @@ impl GhCli {
 
     /// Close a GitHub issue.
     pub async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
+        Self::check_backoff()?;
         let endpoint = format!("repos/{repo}/issues/{number}");
         let payload = serde_json::json!({ "state": "closed" });
         let mut child = self
@@ -521,8 +593,10 @@ impl GhCli {
         let output = child.wait_with_output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
+        Self::record_api_success();
         Ok(())
     }
 
@@ -530,6 +604,7 @@ impl GhCli {
     ///
     /// Returns true if the user has collaborator access, false otherwise.
     pub async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
+        Self::check_backoff()?;
         let endpoint = format!("repos/{repo}/collaborators/{username}");
         let output = self
             .cmd()
@@ -539,12 +614,15 @@ impl GhCli {
             .await?;
         // 204 = is collaborator, 404 = not a collaborator
         if output.status.success() {
+            Self::record_api_success();
             Ok(true)
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("404") {
+                Self::record_api_success();
                 Ok(false)
             } else {
+                Self::maybe_record_rate_limit(&stderr);
                 anyhow::bail!("gh api failed: {stderr}");
             }
         }
@@ -582,6 +660,7 @@ impl GhCli {
         pr_number: u64,
         delete_branch: bool,
     ) -> anyhow::Result<()> {
+        Self::check_backoff()?;
         let mut args = vec![
             "pr".to_string(),
             "merge".to_string(),
@@ -600,9 +679,10 @@ impl GhCli {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("gh pr merge failed: {}", stderr);
         }
-
+        Self::record_api_success();
         Ok(())
     }
 
@@ -705,6 +785,7 @@ impl GhCli {
         repo: &str,
         git_ref: &str,
     ) -> anyhow::Result<(String, u64, u64, u64, u64)> {
+        Self::check_backoff()?;
         // Use the checks endpoint which combines both status checks and check runs
         let endpoint = format!("repos/{repo}/commits/{git_ref}/check-runs");
         let output = self
@@ -718,8 +799,10 @@ impl GhCli {
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("gh api failed: {stderr}");
         }
+        Self::record_api_success();
 
         let runs: Vec<serde_json::Value> = parse_ndjson(&output.stdout)?;
 
@@ -757,6 +840,7 @@ impl GhCli {
 
     /// Re-run failed jobs for a GitHub Actions workflow run.
     pub async fn rerun_failed_jobs(&self, repo: &str, run_id: u64) -> anyhow::Result<()> {
+        Self::check_backoff()?;
         let endpoint = format!("repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs");
         let output = self
             .cmd()
@@ -766,8 +850,10 @@ impl GhCli {
             .await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("rerun-failed-jobs failed: {stderr}");
         }
+        Self::record_api_success();
         Ok(())
     }
 
@@ -824,6 +910,7 @@ impl GhCli {
         workflow: &str,
         branch: &str,
     ) -> anyhow::Result<()> {
+        Self::check_backoff()?;
         let endpoint = format!("repos/{repo}/actions/workflows/{workflow}/dispatches");
         let payload = serde_json::json!({ "ref": branch });
         let mut child = self
@@ -842,8 +929,10 @@ impl GhCli {
         let output = child.wait_with_output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            Self::maybe_record_rate_limit(&stderr);
             anyhow::bail!("workflow dispatch failed: {stderr}");
         }
+        Self::record_api_success();
         Ok(())
     }
 

@@ -339,6 +339,53 @@ impl TaskRunner {
             Err(agents::patterns::classify_from_text(exit_code, &combined))
         };
 
+        // Write structured result.json for deterministic testing and debugging
+        {
+            let result_json = match &parse_result {
+                Ok(parsed) => {
+                    serde_json::json!({
+                        "outcome": "success",
+                        "agent": agent_name,
+                        "model": model_name.as_deref().unwrap_or("default"),
+                        "exit_code": exit_code,
+                        "attempt": new_attempts,
+                        "status": parsed.response.status,
+                        "summary": parsed.response.summary,
+                        "input_tokens": parsed.input_tokens,
+                        "output_tokens": parsed.output_tokens,
+                        "duration_ms": parsed.duration_ms,
+                        "files": parsed.response.files,
+                        "accomplished": parsed.response.accomplished,
+                        "remaining": parsed.response.remaining,
+                        "error": parsed.response.error,
+                        "learnings": parsed.response.learnings,
+                        "delegations": parsed.response.delegations.iter()
+                            .map(|d| serde_json::json!({"title": d.title, "body": d.body}))
+                            .collect::<Vec<_>>(),
+                    })
+                }
+                Err(agent_err) => {
+                    serde_json::json!({
+                        "outcome": "error",
+                        "agent": agent_name,
+                        "model": model_name.as_deref().unwrap_or("default"),
+                        "exit_code": exit_code,
+                        "attempt": new_attempts,
+                        "error_class": agents::error_class_name(agent_err),
+                        "error_message": agent_err.to_string(),
+                        "stderr_tail": &raw_stderr[raw_stderr.len().saturating_sub(2000)..],
+                        "stdout_tail": &raw_stdout[raw_stdout.len().saturating_sub(2000)..],
+                    })
+                }
+            };
+            if let Err(e) = std::fs::write(
+                attempt_dir.join("result.json"),
+                serde_json::to_string_pretty(&result_json).unwrap_or_default(),
+            ) {
+                tracing::debug!(task_id, ?e, "failed to write result.json");
+            }
+        }
+
         match parse_result {
             Ok(parsed) => {
                 let resp = parsed.response;

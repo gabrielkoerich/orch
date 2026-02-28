@@ -556,4 +556,32 @@ mod tests {
             "got: {err:?}"
         );
     }
+
+    // ── Real output.json fixture tests ───────────────────────────
+
+    /// Real failure: websocket disconnections followed by usage limit.
+    /// RateLimit must take priority over AgentFailed (reconnect errors).
+    #[test]
+    fn fixture_codex_usage_limit() {
+        let raw = include_str!("../../../../tests/fixtures/codex_usage_limit.jsonl");
+        let err = runner().parse_response(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "expected RateLimit (priority over reconnect errors), got: {err:?}"
+        );
+    }
+
+    /// Real failure: unsupported model with ChatGPT account.
+    #[test]
+    fn fixture_codex_model_unsupported() {
+        let raw = include_str!("../../../../tests/fixtures/codex_model_unsupported.jsonl");
+        let err = runner().parse_response(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::ModelUnavailable { .. }),
+            "expected ModelUnavailable, got: {err:?}"
+        );
+        if let AgentError::ModelUnavailable { model, .. } = &err {
+            assert_eq!(model, "gpt-4.1");
+        }
+    }
 }

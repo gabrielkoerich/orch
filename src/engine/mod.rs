@@ -523,44 +523,52 @@ pub async fn serve() -> anyhow::Result<()> {
                     rw.tick_weight_recovery();
                 }
 
-                // Core tick: poll tasks for all projects
-                let router_guard = router.read().await;
-                for engine in &project_engines {
-                    if let Err(e) = tick(
-                        &engine.backend,
-                        &tmux,
-                        &engine.repo,
-                        &engine.runner,
-                        &capture_for_tick,
-                        &semaphore,
-                        &config,
-                        &jobs_path,
-                        &db,
-                        &router_guard,
-                        &engine.task_manager,
-                        &weight_tx,
-                        &transport,
-                    ).await {
-                        tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
-                    }
-                }
-                drop(router_guard);
-
-                // Periodic sync (less frequent)
-                // Use fallback interval if in fallback mode
-                let current_sync_interval = if in_fallback_mode {
-                    config.fallback_sync_interval.unwrap_or(config.sync_interval)
+                // Skip tick/sync entirely if GitHub API is rate-limited
+                if let Some(remaining) = GhCli::is_rate_limited() {
+                    tracing::warn!(
+                        remaining_secs = remaining.as_secs(),
+                        "GitHub API rate-limited, skipping tick"
+                    );
                 } else {
-                    config.sync_interval
-                };
-
-                if last_sync.elapsed() >= current_sync_interval {
+                    // Core tick: poll tasks for all projects
+                    let router_guard = router.read().await;
                     for engine in &project_engines {
-                        if let Err(e) = sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config).await {
-                            tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
+                        if let Err(e) = tick(
+                            &engine.backend,
+                            &tmux,
+                            &engine.repo,
+                            &engine.runner,
+                            &capture_for_tick,
+                            &semaphore,
+                            &config,
+                            &jobs_path,
+                            &db,
+                            &router_guard,
+                            &engine.task_manager,
+                            &weight_tx,
+                            &transport,
+                        ).await {
+                            tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
                         }
                     }
-                    last_sync = std::time::Instant::now();
+                    drop(router_guard);
+
+                    // Periodic sync (less frequent)
+                    // Use fallback interval if in fallback mode
+                    let current_sync_interval = if in_fallback_mode {
+                        config.fallback_sync_interval.unwrap_or(config.sync_interval)
+                    } else {
+                        config.sync_interval
+                    };
+
+                    if last_sync.elapsed() >= current_sync_interval {
+                        for engine in &project_engines {
+                            if let Err(e) = sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config).await {
+                                tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
+                            }
+                        }
+                        last_sync = std::time::Instant::now();
+                    }
                 }
 
                 // Periodic webhook health check
@@ -588,29 +596,36 @@ pub async fn serve() -> anyhow::Result<()> {
             }
             // Webhook events trigger an immediate tick (bypass polling interval)
             _ = webhook_notify.notified() => {
-                tracing::info!("webhook event triggered immediate tick");
+                if let Some(remaining) = GhCli::is_rate_limited() {
+                    tracing::warn!(
+                        remaining_secs = remaining.as_secs(),
+                        "GitHub API rate-limited, skipping webhook-triggered tick"
+                    );
+                } else {
+                    tracing::info!("webhook event triggered immediate tick");
 
-                let router_guard = router.read().await;
-                for engine in &project_engines {
-                    if let Err(e) = tick(
-                        &engine.backend,
-                        &tmux,
-                        &engine.repo,
-                        &engine.runner,
-                        &capture_for_tick,
-                        &semaphore,
-                        &config,
-                        &jobs_path,
-                        &db,
-                        &router_guard,
-                        &engine.task_manager,
-                        &weight_tx,
-                        &transport,
-                    ).await {
-                        tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
+                    let router_guard = router.read().await;
+                    for engine in &project_engines {
+                        if let Err(e) = tick(
+                            &engine.backend,
+                            &tmux,
+                            &engine.repo,
+                            &engine.runner,
+                            &capture_for_tick,
+                            &semaphore,
+                            &config,
+                            &jobs_path,
+                            &db,
+                            &router_guard,
+                            &engine.task_manager,
+                            &weight_tx,
+                            &transport,
+                        ).await {
+                            tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
+                        }
                     }
+                    drop(router_guard);
                 }
-                drop(router_guard);
 
                 // Also reset the interval so we don't get a redundant tick right after
                 interval.reset();

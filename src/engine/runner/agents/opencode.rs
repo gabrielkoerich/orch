@@ -126,10 +126,28 @@ impl OpenCodeRunner {
             let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             if event_type == "error" {
+                // OpenCode error events have multiple shapes:
+                // 1. {"type":"error","message":"..."}
+                // 2. {"type":"error","error":"string message"}
+                // 3. {"type":"error","error":{"name":"...","data":{"message":"..."}}}
                 let message = event
                     .get("message")
                     .and_then(|v| v.as_str())
                     .or_else(|| event.get("error").and_then(|v| v.as_str()))
+                    .or_else(|| {
+                        event
+                            .get("error")
+                            .and_then(|e| e.get("data"))
+                            .and_then(|d| d.get("message"))
+                            .and_then(|m| m.as_str())
+                    })
+                    .or_else(|| {
+                        // Last resort: stringify the error object
+                        event
+                            .get("error")
+                            .and_then(|e| e.get("name"))
+                            .and_then(|n| n.as_str())
+                    })
                     .unwrap_or("unknown error");
 
                 return Some(classify_opencode_message(message));
@@ -311,9 +329,15 @@ fn classify_opencode_message(message: &str) -> AgentError {
     }
 
     if lower.contains("model") && (lower.contains("not found") || lower.contains("not supported")) {
+        // Try to extract model name from patterns like "Model not found: anthropic/claude-sonnet-4-6."
+        let model = message
+            .split(": ")
+            .nth(1)
+            .map(|s| s.trim_end_matches('.').to_string())
+            .unwrap_or_default();
         return AgentError::ModelUnavailable {
             message: message.to_string(),
-            model: String::new(),
+            model,
         };
     }
 
@@ -473,5 +497,21 @@ mod tests {
         assert_eq!(parsed.response.accomplished.len(), 2);
         assert_eq!(parsed.input_tokens, Some(17500));
         assert_eq!(parsed.output_tokens, Some(500));
+    }
+
+    /// Real failure: OpenCode returns nested error for unknown model.
+    /// The error object is `{"name":"UnknownError","data":{"message":"Model not found: X"}}`.
+    /// Parser must extract the nested message and classify as ModelUnavailable.
+    #[test]
+    fn fixture_opencode_model_not_found() {
+        let raw = include_str!("../../../../tests/fixtures/opencode_model_not_found.jsonl");
+        let err = runner().parse_response(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::ModelUnavailable { .. }),
+            "expected ModelUnavailable, got: {err:?}"
+        );
+        if let AgentError::ModelUnavailable { model, .. } = &err {
+            assert_eq!(model, "anthropic/claude-sonnet-4-6");
+        }
     }
 }
