@@ -962,7 +962,12 @@ async fn tick(
                         let already_reviewing = sidecar::get(&task_id, "review_started")
                             .map(|v| v == "true")
                             .unwrap_or(false);
-                        tracing::info!(task_id, enable_review, already_reviewing, "review gate check");
+                        tracing::info!(
+                            task_id,
+                            enable_review,
+                            already_reviewing,
+                            "review gate check"
+                        );
                         if enable_review && !already_reviewing {
                             let _ = sidecar::set(&task_id, &["review_started=true".to_string()]);
                             let backend_clone = backend.clone();
