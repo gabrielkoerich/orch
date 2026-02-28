@@ -607,6 +607,7 @@ pub fn parse_review_response(raw: &str) -> anyhow::Result<ReviewResponse> {
 /// with a "result" field. This extracts that text. If the input isn't
 /// an envelope, returns it as-is.
 pub fn unwrap_agent_result(raw: &str) -> String {
+    // Try single JSON object first (claude)
     if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(raw) {
         match envelope.get("result") {
             Some(serde_json::Value::String(s)) => return s.clone(),
@@ -614,6 +615,22 @@ pub fn unwrap_agent_result(raw: &str) -> String {
                 return serde_json::to_string(obj).unwrap_or_else(|_| raw.to_string());
             }
             _ => {}
+        }
+    }
+    // Try NDJSON: last line with a "result" field (codex, opencode)
+    for line in raw.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
+            match obj.get("result") {
+                Some(serde_json::Value::String(s)) => return s.clone(),
+                Some(serde_json::Value::Object(o)) => {
+                    return serde_json::to_string(o).unwrap_or_else(|_| line.to_string());
+                }
+                _ => {}
+            }
         }
     }
     raw.to_string()
