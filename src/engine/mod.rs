@@ -1833,11 +1833,7 @@ enum ReviewDecision {
         notes: String,
         issues: Vec<crate::engine::runner::response::ReviewIssue>,
     },
-    /// Review agent is disabled, skip.
-    #[allow(dead_code)]
-    Skip,
     /// Review agent failed or crashed (reason stored for logging).
-    #[allow(dead_code)]
     Failed(String),
 }
 

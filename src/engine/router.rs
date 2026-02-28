@@ -14,7 +14,6 @@
 
 use crate::backends::ExternalTask;
 use crate::cmd::CommandErrorContext;
-use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -767,11 +766,9 @@ impl Router {
     /// Route using round-robin algorithm (task-ID based, stateless).
     ///
     /// Kept for backward compatibility and unit tests. The project prefers
-    /// the stateful `route_round_robin_stateful` (which persists an index),
-    /// but this stateless modulo-based implementation is intentionally
-    /// retained to allow deterministic selection based on task ID and for
-    /// existing tests that exercise the legacy behavior.
-    #[allow(dead_code)]
+    /// Deterministic round-robin: selects agent by task ID modulo agent count.
+    ///
+    /// Used as fallback when LLM routing fails and `fallback_executor = "round_robin"`.
     fn route_round_robin(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         let agents = &self.available_agents;
         if agents.is_empty() {
@@ -1422,14 +1419,6 @@ impl Router {
     }
 
     /// Get a snapshot of current agent weights for logging.
-    ///
-    /// Public helper kept for debugging and observability (useful when
-    /// inspecting router state from integration tests or admin tooling).
-    #[allow(dead_code)]
-    pub fn weight_snapshot(&self) -> Vec<(String, f64, u32)> {
-        self.weights.snapshot()
-    }
-
     /// Store routing result in sidecar file.
     pub fn store_route_result(&self, task_id: &str, result: &RouteResult) -> anyhow::Result<()> {
         let fields = vec![
@@ -1442,34 +1431,6 @@ impl Router {
         ];
 
         crate::sidecar::set(task_id, &fields)
-    }
-
-    /// Route multiple tasks concurrently using FuturesUnordered.
-    /// Returns results in completion order (not input order).
-    ///
-    /// Retained as a convenience for batch-processing callers and tests.
-    #[allow(dead_code)]
-    pub async fn route_batch(
-        self: &Arc<Self>,
-        tasks: &[ExternalTask],
-    ) -> Vec<(String, anyhow::Result<RouteResult>)> {
-        let mut futures = FuturesUnordered::new();
-
-        for task in tasks {
-            let router = Arc::clone(self);
-            let task = task.clone();
-            futures.push(async move {
-                let task_id = task.id.0.clone();
-                let result = router.route(&task).await;
-                (task_id, result)
-            });
-        }
-
-        let mut results = Vec::with_capacity(tasks.len());
-        while let Some(result) = futures.next().await {
-            results.push(result);
-        }
-        results
     }
 }
 

@@ -67,12 +67,6 @@ pub fn skills_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Alias for state_dir (backward compat).
-#[allow(dead_code)]
-pub fn sidecar_dir() -> anyhow::Result<PathBuf> {
-    state_dir()
-}
-
 /// Get the per-repo state directory: `~/.orch/state/{owner}/{repo}/`.
 ///
 /// Falls back to the flat `~/.orch/state/` if no repo is configured.

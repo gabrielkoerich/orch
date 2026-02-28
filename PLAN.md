@@ -726,7 +726,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] `orch service start/stop/restart/status` — service management
 - [x] `orch completions <shell>` — shell completions
 - [x] `orch board list/link/sync/info` — GitHub Projects V2 board management
-- [ ] `orch project add/remove/list` — multi-project management
+- [x] `orch project add/remove/list` — multi-project management
 - [x] Rename binary from `orch-core` to `orch`
 - [x] Absorb justfile routing into native CLI (justfile deleted)
 
@@ -756,15 +756,15 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 
 **Goal:** Close remaining feature gaps with bash orchestrator.
 
-- [ ] `orch project add/remove/list` — multi-project management CLI
-- [ ] Wire Telegram/Discord channels into engine event loop
-- [ ] Mention detection via webhooks (#112)
-- [ ] Owner commands (feedback via issue comments: `/retry`, `/reroute`)
+- [x] `orch project add/remove/list` — multi-project management CLI (see `src/cli/mod.rs:475-710`)
+- [x] Wire Telegram/Discord channels into engine event loop (see `src/engine/mod.rs:251-296`)
+- [x] Mention detection via webhooks (#112) — polling + webhook via `start_webhook_server()`
+- [ ] Owner commands (feedback via issue comments: `/retry`, `/reroute`) — issue #179
 - [ ] Merge detection (auto-close after PR merge)
-- [ ] Dashboard/reporting CLI command
-- [ ] Graceful shutdown with session handoff
+- [x] Dashboard/reporting CLI command (see `src/cli/dashboard.rs`, `orch dashboard`)
+- [ ] Graceful shutdown with session handoff — SIGTERM handling exists, session handoff partial
 - [ ] Slack channel integration
-- [ ] Context file per issue (persistent context accumulation)
+- [x] Context file per issue (persistent context accumulation) — `load_task_context()` in `src/engine/runner/context.rs:40-45`
 
 ---
 
@@ -1275,9 +1275,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 | Issue | Title | Priority | Description |
 |-------|-------|----------|-------------|
-| #178 | Implement task delegation processing in engine | High | Parser supports `delegations` field but engine doesn't process them to create child tasks. See `src/parser.rs` (Delegation struct), `src/engine/mod.rs` (add process_delegations()). |
 | #179 | Implement owner slash commands for GitHub issue comments | Medium | Add `/retry`, `/reroute [agent]`, `/block [reason]`, `/unblock`, `/close`, `/review` commands for repo owners to control tasks from GitHub. |
-| #143 | PR Review Integration — Auto-create follow-up tasks | Medium | Process `changes_requested` reviews and auto-create sub-tasks with review context. Partially implemented in `src/engine/mod.rs:review_open_prs()`. |
 | #144 | Cost Tracking CLI and Budget Enforcement | Medium | Add `orch cost <task_id>` command, aggregate cost reporting, and visible budget warnings. See src/sidecar.rs (cost tracking), src/cli/mod.rs (add command). |
 | #145 | Webhook Server Production Hardening | Medium | Graceful shutdown coordination, webhook event persistence, retry logic with backoff. See src/channels/github.rs (webhook server), src/engine/mod.rs (lifecycle). |
 
@@ -1285,17 +1283,16 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 | Issue | Title | Description |
 |-------|-------|-------------|
+| #178 | Task delegation processing | `process_delegations()` integrated into engine dispatch loop in `src/engine/runner/mod.rs` — spawns child issues from agent `delegations` field |
+| #143 | PR Review Integration — Auto-create follow-up tasks | `review_and_merge()` in `src/engine/mod.rs:1768+` + `review_open_prs()` at 1469+ — handles full review cycle with follow-up task creation |
+| #186 | Owner slash commands `/reopen`, `/rebase` | Implemented in `src/engine/commands.rs` — issue comment handler supports `/reopen`, `/rebase`, `/retry`, `/reroute`, `/block`, `/unblock` |
+| #187 | Graceful shutdown on SIGTERM/SIGINT | Implemented in `src/engine/mod.rs:681-705` — signal handlers coordinate engine shutdown |
 | - | Review Agent + Auto-Merge | `review_and_merge()` in `src/engine/mod.rs:1768+` - spawns review agent after task completion, handles approve/request_changes |
 | - | PR Review Comments → Fix Dispatch | `review_open_prs()` in `src/engine/mod.rs:1469+` - monitors PR reviews and re-dispatches tasks with review context |
 | - | Dashboard CLI | `orch dashboard` command in `src/cli/dashboard.rs` - shows task counts, active sessions, recent activity |
 | - | Task Tree CLI | `orch task tree` command in `src/cli/tree.rs` - ASCII tree of parent-child task relationships |
 
 ### Implementation Notes
-
-**Issue #143 - PR Review Integration:**
-- Location: `src/engine/mod.rs` (add handler in `process_message()`)
-- Detect review state and create follow-up tasks as sub-issues
-- Update task status appropriately when reviews are submitted
 
 **Issue #144 - Cost Tracking:**
 - Location: `src/cli/mod.rs` (new subcommand), `src/db.rs` (cost metrics)

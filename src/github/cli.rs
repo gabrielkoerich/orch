@@ -430,7 +430,6 @@ impl GhCli {
     }
 
     /// List comments on an issue.
-    #[allow(dead_code)]
     pub async fn list_comments(
         &self,
         repo: &str,
@@ -574,21 +573,6 @@ impl GhCli {
         pr_number: u64,
     ) -> anyhow::Result<Vec<GitHubReview>> {
         let endpoint = format!("repos/{repo}/pulls/{pr_number}/reviews");
-        let json = self.api(&[&endpoint]).await?;
-        Ok(serde_json::from_slice(&json)?)
-    }
-
-    /// Get review comments for a PR review.
-    ///
-    /// Uses `gh api` to fetch all comments for a specific review.
-    #[allow(dead_code)]
-    pub async fn get_pr_review_comments(
-        &self,
-        repo: &str,
-        pr_number: u64,
-        review_id: u64,
-    ) -> anyhow::Result<Vec<GitHubReviewComment>> {
-        let endpoint = format!("repos/{repo}/pulls/{pr_number}/reviews/{review_id}/comments");
         let json = self.api(&[&endpoint]).await?;
         Ok(serde_json::from_slice(&json)?)
     }

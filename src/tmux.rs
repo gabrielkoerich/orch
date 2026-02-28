@@ -16,9 +16,7 @@ use tokio::process::Command;
 pub struct Session {
     pub name: String,
     pub task_id: String,
-    #[allow(dead_code)] // populated for future session monitoring
     pub created_at: chrono::DateTime<chrono::Utc>,
-    #[allow(dead_code)]
     pub pane_pid: Option<u32>,
 }
 
@@ -48,22 +46,10 @@ impl TmuxManager {
         format!("{}{project_name}-{task_id}", self.prefix)
     }
 
-    /// Check if tmux server is running.
-    #[allow(dead_code)]
-    pub async fn is_server_running(&self) -> bool {
-        Command::new("tmux")
-            .args(["list-sessions"])
-            .output_with_context()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
     /// Create a new tmux session for a task and run a command in it.
     ///
     /// The session is detached — the agent runs in the background.
     /// Returns the session name.
-    #[allow(dead_code)]
     pub async fn create_session(
         &self,
         repo: &str,
@@ -121,7 +107,6 @@ impl TmuxManager {
     }
 
     /// Capture the current pane content (last N lines).
-    #[allow(dead_code)]
     pub async fn capture_pane(&self, session: &str, lines: i32) -> anyhow::Result<String> {
         let start = format!("-{lines}");
         let output = Command::new("tmux")
@@ -134,65 +119,6 @@ impl TmuxManager {
             anyhow::bail!("capture-pane failed for {session}: {stderr}");
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
-
-    /// Send a command line to a session (literal text + Enter).
-    ///
-    /// Uses `-l` flag so tmux treats the text literally — no interpretation
-    /// of special key names like `C-c`, `C-d`, etc. This prevents injection
-    /// if untrusted input ever reaches this method.
-    #[allow(dead_code)]
-    pub async fn send_keys(&self, session: &str, keys: &str) -> anyhow::Result<()> {
-        // Send literal text first
-        let output = Command::new("tmux")
-            .args(["send-keys", "-t", session, "-l", keys])
-            .output_with_context()
-            .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("send-keys failed for {session}: {stderr}");
-        }
-        // Then send Enter separately (as a key name, not literal)
-        let output = Command::new("tmux")
-            .args(["send-keys", "-t", session, "Enter"])
-            .output_with_context()
-            .await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("send-keys Enter failed for {session}: {stderr}");
-        }
-        Ok(())
-    }
-
-    /// Send literal text (no Enter) — for piping input.
-    #[allow(dead_code)]
-    pub async fn send_text(&self, session: &str, text: &str) -> anyhow::Result<()> {
-        let output = Command::new("tmux")
-            .args(["send-keys", "-t", session, "-l", text])
-            .output_with_context()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("send-text failed for {session}: {stderr}");
-        }
-        Ok(())
-    }
-
-    /// Get the PID of the process running in a session's pane.
-    #[allow(dead_code)]
-    pub async fn pane_pid(&self, session: &str) -> anyhow::Result<Option<u32>> {
-        let output = Command::new("tmux")
-            .args(["list-panes", "-t", session, "-F", "#{pane_pid}"])
-            .output_with_context()
-            .await?;
-
-        if !output.status.success() {
-            return Ok(None);
-        }
-
-        let pid_str = String::from_utf8_lossy(&output.stdout);
-        Ok(pid_str.trim().parse::<u32>().ok())
     }
 
     /// Check if the process in a session's pane is still running.
@@ -257,7 +183,6 @@ impl TmuxManager {
 
     /// Wait for a session to finish (pane process exits).
     /// Returns the captured output from the last N lines.
-    #[allow(dead_code)]
     pub async fn wait_for_completion(
         &self,
         session: &str,

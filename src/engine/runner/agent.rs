@@ -7,7 +7,6 @@ use crate::tmux::TmuxManager;
 use std::path::PathBuf;
 
 /// Agent invocation configuration.
-#[allow(dead_code)]
 pub struct AgentInvocation {
     /// Agent name (claude, codex, opencode, kimi, minimax)
     pub agent: String,

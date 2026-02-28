@@ -27,7 +27,6 @@ pub struct GitHubUser {
     pub login: String,
 }
 
-#[allow(dead_code)] // used by list_comments and list_recent_comments
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubComment {
     pub id: u64,
@@ -80,7 +79,6 @@ pub struct PullRequestReview {
 
 impl PullRequestReview {
     /// Check if this review requests changes.
-    #[allow(dead_code)]
     pub fn requests_changes(&self) -> bool {
         self.review.state == "CHANGES_REQUESTED"
     }

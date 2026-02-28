@@ -183,50 +183,6 @@ impl ProjectSync {
         Ok(projects)
     }
 
-    /// Create a new project under the given owner.
-    ///
-    /// `owner_id` is the GraphQL node ID of the user or org.
-    #[allow(dead_code)]
-    pub async fn create_project(owner_id: &str, title: &str) -> anyhow::Result<ProjectInfo> {
-        let gh = GhCli::new();
-        let query = format!(
-            r#"mutation {{ createProjectV2(input: {{ownerId: "{}", title: "{}"}}) {{ projectV2 {{ id number title }} }} }}"#,
-            owner_id,
-            title.replace('"', "\\\"")
-        );
-
-        let result = gh.graphql(&query).await?;
-        let project = result
-            .pointer("/data/createProjectV2/projectV2")
-            .ok_or_else(|| anyhow::anyhow!("failed to create project"))?;
-
-        parse_project_node(project)
-            .ok_or_else(|| anyhow::anyhow!("failed to parse created project"))
-    }
-
-    /// Get the GraphQL node ID for a user or org login.
-    #[allow(dead_code)]
-    pub async fn get_owner_id(login: &str) -> anyhow::Result<String> {
-        let gh = GhCli::new();
-
-        // Try user first
-        let query = format!(r#"{{ user(login: "{}") {{ id }} }}"#, login);
-        if let Ok(result) = gh.graphql(&query).await {
-            if let Some(id) = result.pointer("/data/user/id").and_then(|v| v.as_str()) {
-                return Ok(id.to_string());
-            }
-        }
-
-        // Try org
-        let query = format!(r#"{{ organization(login: "{}") {{ id }} }}"#, login);
-        let result = gh.graphql(&query).await?;
-        result
-            .pointer("/data/organization/id")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .ok_or_else(|| anyhow::anyhow!("could not find user or org: {login}"))
-    }
-
     /// Add an issue to the project board. Returns the project item ID.
     pub async fn add_item(&self, issue_node_id: &str) -> anyhow::Result<String> {
         let query = format!(
@@ -274,22 +230,6 @@ impl ProjectSync {
         self.update_item_status(&item_id, status).await
     }
 
-    /// Link a repository to the project.
-    #[allow(dead_code)]
-    pub async fn link_repo(&self, repo_id: &str) -> anyhow::Result<()> {
-        let query = format!(
-            r#"mutation {{ linkProjectV2ToRepository(input: {{projectId: "{}", repositoryId: "{}"}}) {{ repository {{ id }} }} }}"#,
-            self.project_id, repo_id
-        );
-
-        // Linking may fail if already linked — that's fine
-        match self.gh.graphql(&query).await {
-            Ok(_) => Ok(()),
-            Err(e) if e.to_string().contains("already") => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Map orch `Status` to a project board column key.
     pub fn status_to_column(status: &Status) -> &'static str {
         match status {
@@ -298,12 +238,6 @@ impl ProjectSync {
             Status::InReview | Status::NeedsReview => "review",
             Status::Done => "done",
         }
-    }
-
-    /// Get the project ID.
-    #[allow(dead_code)]
-    pub fn project_id(&self) -> &str {
-        &self.project_id
     }
 
     /// Get the status field ID.

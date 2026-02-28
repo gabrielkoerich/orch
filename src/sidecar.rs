@@ -355,27 +355,6 @@ pub fn get_recent_memory(task_id: &str, max_entries: usize) -> anyhow::Result<Ve
     Ok(memory)
 }
 
-/// Clear all memory entries for a task.
-#[allow(dead_code)]
-pub fn clear_memory(task_id: &str) -> anyhow::Result<()> {
-    let path = sidecar_path(task_id)?;
-
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let content = std::fs::read_to_string(&path)?;
-    let mut obj: serde_json::Map<String, Value> = serde_json::from_str(&content)?;
-
-    obj.remove("memory");
-
-    // Write back
-    let content = serde_json::to_string_pretty(&Value::Object(obj))?;
-    std::fs::write(&path, content)?;
-
-    Ok(())
-}
-
 /// Resolve model pricing using a built-in table and normalized model aliases.
 pub fn pricing_for_model(model: &str) -> ModelPricing {
     let normalized = model.trim().to_lowercase();

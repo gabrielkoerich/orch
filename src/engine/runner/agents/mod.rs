@@ -87,7 +87,6 @@ impl PermissionRules {
 /// Parsed response from an agent, including metadata extracted from the
 /// agent-specific output envelope.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ParsedResponse {
     /// Normalized task response (status, summary, accomplished, etc.)
     pub response: AgentResponse,
@@ -103,7 +102,6 @@ pub struct ParsedResponse {
 
 /// Agent-specific error with enough detail for autonomous recovery.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum AgentError {
     /// Rate/usage limit — reroute to different agent, cooldown current.
     RateLimit {
@@ -198,7 +196,6 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
 ///
 /// Each agent implements this to handle its specific CLI invocation,
 /// output parsing, and error classification.
-#[allow(dead_code)]
 pub trait AgentRunner: Send + Sync {
     /// Agent name (e.g., "claude", "codex", "opencode").
     fn name(&self) -> &str;

@@ -56,18 +56,6 @@ pub struct InsertTaskMetric<'a> {
     pub total_cost_usd: Option<f64>,
 }
 
-/// Rate limit event record — tracks rate limit occurrences.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct RateLimitEvent {
-    pub id: i64,
-    pub agent: String,
-    pub limit_type: String, // "rate", "tokens", "budget"
-    pub occurred_at: DateTime<Utc>,
-    pub task_id: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -81,7 +69,6 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::New => "new",
@@ -132,7 +119,6 @@ pub struct Db {
     conn: Arc<Mutex<Connection>>,
 }
 
-#[allow(dead_code)]
 impl Db {
     /// Open (or create) the database at the given path.
     pub fn open(path: &PathBuf) -> anyhow::Result<Self> {
@@ -148,7 +134,6 @@ impl Db {
     }
 
     /// Open an in-memory database (for testing).
-    #[allow(dead_code)]
     pub fn open_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
         // WAL is a no-op for :memory: — only set busy_timeout
@@ -185,7 +170,6 @@ impl Db {
     }
 
     /// Get a reference to the connection (for running queries).
-    #[allow(dead_code)]
     pub async fn conn(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.conn.lock().await
     }
@@ -236,7 +220,6 @@ impl Db {
         Ok(task)
     }
 
-    #[allow(dead_code)]
     pub async fn list_internal_tasks_by_status(
         &self,
         status: TaskStatus,
@@ -279,7 +262,6 @@ impl Db {
         Ok(result)
     }
 
-    #[allow(dead_code)]
     pub async fn update_internal_task_status(
         &self,
         id: i64,
@@ -293,7 +275,6 @@ impl Db {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn delete_internal_task(&self, id: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock().await;
         conn.execute("DELETE FROM internal_tasks WHERE id = ?1", [id])?;
