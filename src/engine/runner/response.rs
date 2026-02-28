@@ -493,7 +493,7 @@ pub fn handle_failover(
             task_id,
             &[
                 format!("agent={next}"),
-                "agent_model=".to_string(),
+                "model=".to_string(),
                 "status=new".to_string(),
                 format!("last_error={error_message}, rerouted to {next}"),
             ],

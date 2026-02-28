@@ -518,7 +518,7 @@ impl TaskRunner {
                             sidecar::set(
                                 task_id,
                                 &[
-                                    format!("agent_model={next}"),
+                                    format!("model={next}"),
                                     "status=new".to_string(),
                                     format!("last_error=model {model} unavailable, trying {next}"),
                                 ],
@@ -638,7 +638,7 @@ impl TaskRunner {
                                 task_id,
                                 &[
                                     "agent=opencode".to_string(),
-                                    format!("agent_model={free_model}"),
+                                    format!("model={free_model}"),
                                     "status=new".to_string(),
                                     format!("model_reroute_chain={new_tried}"),
                                     format!("last_error=all agents exhausted, trying free model {free_model}"),

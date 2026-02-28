@@ -343,10 +343,13 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
         }
     }
 
+    // Reset sidecar state so the task starts fresh
+    crate::sidecar::set(&ext_id.0, &["attempts=0".to_string()]).ok();
+
     // Reset to new
     backend.update_status(&ext_id, Status::New).await?;
 
-    println!("Task #{} reset to new (will be re-routed)", id);
+    println!("Task #{} reset to new (attempts reset, will be re-routed)", id);
     Ok(())
 }
 
@@ -365,14 +368,16 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
         let mut count = 0;
         for task in blocked.iter().chain(needs_review.iter()) {
+            crate::sidecar::set(&task.id.0, &["attempts=0".to_string()]).ok();
             backend.update_status(&task.id, Status::New).await?;
             count += 1;
         }
-        println!("Unblocked {} tasks", count);
+        println!("Unblocked {} tasks (attempts reset)", count);
     } else {
         let ext_id = ExternalId(id.to_string());
+        crate::sidecar::set(&ext_id.0, &["attempts=0".to_string()]).ok();
         backend.update_status(&ext_id, Status::New).await?;
-        println!("Unblocked task #{}", id);
+        println!("Unblocked task #{} (attempts reset)", id);
     }
 
     Ok(())
