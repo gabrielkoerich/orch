@@ -1811,7 +1811,10 @@ async fn review_open_prs(
                 tracing::warn!(task_id, err = %e, "failed to update last_review_ts");
             }
 
-            // Re-dispatch the task by setting status back to routed
+            // Re-dispatch: reset review_started so the next completion triggers review again
+            if let Err(e) = sidecar::set(task_id, &["review_started=false".to_string()]) {
+                tracing::warn!(task_id, err = %e, "failed to reset review_started");
+            }
             if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
                 tracing::warn!(task_id, err = %e, "failed to set status to routed for re-dispatch");
             } else {
