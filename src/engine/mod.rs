@@ -471,6 +471,22 @@ pub async fn serve() -> anyhow::Result<()> {
     // Channel for weight signals from task runners back to the router
     let (weight_tx, mut weight_rx) = mpsc::channel::<WeightSignal>(64);
 
+    // Reset stale review_started flags on startup (prevents stuck reviews after restart)
+    for engine in &project_engines {
+        if let Ok(in_review) = engine.backend.list_by_status(Status::InReview).await {
+            for task in &in_review {
+                let _ = sidecar::set(&task.id.0, &["review_started=false".to_string()]);
+            }
+            if !in_review.is_empty() {
+                tracing::info!(
+                    repo = %engine.repo,
+                    count = in_review.len(),
+                    "reset review_started flags on startup"
+                );
+            }
+        }
+    }
+
     // Main loop
     tracing::info!(
         tick = ?config.tick_interval,
