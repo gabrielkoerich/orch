@@ -206,7 +206,7 @@ impl AgentRunner for OpenCodeRunner {
         &self,
         model: Option<&str>,
         timeout_cmd: &str,
-        _sys_file: &str,
+        sys_file: &str,
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
@@ -225,12 +225,13 @@ impl AgentRunner for OpenCodeRunner {
         };
 
         format!(
-            r#"{config_setup}{timeout_cmd} opencode run {model_flag} \
-  --format json - < "{msg_file}""#,
+            r#"{config_setup}cat "{sys_file}" "{msg_file}" | {timeout_cmd} opencode run {model_flag} \
+  --format json -"#,
             config_setup = config_setup,
+            sys_file = sys_file,
+            msg_file = msg_file,
             timeout_cmd = timeout_cmd,
             model_flag = model_flag,
-            msg_file = msg_file,
         )
     }
 
