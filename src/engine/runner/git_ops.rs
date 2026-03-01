@@ -197,7 +197,7 @@ pub async fn create_pr_if_needed(
     }
 
     body.push_str(&format!(
-        "\n\nCloses #{task_id}\n\n---\n*Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch)*"
+        "\n\n---\n*Task #{task_id} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch)*"
     ));
 
     // Always use the short task title for the PR title (summary goes in body)
@@ -214,11 +214,40 @@ pub async fn create_pr_if_needed(
     if output.status.success() {
         let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
         tracing::info!(task_id, pr_url = %url, "created PR");
+
+        // Link the issue to the PR branch via `gh issue develop`
+        link_issue_to_branch(dir, task_id, branch).await;
+
         Ok(Some(url))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::warn!(task_id, err = %stderr, "failed to create PR");
         Ok(None)
+    }
+}
+
+/// Link an issue to a branch using `gh issue develop`.
+/// This creates the "Development" sidebar link in GitHub.
+/// Failures are logged but not fatal — the PR is still created.
+async fn link_issue_to_branch(dir: &Path, task_id: &str, branch: &str) {
+    let result = Command::new("gh")
+        .args(["issue", "develop", task_id, "--name", branch])
+        .current_dir(dir)
+        .output_with_context()
+        .await;
+
+    match result {
+        Ok(o) if o.status.success() => {
+            tracing::info!(task_id, branch, "linked issue to branch");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            // Branch may already be linked — not an error
+            tracing::debug!(task_id, branch, err = %stderr, "gh issue develop did not succeed (branch may already be linked)");
+        }
+        Err(e) => {
+            tracing::debug!(task_id, branch, err = %e, "failed to run gh issue develop");
+        }
     }
 }
 
