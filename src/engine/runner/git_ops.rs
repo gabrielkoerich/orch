@@ -94,6 +94,11 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
         branch
     };
 
+    // Guard against empty branch names (prevents git config corruption)
+    if branch_to_push.is_empty() {
+        anyhow::bail!("cannot push: branch name is empty");
+    }
+
     // Skip push for main/master
     if branch_to_push == "main" || branch_to_push == "master" {
         return Ok(false);
@@ -230,6 +235,11 @@ pub async fn create_pr_if_needed(
 /// This creates the "Development" sidebar link in GitHub.
 /// Failures are logged but not fatal — the PR is still created.
 async fn link_issue_to_branch(dir: &Path, task_id: &str, branch: &str) {
+    if branch.is_empty() {
+        tracing::warn!(task_id, "skipping link_issue_to_branch: empty branch name");
+        return;
+    }
+
     let result = Command::new("gh")
         .args(["issue", "develop", task_id, "--name", branch])
         .current_dir(dir)
