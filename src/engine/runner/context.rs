@@ -46,7 +46,6 @@ pub fn load_task_context(task_id: &str) -> String {
 }
 
 /// Build parent task context for subtasks.
-#[allow(dead_code)]
 pub async fn build_parent_context(task: &ExternalTask, backend: &dyn ExternalBackend) -> String {
     // Check if task has a parent via sidecar
     let parent_id = match sidecar::get(&task.id.0, "parent_id") {
@@ -226,7 +225,6 @@ pub async fn build_git_log(project_dir: &Path, default_branch: &str) -> String {
 }
 
 /// Fetch recent issue comments for agent context.
-#[allow(dead_code)]
 pub async fn fetch_issue_comments(
     backend: &dyn ExternalBackend,
     task_id: &str,

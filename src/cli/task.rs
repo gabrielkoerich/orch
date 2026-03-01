@@ -317,7 +317,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
     // Run via TaskRunner
     let runner = TaskRunner::new(repo);
     runner
-        .run(&task_id, agent.as_deref(), model.as_deref())
+        .run(&task_id, agent.as_deref(), model.as_deref(), Some(&*backend))
         .await?;
 
     println!("Task #{} completed", task_id);

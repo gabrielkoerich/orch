@@ -68,6 +68,7 @@ impl TaskRunner {
         task_id: &str,
         agent: Option<&str>,
         model: Option<&str>,
+        backend: Option<&dyn ExternalBackend>,
     ) -> anyhow::Result<()> {
         // Record start time for metrics
         let started_at = Utc::now();
@@ -140,9 +141,23 @@ impl TaskRunner {
             .map(String::from)
             .or_else(|| route_result.as_ref().and_then(|r| r.model.clone()));
 
+        // Build a minimal ExternalTask for prompt building
+        let task_title =
+            sidecar::get(task_id, "title").unwrap_or_else(|_| format!("Task #{task_id}"));
+        let task_body = sidecar::get(task_id, "body").unwrap_or_default();
+        let pseudo_task = ExternalTask {
+            id: ExternalId(task_id.to_string()),
+            title: task_title.clone(),
+            body: task_body,
+            state: "open".to_string(),
+            labels: vec![],
+            author: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            url: String::new(),
+        };
+
         // Build context
-        // Note: we'd need a backend reference to build full context,
-        // but for now we build what we can locally
         let task_context = context::load_task_context(task_id);
         let project_instructions = context::build_project_instructions(&wt.work_dir);
         let repo_tree = context::build_repo_tree(&wt.work_dir).await;
@@ -162,32 +177,31 @@ impl TaskRunner {
         // Load PR review context from sidecar (for re-dispatch after review changes requested)
         let pr_review_context = context::load_pr_review_context(task_id);
 
+        // Load backend-dependent context when available
+        let parent_context = if let Some(b) = backend {
+            context::build_parent_context(&pseudo_task, b).await
+        } else {
+            String::new()
+        };
+        let issue_comments = if let Some(b) = backend {
+            context::fetch_issue_comments(b, task_id, 10).await
+        } else {
+            String::new()
+        };
+
+        // Always load memory from previous attempts (no backend required)
+        let (_, memory) = context::build_memory_context(task_id);
+
         let ctx = context::TaskContext {
             task_context,
-            parent_context: String::new(), // Requires backend
+            parent_context,
             project_instructions,
             skills_docs,
             repo_tree,
             git_diff,
-            issue_comments: String::new(), // Requires backend
+            issue_comments,
             pr_review_context,
-            memory: vec![], // Will be loaded on retries
-        };
-
-        // Build a minimal ExternalTask for prompt building
-        let task_title =
-            sidecar::get(task_id, "title").unwrap_or_else(|_| format!("Task #{task_id}"));
-        let task_body = sidecar::get(task_id, "body").unwrap_or_default();
-        let pseudo_task = ExternalTask {
-            id: ExternalId(task_id.to_string()),
-            title: task_title.clone(),
-            body: task_body,
-            state: "open".to_string(),
-            labels: vec![],
-            author: String::new(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            url: String::new(),
+            memory,
         };
 
         // Build prompts
@@ -891,7 +905,7 @@ impl TaskRunner {
         )?;
 
         // Run the task
-        self.run(task_id, agent, model).await?;
+        self.run(task_id, agent, model, Some(&**backend)).await?;
 
         // Process delegations if the agent requested subtasks
         let delegations_raw = sidecar::get(task_id, "delegations").unwrap_or_default();
