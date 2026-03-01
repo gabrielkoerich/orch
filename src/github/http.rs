@@ -474,18 +474,24 @@ impl GhHttp {
     /// List issues filtered by a label (paginated).
     pub async fn list_issues(&self, repo: &str, label: &str) -> anyhow::Result<Vec<GitHubIssue>> {
         let url = format!("{GITHUB_API}/repos/{repo}/issues");
-        self.get_all_pages(
-            &url,
-            &[("labels", label), ("state", "open"), ("per_page", "100")],
-        )
-        .await
+        let all: Vec<GitHubIssue> = self
+            .get_all_pages(
+                &url,
+                &[("labels", label), ("state", "open"), ("per_page", "100")],
+            )
+            .await?;
+        // GitHub /issues API returns PRs too — filter them out
+        Ok(all.into_iter().filter(|i| i.pull_request.is_none()).collect())
     }
 
     /// List all open issues (no label filter, paginated).
     pub async fn list_all_open_issues(&self, repo: &str) -> anyhow::Result<Vec<GitHubIssue>> {
         let url = format!("{GITHUB_API}/repos/{repo}/issues");
-        self.get_all_pages(&url, &[("state", "open"), ("per_page", "100")])
-            .await
+        let all: Vec<GitHubIssue> = self
+            .get_all_pages(&url, &[("state", "open"), ("per_page", "100")])
+            .await?;
+        // GitHub /issues API returns PRs too — filter them out
+        Ok(all.into_iter().filter(|i| i.pull_request.is_none()).collect())
     }
 
     /// Add labels to an issue.
