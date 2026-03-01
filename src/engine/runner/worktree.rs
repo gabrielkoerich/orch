@@ -163,9 +163,9 @@ pub async fn setup_worktree(
         if let Some(existing_dir) = existing {
             let bn = existing_dir
                 .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+                .filter(|n| !n.is_empty())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| branch_name(task_id, title));
             tracing::info!(task_id, worktree = %existing_dir.display(), "found existing worktree");
             (bn, existing_dir)
         } else {
@@ -287,34 +287,40 @@ pub async fn setup_worktree(
         ],
     )?;
 
-    // Link branch to GitHub issue (non-fatal)
-    let repo_slug = crate::config::get_current_repo().unwrap_or_default();
-    let link_output = Command::new("gh")
-        .args([
-            "issue",
-            "develop",
-            task_id,
-            "--base",
-            &default_branch,
-            "--branch-repo",
-            &repo_slug,
-            "--name",
-            &branch_name_str,
-        ])
-        .current_dir(&main_dir)
-        .output_with_context()
-        .await;
-    match link_output {
-        Ok(o) if o.status.success() => {
-            tracing::info!(task_id, branch = %branch_name_str, "linked branch to issue");
+    // Link branch to GitHub issue (non-fatal).
+    // Guard against empty branch name — calling `gh issue develop --name ""` writes
+    // a corrupt `[branch ""]` entry to .git/config that breaks subsequent git pushes.
+    if !branch_name_str.is_empty() {
+        let repo_slug = crate::config::get_current_repo().unwrap_or_default();
+        let link_output = Command::new("gh")
+            .args([
+                "issue",
+                "develop",
+                task_id,
+                "--base",
+                &default_branch,
+                "--branch-repo",
+                &repo_slug,
+                "--name",
+                &branch_name_str,
+            ])
+            .current_dir(&main_dir)
+            .output_with_context()
+            .await;
+        match link_output {
+            Ok(o) if o.status.success() => {
+                tracing::info!(task_id, branch = %branch_name_str, "linked branch to issue");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::debug!(task_id, err = %stderr, "gh issue develop failed (non-fatal)");
+            }
+            Err(e) => {
+                tracing::debug!(task_id, err = %e, "gh issue develop failed (non-fatal)");
+            }
         }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            tracing::debug!(task_id, err = %stderr, "gh issue develop failed (non-fatal)");
-        }
-        Err(e) => {
-            tracing::debug!(task_id, err = %e, "gh issue develop failed (non-fatal)");
-        }
+    } else {
+        tracing::warn!(task_id, "skipping gh issue develop: branch name is empty");
     }
 
     // gh issue develop sometimes creates corrupt [branch ""] config entries — clean up
@@ -390,6 +396,16 @@ mod tests {
     fn branch_name_empty_title() {
         let name = branch_name("99", "");
         assert_eq!(name, "gh-task-99");
+    }
+
+    #[test]
+    fn branch_name_all_special_chars() {
+        // All non-alphanumeric → empty slug → falls back to task-id only.
+        // Ensures we never produce an empty branch name that would write
+        // a corrupt `[branch ""]` entry to .git/config via gh issue develop.
+        let name = branch_name("10", "--- ??? ---");
+        assert_eq!(name, "gh-task-10");
+        assert!(!name.is_empty());
     }
 
     #[test]
