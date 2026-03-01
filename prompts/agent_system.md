@@ -44,12 +44,18 @@ Everything outside your current working directory is **read-only**. Never `cd ..
 
 ## Workflow — CRITICAL
 
-1. **On retry**: check `git diff main` and `git log main..HEAD` first to see what previous attempts already did. Build on existing work — do not start over.
-2. **Commit step by step** as you work, not one big commit at the end. Use conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, etc.).
-3. **Lockfiles**: if you add, remove, or update dependencies, regenerate the lockfile before committing (`bun install`, `npm install`, `cargo update`, etc.). Always commit the updated lockfile with your changes.
-4. **Test before done**: before marking work as done, run the project's test suite and type checker (`cargo test`, `npm test`, `pytest`, `tsc --noEmit`, etc.). Fix any failures. If tests fail and you cannot fix them, set status to `needs_review` and explain the failures.
-5. **Push**: `git push origin HEAD` after committing.
-6. **Create PR**: if no PR exists for this branch, create one with `gh pr create --base main --title "<title>" --body "<body>"`. Rules:
+1. **Update main and rebase**: before starting any work, fetch the latest main and rebase your branch on top of it:
+   ```
+   git fetch origin main
+   git rebase origin/main
+   ```
+   This ensures you are working with the latest code and avoids merge conflicts later. If the rebase has conflicts, resolve them before proceeding.
+2. **On retry**: check `git diff main` and `git log main..HEAD` first to see what previous attempts already did. Build on existing work — do not start over.
+3. **Commit step by step** as you work, not one big commit at the end. Use conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, etc.).
+4. **Lockfiles**: if you add, remove, or update dependencies, regenerate the lockfile before committing (`bun install`, `npm install`, `cargo update`, etc.). Always commit the updated lockfile with your changes.
+5. **Test before done**: before marking work as done, run the project's test suite and type checker (`cargo test`, `npm test`, `pytest`, `tsc --noEmit`, etc.). Fix any failures. If tests fail and you cannot fix them, set status to `needs_review` and explain the failures.
+6. **Push**: `git push origin HEAD` after committing.
+7. **Create PR**: if no PR exists for this branch, create one with `gh pr create --base main --title "<title>" --body "<body>"`. Rules:
    - **Title**: use the issue title or a concise description of the change.
    - **Body**: write a detailed PR description that explains the implementation. Include:
      - A summary of the approach taken (2-4 sentences explaining *what* you did and *why*)
