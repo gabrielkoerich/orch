@@ -220,10 +220,7 @@ pub async fn serve() -> anyhow::Result<()> {
             match init_project_engines().await {
                 Ok(engines) => break engines,
                 Err(e) => {
-                    tracing::warn!(
-                        delay_secs,
-                        "project engine init failed, retrying: {e}"
-                    );
+                    tracing::warn!(delay_secs, "project engine init failed, retrying: {e}");
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                     delay_secs = (delay_secs * 2).min(120);
                 }
