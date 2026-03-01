@@ -3,8 +3,27 @@
 //! Supports Claude, Codex, OpenCode (plus Kimi/MiniMax as Claude aliases).
 //! Generates a runner shell script that tmux executes — agents need a real terminal.
 
+use crate::template::render_template_str;
 use crate::tmux::TmuxManager;
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+const AGENT_SYSTEM_TEMPLATE: &str = include_str!("../../../prompts/agent_system.md");
+const AGENT_MESSAGE_TEMPLATE: &str = include_str!("../../../prompts/agent_message.md");
+const AGENT_MEMORY_ENTRY_TEMPLATE: &str = include_str!("../../../prompts/agent_memory_entry.md");
+const ALLOWED_TOOLS_TEMPLATE: &str = include_str!("../../../prompts/allowed_tools.md");
+const REVIEW_PROMPT_TEMPLATE: &str = include_str!("../../../prompts/review_task.md");
+const REVIEW_SYSTEM_TEMPLATE: &str = include_str!("../../../prompts/review_system.md");
+
+fn render_prompt_template(template: &str, vars: HashMap<String, String>) -> String {
+    match render_template_str(template, &vars) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to render prompt template");
+            template.to_string()
+        }
+    }
+}
 
 /// Agent invocation configuration.
 #[allow(dead_code)]
@@ -85,10 +104,10 @@ pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
             .map(|t| format!("- {t}"))
             .collect::<Vec<_>>()
             .join("\n");
-        format!(
-            "{}\n\n## Allowed Tools\nYou may ONLY use the following tools and commands:\n{tools_list}",
-            inv.system_prompt
-        )
+        let mut vars = HashMap::new();
+        vars.insert("TOOLS_LIST".to_string(), tools_list);
+        let tools_prompt = render_prompt_template(ALLOWED_TOOLS_TEMPLATE, vars);
+        format!("{}\n\n{}", inv.system_prompt, tools_prompt)
     } else {
         inv.system_prompt.clone()
     };
@@ -191,134 +210,39 @@ pub fn build_system_prompt(
     context: &super::context::TaskContext,
     route_result: Option<&crate::engine::router::RouteResult>,
 ) -> String {
-    let mut prompt = String::new();
+    let mut vars = HashMap::new();
 
-    // Role from routing
     if let Some(rr) = route_result {
-        prompt.push_str(&format!("You are a {} agent.\n\n", rr.profile.role));
+        vars.insert("ROLE".to_string(), rr.profile.role.clone());
+
         if !rr.profile.constraints.is_empty() {
-            prompt.push_str("## Constraints\n\n");
-            for c in &rr.profile.constraints {
-                prompt.push_str(&format!("- {c}\n"));
-            }
-            prompt.push('\n');
+            let constraints = rr
+                .profile
+                .constraints
+                .iter()
+                .map(|c| format!("- {c}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            vars.insert("CONSTRAINTS".to_string(), constraints);
         }
     }
 
-    // Project instructions
     if !context.project_instructions.is_empty() {
-        prompt.push_str("## Project Instructions\n\n");
-        prompt.push_str(&context.project_instructions);
-        prompt.push('\n');
+        vars.insert(
+            "PROJECT_INSTRUCTIONS".to_string(),
+            context.project_instructions.clone(),
+        );
     }
 
-    // Skills docs
     if !context.skills_docs.is_empty() {
-        prompt.push_str("## Available Skills\n\n");
-        prompt.push_str(&context.skills_docs);
-        prompt.push('\n');
+        vars.insert("SKILLS_DOCS".to_string(), context.skills_docs.clone());
     }
 
-    // Repo tree
     if !context.repo_tree.is_empty() {
-        prompt.push_str("## Repository Structure\n\n```\n");
-        prompt.push_str(&context.repo_tree);
-        prompt.push_str("\n```\n\n");
+        vars.insert("REPO_TREE".to_string(), context.repo_tree.clone());
     }
 
-    // Rules + workflow instructions
-    prompt.push_str(
-        r#"## Rules
-
-- NEVER use `rm` to delete files. Use `trash` (macOS) or `trash-put` (Linux).
-- NEVER commit directly to the main/master branch. You are on a feature branch.
-- NEVER modify files outside your worktree. Everything outside your current working directory is read-only.
-- If a skill is marked REQUIRED, you MUST follow its workflow exactly.
-- When spawning sub-agents or background tasks, use the cheapest model that can handle the job. Reserve expensive models for complex reasoning and debugging.
-
-## Worktree
-
-You are running inside an isolated git worktree on a feature branch. Do NOT create worktrees or branches yourself — the orchestrator manages that.
-
-Everything outside your current working directory is **read-only**. Never `cd ..` to modify the parent repo or any other directory. All your changes stay in this worktree.
-
-## Workflow — CRITICAL
-
-1. **On retry**: check `git diff main` and `git log main..HEAD` first to see what previous attempts already did. Build on existing work — do not start over.
-2. **Commit step by step** as you work, not one big commit at the end. Use conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, etc.).
-3. **Lockfiles**: if you add, remove, or update dependencies, regenerate the lockfile before committing (`bun install`, `npm install`, `cargo update`, etc.). Always commit the updated lockfile with your changes.
-4. **Test before done**: before marking work as done, run the project's test suite and type checker (`cargo test`, `npm test`, `pytest`, `tsc --noEmit`, etc.). Fix any failures. If tests fail and you cannot fix them, set status to `needs_review` and explain the failures.
-5. **Push**: `git push origin HEAD` after committing.
-6. **Create PR**: if no PR exists for this branch, create one with `gh pr create --base main --title "<issue title>" --body "<body>"`. Rules:
-   - **Title**: use the issue title exactly — do NOT use a long summary or description as the title.
-   - **Body**: include a concise summary (2-4 sentences), a bullet list of key changes, and `Closes #<issue>` at the end.
-
-Do NOT skip any of these steps. Do NOT report "done" unless you have committed, pushed, and verified the PR exists. If you only make changes without committing and pushing, your work will be lost.
-
-If git push fails (e.g., auth error, no remote), set status to `needs_review` with the error.
-
-## Output Format
-
-Your final output MUST be a JSON object with these fields:
-
-```json
-{
-  "status": "done|in_progress|blocked|needs_review",
-  "summary": "Brief summary of what was accomplished",
-  "accomplished": ["list of things done"],
-  "remaining": ["list of remaining items"],
-  "files_changed": ["list of files modified"],
-  "blockers": ["list of blockers, empty if none"],
-  "reason": "reason if blocked or needs_review, empty string otherwise",
-  "delegations": [{"title": "...", "body": "...", "labels": ["..."]}]
-}
-```
-
-Note: `delegations` is optional — only include it when delegating subtasks.
-
-Status rules:
-- **done**: all work is committed, pushed, PR created, and tests pass. You must have produced a visible result (committed code, posted a comment, or completed the requested action). Pure research with no output is `in_progress`.
-- **in_progress**: partial work was committed but more remains.
-- **blocked**: waiting on dependencies, missing information, or delegated subtasks.
-- **needs_review**: encountered errors you cannot resolve.
-
-## Task Delegation
-
-If a task is too complex for a single agent, you can delegate subtasks. Include a `delegations` array in your response:
-
-```json
-{
-  "status": "blocked",
-  "summary": "Decomposed into subtasks",
-  "accomplished": ["Analyzed requirements"],
-  "remaining": ["Waiting on subtasks"],
-  "delegations": [
-    {"title": "Subtask title", "body": "Detailed description of the subtask", "labels": ["label1"]},
-    {"title": "Another subtask", "body": "Description", "labels": ["label2"]}
-  ]
-}
-```
-
-Delegation rules:
-- Set status to `blocked` when delegating — you will be re-run after all subtasks complete.
-- Each delegation becomes a separate GitHub issue routed to an agent independently.
-- Provide clear, detailed descriptions in `body` so the subtask agent has full context.
-- Only delegate when the task genuinely requires parallel workstreams or different expertise.
-- Do not delegate trivial work — just do it yourself.
-- Labels are optional — the orchestrator will route each subtask automatically.
-
-## Visibility
-
-Your output is parsed by the orchestrator and posted as a comment on the GitHub issue. Write clear, detailed summaries:
-- **accomplished**: be specific (e.g., "Fixed memcmp offset from 40 to 48 in yieldRates.ts", not "Fixed bug")
-- **remaining**: tell the owner what's left, what the next attempt should do
-- **files_changed**: include every file you touched
-- **reason**: include the exact command and error message, not just "permission denied"
-- **blockers**: be actionable (e.g., "Need SSH key configured for git push", not "Permission denied")
-"#,
-    );
-
-    prompt
+    render_prompt_template(AGENT_SYSTEM_TEMPLATE, vars)
 }
 
 /// Build the agent message (task prompt).
@@ -327,99 +251,83 @@ pub fn build_agent_message(
     context: &super::context::TaskContext,
     attempts: u32,
 ) -> String {
-    let mut msg = String::new();
+    let mut vars = HashMap::new();
+    vars.insert("TASK_ID".to_string(), task.id.0.clone());
+    vars.insert("TASK_TITLE".to_string(), task.title.clone());
+    vars.insert("TASK_BODY".to_string(), task.body.clone());
 
-    msg.push_str(&format!(
-        "# Task #{}: {}\n\n{}\n\n",
-        task.id.0, task.title, task.body
-    ));
-
-    // Previous context
     if !context.task_context.is_empty() {
-        msg.push_str("## Previous Context\n\n");
-        msg.push_str(&context.task_context);
-        msg.push('\n');
+        vars.insert("TASK_CONTEXT".to_string(), context.task_context.clone());
     }
 
-    // Parent context
     if !context.parent_context.is_empty() {
-        msg.push_str(&context.parent_context);
+        vars.insert("PARENT_CONTEXT".to_string(), context.parent_context.clone());
     }
 
-    // Issue comments
     if !context.issue_comments.is_empty() {
-        msg.push_str("## Recent Comments\n\n");
-        msg.push_str(&context.issue_comments);
-        msg.push('\n');
+        vars.insert("ISSUE_COMMENTS".to_string(), context.issue_comments.clone());
     }
 
-    // PR review context (for re-dispatch after review changes requested)
     if !context.pr_review_context.is_empty() {
-        msg.push_str("## PR Review Feedback\n\n");
-        msg.push_str("A reviewer has requested changes on your PR. Please address the following feedback:\n\n");
-        msg.push_str(&context.pr_review_context);
-        msg.push('\n');
+        vars.insert(
+            "PR_REVIEW_CONTEXT".to_string(),
+            context.pr_review_context.clone(),
+        );
     }
 
-    // Git diff for retries
     if attempts > 0 && !context.git_diff.is_empty() {
-        msg.push_str("## Current Changes (from previous attempt)\n\n```diff\n");
-        msg.push_str(&context.git_diff);
-        msg.push_str("\n```\n\n");
+        vars.insert("GIT_DIFF".to_string(), context.git_diff.clone());
     }
 
     if attempts > 0 {
-        msg.push_str(&format!(
-            "\nThis is attempt #{} (previous attempts may have made partial progress).\n",
-            attempts + 1
-        ));
+        vars.insert("ATTEMPT_NUMBER".to_string(), (attempts + 1).to_string());
     }
 
-    // Memory from previous attempts
     if !context.memory.is_empty() {
-        msg.push_str("\n## Previous Attempts Memory\n\n");
-        msg.push_str(
-            "Learnings from previous task attempts (to help you avoid repeating mistakes):\n\n",
-        );
-
+        let mut sections = Vec::new();
         for entry in &context.memory {
-            msg.push_str(&format!(
-                "### Attempt #{} (Agent: {})",
-                entry.attempt, entry.agent
-            ));
+            let mut entry_vars = HashMap::new();
+            entry_vars.insert("ATTEMPT".to_string(), entry.attempt.to_string());
+            entry_vars.insert("AGENT".to_string(), entry.agent.clone());
 
             if let Some(ref model) = entry.model {
-                msg.push_str(&format!(", Model: {}", model));
+                entry_vars.insert("MODEL".to_string(), model.clone());
             }
-            msg.push('\n');
 
             if !entry.approach.is_empty() {
-                msg.push_str(&format!("**Approach**: {}\n", entry.approach));
+                entry_vars.insert("APPROACH".to_string(), entry.approach.clone());
             }
 
             if !entry.learnings.is_empty() {
-                msg.push_str("**Key Learnings**:\n");
-                for learning in &entry.learnings {
-                    msg.push_str(&format!("- {}\n", learning));
-                }
+                let learnings = entry
+                    .learnings
+                    .iter()
+                    .map(|learning| format!("- {}", learning))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                entry_vars.insert("LEARNINGS".to_string(), learnings);
             }
 
             if let Some(ref error) = entry.error {
-                msg.push_str(&format!("**Error**: {}\n", error));
+                entry_vars.insert("ERROR".to_string(), error.clone());
             }
 
             if !entry.files_modified.is_empty() {
-                msg.push_str(&format!(
-                    "**Files Modified**: {}\n",
-                    entry.files_modified.join(", ")
-                ));
+                entry_vars.insert(
+                    "FILES_MODIFIED".to_string(),
+                    entry.files_modified.join(", "),
+                );
             }
 
-            msg.push('\n');
+            let rendered = render_prompt_template(AGENT_MEMORY_ENTRY_TEMPLATE, entry_vars);
+            sections.push(rendered.trim().to_string());
         }
+
+        let memory_section = sections.join("\n\n");
+        vars.insert("MEMORY_SECTION".to_string(), memory_section);
     }
 
-    msg
+    render_prompt_template(AGENT_MESSAGE_TEMPLATE, vars)
 }
 
 /// Build the review prompt for the review agent.
@@ -432,89 +340,27 @@ pub fn build_review_prompt(
     git_diff: &str,
     git_log: &str,
 ) -> String {
-    let mut msg = String::new();
-
-    msg.push_str(&format!(
-        "## Review Task #{}: {}\n\n",
-        task.id.0, task.title
-    ));
-
-    msg.push_str("You are reviewing a PR created by an AI agent. Check:\n\n");
-    msg.push_str("1. **Requirements met** — does the code satisfy the task description?\n");
-    msg.push_str("2. **Tests pass** — run the test suite, report failures\n");
-    msg.push_str("3. **Code quality** — no obvious bugs, security issues, or regressions\n");
-    msg.push_str("4. **Completeness** — all files committed, no TODOs left behind\n\n");
-
-    msg.push_str("### Task Description\n");
-    msg.push_str(&task.body);
-    msg.push_str("\n\n");
+    let mut vars = HashMap::new();
+    vars.insert("TASK_ID".to_string(), task.id.0.clone());
+    vars.insert("TASK_TITLE".to_string(), task.title.clone());
+    vars.insert("TASK_BODY".to_string(), task.body.clone());
 
     if !agent_summary.is_empty() {
-        msg.push_str("### Agent Summary\n");
-        msg.push_str(agent_summary);
-        msg.push_str("\n\n");
+        vars.insert("AGENT_SUMMARY".to_string(), agent_summary.to_string());
     }
 
     if !git_diff.is_empty() {
-        msg.push_str("### Changes\n```diff\n");
-        msg.push_str(git_diff);
-        msg.push_str("\n```\n\n");
+        vars.insert("GIT_DIFF".to_string(), git_diff.to_string());
     }
 
     if !git_log.is_empty() {
-        msg.push_str("### Commits\n");
-        msg.push_str(git_log);
-        msg.push('\n');
+        vars.insert("GIT_LOG".to_string(), git_log.to_string());
     }
 
-    msg.push_str(
-        r#"
-## Output Format
-
-```json
-{
-  "decision": "approve|request_changes",
-  "notes": "Detailed review feedback",
-  "test_results": "pass|fail|skipped",
-  "issues": [
-    {
-      "file": "src/foo.rs",
-      "line": 42,
-      "severity": "error|warning",
-      "description": "What's wrong and how to fix it"
-    }
-  ]
-}
-```
-
-Decision rules:
-- **approve**: The code meets requirements, tests pass, no major issues
-- **request_changes**: There are bugs, test failures, or the code doesn't meet requirements
-
-Be thorough but practical. Don't block on minor style issues unless they indicate real problems.
-"#,
-    );
-
-    msg
+    render_prompt_template(REVIEW_PROMPT_TEMPLATE, vars)
 }
 
 /// Build the system prompt for the review agent.
 pub fn review_system_prompt() -> String {
-    r#"You are a code review agent. Your job is to review pull requests created by AI agents.
-
-Review criteria:
-1. Correctness — does the code do what the task asked for?
-2. Tests — run the test suite and report any failures
-3. Security — look for obvious security issues (SQL injection, XSS, etc.)
-4. Completeness — are all necessary files committed?
-
-Your output MUST be valid JSON with the exact format specified in the task.
-
-Rules:
-- NEVER use `rm` to delete files. Use `trash` (macOS) or `trash-put` (Linux).
-- NEVER commit directly to the main/master branch.
-- Run tests before making a decision.
-- Be specific about what needs to be fixed if requesting changes.
-"#
-    .to_string()
+    render_prompt_template(REVIEW_SYSTEM_TEMPLATE, HashMap::new())
 }

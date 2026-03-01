@@ -15,24 +15,11 @@ static IF_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 static VAR_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\{\{(\w+)\}\}").expect("BUG: var_pattern regex is invalid"));
 
-pub fn render_template(template_path: &str, extra_vars: &[String]) -> Result<String, String> {
-    if !fs::metadata(template_path)
-        .map(|m| m.is_file())
-        .unwrap_or(false)
-    {
-        return Err(format!("template not found: {}", template_path));
-    }
-
-    let mut data =
-        fs::read_to_string(template_path).map_err(|e| format!("failed to read template: {}", e))?;
-
-    let mut vars: HashMap<String, String> = env::vars().collect();
-
-    for var in extra_vars {
-        if let Some((key, value)) = var.split_once('=') {
-            vars.insert(key.to_string(), value.to_string());
-        }
-    }
+fn render_template_with_vars(
+    template: &str,
+    vars: &HashMap<String, String>,
+) -> Result<String, String> {
+    let mut data = template.to_string();
 
     loop {
         let mut changed = false;
@@ -66,6 +53,35 @@ pub fn render_template(template_path: &str, extra_vars: &[String]) -> Result<Str
     }
 
     Ok(result)
+}
+
+pub fn render_template_str(
+    template: &str,
+    vars: &HashMap<String, String>,
+) -> Result<String, String> {
+    render_template_with_vars(template, vars)
+}
+
+pub fn render_template(template_path: &str, extra_vars: &[String]) -> Result<String, String> {
+    if !fs::metadata(template_path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return Err(format!("template not found: {}", template_path));
+    }
+
+    let data =
+        fs::read_to_string(template_path).map_err(|e| format!("failed to read template: {}", e))?;
+
+    let mut vars: HashMap<String, String> = env::vars().collect();
+
+    for var in extra_vars {
+        if let Some((key, value)) = var.split_once('=') {
+            vars.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    render_template_with_vars(&data, &vars)
 }
 
 pub fn render_and_print(template_path: &str, extra_vars: &[String]) -> io::Result<()> {
