@@ -43,6 +43,8 @@ pub struct Delegation {
     pub body: String,
     #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default)]
+    pub suggested_agent: Option<String>,
 }
 
 /// Parse an agent response from a file path (or stdin if "-").
@@ -301,7 +303,7 @@ Done.
             "blockers": ["Waiting on delegated subtasks"],
             "reason": "Decomposed into subtasks",
             "delegations": [
-                {"title": "Implement login API", "body": "Create POST /api/login", "labels": ["backend"]},
+                {"title": "Implement login API", "body": "Create POST /api/login", "labels": ["backend"], "suggested_agent": "codex"},
                 {"title": "Add login form", "body": "Create React login component", "labels": ["frontend"]}
             ]
         }"#;
@@ -311,8 +313,10 @@ Done.
         assert_eq!(resp.delegations[0].title, "Implement login API");
         assert_eq!(resp.delegations[0].body, "Create POST /api/login");
         assert_eq!(resp.delegations[0].labels, vec!["backend"]);
+        assert_eq!(resp.delegations[0].suggested_agent, Some("codex".to_string()));
         assert_eq!(resp.delegations[1].title, "Add login form");
         assert_eq!(resp.delegations[1].labels, vec!["frontend"]);
+        assert!(resp.delegations[1].suggested_agent.is_none());
     }
 
     #[test]

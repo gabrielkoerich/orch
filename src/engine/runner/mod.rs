@@ -363,7 +363,12 @@ impl TaskRunner {
                         "error": parsed.response.error,
                         "learnings": parsed.response.learnings,
                         "delegations": parsed.response.delegations.iter()
-                            .map(|d| serde_json::json!({"title": d.title, "body": d.body}))
+                            .map(|d| serde_json::json!({
+                                "title": &d.title,
+                                "body": &d.body,
+                                "labels": &d.labels,
+                                "suggested_agent": &d.suggested_agent,
+                            }))
                             .collect::<Vec<_>>(),
                     })
                 }
@@ -1024,6 +1029,17 @@ impl TaskRunner {
             // Build labels: status:new + any labels from the delegation
             let mut labels = delegation.labels.clone();
             labels.push("status:new".to_string());
+            if let Some(agent) = delegation
+                .suggested_agent
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                let agent_label = format!("agent:{agent}");
+                if !labels.iter().any(|label| label == &agent_label) {
+                    labels.push(agent_label);
+                }
+            }
 
             // Build child body with delegation reference
             let child_body = format!(
@@ -1042,6 +1058,16 @@ impl TaskRunner {
                         title = delegation.title,
                         "created delegated subtask"
                     );
+                    if let Err(e) =
+                        sidecar::set(&child_id.0, &[format!("parent_id={}", parent_id.0)])
+                    {
+                        tracing::warn!(
+                            parent = parent_id.0,
+                            child = child_id.0,
+                            error = ?e,
+                            "failed to store parent_id in child sidecar"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
