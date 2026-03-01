@@ -259,6 +259,21 @@ async fn link_issue_to_branch(dir: &Path, task_id: &str, branch: &str) {
             tracing::debug!(task_id, branch, err = %e, "failed to run gh issue develop");
         }
     }
+
+    // gh issue develop sometimes creates a corrupt [branch ""] config entry — clean it up
+    cleanup_empty_branch_config(dir).await;
+}
+
+/// Remove corrupt `[branch ""]` entries from git config.
+///
+/// `gh issue develop` sometimes creates these as a side effect,
+/// which corrupts git config and blocks pushes.
+pub async fn cleanup_empty_branch_config(dir: &Path) {
+    let _ = Command::new("git")
+        .args(["config", "--remove-section", "branch."])
+        .current_dir(dir)
+        .output_with_context()
+        .await;
 }
 
 /// Get the current branch name.

@@ -317,6 +317,9 @@ pub async fn setup_worktree(
         }
     }
 
+    // gh issue develop sometimes creates corrupt [branch ""] config entries — clean up
+    super::git_ops::cleanup_empty_branch_config(&main_dir).await;
+
     tracing::info!(
         task_id,
         worktree = %worktree_dir.display(),
