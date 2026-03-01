@@ -930,6 +930,7 @@ impl GhHttp {
     }
 
     /// Re-run failed jobs for a workflow run.
+    #[allow(dead_code)]
     pub async fn rerun_failed_jobs(&self, repo: &str, run_id: u64) -> anyhow::Result<()> {
         let url = format!("{GITHUB_API}/repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs");
         self.post_json_raw(&url, &serde_json::json!({})).await?;
@@ -937,6 +938,7 @@ impl GhHttp {
     }
 
     /// Get the latest workflow run for a branch.
+    #[allow(dead_code)]
     pub async fn get_latest_run_for_branch(
         &self,
         repo: &str,
