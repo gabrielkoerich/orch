@@ -10,7 +10,7 @@ jobs:
     task:
       title: 'Code review: orch'
       body: |
-        Review the orch codebase (src/**/*.rs, scripts/*.sh, prompts/*.md, justfile, Formula). Look for: bugs, dead code, missing error handling, performance issues, code duplication, inconsistencies, outdated comments.
+        Review the orch codebase (src/**/*.rs, prompts/*.md, justfile, Formula, tests). Look for: bugs, dead code, missing error handling, performance issues, code duplication, inconsistencies, outdated comments.
 
         Suggest concrete improvements with file paths and line numbers. Check test coverage gaps. Do NOT make changes — only report findings.
 
@@ -24,6 +24,18 @@ jobs:
         - Do not create issues for edge cases or workarounds. Fix root causes only.
 
         Prioritize fixes that improve reliability and agent success rate.
+
+        CRITICAL: When your task produces code or documentation changes:
+
+        Make sure you're working in a new branch, not at main.
+        Commit your changes: git add -A && git commit -m "description"
+        Push your branch: git push -u origin {{BRANCH_NAME}}
+        Create a PR: gh pr create --base main --head {{BRANCH_NAME}} --body "Closes #{{GH_ISSUE_NUMBER}}"
+        The PR must be created before you finish — do not leave this for later. Include "Closes #{{GH_ISSUE_NUMBER}}" in the PR body to link it to the issue.
+
+        Post a comment on the linked GitHub issue explaining what you're doing before starting, and what you found/changed when done. Include the worktree path (your current working directory) in the comment.
+        If you encounter errors or blockers, explain what you tried and what went wrong in your output JSON reason field. Be specific — "permission denied" is not enough, include the command and error message.
+        Do NOT mark status as "done" unless you have produced a visible result: committed code, posted a response comment, or completed the action the task requested. Pure research with no output is "in_progress".
       labels:
         - review
         - self-improvement
@@ -57,6 +69,18 @@ jobs:
         - Do not forget to tell the agents to update the PLAN.md with the things that are already implemented, make a TODO list if doesn't exist.
 
         Prioritize improvements that makes the development agile.
+
+        CRITICAL: When your task produces code or documentation changes:
+
+        Make sure you're working in a new branch, not at main.
+        Commit your changes: git add -A && git commit -m "description"
+        Push your branch: git push -u origin {{BRANCH_NAME}}
+        Create a PR: gh pr create --base main --head {{BRANCH_NAME}} --body "Closes #{{GH_ISSUE_NUMBER}}"
+        The PR must be created before you finish — do not leave this for later. Include "Closes #{{GH_ISSUE_NUMBER}}" in the PR body to link it to the issue.
+
+        Post a comment on the linked GitHub issue explaining what you're doing before starting, and what you found/changed when done. Include the worktree path (your current working directory) in the comment.
+        If you encounter errors or blockers, explain what you tried and what went wrong in your output JSON reason field. Be specific — "permission denied" is not enough, include the command and error message.
+        Do NOT mark status as "done" unless you have produced a visible result: committed code, posted a response comment, or completed the action the task requested. Pure research with no output is "in_progress".
       labels:
         - review
         - self-improvement
@@ -66,4 +90,118 @@ jobs:
     enabled: true
     last_run: "2026-02-25T18:00:23Z"
     last_task_status: done
+    active_task_id: ""
+
+  - id: morning-review
+    type: task
+    schedule: 0 10 * * *
+    task:
+      title: 'Daily morning review: improvements and optimization'
+      body: |
+        Morning check-in for orchestrator maintenance and optimization.
+
+        FIRST: Run `git log --since="24 hours ago" --oneline` to see recent changes.
+        Do NOT file issues for problems that have already been resolved.
+
+        SECOND: Read the most recent post in `./docs/content/posts` to understand the current state and recent context.
+
+        THIRD: Look at the most recent evening retrospective task (label: job:evening-retrospective, status: done).
+        Read its summary to see what was identified yesterday — carry forward any unfinished items or priorities.
+
+        When writing your summary post, save it to `./docs/content/posts/morning-review-YYYY-MM-DD.md` (use today's UTC date).
+
+        Then check:
+        1) Are any tasks stuck or failing repeatedly? Diagnose and fix root causes.
+        2) Are there test gaps or flaky tests? Add missing tests.
+        3) Are there error patterns in logs (~/.orch/**.log)?
+        4) Can any scripts be simplified or optimized?
+        5) Check GitHub issues for owner feedback that needs attention.
+
+        When creating issues:
+        - ALWAYS trace symptoms to their root cause. Create ONE task for the root cause, not one per symptom.
+        - Check existing open issues first (`gh issue list --state open`). Do not create duplicates.
+        - Maximum 2-3 high-quality tasks. Fewer is better. Each must be actionable with a clear fix.
+        - Do not create cleanup/janitorial tasks — just do the cleanup yourself or flag it in the summary.
+        - Do not create tasks for edge cases or workarounds. Fix root causes only.
+
+        Prioritize fixes that improve reliability and agent success rate.
+        If the evening retro flagged specific issues, tackle those first.
+
+        CRITICAL: When your task produces code or documentation changes:
+
+        Make sure you're working in a new branch, not at main.
+        Commit your changes: git add -A && git commit -m "description"
+        Push your branch: git push -u origin {{BRANCH_NAME}}
+        Create a PR: gh pr create --base main --head {{BRANCH_NAME}} --body "Closes #{{GH_ISSUE_NUMBER}}"
+        The PR must be created before you finish — do not leave this for later. Include "Closes #{{GH_ISSUE_NUMBER}}" in the PR body to link it to the issue.
+
+        Post a comment on the linked GitHub issue explaining what you're doing before starting, and what you found/changed when done. Include the worktree path (your current working directory) in the comment.
+        If you encounter errors or blockers, explain what you tried and what went wrong in your output JSON reason field. Be specific — "permission denied" is not enough, include the command and error message.
+        Do NOT mark status as "done" unless you have produced a visible result: committed code, posted a response comment, or completed the action the task requested. Pure research with no output is "in_progress".
+      labels:
+        - maintenance
+        - self-improvement
+      agent: null
+    command: null
+    dir: /Users/gb/Projects/orchestrator
+    enabled: true
+    last_run: "2026-02-28T10:05:21Z"
+    last_task_status: needs_review
+    active_task_id: ""
+  - id: evening-retrospective
+    type: task
+    schedule: 0 21 * * *
+    task:
+      title: 'Daily evening retrospective: optimize agent workflows'
+      body: |
+        Evening retrospective of today's orchestrator activity.
+
+        FIRST: Run `git log --since="12 hours ago" --oneline` to see what was already fixed today.
+        Do NOT file issues for problems that have already been resolved by today's commits.
+
+        SECOND: Read the most recent post in `./docs/content/posts` to understand the current state and recent context.
+
+        THIRD: Look at today's morning review task (label: job:morning-review, status: done).
+        Read its summary to see what was planned — acknowledge what got done and what didn't.
+
+        When writing your summary post, save it to `./docs/content/posts/evening-retrospective-YYYY-MM-DD.md` (use today's UTC date).
+
+        Then check:
+        1) Which tasks completed today? What went well?
+        2) Which tasks failed or needed retries? Why?
+        3) Are agent prompts effective or do they need tuning? Review prompts/*.md for clarity.
+        4) Is the routing accurate? Check route decisions vs outcomes.
+        5) Are there performance bottlenecks (slow syncs, lock contention, API rate limits)?
+
+        When creating issues:
+        - ALWAYS trace symptoms to their root cause. Create ONE task for the root cause, not one per symptom.
+        - Check existing open issues first (`gh issue list --state open`). Do not create duplicates.
+        - Check today's git log. Do not file issues for problems already fixed.
+        - Maximum 2-3 high-quality tasks. Fewer is better. Each must be actionable with a clear fix.
+        - Do not create cleanup/janitorial tasks (close stale issues, etc.) — flag them in the summary instead.
+        - Do not create tasks for edge cases or workarounds. Fix root causes only.
+
+        Summarize clearly what tomorrow's morning check-in should tackle first.
+        Focus on making tomorrow's agents more effective.
+
+        CRITICAL: When your task produces code or documentation changes:
+
+        Make sure you're working in a new branch, not at main.
+        Commit your changes: git add -A && git commit -m "description"
+        Push your branch: git push -u origin {{BRANCH_NAME}}
+        Create a PR: gh pr create --base main --head {{BRANCH_NAME}} --body "Closes #{{GH_ISSUE_NUMBER}}"
+        The PR must be created before you finish — do not leave this for later. Include "Closes #{{GH_ISSUE_NUMBER}}" in the PR body to link it to the issue.
+
+        Post a comment on the linked GitHub issue explaining what you're doing before starting, and what you found/changed when done. Include the worktree path (your current working directory) in the comment.
+        If you encounter errors or blockers, explain what you tried and what went wrong in your output JSON reason field. Be specific — "permission denied" is not enough, include the command and error message.
+        Do NOT mark status as "done" unless you have produced a visible result: committed code, posted a response comment, or completed the action the task requested. Pure research with no output is "in_progress".
+      labels:
+        - maintenance
+        - self-improvement
+      agent: null
+    command: null
+    dir: /Users/gb/Projects/orch
+    enabled: true
+    last_run: "2026-02-27T21:02:33Z"
+    last_task_status: "done"
     active_task_id: ""
