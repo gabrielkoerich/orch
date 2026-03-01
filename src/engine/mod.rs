@@ -78,7 +78,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             tick_interval: std::time::Duration::from_secs(10),
-            sync_interval: std::time::Duration::from_secs(120),
+            sync_interval: std::time::Duration::from_secs(45),
             webhook_health_check_interval: Some(std::time::Duration::from_secs(60)),
             max_parallel: 4,
             stuck_timeout: 1800,
@@ -2605,7 +2605,7 @@ mod tests {
     fn engine_config_defaults() {
         let config = EngineConfig::default();
         assert_eq!(config.tick_interval, std::time::Duration::from_secs(10));
-        assert_eq!(config.sync_interval, std::time::Duration::from_secs(120));
+        assert_eq!(config.sync_interval, std::time::Duration::from_secs(45));
         assert_eq!(config.max_parallel, 4);
         assert_eq!(config.stuck_timeout, 1800);
     }
@@ -2615,7 +2615,7 @@ mod tests {
         // Without config files, from_config() should return defaults
         let config = EngineConfig::from_config();
         assert_eq!(config.tick_interval, std::time::Duration::from_secs(10));
-        assert_eq!(config.sync_interval, std::time::Duration::from_secs(120));
+        assert_eq!(config.sync_interval, std::time::Duration::from_secs(45));
         assert_eq!(config.max_parallel, 4);
         assert_eq!(config.stuck_timeout, 1800);
     }
