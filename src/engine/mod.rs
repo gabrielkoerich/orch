@@ -236,212 +236,15 @@ pub async fn serve() -> anyhow::Result<()> {
         capture.start().await;
     });
 
-    // Initialize channel registry
-    let mut channel_registry = ChannelRegistry::new();
+    // Initialize and start notification channels
+    let (channel_registry, channel_receivers) = setup_channels(&transport).await;
+    spawn_channel_message_handlers(channel_receivers, &transport);
+    spawn_notification_dispatcher(&transport, &channel_registry);
 
-    // Try to initialize Telegram channel
-    if let Ok(token) = crate::config::get("channels.telegram.bot_token") {
-        if !token.is_empty() {
-            let chat_id = crate::config::get("channels.telegram.chat_id").ok();
-            let telegram = TelegramChannel::new(token, chat_id);
-            if let Err(e) = telegram.health_check().await {
-                tracing::warn!(?e, "telegram channel health check failed, skipping");
-            } else {
-                channel_registry.register(Box::new(telegram));
-                tracing::info!("telegram channel registered");
-            }
-        }
-    }
-
-    // Try to initialize Discord channel
-    if let Ok(token) = crate::config::get("channels.discord.bot_token") {
-        if !token.is_empty() {
-            let channel_id = crate::config::get("channels.discord.channel_id").ok();
-            let discord = DiscordChannel::new(token, channel_id);
-            if let Err(e) = discord.health_check().await {
-                tracing::warn!(?e, "discord channel health check failed, skipping");
-            } else {
-                channel_registry.register(Box::new(discord));
-                tracing::info!("discord channel registered");
-            }
-        }
-    }
-
-    // Initialize tmux channel with transport for output streaming
-    let tmux_channel = TmuxChannel::with_transport(transport.clone());
-    channel_registry.register(Box::new(tmux_channel));
-    tracing::info!("tmux channel registered");
-
-    // Start all channels and collect their message receivers
-    let mut channel_receivers: Vec<tokio::sync::mpsc::Receiver<IncomingMessage>> = Vec::new();
-    for channel in channel_registry.iter() {
-        match channel.start().await {
-            Ok(rx) => {
-                tracing::info!(channel = channel.name(), "channel started");
-                channel_receivers.push(rx);
-            }
-            Err(e) => {
-                tracing::warn!(channel = channel.name(), ?e, "failed to start channel");
-            }
-        }
-    }
-
-    // Wrap channel registry in Arc for shared access (notification dispatcher needs it)
-    let channel_registry = Arc::new(channel_registry);
-
-    // Spawn tasks to handle incoming channel messages (if any channels are active)
-    let transport_for_messages = transport.clone();
-    for mut rx in channel_receivers {
-        let transport = transport_for_messages.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received message from channel");
-
-                // Route the message through transport
-                match transport.route(&msg).await {
-                    crate::channels::transport::MessageRoute::TaskSession { task_id } => {
-                        tracing::debug!(task_id = %task_id, "message routed to existing session");
-                    }
-                    crate::channels::transport::MessageRoute::Command { raw } => {
-                        tracing::debug!(command = %raw, "message is a command");
-                    }
-                    crate::channels::transport::MessageRoute::NewTask => {
-                        tracing::debug!("message would create new task");
-                    }
-                }
-            }
-        });
-    }
-
-    // Spawn notification dispatcher — reads task completion notifications
-    // from transport and broadcasts to all configured channels.
-    {
-        let mut notification_rx = transport.subscribe_notifications();
-        let channels = channel_registry.clone();
-        tokio::spawn(async move {
-            loop {
-                match notification_rx.recv().await {
-                    Ok(notification) => {
-                        let level = NotificationLevel::from_config();
-                        if !level.should_notify(&notification.status) {
-                            tracing::debug!(
-                                task_id = %notification.task_id,
-                                status = %notification.status,
-                                "notification suppressed by level={:?}",
-                                level
-                            );
-                            continue;
-                        }
-
-                        tracing::info!(
-                            task_id = %notification.task_id,
-                            status = %notification.status,
-                            "broadcasting notification to channels"
-                        );
-
-                        for channel in channels.iter() {
-                            let (body, should_send) = match channel.name() {
-                                "telegram" => (notification.format_telegram(), true),
-                                "discord" => (notification.format_discord(), true),
-                                // GitHub is already handled by backend.post_comment()
-                                // tmux doesn't need task completion notifications
-                                _ => (String::new(), false),
-                            };
-
-                            if !should_send {
-                                continue;
-                            }
-
-                            let msg = OutgoingMessage {
-                                thread_id: notification.task_id.clone(),
-                                body,
-                                reply_to: None,
-                                metadata: serde_json::json!({}),
-                            };
-
-                            if let Err(e) = channel.send(&msg).await {
-                                tracing::warn!(
-                                    channel = channel.name(),
-                                    task_id = %notification.task_id,
-                                    ?e,
-                                    "failed to send notification"
-                                );
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(missed = n, "notification receiver lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::debug!("notification channel closed");
-                        break;
-                    }
-                }
-            }
-        });
-        tracing::info!("notification dispatcher started");
-    }
-
-    // Notify used by webhook events to wake up the engine tick immediately
+    // Initialize webhook server
     let webhook_notify = Arc::new(Notify::new());
-
-    // Track webhook state for health checks and fallback.
-    // When webhooks are disabled, `in_fallback_mode` stays true so sync
-    // uses the faster fallback interval for polling.
-    let webhook_port: Option<u16>;
-    let mut webhook_healthy: bool;
+    let mut webhook_state = setup_webhook(&project_engines, &transport, &webhook_notify).await;
     let mut last_webhook_health_check = std::time::Instant::now();
-    // Start webhook server if configured
-    let webhook_enabled = crate::config::get("webhook.enabled")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-
-    if webhook_enabled {
-        let port: u16 = crate::config::get("webhook.port")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8080);
-        webhook_port = Some(port);
-        let secret = crate::config::get("webhook.secret").unwrap_or_default();
-        let webhook_repo = project_engines
-            .first()
-            .map(|e| e.repo.clone())
-            .unwrap_or_default();
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
-
-        // Spawn the HTTP server (runs until shutdown)
-        tokio::spawn(async move {
-            if let Err(e) = start_webhook_server(port, secret, webhook_repo, tx).await {
-                tracing::error!(?e, "webhook server failed");
-            }
-        });
-
-        // Spawn the message forwarding task (reads from webhook channel)
-        let notify = webhook_notify.clone();
-        let transport_for_webhook = transport.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                tracing::info!(
-                    channel = %msg.channel,
-                    thread = %msg.thread_id,
-                    event = %msg.metadata.get("event").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                    action = %msg.metadata.get("action").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                    "webhook event received, triggering immediate tick"
-                );
-                let _ = transport_for_webhook.route(&msg).await;
-                // Wake up the engine tick immediately instead of waiting up to 10s
-                notify.notify_one();
-            }
-        });
-
-        webhook_healthy = true;
-        tracing::info!(port, "webhook server started");
-    } else {
-        webhook_port = None;
-        webhook_healthy = false;
-        tracing::info!("webhook server disabled, using polling fallback mode");
-    }
 
     // Agent router (selects agent + model per task) - shared across projects
     let router = Arc::new(RwLock::new(Router::from_config()));
@@ -564,20 +367,18 @@ pub async fn serve() -> anyhow::Result<()> {
                 }
 
                 // Periodic webhook health check
-                if webhook_enabled {
+                if let Some(port) = webhook_state.port {
                     let health_check_interval = config.webhook_health_check_interval
                         .unwrap_or(std::time::Duration::from_secs(60));
 
                     if last_webhook_health_check.elapsed() >= health_check_interval {
-                        if let Some(port) = webhook_port {
-                            let health = crate::channels::github::check_webhook_health(port).await;
-                            if health != webhook_healthy {
-                                webhook_healthy = health;
-                                if webhook_healthy {
-                                    tracing::info!(port, "webhook health restored");
-                                } else {
-                                    tracing::warn!(port, "webhook health check failed");
-                                }
+                        let health = crate::channels::github::check_webhook_health(port).await;
+                        if health != webhook_state.healthy {
+                            webhook_state.healthy = health;
+                            if webhook_state.healthy {
+                                tracing::info!(port, "webhook health restored");
+                            } else {
+                                tracing::warn!(port, "webhook health check failed");
                             }
                         }
                         last_webhook_health_check = std::time::Instant::now();
@@ -722,15 +523,45 @@ async fn tick(
     let _tick_span = tracing::info_span!("engine.tick").entered();
 
     // Phase 1: Check active tmux sessions for completions
-    let _phase1 = tracing::info_span!("engine.tick.phase1.sessions").entered();
+    check_session_completions(tmux, repo, capture).await;
+
+    // Phase 2: Recover stuck tasks
+    recover_stuck_tasks(backend, tmux, repo, task_manager, config).await?;
+
+    // Phase 3a: Route new tasks
+    route_new_tasks(backend, task_manager, router).await?;
+
+    // Phase 3b: Dispatch routed tasks
+    dispatch_routed_tasks(
+        backend, tmux, repo, runner, capture, semaphore,
+        router_arc, task_manager, weight_tx, transport,
+    ).await?;
+
+    // Phase 4: Unblock parents (blocked tasks whose children are all done)
+    unblock_parent_tasks(backend, task_manager).await?;
+
+    // Phase 5: Check job schedules
+    if let Err(e) = jobs::tick(jobs_path, backend, db).await {
+        tracing::error!(?e, "job scheduler tick failed");
+    }
+
+    Ok(())
+}
+
+/// Phase 1: Check active tmux sessions for completions.
+///
+/// Monitors the tmux session snapshot and cleans up completed sessions.
+async fn check_session_completions(
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    capture: &Arc<CaptureService>,
+) {
+    let _span = tracing::info_span!("engine.tick.phase1.sessions").entered();
     let session_snapshot = tmux.snapshot().await;
     for (task_id, active) in &session_snapshot {
         if !active {
             tracing::info!(task_id, "session completed, collecting results");
-            // Unregister from capture service
             capture.unregister_session(task_id).await;
-            // The runner handles status updates and GitHub comment posting.
-            // We just clean up the session.
             let session_name = tmux.session_name(repo, task_id);
             if let Err(e) = tmux.kill_session(&session_name).await {
                 tracing::debug!(
@@ -741,10 +572,21 @@ async fn tick(
             }
         }
     }
-    drop(_phase1);
+}
 
-    // Phase 2: Recover stuck tasks
-    let _phase2 = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
+/// Phase 2: Recover tasks stuck in `in_progress` without an active session.
+///
+/// Checks each in-progress task for a corresponding tmux session. If no session
+/// exists and the task has been stuck longer than `config.stuck_timeout`, resets
+/// it to `new` for re-routing.
+async fn recover_stuck_tasks(
+    backend: &Arc<dyn ExternalBackend>,
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    task_manager: &Arc<TaskManager>,
+    config: &EngineConfig,
+) -> anyhow::Result<()> {
+    let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
     let in_progress = task_manager
         .list_external_by_status(Status::InProgress)
         .await?;
@@ -753,7 +595,6 @@ async fn tick(
         let has_session = tmux.session_exists(&session_name).await;
 
         if !has_session {
-            // No tmux session — check if stuck
             let updated = match chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
                 Ok(dt) => dt.with_timezone(&chrono::Utc),
                 Err(e) => {
@@ -774,7 +615,6 @@ async fn tick(
                     age_mins = age.num_minutes(),
                     "recovering stuck task → new"
                 );
-                // Remove stale agent label so the LLM router re-routes properly
                 for label in &task.labels {
                     if label.starts_with("agent:") {
                         backend.remove_label(&task.id, label).await.ok();
@@ -816,10 +656,19 @@ async fn tick(
             }
         }
     }
-    drop(_phase2);
+    Ok(())
+}
 
-    // Phase 3a: Route new tasks (includes issues with status:new or no status:* label)
-    let _phase3a = tracing::info_span!("engine.tick.phase3a.route").entered();
+/// Phase 3a: Route new tasks via the LLM router.
+///
+/// Finds tasks with `status:new` (excluding `no-agent` labeled), routes them
+/// to an agent, and transitions to `status:routed`.
+async fn route_new_tasks(
+    backend: &Arc<dyn ExternalBackend>,
+    task_manager: &Arc<TaskManager>,
+    router: &Router,
+) -> anyhow::Result<()> {
+    let _span = tracing::info_span!("engine.tick.phase3a.route").entered();
     let new_tasks = task_manager.list_routable().await?;
     let routable: Vec<&ExternalTask> = new_tasks
         .iter()
@@ -830,12 +679,10 @@ async fn tick(
         let _task_span = tracing::info_span!("engine.route", task_id = %task.id.0).entered();
         match router.route(task).await {
             Ok(result) => {
-                // Store route result in sidecar
                 if let Err(e) = router.store_route_result(&task.id.0, &result) {
                     tracing::warn!(task_id = task.id.0, ?e, "failed to store route result");
                 }
 
-                // Add agent and complexity labels (additive — does not remove existing labels)
                 let labels = vec![
                     format!("agent:{}", result.agent),
                     format!("complexity:{}", result.complexity),
@@ -844,7 +691,6 @@ async fn tick(
                     tracing::warn!(task_id = task.id.0, ?e, "failed to set routing labels");
                 }
 
-                // Transition to routed
                 if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
                     tracing::warn!(task_id = task.id.0, ?e, "failed to set status:routed");
                 }
@@ -866,12 +712,28 @@ async fn tick(
             }
         }
     }
-    drop(_phase3a);
+    Ok(())
+}
 
-    // Phase 3b: Dispatch routed tasks.
-    // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
-    // but we keep this filter as defense-in-depth.
-    let _phase3b = tracing::info_span!("engine.tick.phase3b.dispatch").entered();
+/// Phase 3b: Dispatch routed tasks by spawning agent runners.
+///
+/// Acquires semaphore permits for concurrency control, marks tasks as
+/// `in_progress`, and spawns each task in a tokio task with its own
+/// tmux session.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_routed_tasks(
+    backend: &Arc<dyn ExternalBackend>,
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    runner: &Arc<TaskRunner>,
+    capture: &Arc<CaptureService>,
+    semaphore: &Arc<Semaphore>,
+    router_arc: &Arc<RwLock<Router>>,
+    task_manager: &Arc<TaskManager>,
+    weight_tx: &mpsc::Sender<WeightSignal>,
+    transport: &Arc<Transport>,
+) -> anyhow::Result<()> {
+    let _span = tracing::info_span!("engine.tick.phase3b.dispatch").entered();
     let routed_tasks = task_manager.list_external_by_status(Status::Routed).await?;
     let dispatchable: Vec<&ExternalTask> = routed_tasks
         .iter()
@@ -883,13 +745,11 @@ async fn tick(
     }
 
     for task in dispatchable {
-        // Check if already running (has active session)
         let session_name = tmux.session_name(repo, &task.id.0);
         if tmux.session_exists(&session_name).await {
             continue;
         }
 
-        // Try to acquire a slot
         let permit = match semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -898,7 +758,6 @@ async fn tick(
             }
         };
 
-        // Mark in_progress BEFORE spawning to prevent double dispatch.
         let task_id = task.id.0.clone();
         if let Err(e) = backend.update_status(&task.id, Status::InProgress).await {
             tracing::error!(task_id, ?e, "failed to set in_progress, skipping dispatch");
@@ -906,11 +765,9 @@ async fn tick(
             continue;
         }
 
-        // Register session for capture
         let session_name = tmux.session_name(repo, &task_id);
         capture.register_session(&task_id, &session_name).await;
 
-        // Dispatch task
         let runner = runner.clone();
         let backend = backend.clone();
         let tmux = tmux.clone();
@@ -922,7 +779,6 @@ async fn tick(
         let weight_tx = weight_tx.clone();
         let repo_owned = repo.to_string();
 
-        // Load routing result from sidecar (stored during Phase 3a)
         let route_result = get_route_result(&task_id).ok();
         let agent_name = route_result
             .as_ref()
@@ -930,8 +786,6 @@ async fn tick(
             .unwrap_or_else(|| "claude".to_string());
 
         tokio::spawn(async move {
-            // Note: Using tracing::info_span directly without holding across await
-            // to avoid Send issues with EnteredSpan
             tracing::info!(task_id, "dispatching task");
 
             let dispatch_start = std::time::Instant::now();
@@ -942,10 +796,8 @@ async fn tick(
             {
                 Ok(signal) => {
                     tracing::info!(task_id, "task runner completed");
-                    // Send weight signal back to the router
                     let _ = weight_tx.send(signal).await;
 
-                    // Send task completion notification
                     let status = sidecar::get(&task_id, "status").unwrap_or_default();
                     let summary = sidecar::get(&task_id, "summary").unwrap_or_default();
                     let duration = dispatch_start.elapsed().as_secs_f64();
@@ -959,13 +811,11 @@ async fn tick(
                         summary: summary.clone(),
                     });
 
-                    // Trigger review agent for in_review tasks (PR exists, needs review)
                     tracing::debug!(task_id, %status, "checking review trigger");
                     if status == "in_review" {
                         let enable_review = config::get("workflow.enable_review_agent")
                             .map(|v| v != "false")
                             .unwrap_or(true);
-                        // Guard against duplicate review spawns
                         let already_reviewing = sidecar::get(&task_id, "review_started")
                             .map(|v| v == "true")
                             .unwrap_or(false);
@@ -1016,7 +866,6 @@ async fn tick(
                         );
                     }
 
-                    // Send error notification
                     let duration = dispatch_start.elapsed().as_secs_f64();
                     transport.push_notification(TaskNotification {
                         task_id: task_id.clone(),
@@ -1029,15 +878,21 @@ async fn tick(
                 }
             }
 
-            // Unregister session from capture
             capture.unregister_session(&task_id_for_cleanup).await;
-
-            // Release the semaphore permit
             drop(permit);
         });
     }
+    Ok(())
+}
 
-    // Phase 4: Unblock parents (blocked tasks whose children are all done)
+/// Phase 4: Unblock parent tasks whose children are all done.
+///
+/// Scans `status:blocked` tasks, checks if all sub-issues are `status:done`,
+/// and transitions the parent back to `status:new` for re-routing.
+async fn unblock_parent_tasks(
+    backend: &Arc<dyn ExternalBackend>,
+    task_manager: &Arc<TaskManager>,
+) -> anyhow::Result<()> {
     let blocked = task_manager
         .list_external_by_status(Status::Blocked)
         .await?;
@@ -1050,12 +905,10 @@ async fn tick(
             }
         };
 
-        // No children means nothing to wait on — skip (may be blocked for other reasons)
         if children.is_empty() {
             continue;
         }
 
-        // Check if every child is done
         let mut all_done = true;
         for child_id in &children {
             match backend.get_task(child_id).await {
@@ -1089,12 +942,6 @@ async fn tick(
             }
         }
     }
-
-    // Phase 5: Check job schedules
-    if let Err(e) = jobs::tick(jobs_path, backend, db).await {
-        tracing::error!(?e, "job scheduler tick failed");
-    }
-
     Ok(())
 }
 
@@ -1182,8 +1029,237 @@ async fn sync_tick(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// serve() setup helpers
+// ---------------------------------------------------------------------------
 
+/// Webhook server state returned by `setup_webhook()`.
+struct WebhookState {
+    /// Listening port (None if webhooks are disabled).
+    port: Option<u16>,
+    /// Whether the last health check succeeded.
+    healthy: bool,
+}
 
+/// Initialize the channel registry with configured notification channels.
+///
+/// Registers Telegram, Discord, and tmux channels based on configuration,
+/// starts each channel, and returns the registry with message receivers.
+async fn setup_channels(
+    transport: &Arc<Transport>,
+) -> (Arc<ChannelRegistry>, Vec<mpsc::Receiver<IncomingMessage>>) {
+    let mut channel_registry = ChannelRegistry::new();
+
+    // Try to initialize Telegram channel
+    if let Ok(token) = crate::config::get("channels.telegram.bot_token") {
+        if !token.is_empty() {
+            let chat_id = crate::config::get("channels.telegram.chat_id").ok();
+            let telegram = TelegramChannel::new(token, chat_id);
+            if let Err(e) = telegram.health_check().await {
+                tracing::warn!(?e, "telegram channel health check failed, skipping");
+            } else {
+                channel_registry.register(Box::new(telegram));
+                tracing::info!("telegram channel registered");
+            }
+        }
+    }
+
+    // Try to initialize Discord channel
+    if let Ok(token) = crate::config::get("channels.discord.bot_token") {
+        if !token.is_empty() {
+            let channel_id = crate::config::get("channels.discord.channel_id").ok();
+            let discord = DiscordChannel::new(token, channel_id);
+            if let Err(e) = discord.health_check().await {
+                tracing::warn!(?e, "discord channel health check failed, skipping");
+            } else {
+                channel_registry.register(Box::new(discord));
+                tracing::info!("discord channel registered");
+            }
+        }
+    }
+
+    // Initialize tmux channel with transport for output streaming
+    let tmux_channel = TmuxChannel::with_transport(transport.clone());
+    channel_registry.register(Box::new(tmux_channel));
+    tracing::info!("tmux channel registered");
+
+    // Start all channels and collect their message receivers
+    let mut channel_receivers: Vec<mpsc::Receiver<IncomingMessage>> = Vec::new();
+    for channel in channel_registry.iter() {
+        match channel.start().await {
+            Ok(rx) => {
+                tracing::info!(channel = channel.name(), "channel started");
+                channel_receivers.push(rx);
+            }
+            Err(e) => {
+                tracing::warn!(channel = channel.name(), ?e, "failed to start channel");
+            }
+        }
+    }
+
+    (Arc::new(channel_registry), channel_receivers)
+}
+
+/// Spawn tasks to forward incoming channel messages through the transport layer.
+fn spawn_channel_message_handlers(
+    receivers: Vec<mpsc::Receiver<IncomingMessage>>,
+    transport: &Arc<Transport>,
+) {
+    for mut rx in receivers {
+        let transport = transport.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received message from channel");
+
+                match transport.route(&msg).await {
+                    crate::channels::transport::MessageRoute::TaskSession { task_id } => {
+                        tracing::debug!(task_id = %task_id, "message routed to existing session");
+                    }
+                    crate::channels::transport::MessageRoute::Command { raw } => {
+                        tracing::debug!(command = %raw, "message is a command");
+                    }
+                    crate::channels::transport::MessageRoute::NewTask => {
+                        tracing::debug!("message would create new task");
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Spawn the notification dispatcher that broadcasts task events to channels.
+///
+/// Reads task completion notifications from the transport layer and forwards
+/// them to Telegram, Discord, etc. based on the configured notification level.
+fn spawn_notification_dispatcher(
+    transport: &Arc<Transport>,
+    channels: &Arc<ChannelRegistry>,
+) {
+    let mut notification_rx = transport.subscribe_notifications();
+    let channels = channels.clone();
+    tokio::spawn(async move {
+        loop {
+            match notification_rx.recv().await {
+                Ok(notification) => {
+                    let level = NotificationLevel::from_config();
+                    if !level.should_notify(&notification.status) {
+                        tracing::debug!(
+                            task_id = %notification.task_id,
+                            status = %notification.status,
+                            "notification suppressed by level={:?}",
+                            level
+                        );
+                        continue;
+                    }
+
+                    tracing::info!(
+                        task_id = %notification.task_id,
+                        status = %notification.status,
+                        "broadcasting notification to channels"
+                    );
+
+                    for channel in channels.iter() {
+                        let (body, should_send) = match channel.name() {
+                            "telegram" => (notification.format_telegram(), true),
+                            "discord" => (notification.format_discord(), true),
+                            _ => (String::new(), false),
+                        };
+
+                        if !should_send {
+                            continue;
+                        }
+
+                        let msg = OutgoingMessage {
+                            thread_id: notification.task_id.clone(),
+                            body,
+                            reply_to: None,
+                            metadata: serde_json::json!({}),
+                        };
+
+                        if let Err(e) = channel.send(&msg).await {
+                            tracing::warn!(
+                                channel = channel.name(),
+                                task_id = %notification.task_id,
+                                ?e,
+                                "failed to send notification"
+                            );
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(missed = n, "notification receiver lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::debug!("notification channel closed");
+                    break;
+                }
+            }
+        }
+    });
+    tracing::info!("notification dispatcher started");
+}
+
+/// Start the webhook server if configured.
+///
+/// When enabled, spawns the HTTP server and a message forwarding task that
+/// wakes the engine tick immediately on incoming events.
+async fn setup_webhook(
+    project_engines: &[ProjectEngine],
+    transport: &Arc<Transport>,
+    webhook_notify: &Arc<Notify>,
+) -> WebhookState {
+    let webhook_enabled = crate::config::get("webhook.enabled")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    if !webhook_enabled {
+        tracing::info!("webhook server disabled, using polling fallback mode");
+        return WebhookState {
+            port: None,
+            healthy: false,
+        };
+    }
+
+    let port: u16 = crate::config::get("webhook.port")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8080);
+    let secret = crate::config::get("webhook.secret").unwrap_or_default();
+    let webhook_repo = project_engines
+        .first()
+        .map(|e| e.repo.clone())
+        .unwrap_or_default();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
+
+    tokio::spawn(async move {
+        if let Err(e) = start_webhook_server(port, secret, webhook_repo, tx).await {
+            tracing::error!(?e, "webhook server failed");
+        }
+    });
+
+    let notify = webhook_notify.clone();
+    let transport_for_webhook = transport.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            tracing::info!(
+                channel = %msg.channel,
+                thread = %msg.thread_id,
+                event = %msg.metadata.get("event").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                action = %msg.metadata.get("action").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                "webhook event received, triggering immediate tick"
+            );
+            let _ = transport_for_webhook.route(&msg).await;
+            notify.notify_one();
+        }
+    });
+
+    tracing::info!(port, "webhook server started");
+    WebhookState {
+        port: Some(port),
+        healthy: true,
+    }
+}
 
 
 
