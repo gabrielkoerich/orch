@@ -321,17 +321,22 @@ pub fn load_pr_review_context(task_id: &str) -> String {
 }
 
 /// Build the full task context.
-#[allow(dead_code)]
 pub async fn build_full_context(
     task: &ExternalTask,
-    backend: &dyn ExternalBackend,
+    backend: Option<&dyn ExternalBackend>,
     project_dir: &Path,
     default_branch: &str,
     attempts: u32,
     selected_skills: &[String],
 ) -> TaskContext {
     let task_context = load_task_context(&task.id.0);
-    let parent_context = build_parent_context(task, backend).await;
+
+    let parent_context = if let Some(b) = backend {
+        build_parent_context(task, b).await
+    } else {
+        String::new()
+    };
+
     let project_instructions = build_project_instructions(project_dir);
     let skills_docs = build_skills_docs(selected_skills);
     let repo_tree = build_repo_tree(project_dir).await;
@@ -342,17 +347,17 @@ pub async fn build_full_context(
         String::new()
     };
 
-    let issue_comments = fetch_issue_comments(backend, &task.id.0, 10).await;
+    let issue_comments = if let Some(b) = backend {
+        fetch_issue_comments(b, &task.id.0, 10).await
+    } else {
+        String::new()
+    };
 
     // Load PR review context from sidecar (for re-dispatch after review changes requested)
     let pr_review_context = load_pr_review_context(&task.id.0);
 
-    // Load memory from previous attempts (only on retries)
-    let (_, memory) = if attempts > 0 {
-        build_memory_context(&task.id.0)
-    } else {
-        (String::new(), vec![])
-    };
+    // Always load memory from previous attempts (empty on first run, populated on retries)
+    let (_, memory) = build_memory_context(&task.id.0);
 
     TaskContext {
         task_context,

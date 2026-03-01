@@ -157,52 +157,21 @@ impl TaskRunner {
             url: String::new(),
         };
 
-        // Build context
-        let task_context = context::load_task_context(task_id);
-        let project_instructions = context::build_project_instructions(&wt.work_dir);
-        let repo_tree = context::build_repo_tree(&wt.work_dir).await;
-
         let selected_skills = route_result
             .as_ref()
             .map(|r| r.selected_skills.clone())
             .unwrap_or_default();
-        let skills_docs = context::build_skills_docs(&selected_skills);
 
-        let git_diff = if attempts > 0 {
-            context::build_git_diff(&wt.work_dir, &wt.default_branch).await
-        } else {
-            String::new()
-        };
-
-        // Load PR review context from sidecar (for re-dispatch after review changes requested)
-        let pr_review_context = context::load_pr_review_context(task_id);
-
-        // Load backend-dependent context when available
-        let parent_context = if let Some(b) = backend {
-            context::build_parent_context(&pseudo_task, b).await
-        } else {
-            String::new()
-        };
-        let issue_comments = if let Some(b) = backend {
-            context::fetch_issue_comments(b, task_id, 10).await
-        } else {
-            String::new()
-        };
-
-        // Always load memory from previous attempts (no backend required)
-        let (_, memory) = context::build_memory_context(task_id);
-
-        let ctx = context::TaskContext {
-            task_context,
-            parent_context,
-            project_instructions,
-            skills_docs,
-            repo_tree,
-            git_diff,
-            issue_comments,
-            pr_review_context,
-            memory,
-        };
+        // Build full context: memory, issue comments, and parent context are all loaded here
+        let ctx = context::build_full_context(
+            &pseudo_task,
+            backend,
+            &wt.work_dir,
+            &wt.default_branch,
+            attempts,
+            &selected_skills,
+        )
+        .await;
 
         // Build prompts
         let system_prompt = agent::build_system_prompt(&pseudo_task, &ctx, route_result.as_ref());
