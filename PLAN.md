@@ -787,7 +787,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Wire Telegram/Discord channels into engine event loop
 - [x] Mention detection via webhooks (#112)
 - [x] Owner commands (feedback via issue comments: `/retry`, `/reroute`) — see `src/engine/commands.rs`
-- [x] Merge detection (auto-close after PR merge) — see `check_merged_prs()` in `src/engine/mod.rs:1405-1452`
+- [x] Merge detection (auto-close after PR merge) — see `check_merged_prs()` in `src/engine/sync_ops.rs`
 - [x] Dashboard/reporting CLI command — see `src/cli/dashboard.rs`
 - [x] Graceful shutdown with session handoff — see `src/engine/mod.rs:681-705`
 - [ ] Slack channel integration
@@ -824,7 +824,9 @@ src/
 │   └── discord.rs           # Discord gateway websocket (stub)
 │
 ├── engine/
-│   ├── mod.rs               # Engine struct, event loop (10s tick + 120s sync), PR review integration
+│   ├── mod.rs               # Engine init, event loop (10s tick + 120s sync), orchestration glue
+│   ├── pr_review.rs         # PR review state machine (review_open_prs, review_and_merge, auto_merge)
+│   ├── sync_ops.rs          # Sync tick operations (worktree cleanup, merged PRs, mentions, skills sync)
 │   ├── tasks.rs             # TaskManager — unified internal + external CRUD
 │   ├── internal_tasks.rs    # Internal task SQLite operations
 │   ├── router.rs            # Agent routing (label, round-robin, LLM, circuit breaker)
@@ -917,7 +919,7 @@ Unified notification dispatch that broadcasts task completion events to all conf
 
 ### PR Review Integration
 
-**Location:** `src/engine/mod.rs` (`review_open_prs()`)
+**Location:** `src/engine/pr_review.rs` (`review_open_prs()`)
 
 Automatically creates follow-up tasks when a PR receives a `CHANGES_REQUESTED` review. This closes the feedback loop between code review and agent execution.
 
@@ -1207,7 +1209,7 @@ Last updated: 2026-02-26 (276 tests, ~90% parity)
 | Project-aware tmux naming (`orch-{project}-{id}`) | `src/tmux.rs`, `src/engine/mod.rs` | — |
 | Simplified service management (brew wrapper) | `src/cli/service.rs` | — |
 | Permission rules per-agent translation | `src/engine/runner/agents/` | — |
-| PR review integration | `src/engine/mod.rs` | PR #125 |
+| PR review integration | `src/engine/pr_review.rs` | PR #125 |
 | Agent memory across retries | `src/sidecar.rs` | PR #122 |
 | Self-improvement loop | `src/engine/jobs.rs` | PR #120 |
 | Polling fallback for webhooks | `src/channels/github.rs` | PR #131 |
@@ -1219,14 +1221,14 @@ Last updated: 2026-02-26 (276 tests, ~90% parity)
 | `orch project add/remove/list` CLI | Implemented | Done | See `src/cli/mod.rs:484-710` |
 | Wire Telegram/Discord into engine loop | Implemented | Done | See `src/channels/telegram.rs`, `src/channels/discord.rs`, `src/engine/mod.rs:251-296` |
 | Mention detection via webhooks | Implemented | Done | Polling works, webhook receives events via `start_webhook_server()` in `src/channels/github.rs` |
-| Review Agent + Auto-Merge | Implemented | Done | See `src/engine/mod.rs:1768-2100+` `review_and_merge()` function |
-| PR Review Comments → Fix Dispatch | Implemented | Done | See `src/engine/mod.rs:1469-1700+` `review_open_prs()` function |
+| Review Agent + Auto-Merge | Implemented | Done | See `src/engine/pr_review.rs` `review_and_merge()` function |
+| PR Review Comments → Fix Dispatch | Implemented | Done | See `src/engine/pr_review.rs` `review_open_prs()` function |
 | Dashboard CLI | Implemented | Done | See `src/cli/dashboard.rs` - `orch dashboard` command |
 | Task Tree CLI | Implemented | Done | See `src/cli/tree.rs` - `orch task tree` command |
 | Owner commands (issue comment commands) | Implemented | Done | Issue #179 - see `src/engine/commands.rs` for `/retry`, `/reroute`, `/block` |
 | Child task delegation (auto-spawn subtasks) | Implemented | Done | Issue #178 - see `src/engine/runner/mod.rs:1003-1070` |
 | Skills Sync (auto-clone skill repos) | Missing | Low | Config exists but no sync implementation |
-| Merge detection (auto-close after PR merge) | Implemented | Done | See `check_merged_prs()` in `src/engine/mod.rs:1405-1452` |
+| Merge detection (auto-close after PR merge) | Implemented | Done | See `check_merged_prs()` in `src/engine/sync_ops.rs` |
 | Graceful shutdown with session handoff | Implemented | Done | See `src/engine/mod.rs:681-705` |
 | Slack channel integration | Missing | Low | Future channel addition |
 | Context file per issue | Implemented | Done | See `src/engine/runner/context.rs:40-45` `load_task_context()` |
@@ -1314,9 +1316,9 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 |-------|-------|-------------|
 | #178 | Task delegation processing | `src/engine/runner/mod.rs:1003-1070` - spawns child tasks from `delegations` field |
 | #179 | Owner slash commands | `src/engine/commands.rs` - `/retry`, `/reroute [agent]`, `/block [reason]`, `/unblock`, `/close`, `/review` |
-| #143 | PR Review Integration | `src/engine/mod.rs:1469-1700+` - processes `changes_requested` reviews and re-dispatches tasks with review context |
-| - | Review Agent + Auto-Merge | `review_and_merge()` in `src/engine/mod.rs:1768+` - spawns review agent after task completion, handles approve/request_changes |
-| - | Merge Detection | `check_merged_prs()` in `src/engine/mod.rs:1405-1452` - monitors merged PRs and auto-closes associated tasks |
+| #143 | PR Review Integration | `src/engine/pr_review.rs` - processes `changes_requested` reviews and re-dispatches tasks with review context |
+| - | Review Agent + Auto-Merge | `review_and_merge()` in `src/engine/pr_review.rs` - spawns review agent after task completion, handles approve/request_changes |
+| - | Merge Detection | `check_merged_prs()` in `src/engine/sync_ops.rs` - monitors merged PRs and auto-closes associated tasks |
 | - | Dashboard CLI | `orch dashboard` command in `src/cli/dashboard.rs` - shows task counts, active sessions, recent activity |
 | - | Task Tree CLI | `orch task tree` command in `src/cli/tree.rs` - ASCII tree of parent-child task relationships |
 | - | Graceful Shutdown | SIGTERM/SIGINT handlers in `src/engine/mod.rs:681-705` - drain mode for safe upgrades |
@@ -1324,7 +1326,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 ### Implementation Notes
 
 **Issue #143 - PR Review Integration:**
-- Location: `src/engine/mod.rs` (add handler in `process_message()`)
+- Location: `src/engine/pr_review.rs` (`review_open_prs()`)
 - Detect review state and create follow-up tasks as sub-issues
 - Update task status appropriately when reviews are submitted
 
