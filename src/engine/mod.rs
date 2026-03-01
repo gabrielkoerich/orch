@@ -211,8 +211,22 @@ pub async fn serve() -> anyhow::Result<()> {
     db.migrate().await?;
     tracing::info!("internal database ready");
 
-    // Initialize project engines
-    let mut project_engines = init_project_engines().await?;
+    // Initialize project engines — retry with backoff so a network outage at
+    // startup doesn't cause a crash-loop (launchd KeepAlive would restart us
+    // immediately, filling the error log with 600+ identical messages).
+    let mut project_engines = {
+        let mut delay_secs = 5u64;
+        loop {
+            match init_project_engines().await {
+                Ok(engines) => break engines,
+                Err(e) => {
+                    tracing::warn!(delay_secs, "project engine init failed, retrying: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    delay_secs = (delay_secs * 2).min(120);
+                }
+            }
+        }
+    };
 
     tracing::info!(
         project_count = project_engines.len(),

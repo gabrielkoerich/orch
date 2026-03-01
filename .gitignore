@@ -8,6 +8,7 @@ __pycache__/
 config.yml
 contexts/
 docs/public/
+.opencode/
 opencode.json
 skills/
 tasks.yml
