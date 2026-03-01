@@ -746,9 +746,13 @@ async fn tick(
 
     // Phase 2: Recover stuck tasks
     let _phase2 = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
-    let in_progress = task_manager
-        .list_external_by_status(Status::InProgress)
-        .await?;
+    let in_progress = match task_manager.list_external_by_status(Status::InProgress).await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::error!(?e, "failed to list in_progress tasks");
+            Vec::new()
+        }
+    };
     for task in &in_progress {
         let session_name = tmux.session_name(repo, &task.id.0);
         let has_session = tmux.session_exists(&session_name).await;
@@ -778,19 +782,37 @@ async fn tick(
                 // Remove stale agent label so the LLM router re-routes properly
                 for label in &task.labels {
                     if label.starts_with("agent:") {
-                        backend.remove_label(&task.id, label).await.ok();
+                        if let Err(e) = backend.remove_label(&task.id, label).await {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                label,
+                                ?e,
+                                "failed to remove agent label for stuck task"
+                            );
+                        }
                     }
                 }
-                sidecar::set(
+                if let Err(e) = sidecar::set(
                     &task.id.0,
                     &[
                         "agent=".to_string(),
                         "model=".to_string(),
                         "route_attempts=0".to_string(),
                     ],
-                )?;
-                backend.update_status(&task.id, Status::New).await?;
-                backend
+                ) {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        ?e,
+                        "failed to reset sidecar for stuck task"
+                    );
+                }
+                if let Err(e) = backend.update_status(&task.id, Status::New).await {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        ?e,
+                        "failed to update status to new for stuck task"
+                    );
+                } else if let Err(e) = backend
                     .post_comment(
                         &task.id,
                         &format!(
@@ -799,7 +821,14 @@ async fn tick(
                             age.num_minutes()
                         ),
                     )
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        ?e,
+                        "failed to post stuck-task recovery comment"
+                    );
+                }
             }
         }
     }
@@ -807,7 +836,13 @@ async fn tick(
 
     // Phase 3a: Route new tasks (includes issues with status:new or no status:* label)
     let _phase3a = tracing::info_span!("engine.tick.phase3a.route").entered();
-    let new_tasks = task_manager.list_routable().await?;
+    let new_tasks = match task_manager.list_routable().await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::error!(?e, "failed to list routable tasks");
+            Vec::new()
+        }
+    };
     let routable: Vec<&ExternalTask> = new_tasks
         .iter()
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
@@ -859,7 +894,13 @@ async fn tick(
     // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
     // but we keep this filter as defense-in-depth.
     let _phase3b = tracing::info_span!("engine.tick.phase3b.dispatch").entered();
-    let routed_tasks = task_manager.list_external_by_status(Status::Routed).await?;
+    let routed_tasks = match task_manager.list_external_by_status(Status::Routed).await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::error!(?e, "failed to list routed tasks");
+            Vec::new()
+        }
+    };
     let dispatchable: Vec<&ExternalTask> = routed_tasks
         .iter()
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
@@ -1025,9 +1066,13 @@ async fn tick(
     }
 
     // Phase 4: Unblock parents (blocked tasks whose children are all done)
-    let blocked = task_manager
-        .list_external_by_status(Status::Blocked)
-        .await?;
+    let blocked = match task_manager.list_external_by_status(Status::Blocked).await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::error!(?e, "failed to list blocked tasks");
+            Vec::new()
+        }
+    };
     for task in &blocked {
         let children = match backend.get_sub_issues(&task.id).await {
             Ok(ids) => ids,

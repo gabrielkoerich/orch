@@ -358,7 +358,14 @@ pub fn clear_expired_cooldowns() {
                 let mut to_remove = Vec::new();
                 for (agent, entry) in &cooldowns {
                     if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
-                        if (now - failed_at) >= AGENT_COOLDOWN_SECS {
+                        // Keys with ':' are model-specific (e.g. "claude:claude-opus-4-5")
+                        // and use the longer MODEL_COOLDOWN_SECS. Agent-only keys use AGENT_COOLDOWN_SECS.
+                        let timeout = if agent.contains(':') {
+                            MODEL_COOLDOWN_SECS
+                        } else {
+                            AGENT_COOLDOWN_SECS
+                        };
+                        if (now - failed_at) >= timeout {
                             to_remove.push(agent.clone());
                         }
                     }

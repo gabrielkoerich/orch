@@ -248,7 +248,7 @@ pub async fn scan_commands(
     // Persist processed IDs (keep last 500 to avoid unbounded growth)
     if !new_processed.is_empty() {
         let mut all: Vec<String> = processed_ids.into_iter().collect();
-        all.sort();
+        all.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
         all.extend(new_processed);
         if all.len() > 500 {
             all = all.split_off(all.len() - 500);
