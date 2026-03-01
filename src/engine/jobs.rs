@@ -176,6 +176,13 @@ pub async fn tick(
         let mut should_skip = false;
 
         if let Some(ref task_id) = job.active_task_id {
+            if task_id.is_empty() {
+                job.active_task_id = None;
+                should_clear_task_id = false; // already cleared
+            }
+        }
+
+        if let Some(ref task_id) = job.active_task_id {
             let task_id_clone = task_id.clone();
             let is_active = if job.external {
                 // Check external (GitHub) task
