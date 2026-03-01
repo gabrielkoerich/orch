@@ -697,33 +697,13 @@ pub async fn serve() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Core tick — runs every 10s.
-///
-/// Phases (matching v0 poll.sh):
-/// 1. Monitor active tmux sessions (detect completions)
-/// 2. Recover stuck in_progress tasks
-/// 3. Dispatch new/routed tasks
-#[allow(clippy::too_many_arguments)]
-async fn tick(
-    backend: &Arc<dyn ExternalBackend>,
+/// Phase 1 of tick: poll tmux for finished sessions and clean them up.
+async fn tick_check_session_completions(
     tmux: &Arc<TmuxManager>,
     repo: &str,
-    runner: &Arc<TaskRunner>,
     capture: &Arc<CaptureService>,
-    semaphore: &Arc<Semaphore>,
-    config: &EngineConfig,
-    jobs_path: &std::path::PathBuf,
-    db: &Arc<Db>,
-    router: &Router,
-    router_arc: &Arc<RwLock<Router>>,
-    task_manager: &Arc<TaskManager>,
-    weight_tx: &mpsc::Sender<WeightSignal>,
-    transport: &Arc<Transport>,
 ) -> anyhow::Result<()> {
-    let _tick_span = tracing::info_span!("engine.tick").entered();
-
-    // Phase 1: Check active tmux sessions for completions
-    let _phase1 = tracing::info_span!("engine.tick.phase1.sessions").entered();
+    let _span = tracing::info_span!("engine.tick.phase1.sessions").entered();
     let session_snapshot = tmux.snapshot().await;
     for (task_id, active) in &session_snapshot {
         if !active {
@@ -742,10 +722,18 @@ async fn tick(
             }
         }
     }
-    drop(_phase1);
+    Ok(())
+}
 
-    // Phase 2: Recover stuck tasks
-    let _phase2 = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
+/// Phase 2 of tick: detect tasks stuck in_progress without an active tmux session and reset them.
+async fn tick_recover_stuck_tasks(
+    backend: &Arc<dyn ExternalBackend>,
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    task_manager: &Arc<TaskManager>,
+    config: &EngineConfig,
+) -> anyhow::Result<()> {
+    let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
     let in_progress = task_manager
         .list_external_by_status(Status::InProgress)
         .await?;
@@ -817,10 +805,16 @@ async fn tick(
             }
         }
     }
-    drop(_phase2);
+    Ok(())
+}
 
-    // Phase 3a: Route new tasks (includes issues with status:new or no status:* label)
-    let _phase3a = tracing::info_span!("engine.tick.phase3a.route").entered();
+/// Phase 3a of tick: route status:new tasks to an agent and transition them to status:routed.
+async fn tick_route_tasks(
+    backend: &Arc<dyn ExternalBackend>,
+    task_manager: &Arc<TaskManager>,
+    router: &Router,
+) -> anyhow::Result<()> {
+    let _span = tracing::info_span!("engine.tick.phase3a.route").entered();
     let new_tasks = task_manager.list_routable().await?;
     let routable: Vec<&ExternalTask> = new_tasks
         .iter()
@@ -867,12 +861,26 @@ async fn tick(
             }
         }
     }
-    drop(_phase3a);
+    Ok(())
+}
 
-    // Phase 3b: Dispatch routed tasks.
+/// Phase 3b of tick: spawn agents for all status:routed tasks up to the parallel limit.
+#[allow(clippy::too_many_arguments)]
+async fn tick_dispatch_tasks(
+    backend: &Arc<dyn ExternalBackend>,
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    runner: &Arc<TaskRunner>,
+    capture: &Arc<CaptureService>,
+    semaphore: &Arc<Semaphore>,
+    task_manager: &Arc<TaskManager>,
+    weight_tx: &mpsc::Sender<WeightSignal>,
+    transport: &Arc<Transport>,
+    router_arc: &Arc<RwLock<Router>>,
+) -> anyhow::Result<()> {
+    let _span = tracing::info_span!("engine.tick.phase3b.dispatch").entered();
     // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
     // but we keep this filter as defense-in-depth.
-    let _phase3b = tracing::info_span!("engine.tick.phase3b.dispatch").entered();
     let routed_tasks = task_manager.list_external_by_status(Status::Routed).await?;
     let dispatchable: Vec<&ExternalTask> = routed_tasks
         .iter()
@@ -1037,8 +1045,14 @@ async fn tick(
             drop(permit);
         });
     }
+    Ok(())
+}
 
-    // Phase 4: Unblock parents (blocked tasks whose children are all done)
+/// Phase 4 of tick: unblock parent tasks whose sub-issues are all done.
+async fn tick_unblock_parents(
+    backend: &Arc<dyn ExternalBackend>,
+    task_manager: &Arc<TaskManager>,
+) -> anyhow::Result<()> {
     let blocked = task_manager
         .list_external_by_status(Status::Blocked)
         .await?;
@@ -1090,12 +1104,53 @@ async fn tick(
             }
         }
     }
+    Ok(())
+}
 
-    // Phase 5: Check job schedules
-    if let Err(e) = jobs::tick(jobs_path, backend, db).await {
+/// Phase 5 of tick: run cron job matching and fire any due jobs.
+async fn tick_job_scheduler(
+    jobs_path: &std::path::PathBuf,
+    backend: &Arc<dyn ExternalBackend>,
+    db: &Arc<Db>,
+) -> anyhow::Result<()> {
+    jobs::tick(jobs_path, backend, db).await
+}
+
+/// Core tick — runs every 10s.
+///
+/// Delegates to named phase functions in order:
+/// 1. `tick_check_session_completions` — poll tmux for finished sessions
+/// 2. `tick_recover_stuck_tasks`       — reset in_progress tasks with no active session
+/// 3. `tick_route_tasks`               — route status:new tasks to an agent
+/// 4. `tick_dispatch_tasks`            — spawn agents for status:routed tasks
+/// 5. `tick_unblock_parents`           — unblock parents whose sub-issues are all done
+/// 6. `tick_job_scheduler`             — fire due cron jobs
+#[allow(clippy::too_many_arguments)]
+async fn tick(
+    backend: &Arc<dyn ExternalBackend>,
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    runner: &Arc<TaskRunner>,
+    capture: &Arc<CaptureService>,
+    semaphore: &Arc<Semaphore>,
+    config: &EngineConfig,
+    jobs_path: &std::path::PathBuf,
+    db: &Arc<Db>,
+    router: &Router,
+    router_arc: &Arc<RwLock<Router>>,
+    task_manager: &Arc<TaskManager>,
+    weight_tx: &mpsc::Sender<WeightSignal>,
+    transport: &Arc<Transport>,
+) -> anyhow::Result<()> {
+    let _tick_span = tracing::info_span!("engine.tick").entered();
+    tick_check_session_completions(tmux, repo, capture).await?;
+    tick_recover_stuck_tasks(backend, tmux, repo, task_manager, config).await?;
+    tick_route_tasks(backend, task_manager, router).await?;
+    tick_dispatch_tasks(backend, tmux, repo, runner, capture, semaphore, task_manager, weight_tx, transport, router_arc).await?;
+    tick_unblock_parents(backend, task_manager).await?;
+    if let Err(e) = tick_job_scheduler(jobs_path, backend, db).await {
         tracing::error!(?e, "job scheduler tick failed");
     }
-
     Ok(())
 }
 
