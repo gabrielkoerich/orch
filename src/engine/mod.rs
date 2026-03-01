@@ -2193,7 +2193,7 @@ async fn review_and_merge(
                 .unwrap_or(true);
 
             if auto_merge {
-                if let Err(e) = auto_merge_pr(task, &branch_name, &worktree_path, backend, repo).await {
+                if let Err(e) = auto_merge_pr(task, &branch_name, backend, repo).await {
                     tracing::error!(
                         task_id = task.id.0,
                         pr_number = pr_number_early,
@@ -2217,53 +2217,14 @@ async fn review_and_merge(
     }
 }
 
-/// Rebase the branch on main and force-push.
-async fn rebase_and_push(worktree: &std::path::Path, branch: &str) -> bool {
-    use tokio::process::Command;
-
-    let fetch = Command::new("git")
-        .args(["fetch", "origin", "main"])
-        .current_dir(worktree)
-        .output()
-        .await;
-    if fetch.is_err() || !fetch.unwrap().status.success() {
-        return false;
-    }
-
-    let rebase = Command::new("git")
-        .args(["rebase", "origin/main"])
-        .current_dir(worktree)
-        .output()
-        .await;
-    match rebase {
-        Ok(output) if output.status.success() => {}
-        _ => {
-            // Abort failed rebase
-            let _ = Command::new("git")
-                .args(["rebase", "--abort"])
-                .current_dir(worktree)
-                .output()
-                .await;
-            return false;
-        }
-    }
-
-    let push = Command::new("git")
-        .args(["push", "origin", branch, "--force-with-lease"])
-        .current_dir(worktree)
-        .output()
-        .await;
-    matches!(push, Ok(output) if output.status.success())
-}
-
 /// Auto-merge a PR after review approval.
 ///
 /// Checks that the automated review comment says "approve" and that CI checks
-/// are green before merging. If CI fails, rebases on main and retries.
+/// are green before merging. If CI fails, sets task back to routed so the
+/// agent is re-dispatched to fix the issues.
 async fn auto_merge_pr(
     task: &ExternalTask,
     branch: &str,
-    worktree: &std::path::Path,
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
 ) -> anyhow::Result<()> {
@@ -2311,9 +2272,7 @@ async fn auto_merge_pr(
     // 4. Wait for CI checks to pass (poll up to 5 minutes)
     let max_wait = std::time::Duration::from_secs(300);
     let poll_interval = std::time::Duration::from_secs(15);
-    let mut start = std::time::Instant::now();
-    let mut rebased = false;
-    let mut reran_ci = false;
+    let start = std::time::Instant::now();
 
     loop {
         let (state, total, passing, failing, pending) =
@@ -2333,52 +2292,9 @@ async fn auto_merge_pr(
         match state.as_str() {
             "success" => break,
             "failure" => {
-                // First attempt: rebase on main and force-push to re-trigger CI
-                if !rebased {
-                    tracing::info!(task_id = task.id.0, "CI failing, rebasing on main");
-                    let rebase_ok = rebase_and_push(worktree, branch).await;
-                    rebased = true;
-                    if rebase_ok {
-                        tracing::info!(task_id = task.id.0, "rebase succeeded, waiting for CI");
-                        // Reset timer — give CI time to re-run after rebase
-                        start = std::time::Instant::now();
-                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                        continue;
-                    } else {
-                        tracing::warn!(task_id = task.id.0, "rebase failed, trying re-run");
-                    }
-                }
-
-                // Second attempt: re-run failed CI jobs
-                if !reran_ci {
-                    if let Ok(Some((run_id, _, _))) =
-                        gh.get_latest_run_for_branch(repo, branch).await
-                    {
-                        match gh.rerun_failed_jobs(repo, run_id).await {
-                            Ok(()) => {
-                                tracing::info!(
-                                    task_id = task.id.0,
-                                    run_id,
-                                    "re-triggered failed CI jobs"
-                                );
-                                reran_ci = true;
-                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                                continue;
-                            }
-                            Err(e) => tracing::warn!(
-                                task_id = task.id.0,
-                                run_id,
-                                error = %e,
-                                "failed to re-trigger CI jobs"
-                            ),
-                        }
-                    }
-                    reran_ci = true;
-                }
-
                 if start.elapsed() >= max_wait {
-                    tracing::warn!(task_id = task.id.0, "CI still failing after rebase + re-run");
-                    backend.update_status(&task.id, Status::NeedsReview).await?;
+                    tracing::warn!(task_id = task.id.0, "CI failing, re-dispatching agent to fix");
+                    backend.update_status(&task.id, Status::Routed).await?;
                     return Ok(());
                 }
             }
