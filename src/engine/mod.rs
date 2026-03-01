@@ -2385,7 +2385,11 @@ async fn auto_merge_pr(
 
     // 9. Post final comment on the PR
     let _ = gh
-        .add_comment(repo, &pr_number.to_string(), "✅ PR reviewed, approved, and merged.")
+        .add_comment(
+            repo,
+            &pr_number.to_string(),
+            "✅ PR reviewed, approved, and merged.",
+        )
         .await;
 
     tracing::info!(task_id = task.id.0, "auto-merge completed");

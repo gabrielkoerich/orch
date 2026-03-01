@@ -481,7 +481,10 @@ impl GhHttp {
             )
             .await?;
         // GitHub /issues API returns PRs too — filter them out
-        Ok(all.into_iter().filter(|i| i.pull_request.is_none()).collect())
+        Ok(all
+            .into_iter()
+            .filter(|i| i.pull_request.is_none())
+            .collect())
     }
 
     /// List all open issues (no label filter, paginated).
@@ -491,7 +494,10 @@ impl GhHttp {
             .get_all_pages(&url, &[("state", "open"), ("per_page", "100")])
             .await?;
         // GitHub /issues API returns PRs too — filter them out
-        Ok(all.into_iter().filter(|i| i.pull_request.is_none()).collect())
+        Ok(all
+            .into_iter()
+            .filter(|i| i.pull_request.is_none())
+            .collect())
     }
 
     /// Add labels to an issue.
