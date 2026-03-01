@@ -60,13 +60,17 @@ pub fn branch_name(task_id: &str, title: &str) -> String {
 /// Detect the default branch of a repository.
 pub async fn detect_default_branch(project_dir: &Path) -> String {
     let output = Command::new("git")
-        .args(["symbolic-ref", "--short", "HEAD"])
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .current_dir(project_dir)
         .output_with_context()
         .await;
 
     match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) if o.status.success() => {
+            let branch = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            // strip "origin/" prefix if present
+            branch.strip_prefix("origin/").unwrap_or(&branch).to_string()
+        }
         _ => "main".to_string(),
     }
 }
