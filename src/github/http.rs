@@ -574,7 +574,6 @@ impl GhHttp {
     }
 
     /// List comments on an issue.
-    #[allow(dead_code)]
     pub async fn list_comments(
         &self,
         repo: &str,

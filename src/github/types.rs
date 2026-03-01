@@ -29,7 +29,6 @@ pub struct GitHubUser {
     pub login: String,
 }
 
-#[allow(dead_code)] // used by list_comments and list_recent_comments
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubComment {
     pub id: u64,

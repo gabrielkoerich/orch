@@ -6,35 +6,10 @@
 //! 3. Classifies errors (timeout, usage limit, auth, tooling)
 //! 4. Determines next action (success, reroute, needs_review)
 
-use crate::engine::runner::agents::patterns;
-use crate::parser::{self, AgentResponse};
 use crate::sidecar;
 use fs2::FileExt; // for try_lock_exclusive / unlock
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
-
-/// Classification of agent execution result (legacy, used in tests).
-///
-/// This enum is kept for backwards compatibility with older call sites and
-/// unit tests that inspect detailed execution outcomes. Newer code prefers
-/// `WeightSignal` and the parsing helpers above, but removing this enum would
-/// require updating multiple modules and tests, so it remains intentionally
-/// available.
-#[allow(dead_code)]
-pub enum RunResult {
-    /// Agent completed successfully with a parsed response.
-    Success(AgentResponse),
-    /// Agent timed out (exit 124).
-    Timeout,
-    /// Usage/rate limit hit — should reroute to different agent.
-    UsageLimit(String),
-    /// Auth/billing error — should try fallback agent.
-    AuthError(String),
-    /// Missing tooling — mark needs_review.
-    MissingTooling(String),
-    /// General failure — mark needs_review.
-    Failed(String),
-}
 
 /// Outcome signal for the engine to update router weights.
 ///
@@ -48,99 +23,6 @@ pub enum WeightSignal {
     RateLimited { agent: String },
     /// No weight-relevant signal (timeout, auth error, etc.)
     None,
-}
-
-/// Collect and classify the agent's response (legacy, kept for backward compat).
-#[allow(dead_code)]
-pub fn collect_response(task_id: &str, exit_code: i32, output_file: &Path) -> RunResult {
-    // Read stderr (check new state dir, fall back to legacy)
-    let stderr_path = sidecar::state_file(&format!("stderr-{task_id}.txt"))
-        .unwrap_or_else(|_| PathBuf::from(format!("/tmp/stderr-{task_id}.txt")));
-    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
-
-    // Read response from output file (legacy path — no repo context)
-    let response_content = read_output_file(task_id, output_file, "");
-
-    let combined = format!("{response_content}{stderr}");
-
-    // Check exit code first
-    if exit_code != 0 {
-        // Check for missing tooling
-        if let Some(crate::engine::runner::agents::AgentError::MissingTool { tool }) =
-            patterns::detect_missing_tool(&combined)
-        {
-            return RunResult::MissingTooling(format!("missing tool: {tool}"));
-        }
-
-        // Timeout (exit 124)
-        if exit_code == 124 {
-            return RunResult::Timeout;
-        }
-
-        // Usage/rate limit
-        if patterns::detect_rate_limit(&combined).is_some() {
-            return RunResult::UsageLimit(snippet(&combined));
-        }
-
-        // Auth/billing error
-        if patterns::detect_auth_error(&combined).is_some() {
-            return RunResult::AuthError(snippet(&combined));
-        }
-
-        // General failure
-        return RunResult::Failed(format!("agent exited with code {exit_code}"));
-    }
-
-    // Exit 0 — try to parse response
-    if response_content.is_empty() {
-        // Empty response might be usage limit
-        if patterns::detect_rate_limit(&stderr).is_some() {
-            return RunResult::UsageLimit(snippet(&stderr));
-        }
-        if patterns::detect_auth_error(&stderr).is_some() {
-            return RunResult::AuthError(snippet(&stderr));
-        }
-        return RunResult::Failed("empty agent response".to_string());
-    }
-
-    // Parse the response
-    match parser::parse(&response_content) {
-        Ok(resp) => {
-            // Check if agent self-reported usage limit
-            if matches!(resp.status.as_str(), "needs_review" | "blocked") {
-                if let Some(ref reason) = resp.error {
-                    if patterns::detect_rate_limit(reason).is_some() {
-                        return RunResult::UsageLimit(snippet(reason));
-                    }
-                }
-            }
-
-            // Check for missing tooling in response
-            let check_text = format!(
-                "{}{}{}",
-                resp.error.as_deref().unwrap_or(""),
-                resp.summary,
-                resp.remaining.join(" "),
-            );
-            if let Some(crate::engine::runner::agents::AgentError::MissingTool { tool }) =
-                patterns::detect_missing_tool(&check_text)
-            {
-                return RunResult::MissingTooling(format!("missing tool: {tool}"));
-            }
-
-            RunResult::Success(resp)
-        }
-        Err(_) => {
-            // Failed to parse — check for known error patterns
-            if patterns::detect_rate_limit(&combined).is_some() {
-                return RunResult::UsageLimit(snippet(&combined));
-            }
-            if patterns::detect_auth_error(&combined).is_some() {
-                return RunResult::AuthError(snippet(&combined));
-            }
-            RunResult::Failed("invalid agent response JSON".to_string())
-        }
-    }
 }
 
 /// Read the agent's output file, trying multiple locations.
@@ -517,21 +399,6 @@ pub fn handle_failover(
     false
 }
 
-/// Get a truncated snippet for error messages (last 300 chars, UTF-8 safe).
-#[allow(dead_code)]
-fn snippet(text: &str) -> String {
-    if text.len() <= 300 {
-        return text.to_string();
-    }
-    let start = text.len() - 300;
-    // Walk forward to find a char boundary
-    let mut idx = start;
-    while idx < text.len() && !text.is_char_boundary(idx) {
-        idx += 1;
-    }
-    text[idx..].to_string()
-}
-
 /// Get the reroute chain from sidecar.
 pub fn get_reroute_chain(task_id: &str) -> String {
     sidecar::get(task_id, "limit_reroute_chain")
@@ -682,7 +549,7 @@ pub fn store_failure_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::runner::agents::AgentError;
+    use crate::engine::runner::agents::{patterns, AgentError};
 
     #[test]
     fn is_usage_limit_detects_rate_limit() {
@@ -770,19 +637,6 @@ mod tests {
         let available = vec!["test_agent_a".to_string(), "test_agent_b".to_string()];
         let result = pick_fallback_agent("test_agent_a", "test_agent_a,test_agent_b", &available);
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn snippet_truncates_long_text() {
-        let long = "x".repeat(500);
-        let s = snippet(&long);
-        assert_eq!(s.len(), 300);
-    }
-
-    #[test]
-    fn snippet_preserves_short_text() {
-        let short = "hello";
-        assert_eq!(snippet(short), "hello");
     }
 
     #[test]

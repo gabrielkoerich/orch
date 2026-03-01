@@ -377,12 +377,12 @@ In v1, the tmux bridge changes this completely:
 | Component | v0 (bash) | v1 (Rust) | Status |
 |-----------|-----------|-----------|--------|
 | Service loop | `serve.sh` (sleep 10s) | Tokio event loop | **Done** |
-| Task polling | `poll.sh` (5x gh CLI calls) | `gh api` + `serde` parsing | **Done** |
+| Task polling | `poll.sh` (5x gh CLI calls) | Native reqwest HTTP + `serde` | **Done** |
 | Config loading | `yq` subprocess per read | In-memory struct, hot-reload | **Done** |
 | Cron matching | `python3 cron_match.py` | Native `cron` crate | **Done** |
 | JSON parsing | `jq` subprocesses | `serde_json` | **Done** |
 | Response normalization | `python3 normalize_json.py` | Native parser | **Done** |
-| GitHub API calls | `gh` CLI + `jq` parsing | `gh` CLI + `serde` parsing | **Done** |
+| GitHub API calls | `gh` CLI + `jq` parsing | Native reqwest HTTP + `serde` | **Done** |
 | Task execution | `run_task.sh` (bash) | `src/engine/runner/` (Rust) | **Done** |
 | Git operations | bash `git` + `gh pr` | `runner/git_ops.rs` | **Done** |
 | Agent invocation | bash script | `runner/agent.rs` | **Done** |
@@ -678,7 +678,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] ExternalBackend trait — `src/backends/mod.rs` (Status, ExternalTask, ExternalId)
 - [x] GitHub backend — `src/backends/github.rs` (implements ExternalBackend via native reqwest HTTP)
 - [x] Engine main loop — `src/engine/mod.rs` (tokio::select! with 10s tick + 120s sync)
-- [x] Task polling (GitHub API via gh CLI + serde) — Phase 3 of tick()
+- [x] Task polling (GitHub API via native reqwest HTTP) — Phase 3 of tick()
 - [x] Task runner — `src/engine/runner/` (context, worktree, agent, response, git_ops)
 - [x] Stuck task recovery — Phase 2 of tick()
 - [x] Parent/child unblocking — Phase 4 of tick()
@@ -774,6 +774,10 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Project-aware tmux session naming (`orch-{project}-{id}`)
 - [x] Simplified service management (pure `brew services` wrapper)
 - [x] Permission rules per-agent translation (PermissionRules → native CLI flags)
+- [x] Global `allowed_tools` config with per-agent translation — PR #163 merged
+- [x] Migrate GitHub API from `gh` CLI to native reqwest HTTP client — PR #203 merged
+- [x] System prompt file passed to Codex and OpenCode agents — PR #201 merged
+- [x] Dead code cleanup: removed legacy `RunResult`/`collect_response` from response.rs
 
 ### Phase 6: Remaining Gaps
 
@@ -835,12 +839,14 @@ src/
 │       │   ├── claude.rs    # Claude/Kimi/MiniMax runner (JSON envelope parser)
 │       │   ├── codex.rs     # Codex runner (NDJSON stream parser)
 │       │   └── opencode.rs  # OpenCode runner (NDJSON parser + free model discovery)
-│       ├── response.rs      # Failover logic, cooldowns, weight signals, memory storage
+│       ├── response.rs      # Failover logic, cooldowns, weight signals, review parsing, memory storage
 │       └── git_ops.rs       # Auto-commit, push, PR creation, PR override detection
 │
 ├── github/
 │   ├── mod.rs               # GitHub helpers (shared by backend + channel)
-│   ├── cli.rs               # `gh api` wrapper — structured args in, serde out
+│   ├── http.rs              # Native reqwest HTTP client (connection pooling, rate-limit backoff) — primary
+│   ├── cli.rs               # `gh api` wrapper — legacy fallback (superseded by http.rs)
+│   ├── backoff.rs           # Exponential backoff state for GitHub 403 rate limits
 │   ├── types.rs             # GitHubIssue, GitHubComment, GitHubLabel, etc.
 │   └── projects.rs          # GitHub Projects V2 GraphQL operations
 │
