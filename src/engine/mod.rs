@@ -2293,7 +2293,10 @@ async fn auto_merge_pr(
             "success" => break,
             "failure" => {
                 if start.elapsed() >= max_wait {
-                    tracing::warn!(task_id = task.id.0, "CI failing, re-dispatching agent to fix");
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        "CI failing, re-dispatching agent to fix"
+                    );
                     backend.update_status(&task.id, Status::Routed).await?;
                     return Ok(());
                 }
