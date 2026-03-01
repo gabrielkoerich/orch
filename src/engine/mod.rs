@@ -2210,7 +2210,7 @@ async fn review_and_merge(
             ref notes,
             ref issues,
         } => {
-            handle_review_changes(task, notes, issues, backend, repo).await?;
+            handle_review_changes(task, notes, issues, backend, repo, pr_number_early).await?;
             Ok(decision)
         }
         _ => Ok(decision),
@@ -2315,12 +2315,11 @@ async fn auto_merge_pr(
 
                 if start.elapsed() >= max_wait {
                     tracing::warn!(task_id = task.id.0, "CI checks still failing after timeout");
-                    backend
-                        .post_comment(
-                            &task.id,
-                            "⚠️ Auto-merge: CI checks are failing. PR is approved but cannot be merged until CI passes.",
-                        )
-                        .await?;
+                    let _ = gh.add_comment(
+                        repo,
+                        &pr_number.to_string(),
+                        "⚠️ Auto-merge: CI checks are failing. PR is approved but cannot be merged until CI passes.",
+                    ).await;
                     backend.update_status(&task.id, Status::NeedsReview).await?;
                     return Ok(());
                 }
@@ -2329,12 +2328,11 @@ async fn auto_merge_pr(
                 // pending
                 if start.elapsed() >= max_wait {
                     tracing::warn!(task_id = task.id.0, "CI checks still pending after timeout");
-                    backend
-                        .post_comment(
-                            &task.id,
-                            "⚠️ Auto-merge: CI checks still pending after timeout. Will merge when checks complete.",
-                        )
-                        .await?;
+                    let _ = gh.add_comment(
+                        repo,
+                        &pr_number.to_string(),
+                        "⚠️ Auto-merge: CI checks still pending after timeout. Will merge when checks complete.",
+                    ).await;
                     // Don't merge with unknown CI status — set status to in_review
                     // so the next engine tick re-checks
                     backend.update_status(&task.id, Status::InReview).await?;
@@ -2358,9 +2356,13 @@ async fn auto_merge_pr(
         // Merge failed (conflicts, branch protection, etc.)
         tracing::error!(task_id = task.id.0, error = %e, "merge failed");
         backend.update_status(&task.id, Status::NeedsReview).await?;
-        backend
-            .post_comment(&task.id, &format!("Auto-merge failed: {}", e))
-            .await?;
+        let _ = gh
+            .add_comment(
+                repo,
+                &pr_number.to_string(),
+                &format!("Auto-merge failed: {}", e),
+            )
+            .await;
         return Err(e);
     }
 
@@ -2381,10 +2383,10 @@ async fn auto_merge_pr(
     // 8. Mark worktree for cleanup
     let _ = sidecar::set(&task.id.0, &["worktree_cleaned=false".to_string()]);
 
-    // 9. Post final comment on task issue
-    backend
-        .post_comment(&task.id, "✅ PR reviewed, approved, and merged.")
-        .await?;
+    // 9. Post final comment on the PR
+    let _ = gh
+        .add_comment(repo, &pr_number.to_string(), "✅ PR reviewed, approved, and merged.")
+        .await;
 
     tracing::info!(task_id = task.id.0, "auto-merge completed");
 
@@ -2397,7 +2399,8 @@ async fn handle_review_changes(
     notes: &str,
     issues: &[crate::engine::runner::response::ReviewIssue],
     backend: &Arc<dyn ExternalBackend>,
-    _repo: &str,
+    repo: &str,
+    pr_number: u64,
 ) -> anyhow::Result<()> {
     // 1. Check review cycle count (max 2 review rounds)
     let review_cycles: u32 = sidecar::get(&task.id.0, "review_cycles")
@@ -2410,6 +2413,9 @@ async fn handle_review_changes(
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
 
+    let gh = GhHttp::new();
+    let pr_num_str = pr_number.to_string();
+
     if review_cycles >= max_cycles {
         // Too many review cycles — escalate to human
         tracing::warn!(
@@ -2419,14 +2425,17 @@ async fn handle_review_changes(
             "max review cycles exceeded, escalating to human"
         );
         backend.update_status(&task.id, Status::NeedsReview).await?;
-        backend.post_comment(&task.id, &format!(
+        let escalation = format!(
             "🔍 Review agent requested changes after {} cycles. Escalating to human.\n\n**Review Notes:**\n{}",
             review_cycles, notes
-        )).await?;
+        );
+        if let Err(e) = gh.add_comment(repo, &pr_num_str, &escalation).await {
+            tracing::warn!(task_id = task.id.0, pr_number, err = %e, "failed to post escalation comment on PR");
+        }
         return Ok(());
     }
 
-    // 2. Post review feedback as comment
+    // 2. Post review feedback as comment on the PR
     let mut comment = format!(
         "🔍 Review agent requested changes (cycle {} of {}):\n\n{}",
         review_cycles + 1,
@@ -2450,7 +2459,9 @@ async fn handle_review_changes(
         }
     }
 
-    backend.post_comment(&task.id, &comment).await?;
+    if let Err(e) = gh.add_comment(repo, &pr_num_str, &comment).await {
+        tracing::warn!(task_id = task.id.0, pr_number, err = %e, "failed to post review comment on PR");
+    }
 
     // 3. Update sidecar with review context (including pr_review_context so the
     //    re-dispatched agent can see what the reviewer found wrong)
