@@ -156,6 +156,7 @@ impl ExternalBackend for GitHubBackend {
         let issues = self.gh.list_issues(&self.repo, status.as_label()).await?;
         Ok(issues
             .into_iter()
+            .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
             .map(|issue| ExternalTask {
                 id: ExternalId(issue.number.to_string()),
                 title: issue.title,
@@ -175,6 +176,7 @@ impl ExternalBackend for GitHubBackend {
         let issues = self.gh.list_all_open_issues(&self.repo).await?;
         Ok(issues
             .into_iter()
+            .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
             .filter(|issue| {
                 let labels: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
                 // Include if: has status:new, OR has no status:* label at all
@@ -257,7 +259,10 @@ impl ExternalBackend for GitHubBackend {
 
     async fn has_open_issue_with_title(&self, title: &str, label: &str) -> anyhow::Result<bool> {
         let issues = self.gh.list_issues(&self.repo, label).await?;
-        Ok(issues.iter().any(|i| i.title == title))
+        Ok(issues
+            .iter()
+            .filter(|i| i.pull_request.is_none()) // Exclude PRs
+            .any(|i| i.title == title))
     }
 
     async fn health_check(&self) -> anyhow::Result<()> {
