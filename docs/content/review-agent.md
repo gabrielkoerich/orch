@@ -52,7 +52,7 @@ The `review_agent` config key is now a fallback — `opposite_agent()` handles p
 
 ## Review Prompt
 
-The review prompt (`prompts/review.md`) sends:
+The review prompt (`prompts/review_task.md`) sends:
 
 - Task ID and title
 - PR number

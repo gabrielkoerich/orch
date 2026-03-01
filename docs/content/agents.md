@@ -90,7 +90,7 @@ Every agent receives a rich context built from multiple sources:
 
 | Context | Source | When |
 |---------|--------|------|
-| System prompt | `prompts/system.md` | Always |
+| System prompt | `prompts/agent_system.md` | Always |
 | Task details | `tasks.yml` | Always |
 | Agent profile | Router-generated role/skills/tools/constraints | Always |
 | Error history | `tasks.yml` `.history[]` | On retries |

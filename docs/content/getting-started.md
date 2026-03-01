@@ -68,11 +68,13 @@ Source files:
 
 | File | Description |
 |------|-------------|
-| `prompts/system.md` | System prompt (output format, workflow, constraints) |
-| `prompts/agent.md` | Execution prompt (task details + enriched context) |
-| `prompts/plan.md` | Planning/decomposition prompt |
+| `prompts/agent_system.md` | System prompt (workflow, rules, output format) |
+| `prompts/agent_message.md` | Task message (task details, context, memory) |
+| `prompts/agent_memory_entry.md` | Memory entry template (per-attempt learnings) |
+| `prompts/allowed_tools.md` | Tool permissions (appended to system when configured) |
 | `prompts/route.md` | Routing + profile generation prompt |
-| `prompts/review.md` | Review agent prompt |
+| `prompts/review_system.md` | Review agent system prompt |
+| `prompts/review_task.md` | Review task prompt (diff, commits, criteria) |
 | `scripts/*.sh` | Orchestration commands |
 | `tests/orchestrator.bats` | Tests (bats framework) |
 
