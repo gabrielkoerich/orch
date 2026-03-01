@@ -226,10 +226,16 @@ impl Db {
                     block_reason: row.get(7)?,
                     created_at: DateTime::parse_from_rfc3339(&created_str)
                         .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(id, error = %e, "corrupt created_at timestamp in internal_task");
+                            Utc::now()
+                        }),
                     updated_at: DateTime::parse_from_rfc3339(&updated_str)
                         .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(id, error = %e, "corrupt updated_at timestamp in internal_task");
+                            Utc::now()
+                        }),
                 })
             },
         )?;
@@ -261,10 +267,16 @@ impl Db {
                 block_reason: row.get(7)?,
                 created_at: DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "corrupt created_at timestamp in internal_task");
+                        Utc::now()
+                    }),
                 updated_at: DateTime::parse_from_rfc3339(&updated_str)
                     .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "corrupt updated_at timestamp in internal_task");
+                        Utc::now()
+                    }),
             })
         })?;
         let result: Vec<InternalTask> = tasks
@@ -372,10 +384,16 @@ impl Db {
                 block_reason: row.get(7)?,
                 created_at: DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "corrupt created_at timestamp in internal_task");
+                        Utc::now()
+                    }),
                 updated_at: DateTime::parse_from_rfc3339(&updated_str)
                     .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "corrupt updated_at timestamp in internal_task");
+                        Utc::now()
+                    }),
             })
         })?;
         let result: Vec<InternalTask> = tasks
@@ -439,10 +457,16 @@ impl Db {
                 duration_seconds: row.get(6)?,
                 started_at: DateTime::parse_from_rfc3339(&started_str)
                     .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(task_id, error = %e, "corrupt started_at timestamp in task_metric");
+                        Utc::now()
+                    }),
                 completed_at: DateTime::parse_from_rfc3339(&completed_str)
                     .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(task_id, error = %e, "corrupt completed_at timestamp in task_metric");
+                        Utc::now()
+                    }),
                 attempts: row.get(9)?,
                 files_changed: row.get(10)?,
                 error_type: row.get(11)?,
@@ -453,7 +477,10 @@ impl Db {
                 total_cost_usd: row.get(16)?,
                 created_at: DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(task_id, error = %e, "corrupt created_at timestamp in task_metric");
+                        Utc::now()
+                    }),
             })
         })?;
         let result: Vec<TaskMetric> = metrics.filter_map(|m| m.ok()).collect();

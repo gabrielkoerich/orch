@@ -8,8 +8,10 @@
 //! Legacy fallback: `~/.orchestrator/state/` (read-only)
 
 use anyhow::Context;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::path::PathBuf;
 
 /// Token usage for an agent run.
@@ -141,6 +143,50 @@ fn sidecar_path_for_repo(task_id: &str, repo: Option<&str>) -> anyhow::Result<Pa
     state_file(&format!("{task_id}.json"))
 }
 
+/// Perform a locked read-modify-write on a sidecar JSON file.
+///
+/// Acquires an exclusive file lock before reading, applies `mutate` to the
+/// parsed JSON object, then writes back while still holding the lock.
+/// This prevents TOCTOU races between concurrent writers (engine, runner, CLI).
+fn with_locked_sidecar<F>(task_id: &str, mutate: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut serde_json::Map<String, Value>) -> anyhow::Result<()>,
+{
+    let path = sidecar_path(task_id)?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    file.lock_exclusive()?;
+
+    let mut content = String::new();
+    (&file).read_to_string(&mut content)?;
+
+    let mut obj: serde_json::Map<String, Value> = if content.is_empty() {
+        serde_json::Map::new()
+    } else {
+        serde_json::from_str(&content)?
+    };
+
+    mutate(&mut obj)?;
+
+    let new_content = serde_json::to_string_pretty(&Value::Object(obj))?;
+
+    file.set_len(0)?;
+    (&file).seek(SeekFrom::Start(0))?;
+    (&file).write_all(new_content.as_bytes())?;
+
+    // Lock released on drop
+    Ok(())
+}
+
 /// Read a field from a sidecar file.
 pub fn get(task_id: &str, field: &str) -> anyhow::Result<String> {
     let path = sidecar_path(task_id)?;
@@ -164,29 +210,17 @@ pub fn get(task_id: &str, field: &str) -> anyhow::Result<String> {
 /// Set one or more fields in a sidecar file.
 ///
 /// Each entry in `fields` is "key=value" format.
+/// Uses exclusive file locking to prevent concurrent write races.
 pub fn set(task_id: &str, fields: &[String]) -> anyhow::Result<()> {
-    let path = sidecar_path(task_id)?;
-
-    // Load existing or create new
-    let mut obj: serde_json::Map<String, Value> = if path.exists() {
-        let content = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&content)?
-    } else {
-        serde_json::Map::new()
-    };
-
-    // Apply field updates
-    for field in fields {
-        let (key, value) = field
-            .split_once('=')
-            .with_context(|| format!("invalid field format (expected key=value): {field}"))?;
-        obj.insert(key.to_string(), Value::String(value.to_string()));
-    }
-
-    // Write back
-    let content = serde_json::to_string_pretty(&Value::Object(obj))?;
-    std::fs::write(&path, content)?;
-    Ok(())
+    with_locked_sidecar(task_id, |obj| {
+        for field in fields {
+            let (key, value) = field
+                .split_once('=')
+                .with_context(|| format!("invalid field format (expected key=value): {field}"))?;
+            obj.insert(key.to_string(), Value::String(value.to_string()));
+        }
+        Ok(())
+    })
 }
 
 /// Read a numeric sidecar field as u64. Missing or invalid values return 0.
@@ -206,22 +240,15 @@ pub fn get_f64(task_id: &str, field: &str) -> f64 {
 }
 
 /// Store token usage for a task.
+///
+/// Writes all token counts, costs, and model in a single locked write
+/// to avoid a TOCTOU race between the two former `set()` calls.
 pub fn store_token_usage(
     task_id: &str,
     input_tokens: u64,
     output_tokens: u64,
     model: &str,
 ) -> anyhow::Result<()> {
-    // Store raw token counts
-    set(
-        task_id,
-        &[
-            format!("input_tokens={}", input_tokens),
-            format!("output_tokens={}", output_tokens),
-        ],
-    )?;
-
-    // Calculate and store cost
     let pricing = pricing_for_model(model);
     let usage = TokenUsage {
         input_tokens,
@@ -232,14 +259,14 @@ pub fn store_token_usage(
     set(
         task_id,
         &[
+            format!("input_tokens={}", input_tokens),
+            format!("output_tokens={}", output_tokens),
             format!("input_cost_usd={:.6}", cost.input_cost_usd),
             format!("output_cost_usd={:.6}", cost.output_cost_usd),
             format!("total_cost_usd={:.6}", cost.total_cost_usd),
             format!("model={}", model),
         ],
-    )?;
-
-    Ok(())
+    )
 }
 
 /// Get token usage for a task.
@@ -292,34 +319,19 @@ pub struct MemoryEntry {
 }
 
 /// Store a memory entry for a task attempt.
+///
+/// Uses exclusive file locking to prevent concurrent write races.
 pub fn store_memory(task_id: &str, entry: &MemoryEntry) -> anyhow::Result<()> {
-    let path = sidecar_path(task_id)?;
+    with_locked_sidecar(task_id, |obj| {
+        let mut memory: Vec<MemoryEntry> = obj
+            .get("memory")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
-    // Load existing or create new
-    let mut obj: serde_json::Map<String, Value> = if path.exists() {
-        let content = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&content)?
-    } else {
-        serde_json::Map::new()
-    };
-
-    // Get existing memory array or create new
-    let mut memory: Vec<MemoryEntry> = obj
-        .get("memory")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    // Add new entry
-    memory.push(entry.clone());
-
-    // Store back
-    obj.insert("memory".to_string(), serde_json::to_value(&memory)?);
-
-    // Write back
-    let content = serde_json::to_string_pretty(&Value::Object(obj))?;
-    std::fs::write(&path, content)?;
-
-    Ok(())
+        memory.push(entry.clone());
+        obj.insert("memory".to_string(), serde_json::to_value(&memory)?);
+        Ok(())
+    })
 }
 
 /// Get all memory entries for a task.
@@ -359,21 +371,13 @@ pub fn get_recent_memory(task_id: &str, max_entries: usize) -> anyhow::Result<Ve
 #[allow(dead_code)]
 pub fn clear_memory(task_id: &str) -> anyhow::Result<()> {
     let path = sidecar_path(task_id)?;
-
     if !path.exists() {
         return Ok(());
     }
-
-    let content = std::fs::read_to_string(&path)?;
-    let mut obj: serde_json::Map<String, Value> = serde_json::from_str(&content)?;
-
-    obj.remove("memory");
-
-    // Write back
-    let content = serde_json::to_string_pretty(&Value::Object(obj))?;
-    std::fs::write(&path, content)?;
-
-    Ok(())
+    with_locked_sidecar(task_id, |obj| {
+        obj.remove("memory");
+        Ok(())
+    })
 }
 
 /// Resolve model pricing using a built-in table and normalized model aliases.
