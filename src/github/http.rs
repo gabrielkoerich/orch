@@ -6,7 +6,9 @@
 //! Auth: reads token from `gh auth token` once at startup, falls back to
 //! `GITHUB_TOKEN` / `GH_TOKEN` env vars.
 
-use super::types::{GitHubComment, GitHubIssue, GitHubReview, GitHubReviewComment};
+use super::types::{
+    GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview, GitHubReviewComment,
+};
 use reqwest::{header, Client, Response, StatusCode};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -662,6 +664,13 @@ impl GhHttp {
             .and_then(|n| n.as_u64())
             .ok_or_else(|| anyhow::anyhow!("PR missing number field"))
             .map(Some)
+    }
+
+    /// Get PR details by PR number.
+    /// Returns the full PR object including the `mergeable` field.
+    pub async fn get_pr(&self, repo: &str, pr_number: u64) -> anyhow::Result<GitHubPullRequest> {
+        let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}");
+        self.get_json(&url).await
     }
 
     /// Get reviews for a PR.
