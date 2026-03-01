@@ -746,9 +746,16 @@ async fn tick(
 
     // Phase 2: Recover stuck tasks
     let _phase2 = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
-    let in_progress = task_manager
+    let in_progress = match task_manager
         .list_external_by_status(Status::InProgress)
-        .await?;
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(?e, "failed to list in_progress tasks, skipping stuck task recovery");
+            Vec::new()
+        }
+    };
     for task in &in_progress {
         let session_name = tmux.session_name(repo, &task.id.0);
         let has_session = tmux.session_exists(&session_name).await;
@@ -807,7 +814,13 @@ async fn tick(
 
     // Phase 3a: Route new tasks (includes issues with status:new or no status:* label)
     let _phase3a = tracing::info_span!("engine.tick.phase3a.route").entered();
-    let new_tasks = task_manager.list_routable().await?;
+    let new_tasks = match task_manager.list_routable().await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(?e, "failed to list routable tasks, skipping routing phase");
+            Vec::new()
+        }
+    };
     let routable: Vec<&ExternalTask> = new_tasks
         .iter()
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
@@ -859,7 +872,13 @@ async fn tick(
     // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
     // but we keep this filter as defense-in-depth.
     let _phase3b = tracing::info_span!("engine.tick.phase3b.dispatch").entered();
-    let routed_tasks = task_manager.list_external_by_status(Status::Routed).await?;
+    let routed_tasks = match task_manager.list_external_by_status(Status::Routed).await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(?e, "failed to list routed tasks, skipping dispatch phase");
+            Vec::new()
+        }
+    };
     let dispatchable: Vec<&ExternalTask> = routed_tasks
         .iter()
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
@@ -1025,9 +1044,16 @@ async fn tick(
     }
 
     // Phase 4: Unblock parents (blocked tasks whose children are all done)
-    let blocked = task_manager
+    let blocked = match task_manager
         .list_external_by_status(Status::Blocked)
-        .await?;
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(?e, "failed to list blocked tasks, skipping unblock phase");
+            Vec::new()
+        }
+    };
     for task in &blocked {
         let children = match backend.get_sub_issues(&task.id).await {
             Ok(ids) => ids,

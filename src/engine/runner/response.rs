@@ -356,15 +356,22 @@ pub fn clear_expired_cooldowns() {
 
                 let now = chrono::Utc::now().timestamp();
                 let mut to_remove = Vec::new();
-                for (agent, entry) in &cooldowns {
+                for (key, entry) in &cooldowns {
                     if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
-                        if (now - failed_at) >= AGENT_COOLDOWN_SECS {
-                            to_remove.push(agent.clone());
+                        // Use MODEL_COOLDOWN_SECS for model-specific keys (containing ':'),
+                        // AGENT_COOLDOWN_SECS for agent-only keys
+                        let cooldown_secs = if key.contains(':') {
+                            MODEL_COOLDOWN_SECS
+                        } else {
+                            AGENT_COOLDOWN_SECS
+                        };
+                        if (now - failed_at) >= cooldown_secs {
+                            to_remove.push(key.clone());
                         }
                     }
                 }
-                for agent in to_remove {
-                    cooldowns.remove(&agent);
+                for key in to_remove {
+                    cooldowns.remove(&key);
                 }
 
                 if let Ok(content) =

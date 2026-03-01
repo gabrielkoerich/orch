@@ -416,11 +416,18 @@ impl TaskRunner {
                     }
 
                     // Push
-                    if let Err(e) =
-                        git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await
+                    match git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await
                     {
-                        tracing::error!(task_id, error = ?e, "push failed");
-                        sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
+                        Ok(true) => {
+                            tracing::info!(task_id, "branch pushed successfully");
+                        }
+                        Ok(false) => {
+                            tracing::info!(task_id, "branch push skipped (no unpushed commits or main/master branch)");
+                        }
+                        Err(e) => {
+                            tracing::error!(task_id, error = ?e, "push failed");
+                            sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
+                        }
                     }
 
                     // Create PR
