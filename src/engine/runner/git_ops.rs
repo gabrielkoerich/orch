@@ -130,7 +130,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         tracing::warn!(branch = branch_to_push, err = %stderr, "push failed");
-        Ok(false)
+        anyhow::bail!("push failed: {stderr}")
     }
 }
 

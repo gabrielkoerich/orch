@@ -416,35 +416,47 @@ impl TaskRunner {
                     }
 
                     // Push
-                    if let Err(e) =
-                        git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await
-                    {
-                        tracing::error!(task_id, error = ?e, "push failed");
-                        sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
-                    }
+                    let push_ok =
+                        match git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch)
+                            .await
+                        {
+                            Ok(_) => true,
+                            Err(e) => {
+                                tracing::error!(task_id, error = ?e, "push failed");
+                                sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
+                                false
+                            }
+                        };
 
-                    // Create PR
-                    match git_ops::create_pr_if_needed(
-                        &wt.work_dir,
-                        &wt.branch,
-                        &task_title,
-                        &resp.summary,
-                        &resp.accomplished,
-                        &resp.remaining,
-                        &resp.files,
-                        task_id,
-                        &agent_name,
-                    )
-                    .await
-                    {
-                        Ok(Some(_url)) => has_pr = true,
-                        Ok(None) => {
-                            // PR already existed
-                            has_pr = true;
-                        }
-                        Err(e) => {
-                            tracing::error!(task_id, error = ?e, "create PR failed");
-                            sidecar::set(task_id, &[format!("last_error=create PR failed: {e}")])?;
+                    // Create PR (skip if push failed)
+                    if !push_ok {
+                        tracing::warn!(task_id, "skipping PR creation due to push failure");
+                    } else {
+                        match git_ops::create_pr_if_needed(
+                            &wt.work_dir,
+                            &wt.branch,
+                            &task_title,
+                            &resp.summary,
+                            &resp.accomplished,
+                            &resp.remaining,
+                            &resp.files,
+                            task_id,
+                            &agent_name,
+                        )
+                        .await
+                        {
+                            Ok(Some(_url)) => has_pr = true,
+                            Ok(None) => {
+                                // PR already existed
+                                has_pr = true;
+                            }
+                            Err(e) => {
+                                tracing::error!(task_id, error = ?e, "create PR failed");
+                                sidecar::set(
+                                    task_id,
+                                    &[format!("last_error=create PR failed: {e}")],
+                                )?;
+                            }
                         }
                     }
                 }
