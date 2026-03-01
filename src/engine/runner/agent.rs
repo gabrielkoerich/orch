@@ -270,7 +270,7 @@ Your final output MUST be a JSON object with these fields:
   "files_changed": ["list of files modified"],
   "blockers": ["list of blockers, empty if none"],
   "reason": "reason if blocked or needs_review, empty string otherwise",
-  "delegations": [{"title": "...", "body": "...", "labels": ["..."]}]
+  "delegations": [{"title": "...", "body": "...", "labels": ["..."], "suggested_agent": "codex"}]
 }
 ```
 
@@ -293,7 +293,7 @@ If a task is too complex for a single agent, you can delegate subtasks. Include 
   "accomplished": ["Analyzed requirements"],
   "remaining": ["Waiting on subtasks"],
   "delegations": [
-    {"title": "Subtask title", "body": "Detailed description of the subtask", "labels": ["label1"]},
+    {"title": "Subtask title", "body": "Detailed description of the subtask", "labels": ["label1"], "suggested_agent": "codex"},
     {"title": "Another subtask", "body": "Description", "labels": ["label2"]}
   ]
 }
@@ -306,6 +306,7 @@ Delegation rules:
 - Only delegate when the task genuinely requires parallel workstreams or different expertise.
 - Do not delegate trivial work — just do it yourself.
 - Labels are optional — the orchestrator will route each subtask automatically.
+- `suggested_agent` is optional — use when a specific agent is best suited for a subtask.
 
 ## Visibility
 

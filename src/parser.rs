@@ -43,6 +43,8 @@ pub struct Delegation {
     pub body: String,
     #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default)]
+    pub suggested_agent: Option<String>,
 }
 
 /// Parse an agent response from a file path (or stdin if "-").
