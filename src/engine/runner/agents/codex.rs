@@ -264,14 +264,13 @@ impl AgentRunner for CodexRunner {
         };
 
         format!(
-            r#"cat "{msg_file}" | {timeout_cmd} codex {model_flag} \
-  --instructions "{sys_file}" \
+            r#"cat "{sys_file}" "{msg_file}" | {timeout_cmd} codex {model_flag} \
   {permission_flags} \
   exec --json -"#,
+            sys_file = sys_file,
             msg_file = msg_file,
             timeout_cmd = timeout_cmd,
             model_flag = model_flag,
-            sys_file = sys_file,
             permission_flags = permission_flags,
         )
     }
