@@ -363,7 +363,12 @@ impl TaskRunner {
                         "error": parsed.response.error,
                         "learnings": parsed.response.learnings,
                         "delegations": parsed.response.delegations.iter()
-                            .map(|d| serde_json::json!({"title": d.title, "body": d.body}))
+                            .map(|d| serde_json::json!({
+                                "title": d.title,
+                                "body": d.body,
+                                "labels": d.labels,
+                                "suggested_agent": d.suggested_agent,
+                            }))
                             .collect::<Vec<_>>(),
                     })
                 }
@@ -1025,6 +1030,11 @@ impl TaskRunner {
             let mut labels = delegation.labels.clone();
             labels.push("status:new".to_string());
 
+            // If the agent suggested a specific executor, add the routing label
+            if let Some(ref agent) = delegation.suggested_agent {
+                labels.push(format!("agent:{agent}"));
+            }
+
             // Build child body with delegation reference
             let child_body = format!(
                 "{}\n\n---\n_Delegated from #{}_",
@@ -1042,6 +1052,18 @@ impl TaskRunner {
                         title = delegation.title,
                         "created delegated subtask"
                     );
+                    // Store parent_id in child sidecar so the engine can link them
+                    if let Err(e) = sidecar::set(
+                        &child_id.0,
+                        &[format!("parent_id={}", parent_id.0)],
+                    ) {
+                        tracing::warn!(
+                            child = child_id.0,
+                            parent = parent_id.0,
+                            err = %e,
+                            "failed to store parent_id in child sidecar"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::error!(

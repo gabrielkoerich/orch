@@ -43,6 +43,10 @@ pub struct Delegation {
     pub body: String,
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Optionally hint which agent should handle this subtask (e.g. "claude", "codex").
+    /// When set, an `agent:{agent}` label is added to the child task for label-based routing.
+    #[serde(default)]
+    pub suggested_agent: Option<String>,
 }
 
 /// Parse an agent response from a file path (or stdin if "-").
@@ -336,5 +340,25 @@ Done.
         assert_eq!(resp.delegations.len(), 1);
         assert_eq!(resp.delegations[0].title, "Subtask");
         assert!(resp.delegations[0].labels.is_empty());
+        assert!(resp.delegations[0].suggested_agent.is_none());
+    }
+
+    #[test]
+    fn parse_delegations_with_suggested_agent() {
+        let input = r#"{
+            "status": "blocked",
+            "summary": "Delegating with agent hint",
+            "delegations": [
+                {"title": "Backend task", "body": "Do backend work", "suggested_agent": "codex"},
+                {"title": "Frontend task", "body": "Do frontend work", "labels": ["ui"]}
+            ]
+        }"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.delegations.len(), 2);
+        assert_eq!(
+            resp.delegations[0].suggested_agent,
+            Some("codex".to_string())
+        );
+        assert!(resp.delegations[1].suggested_agent.is_none());
     }
 }
