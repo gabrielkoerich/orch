@@ -179,11 +179,9 @@ pub trait ExternalBackend: Send + Sync {
     /// Add metadata labels / tags (additive — does not remove existing labels).
     /// The GitHub backend uses POST /repos/{repo}/issues/{number}/labels,
     /// which appends to the existing label set.
-    #[allow(dead_code)]
     async fn set_labels(&self, id: &ExternalId, labels: &[String]) -> anyhow::Result<()>;
 
     /// Remove a label / tag.
-    #[allow(dead_code)]
     async fn remove_label(&self, id: &ExternalId, label: &str) -> anyhow::Result<()>;
 
     /// Get sub-issues (children) of a task.

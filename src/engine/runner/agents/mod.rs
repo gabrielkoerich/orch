@@ -100,7 +100,6 @@ impl PermissionRules {
 /// Parsed response from an agent, including metadata extracted from the
 /// agent-specific output envelope.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ParsedResponse {
     /// Normalized task response (status, summary, accomplished, etc.)
     pub response: AgentResponse,
@@ -111,16 +110,17 @@ pub struct ParsedResponse {
     /// Wall-clock duration in milliseconds (if reported by the agent).
     pub duration_ms: Option<u64>,
     /// Permission denials encountered during execution.
+    #[allow(dead_code)]
     pub permission_denials: Vec<String>,
 }
 
 /// Agent-specific error with enough detail for autonomous recovery.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum AgentError {
     /// Rate/usage limit — reroute to different agent, cooldown current.
     RateLimit {
         message: String,
+        #[allow(dead_code)]
         retry_after: Option<Duration>,
     },
     /// Auth/billing/API key error — switch agent entirely.
@@ -130,6 +130,7 @@ pub enum AgentError {
     /// Context window exceeded — truncate and retry, then switch agent.
     ContextOverflow {
         message: String,
+        #[allow(dead_code)]
         max_tokens: Option<u64>,
     },
     /// Agent timed out — retry once, then switch agent.
@@ -211,12 +212,13 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
 ///
 /// Each agent implements this to handle its specific CLI invocation,
 /// output parsing, and error classification.
-#[allow(dead_code)]
 pub trait AgentRunner: Send + Sync {
     /// Agent name (e.g., "claude", "codex", "opencode").
+    #[allow(dead_code)]
     fn name(&self) -> &str;
 
     /// Check if this agent's binary is available on the system.
+    #[allow(dead_code)]
     fn is_available(&self) -> bool;
 
     /// Build the CLI command string for the runner shell script.
