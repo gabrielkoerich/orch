@@ -1146,7 +1146,19 @@ async fn tick(
     tick_check_session_completions(tmux, repo, capture).await?;
     tick_recover_stuck_tasks(backend, tmux, repo, task_manager, config).await?;
     tick_route_tasks(backend, task_manager, router).await?;
-    tick_dispatch_tasks(backend, tmux, repo, runner, capture, semaphore, task_manager, weight_tx, transport, router_arc).await?;
+    tick_dispatch_tasks(
+        backend,
+        tmux,
+        repo,
+        runner,
+        capture,
+        semaphore,
+        task_manager,
+        weight_tx,
+        transport,
+        router_arc,
+    )
+    .await?;
     tick_unblock_parents(backend, task_manager).await?;
     if let Err(e) = tick_job_scheduler(jobs_path, backend, db).await {
         tracing::error!(?e, "job scheduler tick failed");
