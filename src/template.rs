@@ -1,6 +1,5 @@
 use regex::Regex;
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::sync::LazyLock;
@@ -73,7 +72,7 @@ pub fn render_template(template_path: &str, extra_vars: &[String]) -> Result<Str
     let data =
         fs::read_to_string(template_path).map_err(|e| format!("failed to read template: {}", e))?;
 
-    let mut vars: HashMap<String, String> = env::vars().collect();
+    let mut vars: HashMap<String, String> = HashMap::new();
 
     for var in extra_vars {
         if let Some((key, value)) = var.split_once('=') {
@@ -82,6 +81,44 @@ pub fn render_template(template_path: &str, extra_vars: &[String]) -> Result<Str
     }
 
     render_template_with_vars(&data, &vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn render_template_does_not_leak_env_vars() {
+        // Set a sensitive env var that must NOT appear in the rendered output
+        unsafe {
+            std::env::set_var("ORCH_TEST_SECRET_TOKEN", "should-not-appear");
+        }
+
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "hello world").unwrap();
+
+        let result = render_template(f.path().to_str().unwrap(), &[]).unwrap();
+        assert!(
+            !result.contains("should-not-appear"),
+            "env var leaked into rendered template"
+        );
+
+        unsafe {
+            std::env::remove_var("ORCH_TEST_SECRET_TOKEN");
+        }
+    }
+
+    #[test]
+    fn render_template_uses_explicit_vars() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "value={{{{MY_VAR}}}}").unwrap();
+
+        let result =
+            render_template(f.path().to_str().unwrap(), &["MY_VAR=hello".to_string()]).unwrap();
+        assert_eq!(result.trim(), "value=hello");
+    }
 }
 
 pub fn render_and_print(template_path: &str, extra_vars: &[String]) -> io::Result<()> {
