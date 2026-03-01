@@ -1923,6 +1923,37 @@ async fn review_and_merge(
         }
     };
 
+    // 2b. Verify an open PR exists before running the (expensive) review agent
+    let gh_check = GhHttp::new();
+    let pr_number_early = match gh_check.get_pr_number(repo, &branch_name).await {
+        Ok(Some(n)) => {
+            tracing::info!(
+                task_id = task.id.0,
+                pr_number = n,
+                branch = %branch_name,
+                "open PR found, proceeding with review"
+            );
+            n
+        }
+        Ok(None) => {
+            tracing::warn!(
+                task_id = task.id.0,
+                branch = %branch_name,
+                "no open PR found, skipping review"
+            );
+            return Ok(ReviewDecision::Failed("no open PR".to_string()));
+        }
+        Err(e) => {
+            tracing::warn!(
+                task_id = task.id.0,
+                branch = %branch_name,
+                error = %e,
+                "failed to check PR status"
+            );
+            return Ok(ReviewDecision::Failed(format!("PR check failed: {e}")));
+        }
+    };
+
     // 3. Rebase with main to resolve conflicts before review
     let default_branch = config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
     {
@@ -2100,6 +2131,7 @@ async fn review_and_merge(
 
     tracing::info!(
         task_id = task.id.0,
+        pr_number = pr_number_early,
         decision = ?decision,
         "review agent decision received"
     );
@@ -2162,7 +2194,13 @@ async fn review_and_merge(
 
             if auto_merge {
                 if let Err(e) = auto_merge_pr(task, &branch_name, backend, repo).await {
-                    tracing::error!(task_id = task.id.0, error = %e, "auto-merge failed");
+                    tracing::error!(
+                        task_id = task.id.0,
+                        pr_number = pr_number_early,
+                        branch = %branch_name,
+                        error = %e,
+                        "auto-merge failed"
+                    );
                     return Ok(ReviewDecision::Failed(format!("merge failed: {e}")));
                 }
             }
