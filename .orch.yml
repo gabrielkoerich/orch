@@ -94,7 +94,7 @@ jobs:
 
   - id: morning-review
     type: task
-    schedule: 23 12 * * *
+    schedule: 28 15 * * *
     task:
       title: 'Daily morning review: improvements and optimization'
       body: |
