@@ -43,6 +43,8 @@ pub struct Delegation {
     pub body: String,
     #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default)]
+    pub suggested_agent: Option<String>,
 }
 
 /// Parse an agent response from a file path (or stdin if "-").
@@ -336,5 +338,30 @@ Done.
         assert_eq!(resp.delegations.len(), 1);
         assert_eq!(resp.delegations[0].title, "Subtask");
         assert!(resp.delegations[0].labels.is_empty());
+        assert!(resp.delegations[0].suggested_agent.is_none());
+    }
+
+    #[test]
+    fn parse_delegations_with_suggested_agent() {
+        let input = r#"{
+            "status": "blocked",
+            "summary": "Delegating",
+            "delegations": [
+                {
+                    "title": "Subtask",
+                    "body": "Do the thing",
+                    "labels": ["backend"],
+                    "suggested_agent": "codex"
+                }
+            ]
+        }"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.delegations.len(), 1);
+        assert_eq!(resp.delegations[0].title, "Subtask");
+        assert_eq!(resp.delegations[0].labels, vec!["backend"]);
+        assert_eq!(
+            resp.delegations[0].suggested_agent,
+            Some("codex".to_string())
+        );
     }
 }
