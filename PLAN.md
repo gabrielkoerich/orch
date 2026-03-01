@@ -1190,7 +1190,7 @@ Note: `orch board` manages GitHub Projects V2 boards. `orch project` manages the
 
 ## Parity Audit — Feature Gaps
 
-Last updated: 2026-02-26 (276 tests, ~90% parity)
+Last updated: 2026-03-01 (366 tests, ~98% parity)
 
 ### Completed
 
@@ -1304,44 +1304,34 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 | Issue | Title | Priority | Description |
 |-------|-------|----------|-------------|
-| #144 | Cost Tracking CLI and Budget Enforcement | Medium | Add `orch cost <task_id>` command, aggregate cost reporting, and visible budget warnings. See src/sidecar.rs (cost tracking), src/cli/mod.rs (add command). |
-| #145 | Webhook Server Production Hardening | Medium | Graceful shutdown coordination, webhook event persistence, retry logic with backoff. See src/channels/github.rs (webhook server), src/engine/mod.rs (lifecycle). |
-| #112 | Skills sync from config (auto-clone skill repos) | Low | Config structure exists but sync implementation is missing. Needed for per-project skill repositories. |
+| #228 | Decompose `engine/mod.rs` into focused submodules | High | Extract PR review workflow (~804 lines) into `pr_review.rs`, sync operations (~340 lines) into `sync_ops.rs`. Break down `serve()` (503 lines) and `tick()` (401 lines) into named phases. See issue for full plan. |
+| #230 | Break `tick()` into named phases | Medium | Extract 4-5 phases of the 401-line `tick()` function into independent methods for readability and testability. Pure refactoring, no behavior change. |
 
-### Recently Completed
+### Recently Closed
 
 | Issue | Title | Description |
 |-------|-------|-------------|
-| #178 | Task delegation processing | `src/engine/runner/mod.rs:1003-1070` - spawns child tasks from `delegations` field |
-| #179 | Owner slash commands | `src/engine/commands.rs` - `/retry`, `/reroute [agent]`, `/block [reason]`, `/unblock`, `/close`, `/review` |
-| #143 | PR Review Integration | `src/engine/mod.rs:1469-1700+` - processes `changes_requested` reviews and re-dispatches tasks with review context |
-| - | Review Agent + Auto-Merge | `review_and_merge()` in `src/engine/mod.rs:1768+` - spawns review agent after task completion, handles approve/request_changes |
-| - | Merge Detection | `check_merged_prs()` in `src/engine/mod.rs:1405-1452` - monitors merged PRs and auto-closes associated tasks |
-| - | Dashboard CLI | `orch dashboard` command in `src/cli/dashboard.rs` - shows task counts, active sessions, recent activity |
-| - | Task Tree CLI | `orch task tree` command in `src/cli/tree.rs` - ASCII tree of parent-child task relationships |
-| - | Graceful Shutdown | SIGTERM/SIGINT handlers in `src/engine/mod.rs:681-705` - drain mode for safe upgrades |
+| #144 | Cost Tracking CLI and Budget Enforcement | `orch cost` command in `src/cli/cost.rs` — per-task and aggregate cost reporting |
+| #145 | Webhook Server Production Hardening | Graceful shutdown, webhook event handling in `src/channels/github.rs` |
+| #112 | Wire webhook server into engine | Webhook server integrated via `start_webhook_server()` in `src/channels/github.rs` |
+| #178 | Task delegation processing | `src/engine/runner/mod.rs:1003-1070` — spawns child tasks from `delegations` field |
+| #179 | Owner slash commands | `src/engine/commands.rs` — `/retry`, `/reroute [agent]`, `/block [reason]`, `/unblock`, `/close`, `/review` |
+| #143 | PR Review Integration | `src/engine/mod.rs` — processes `changes_requested` reviews and re-dispatches tasks |
+| - | Review Agent + Auto-Merge | `review_and_merge()` in `src/engine/mod.rs` |
+| - | Merge Detection | `check_merged_prs()` in `src/engine/mod.rs` |
+| - | Dashboard CLI | `orch dashboard` in `src/cli/dashboard.rs` |
+| - | Task Tree CLI | `orch task tree` in `src/cli/tree.rs` |
+| - | Graceful Shutdown | SIGTERM/SIGINT handlers in `src/engine/mod.rs` |
 
-### Implementation Notes
+### Code Quality
 
-**Issue #143 - PR Review Integration:**
-- Location: `src/engine/mod.rs` (add handler in `process_message()`)
-- Detect review state and create follow-up tasks as sub-issues
-- Update task status appropriately when reviews are submitted
+- [ ] `src/engine/mod.rs` — 2,687 lines, needs decomposition (#228)
+- [ ] `src/engine/router.rs` — 2,356 lines, well-structured but large; consider extracting LLM response parsing
+- [ ] `src/engine/runner/mod.rs` — 45KB, largest runner file; review for extraction opportunities
+- [ ] No test coverage tooling configured — add `cargo-llvm-cov` or `tarpaulin` to CI
+- [ ] 366 unit tests exist but coverage metrics not tracked
 
-**Issue #144 - Cost Tracking:**
-- Location: `src/cli/mod.rs` (new subcommand), `src/db.rs` (cost metrics)
-- Build on existing cost estimation in `src/sidecar.rs:208-260`
-- Add budget warnings at 80% threshold with GitHub comment posting
+### Feature Gaps (Low Priority)
 
-**Issue #145 - Webhook Hardening:**
-- Location: `src/channels/github.rs` (shutdown signal handling)
-- Add graceful shutdown with engine lifecycle
-- Implement webhook delivery persistence table
-- Add retry queue for failed webhook processing
-
-### Documentation Updates Needed
-
-- [ ] Update `AGENTS.md` with PR review integration flow
-- [ ] Document `orch cost` command when implemented
-- [ ] Document webhook server configuration options
-- [ ] Update feature checklist in this PLAN.md as issues are closed
+- [ ] Skills sync from config (auto-clone skill repos) — config exists but no sync implementation
+- [ ] Slack channel integration — future channel addition
