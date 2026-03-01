@@ -157,12 +157,28 @@ impl GhHttp {
     fn record_response(resp: &Response) {
         if let Ok(mut rl) = RATE_LIMIT.lock() {
             rl.update_from_headers(resp.headers());
-            if resp.status() == StatusCode::FORBIDDEN
-                || resp.status() == StatusCode::TOO_MANY_REQUESTS
-            {
+            // Only backoff on 429 (always rate limit) — 403 requires body inspection
+            // which is handled in maybe_record_rate_limit_from_body().
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
                 rl.record_rate_limit();
             } else if resp.status().is_success() {
                 rl.record_success();
+            }
+        }
+    }
+
+    /// Check response body for rate-limit signals on 403 responses.
+    /// Not all 403s are rate limits — some are permission errors.
+    fn maybe_record_rate_limit_from_body(status: StatusCode, body: &str) {
+        if status == StatusCode::FORBIDDEN {
+            let lower = body.to_lowercase();
+            if lower.contains("rate limit")
+                || lower.contains("abuse detection")
+                || lower.contains("secondary rate")
+            {
+                if let Ok(mut rl) = RATE_LIMIT.lock() {
+                    rl.record_rate_limit();
+                }
             }
         }
     }
@@ -194,6 +210,7 @@ impl GhHttp {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            Self::maybe_record_rate_limit_from_body(status, &body);
             anyhow::bail!("GitHub API GET {url} failed ({status}): {body}");
         }
         Ok(serde_json::from_str(&resp.text().await?)?)
@@ -214,6 +231,7 @@ impl GhHttp {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            Self::maybe_record_rate_limit_from_body(status, &body);
             anyhow::bail!("GitHub API GET {url} failed ({status}): {body}");
         }
         Ok(resp.bytes().await?.to_vec())
@@ -239,6 +257,7 @@ impl GhHttp {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            Self::maybe_record_rate_limit_from_body(status, &body);
             anyhow::bail!("GitHub API GET {url} failed ({status}): {body}");
         }
         Ok(serde_json::from_str(&resp.text().await?)?)
@@ -260,6 +279,7 @@ impl GhHttp {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            Self::maybe_record_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub API POST {url} failed ({status}): {text}");
         }
         Ok(text)
@@ -291,6 +311,7 @@ impl GhHttp {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            Self::maybe_record_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub API PATCH {url} failed ({status}): {text}");
         }
         Ok(text)
@@ -311,6 +332,7 @@ impl GhHttp {
         let status = resp.status();
         if !status.is_success() && status != StatusCode::NOT_FOUND {
             let body = resp.text().await.unwrap_or_default();
+            Self::maybe_record_rate_limit_from_body(status, &body);
             anyhow::bail!("GitHub API DELETE {url} failed ({status}): {body}");
         }
         Ok(status)
@@ -356,6 +378,7 @@ impl GhHttp {
 
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
+                Self::maybe_record_rate_limit_from_body(status, &body);
                 anyhow::bail!("GitHub API GET (paginated) failed ({status}): {body}");
             }
 
@@ -396,6 +419,7 @@ impl GhHttp {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            Self::maybe_record_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub GraphQL failed ({status}): {text}");
         }
         Self::record_success();
