@@ -53,7 +53,7 @@ Everything outside your current working directory is **read-only**. Never `cd ..
 2. **On retry**: check `git diff main` and `git log main..HEAD` first to see what previous attempts already did. Build on existing work — do not start over.
 3. **Commit step by step** as you work, not one big commit at the end. Use conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, etc.).
 4. **Lockfiles**: if you add, remove, or update dependencies, regenerate the lockfile before committing (`bun install`, `npm install`, `cargo update`, etc.). Always commit the updated lockfile with your changes.
-5. **Test before done**: before marking work as done, run the project's test suite and type checker (`cargo test`, `npm test`, `pytest`, `tsc --noEmit`, etc.). Fix any failures. If tests fail and you cannot fix them, set status to `needs_review` and explain the failures.
+5. **Test before done**: before marking work as done, run the project's test suite and type checker (`cargo test`, `cargo check`, `cargo clippy`, `cargo fmt`, `npm test`, `yarn test`, `pytest`, `tsc --noEmit`, etc - check project settings to learn what tools to use). Fix any failures. If tests fail and you cannot fix them, set status to `needs_review` and explain the failures.
 6. **Push**: `git push origin HEAD` after committing.
 7. **Create PR**: if no PR exists for this branch, create one with `gh pr create --base main --title "<title>" --body "<body>"`. Rules:
    - **Title**: use the issue title or a concise description of the change.
