@@ -1777,14 +1777,35 @@ async fn review_open_prs(
 
         // Handle fully-approved PRs (either via PR review API or comment-based review)
         if (all_approved || comment_approved) && auto_close_task && !comment_changes_requested {
-            tracing::info!(
-                task_id,
-                pr_number,
-                comment_approved,
-                "PR approved, closing task (marking as done)"
-            );
-            if let Err(e) = backend.update_status(&task.id, Status::Done).await {
-                tracing::warn!(task_id, err = %e, "failed to update task status to done");
+            // Check if the PR is already merged before marking done.
+            // If not merged, attempt auto-merge so the PR doesn't get orphaned.
+            let already_merged = gh.is_pr_merged(repo, &branch).await.unwrap_or(false);
+
+            if already_merged {
+                tracing::info!(
+                    task_id,
+                    pr_number,
+                    "PR already merged, marking task as done"
+                );
+                if let Err(e) = backend.update_status(&task.id, Status::Done).await {
+                    tracing::warn!(task_id, err = %e, "failed to update task status to done");
+                }
+            } else {
+                tracing::info!(
+                    task_id,
+                    pr_number,
+                    comment_approved,
+                    "PR approved but not yet merged — attempting auto-merge"
+                );
+                if let Err(e) = auto_merge_pr(&task, &branch, backend, repo).await {
+                    tracing::warn!(
+                        task_id,
+                        pr_number,
+                        err = %e,
+                        "auto-merge failed, keeping task in_review for next tick"
+                    );
+                }
+                // auto_merge_pr handles all status transitions (Done / Routed / InReview)
             }
             continue;
         }
