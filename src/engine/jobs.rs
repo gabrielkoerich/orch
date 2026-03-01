@@ -88,12 +88,26 @@ struct ConfigFile {
 ///
 /// Priority:
 /// 1. `.orch.yml` in the current directory (project config)
-/// 2. `~/.orch/config.yml` (global config)
+/// 2. `.orch.yml` in any registered project directory (from global config)
+/// 3. `~/.orch/config.yml` (global config)
 pub fn resolve_jobs_path() -> PathBuf {
+    // 1. Check cwd
     let project = PathBuf::from(".orch.yml");
     if project.exists() {
         return project;
     }
+
+    // 2. Check registered project directories (handles brew service running from /)
+    if let Ok(paths) = crate::config::get_project_paths() {
+        for path_str in &paths {
+            let candidate = PathBuf::from(path_str).join(".orch.yml");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+
+    // 3. Fall back to global config
     crate::home::config_path().unwrap_or_else(|_| PathBuf::from(".orch/config.yml"))
 }
 
