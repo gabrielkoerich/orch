@@ -592,8 +592,7 @@ impl GhHttp {
         number: &str,
     ) -> anyhow::Result<Vec<GitHubComment>> {
         let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}/comments");
-        self.get_all_pages(&url, &[("per_page", "100")])
-            .await
+        self.get_all_pages(&url, &[("per_page", "100")]).await
     }
 
     /// Check if a PR with the given branch was merged.
@@ -672,8 +671,7 @@ impl GhHttp {
         pr_number: u64,
     ) -> anyhow::Result<Vec<GitHubReview>> {
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/reviews");
-        self.get_all_pages(&url, &[("per_page", "100")])
-            .await
+        self.get_all_pages(&url, &[("per_page", "100")]).await
     }
 
     /// Get review comments for a specific PR review.
