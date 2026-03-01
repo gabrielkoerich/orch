@@ -2,16 +2,13 @@
 .env*
 .lock
 .lock.*
-.orchestrator/
+.orch.yml
 /target
 __pycache__/
 config.yml
 contexts/
 docs/public/
 opencode.json
-orchestrator.db
-orchestrator.log
-orchestrator.pid
 skills/
 tasks.yml
 tasks.yml.lock*

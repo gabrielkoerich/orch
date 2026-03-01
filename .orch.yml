@@ -94,7 +94,7 @@ jobs:
 
   - id: morning-review
     type: task
-    schedule: 0 10 * * *
+    schedule: 23 12 * * *
     task:
       title: 'Daily morning review: improvements and optimization'
       body: |
@@ -108,7 +108,8 @@ jobs:
         THIRD: Look at the most recent evening retrospective task (label: job:evening-retrospective, status: done).
         Read its summary to see what was identified yesterday — carry forward any unfinished items or priorities.
 
-        When writing your summary post, save it to `./docs/content/posts/morning-review-YYYY-MM-DD.md` (use today's UTC date).
+        When writing your summary post, it should be saved to `./docs/content/posts/morning-review-YYYY-MM-DD.md` (use today's UTC date).
+        But before saving it, make sure there's not a file even the same name. If the file exists, add the current time on the posts md file.
 
         Then check:
         1) Are any tasks stuck or failing repeatedly? Diagnose and fix root causes.
@@ -165,6 +166,7 @@ jobs:
         Read its summary to see what was planned — acknowledge what got done and what didn't.
 
         When writing your summary post, save it to `./docs/content/posts/evening-retrospective-YYYY-MM-DD.md` (use today's UTC date).
+        But before saving it, make sure there's not a file even the same name. If the file exists, add the current time on the posts md file.
 
         Then check:
         1) Which tasks completed today? What went well?
