@@ -548,7 +548,7 @@ pub(crate) async fn review_and_merge(
         }
     }
 
-    // 9. Read and parse response using the same pipeline as normal tasks
+    // 9. Read and parse response
     let raw_output = runner::response::read_output_file(&review_task_id, &output_file, repo);
     let agent_runner = runner::agents::get_runner(&review_agent);
 
@@ -560,27 +560,60 @@ pub(crate) async fn review_and_merge(
 
     let stderr = std::fs::read_to_string(review_attempt_dir.join("stderr.txt")).unwrap_or_default();
 
-    // Use agent-specific parsing (handles envelope, is_error, auth, rate limit)
-    let parse_result = if exit_code == 0 && !raw_output.is_empty() {
-        agent_runner.parse_response(&raw_output)
-    } else {
-        Err(agent_runner.classify_error(exit_code, &raw_output, &stderr))
-    };
+    // Abort on hard agent errors (non-zero exit, rate limit, auth, etc.)
+    if exit_code != 0 || raw_output.is_empty() {
+        let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
+        tracing::error!(task_id = task.id.0, error = %err, "review agent failed");
+        return Ok(ReviewDecision::Failed(format!("agent error: {err}")));
+    }
 
-    let parsed = match parse_result {
-        Ok(p) => p,
+    // Stage 1: strip the agent-specific output envelope to get the review text.
+    //
+    // For opencode this unwraps the NDJSON stream; for claude/kimi it unwraps
+    // the JSON content envelope. When parsing fails (e.g. opencode emits NDJSON
+    // with no "text" events due to a format change) or the summary is empty
+    // (the agent put a ReviewResponse JSON where AgentResponse.summary was
+    // expected), fall back to the raw output and let Stage 2 handle it.
+    let text_for_review = match agent_runner.parse_response(&raw_output) {
+        Ok(p) if !p.response.summary.is_empty() => p.response.summary,
+        Ok(_) => {
+            // Envelope parsed but summary is empty — the agent likely
+            // output a ReviewResponse JSON directly (no AgentResponse wrapper).
+            tracing::debug!(
+                task_id = task.id.0,
+                agent = %review_agent,
+                "review agent: empty summary after parse, falling back to raw output"
+            );
+            raw_output.clone()
+        }
+        Err(runner::agents::AgentError::InvalidResponse { .. }) => {
+            // Unparseable envelope (e.g. opencode NDJSON format change).
+            // Fall back; parse_review_from_output handles NDJSON directly.
+            tracing::warn!(
+                task_id = task.id.0,
+                agent = %review_agent,
+                "review agent: envelope parse failed (InvalidResponse), falling back to raw output"
+            );
+            raw_output.clone()
+        }
         Err(e) => {
-            tracing::error!(task_id = task.id.0, error = %e, "review agent error: {}", e);
+            // Hard error — rate limit, auth, model unavailable, etc.
+            tracing::error!(task_id = task.id.0, error = %e, "review agent error");
             return Ok(ReviewDecision::Failed(format!("agent error: {e}")));
         }
     };
 
-    // The agent's summary contains the review JSON (or markdown with JSON block)
-    let review_text = &parsed.response.summary;
-    let review_response = match runner::response::parse_review_response(review_text) {
+    // Stage 2: parse the ReviewResponse from the extracted text.
+    // parse_review_from_output handles JSON, markdown code blocks, and NDJSON.
+    let review_response = match runner::response::parse_review_from_output(&text_for_review) {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(task_id = task.id.0, error = %e, review_text = %review_text, "failed to parse review response");
+            tracing::error!(
+                task_id = task.id.0,
+                error = %e,
+                output = %text_for_review.chars().take(300).collect::<String>(),
+                "failed to parse review response"
+            );
             return Ok(ReviewDecision::Failed(format!("parse error: {e}")));
         }
     };

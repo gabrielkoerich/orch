@@ -64,6 +64,10 @@ impl OpenCodeRunner {
     /// JSON response. If the concatenated text doesn't parse as JSON,
     /// tries each text event individually (newest first) since earlier
     /// events are often progress messages.
+    ///
+    /// Handles two text event formats emitted by different opencode versions:
+    /// - Format 1 (current): `{"type":"text","part":{"type":"text","text":"..."}}`
+    /// - Format 2 (newer):   `{"type":"text","text":"..."}`
     fn extract_text(&self, events: &[serde_json::Value]) -> Option<String> {
         let mut texts = Vec::new();
 
@@ -71,10 +75,16 @@ impl OpenCodeRunner {
             let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             if event_type == "text" {
+                // Format 1: text nested in part object
                 if let Some(part) = event.get("part") {
                     if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                         texts.push(text.to_string());
+                        continue;
                     }
+                }
+                // Format 2: text directly in event (newer opencode versions)
+                if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
+                    texts.push(text.to_string());
                 }
             }
         }
@@ -489,6 +499,21 @@ mod tests {
         assert_eq!(parsed.response.summary, "hello");
         assert_eq!(parsed.input_tokens, Some(17509));
         assert_eq!(parsed.output_tokens, Some(3));
+    }
+
+    /// Newer opencode versions emit text directly in the event (no "part" wrapper).
+    /// The extract_text method must handle both formats.
+    #[test]
+    fn parse_opencode_ndjson_direct_text_format() {
+        let raw = r#"{"type":"step_start","timestamp":1000,"sessionID":"ses_abc"}
+{"type":"text","timestamp":1001,"sessionID":"ses_abc","text":"{\"status\":\"done\",\"summary\":\"fixed\",\"accomplished\":[],\"remaining\":[],\"files\":[]}"}
+{"type":"step_finish","timestamp":1002,"sessionID":"ses_abc","part":{"type":"step-finish","reason":"stop","tokens":{"input":200,"output":10}}}"#;
+
+        let parsed = runner().parse_response(raw).unwrap();
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(parsed.response.summary, "fixed");
+        assert_eq!(parsed.input_tokens, Some(200));
+        assert_eq!(parsed.output_tokens, Some(10));
     }
 
     #[test]

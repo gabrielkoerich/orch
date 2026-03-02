@@ -453,6 +453,57 @@ pub struct ReviewIssue {
     pub description: String,
 }
 
+/// Parse a review response from raw agent output, handling NDJSON streams.
+///
+/// This is the primary entry point for review response parsing. It handles:
+/// 1. Direct JSON (`ReviewResponse` object)
+/// 2. Markdown with ` ```json ` code blocks containing a `ReviewResponse`
+/// 3. NDJSON streams (opencode `run --format json` output) — extracts text
+///    from `type:"text"` events and then applies steps 1 & 2
+///
+/// Use this in the review pipeline instead of `parse_review_response` so that
+/// raw opencode NDJSON output is handled even when the normal agent-envelope
+/// parsing chain fails (e.g. format change, empty summary).
+pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> {
+    // Step 1: direct JSON / markdown parse
+    if let Ok(r) = parse_review_response(output) {
+        return Ok(r);
+    }
+
+    // Step 2: NDJSON — extract text events and parse the concatenated text
+    let extracted = ndjson_extract_text(output);
+    if !extracted.is_empty() {
+        return parse_review_response(&extracted)
+            .map_err(|e| anyhow::anyhow!("parse failed after NDJSON extraction: {e}"));
+    }
+
+    anyhow::bail!("failed to parse review response from output")
+}
+
+/// Extract the concatenated text content from an NDJSON event stream.
+///
+/// Handles two text event formats emitted by different opencode versions:
+/// - Format 1 (current): `{"type":"text","part":{"type":"text","text":"..."}}`
+/// - Format 2 (newer):   `{"type":"text","text":"..."}`
+fn ndjson_extract_text(ndjson: &str) -> String {
+    ndjson
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("text"))
+        .filter_map(|e| {
+            // Format 1: text nested under "part"
+            e.get("part")
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+                // Format 2: text directly in event
+                .or_else(|| e.get("text").and_then(|t| t.as_str()).map(str::to_string))
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 /// Parse a review response from already-unwrapped text.
 ///
 /// Expects the raw result text (already extracted from the agent envelope
@@ -709,5 +760,77 @@ That's all."#;
     #[test]
     fn extract_json_block_none_when_missing() {
         assert!(extract_json_block("no code blocks here").is_none());
+    }
+
+    // ── parse_review_from_output ─────────────────────────────────
+
+    #[test]
+    fn parse_review_from_output_direct_json() {
+        let json = r#"{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#;
+        let resp = parse_review_from_output(json).unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn parse_review_from_output_markdown() {
+        let md = "Review complete.\n\n```json\n{\"decision\":\"request_changes\",\"notes\":\"Fix it\",\"issues\":[]}\n```\n";
+        let resp = parse_review_from_output(md).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+    }
+
+    /// opencode NDJSON stream — text events use the `part.text` format.
+    #[test]
+    fn parse_review_from_output_ndjson_part_format() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000,"sessionID":"ses_abc"}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"Reviewing the PR...\n\n```json\n{\"decision\":\"approve\",\"notes\":\"All checks pass\",\"test_results\":\"pass\",\"issues\":[]}\n```\n"}}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"stop"}}"#,
+        );
+        let resp = parse_review_from_output(ndjson).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert_eq!(resp.notes, "All checks pass");
+    }
+
+    /// opencode NDJSON stream — text events use the newer `text` directly-in-event format.
+    #[test]
+    fn parse_review_from_output_ndjson_direct_text_format() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000,"sessionID":"ses_abc"}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"sessionID":"ses_abc","text":"Here is my review:\n\n```json\n{\"decision\":\"request_changes\",\"notes\":\"Fix the bug\",\"test_results\":\"fail\",\"issues\":[]}\n```\n"}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"sessionID":"ses_abc"}"#,
+        );
+        let resp = parse_review_from_output(ndjson).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+        assert_eq!(resp.notes, "Fix the bug");
+    }
+
+    /// opencode NDJSON with ReviewResponse JSON directly in a text event (no markdown wrapper).
+    #[test]
+    fn parse_review_from_output_ndjson_direct_json_in_text_event() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}"}}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002}"#,
+        );
+        let resp = parse_review_from_output(ndjson).unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    /// Concatenated text events produce a valid ReviewResponse.
+    #[test]
+    fn parse_review_from_output_ndjson_concatenated_text() {
+        let ndjson = concat!(
+            r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"Here is my\n"}}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1002,"part":{"type":"text","text":"review:\n\n```json\n{\"decision\":\"approve\",\"notes\":\"OK\",\"test_results\":\"pass\",\"issues\":[]}\n```\n"}}"#,
+        );
+        let resp = parse_review_from_output(ndjson).unwrap();
+        assert_eq!(resp.decision, "approve");
     }
 }
