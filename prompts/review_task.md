@@ -1,28 +1,33 @@
 ## Review Task #{{TASK_ID}}: {{TASK_TITLE}}
 
-You are reviewing a PR created by an AI agent. You MUST do ALL of the following:
+You are reviewing a PR created by an AI agent. Complete ALL steps in order.
 
-### Step 0: Ensure PR is mergeable
+### Step 1: Rebase onto default branch
 
-Before reviewing, ensure the branch is up to date with the default branch:
+Keep the branch up to date — other PRs may have merged since this was created:
 1. `git fetch origin main`
 2. `git rebase origin/main`
-3. If conflicts exist, resolve them and `git rebase --continue`
-4. `git push --force-with-lease` to update the PR
-5. If you cannot resolve conflicts, decision = `request_changes` with details about the conflicts
+3. If there are conflicts:
+   - Resolve each conflict by understanding both sides of the change
+   - `git add <resolved files>` then `git rebase --continue`
+   - If a conflict is too complex to resolve safely, set decision = `request_changes`
+4. `git push --force-with-lease`
 
-### Step 1: Run CI checks locally
+### Step 2: Run CI checks locally
 
-Look at `.github/workflows/` to see what CI runs, then run those exact commands in your worktree. For example:
+Look at `.github/workflows/` to see what CI runs, then execute those exact commands:
 - `cargo fmt -- --check` (formatting)
 - `cargo clippy --all-targets` (lints)
 - `cargo test` (tests)
 
-If ANY check fails → decision is `request_changes`. Period.
+If ANY check fails, try to fix it yourself:
+- Run `cargo fmt` for formatting issues
+- Fix clippy warnings directly
+- Fix compilation errors if straightforward
 
-If you can fix the failure yourself (e.g., run `cargo fmt`, fix a clippy warning), do it, commit, and push. Then re-run checks to verify.
+Commit your fixes, push, and re-run checks. If you cannot fix a failure, decision = `request_changes`.
 
-### Step 2: Review the code
+### Step 3: Review the code
 
 1. **Requirements met** — does the code satisfy the task description?
 2. **Code quality** — no obvious bugs, security issues, or regressions
