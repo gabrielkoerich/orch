@@ -709,6 +709,20 @@ fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
         .map(String::from)
 }
 
+/// Initialize task manager with database and backend.
+pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
+    use crate::backends::github::GitHubBackend;
+    use crate::backends::ExternalBackend;
+    use crate::db::Db;
+
+    let repo = config::get_current_repo()
+        .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+    let db = Arc::new(Db::open(&crate::db::default_path()?)?);
+    db.migrate().await?;
+    Ok(TaskManager::new(db, backend))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,18 +793,4 @@ mod tests {
         // Three segments like a deep path shouldn't match as a slug
         assert_eq!(parse_github_slug("a/b/c"), None);
     }
-}
-
-/// Initialize task manager with database and backend.
-pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
-    use crate::backends::github::GitHubBackend;
-    use crate::backends::ExternalBackend;
-    use crate::db::Db;
-
-    let repo = config::get_current_repo()
-        .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
-    let db = Arc::new(Db::open(&crate::db::default_path()?)?);
-    db.migrate().await?;
-    Ok(TaskManager::new(db, backend))
 }
