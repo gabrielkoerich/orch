@@ -83,7 +83,7 @@ fn ensure_path() {
 }
 
 #[derive(Parser)]
-#[command(name = "orch", version, about = "Orch — The Agent Orchestrator")]
+#[command(name = "orch", version = env!("ORCH_VERSION"), about = "Orch — The Agent Orchestrator")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -400,7 +400,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Serve => {
-            tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting orch serve");
+            tracing::info!(version = env!("ORCH_VERSION"), "starting orch serve");
             engine::serve().await?;
         }
         Commands::Version => {

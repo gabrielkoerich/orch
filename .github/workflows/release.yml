@@ -67,7 +67,7 @@ jobs:
 
   # Cross-compile build jobs for macOS targets
   build-macos:
-    needs: [test, secrets]
+    needs: [test, secrets, check-release]
     if: github.ref == 'refs/heads/main'
     strategy:
       matrix:
@@ -100,6 +100,8 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          ORCH_BUILD_VERSION: ${{ needs.check-release.outputs.version }}
 
       - name: Package binary
         run: |

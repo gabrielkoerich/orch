@@ -15,9 +15,7 @@ use tokio::sync::broadcast;
 
 /// Print version information.
 pub fn version() {
-    let pkg_version = env!("CARGO_PKG_VERSION");
-    let git_desc = option_env!("ORCH_GIT_DESCRIBE").unwrap_or("unknown");
-    println!("orch {pkg_version} ({git_desc})");
+    println!("orch {}", env!("ORCH_VERSION"));
 }
 
 /// Initialize orchestrator for a project.
