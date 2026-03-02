@@ -1295,6 +1295,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | `axum` | Webhook HTTP server | In use |
 | `teloxide` | Telegram bot | Future (Phase 3) |
 | `serenity` | Discord bot | Future (Phase 3) |
+| `cargo-llvm-cov` | Coverage tracking in CI | CI tooling |
 
 ---
 
