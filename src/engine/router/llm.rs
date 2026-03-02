@@ -2,7 +2,7 @@
 //!
 //! This module contains all logic for calling an LLM to classify tasks and
 //! select the best agent. It is intentionally separate from the agent selection
-//! strategies (round-robin, weighted, label-based) in `router.rs`.
+//! strategies (round-robin, weighted, label-based) in `mod.rs`.
 //!
 //! # Responsibilities
 //! - Building the routing prompt from a task and the skills catalog
@@ -16,7 +16,7 @@ use crate::cmd::CommandErrorContext;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::router::{AgentProfile, RouteResult, RouterConfig};
+use super::{AgentProfile, RouteResult, RouterConfig};
 use serde::Deserialize;
 
 /// Response from the LLM router.
@@ -182,7 +182,7 @@ impl LlmRouter {
         task: &ExternalTask,
         available_agents: &[String],
     ) -> anyhow::Result<String> {
-        let template = include_str!("../../prompts/route.md");
+        let template = include_str!("../../../prompts/route.md");
 
         // Build available agents string
         let available_agents_str = available_agents.join(", ");

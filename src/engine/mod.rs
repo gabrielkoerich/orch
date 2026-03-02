@@ -16,7 +16,6 @@ pub mod cleanup;
 pub mod commands;
 pub mod internal_tasks;
 pub mod jobs;
-mod llm_router;
 pub mod review;
 pub mod router;
 pub mod runner;

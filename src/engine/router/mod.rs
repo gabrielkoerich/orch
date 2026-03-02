@@ -12,13 +12,15 @@
 //! 5. After N LLM failures, fall back to round-robin
 //! 6. Track last routed agent to distribute load across agents
 
+mod llm;
+
 use crate::backends::ExternalTask;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::llm_router::LlmRouter;
+use llm::LlmRouter;
 
 /// Result of routing a task to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1036,7 +1038,7 @@ pub fn get_route_result(task_id: &str) -> anyhow::Result<RouteResult> {
 mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask};
-    use crate::engine::llm_router::LlmRouteResponse;
+    use super::llm::LlmRouteResponse;
 
     // Test-only delegates so tests can call router.parse_llm_response() and
     // router.check_routing_sanity() directly without referencing llm_router.
@@ -1386,7 +1388,7 @@ Hope that helps!"#;
         let config = RouterConfig::default();
         let router = Router::new(config);
 
-        let response = include_str!("../../tests/fixtures/route-response-string.json");
+        let response = include_str!("../../../tests/fixtures/route-response-string.json");
         let parsed = router.parse_llm_response(response).unwrap();
         assert_eq!(parsed.executor, "codex");
         assert_eq!(parsed.complexity, "medium");
@@ -1401,7 +1403,7 @@ Hope that helps!"#;
         let config = RouterConfig::default();
         let router = Router::new(config);
 
-        let response = include_str!("../../tests/fixtures/route-response-object.json");
+        let response = include_str!("../../../tests/fixtures/route-response-object.json");
         let parsed = router.parse_llm_response(response).unwrap();
         assert_eq!(parsed.executor, "claude");
         assert_eq!(parsed.complexity, "complex");
@@ -1413,7 +1415,7 @@ Hope that helps!"#;
         let config = RouterConfig::default();
         let router = Router::new(config);
 
-        let response = include_str!("../../tests/fixtures/route-response-markdown.json");
+        let response = include_str!("../../../tests/fixtures/route-response-markdown.json");
         let parsed = router.parse_llm_response(response).unwrap();
         assert_eq!(parsed.executor, "codex");
         assert_eq!(parsed.complexity, "medium");
