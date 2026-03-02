@@ -1008,8 +1008,9 @@ async fn tick_dispatch_tasks(
                             let tmux_clone = tmux.clone();
                             let task_owned_clone = task_owned.clone();
                             let router_for_review = router_clone.clone();
+                            let task_id_for_review = task_id.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = review_and_merge(
+                                match review_and_merge(
                                     &task_owned_clone,
                                     &backend_clone,
                                     &tmux_clone,
@@ -1018,7 +1019,30 @@ async fn tick_dispatch_tasks(
                                 )
                                 .await
                                 {
-                                    tracing::error!(task_id, error = %e, "review_and_merge failed");
+                                    Ok(ReviewDecision::Failed(reason)) => {
+                                        tracing::error!(
+                                            task_id = task_id_for_review,
+                                            reason,
+                                            "review agent failed — resetting review_started for retry"
+                                        );
+                                        // Reset so the next tick retries with a different agent
+                                        let _ = sidecar::set(
+                                            &task_id_for_review,
+                                            &["review_started=false".to_string()],
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            task_id = task_id_for_review,
+                                            error = %e,
+                                            "review_and_merge failed — resetting review_started for retry"
+                                        );
+                                        let _ = sidecar::set(
+                                            &task_id_for_review,
+                                            &["review_started=false".to_string()],
+                                        );
+                                    }
+                                    Ok(_) => {} // Approve or RequestChanges handled inside
                                 }
                             });
                         }
@@ -1240,14 +1264,26 @@ async fn sync_tick(
                     let repo_s = repo.to_string();
                     let router_c = router.clone();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c).await
+                        let tid = task_c.id.0.clone();
+                        match review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c)
+                            .await
                         {
-                            tracing::error!(
-                                task_id = task_c.id.0,
-                                error = %e,
-                                "review_and_merge failed"
-                            );
+                            Ok(ReviewDecision::Failed(reason)) => {
+                                tracing::error!(
+                                    task_id = tid,
+                                    reason,
+                                    "review agent failed — resetting for retry"
+                                );
+                                let _ = sidecar::set(&tid, &["review_started=false".to_string()]);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    task_id = tid, error = %e,
+                                    "review_and_merge failed — resetting for retry"
+                                );
+                                let _ = sidecar::set(&tid, &["review_started=false".to_string()]);
+                            }
+                            Ok(_) => {}
                         }
                     });
                 }
