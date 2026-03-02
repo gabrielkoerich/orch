@@ -613,7 +613,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         let repo = engine.repo.clone();
                         REPO_CONTEXT.scope(repo, async {
                             if let Err(e) = tick::tick_check_session_completions(&tmux, &engine.repo, &capture_for_tick).await {
-                                tracing::debug!(repo = %engine.repo, ?e, "session completion check failed during drain");
+                                tracing::error!(repo = %engine.repo, ?e, "session completion check failed during drain");
                             }
                         }).await;
                     }

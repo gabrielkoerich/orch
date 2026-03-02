@@ -82,13 +82,15 @@ pub(crate) async fn sync_tick(
                     continue;
                 }
                 // Record timestamp so stale detection can apply a grace period
-                let _ = sidecar::set(
+                if let Err(e) = sidecar::set(
                     task_id,
                     &[format!(
                         "in_review_since={}",
                         chrono::Utc::now().timestamp()
                     )],
-                );
+                ) {
+                    tracing::error!(task_id, err = %e, "failed to write in_review_since sidecar — stale detection grace period will not work");
+                }
                 let backend_c = backend.clone();
                 let tmux_c = tmux.clone();
                 let task_c = task.clone();
@@ -97,27 +99,26 @@ pub(crate) async fn sync_tick(
                 let repo_ctx = repo_s.clone();
                 tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                     let tid = task_c.id.0.clone();
-                    match review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c).await {
+                    let needs_reset = match review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c).await {
                         Ok(ReviewDecision::Failed(reason)) => {
                             tracing::error!(
                                 task_id = tid,
                                 reason,
                                 "review agent failed — resetting to NeedsReview for retry"
                             );
-                            let _ = backend_c
-                                .update_status(&ExternalId(tid), Status::NeedsReview)
-                                .await;
+                            true
                         }
                         Err(e) => {
                             tracing::error!(
                                 task_id = tid, error = %e,
                                 "review_and_merge failed — resetting to NeedsReview for retry"
                             );
-                            let _ = backend_c
-                                .update_status(&ExternalId(tid), Status::NeedsReview)
-                                .await;
+                            true
                         }
-                        Ok(_) => {}
+                        Ok(_) => false,
+                    };
+                    if needs_reset {
+                        reset_to_needs_review_with_retry(&backend_c, &tid).await;
                     }
                 }));
             }
@@ -152,7 +153,9 @@ pub(crate) async fn sync_tick(
                         age_secs,
                         "InReview task has no active review session — resetting to NeedsReview"
                     );
-                    let _ = backend.update_status(&task.id, Status::NeedsReview).await;
+                    if let Err(e) = backend.update_status(&task.id, Status::NeedsReview).await {
+                        tracing::error!(task_id = %task.id.0, err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
+                    }
                 }
             }
         }
@@ -169,6 +172,32 @@ pub(crate) async fn sync_tick(
     }
 
     Ok(())
+}
+
+/// Reset a task to NeedsReview, retrying up to 3 times with exponential backoff.
+///
+/// If the reset fails on every attempt, an error is logged and the task will
+/// remain stuck in InReview until the stale-detection sweep rescues it (≤45s).
+async fn reset_to_needs_review_with_retry(backend: &Arc<dyn ExternalBackend>, task_id: &str) {
+    let eid = ExternalId(task_id.to_string());
+    for attempt in 1u32..=3 {
+        match backend.update_status(&eid, Status::NeedsReview).await {
+            Ok(_) => return,
+            Err(e) if attempt < 3 => {
+                tracing::warn!(
+                    task_id, attempt, err = %e,
+                    "failed to reset review task to NeedsReview, retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(attempt as u64 * 2)).await;
+            }
+            Err(e) => {
+                tracing::error!(
+                    task_id, err = %e,
+                    "all retries exhausted resetting to NeedsReview — task stuck in InReview until stale sweep"
+                );
+            }
+        }
+    }
 }
 
 /// Scan for @mentions and create internal tasks.
@@ -356,4 +385,123 @@ async fn skills_sync() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::{ExternalId, ExternalTask, Mention, Status};
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    /// Mock backend where `update_status` fails for the first `fail_first_n` calls,
+    /// then succeeds. All other methods are stubs.
+    struct CountingBackend {
+        calls: Arc<Mutex<u32>>,
+        fail_first_n: u32,
+    }
+
+    impl CountingBackend {
+        fn new(fail_first_n: u32) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Arc::new(Mutex::new(0)),
+                fail_first_n,
+            })
+        }
+
+        fn call_count(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ExternalBackend for CountingBackend {
+        fn name(&self) -> &str {
+            "counting-mock"
+        }
+
+        async fn create_task(&self, _: &str, _: &str, _: &[String]) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("1".into()))
+        }
+
+        async fn get_task(&self, _: &ExternalId) -> anyhow::Result<ExternalTask> {
+            Ok(ExternalTask {
+                id: ExternalId("1".into()),
+                title: "test".into(),
+                body: "".into(),
+                state: "open".into(),
+                labels: vec![],
+                author: "user".into(),
+                created_at: "2024-01-01T00:00:00Z".into(),
+                updated_at: "2024-01-01T00:00:00Z".into(),
+                url: "https://github.com/owner/repo/issues/1".into(),
+            })
+        }
+
+        /// Override update_status so we control success/failure directly, bypassing
+        /// the default get_task/remove_label/set_labels orchestration.
+        async fn update_status(&self, _: &ExternalId, _: Status) -> anyhow::Result<()> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls <= self.fail_first_n {
+                anyhow::bail!("simulated failure on call {}", *calls)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn list_by_status(&self, _: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+
+        async fn post_comment(&self, _: &ExternalId, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn set_labels(&self, _: &ExternalId, _: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_label(&self, _: &ExternalId, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get_sub_issues(&self, _: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get_mentions(&self, _: &str) -> anyhow::Result<Vec<Mention>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reset_succeeds_on_first_try() {
+        let backend = CountingBackend::new(0);
+        let backend_arc: Arc<dyn ExternalBackend> = backend.clone();
+        reset_to_needs_review_with_retry(&backend_arc, "task-1").await;
+        assert_eq!(backend.call_count(), 1, "should call update_status exactly once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reset_retries_on_transient_failures_and_succeeds() {
+        // Fail first 2 calls, succeed on the 3rd
+        let backend = CountingBackend::new(2);
+        let backend_arc: Arc<dyn ExternalBackend> = backend.clone();
+        reset_to_needs_review_with_retry(&backend_arc, "task-1").await;
+        assert_eq!(backend.call_count(), 3, "should retry twice then succeed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reset_stops_after_three_attempts_when_exhausted() {
+        // Always fail — function must not panic, just log error and stop
+        let backend = CountingBackend::new(10);
+        let backend_arc: Arc<dyn ExternalBackend> = backend.clone();
+        reset_to_needs_review_with_retry(&backend_arc, "task-1").await;
+        assert_eq!(backend.call_count(), 3, "should attempt exactly 3 times then give up");
+    }
 }
