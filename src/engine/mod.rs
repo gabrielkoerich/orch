@@ -67,8 +67,11 @@ pub struct EngineConfig {
     pub webhook_health_check_interval: Option<std::time::Duration>,
     /// Maximum parallel task executions
     pub max_parallel: usize,
-    /// Stuck task timeout (seconds)
+    /// Stuck task timeout for tasks with an active tmux session (seconds)
     pub stuck_timeout: u64,
+    /// Stuck task timeout for tasks with no active tmux session (seconds).
+    /// Shorter than `stuck_timeout` because no session means the agent has already exited.
+    pub no_session_stuck_timeout: u64,
     /// Auto-create follow-up tasks when PR reviews request changes
     pub auto_create_followup_on_changes: bool,
     /// Auto-close task (mark Done) when all PR reviews are approved.
@@ -86,6 +89,7 @@ impl Default for EngineConfig {
             webhook_health_check_interval: Some(std::time::Duration::from_secs(60)),
             max_parallel: 4,
             stuck_timeout: 1800,
+            no_session_stuck_timeout: 600,
             auto_create_followup_on_changes: true,
             auto_close_task_on_approval: false,
             graceful_shutdown_timeout: std::time::Duration::from_secs(600),
@@ -119,6 +123,12 @@ impl EngineConfig {
         if let Ok(val) = crate::config::get("engine.stuck_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.stuck_timeout = secs;
+            }
+        }
+
+        if let Ok(val) = crate::config::get("engine.no_session_stuck_timeout") {
+            if let Ok(secs) = val.parse::<u64>() {
+                config.no_session_stuck_timeout = secs;
             }
         }
 
@@ -849,67 +859,91 @@ async fn tick_recover_stuck_tasks(
         let session_name = tmux.session_name(repo, &task.id.0);
         let has_session = tmux.session_exists(&session_name).await;
 
-        if !has_session {
-            // No tmux session — check if stuck
-            let updated = match chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
-                Ok(dt) => dt.with_timezone(&chrono::Utc),
-                Err(e) => {
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        updated_at = task.updated_at,
-                        ?e,
-                        "cannot parse updated_at, skipping stuck-task check"
-                    );
-                    continue;
-                }
-            };
-            let age = chrono::Utc::now() - updated;
+        let threshold = if has_session {
+            config.stuck_timeout
+        } else {
+            config.no_session_stuck_timeout
+        };
 
-            if age.num_seconds() > config.stuck_timeout as i64 {
+        let updated = match chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(e) => {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    updated_at = task.updated_at,
+                    ?e,
+                    "cannot parse updated_at, skipping stuck-task check"
+                );
+                continue;
+            }
+        };
+        let age = chrono::Utc::now() - updated;
+
+        if age.num_seconds() > threshold as i64 {
+            if has_session {
                 tracing::warn!(
                     task_id = task.id.0,
                     age_mins = age.num_minutes(),
-                    "recovering stuck task → new"
+                    threshold_mins = threshold / 60,
+                    "recovering stuck task: timed out with active session → new"
                 );
-                // Remove stale agent label so the LLM router re-routes properly
-                for label in &task.labels {
-                    if label.starts_with("agent:") {
-                        backend.remove_label(&task.id, label).await.ok();
-                    }
+            } else {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    age_mins = age.num_minutes(),
+                    threshold_mins = threshold / 60,
+                    "recovering stuck task: no session found — reclaiming early → new"
+                );
+            }
+            // Remove stale agent label so the LLM router re-routes properly
+            for label in &task.labels {
+                if label.starts_with("agent:") {
+                    backend.remove_label(&task.id, label).await.ok();
                 }
-                if let Err(e) = sidecar::set(
-                    &task.id.0,
-                    &[
-                        "agent=".to_string(),
-                        "model=".to_string(),
-                        "route_attempts=0".to_string(),
-                    ],
-                ) {
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        ?e,
-                        "failed to reset sidecar for stuck task"
-                    );
-                    continue;
-                }
-                if let Err(e) = backend.update_status(&task.id, Status::New).await {
-                    tracing::warn!(task_id = task.id.0, ?e, "failed to reset stuck task status");
-                    continue;
-                }
-                if let Err(e) = backend
-                    .post_comment(
-                        &task.id,
-                        &format!(
-                            "[{}] recovered: stuck in_progress for {}m with no active session (cleared agent for re-routing)",
-                            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                            age.num_minutes()
-                        ),
-                    )
-                    .await
-                {
-                    tracing::warn!(task_id = task.id.0, ?e, "failed to post stuck-task recovery comment");
-                    continue;
-                }
+            }
+            if let Err(e) = sidecar::set(
+                &task.id.0,
+                &[
+                    "agent=".to_string(),
+                    "model=".to_string(),
+                    "route_attempts=0".to_string(),
+                ],
+            ) {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    ?e,
+                    "failed to reset sidecar for stuck task"
+                );
+                continue;
+            }
+            if let Err(e) = backend.update_status(&task.id, Status::New).await {
+                tracing::warn!(task_id = task.id.0, ?e, "failed to reset stuck task status");
+                continue;
+            }
+            let reason = if has_session {
+                format!(
+                    "timed out after {}m with active session (cleared agent for re-routing)",
+                    age.num_minutes()
+                )
+            } else {
+                format!(
+                    "no session found — reclaiming early after {}m (cleared agent for re-routing)",
+                    age.num_minutes()
+                )
+            };
+            if let Err(e) = backend
+                .post_comment(
+                    &task.id,
+                    &format!(
+                        "[{}] recovered: stuck in_progress — {}",
+                        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                        reason
+                    ),
+                )
+                .await
+            {
+                tracing::warn!(task_id = task.id.0, ?e, "failed to post stuck-task recovery comment");
+                continue;
             }
         }
     }
@@ -2856,6 +2890,11 @@ mod tests {
         assert_eq!(config.sync_interval, std::time::Duration::from_secs(45));
         assert_eq!(config.max_parallel, 4);
         assert_eq!(config.stuck_timeout, 1800);
+        assert_eq!(config.no_session_stuck_timeout, 600);
+        assert!(
+            config.no_session_stuck_timeout < config.stuck_timeout,
+            "no_session_stuck_timeout must be shorter than stuck_timeout"
+        );
         assert_eq!(
             config.graceful_shutdown_timeout,
             std::time::Duration::from_secs(600)
@@ -2870,9 +2909,21 @@ mod tests {
         assert_eq!(config.sync_interval, std::time::Duration::from_secs(45));
         assert_eq!(config.max_parallel, 4);
         assert_eq!(config.stuck_timeout, 1800);
+        assert_eq!(config.no_session_stuck_timeout, 600);
         assert_eq!(
             config.graceful_shutdown_timeout,
             std::time::Duration::from_secs(600)
+        );
+    }
+
+    #[test]
+    fn engine_config_no_session_timeout_is_under_15_minutes() {
+        // Acceptance criterion: no_session_stuck_timeout must be ≤ 15 minutes (900 seconds)
+        let config = EngineConfig::default();
+        assert!(
+            config.no_session_stuck_timeout <= 900,
+            "no_session_stuck_timeout ({}) exceeds 15 minutes",
+            config.no_session_stuck_timeout
         );
     }
 
