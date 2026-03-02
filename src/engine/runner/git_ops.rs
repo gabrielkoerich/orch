@@ -85,6 +85,48 @@ pub async fn auto_commit(
     Ok(true)
 }
 
+/// Rebase the current branch on the default branch.
+///
+/// Run before the agent starts to ensure the worktree has the latest code.
+/// Non-fatal: if rebase fails (conflicts), the agent may still be able to work.
+pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
+    // Fetch latest from origin first
+    let _ = Command::new("git")
+        .args(["fetch", "origin", default_branch])
+        .current_dir(dir)
+        .output_with_context()
+        .await;
+
+    let output = Command::new("git")
+        .args(["rebase", &format!("origin/{default_branch}")])
+        .current_dir(dir)
+        .output_with_context()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::debug!(default_branch, "rebased worktree on default branch");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!(
+                default_branch,
+                err = %stderr,
+                "rebase failed, aborting and continuing with current state"
+            );
+            // Abort failed rebase so the worktree is in a clean state
+            let _ = Command::new("git")
+                .args(["rebase", "--abort"])
+                .current_dir(dir)
+                .output_with_context()
+                .await;
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to run rebase");
+        }
+    }
+}
+
 /// Push the branch to origin.
 pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyhow::Result<bool> {
     let current = get_current_branch(dir).await;
@@ -131,12 +173,67 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 
     if output.status.success() {
         tracing::info!(branch = branch_to_push, "push succeeded");
-        Ok(true)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!(branch = branch_to_push, err = %stderr, "push failed");
-        anyhow::bail!("push failed: {stderr}")
+        return Ok(true);
     }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // If push failed due to non-fast-forward, try pull --rebase and retry once
+    if stderr.contains("non-fast-forward") || stderr.contains("rejected") {
+        tracing::warn!(
+            branch = branch_to_push,
+            "push rejected (non-fast-forward), pulling with rebase and retrying"
+        );
+
+        let pull = Command::new("git")
+            .args(["pull", "--rebase", "origin", branch_to_push])
+            .current_dir(dir)
+            .output_with_context()
+            .await;
+
+        match pull {
+            Ok(p) if p.status.success() => {
+                // Retry push after rebase
+                let retry = Command::new("git")
+                    .args([
+                        "-c",
+                        "url.https://github.com/.insteadOf=git@github.com:",
+                        "push",
+                        "-u",
+                        "origin",
+                        branch_to_push,
+                    ])
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await?;
+
+                if retry.status.success() {
+                    tracing::info!(branch = branch_to_push, "push succeeded after rebase");
+                    return Ok(true);
+                }
+                let retry_err = String::from_utf8_lossy(&retry.stderr);
+                tracing::warn!(branch = branch_to_push, err = %retry_err, "push still failed after rebase");
+                anyhow::bail!("push failed after rebase: {retry_err}")
+            }
+            Ok(p) => {
+                let pull_err = String::from_utf8_lossy(&p.stderr);
+                tracing::warn!(branch = branch_to_push, err = %pull_err, "pull --rebase failed (conflicts?)");
+                // Abort the rebase so worktree is clean
+                let _ = Command::new("git")
+                    .args(["rebase", "--abort"])
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await;
+                anyhow::bail!("push failed: {stderr} (rebase also failed: {pull_err})")
+            }
+            Err(e) => {
+                anyhow::bail!("push failed: {stderr} (pull --rebase error: {e})")
+            }
+        }
+    }
+
+    tracing::warn!(branch = branch_to_push, err = %stderr, "push failed");
+    anyhow::bail!("push failed: {stderr}")
 }
 
 /// Create a PR if one doesn't already exist.

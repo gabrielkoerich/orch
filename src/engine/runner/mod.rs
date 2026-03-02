@@ -129,6 +129,10 @@ impl TaskRunner {
         // Set up worktree
         let wt = worktree::setup_worktree(task_id, &title_for_branch, &project_dir).await?;
 
+        // Rebase worktree on default branch to pick up latest changes.
+        // This prevents non-fast-forward push failures when the task is re-dispatched.
+        git_ops::rebase_on_default(&wt.work_dir, &wt.default_branch).await;
+
         // Get routing result
         let route_result = get_route_result(task_id).ok();
 
