@@ -842,8 +842,13 @@ src/
 │   ├── cleanup.rs           # Worktree cleanup, branch deletion, merged-PR detection
 │   ├── tasks.rs             # TaskManager — unified internal + external CRUD
 │   ├── internal_tasks.rs    # Internal task SQLite operations
-│   ├── router.rs            # Agent selection strategies (label, round-robin, weighted, circuit breaker) — 1,919 lines
-│   ├── llm_router.rs        # LlmRouter — prompt building, LLM call, response parsing, skills catalog — 511 lines
+│   ├── router/
+│   │   ├── mod.rs           # Router struct, route() orchestration, public API (~200 lines)
+│   │   ├── config.rs        # RouterConfig, DEFAULT_AGENTS, model_map loading (~250 lines)
+│   │   ├── weights.rs       # RateLimitState, AgentWeights, weight decay/recovery (~175 lines)
+│   │   ├── selection.rs     # Hash utilities: simple_hash_fraction_for, simple_hash_index_for (~60 lines)
+│   │   ├── strategies.rs    # route_via_round_robin, route_via_weighted, route_via_fallback (~200 lines)
+│   │   └── llm.rs           # LlmRouter — prompt building, LLM call, response parsing, skills catalog (~511 lines)
 │   ├── jobs.rs              # Cron scheduler + self-review job (metrics → improvement issues)
 │   ├── commands.rs          # Owner /slash command scanning (/retry, /reroute, /block, etc.)
 │   └── runner/
@@ -1345,7 +1350,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 ### Code Quality
 
 - [x] `src/engine/mod.rs` — decomposed into tick.rs, sync.rs, review.rs, cleanup.rs (#283)
-- [x] `src/engine/router.rs` — extracted LLM routing into `llm_router.rs` (#257); now 1,919 lines
+- [x] `src/engine/router.rs` — extracted LLM routing into `llm_router.rs` (#257); decomposed into `router/` module directory (#288)
 - [ ] `src/engine/runner/mod.rs` — 45KB coordinator; largest file in runner module
 - [x] No test coverage tooling in CI (#258) — 366 tests exist but coverage metrics not tracked; `cargo-llvm-cov` already in CI (`release.yml`); 37 new unit tests added for `llm_router.rs` (23 tests), `tick.rs` (5 tests), `runner/mod.rs` (9 tests) in #296
 

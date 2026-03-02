@@ -12,13 +12,19 @@
 //! 5. After N LLM failures, fall back to round-robin
 //! 6. Track last routed agent to distribute load across agents
 
+pub mod config;
+mod llm;
+mod selection;
+mod strategies;
+pub mod weights;
+
+pub use config::RouterConfig;
+pub use weights::AgentWeights;
+
 use crate::backends::ExternalTask;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::llm_router::LlmRouter;
+use llm::LlmRouter;
 
 /// Result of routing a task to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -50,480 +56,6 @@ pub struct AgentProfile {
     pub tools: Vec<String>,
     /// Constraints for this task
     pub constraints: Vec<String>,
-}
-
-/// Default weight for agents with full capacity.
-const DEFAULT_WEIGHT: f64 = 1.0;
-
-/// Minimum weight — an agent never drops below this (still gets occasional tasks).
-const MIN_WEIGHT: f64 = 0.05;
-
-/// How much to reduce weight on each rate limit hit (multiplicative decay).
-const RATE_LIMIT_DECAY: f64 = 0.3;
-
-/// Duration after which a rate-limited agent starts recovering weight.
-const RECOVERY_DELAY: Duration = Duration::from_secs(60);
-
-/// Per-tick weight recovery amount (additive, applied each routing call).
-const RECOVERY_RATE: f64 = 0.1;
-
-/// Global sequence counter to decorrelate hash inputs across rapid calls.
-static HASH_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Rate limit state for a single agent.
-#[derive(Debug, Clone)]
-pub struct RateLimitState {
-    /// Current routing weight (0.0..=1.0). Higher = more tasks.
-    pub weight: f64,
-    /// When the last rate limit error was recorded.
-    pub last_limited_at: Option<Instant>,
-    /// How many consecutive rate limit hits.
-    pub consecutive_hits: u32,
-}
-
-impl Default for RateLimitState {
-    fn default() -> Self {
-        Self {
-            weight: DEFAULT_WEIGHT,
-            last_limited_at: None,
-            consecutive_hits: 0,
-        }
-    }
-}
-
-impl RateLimitState {
-    /// Record a rate limit event — decay the weight.
-    pub fn record_rate_limit(&mut self) {
-        self.consecutive_hits += 1;
-        self.weight = (self.weight * RATE_LIMIT_DECAY).max(MIN_WEIGHT);
-        self.last_limited_at = Some(Instant::now());
-    }
-
-    /// Record a successful completion — bump weight back toward 1.0.
-    pub fn record_success(&mut self) {
-        self.consecutive_hits = 0;
-        self.weight = (self.weight + RECOVERY_RATE).min(DEFAULT_WEIGHT);
-    }
-
-    /// Tick recovery: if enough time has passed since the last limit, gradually restore.
-    pub fn maybe_recover(&mut self) {
-        if let Some(last) = self.last_limited_at {
-            if last.elapsed() >= RECOVERY_DELAY {
-                self.weight = (self.weight + RECOVERY_RATE).min(DEFAULT_WEIGHT);
-                if self.weight >= DEFAULT_WEIGHT {
-                    self.last_limited_at = None;
-                    self.consecutive_hits = 0;
-                }
-            }
-        }
-    }
-
-    /// Is this agent currently rate-limited (weight below full)?
-    pub fn is_limited(&self) -> bool {
-        self.weight < DEFAULT_WEIGHT
-    }
-}
-
-/// Tracks per-agent weights for weighted round-robin routing.
-#[derive(Debug, Clone, Default)]
-pub struct AgentWeights {
-    pub states: HashMap<String, RateLimitState>,
-}
-
-impl AgentWeights {
-    /// Ensure all available agents have an entry.
-    pub fn ensure_agents(&mut self, agents: &[String]) {
-        for agent in agents {
-            self.states.entry(agent.clone()).or_default();
-        }
-    }
-
-    /// Record a rate limit event for an agent.
-    pub fn record_rate_limit(&mut self, agent: &str) {
-        self.states
-            .entry(agent.to_string())
-            .or_default()
-            .record_rate_limit();
-        tracing::info!(
-            agent,
-            weight = self.states[agent].weight,
-            hits = self.states[agent].consecutive_hits,
-            "agent weight reduced (rate limit)"
-        );
-    }
-
-    /// Record a successful task completion for an agent.
-    pub fn record_success(&mut self, agent: &str) {
-        self.states
-            .entry(agent.to_string())
-            .or_default()
-            .record_success();
-    }
-
-    /// Tick recovery for all agents.
-    pub fn tick_recovery(&mut self) {
-        for (agent, state) in &mut self.states {
-            let was_limited = state.is_limited();
-            state.maybe_recover();
-            if was_limited && !state.is_limited() {
-                tracing::info!(agent, "agent weight fully recovered");
-            }
-        }
-    }
-
-    /// Select an agent by weighted probability from the given list.
-    ///
-    /// Uses a simple weighted random selection: each agent's probability is
-    /// proportional to its weight. If all weights are zero (shouldn't happen
-    /// due to MIN_WEIGHT), falls back to uniform selection.
-    pub fn weighted_select(&self, agents: &[String], task_id: &str) -> Option<String> {
-        if agents.is_empty() {
-            return None;
-        }
-
-        let weights: Vec<f64> = agents
-            .iter()
-            .map(|a| {
-                self.states
-                    .get(a)
-                    .map(|s| s.weight)
-                    .unwrap_or(DEFAULT_WEIGHT)
-            })
-            .collect();
-
-        let total: f64 = weights.iter().sum();
-        if total <= 0.0 {
-            // Safety fallback: uniform random
-            let idx = simple_hash_index_for(agents.len(), task_id);
-            return Some(agents[idx].clone());
-        }
-
-        // Deterministic-ish selection using a hash of the current time
-        // to avoid requiring rand crate. Good enough for load distribution.
-        let pick = simple_hash_fraction_for(task_id) * total;
-        let mut cumulative = 0.0;
-        for (i, w) in weights.iter().enumerate() {
-            cumulative += w;
-            if pick < cumulative {
-                return Some(agents[i].clone());
-            }
-        }
-
-        // Rounding edge case — return last agent
-        Some(agents.last().unwrap().clone())
-    }
-
-    /// Get the current weight for an agent.
-    pub fn get_weight(&self, agent: &str) -> f64 {
-        self.states
-            .get(agent)
-            .map(|s| s.weight)
-            .unwrap_or(DEFAULT_WEIGHT)
-    }
-
-    /// Get a snapshot of all agent weights (for logging/debugging).
-    pub fn snapshot(&self) -> Vec<(String, f64, u32)> {
-        let mut snap: Vec<_> = self
-            .states
-            .iter()
-            .map(|(a, s)| (a.clone(), s.weight, s.consecutive_hits))
-            .collect();
-        snap.sort_by(|a, b| a.0.cmp(&b.0));
-        snap
-    }
-}
-
-/// Simple deterministic-ish fraction [0.0, 1.0) based on time + task data.
-/// Not cryptographic, but sufficient for load distribution.
-fn simple_hash_fraction_for(task_id: &str) -> f64 {
-    // Use SystemTime since Instant::now().elapsed() measures time since
-    // the instant was created and is nearly always ~0 here. SystemTime
-    // gives a clock relative to the UNIX epoch which varies across calls.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-
-    let seq = HASH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let task_hash = hash_task_id(task_id);
-    let seed = nanos ^ seq ^ task_hash;
-
-    // Mix bits using a simple hash
-    let hash = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (hash % 10000) as f64 / 10000.0
-}
-
-/// Simple index selection using instant-based hash.
-fn simple_hash_index_for(len: usize, task_id: &str) -> usize {
-    if len == 0 {
-        return 0;
-    }
-
-    // Use SystemTime for a variable seed instead of Instant::now().elapsed().
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-
-    let seq = HASH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let task_hash = hash_task_id(task_id);
-    let seed = nanos ^ seq ^ task_hash;
-
-    let hash = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (hash as usize) % len
-}
-
-fn hash_task_id(task_id: &str) -> u64 {
-    task_id
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
-}
-
-/// Router configuration.
-#[derive(Debug, Clone)]
-pub struct RouterConfig {
-    /// Routing mode: "llm" or "round_robin"
-    pub mode: String,
-    /// Which agent performs routing (default: "claude")
-    pub router_agent: String,
-    /// Model for routing (default: "haiku")
-    pub router_model: String,
-    /// Timeout for routing LLM call in seconds
-    pub timeout_seconds: u64,
-    /// Fallback executor if routing fails
-    pub fallback_executor: String,
-    /// Configurable agent list (checked against PATH at runtime)
-    pub agents: Vec<String>,
-    /// Max LLM routing attempts before falling back to round-robin
-    pub max_route_attempts: u32,
-    /// Default tools allowed
-    pub allowed_tools: Vec<String>,
-    /// Default skills to always include
-    pub default_skills: Vec<String>,
-    /// Model map for complexity levels
-    pub model_map: HashMap<String, HashMap<String, String>>,
-    /// Enable weighted round-robin routing based on rate limit capacity.
-    /// When true, agents that hit rate limits get fewer tasks.
-    pub weighted_round_robin: bool,
-}
-
-/// Default agents to check in PATH.
-///
-/// All 5 agents are listed, but availability is checked at runtime via
-/// `which::which()`. Agents not installed (e.g. kimi, minimax) are
-/// automatically skipped during routing. Users can customize this list
-/// in their `config.yml` under `routing.agents`.
-pub const DEFAULT_AGENTS: &[&str] = &["claude", "codex", "opencode", "kimi", "minimax"];
-
-impl Default for RouterConfig {
-    fn default() -> Self {
-        let mut model_map = HashMap::new();
-
-        // Simple tasks — fast, cheap models
-        let mut simple = HashMap::new();
-        simple.insert(
-            "claude".to_string(),
-            "claude-haiku-4-5-20251001".to_string(),
-        );
-        simple.insert("codex".to_string(), "o4-mini".to_string());
-        simple.insert("opencode".to_string(), "openai/gpt-4.1-mini".to_string());
-        simple.insert("kimi".to_string(), "claude-haiku-4-5-20251001".to_string());
-        simple.insert(
-            "minimax".to_string(),
-            "claude-haiku-4-5-20251001".to_string(),
-        );
-        model_map.insert("simple".to_string(), simple);
-
-        // Medium tasks — balanced cost/capability
-        let mut medium = HashMap::new();
-        medium.insert("claude".to_string(), "claude-sonnet-4-6".to_string());
-        medium.insert("codex".to_string(), "gpt-4.1".to_string());
-        medium.insert(
-            "opencode".to_string(),
-            "anthropic/claude-sonnet-4-6".to_string(),
-        );
-        medium.insert("kimi".to_string(), "claude-sonnet-4-6".to_string());
-        medium.insert("minimax".to_string(), "claude-sonnet-4-6".to_string());
-        model_map.insert("medium".to_string(), medium);
-
-        // Complex tasks — most capable models
-        let mut complex = HashMap::new();
-        complex.insert("claude".to_string(), "claude-opus-4-6".to_string());
-        complex.insert("codex".to_string(), "o3".to_string());
-        complex.insert(
-            "opencode".to_string(),
-            "anthropic/claude-opus-4-6".to_string(),
-        );
-        complex.insert("kimi".to_string(), "claude-opus-4-6".to_string());
-        complex.insert("minimax".to_string(), "claude-opus-4-6".to_string());
-        model_map.insert("complex".to_string(), complex);
-
-        // Review tasks — strong reasoning, moderate cost
-        let mut review = HashMap::new();
-        review.insert("claude".to_string(), "claude-sonnet-4-6".to_string());
-        review.insert("codex".to_string(), "gpt-4.1".to_string());
-        review.insert(
-            "opencode".to_string(),
-            "anthropic/claude-sonnet-4-6".to_string(),
-        );
-        review.insert("kimi".to_string(), "claude-sonnet-4-6".to_string());
-        review.insert("minimax".to_string(), "claude-sonnet-4-6".to_string());
-        model_map.insert("review".to_string(), review);
-
-        Self {
-            mode: "llm".to_string(),
-            router_agent: "claude".to_string(),
-            router_model: "claude-haiku-4-5-20251001".to_string(),
-            timeout_seconds: 120,
-            fallback_executor: "codex".to_string(),
-            agents: DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect(),
-            max_route_attempts: 3,
-            allowed_tools: vec![
-                "yq".to_string(),
-                "jq".to_string(),
-                "bash".to_string(),
-                "just".to_string(),
-                "git".to_string(),
-                "rg".to_string(),
-                "sed".to_string(),
-                "awk".to_string(),
-                "python3".to_string(),
-                "node".to_string(),
-                "npm".to_string(),
-                "bun".to_string(),
-            ],
-            default_skills: vec!["gh".to_string(), "git-worktree".to_string()],
-            model_map,
-            weighted_round_robin: false,
-        }
-    }
-}
-
-impl RouterConfig {
-    /// Load configuration from config files.
-    pub fn from_config() -> Self {
-        let mut config = Self::default();
-
-        // Try to load from config
-        if let Ok(mode) = crate::config::get("router.mode") {
-            if mode == "round_robin" || mode == "llm" {
-                config.mode = mode;
-            }
-        }
-
-        if let Ok(agent) = crate::config::get("router.agent") {
-            if !agent.is_empty() {
-                config.router_agent = agent;
-            }
-        }
-
-        if let Ok(model) = crate::config::get("router.model") {
-            if !model.is_empty() {
-                config.router_model = model;
-            }
-        }
-
-        if let Ok(timeout) = crate::config::get("router.timeout_seconds") {
-            if let Ok(secs) = timeout.parse::<u64>() {
-                config.timeout_seconds = secs;
-            }
-        }
-
-        if let Ok(fallback) = crate::config::get("router.fallback_executor") {
-            if !fallback.is_empty() {
-                config.fallback_executor = fallback;
-            }
-        }
-
-        // Parse agents list
-        if let Ok(agents_str) = crate::config::get("router.agents") {
-            if !agents_str.is_empty() && agents_str != "[]" {
-                if let Ok(agents_arr) = serde_json::from_str::<Vec<String>>(&agents_str) {
-                    config.agents = agents_arr;
-                } else {
-                    config.agents = agents_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-            }
-        }
-
-        if let Ok(max_attempts) = crate::config::get("router.max_route_attempts") {
-            if let Ok(n) = max_attempts.parse::<u32>() {
-                config.max_route_attempts = n;
-            }
-        }
-
-        // Parse allowed_tools as comma-separated or YAML array
-        if let Ok(tools_str) = crate::config::get("router.allowed_tools") {
-            if !tools_str.is_empty() && tools_str != "[]" {
-                // Try to parse as JSON/YAML array first
-                if let Ok(tools_arr) = serde_json::from_str::<Vec<String>>(&tools_str) {
-                    config.allowed_tools = tools_arr;
-                } else {
-                    // Fall back to comma-separated
-                    config.allowed_tools = tools_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-            }
-        }
-
-        // Parse weighted_round_robin
-        if let Ok(val) = crate::config::get("router.weighted_round_robin") {
-            config.weighted_round_robin = val == "true" || val == "1";
-        }
-
-        // Load model_map overrides from config (model_map.{complexity}.{agent})
-        let known_agents = ["claude", "codex", "opencode", "kimi", "minimax"];
-        for complexity in config.model_map.keys().cloned().collect::<Vec<_>>() {
-            for agent in &known_agents {
-                let key = format!("model_map.{complexity}.{agent}");
-                if let Ok(model) = crate::config::get(&key) {
-                    if !model.is_empty() {
-                        config
-                            .model_map
-                            .entry(complexity.clone())
-                            .or_default()
-                            .insert(agent.to_string(), model);
-                    }
-                }
-            }
-        }
-
-        // Parse default_skills
-        if let Ok(skills_str) = crate::config::get("router.default_skills") {
-            if !skills_str.is_empty() && skills_str != "[]" {
-                if let Ok(skills_arr) = serde_json::from_str::<Vec<String>>(&skills_str) {
-                    config.default_skills = skills_arr;
-                } else {
-                    config.default_skills = skills_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
-            }
-        }
-
-        config
-    }
-
-    /// Get the model for a given agent and complexity level.
-    pub fn model_for_complexity(&self, agent: &str, complexity: &str) -> Option<String> {
-        self.model_map
-            .get(complexity)
-            .and_then(|m| m.get(agent))
-            .cloned()
-    }
 }
 
 /// The agent router.
@@ -595,10 +127,6 @@ impl Router {
     }
 
     /// Get the first available agent.
-    fn first_available_agent(&self) -> Option<String> {
-        self.available_agents.first().cloned()
-    }
-
     /// Pick next agent via round-robin (for review or other non-task routing).
     pub fn next_round_robin_agent(&self) -> Option<String> {
         if self.available_agents.is_empty() {
@@ -624,9 +152,11 @@ impl Router {
     /// 5. After max_route_attempts LLM failures, fall back to round-robin
     pub async fn route(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         // 1. Check for explicit agent label
-        if let Some(agent) = self.extract_agent_from_labels(&task.labels) {
+        if let Some(agent) =
+            strategies::extract_agent_from_labels(&self.config.agents, &task.labels)
+        {
             if self.is_agent_available(&agent) {
-                let complexity = self.extract_complexity_from_labels(&task.labels);
+                let complexity = strategies::extract_complexity_from_labels(&task.labels);
                 let model = self.config.model_for_complexity(&agent, &complexity);
                 let profile = AgentProfile {
                     role: format!("{} specialist", agent),
@@ -650,13 +180,22 @@ impl Router {
 
         // 2. Weighted round-robin — capacity-based selection
         if self.config.weighted_round_robin {
-            return self.route_weighted_round_robin(task);
+            return strategies::route_via_weighted_round_robin(
+                &self.available_agents,
+                &self.weights,
+                &self.config,
+                task,
+            );
         }
 
         // 3. Round-robin mode — use stateful round-robin
         if self.config.mode == "round_robin" {
             tracing::debug!(task_id = %task.id.0, "routing via round-robin mode");
-            return self.route_round_robin_stateful(task);
+            return strategies::route_via_round_robin_stateful(
+                &self.available_agents,
+                &self.config,
+                task,
+            );
         }
 
         // 3. LLM-based routing with retry tracking
@@ -669,7 +208,11 @@ impl Router {
                 max = self.config.max_route_attempts,
                 "max LLM route attempts reached, falling back to round-robin"
             );
-            return self.route_round_robin_stateful(task);
+            return strategies::route_via_round_robin_stateful(
+                &self.available_agents,
+                &self.config,
+                task,
+            );
         }
 
         // Log routing start (before await)
@@ -700,9 +243,13 @@ impl Router {
                         "falling back to round-robin after {} failed attempts",
                         new_attempts
                     );
-                    self.route_round_robin_stateful(task)
+                    strategies::route_via_round_robin_stateful(
+                        &self.available_agents,
+                        &self.config,
+                        task,
+                    )
                 } else {
-                    self.route_fallback(task)
+                    strategies::route_via_fallback(&self.available_agents, &self.config, task)
                 }
             }
         }
@@ -721,241 +268,11 @@ impl Router {
         crate::sidecar::set(task_id, &[format!("route_attempts={}", attempts)])
     }
 
-    /// Extract agent from labels (e.g., "agent:claude" -> "claude").
-    /// Accepts any agent from the configured agents list.
-    fn extract_agent_from_labels(&self, labels: &[String]) -> Option<String> {
-        for label in labels {
-            if let Some(agent) = label.strip_prefix("agent:") {
-                let agent = agent.to_lowercase();
-                if self.config.agents.iter().any(|a| a == &agent) {
-                    return Some(agent);
-                }
-            }
-        }
-        None
-    }
-
-    /// Extract complexity from labels (e.g., "complexity:simple" -> "simple").
-    fn extract_complexity_from_labels(&self, labels: &[String]) -> String {
-        for label in labels {
-            if let Some(comp) = label.strip_prefix("complexity:") {
-                let comp = comp.to_lowercase();
-                if ["simple", "medium", "complex"].contains(&comp.as_str()) {
-                    return comp;
-                }
-            }
-        }
-        "medium".to_string()
-    }
-
-    /// Route using round-robin algorithm (task-ID based, stateless).
-    ///
-    /// Kept for backward compatibility and unit tests. The project prefers
-    /// the stateful `route_round_robin_stateful` (which persists an index),
-    /// but this stateless modulo-based implementation is intentionally
-    /// retained to allow deterministic selection based on task ID and for
-    /// existing tests that exercise the legacy behavior.
-    fn route_round_robin(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
-        let agents = &self.available_agents;
-        if agents.is_empty() {
-            anyhow::bail!("no agent CLIs found in PATH");
-        }
-
-        // Parse task ID as number for modulo operation
-        let task_num: usize = task.id.0.parse().unwrap_or(0);
-        let agent_idx = task_num % agents.len();
-        let agent = agents[agent_idx].clone();
-
-        let profile = AgentProfile {
-            role: "general".to_string(),
-            skills: vec![],
-            tools: self.config.allowed_tools.clone(),
-            constraints: vec![],
-        };
-
-        Ok(RouteResult {
-            agent: agent.clone(),
-            model: self.config.model_for_complexity(&agent, "medium"),
-            complexity: "medium".to_string(),
-            reason: format!("round_robin (task {} % {} agents)", task.id.0, agents.len()),
-            profile,
-            selected_skills: self.config.default_skills.clone(),
-            warning: None,
-        })
-    }
-
-    /// Stateful round-robin: cycles through agents using a persistent index,
-    /// skipping the last-used agent when possible.
-    fn route_round_robin_stateful(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
-        let agents = &self.available_agents;
-        if agents.is_empty() {
-            anyhow::bail!("no agent CLIs found in PATH");
-        }
-
-        // Get current round-robin index from sidecar KV
-        let current_idx: usize = crate::sidecar::get("_router", "rr_index")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        // Get last routed agent
-        let last_agent = crate::sidecar::get("_router", "last_agent").ok();
-
-        // Pick the next agent, skipping last-used if we have >1 agent
-        let mut agent_idx = current_idx % agents.len();
-        if agents.len() > 1 {
-            if let Some(ref last) = last_agent {
-                if agents.get(agent_idx).map(|a| a.as_str()) == Some(last.as_str()) {
-                    agent_idx = (agent_idx + 1) % agents.len();
-                }
-            }
-        }
-
-        let agent = agents[agent_idx].clone();
-
-        // Persist the next index and last agent
-        let next_idx = (agent_idx + 1) % agents.len();
-        if let Err(e) = crate::sidecar::set(
-            "_router",
-            &[
-                format!("rr_index={}", next_idx),
-                format!("last_agent={}", agent),
-            ],
-        ) {
-            tracing::warn!(error = ?e, "failed to persist round-robin state");
-        }
-
-        let complexity = self.extract_complexity_from_labels(&task.labels);
-        let model = self.config.model_for_complexity(&agent, &complexity);
-
-        let profile = AgentProfile {
-            role: "general".to_string(),
-            skills: vec![],
-            tools: self.config.allowed_tools.clone(),
-            constraints: vec![],
-        };
-
-        Ok(RouteResult {
-            agent: agent.clone(),
-            model,
-            complexity,
-            reason: format!(
-                "round_robin (index {} of {} agents)",
-                agent_idx,
-                agents.len()
-            ),
-            profile,
-            selected_skills: self.config.default_skills.clone(),
-            warning: None,
-        })
-    }
-
-    /// Weighted round-robin: selects an agent based on capacity weights.
-    ///
-    /// Agents with higher weights (more capacity) get more tasks.
-    /// Rate-limited agents have reduced weights and receive fewer tasks.
-    fn route_weighted_round_robin(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
-        let agents = &self.available_agents;
-        if agents.is_empty() {
-            anyhow::bail!("no agent CLIs found in PATH");
-        }
-
-        let agent = self
-            .weights
-            .weighted_select(agents, &task.id.0)
-            .unwrap_or_else(|| agents[0].clone());
-
-        let weight = self.weights.get_weight(&agent);
-        let complexity = self.extract_complexity_from_labels(&task.labels);
-        let model = self.config.model_for_complexity(&agent, &complexity);
-
-        // Build weight summary for reason
-        let weight_summary: Vec<String> = self
-            .weights
-            .snapshot()
-            .iter()
-            .filter(|(a, _, _)| agents.contains(a))
-            .map(|(a, w, _)| format!("{a}={w:.2}"))
-            .collect();
-
-        let profile = AgentProfile {
-            role: "general".to_string(),
-            skills: vec![],
-            tools: self.config.allowed_tools.clone(),
-            constraints: vec![],
-        };
-
-        // Track last agent
-        let _ = crate::sidecar::set("_router", &[format!("last_agent={}", agent)]);
-
-        let reason = format!(
-            "weighted_round_robin (weight={weight:.2}, weights=[{}])",
-            weight_summary.join(", ")
-        );
-
-        tracing::info!(
-            task_id = %task.id.0,
-            agent = %agent,
-            weight,
-            "weighted round-robin selected agent"
-        );
-
-        Ok(RouteResult {
-            agent,
-            model,
-            complexity,
-            reason,
-            profile,
-            selected_skills: self.config.default_skills.clone(),
-            warning: None,
-        })
-    }
-
     /// Route using LLM classification. Delegates to `self.llm_router`.
     async fn route_with_llm(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         self.llm_router
             .route_with_llm(task, &self.available_agents, &self.config)
             .await
-    }
-
-    /// Fallback routing when LLM fails.
-    ///
-    /// If `fallback_executor` is "round_robin", uses round-robin selection.
-    /// Otherwise uses the named agent, falling back to first available.
-    fn route_fallback(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
-        if self.config.fallback_executor == "round_robin" {
-            return self.route_round_robin(task).map(|mut r| {
-                r.reason = format!("router failed; fallback round_robin → {}", r.agent);
-                r
-            });
-        }
-
-        let agent = if self.is_agent_available(&self.config.fallback_executor) {
-            self.config.fallback_executor.clone()
-        } else {
-            self.first_available_agent()
-                .ok_or_else(|| anyhow::anyhow!("no agents available"))?
-        };
-
-        let complexity = self.extract_complexity_from_labels(&task.labels);
-        let model = self.config.model_for_complexity(&agent, &complexity);
-
-        let profile = AgentProfile {
-            role: "general".to_string(),
-            skills: vec![],
-            tools: self.config.allowed_tools.clone(),
-            constraints: vec![],
-        };
-
-        Ok(RouteResult {
-            agent: agent.clone(),
-            model,
-            complexity,
-            reason: format!("router failed; fallback to {agent}"),
-            profile,
-            selected_skills: self.config.default_skills.clone(),
-            warning: None,
-        })
     }
 
     /// Record a rate limit event for an agent, reducing its routing weight.
@@ -1034,9 +351,15 @@ pub fn get_route_result(task_id: &str) -> anyhow::Result<RouteResult> {
 
 #[cfg(test)]
 mod tests {
+    use super::config::DEFAULT_AGENTS;
+    use super::llm::LlmRouteResponse;
+    use super::strategies;
+    use super::weights::{
+        AgentWeights, RateLimitState, DEFAULT_WEIGHT, MIN_WEIGHT, RATE_LIMIT_DECAY, RECOVERY_DELAY,
+    };
     use super::*;
     use crate::backends::{ExternalId, ExternalTask};
-    use crate::engine::llm_router::LlmRouteResponse;
+    use std::time::{Duration, Instant};
 
     // Test-only delegates so tests can call router.parse_llm_response() and
     // router.check_routing_sanity() directly without referencing llm_router.
@@ -1072,31 +395,30 @@ mod tests {
     #[test]
     fn extract_agent_from_labels() {
         let config = RouterConfig::default();
-        let router = Router::new(config);
 
         assert_eq!(
-            router.extract_agent_from_labels(&["agent:claude".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["agent:claude".to_string()]),
             Some("claude".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&["agent:codex".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["agent:codex".to_string()]),
             Some("codex".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&["agent:opencode".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["agent:opencode".to_string()]),
             Some("opencode".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&["status:new".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["status:new".to_string()]),
             None
         );
         // Verify kimi and minimax are recognized from labels
         assert_eq!(
-            router.extract_agent_from_labels(&["agent:kimi".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["agent:kimi".to_string()]),
             Some("kimi".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&["agent:minimax".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["agent:minimax".to_string()]),
             Some("minimax".to_string())
         );
     }
@@ -1111,23 +433,20 @@ mod tests {
 
     #[test]
     fn extract_complexity_from_labels() {
-        let config = RouterConfig::default();
-        let router = Router::new(config);
-
         assert_eq!(
-            router.extract_complexity_from_labels(&["complexity:simple".to_string()]),
+            strategies::extract_complexity_from_labels(&["complexity:simple".to_string()]),
             "simple"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&["complexity:medium".to_string()]),
+            strategies::extract_complexity_from_labels(&["complexity:medium".to_string()]),
             "medium"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&["complexity:complex".to_string()]),
+            strategies::extract_complexity_from_labels(&["complexity:complex".to_string()]),
             "complex"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&["status:new".to_string()]),
+            strategies::extract_complexity_from_labels(&["status:new".to_string()]),
             "medium"
         );
     }
@@ -1386,7 +705,7 @@ Hope that helps!"#;
         let config = RouterConfig::default();
         let router = Router::new(config);
 
-        let response = include_str!("../../tests/fixtures/route-response-string.json");
+        let response = include_str!("../../../tests/fixtures/route-response-string.json");
         let parsed = router.parse_llm_response(response).unwrap();
         assert_eq!(parsed.executor, "codex");
         assert_eq!(parsed.complexity, "medium");
@@ -1401,7 +720,7 @@ Hope that helps!"#;
         let config = RouterConfig::default();
         let router = Router::new(config);
 
-        let response = include_str!("../../tests/fixtures/route-response-object.json");
+        let response = include_str!("../../../tests/fixtures/route-response-object.json");
         let parsed = router.parse_llm_response(response).unwrap();
         assert_eq!(parsed.executor, "claude");
         assert_eq!(parsed.complexity, "complex");
@@ -1413,7 +732,7 @@ Hope that helps!"#;
         let config = RouterConfig::default();
         let router = Router::new(config);
 
-        let response = include_str!("../../tests/fixtures/route-response-markdown.json");
+        let response = include_str!("../../../tests/fixtures/route-response-markdown.json");
         let parsed = router.parse_llm_response(response).unwrap();
         assert_eq!(parsed.executor, "codex");
         assert_eq!(parsed.complexity, "medium");
@@ -1464,7 +783,9 @@ Hope that helps!"#;
         };
 
         let task = create_test_task("1", "Test task", vec![]);
-        let result = router.route_round_robin(&task).unwrap();
+        let result =
+            strategies::route_via_round_robin(&router.available_agents, &router.config, &task)
+                .unwrap();
 
         // Task 1 % 2 agents = agent at index 1 = codex
         assert_eq!(result.agent, "codex");
