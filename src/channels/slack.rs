@@ -83,7 +83,10 @@ impl SlackChannel {
     ///
     /// Uses `oldest` to retrieve only messages newer than `last_ts`.
     async fn get_messages(&self, channel_id: &str) -> anyhow::Result<Vec<SlackMessage>> {
-        let mut params = vec![("channel", channel_id.to_string()), ("limit", "50".to_string())];
+        let mut params = vec![
+            ("channel", channel_id.to_string()),
+            ("limit", "50".to_string()),
+        ];
 
         {
             let last = self.last_ts.lock().unwrap();
@@ -299,10 +302,7 @@ mod tests {
     #[test]
     fn slack_api_url() {
         let ch = SlackChannel::new("xoxb-test".to_string(), None);
-        assert_eq!(
-            ch.api_url("auth.test"),
-            "https://slack.com/api/auth.test"
-        );
+        assert_eq!(ch.api_url("auth.test"), "https://slack.com/api/auth.test");
         assert_eq!(
             ch.api_url("chat.postMessage"),
             "https://slack.com/api/chat.postMessage"
