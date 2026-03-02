@@ -728,7 +728,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Discord channel (polling implementation) — PR #81 merged
 - [x] Webhook HTTP server (axum) — PR #93 merged
 - [x] Wire webhook server into engine — PR #123 merged
-- [ ] Mention detection via webhooks (#112)
+- [x] Mention detection via webhooks (#112) — webhook handler + polling fallback
 - [x] Polling fallback when webhooks not configured — PR #131 merged
 - [x] Wire channels into engine event loop — PR #81 merged
 
@@ -760,7 +760,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] `orch service start/stop/restart/status` — service management
 - [x] `orch completions <shell>` — shell completions
 - [x] `orch board list/link/sync/info` — GitHub Projects V2 board management
-- [ ] `orch project add/remove/list` — multi-project management
+- [x] `orch project add/remove/list` — multi-project management (see Phase 6)
 - [x] Rename binary from `orch-core` to `orch`
 - [x] Absorb justfile routing into native CLI (justfile deleted)
 

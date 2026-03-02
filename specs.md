@@ -1,13 +1,13 @@
 # Orch — Feature Specs
 
-Missing features identified in the bash `orchestrator` → Rust `orch` parity audit.
+Features identified in the bash `orchestrator` → Rust `orch` parity audit.
 
 ---
 
 ## 1. Review Agent + Auto-Merge
 
 **Priority:** Critical
-**Status:** Not implemented
+**Status:** Implemented — `review_and_merge()` in `src/engine/mod.rs`, review prompts in `prompts/review_system.md` and `prompts/review_task.md`
 **Files:** `src/engine/runner/mod.rs`, `src/engine/mod.rs`, `src/backends/github.rs`
 
 ### Problem
@@ -306,7 +306,7 @@ new → routed → in_progress → done (agent finishes)
 ## 2. PR Review Comments → Fix Dispatch
 
 **Priority:** Critical
-**Status:** Partially implemented (parsing exists, dispatch missing)
+**Status:** Implemented — `review_open_prs()` re-dispatches on `CHANGES_REQUESTED`, creates follow-up tasks with PR context
 **Files:** `src/engine/mod.rs` (`review_open_prs()`), `src/engine/runner/`
 
 ### Problem
@@ -386,7 +386,7 @@ if !context.pr_review_context.is_empty() {
 ## 3. Task Delegation
 
 **Priority:** High
-**Status:** DB supports parent/child, no agent-side delegation
+**Status:** Implemented — `Delegation` struct in `src/parser.rs`, `process_delegations()` in `src/engine/runner/mod.rs:1025`, parent/child unblocking in engine tick Phase 4
 **Files:** `src/engine/runner/mod.rs`, `src/parser.rs`, `src/engine/mod.rs`
 
 ### Problem
@@ -548,8 +548,8 @@ Rules:
 ## 4. Skills Sync
 
 **Priority:** Medium
-**Status:** Missing
-**Issue:** To be created
+**Status:** Implemented — `skills_sync()` in `src/engine/mod.rs:1507`, auto-clones/pulls skill repos from config during sync tick
+**Issue:** #155 (closed, PR #158 merged)
 
 ### Problem
 
@@ -580,8 +580,8 @@ On each sync tick (120s), pull latest for each skill repo. Store in `~/.orch/ski
 ## 5. Dashboard CLI
 
 **Priority:** Low
-**Status:** Missing
-**Issue:** To be created
+**Status:** Implemented — `src/cli/dashboard.rs`, combines task counts + active sessions + recent activity
+**Issue:** N/A (completed)
 
 ### Design
 
@@ -619,8 +619,8 @@ Recent (last 24h)
 ## 6. Task Tree CLI
 
 **Priority:** Low
-**Status:** Missing
-**Issue:** To be created
+**Status:** Implemented — `src/cli/tree.rs` (391 lines), ASCII tree with parent-child relationships
+**Issue:** N/A (completed)
 
 ### Design
 
@@ -649,8 +649,8 @@ $ orch task tree
 ## 7. Owner Commands
 
 **Priority:** Medium
-**Status:** Missing
-**Issue:** To be created
+**Status:** Implemented — `src/engine/commands.rs` (499 lines), `/retry`, `/reroute`, `/close`, `/block`, `/unblock`, `/review` with collaborator validation and code fence detection
+**Issue:** N/A (completed)
 
 ### Design
 
