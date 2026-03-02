@@ -1446,11 +1446,13 @@ async fn sync_tick(
         // Detect stale InReview tasks (review agent crashed, no active tmux session)
         if let Ok(in_review) = backend.list_by_status(Status::InReview).await {
             for task in in_review {
-                let review_session = format!("{}-review", task.id.0);
+                let review_task_id = format!("{}-review", task.id.0);
+                let review_session = tmux.session_name(repo, &review_task_id);
                 let has_session = tmux.session_exists(&review_session).await;
                 if !has_session {
                     tracing::warn!(
                         task_id = task.id.0,
+                        session = %review_session,
                         "InReview task has no active review session — resetting to NeedsReview"
                     );
                     let _ = backend.update_status(&task.id, Status::NeedsReview).await;
@@ -1581,6 +1583,10 @@ async fn skills_sync() -> anyhow::Result<()> {
 ///
 /// Queries status:done tasks, checks if worktree exists, removes it,
 /// deletes the local branch, and marks the worktree as cleaned.
+///
+/// Note: This is a fallback. Primary cleanup happens inline in
+/// `auto_merge_pr` via `cleanup_task_worktree`. This catches edge cases
+/// where the inline cleanup missed (e.g., manual merges).
 async fn cleanup_done_worktrees(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
@@ -1588,123 +1594,149 @@ async fn cleanup_done_worktrees(
     let done_tasks = backend.list_by_status(Status::Done).await?;
     tracing::debug!(count = done_tasks.len(), "checking done tasks for cleanup");
 
-    // Resolve the main repository root for git operations.
-    // We need this because worktree removal and branch deletion must run
-    // from the main repo, not from the (soon-to-be-deleted) worktree dir.
-    let repo_root = resolve_repo_root(repo).await?;
+    for task in done_tasks {
+        let task_id = &task.id.0;
+
+        // Skip if already cleaned
+        let worktree_cleaned = sidecar::get(task_id, "worktree_cleaned").ok();
+        if worktree_cleaned.as_deref() == Some("true") || worktree_cleaned.as_deref() == Some("1") {
+            continue;
+        }
+
+        if let Err(e) = cleanup_task_worktree(task_id, repo).await {
+            tracing::warn!(task_id, err = %e, "worktree cleanup failed for task");
+        }
+    }
+
+    Ok(())
+}
+
+/// Cleanup a single task's worktree and branches.
+///
+/// Removes the git worktree, deletes local + remote branches,
+/// pulls main to stay up-to-date, and marks sidecar as cleaned.
+async fn cleanup_task_worktree(task_id: &str, repo: &str) -> anyhow::Result<()> {
+    let worktree = sidecar::get(task_id, "worktree").ok();
+    let branch = sidecar::get(task_id, "branch").ok();
+
+    let worktree_path = worktree.as_ref().map(std::path::PathBuf::from);
 
     // Get worktrees base path
     let worktrees_base = crate::home::worktrees_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from(".orch/worktrees"));
 
-    for task in done_tasks {
-        let task_id = &task.id.0;
-
-        // Get worktree and branch from sidecar
-        let worktree = sidecar::get(task_id, "worktree").ok();
-        let branch = sidecar::get(task_id, "branch").ok();
-        let worktree_cleaned = sidecar::get(task_id, "worktree_cleaned").ok();
-
-        // Skip if already cleaned
-        if worktree_cleaned.as_deref() == Some("true") || worktree_cleaned.as_deref() == Some("1") {
-            continue;
-        }
-
-        let worktree_path = worktree.as_ref().map(std::path::PathBuf::from);
-
-        // Try to construct default worktree path if not in sidecar
-        let worktree_to_remove = if let Some(ref wt) = worktree_path {
-            if wt.exists() {
-                Some(wt.clone())
-            } else {
-                None
-            }
-        } else if let (Some(b), Some(dir)) = (&branch, worktree.as_ref()) {
-            // Try: worktrees_base/{project}/{branch}
-            let project = std::path::Path::new(dir)
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| repo.replace('/', "__"));
-            let wt = worktrees_base.join(&project).join(b);
-            if wt.exists() {
-                Some(wt)
-            } else {
-                None
-            }
+    // Try to construct default worktree path if not in sidecar
+    let worktree_to_remove = if let Some(ref wt) = worktree_path {
+        if wt.exists() {
+            Some(wt.clone())
         } else {
             None
-        };
+        }
+    } else if let (Some(b), Some(dir)) = (&branch, worktree.as_ref()) {
+        // Try: worktrees_base/{project}/{branch}
+        let project = std::path::Path::new(dir)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| repo.replace('/', "__"));
+        let wt = worktrees_base.join(&project).join(b);
+        if wt.exists() {
+            Some(wt)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-        if let Some(wt) = worktree_to_remove {
-            tracing::info!(task_id, worktree = %wt.display(), "removing worktree");
+    let repo_root = resolve_repo_root(repo).await?;
 
-            // Remove worktree FIRST, then delete the branch.
-            // Git refuses to remove a worktree if its branch is already deleted.
-            // Both commands run from the main repo root (not the worktree dir).
-            let wt_str = wt.to_string_lossy().to_string();
-            let remove_result = Command::new("git")
-                .args(["-C", &repo_root, "worktree", "remove", &wt_str, "--force"])
+    if let Some(wt) = worktree_to_remove {
+        tracing::info!(task_id, worktree = %wt.display(), "removing worktree");
+
+        // Remove worktree FIRST, then delete the branch.
+        // Git refuses to remove a worktree if its branch is already deleted.
+        // Both commands run from the main repo root (not the worktree dir).
+        let wt_str = wt.to_string_lossy().to_string();
+        let remove_result = Command::new("git")
+            .args(["-C", &repo_root, "worktree", "remove", &wt_str, "--force"])
+            .output_with_context()
+            .await;
+
+        match remove_result {
+            Ok(output) if output.status.success() => {
+                tracing::info!(task_id, "worktree removed");
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(task_id, err = %stderr, "failed to remove worktree");
+            }
+            Err(e) => {
+                tracing::warn!(task_id, err = %e, "failed to remove worktree");
+            }
+        }
+
+        // Delete local and remote branch from the main repo root (worktree is already gone)
+        if let Some(ref br) = branch {
+            let branch_delete_result = Command::new("git")
+                .args(["-C", &repo_root, "branch", "-D", br])
                 .output_with_context()
                 .await;
 
-            match remove_result {
+            match branch_delete_result {
                 Ok(output) if output.status.success() => {
-                    tracing::info!(task_id, "worktree removed");
+                    tracing::info!(task_id, branch = %br, "local branch deleted");
                 }
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!(task_id, err = %stderr, "failed to remove worktree");
+                    tracing::debug!(task_id, err = %stderr, "local branch delete skipped (may not exist)");
                 }
                 Err(e) => {
-                    tracing::warn!(task_id, err = %e, "failed to remove worktree");
+                    tracing::warn!(task_id, err = %e, "failed to delete local branch");
                 }
             }
 
-            // Delete local and remote branch from the main repo root (worktree is already gone)
-            if let Some(ref br) = branch {
-                let branch_delete_result = Command::new("git")
-                    .args(["-C", &repo_root, "branch", "-D", br])
-                    .output_with_context()
-                    .await;
+            // Delete remote branch
+            let remote_delete = Command::new("git")
+                .args(["-C", &repo_root, "push", "origin", "--delete", br])
+                .output_with_context()
+                .await;
 
-                match branch_delete_result {
-                    Ok(output) if output.status.success() => {
-                        tracing::info!(task_id, branch = %br, "local branch deleted");
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        tracing::debug!(task_id, err = %stderr, "local branch delete skipped (may not exist)");
-                    }
-                    Err(e) => {
-                        tracing::warn!(task_id, err = %e, "failed to delete local branch");
-                    }
+            match remote_delete {
+                Ok(output) if output.status.success() => {
+                    tracing::info!(task_id, branch = %br, "remote branch deleted");
                 }
-
-                // Delete remote branch
-                let remote_delete = Command::new("git")
-                    .args(["-C", &repo_root, "push", "origin", "--delete", br])
-                    .output_with_context()
-                    .await;
-
-                match remote_delete {
-                    Ok(output) if output.status.success() => {
-                        tracing::info!(task_id, branch = %br, "remote branch deleted");
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        tracing::debug!(task_id, err = %stderr, "remote branch delete skipped");
-                    }
-                    Err(e) => {
-                        tracing::warn!(task_id, err = %e, "failed to delete remote branch");
-                    }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::debug!(task_id, err = %stderr, "remote branch delete skipped");
                 }
-            }
-
-            // Mark as cleaned in sidecar
-            if let Err(e) = sidecar::set(task_id, &["worktree_cleaned=true".to_string()]) {
-                tracing::warn!(task_id, err = %e, "failed to mark worktree_cleaned");
+                Err(e) => {
+                    tracing::warn!(task_id, err = %e, "failed to delete remote branch");
+                }
             }
         }
+    }
+
+    // Pull main to keep local repo up-to-date for future worktrees
+    let pull_result = Command::new("git")
+        .args(["-C", &repo_root, "pull", "--ff-only"])
+        .output_with_context()
+        .await;
+    match pull_result {
+        Ok(output) if output.status.success() => {
+            tracing::info!(task_id, "pulled main after cleanup");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!(task_id, err = %stderr, "git pull skipped");
+        }
+        Err(e) => {
+            tracing::debug!(task_id, err = %e, "git pull failed");
+        }
+    }
+
+    // Mark as cleaned in sidecar
+    if let Err(e) = sidecar::set(task_id, &["worktree_cleaned=true".to_string()]) {
+        tracing::warn!(task_id, err = %e, "failed to mark worktree_cleaned");
     }
 
     Ok(())
@@ -2740,8 +2772,11 @@ async fn auto_merge_pr(
     // 6. Update status to done (auto-closes the issue via backend)
     backend.update_status(&task.id, Status::Done).await?;
 
-    // 7. Mark worktree for cleanup
-    let _ = sidecar::set(&task.id.0, &["worktree_cleaned=false".to_string()]);
+    // 7. Cleanup worktree + branches + pull main immediately
+    // (can't rely on sync_tick because auto-close makes list_by_status(Done) miss it)
+    if let Err(e) = cleanup_task_worktree(&task.id.0, repo).await {
+        tracing::warn!(task_id = task.id.0, err = %e, "post-merge cleanup failed");
+    }
 
     // 8. Post final comment on the PR
     let _ = gh
