@@ -80,6 +80,29 @@ impl TaskNotification {
         )
     }
 
+    /// Format for Slack (mrkdwn).
+    ///
+    /// Slack uses its own "mrkdwn" dialect: *bold*, _italic_, `code`.
+    pub fn format_slack(&self) -> String {
+        let emoji = status_emoji(&self.status);
+        let duration = format_duration(self.duration_seconds);
+
+        format!(
+            "{emoji} *Task #{task_id}*: {status}\n\
+             *{title}*\n\
+             Agent: `{agent}` | Duration: {duration}\n\
+             \n\
+             {summary}",
+            emoji = emoji,
+            task_id = self.task_id,
+            status = self.status,
+            title = self.title,
+            agent = self.agent,
+            duration = duration,
+            summary = self.summary,
+        )
+    }
+
     /// Format for Discord (Markdown with bold instead of Telegram-style).
     pub fn format_discord(&self) -> String {
         let emoji = status_emoji(&self.status);
@@ -227,6 +250,26 @@ mod tests {
         };
         let msg = n.format_telegram();
         assert!(msg.contains("Fix \\_underscores\\_ and \\*bold\\*"));
+    }
+
+    #[test]
+    fn format_slack_done() {
+        let n = TaskNotification {
+            task_id: "7".to_string(),
+            title: "Refactor engine".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 60.0,
+            summary: "Decomposed mod.rs".to_string(),
+        };
+        let msg = n.format_slack();
+        assert!(msg.contains("✅"));
+        assert!(msg.contains("*Task #7*"));
+        assert!(msg.contains("done"));
+        assert!(msg.contains("Refactor engine"));
+        assert!(msg.contains("`claude`"));
+        assert!(msg.contains("1m 0s"));
+        assert!(msg.contains("Decomposed mod.rs"));
     }
 
     #[test]
