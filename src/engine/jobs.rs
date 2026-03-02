@@ -146,6 +146,18 @@ pub fn save_jobs(path: &PathBuf, jobs: &[Job]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Returns `true` if the error indicates a "not found" (404) response.
+///
+/// Used to distinguish permanent task deletion from transient API errors.
+/// A 404 should clear `active_task_id`; other errors (rate limit, 5xx,
+/// network timeout) should be retried next tick without losing the reference.
+fn is_not_found_error(e: &anyhow::Error) -> bool {
+    // Walk the full error chain. Both the HTTP backend ("GitHub API GET {url}
+    // failed (404): ...") and the CLI backend ("... 404 ...") include "404"
+    // in the error string, matching the convention used throughout this codebase.
+    e.chain().any(|cause| cause.to_string().contains("404"))
+}
+
 /// Check all jobs and execute due ones.
 pub async fn tick(
     jobs_path: &PathBuf,
@@ -198,16 +210,27 @@ pub async fn tick(
                         }
                     }
                     Err(e) => {
-                        // Task lookup failed (deleted, API error, rate limit).
-                        // Clear active_task_id so the job isn't permanently blocked.
-                        tracing::warn!(
-                            job_id = job.id,
-                            task_id = task_id_clone,
-                            ?e,
-                            "cannot fetch active task, clearing active_task_id"
-                        );
-                        should_clear_task_id = true;
-                        job.last_task_status = Some("error".to_string());
+                        if is_not_found_error(&e) {
+                            // Task was permanently deleted — clear the stale reference
+                            // so the job can create a new task this tick.
+                            tracing::warn!(
+                                job_id = job.id,
+                                task_id = task_id_clone,
+                                "active task not found (404), clearing active_task_id"
+                            );
+                            should_clear_task_id = true;
+                            job.last_task_status = Some("error".to_string());
+                        } else {
+                            // Transient error (rate limit, 5xx, network hiccup) — preserve
+                            // active_task_id and skip this tick. Will retry next cycle.
+                            tracing::warn!(
+                                job_id = job.id,
+                                task_id = task_id_clone,
+                                ?e,
+                                "transient error fetching active task, skipping tick (active_task_id preserved)"
+                            );
+                            should_skip = true;
+                        }
                         false
                     }
                 }
@@ -650,6 +673,172 @@ struct ImprovementIssue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
+    use crate::db::Db;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    /// Minimal backend that always returns a configurable error from `get_task`,
+    /// and records task IDs created via `create_task`.
+    struct ErrorBackend {
+        error_msg: String,
+        created_ids: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ExternalBackend for ErrorBackend {
+        fn name(&self) -> &str {
+            "error-backend"
+        }
+
+        async fn create_task(
+            &self,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            let mut ids = self.created_ids.lock().unwrap();
+            let new_id = format!("new-{}", ids.len() + 1);
+            ids.push(new_id.clone());
+            Ok(ExternalId(new_id))
+        }
+
+        async fn get_task(&self, _id: &ExternalId) -> anyhow::Result<ExternalTask> {
+            Err(anyhow::anyhow!("{}", self.error_msg))
+        }
+
+        async fn list_by_status(&self, _status: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+
+        async fn post_comment(&self, _id: &ExternalId, _body: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn set_labels(&self, _id: &ExternalId, _labels: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_label(&self, _id: &ExternalId, _label: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_clears_active_task_id_on_404() {
+        // A 404 error (task deleted) should clear active_task_id and spawn a new task.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.yml");
+        std::fs::write(
+            &path,
+            r#"jobs:
+  - id: test-job
+    schedule: "* * * * *"
+    task:
+      title: Test task
+      body: ""
+    last_run: "2000-01-01T00:00:00Z"
+    active_task_id: "old-task-42"
+"#,
+        )
+        .unwrap();
+
+        let backend = Arc::new(ErrorBackend {
+            error_msg: "GitHub API GET https://api.github.com/repos/foo/bar/issues/42 failed (404): Not Found".into(),
+            created_ids: Arc::new(Mutex::new(vec![])),
+        });
+        let db = Arc::new(Db::open_memory().unwrap());
+        tick(&path, &(backend.clone() as Arc<dyn ExternalBackend>), &db)
+            .await
+            .unwrap();
+
+        let jobs = load_jobs(&path).unwrap();
+        // active_task_id should point to the newly created task, not the old deleted one
+        assert_ne!(
+            jobs[0].active_task_id,
+            Some("old-task-42".into()),
+            "stale 404 ID should be cleared"
+        );
+        // A new task should have been spawned
+        let created = backend.created_ids.lock().unwrap();
+        assert_eq!(created.len(), 1, "exactly one new task should be created");
+    }
+
+    #[tokio::test]
+    async fn tick_preserves_active_task_id_on_transient_error() {
+        // A transient error (rate limit, 5xx) should preserve active_task_id and skip the tick.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.yml");
+        std::fs::write(
+            &path,
+            r#"jobs:
+  - id: test-job
+    schedule: "* * * * *"
+    task:
+      title: Test task
+      body: ""
+    last_run: "2000-01-01T00:00:00Z"
+    active_task_id: "in-progress-99"
+"#,
+        )
+        .unwrap();
+
+        let backend = Arc::new(ErrorBackend {
+            error_msg: "GitHub API GET https://api.github.com/repos/foo/bar/issues/99 failed (429): rate limit exceeded".into(),
+            created_ids: Arc::new(Mutex::new(vec![])),
+        });
+        let db = Arc::new(Db::open_memory().unwrap());
+        tick(&path, &(backend.clone() as Arc<dyn ExternalBackend>), &db)
+            .await
+            .unwrap();
+
+        let jobs = load_jobs(&path).unwrap();
+        // active_task_id must be preserved — transient error, don't lose the reference
+        assert_eq!(
+            jobs[0].active_task_id,
+            Some("in-progress-99".into()),
+            "active_task_id must be preserved on transient error"
+        );
+        // No new task should be spawned
+        let created = backend.created_ids.lock().unwrap();
+        assert_eq!(
+            created.len(),
+            0,
+            "no new task should be created on transient error"
+        );
+    }
+
+    #[test]
+    fn is_not_found_error_detects_404() {
+        let e = anyhow::anyhow!(
+            "GitHub API GET https://api.github.com/repos/foo/bar/issues/1 failed (404): Not Found"
+        );
+        assert!(is_not_found_error(&e));
+    }
+
+    #[test]
+    fn is_not_found_error_ignores_transient() {
+        let rate_limit = anyhow::anyhow!(
+            "GitHub API GET https://api.github.com/... failed (429): rate limit exceeded"
+        );
+        assert!(!is_not_found_error(&rate_limit));
+
+        let server_err = anyhow::anyhow!(
+            "GitHub API GET https://api.github.com/... failed (500): Internal Server Error"
+        );
+        assert!(!is_not_found_error(&server_err));
+
+        let network_err = anyhow::anyhow!("connection refused");
+        assert!(!is_not_found_error(&network_err));
+    }
 
     #[test]
     fn load_empty_file() {
