@@ -172,7 +172,7 @@ pub async fn build_repo_tree(project_dir: &Path) -> String {
 /// Build git diff from base branch (only for retries).
 pub async fn build_git_diff(project_dir: &Path, default_branch: &str) -> String {
     let output = Command::new("git")
-        .args(["diff", default_branch])
+        .args(["diff", &format!("origin/{default_branch}")])
         .current_dir(project_dir)
         .output_with_context()
         .await;

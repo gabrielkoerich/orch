@@ -429,7 +429,7 @@ async fn has_unpushed_commits(dir: &Path, branch: &str, default_branch: &str) ->
     } else {
         // Compare against default branch (passed in, NOT detected from
         // current HEAD — in a worktree HEAD is the feature branch itself)
-        format!("{default_branch}..HEAD")
+        format!("origin/{default_branch}..HEAD")
     };
 
     tracing::debug!(
