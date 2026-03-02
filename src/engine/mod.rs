@@ -17,7 +17,7 @@
 pub mod commands;
 pub mod internal_tasks;
 pub mod jobs;
-pub mod llm_router;
+mod llm_router;
 pub mod router;
 pub mod runner;
 pub mod tasks;

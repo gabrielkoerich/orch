@@ -55,7 +55,7 @@ pub(crate) struct LlmAgentProfile {
 /// cache as mutable state.
 ///
 /// `Router` holds a `LlmRouter` and delegates `route_with_llm` to it.
-pub struct LlmRouter {
+pub(super) struct LlmRouter {
     /// Cached skills catalog loaded once to avoid repeated blocking I/O.
     skills_catalog: std::sync::Mutex<Option<String>>,
 }

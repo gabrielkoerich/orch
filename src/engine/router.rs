@@ -537,7 +537,7 @@ pub struct Router {
     /// Per-agent rate limit weights (used when weighted_round_robin is enabled)
     pub weights: AgentWeights,
     /// LLM routing subsystem
-    pub llm_router: LlmRouter,
+    llm_router: LlmRouter,
 }
 
 impl Router {
