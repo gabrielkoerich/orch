@@ -798,7 +798,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Wire Telegram/Discord channels into engine event loop
 - [x] Mention detection via webhooks (#112)
 - [x] Owner commands (feedback via issue comments: `/retry`, `/reroute`) — see `src/engine/commands.rs`
-- [x] Merge detection (auto-close after PR merge) — see `check_merged_prs()` in `src/engine/mod.rs:1405-1452`
+- [x] Merge detection (auto-close after PR merge) — see `check_merged_prs()` in `src/engine/cleanup.rs:229`
 - [x] Dashboard/reporting CLI command — see `src/cli/dashboard.rs`
 - [x] Graceful shutdown with session handoff — see `src/engine/mod.rs:681-705`
 - [x] Slack channel integration — `src/channels/slack.rs` (Web API polling)
@@ -830,10 +830,9 @@ src/
 │   ├── capture.rs           # tmux output capture + diffing service
 │   ├── notification.rs      # Unified notification dispatch (levels, formatting, broadcast)
 │   ├── tmux.rs              # tmux channel (pane monitoring)
-│   ├── github.rs            # GitHub App: webhooks (stub)
-│   ├── telegram.rs          # Telegram Bot API (stub)
-│   ├── discord.rs           # Discord gateway websocket (stub)
-│   └── slack.rs             # Slack Web API polling (conversations.history)
+│   ├── github.rs            # GitHub App: webhooks + polling
+│   ├── telegram.rs          # Telegram Bot API (long-poll)
+│   └── discord.rs           # Discord gateway websocket
 │
 ├── engine/
 │   ├── mod.rs               # Engine struct, config, project init, main event loop (serve)

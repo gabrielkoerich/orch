@@ -7,8 +7,8 @@ Features identified in the bash `orchestrator` → Rust `orch` parity audit.
 ## 1. Review Agent + Auto-Merge
 
 **Priority:** Critical
-**Status:** Implemented — `review_and_merge()` in `src/engine/mod.rs`, review prompts in `prompts/review_system.md` and `prompts/review_task.md`
-**Files:** `src/engine/runner/mod.rs`, `src/engine/mod.rs`, `src/backends/github.rs`
+**Status:** Implemented — `review_and_merge()` in `src/engine/review.rs:408`, review prompts in `prompts/review_system.md` and `prompts/review_task.md`
+**Files:** `src/engine/review.rs`, `src/engine/runner/mod.rs`, `src/backends/github.rs`
 
 ### Problem
 
@@ -293,7 +293,7 @@ new → routed → in_progress → done (agent finishes)
 
 1. Add `ReviewResponse`, `ReviewIssue`, `ReviewDecision` types to `src/engine/runner/response.rs`
 2. Add `build_review_prompt()` and `review_system_prompt()` to `src/engine/runner/agent.rs`
-3. Add `review_and_merge()` to `src/engine/mod.rs` — called after Phase 3b dispatch completes with `status:done`
+3. Add `review_and_merge()` to `src/engine/review.rs` — called after Phase 3b dispatch completes with `status:done`
 4. Add `auto_merge()` using `gh pr merge --squash --delete-branch`
 5. Add `handle_review_changes()` to re-dispatch with review context
 6. Add `review_cycles` tracking in sidecar
@@ -307,7 +307,7 @@ new → routed → in_progress → done (agent finishes)
 
 **Priority:** Critical
 **Status:** Implemented — `review_open_prs()` re-dispatches on `CHANGES_REQUESTED`, creates follow-up tasks with PR context
-**Files:** `src/engine/mod.rs` (`review_open_prs()`), `src/engine/runner/`
+**Files:** `src/engine/review.rs` (`review_open_prs()` at line 44), `src/engine/runner/`
 
 ### Problem
 
@@ -386,8 +386,8 @@ if !context.pr_review_context.is_empty() {
 ## 3. Task Delegation
 
 **Priority:** High
-**Status:** Implemented — `Delegation` struct in `src/parser.rs`, `process_delegations()` in `src/engine/runner/mod.rs:1025`, parent/child unblocking in engine tick Phase 4
-**Files:** `src/engine/runner/mod.rs`, `src/parser.rs`, `src/engine/mod.rs`
+**Status:** Implemented — `Delegation` struct in `src/parser.rs`, `process_delegations()` in `src/engine/runner/mod.rs:1030`, parent/child unblocking in engine tick Phase 4
+**Files:** `src/engine/runner/mod.rs`, `src/parser.rs`, `src/engine/tick.rs`
 
 ### Problem
 
@@ -538,7 +538,7 @@ Rules:
 #### Implementation Steps
 
 1. Add `Delegation` struct and `delegations` field to `AgentResponse` in `parser.rs`
-2. Add `process_delegations()` to `src/engine/mod.rs`
+2. Add `process_delegations()` to `src/engine/runner/mod.rs`
 3. Call it after successful task completion in Phase 3b dispatch
 4. Add delegation instructions to system prompt in `agent.rs`
 5. Tests: delegation parsing, child task creation, parent blocking
@@ -548,7 +548,7 @@ Rules:
 ## 4. Skills Sync
 
 **Priority:** Medium
-**Status:** Implemented — `skills_sync()` in `src/engine/mod.rs:1507`, auto-clones/pulls skill repos from config during sync tick
+**Status:** Implemented — `skills_sync()` in `src/engine/sync.rs:263`, auto-clones/pulls skill repos from config during sync tick
 **Issue:** #155 (closed, PR #158 merged)
 
 ### Problem
