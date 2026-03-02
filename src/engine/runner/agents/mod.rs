@@ -1036,9 +1036,16 @@ mod tests {
         let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
 
         if perms.autonomous {
-            assert!(cmd.contains("--ask-for-approval never"));
+            // autonomous codex uses --full-auto (sandbox::WorkspaceWrite default)
+            assert!(
+                cmd.contains("--full-auto"),
+                "autonomous config → --full-auto, got: {cmd}"
+            );
         } else {
-            assert!(cmd.contains("--ask-for-approval suggest"));
+            assert!(
+                cmd.contains("--ask-for-approval suggest"),
+                "supervised config → --ask-for-approval suggest, got: {cmd}"
+            );
         }
     }
 }
