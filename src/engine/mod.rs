@@ -40,6 +40,7 @@ use crate::github::types::{GitHubReviewComment, PullRequestReview};
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use runner::{TaskRunner, WeightSignal};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
@@ -72,6 +73,8 @@ pub struct EngineConfig {
     /// Auto-close task (mark Done) when all PR reviews are approved.
     /// Note: this does NOT merge the PR itself -- only updates the task status.
     pub auto_close_task_on_approval: bool,
+    /// Graceful shutdown timeout — how long to wait for running agents before exiting.
+    pub graceful_shutdown_timeout: std::time::Duration,
 }
 
 impl Default for EngineConfig {
@@ -84,6 +87,7 @@ impl Default for EngineConfig {
             stuck_timeout: 1800,
             auto_create_followup_on_changes: true,
             auto_close_task_on_approval: false,
+            graceful_shutdown_timeout: std::time::Duration::from_secs(600),
         }
     }
 }
@@ -138,6 +142,12 @@ impl EngineConfig {
             config.auto_close_task_on_approval = val.eq_ignore_ascii_case("true");
         } else if let Ok(val) = crate::config::get("workflow.auto_close") {
             config.auto_close_task_on_approval = val.eq_ignore_ascii_case("true");
+        }
+
+        if let Ok(val) = crate::config::get("engine.graceful_shutdown_timeout") {
+            if let Ok(secs) = val.parse::<u64>() {
+                config.graceful_shutdown_timeout = std::time::Duration::from_secs(secs);
+            }
         }
 
         config
@@ -514,10 +524,18 @@ pub async fn serve() -> anyhow::Result<()> {
     );
     let mut interval = tokio::time::interval(config.tick_interval);
 
-    // SIGTERM handler (launchd/systemd send SIGTERM to stop services)
+    // Signal handlers (launchd/systemd send SIGTERM to stop services, SIGHUP for reload/restart)
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+
+    // Graceful shutdown flag — when set, the engine stops dispatching new tasks
+    // but continues ticking to monitor running sessions until they complete.
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let mut drain_deadline: Option<tokio::time::Instant> = None;
 
     loop {
+        let is_draining = shutting_down.load(Ordering::Relaxed);
+
         tokio::select! {
             _ = interval.tick() => {
                 // Drain any pending weight signals from completed tasks
@@ -538,6 +556,30 @@ pub async fn serve() -> anyhow::Result<()> {
                 {
                     let mut rw = router.write().await;
                     rw.tick_weight_recovery();
+                }
+
+                // During graceful shutdown, only check session completions —
+                // no new routing, dispatch, or sync work.
+                if is_draining {
+                    for engine in &project_engines {
+                        if let Err(e) = tick_check_session_completions(&tmux, &engine.repo, &capture_for_tick).await {
+                            tracing::debug!(repo = %engine.repo, ?e, "session completion check failed during drain");
+                        }
+                    }
+
+                    // Check if all sessions have finished
+                    let sessions = tmux.list_sessions().await.unwrap_or_default();
+                    if sessions.is_empty() {
+                        tracing::info!("all agent sessions completed, shutting down");
+                        break;
+                    } else {
+                        tracing::info!(
+                            remaining = sessions.len(),
+                            sessions = ?sessions.iter().map(|s| &s.name).collect::<Vec<_>>(),
+                            "waiting for agent sessions to complete"
+                        );
+                    }
+                    continue;
                 }
 
                 // Skip tick/sync entirely if GitHub API is rate-limited
@@ -604,7 +646,7 @@ pub async fn serve() -> anyhow::Result<()> {
                 }
             }
             // Webhook events trigger an immediate tick (bypass polling interval)
-            _ = webhook_notify.notified() => {
+            _ = webhook_notify.notified(), if !is_draining => {
                 if let Some(remaining) = GhHttp::is_rate_limited() {
                     tracing::warn!(
                         remaining_secs = remaining.as_secs(),
@@ -640,7 +682,7 @@ pub async fn serve() -> anyhow::Result<()> {
                 // Also reset the interval so we don't get a redundant tick right after
                 interval.reset();
             }
-            result = config_rx.recv() => {
+            result = config_rx.recv(), if !is_draining => {
                 match result {
                     Ok(path) => {
                         tracing::info!(path = %path.display(), "config file changed, reloading");
@@ -688,25 +730,48 @@ pub async fn serve() -> anyhow::Result<()> {
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("received SIGINT, shutting down");
-                break;
+            signal_name = async {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = sigterm.recv() => "SIGTERM",
+                    _ = sighup.recv() => "SIGHUP",
+                }
+            } => {
+                if is_draining {
+                    tracing::warn!(signal = signal_name, "received signal during drain, forcing immediate shutdown");
+                    break;
+                }
+                tracing::info!(signal = signal_name, "beginning graceful shutdown");
+                shutting_down.store(true, Ordering::Relaxed);
+
+                let sessions = tmux.list_sessions().await.unwrap_or_default();
+                if sessions.is_empty() {
+                    tracing::info!("no active sessions, shutting down immediately");
+                    break;
+                }
+                tracing::info!(
+                    count = sessions.len(),
+                    timeout_secs = config.graceful_shutdown_timeout.as_secs(),
+                    "waiting for running agents to complete before shutdown"
+                );
+                // Switch to a faster tick for drain monitoring
+                interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                drain_deadline = Some(tokio::time::Instant::now() + config.graceful_shutdown_timeout);
             }
-            _ = sigterm.recv() => {
-                tracing::info!("received SIGTERM, shutting down");
+        }
+
+        // Check drain deadline
+        if let Some(deadline) = drain_deadline {
+            if tokio::time::Instant::now() >= deadline {
+                let sessions = tmux.list_sessions().await.unwrap_or_default();
+                tracing::warn!(
+                    remaining = sessions.len(),
+                    sessions = ?sessions.iter().map(|s| &s.name).collect::<Vec<_>>(),
+                    "graceful shutdown timeout reached, exiting with sessions still running"
+                );
                 break;
             }
         }
-    }
-
-    // Graceful shutdown
-    tracing::info!("draining active sessions...");
-    let sessions = tmux.list_sessions().await?;
-    if !sessions.is_empty() {
-        tracing::info!(
-            count = sessions.len(),
-            "active sessions will continue running"
-        );
     }
 
     // transport and channels drop here at end of scope
@@ -2720,6 +2785,10 @@ mod tests {
         assert_eq!(config.sync_interval, std::time::Duration::from_secs(45));
         assert_eq!(config.max_parallel, 4);
         assert_eq!(config.stuck_timeout, 1800);
+        assert_eq!(
+            config.graceful_shutdown_timeout,
+            std::time::Duration::from_secs(600)
+        );
     }
 
     #[test]
@@ -2730,6 +2799,10 @@ mod tests {
         assert_eq!(config.sync_interval, std::time::Duration::from_secs(45));
         assert_eq!(config.max_parallel, 4);
         assert_eq!(config.stuck_timeout, 1800);
+        assert_eq!(
+            config.graceful_shutdown_timeout,
+            std::time::Duration::from_secs(600)
+        );
     }
 
     #[test]
