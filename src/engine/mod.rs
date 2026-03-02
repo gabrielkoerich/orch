@@ -1805,6 +1805,29 @@ async fn review_open_prs(
                     tracing::warn!(task_id, err = %e, "failed to update task status to done");
                 }
             } else {
+                // Check if PR has merge conflicts before attempting auto-merge
+                let pr_details = gh.get_pr(repo, pr_number).await;
+                let is_conflicting = pr_details
+                    .as_ref()
+                    .map(|pr| pr.mergeable == Some(false))
+                    .unwrap_or(false);
+
+                if is_conflicting {
+                    tracing::info!(
+                        task_id,
+                        pr_number,
+                        "PR approved but has merge conflicts — re-dispatching agent to rebase"
+                    );
+                    // Reset review_started flag so agent can be re-dispatched
+                    if let Err(e) = sidecar::set(task_id, &["review_started=".to_string()]) {
+                        tracing::warn!(task_id, err = %e, "failed to reset review_started flag");
+                    }
+                    if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
+                        tracing::warn!(task_id, err = %e, "failed to re-route conflicting PR");
+                    }
+                    continue;
+                }
+
                 tracing::info!(
                     task_id,
                     pr_number,
