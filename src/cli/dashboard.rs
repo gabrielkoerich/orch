@@ -52,12 +52,7 @@ pub async fn dashboard() -> anyhow::Result<()> {
     let sessions = tmux.list_sessions().await.unwrap_or_default();
     for s in sessions.iter() {
         let agent = sidecar::get(&s.task_id, "agent").unwrap_or_default();
-        let age = Utc::now() - s.created_at;
-        let mins = age.num_minutes();
-        println!(
-            "  {:<25} {:<8} #{:<6} {}m ago",
-            s.name, agent, s.task_id, mins
-        );
+        println!("  {:<25} {:<8} #{}", s.name, agent, s.task_id);
     }
 
     println!("\nRecent (last 24h)");

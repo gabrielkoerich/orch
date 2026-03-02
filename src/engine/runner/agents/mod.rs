@@ -109,30 +109,19 @@ pub struct ParsedResponse {
     pub output_tokens: Option<u64>,
     /// Wall-clock duration in milliseconds (if reported by the agent).
     pub duration_ms: Option<u64>,
-    /// Permission denials encountered during execution.
-    #[allow(dead_code)]
-    pub permission_denials: Vec<String>,
 }
 
 /// Agent-specific error with enough detail for autonomous recovery.
 #[derive(Debug, Clone)]
 pub enum AgentError {
     /// Rate/usage limit — reroute to different agent, cooldown current.
-    RateLimit {
-        message: String,
-        #[allow(dead_code)]
-        retry_after: Option<Duration>,
-    },
+    RateLimit { message: String },
     /// Auth/billing/API key error — switch agent entirely.
     Auth { message: String },
     /// Requested model not available — try different model, then switch agent.
     ModelUnavailable { message: String, model: String },
     /// Context window exceeded — truncate and retry, then switch agent.
-    ContextOverflow {
-        message: String,
-        #[allow(dead_code)]
-        max_tokens: Option<u64>,
-    },
+    ContextOverflow { message: String },
     /// Agent timed out — retry once, then switch agent.
     Timeout { elapsed: Duration },
     /// Required tool/binary missing from the environment.
@@ -213,13 +202,9 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
 /// Each agent implements this to handle its specific CLI invocation,
 /// output parsing, and error classification.
 pub trait AgentRunner: Send + Sync {
-    /// Agent name (e.g., "claude", "codex", "opencode").
-    #[allow(dead_code)]
+    /// Agent name (e.g., "claude", "codex", "opencode"). Used in tests.
+    #[cfg(test)]
     fn name(&self) -> &str;
-
-    /// Check if this agent's binary is available on the system.
-    #[allow(dead_code)]
-    fn is_available(&self) -> bool;
 
     /// Build the CLI command string for the runner shell script.
     ///
@@ -301,7 +286,6 @@ pub(crate) mod patterns {
         if patterns.iter().any(|p| lower.contains(p)) || lower.contains("429") {
             return Some(AgentError::RateLimit {
                 message: safe_tail(text, 300),
-                retry_after: None,
             });
         }
         None
@@ -350,7 +334,6 @@ pub(crate) mod patterns {
         if patterns.iter().any(|p| lower.contains(p)) {
             return Some(AgentError::ContextOverflow {
                 message: text.to_string(),
-                max_tokens: None,
             });
         }
         None
@@ -531,7 +514,6 @@ mod tests {
     fn agent_error_display() {
         let e = AgentError::RateLimit {
             message: "429 Too Many Requests".to_string(),
-            retry_after: None,
         };
         assert!(e.to_string().contains("rate limit"));
 

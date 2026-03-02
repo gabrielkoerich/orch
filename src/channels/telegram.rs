@@ -2,12 +2,11 @@
 //!
 //! Uses the Telegram Bot API to receive commands and stream agent output.
 
-use super::{Channel, IncomingMessage, OutgoingMessage, OutputChunk};
+use super::{Channel, IncomingMessage, OutgoingMessage};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
-use tokio::sync::broadcast;
 
 pub struct TelegramChannel {
     pub token: String,
@@ -18,15 +17,9 @@ pub struct TelegramChannel {
 
 #[derive(Deserialize)]
 struct TelegramUser {
-    id: i64,
     first_name: String,
     #[serde(default)]
     username: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GetMeResponse {
-    result: TelegramUser,
 }
 
 #[derive(Deserialize)]
@@ -219,62 +212,6 @@ impl Channel for TelegramChannel {
         self.send_message(chat_id, &msg.body).await
     }
 
-    async fn stream_output(
-        &self,
-        thread_id: &str,
-        mut rx: broadcast::Receiver<OutputChunk>,
-    ) -> anyhow::Result<()> {
-        let chat_id: i64 = thread_id
-            .parse()
-            .map_err(|_| anyhow::anyhow!("invalid chat_id: {}", thread_id))?;
-
-        let mut buffer = String::new();
-        let mut last_post = std::time::Instant::now();
-        let post_interval = std::time::Duration::from_secs(10);
-
-        loop {
-            tokio::select! {
-                chunk = rx.recv() => {
-                    match chunk {
-                        Ok(chunk) => {
-                            if chunk.is_final {
-                                if !buffer.is_empty() {
-                                    let _ = self.send_message(chat_id, &buffer).await;
-                                    buffer.clear();
-                                }
-                                let _ = self.send_message(chat_id, "---").await;
-                                let _ = self.send_message(chat_id, "Session complete.").await;
-                                break;
-                            }
-
-                            buffer.push_str(&chunk.content);
-
-                            // Truncate if buffer gets too large
-                            if buffer.len() > 3000 {
-                                let _ = self.send_message(chat_id, &buffer).await;
-                                buffer.clear();
-                                last_post = std::time::Instant::now();
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => {
-                            break;
-                        }
-                    }
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-            }
-
-            if last_post.elapsed() >= post_interval && !buffer.is_empty() {
-                let _ = self.send_message(chat_id, &buffer).await;
-                buffer.clear();
-                last_post = std::time::Instant::now();
-            }
-        }
-
-        Ok(())
-    }
-
     async fn health_check(&self) -> anyhow::Result<()> {
         let url = self.api_url("getMe");
 
@@ -285,12 +222,7 @@ impl Channel for TelegramChannel {
             anyhow::bail!("telegram health check failed: {}", body);
         }
 
-        let _me: GetMeResponse = response.json().await?;
         tracing::info!("telegram bot health check passed");
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> anyhow::Result<()> {
         Ok(())
     }
 }

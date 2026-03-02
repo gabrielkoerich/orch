@@ -15,7 +15,6 @@ use crate::channels::OutputChunk;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Buffer for tracking session output state.
@@ -38,7 +37,7 @@ pub struct CaptureService {
     /// Transport layer for broadcasting output
     transport: Arc<Transport>,
     /// Polling interval
-    interval: Duration,
+    interval: std::time::Duration,
 }
 
 impl CaptureService {
@@ -47,14 +46,8 @@ impl CaptureService {
         Self {
             buffers: Arc::new(RwLock::new(HashMap::new())),
             transport,
-            interval: Duration::from_secs(2),
+            interval: std::time::Duration::from_secs(2),
         }
-    }
-
-    /// Set the polling interval.
-    pub fn with_interval(mut self, interval: Duration) -> Self {
-        self.interval = interval;
-        self
     }
 
     /// Register a session to be tracked.
@@ -145,9 +138,7 @@ impl CaptureService {
 
                             if !new_content.is_empty() {
                                 let chunk = OutputChunk {
-                                    task_id: task_id.clone(),
                                     content: new_content,
-                                    timestamp: Utc::now(),
                                     is_final: false,
                                 };
                                 self.transport.push_output(&task_id, chunk).await;
@@ -175,9 +166,7 @@ impl CaptureService {
                             );
                             // Send final chunk to signal stream termination
                             let chunk = OutputChunk {
-                                task_id: task_id.clone(),
                                 content: String::new(),
-                                timestamp: Utc::now(),
                                 is_final: true,
                             };
                             self.transport.push_output(&task_id, chunk).await;
@@ -196,15 +185,5 @@ impl CaptureService {
                 }
             }
         }
-    }
-
-    /// Check if a session is being tracked.
-    pub async fn is_tracking(&self, task_id: &str) -> bool {
-        self.buffers.read().await.contains_key(task_id)
-    }
-
-    /// Get the list of tracked task IDs.
-    pub async fn tracked_sessions(&self) -> Vec<String> {
-        self.buffers.read().await.keys().cloned().collect()
     }
 }

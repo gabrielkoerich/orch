@@ -12,29 +12,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Task metrics record — stores execution metrics for each task run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskMetric {
-    pub id: i64,
-    pub task_id: String,
-    pub agent: String,
-    pub model: Option<String>,
-    pub complexity: Option<String>,
-    pub outcome: String, // "success", "failed", "timeout", "rate_limit", "auth_error"
-    pub duration_seconds: f64, // task execution duration in seconds
-    pub started_at: DateTime<Utc>,
-    pub completed_at: DateTime<Utc>,
-    pub attempts: i32,
-    pub files_changed: i32,
-    pub error_type: Option<String>,
-    pub input_tokens: Option<i64>,
-    pub output_tokens: Option<i64>,
-    pub input_cost_usd: Option<f64>,
-    pub output_cost_usd: Option<f64>,
-    pub total_cost_usd: Option<f64>,
-    pub created_at: DateTime<Utc>,
-}
-
 /// Parameters for inserting a new task metric record.
 #[derive(Debug, Clone)]
 pub struct InsertTaskMetric<'a> {
@@ -56,18 +33,6 @@ pub struct InsertTaskMetric<'a> {
     pub total_cost_usd: Option<f64>,
 }
 
-/// Rate limit event record — tracks rate limit occurrences.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct RateLimitEvent {
-    pub id: i64,
-    pub agent: String,
-    pub limit_type: String, // "rate", "tokens", "budget"
-    pub occurred_at: DateTime<Utc>,
-    pub task_id: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -81,7 +46,6 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::New => "new",
@@ -132,7 +96,6 @@ pub struct Db {
     conn: Arc<Mutex<Connection>>,
 }
 
-#[allow(dead_code)]
 impl Db {
     /// Open (or create) the database at the given path.
     pub fn open(path: &PathBuf) -> anyhow::Result<Self> {
@@ -148,7 +111,7 @@ impl Db {
     }
 
     /// Open an in-memory database (for testing).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn open_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
         // WAL is a no-op for :memory: — only set busy_timeout
@@ -185,7 +148,6 @@ impl Db {
     }
 
     /// Get a reference to the connection (for running queries).
-    #[allow(dead_code)]
     pub async fn conn(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.conn.lock().await
     }
@@ -242,7 +204,6 @@ impl Db {
         Ok(task)
     }
 
-    #[allow(dead_code)]
     pub async fn list_internal_tasks_by_status(
         &self,
         status: TaskStatus,
@@ -291,7 +252,6 @@ impl Db {
         Ok(result)
     }
 
-    #[allow(dead_code)]
     pub async fn update_internal_task_status(
         &self,
         id: i64,
@@ -302,13 +262,6 @@ impl Db {
             "UPDATE internal_tasks SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
             rusqlite::params![status.as_str(), id],
         )?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn delete_internal_task(&self, id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute("DELETE FROM internal_tasks WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -332,32 +285,6 @@ impl Db {
             "INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
              ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
             rusqlite::params![key, value],
-        )?;
-        Ok(())
-    }
-
-    pub async fn set_internal_task_agent(
-        &self,
-        id: i64,
-        agent: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE internal_tasks SET agent = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
-            rusqlite::params![agent, id],
-        )?;
-        Ok(())
-    }
-
-    pub async fn set_internal_task_block_reason(
-        &self,
-        id: i64,
-        reason: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE internal_tasks SET block_reason = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
-            rusqlite::params![reason, id],
         )?;
         Ok(())
     }
@@ -434,57 +361,6 @@ impl Db {
             ],
         )?;
         Ok(conn.last_insert_rowid())
-    }
-
-    /// Get task metrics for a specific task.
-    pub async fn get_task_metrics(&self, task_id: &str) -> anyhow::Result<Vec<TaskMetric>> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT id, task_id, agent, model, complexity, outcome, duration_seconds, started_at, completed_at, attempts, files_changed, error_type, input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd, created_at
-             FROM task_metrics WHERE task_id = ?1 ORDER BY created_at DESC",
-        )?;
-        let metrics = stmt.query_map([task_id], |row| {
-            let started_str: String = row.get(7)?;
-            let completed_str: String = row.get(8)?;
-            let created_str: String = row.get(17)?;
-            Ok(TaskMetric {
-                id: row.get(0)?,
-                task_id: row.get(1)?,
-                agent: row.get(2)?,
-                model: row.get(3)?,
-                complexity: row.get(4)?,
-                outcome: row.get(5)?,
-                duration_seconds: row.get(6)?,
-                started_at: DateTime::parse_from_rfc3339(&started_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(task_id, error = %e, "corrupt started_at timestamp in task_metric");
-                        Utc::now()
-                    }),
-                completed_at: DateTime::parse_from_rfc3339(&completed_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(task_id, error = %e, "corrupt completed_at timestamp in task_metric");
-                        Utc::now()
-                    }),
-                attempts: row.get(9)?,
-                files_changed: row.get(10)?,
-                error_type: row.get(11)?,
-                input_tokens: row.get(12)?,
-                output_tokens: row.get(13)?,
-                input_cost_usd: row.get(14)?,
-                output_cost_usd: row.get(15)?,
-                total_cost_usd: row.get(16)?,
-                created_at: DateTime::parse_from_rfc3339(&created_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(task_id, error = %e, "corrupt created_at timestamp in task_metric");
-                        Utc::now()
-                    }),
-            })
-        })?;
-        let result: Vec<TaskMetric> = metrics.filter_map(|m| m.ok()).collect();
-        Ok(result)
     }
 
     /// Get aggregated metrics for the last 24 hours.
@@ -587,38 +463,6 @@ impl Db {
             rusqlite::params![agent, limit_type, task_id],
         )?;
         Ok(conn.last_insert_rowid())
-    }
-
-    /// Get failed tasks with error details from the last 7 days.
-    pub async fn get_failed_tasks_7d(&self) -> anyhow::Result<Vec<FailedTaskInfo>> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT task_id, agent, error_type, COUNT(*) as failure_count
-             FROM task_metrics
-             WHERE completed_at >= datetime('now', '-7 days')
-               AND outcome != 'success'
-             GROUP BY task_id, agent, error_type
-             ORDER BY failure_count DESC
-             LIMIT 20",
-        )?;
-        let failures = stmt
-            .query_map([], |row| {
-                Ok(FailedTaskInfo {
-                    task_id: row.get(0)?,
-                    agent: row.get(1)?,
-                    error_type: row.get(2)?,
-                    failure_count: row.get(3)?,
-                })
-            })?
-            .filter_map(|r| match r {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!(?e, "failed to parse row");
-                    None
-                }
-            })
-            .collect();
-        Ok(failures)
     }
 
     /// Get slow tasks (top 10 longest running) from the last 7 days.
@@ -817,15 +661,6 @@ pub struct AgentStat {
     pub total_runs: i64,
     pub success_count: i64,
     pub success_rate: f64,
-}
-
-/// Failed task info for pattern detection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FailedTaskInfo {
-    pub task_id: String,
-    pub agent: String,
-    pub error_type: Option<String>,
-    pub failure_count: i64,
 }
 
 /// Slow task info for pattern detection.
@@ -1068,10 +903,6 @@ mod tests {
             .unwrap();
         let task = db.get_internal_task(id).await.unwrap();
         assert_eq!(task.status, TaskStatus::Done);
-
-        db.delete_internal_task(id).await.unwrap();
-        let result = db.get_internal_task(id).await;
-        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1104,27 +935,6 @@ mod tests {
             .unwrap();
         assert_eq!(done_tasks.len(), 1);
         assert_eq!(done_tasks[0].title, "Task 1");
-    }
-
-    #[tokio::test]
-    async fn set_internal_task_agent() {
-        let db = Db::open_memory().unwrap();
-        db.migrate().await.unwrap();
-
-        let id = db
-            .create_internal_task("Test", "", "manual", "")
-            .await
-            .unwrap();
-
-        db.set_internal_task_agent(id, Some("claude"))
-            .await
-            .unwrap();
-        let task = db.get_internal_task(id).await.unwrap();
-        assert_eq!(task.agent, Some("claude".to_string()));
-
-        db.set_internal_task_agent(id, None).await.unwrap();
-        let task = db.get_internal_task(id).await.unwrap();
-        assert_eq!(task.agent, None);
     }
 
     #[tokio::test]

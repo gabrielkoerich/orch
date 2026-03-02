@@ -28,11 +28,7 @@ pub(crate) enum ReviewDecision {
         notes: String,
         issues: Vec<crate::engine::runner::response::ReviewIssue>,
     },
-    /// Review agent is disabled, skip.
-    #[allow(dead_code)]
-    Skip,
     /// Review agent failed or crashed (reason stored for logging).
-    #[allow(dead_code)]
     Failed(String),
 }
 
@@ -506,8 +502,6 @@ pub(crate) async fn review_and_merge(
         system_prompt,
         agent_message: review_prompt,
         task_id: review_task_id.clone(),
-        branch: branch_name.clone(),
-        main_project_dir: worktree_path.clone(), // Use worktree as main dir for review
         disallowed_tools: vec![],
         git_author_name: git_name,
         git_author_email: git_email,

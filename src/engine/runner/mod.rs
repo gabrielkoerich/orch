@@ -220,8 +220,6 @@ impl TaskRunner {
             system_prompt,
             agent_message,
             task_id: task_id.to_string(),
-            branch: wt.branch.clone(),
-            main_project_dir: wt.main_project_dir.clone(),
             disallowed_tools,
             git_author_name: git_name,
             git_author_email: git_email,

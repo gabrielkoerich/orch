@@ -39,12 +39,6 @@ pub struct AgentInvocation {
     pub agent_message: String,
     /// Task ID
     pub task_id: String,
-    /// Branch name (reserved for sandbox isolation, not yet wired into the runner script).
-    #[allow(dead_code)]
-    pub branch: String,
-    /// Main project directory (reserved for sandbox isolation, not yet wired into the runner script).
-    #[allow(dead_code)]
-    pub main_project_dir: PathBuf,
     /// Disallowed tools pattern
     pub disallowed_tools: Vec<String>,
     /// Git author name
