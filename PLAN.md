@@ -801,7 +801,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Merge detection (auto-close after PR merge) — see `check_merged_prs()` in `src/engine/mod.rs:1405-1452`
 - [x] Dashboard/reporting CLI command — see `src/cli/dashboard.rs`
 - [x] Graceful shutdown with session handoff — see `src/engine/mod.rs:681-705`
-- [ ] Slack channel integration
+- [x] Slack channel integration — `src/channels/slack.rs` (Web API polling)
 - [x] Context file per issue (persistent context accumulation) — see `src/engine/runner/context.rs:40-45`
 
 ---
@@ -832,7 +832,8 @@ src/
 │   ├── tmux.rs              # tmux channel (pane monitoring)
 │   ├── github.rs            # GitHub App: webhooks (stub)
 │   ├── telegram.rs          # Telegram Bot API (stub)
-│   └── discord.rs           # Discord gateway websocket (stub)
+│   ├── discord.rs           # Discord gateway websocket (stub)
+│   └── slack.rs             # Slack Web API polling (conversations.history)
 │
 ├── engine/
 │   ├── mod.rs               # Engine struct, config, project init, main event loop (serve)
@@ -1244,7 +1245,7 @@ Last updated: 2026-03-01 (366 tests, ~98% parity)
 | Skills Sync (auto-clone skill repos) | Missing | Low | Config exists but no sync implementation |
 | Merge detection (auto-close after PR merge) | Implemented | Done | See `check_merged_prs()` in `src/engine/cleanup.rs` |
 | Graceful shutdown with session handoff | Implemented | Done | See `src/engine/mod.rs` serve() loop |
-| Slack channel integration | Missing | Low | Future channel addition |
+| Slack channel integration | Implemented | Done | See `src/channels/slack.rs` (Web API polling + chat.postMessage) |
 | Context file per issue | Implemented | Done | See `src/engine/runner/context.rs:40-45` `load_task_context()` |
 
 ### Config Architecture
@@ -1352,4 +1353,4 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 ### Feature Gaps (Low Priority)
 
 - [ ] Skills sync from config (auto-clone skill repos) — config exists but no sync implementation
-- [ ] Slack channel integration — future channel addition
+- [x] Slack channel integration — implemented in `src/channels/slack.rs`

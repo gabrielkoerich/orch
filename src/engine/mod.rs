@@ -29,6 +29,7 @@ use crate::channels::capture::CaptureService;
 use crate::channels::discord::DiscordChannel;
 use crate::channels::github::start_webhook_server;
 use crate::channels::notification::NotificationLevel;
+use crate::channels::slack::SlackChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
@@ -308,6 +309,20 @@ pub async fn serve() -> anyhow::Result<()> {
         }
     }
 
+    // Try to initialize Slack channel
+    if let Ok(token) = crate::config::get("channels.slack.bot_token") {
+        if !token.is_empty() {
+            let channel_id = crate::config::get("channels.slack.channel_id").ok();
+            let slack = SlackChannel::new(token, channel_id);
+            if let Err(e) = slack.health_check().await {
+                tracing::warn!(?e, "slack channel health check failed, skipping");
+            } else {
+                channel_registry.register(Box::new(slack));
+                tracing::info!("slack channel registered");
+            }
+        }
+    }
+
     // Initialize tmux channel with transport for output streaming
     let tmux_channel = TmuxChannel::with_transport(transport.clone());
     channel_registry.register(Box::new(tmux_channel));
@@ -384,6 +399,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             let (body, should_send) = match channel.name() {
                                 "telegram" => (notification.format_telegram(), true),
                                 "discord" => (notification.format_discord(), true),
+                                "slack" => (notification.format_slack(), true),
                                 // GitHub is already handled by backend.post_comment()
                                 // tmux doesn't need task completion notifications
                                 _ => (String::new(), false),
