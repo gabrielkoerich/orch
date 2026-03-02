@@ -363,8 +363,8 @@ impl TaskRunner {
                         "attempt": new_attempts,
                         "error_class": agents::error_class_name(agent_err),
                         "error_message": agent_err.to_string(),
-                        "stderr_tail": &raw_stderr[raw_stderr.len().saturating_sub(2000)..],
-                        "stdout_tail": &raw_stdout[raw_stdout.len().saturating_sub(2000)..],
+                        "stderr_tail": safe_utf8_tail(&raw_stderr, 2000),
+                        "stdout_tail": safe_utf8_tail(&raw_stdout, 2000),
                     })
                 }
             };
@@ -1143,4 +1143,19 @@ impl TaskRunner {
         // Fall back to current directory
         Ok(std::env::current_dir()?)
     }
+}
+
+/// Return the last `max_bytes` of `s`, walking forward to the nearest UTF-8
+/// character boundary so the slice is always valid.
+fn safe_utf8_tail(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let start = s.len() - max_bytes;
+    // Walk forward from `start` until we land on a char boundary
+    let mut idx = start;
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    &s[idx..]
 }

@@ -1403,6 +1403,14 @@ async fn sync_tick(
                     tracing::warn!(task_id, err = %e, "failed to transition to InReview");
                     continue;
                 }
+                // Record timestamp so stale detection can apply a grace period
+                let _ = sidecar::set(
+                    task_id,
+                    &[format!(
+                        "in_review_since={}",
+                        chrono::Utc::now().timestamp()
+                    )],
+                );
                 let backend_c = backend.clone();
                 let tmux_c = tmux.clone();
                 let task_c = task.clone();
@@ -1443,16 +1451,33 @@ async fn sync_tick(
             }
         }
 
-        // Detect stale InReview tasks (review agent crashed, no active tmux session)
+        // Detect stale InReview tasks (review agent crashed, no active tmux session).
+        // Apply a 90-second grace period so the freshly-spawned review agent has time
+        // to create its tmux session before we consider it stale.
         if let Ok(in_review) = backend.list_by_status(Status::InReview).await {
+            let now_ts = chrono::Utc::now().timestamp();
             for task in in_review {
                 let review_task_id = format!("{}-review", task.id.0);
                 let review_session = tmux.session_name(repo, &review_task_id);
                 let has_session = tmux.session_exists(&review_session).await;
                 if !has_session {
+                    let in_review_since = sidecar::get(&task.id.0, "in_review_since")
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(now_ts);
+                    let age_secs = now_ts - in_review_since;
+                    if age_secs < 90 {
+                        tracing::debug!(
+                            task_id = task.id.0,
+                            age_secs,
+                            "InReview task has no session yet — within grace period, skipping"
+                        );
+                        continue;
+                    }
                     tracing::warn!(
                         task_id = task.id.0,
                         session = %review_session,
+                        age_secs,
                         "InReview task has no active review session — resetting to NeedsReview"
                     );
                     let _ = backend.update_status(&task.id, Status::NeedsReview).await;

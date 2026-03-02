@@ -124,9 +124,16 @@ pub fn scan(text: &str) -> Vec<LeakMatch> {
         for (rule, pattern, _high_conf) in LEAK_PATTERNS.iter() {
             if let Some(m) = pattern.find(line) {
                 let matched = m.as_str();
-                // Redact: show first 4 chars + ... + last 2 chars
+                // Redact: show first 4 chars + ... + last 2 chars (safe UTF-8 boundaries)
                 let redacted = if matched.len() > 8 {
-                    format!("{}...{}", &matched[..4], &matched[matched.len() - 2..])
+                    let head_end = (0..=4)
+                        .rev()
+                        .find(|&i| matched.is_char_boundary(i))
+                        .unwrap_or(0);
+                    let tail_start = (matched.len() - 2..=matched.len())
+                        .find(|&i| matched.is_char_boundary(i))
+                        .unwrap_or(matched.len());
+                    format!("{}...{}", &matched[..head_end], &matched[tail_start..])
                 } else {
                     "****".to_string()
                 };
