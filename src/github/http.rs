@@ -95,10 +95,7 @@ impl RateLimit {
                 let wait_secs = reset_epoch - now_epoch + 1;
                 self.backoff_delay = Duration::from_secs(wait_secs);
                 self.backoff_until = Some(Instant::now() + self.backoff_delay);
-                tracing::warn!(
-                    wait_secs,
-                    "GitHub rate limit hit, waiting until reset time"
-                );
+                tracing::warn!(wait_secs, "GitHub rate limit hit, waiting until reset time");
                 return;
             }
         }
@@ -156,7 +153,8 @@ impl RateLimit {
 
     /// Combined check: backoff or proactive throttle. Used by engine's is_rate_limited().
     fn is_active(&self) -> Option<Duration> {
-        self.backoff_remaining().or_else(|| self.proactive_wait_duration())
+        self.backoff_remaining()
+            .or_else(|| self.proactive_wait_duration())
     }
 
     /// Clear remaining/reset state after a proactive wait (values are now stale).
@@ -218,7 +216,11 @@ impl GhHttp {
 
     /// Fail fast if the REST API is in hard backoff (post-403/429).
     fn check_backoff() -> anyhow::Result<()> {
-        if let Some(remaining) = REST_RATE_LIMIT.lock().ok().and_then(|rl| rl.backoff_remaining()) {
+        if let Some(remaining) = REST_RATE_LIMIT
+            .lock()
+            .ok()
+            .and_then(|rl| rl.backoff_remaining())
+        {
             anyhow::bail!(
                 "GitHub API rate-limited, backoff active for {}s",
                 remaining.as_secs()
@@ -229,8 +231,10 @@ impl GhHttp {
 
     /// Fail fast if the GraphQL API is in hard backoff (post-403/429).
     fn check_graphql_backoff() -> anyhow::Result<()> {
-        if let Some(remaining) =
-            GRAPHQL_RATE_LIMIT.lock().ok().and_then(|rl| rl.backoff_remaining())
+        if let Some(remaining) = GRAPHQL_RATE_LIMIT
+            .lock()
+            .ok()
+            .and_then(|rl| rl.backoff_remaining())
         {
             anyhow::bail!(
                 "GitHub GraphQL API rate-limited, backoff active for {}s",
