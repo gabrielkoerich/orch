@@ -800,8 +800,9 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Owner commands (feedback via issue comments: `/retry`, `/reroute`) — see `src/engine/commands.rs`
 - [x] Merge detection (auto-close after PR merge) — see `check_merged_prs()` in `src/engine/cleanup.rs:229`
 - [x] Dashboard/reporting CLI command — see `src/cli/dashboard.rs`
-- [x] Graceful shutdown with session handoff — see `src/engine/mod.rs:681-705`
-- [x] Slack channel integration — `src/channels/slack.rs` (Web API polling)
+- [x] Graceful shutdown with session handoff — see `src/engine/mod.rs` serve() loop (signal handlers at line 770+)
+- [ ] Slack channel integration
+
 - [x] Context file per issue (persistent context accumulation) — see `src/engine/runner/context.rs:40-45`
 
 ---
@@ -1241,7 +1242,7 @@ Last updated: 2026-03-01 (366 tests, ~98% parity)
 | Task Tree CLI | Implemented | Done | See `src/cli/tree.rs` - `orch task tree` command |
 | Owner commands (issue comment commands) | Implemented | Done | Issue #179 - see `src/engine/commands.rs` for `/retry`, `/reroute`, `/block` |
 | Child task delegation (auto-spawn subtasks) | Implemented | Done | Issue #178 - see `src/engine/runner/mod.rs:1003-1070` |
-| Skills Sync (auto-clone skill repos) | Missing | Low | Config exists but no sync implementation |
+| Skills Sync (auto-clone skill repos) | Implemented | Done | See `skills_sync()` in `src/engine/sync.rs:263` (PR #158) |
 | Merge detection (auto-close after PR merge) | Implemented | Done | See `check_merged_prs()` in `src/engine/cleanup.rs` |
 | Graceful shutdown with session handoff | Implemented | Done | See `src/engine/mod.rs` serve() loop |
 | Slack channel integration | Implemented | Done | See `src/channels/slack.rs` (Web API polling + chat.postMessage) |
@@ -1351,5 +1352,5 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 ### Feature Gaps (Low Priority)
 
-- [ ] Skills sync from config (auto-clone skill repos) — config exists but no sync implementation
-- [x] Slack channel integration — implemented in `src/channels/slack.rs`
+- [x] Skills sync from config (auto-clone skill repos) — see `src/engine/sync.rs:263` (PR #158)
+- [ ] Slack channel integration — future channel addition

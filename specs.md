@@ -48,7 +48,7 @@ If request_changes:
 The review agent runs as a separate agent invocation in the **same worktree** as the task. It doesn't get a new worktree — it reviews what's already there.
 
 ```rust
-// In engine/mod.rs, after task completes with status:done
+// In engine/review.rs, after task completes with status:done
 async fn review_and_merge(
     &self,
     task: &ExternalTask,
@@ -450,7 +450,7 @@ pub struct Delegation {
 After parsing a successful response with delegations:
 
 ```rust
-// In engine/runner/mod.rs or engine/mod.rs
+// In engine/runner/mod.rs
 async fn process_delegations(
     &self,
     parent_task: &ExternalTask,
@@ -570,7 +570,7 @@ On each sync tick (120s), pull latest for each skill repo. Store in `~/.orch/ski
 
 ### Implementation
 
-- Add `skills_sync()` to sync tick in `engine/mod.rs`
+- Add `skills_sync()` to sync tick in `engine/sync.rs`
 - Git clone/pull via `tokio::process::Command`
 - Config: `skills` array with `repo` and `path` keys
 - Context builder reads from `~/.orch/skills/` in addition to project-local paths
