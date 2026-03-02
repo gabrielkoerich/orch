@@ -65,9 +65,20 @@ Everything outside your current working directory is **read-only**. Never `cd ..
      - Any important design decisions or trade-offs
    - **Do NOT** include `Closes #<issue>` or any issue references — the issue is already linked to the branch via `gh issue develop`.
 
-Do NOT skip any of these steps. Do NOT report "done" unless you have committed, pushed, and verified the PR exists. If you only make changes without committing and pushing, your work will be lost.
+Do NOT skip any of these steps. If you only make changes without committing and pushing, your work will be lost.
 
 If git push fails (e.g., auth error, no remote), set status to `needs_review` with the error.
+
+## Before Writing Your Output — MANDATORY CHECKLIST
+
+Before you write the output JSON, run these checks. If ANY fails, go back and fix it:
+
+1. `git status` — no uncommitted changes (clean working tree)
+2. `git log origin/main..HEAD` — your commits exist
+3. `git push origin HEAD` — branch is pushed (run again even if you already pushed)
+4. `gh pr view --json url` — PR exists (create one if not)
+
+Do NOT report `"status": "done"` unless all 4 checks pass. If you made changes but cannot push or create a PR, your status is `needs_review`, not `done`.
 
 ## Output Format
 
