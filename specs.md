@@ -1,14 +1,14 @@
 # Orch — Feature Specs
 
-Missing features identified in the bash `orchestrator` → Rust `orch` parity audit.
+Features identified in the bash `orchestrator` → Rust `orch` parity audit.
 
 ---
 
 ## 1. Review Agent + Auto-Merge
 
 **Priority:** Critical
-**Status:** Not implemented
-**Files:** `src/engine/runner/mod.rs`, `src/engine/mod.rs`, `src/backends/github.rs`
+**Status:** Implemented — `review_and_merge()` in `src/engine/review.rs:408`, review prompts in `prompts/review_system.md` and `prompts/review_task.md`
+**Files:** `src/engine/review.rs`, `src/engine/runner/mod.rs`, `src/backends/github.rs`
 
 ### Problem
 
@@ -48,7 +48,7 @@ If request_changes:
 The review agent runs as a separate agent invocation in the **same worktree** as the task. It doesn't get a new worktree — it reviews what's already there.
 
 ```rust
-// In engine/mod.rs, after task completes with status:done
+// In engine/review.rs, after task completes with status:done
 async fn review_and_merge(
     &self,
     task: &ExternalTask,
@@ -293,7 +293,7 @@ new → routed → in_progress → done (agent finishes)
 
 1. Add `ReviewResponse`, `ReviewIssue`, `ReviewDecision` types to `src/engine/runner/response.rs`
 2. Add `build_review_prompt()` and `review_system_prompt()` to `src/engine/runner/agent.rs`
-3. Add `review_and_merge()` to `src/engine/mod.rs` — called after Phase 3b dispatch completes with `status:done`
+3. Add `review_and_merge()` to `src/engine/review.rs` — called after Phase 3b dispatch completes with `status:done`
 4. Add `auto_merge()` using `gh pr merge --squash --delete-branch`
 5. Add `handle_review_changes()` to re-dispatch with review context
 6. Add `review_cycles` tracking in sidecar
@@ -306,8 +306,8 @@ new → routed → in_progress → done (agent finishes)
 ## 2. PR Review Comments → Fix Dispatch
 
 **Priority:** Critical
-**Status:** Partially implemented (parsing exists, dispatch missing)
-**Files:** `src/engine/mod.rs` (`review_open_prs()`), `src/engine/runner/`
+**Status:** Implemented — `review_open_prs()` re-dispatches on `CHANGES_REQUESTED`, creates follow-up tasks with PR context
+**Files:** `src/engine/review.rs` (`review_open_prs()` at line 44), `src/engine/runner/`
 
 ### Problem
 
@@ -386,8 +386,8 @@ if !context.pr_review_context.is_empty() {
 ## 3. Task Delegation
 
 **Priority:** High
-**Status:** DB supports parent/child, no agent-side delegation
-**Files:** `src/engine/runner/mod.rs`, `src/parser.rs`, `src/engine/mod.rs`
+**Status:** Implemented — `Delegation` struct in `src/parser.rs`, `process_delegations()` in `src/engine/runner/mod.rs:1030`, parent/child unblocking in engine tick Phase 4
+**Files:** `src/engine/runner/mod.rs`, `src/parser.rs`, `src/engine/tick.rs`
 
 ### Problem
 
@@ -450,7 +450,7 @@ pub struct Delegation {
 After parsing a successful response with delegations:
 
 ```rust
-// In engine/runner/mod.rs or engine/mod.rs
+// In engine/runner/mod.rs
 async fn process_delegations(
     &self,
     parent_task: &ExternalTask,
@@ -538,7 +538,7 @@ Rules:
 #### Implementation Steps
 
 1. Add `Delegation` struct and `delegations` field to `AgentResponse` in `parser.rs`
-2. Add `process_delegations()` to `src/engine/mod.rs`
+2. Add `process_delegations()` to `src/engine/runner/mod.rs`
 3. Call it after successful task completion in Phase 3b dispatch
 4. Add delegation instructions to system prompt in `agent.rs`
 5. Tests: delegation parsing, child task creation, parent blocking
@@ -548,8 +548,8 @@ Rules:
 ## 4. Skills Sync
 
 **Priority:** Medium
-**Status:** Missing
-**Issue:** To be created
+**Status:** Implemented — `skills_sync()` in `src/engine/sync.rs:263`, auto-clones/pulls skill repos from config during sync tick
+**Issue:** #155 (closed, PR #158 merged)
 
 ### Problem
 
@@ -570,7 +570,7 @@ On each sync tick (120s), pull latest for each skill repo. Store in `~/.orch/ski
 
 ### Implementation
 
-- Add `skills_sync()` to sync tick in `engine/mod.rs`
+- Add `skills_sync()` to sync tick in `engine/sync.rs`
 - Git clone/pull via `tokio::process::Command`
 - Config: `skills` array with `repo` and `path` keys
 - Context builder reads from `~/.orch/skills/` in addition to project-local paths
@@ -580,8 +580,8 @@ On each sync tick (120s), pull latest for each skill repo. Store in `~/.orch/ski
 ## 5. Dashboard CLI
 
 **Priority:** Low
-**Status:** Missing
-**Issue:** To be created
+**Status:** Implemented — `src/cli/dashboard.rs`, combines task counts + active sessions + recent activity
+**Issue:** N/A (completed)
 
 ### Design
 
@@ -619,8 +619,8 @@ Recent (last 24h)
 ## 6. Task Tree CLI
 
 **Priority:** Low
-**Status:** Missing
-**Issue:** To be created
+**Status:** Implemented — `src/cli/tree.rs` (391 lines), ASCII tree with parent-child relationships
+**Issue:** N/A (completed)
 
 ### Design
 
@@ -649,8 +649,8 @@ $ orch task tree
 ## 7. Owner Commands
 
 **Priority:** Medium
-**Status:** Missing
-**Issue:** To be created
+**Status:** Implemented — `src/engine/commands.rs` (499 lines), `/retry`, `/reroute`, `/close`, `/block`, `/unblock`, `/review` with collaborator validation and code fence detection
+**Issue:** N/A (completed)
 
 ### Design
 

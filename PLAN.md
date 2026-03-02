@@ -728,7 +728,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Discord channel (polling implementation) — PR #81 merged
 - [x] Webhook HTTP server (axum) — PR #93 merged
 - [x] Wire webhook server into engine — PR #123 merged
-- [ ] Mention detection via webhooks (#112)
+- [x] Mention detection via webhooks (#112) — webhook handler + polling fallback
 - [x] Polling fallback when webhooks not configured — PR #131 merged
 - [x] Wire channels into engine event loop — PR #81 merged
 
@@ -760,7 +760,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] `orch service start/stop/restart/status` — service management
 - [x] `orch completions <shell>` — shell completions
 - [x] `orch board list/link/sync/info` — GitHub Projects V2 board management
-- [ ] `orch project add/remove/list` — multi-project management
+- [x] `orch project add/remove/list` — multi-project management (see Phase 6)
 - [x] Rename binary from `orch-core` to `orch`
 - [x] Absorb justfile routing into native CLI (justfile deleted)
 
@@ -798,10 +798,10 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Wire Telegram/Discord channels into engine event loop
 - [x] Mention detection via webhooks (#112)
 - [x] Owner commands (feedback via issue comments: `/retry`, `/reroute`) — see `src/engine/commands.rs`
-- [x] Merge detection (auto-close after PR merge) — see `check_merged_prs()` in `src/engine/mod.rs:1405-1452`
+- [x] Merge detection (auto-close after PR merge) — see `check_merged_prs()` in `src/engine/cleanup.rs:229`
 - [x] Dashboard/reporting CLI command — see `src/cli/dashboard.rs`
-- [x] Graceful shutdown with session handoff — see `src/engine/mod.rs:681-705`
-- [x] Slack channel integration — `src/channels/slack.rs` (Web API polling)
+- [x] Graceful shutdown with session handoff — see `src/engine/mod.rs` serve() loop (signal handlers at line 770+)
+- [ ] Slack channel integration
 - [x] Context file per issue (persistent context accumulation) — see `src/engine/runner/context.rs:40-45`
 
 ---
@@ -830,10 +830,9 @@ src/
 │   ├── capture.rs           # tmux output capture + diffing service
 │   ├── notification.rs      # Unified notification dispatch (levels, formatting, broadcast)
 │   ├── tmux.rs              # tmux channel (pane monitoring)
-│   ├── github.rs            # GitHub App: webhooks (stub)
-│   ├── telegram.rs          # Telegram Bot API (stub)
-│   ├── discord.rs           # Discord gateway websocket (stub)
-│   └── slack.rs             # Slack Web API polling (conversations.history)
+│   ├── github.rs            # GitHub App: webhooks + polling
+│   ├── telegram.rs          # Telegram Bot API (long-poll)
+│   └── discord.rs           # Discord gateway websocket
 │
 ├── engine/
 │   ├── mod.rs               # Engine struct, config, project init, main event loop (serve)
@@ -1242,10 +1241,10 @@ Last updated: 2026-03-01 (366 tests, ~98% parity)
 | Task Tree CLI | Implemented | Done | See `src/cli/tree.rs` - `orch task tree` command |
 | Owner commands (issue comment commands) | Implemented | Done | Issue #179 - see `src/engine/commands.rs` for `/retry`, `/reroute`, `/block` |
 | Child task delegation (auto-spawn subtasks) | Implemented | Done | Issue #178 - see `src/engine/runner/mod.rs:1003-1070` |
-| Skills Sync (auto-clone skill repos) | Missing | Low | Config exists but no sync implementation |
+| Skills Sync (auto-clone skill repos) | Implemented | Done | See `skills_sync()` in `src/engine/sync.rs:263` (PR #158) |
 | Merge detection (auto-close after PR merge) | Implemented | Done | See `check_merged_prs()` in `src/engine/cleanup.rs` |
 | Graceful shutdown with session handoff | Implemented | Done | See `src/engine/mod.rs` serve() loop |
-| Slack channel integration | Implemented | Done | See `src/channels/slack.rs` (Web API polling + chat.postMessage) |
+| Slack channel integration | Missing | Low | Future channel addition |
 | Context file per issue | Implemented | Done | See `src/engine/runner/context.rs:40-45` `load_task_context()` |
 
 ### Config Architecture
@@ -1352,5 +1351,5 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 ### Feature Gaps (Low Priority)
 
-- [ ] Skills sync from config (auto-clone skill repos) — config exists but no sync implementation
-- [x] Slack channel integration — implemented in `src/channels/slack.rs`
+- [x] Skills sync from config (auto-clone skill repos) — see `src/engine/sync.rs:263` (PR #158)
+- [ ] Slack channel integration — future channel addition
