@@ -125,7 +125,14 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
 
     let accomplished = extract_string_array(obj.get("accomplished"));
     let remaining = extract_string_array(obj.get("remaining"));
-    let files = extract_string_array(obj.get("files"));
+    let files = {
+        let f = extract_string_array(obj.get("files"));
+        if !f.is_empty() {
+            f
+        } else {
+            extract_string_array(obj.get("files_changed"))
+        }
+    };
     let error = obj.get("error").and_then(|v| v.as_str()).map(String::from);
     let learnings = extract_string_array(obj.get("learnings"));
 
