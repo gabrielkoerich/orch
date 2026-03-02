@@ -37,7 +37,7 @@ use crate::config;
 use crate::db::Db;
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
-use crate::github::http::GhHttp;
+use crate::github::http::{rate_limit_metrics, GhHttp};
 use crate::sidecar::REPO_CONTEXT;
 use crate::tmux::TmuxManager;
 use runner::WeightSignal;
@@ -635,8 +635,14 @@ pub async fn serve() -> anyhow::Result<()> {
 
                 // Skip tick/sync entirely if GitHub API is rate-limited
                 if let Some(remaining) = GhHttp::is_rate_limited() {
+                    let m = rate_limit_metrics();
                     tracing::warn!(
                         remaining_secs = remaining.as_secs(),
+                        rate_limit_hits = m.hits,
+                        proactive_throttles = m.proactive_throttles,
+                        wait_secs_total = m.wait_secs,
+                        rest_remaining = ?m.rest_remaining,
+                        graphql_remaining = ?m.graphql_remaining,
                         "GitHub API rate-limited, skipping tick"
                     );
                 } else {
