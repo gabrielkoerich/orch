@@ -802,7 +802,6 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Dashboard/reporting CLI command — see `src/cli/dashboard.rs`
 - [x] Graceful shutdown with session handoff — see `src/engine/mod.rs` serve() loop (signal handlers at line 770+)
 - [ ] Slack channel integration
-
 - [x] Context file per issue (persistent context accumulation) — see `src/engine/runner/context.rs:40-45`
 
 ---
@@ -1245,7 +1244,7 @@ Last updated: 2026-03-01 (366 tests, ~98% parity)
 | Skills Sync (auto-clone skill repos) | Implemented | Done | See `skills_sync()` in `src/engine/sync.rs:263` (PR #158) |
 | Merge detection (auto-close after PR merge) | Implemented | Done | See `check_merged_prs()` in `src/engine/cleanup.rs` |
 | Graceful shutdown with session handoff | Implemented | Done | See `src/engine/mod.rs` serve() loop |
-| Slack channel integration | Implemented | Done | See `src/channels/slack.rs` (Web API polling + chat.postMessage) |
+| Slack channel integration | Missing | Low | Future channel addition |
 | Context file per issue | Implemented | Done | See `src/engine/runner/context.rs:40-45` `load_task_context()` |
 
 ### Config Architecture
