@@ -942,7 +942,11 @@ async fn tick_recover_stuck_tasks(
                 )
                 .await
             {
-                tracing::warn!(task_id = task.id.0, ?e, "failed to post stuck-task recovery comment");
+                tracing::warn!(
+                    task_id = task.id.0,
+                    ?e,
+                    "failed to post stuck-task recovery comment"
+                );
                 continue;
             }
         }
