@@ -7,6 +7,7 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::config;
 use crate::engine::router::{get_route_result, RouteResult};
 use crate::sidecar;
+use crate::tmux::TmuxManager;
 use std::path::{Path, PathBuf};
 
 use super::{agent, context, git_ops, worktree};
@@ -27,7 +28,9 @@ pub struct TaskInitResult {
 ///
 /// Returns `None` if the task should be skipped (already logged/handled).
 /// Returns `Some(attempts)` if the task should proceed.
-pub fn check_guards(task_id: &str) -> anyhow::Result<Option<u32>> {
+///
+/// Also checks for existing tmux sessions to prevent duplicate dispatch.
+pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<Option<u32>> {
     let attempts: u32 = sidecar::get(task_id, "attempts")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -37,6 +40,18 @@ pub fn check_guards(task_id: &str) -> anyhow::Result<Option<u32>> {
     let current_status = sidecar::get(task_id, "status").unwrap_or_default();
     if current_status == "needs_review" {
         tracing::info!(task_id, "skipping needs_review task");
+        return Ok(None);
+    }
+
+    // Guard: check if tmux session already exists (prevents duplicate dispatch)
+    let tmux = TmuxManager::new();
+    let session_name = tmux.session_name(repo, task_id);
+    if tmux.session_exists(&session_name).await {
+        tracing::info!(
+            task_id,
+            session = %session_name,
+            "skipping task: tmux session already exists"
+        );
         return Ok(None);
     }
 

@@ -87,9 +87,10 @@ impl TaskRunner {
         );
 
         // Check task guards; returns None if task should be skipped
-        let attempts = match task_init::check_guards(task_id)? {
-            Some(a) => a,
-            None => return Ok(()),
+        let attempts = match task_init::check_guards(task_id, &self.repo).await {
+            Ok(Some(a)) => a,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e),
         };
 
         // Resolve project directory
