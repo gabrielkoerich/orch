@@ -14,6 +14,9 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -23,11 +26,16 @@ struct GhUser {
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Deduplication window: 2 hours (GitHub retries within ~1 hour).
+const DEDUP_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
+
 #[derive(Clone)]
 struct WebhookState {
     secret: String,
     repo: String,
     tx: tokio::sync::mpsc::Sender<IncomingMessage>,
+    /// In-memory delivery deduplication: delivery_id → time first seen.
+    seen_deliveries: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -206,6 +214,29 @@ async fn handle_webhook(
         return (StatusCode::UNAUTHORIZED, "Invalid signature");
     }
 
+    // Deduplicate by x-github-delivery header — GitHub retries unacknowledged
+    // deliveries and allows manual re-delivery from the App settings UI.
+    let delivery_id = headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if !delivery_id.is_empty() {
+        let mut seen = state.seen_deliveries.lock().await;
+        // Evict entries older than the dedup window before checking.
+        let cutoff = Instant::now()
+            .checked_sub(DEDUP_WINDOW)
+            .unwrap_or(Instant::now());
+        seen.retain(|_, t| *t > cutoff);
+
+        if seen.contains_key(&delivery_id) {
+            tracing::debug!(delivery_id = %delivery_id, "duplicate webhook delivery, skipping");
+            return (StatusCode::OK, "OK");
+        }
+        seen.insert(delivery_id, Instant::now());
+    }
+
     let payload: WebhookPayload = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -263,7 +294,12 @@ pub async fn start_webhook_server(
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
 
-    let state = WebhookState { secret, repo, tx };
+    let state = WebhookState {
+        secret,
+        repo,
+        tx,
+        seen_deliveries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+    };
 
     let app = Router::new()
         .route("/health", get(webhook_health))
@@ -597,6 +633,7 @@ mod tests {
             secret: String::new(), // empty secret = skip verification
             repo: "owner/repo".to_string(),
             tx,
+            seen_deliveries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
         let app = Router::new()
@@ -650,6 +687,7 @@ mod tests {
             secret: String::new(),
             repo: "owner/repo".to_string(),
             tx,
+            seen_deliveries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
         let app = Router::new()
@@ -701,6 +739,7 @@ mod tests {
             secret: String::new(),
             repo: "owner/repo".to_string(),
             tx,
+            seen_deliveries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
         let app = Router::new()
@@ -754,6 +793,7 @@ mod tests {
             secret: "real-secret".to_string(),
             repo: "owner/repo".to_string(),
             tx,
+            seen_deliveries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         };
 
         let app = Router::new()
@@ -786,5 +826,113 @@ mod tests {
             rx.try_recv().is_err(),
             "no message should be sent for invalid signature"
         );
+    }
+
+    /// Deduplication test: same x-github-delivery ID sent twice → only one message
+    /// processed by the engine.
+    #[tokio::test]
+    async fn test_webhook_deduplication_same_delivery_id() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+
+        // Shared seen_deliveries — both requests use the same state.
+        let seen_deliveries = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let body_json = serde_json::json!({
+            "action": "opened",
+            "issue": {
+                "number": 200,
+                "title": "Deduplicated issue",
+                "labels": []
+            }
+        });
+        let body_bytes = serde_json::to_vec(&body_json).unwrap();
+
+        // First delivery — should be processed.
+        {
+            let state = WebhookState {
+                secret: String::new(),
+                repo: "owner/repo".to_string(),
+                tx: tx.clone(),
+                seen_deliveries: seen_deliveries.clone(),
+            };
+            let app = Router::new()
+                .route("/webhook", post(handle_webhook))
+                .with_state(state);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("content-type", "application/json")
+                .header("x-github-event", "issues")
+                .header("x-github-delivery", "abc-123-unique-id")
+                .body(Body::from(body_bytes.clone()))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // Should have received exactly one message.
+        let msg = rx.try_recv().expect("first delivery should produce a message");
+        assert_eq!(msg.thread_id, "200");
+        assert!(rx.try_recv().is_err(), "no second message yet");
+
+        // Second delivery with the SAME delivery ID — should be silently ACKed.
+        {
+            let state = WebhookState {
+                secret: String::new(),
+                repo: "owner/repo".to_string(),
+                tx: tx.clone(),
+                seen_deliveries: seen_deliveries.clone(),
+            };
+            let app = Router::new()
+                .route("/webhook", post(handle_webhook))
+                .with_state(state);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("content-type", "application/json")
+                .header("x-github-event", "issues")
+                .header("x-github-delivery", "abc-123-unique-id")
+                .body(Body::from(body_bytes.clone()))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            // Must still return 200 OK to prevent GitHub from retrying again.
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // No second message should have been sent.
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate delivery should not produce a second message"
+        );
+
+        // Third delivery with a DIFFERENT delivery ID — should be processed normally.
+        {
+            let state = WebhookState {
+                secret: String::new(),
+                repo: "owner/repo".to_string(),
+                tx: tx.clone(),
+                seen_deliveries: seen_deliveries.clone(),
+            };
+            let app = Router::new()
+                .route("/webhook", post(handle_webhook))
+                .with_state(state);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/webhook")
+                .header("content-type", "application/json")
+                .header("x-github-event", "issues")
+                .header("x-github-delivery", "xyz-456-different-id")
+                .body(Body::from(body_bytes))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let msg2 = rx.try_recv().expect("different delivery ID should produce a message");
+        assert_eq!(msg2.thread_id, "200");
     }
 }
