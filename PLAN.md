@@ -1350,9 +1350,9 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 ### Code Quality
 
 - [x] `src/engine/mod.rs` — decomposed into tick.rs, sync.rs, review.rs, cleanup.rs (#283)
-- [x] `src/engine/router.rs` — extracted LLM routing into `llm_router.rs` (#257); decomposed into `router/` module directory (#288)
-- [ ] `src/engine/runner/mod.rs` — 45KB coordinator; largest file in runner module
-- [x] No test coverage tooling in CI (#258) — 366 tests exist but coverage metrics not tracked; `cargo-llvm-cov` already in CI (`release.yml`); 37 new unit tests added for `llm_router.rs` (23 tests), `tick.rs` (5 tests), `runner/mod.rs` (9 tests) in #296
+- [x] `src/engine/router.rs` — extracted LLM routing into `llm_router.rs` (#257); now 1,919 lines
+- [x] `src/engine/runner/mod.rs` — decomposed into task_init.rs, session.rs, response_handler.rs, fallback.rs (#295)
+- [ ] No test coverage tooling in CI (#258) — 366 tests exist but coverage metrics not tracked
 
 ### Feature Gaps (Low Priority)
 
