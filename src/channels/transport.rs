@@ -30,13 +30,11 @@ use super::notification::TaskNotification;
 use super::{IncomingMessage, OutputChunk};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, RwLock};
 
 /// A live connection between a channel thread and a tmux session.
 #[derive(Debug, Clone)]
 pub struct SessionBinding {
-    /// The task ID (issue number)
-    pub task_id: String,
     /// tmux session name (e.g. "orch-myproject-42")
     pub tmux_session: String,
     /// Channel threads connected to this session.
@@ -52,8 +50,6 @@ pub struct Transport {
     bindings: Arc<RwLock<HashMap<String, SessionBinding>>>,
     /// Reverse lookup: "channel:thread_id" → task_id
     thread_to_task: Arc<RwLock<HashMap<String, String>>>,
-    /// The main chat session (for direct orchestrator commands)
-    main_session: Arc<Mutex<Option<String>>>,
     /// Broadcast sender for task completion notifications
     notification_tx: broadcast::Sender<TaskNotification>,
 }
@@ -64,7 +60,6 @@ impl Transport {
         Self {
             bindings: Arc::new(RwLock::new(HashMap::new())),
             thread_to_task: Arc::new(RwLock::new(HashMap::new())),
-            main_session: Arc::new(Mutex::new(None)),
             notification_tx,
         }
     }
@@ -76,7 +71,6 @@ impl Transport {
         let binding = bindings.entry(task_id.to_string()).or_insert_with(|| {
             let (tx, _) = broadcast::channel(256);
             SessionBinding {
-                task_id: task_id.to_string(),
                 tmux_session: tmux_session.to_string(),
                 connected_threads: Vec::new(),
                 output_tx: tx,
@@ -91,21 +85,6 @@ impl Transport {
             .write()
             .await
             .insert(key, task_id.to_string());
-    }
-
-    /// Unbind a channel thread from its task session.
-    pub async fn unbind(&self, channel: &str, thread_id: &str) {
-        let key = format!("{channel}:{thread_id}");
-        let task_id = self.thread_to_task.write().await.remove(&key);
-        if let Some(task_id) = task_id {
-            let mut bindings = self.bindings.write().await;
-            if let Some(binding) = bindings.get_mut(&task_id) {
-                binding.connected_threads.retain(|t| t != &key);
-                if binding.connected_threads.is_empty() {
-                    bindings.remove(&task_id);
-                }
-            }
-        }
     }
 
     /// Get the broadcast receiver for a task's output stream.
@@ -145,12 +124,6 @@ impl Transport {
 
         // New conversation — could become a task
         MessageRoute::NewTask
-    }
-
-    /// Get the tmux session name for a task.
-    pub async fn tmux_session_for(&self, task_id: &str) -> Option<String> {
-        let bindings = self.bindings.read().await;
-        bindings.get(task_id).map(|b| b.tmux_session.clone())
     }
 
     /// List all active bindings.

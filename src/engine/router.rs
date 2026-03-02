@@ -13,11 +13,9 @@
 //! 6. Track last routed agent to distribute load across agents
 
 use crate::backends::ExternalTask;
-use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::llm_router::LlmRouter;
@@ -757,7 +755,6 @@ impl Router {
     /// but this stateless modulo-based implementation is intentionally
     /// retained to allow deterministic selection based on task ID and for
     /// existing tests that exercise the legacy behavior.
-    #[allow(dead_code)]
     fn route_round_robin(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         let agents = &self.available_agents;
         if agents.is_empty() {
@@ -981,15 +978,6 @@ impl Router {
         self.weights.tick_recovery();
     }
 
-    /// Get a snapshot of current agent weights for logging.
-    ///
-    /// Public helper kept for debugging and observability (useful when
-    /// inspecting router state from integration tests or admin tooling).
-    #[allow(dead_code)]
-    pub fn weight_snapshot(&self) -> Vec<(String, f64, u32)> {
-        self.weights.snapshot()
-    }
-
     /// Store routing result in sidecar file.
     pub fn store_route_result(&self, task_id: &str, result: &RouteResult) -> anyhow::Result<()> {
         let fields = vec![
@@ -1002,34 +990,6 @@ impl Router {
         ];
 
         crate::sidecar::set(task_id, &fields)
-    }
-
-    /// Route multiple tasks concurrently using FuturesUnordered.
-    /// Returns results in completion order (not input order).
-    ///
-    /// Retained as a convenience for batch-processing callers and tests.
-    #[allow(dead_code)]
-    pub async fn route_batch(
-        self: &Arc<Self>,
-        tasks: &[ExternalTask],
-    ) -> Vec<(String, anyhow::Result<RouteResult>)> {
-        let mut futures = FuturesUnordered::new();
-
-        for task in tasks {
-            let router = Arc::clone(self);
-            let task = task.clone();
-            futures.push(async move {
-                let task_id = task.id.0.clone();
-                let result = router.route(&task).await;
-                (task_id, result)
-            });
-        }
-
-        let mut results = Vec::with_capacity(tasks.len());
-        while let Some(result) = futures.next().await {
-            results.push(result);
-        }
-        results
     }
 }
 

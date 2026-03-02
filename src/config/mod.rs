@@ -398,12 +398,9 @@ pub fn get_current_repo() -> anyhow::Result<String> {
 
 /// Skill repository configuration.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SkillConfig {
     /// GitHub repository in "owner/repo" format.
     pub repo: String,
-    /// Path within the repository to the skills directory.
-    pub path: String,
 }
 
 /// Get skills configuration from the global config.
@@ -412,9 +409,7 @@ pub struct SkillConfig {
 /// ```yaml
 /// skills:
 ///   - repo: "owner/skill-repo"
-///     path: "skills/"
 ///   - repo: "owner/another-repo"
-///     path: "docs/skills/"
 /// ```
 ///
 /// Returns an empty vector if no skills are configured.
@@ -463,14 +458,9 @@ fn extract_skills_list(root: &serde_yml::Value) -> anyhow::Result<Vec<SkillConfi
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .unwrap_or_default();
-            let path = map
-                .get("path")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| "skills".to_string());
 
             if !repo.is_empty() {
-                skills.push(SkillConfig { repo, path });
+                skills.push(SkillConfig { repo });
             }
         }
     }
@@ -785,25 +775,22 @@ mod tests {
     #[test]
     fn extract_skills_list_from_sequence() {
         let yaml = serde_yml::from_str::<serde_yml::Value>(
-            "skills:\n  - repo: owner/skills1\n    path: skills/\n  - repo: owner/skills2\n    path: docs/\n",
+            "skills:\n  - repo: owner/skills1\n  - repo: owner/skills2\n",
         )
         .unwrap();
         let skills = extract_skills_list(&yaml).unwrap();
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].repo, "owner/skills1");
-        assert_eq!(skills[0].path, "skills/");
         assert_eq!(skills[1].repo, "owner/skills2");
-        assert_eq!(skills[1].path, "docs/");
     }
 
     #[test]
-    fn extract_skills_list_defaults_path() {
+    fn extract_skills_list_single_repo() {
         let yaml =
             serde_yml::from_str::<serde_yml::Value>("skills:\n  - repo: owner/skills\n").unwrap();
         let skills = extract_skills_list(&yaml).unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].repo, "owner/skills");
-        assert_eq!(skills[0].path, "skills"); // default path
     }
 
     #[test]

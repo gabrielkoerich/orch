@@ -683,20 +683,6 @@ impl GhHttp {
         self.get_all_pages(&url, &[("per_page", "100")]).await
     }
 
-    /// Get review comments for a specific PR review.
-    #[allow(dead_code)]
-    pub async fn get_pr_review_comments(
-        &self,
-        repo: &str,
-        pr_number: u64,
-        review_id: u64,
-    ) -> anyhow::Result<Vec<GitHubReviewComment>> {
-        self.get_json(&format!(
-            "{GITHUB_API}/repos/{repo}/pulls/{pr_number}/reviews/{review_id}/comments"
-        ))
-        .await
-    }
-
     /// Get all review comments for a PR.
     pub async fn get_pr_comments(
         &self,
@@ -936,52 +922,6 @@ impl GhHttp {
         };
 
         Ok((state, total, passing, failing, pending))
-    }
-
-    /// Re-run failed jobs for a workflow run.
-    #[allow(dead_code)]
-    pub async fn rerun_failed_jobs(&self, repo: &str, run_id: u64) -> anyhow::Result<()> {
-        let url = format!("{GITHUB_API}/repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs");
-        self.post_json_raw(&url, &serde_json::json!({})).await?;
-        Ok(())
-    }
-
-    /// Get the latest workflow run for a branch.
-    #[allow(dead_code)]
-    pub async fn get_latest_run_for_branch(
-        &self,
-        repo: &str,
-        branch: &str,
-    ) -> anyhow::Result<Option<(u64, String, String)>> {
-        let url = format!("{GITHUB_API}/repos/{repo}/actions/runs");
-        let resp: serde_json::Value = self
-            .get_with_query(&url, &[("branch", branch), ("per_page", "1")])
-            .await?;
-
-        let runs = resp
-            .get("workflow_runs")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        if runs.is_empty() {
-            return Ok(None);
-        }
-
-        let run = &runs[0];
-        let id = run.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-        let status = run
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let conclusion = run
-            .get("conclusion")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        Ok(Some((id, status, conclusion)))
     }
 
     /// Trigger a workflow dispatch.

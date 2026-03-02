@@ -13,7 +13,6 @@ use crate::cmd::CommandErrorContext;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tokio::time::{Duration, Interval};
 
 pub struct TmuxChannel {
@@ -22,27 +21,9 @@ pub struct TmuxChannel {
 }
 
 impl TmuxChannel {
-    pub fn new() -> Self {
-        Self { transport: None }
-    }
-
     pub fn with_transport(transport: Arc<crate::channels::transport::Transport>) -> Self {
         Self {
             transport: Some(transport),
-        }
-    }
-}
-
-/// State for the capture loop
-struct CaptureState {
-    /// Last captured content per session
-    last_content: HashMap<String, String>,
-}
-
-impl CaptureState {
-    fn new() -> Self {
-        Self {
-            last_content: HashMap::new(),
         }
     }
 }
@@ -78,19 +59,6 @@ impl Channel for TmuxChannel {
         send_keys(session, &msg.body).await
     }
 
-    async fn stream_output(
-        &self,
-        thread_id: &str,
-        _rx: broadcast::Receiver<OutputChunk>,
-    ) -> anyhow::Result<()> {
-        // tmux IS the output source — this captures and broadcasts
-        tracing::debug!(
-            session = thread_id,
-            "tmux channel handles its own output capture"
-        );
-        Ok(())
-    }
-
     async fn health_check(&self) -> anyhow::Result<()> {
         // Check if tmux server is running
         let output = tokio::process::Command::new("tmux")
@@ -100,10 +68,6 @@ impl Channel for TmuxChannel {
         if !output.status.success() {
             anyhow::bail!("tmux server not running");
         }
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -259,9 +223,7 @@ async fn capture_loop(transport: Arc<crate::channels::transport::Transport>) -> 
                                 .push_output(
                                     &task_id,
                                     OutputChunk {
-                                        task_id: task_id.clone(),
                                         content: new_chunk,
-                                        timestamp: chrono::Utc::now(),
                                         is_final: false,
                                     },
                                 )
@@ -279,16 +241,5 @@ async fn capture_loop(transport: Arc<crate::channels::transport::Transport>) -> 
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_capture_state_new() {
-        let state = CaptureState::new();
-        assert!(state.last_content.is_empty());
     }
 }

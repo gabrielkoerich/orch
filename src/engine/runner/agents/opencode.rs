@@ -194,12 +194,9 @@ impl OpenCodeRunner {
 }
 
 impl AgentRunner for OpenCodeRunner {
+    #[cfg(test)]
     fn name(&self) -> &str {
         "opencode"
-    }
-
-    fn is_available(&self) -> bool {
-        crate::cmd_cache::command_exists("opencode")
     }
 
     fn build_command(
@@ -251,7 +248,6 @@ impl AgentRunner for OpenCodeRunner {
                     input_tokens: None,
                     output_tokens: None,
                     duration_ms: None,
-                    permission_denials: vec![],
                 });
             }
             return Err(AgentError::InvalidResponse {
@@ -283,7 +279,6 @@ impl AgentRunner for OpenCodeRunner {
             input_tokens,
             output_tokens,
             duration_ms: None,
-            permission_denials: vec![],
         })
     }
 
@@ -399,14 +394,12 @@ fn classify_opencode_message(message: &str) -> AgentError {
     {
         return AgentError::RateLimit {
             message: message.to_string(),
-            retry_after: None,
         };
     }
 
     if lower.contains("context") && (lower.contains("length") || lower.contains("overflow")) {
         return AgentError::ContextOverflow {
             message: message.to_string(),
-            max_tokens: None,
         };
     }
 

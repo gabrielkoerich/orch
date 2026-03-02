@@ -168,7 +168,6 @@ impl CodexRunner {
         {
             return AgentError::RateLimit {
                 message: message.to_string(),
-                retry_after: None,
             };
         }
 
@@ -202,7 +201,6 @@ impl CodexRunner {
         if lower.contains("context_length") || lower.contains("too many tokens") {
             return AgentError::ContextOverflow {
                 message: message.to_string(),
-                max_tokens: None,
             };
         }
 
@@ -226,12 +224,9 @@ impl CodexRunner {
 }
 
 impl AgentRunner for CodexRunner {
+    #[cfg(test)]
     fn name(&self) -> &str {
         "codex"
-    }
-
-    fn is_available(&self) -> bool {
-        which::which("codex").is_ok()
     }
 
     fn build_command(
@@ -291,7 +286,6 @@ impl AgentRunner for CodexRunner {
                     input_tokens: None,
                     output_tokens: None,
                     duration_ms: None,
-                    permission_denials: vec![],
                 });
             }
             return Err(AgentError::InvalidResponse {
@@ -321,7 +315,6 @@ impl AgentRunner for CodexRunner {
             input_tokens: None,
             output_tokens: None,
             duration_ms: None,
-            permission_denials: vec![],
         })
     }
 

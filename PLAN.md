@@ -674,7 +674,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 
 - [x] Config loading (config.yml, .orchestrator.yml) — `src/config.rs` (hot-reload via `notify`)
 - [x] Sidecar JSON I/O (read/write/merge) — `src/sidecar.rs`
-- [x] GitHub API client (gh CLI wrapper with serde parsing) — `src/github/cli.rs`, `src/github/types.rs`
+- [x] GitHub API client (gh CLI wrapper with serde parsing) — ~~`src/github/cli.rs`~~ removed, `src/github/types.rs`
 - [x] Native HTTP client (reqwest, connection pooling, header-based rate limiting) — `src/github/http.rs` (supersedes `cli.rs`)
 - [ ] ~~GitHub App auth (JWT, token refresh, GH_TOKEN export)~~ — using `gh auth token` / `GH_TOKEN` env instead
 - [x] Agent response parser — `src/parser.rs`
@@ -861,8 +861,7 @@ src/
 │
 ├── github/
 │   ├── mod.rs               # GitHub helpers (shared by backend + channel)
-│   ├── http.rs              # Native reqwest HTTP client (connection pooling, rate-limit backoff) — primary
-│   ├── cli.rs               # `gh api` wrapper — legacy fallback (superseded by http.rs)
+│   ├── http.rs              # Native reqwest HTTP client (connection pooling, rate-limit backoff)
 │   ├── backoff.rs           # Exponential backoff state for GitHub 403 rate limits
 │   ├── types.rs             # GitHubIssue, GitHubComment, GitHubLabel, etc.
 │   └── projects.rs          # GitHub Projects V2 GraphQL operations

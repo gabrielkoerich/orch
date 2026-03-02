@@ -104,18 +104,20 @@ pub struct PullRequestReview {
 }
 
 impl PullRequestReview {
-    /// Check if this review requests changes.
-    #[allow(dead_code)]
-    pub fn requests_changes(&self) -> bool {
-        self.review.state == "CHANGES_REQUESTED"
-    }
-
     /// Get actionable comments (non-empty, not replies).
     pub fn actionable_comments(&self) -> Vec<&GitHubReviewComment> {
         self.comments
             .iter()
             .filter(|c| !c.body.trim().is_empty() && c.in_reply_to_id.is_none())
             .collect()
+    }
+}
+
+#[cfg(test)]
+impl PullRequestReview {
+    /// Check if this review requests changes (test helper).
+    pub fn requests_changes(&self) -> bool {
+        self.review.state == "CHANGES_REQUESTED"
     }
 }
 

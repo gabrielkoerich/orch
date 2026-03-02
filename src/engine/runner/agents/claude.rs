@@ -25,8 +25,7 @@
 //!   "duration_ms": 2006,
 //!   "result": "```json\n{\"status\": \"done\", ...}\n```",
 //!   "usage": {"input_tokens": 10, "output_tokens": 78},
-//!   "modelUsage": {"claude-haiku-4-5-20251001": {"inputTokens": 10, ...}},
-//!   "permission_denials": []
+//!   "modelUsage": {"claude-haiku-4-5-20251001": {"inputTokens": 10, ...}}
 //! }
 //! ```
 //!
@@ -65,7 +64,7 @@ impl ClaudeRunner {
 
     /// Parse the Claude `--output-format json` envelope.
     ///
-    /// Extracts `result`, `usage`, `permission_denials`, and `is_error`.
+    /// Extracts `result`, `usage`, and `is_error`.
     fn parse_envelope(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
         let parsed_json: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
             // Not valid JSON at all — try as raw text
@@ -125,17 +124,6 @@ impl ClaudeRunner {
         // Extract duration
         let duration_ms = envelope.get("duration_ms").and_then(|v| v.as_u64());
 
-        // Extract permission denials
-        let permission_denials = envelope
-            .get("permission_denials")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
         // Parse the inner result text into AgentResponse
         let response = parser::parse(result_text).map_err(|_| {
             // Check if result_text itself contains error signals
@@ -152,7 +140,6 @@ impl ClaudeRunner {
             input_tokens,
             output_tokens,
             duration_ms,
-            permission_denials,
         })
     }
 
@@ -167,18 +154,14 @@ impl ClaudeRunner {
             input_tokens: None,
             output_tokens: None,
             duration_ms: None,
-            permission_denials: vec![],
         })
     }
 }
 
 impl AgentRunner for ClaudeRunner {
+    #[cfg(test)]
     fn name(&self) -> &str {
         &self.binary
-    }
-
-    fn is_available(&self) -> bool {
-        which::which(&self.binary).is_ok()
     }
 
     fn build_command(
@@ -370,7 +353,6 @@ mod tests {
         assert_eq!(parsed.input_tokens, Some(10));
         assert_eq!(parsed.output_tokens, Some(78));
         assert_eq!(parsed.duration_ms, Some(2006));
-        assert!(parsed.permission_denials.is_empty());
     }
 
     #[test]
@@ -388,7 +370,6 @@ mod tests {
         let parsed = runner().parse_response(raw).unwrap();
         assert_eq!(parsed.response.status, "done");
         assert_eq!(parsed.response.summary, "fixed bug");
-        assert_eq!(parsed.permission_denials, vec!["Bash(rm *)"]);
     }
 
     #[test]

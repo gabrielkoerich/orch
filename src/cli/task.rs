@@ -434,11 +434,10 @@ pub async fn live() -> anyhow::Result<()> {
     for session in &sessions {
         let active = tmux.is_session_active(&session.name).await;
         println!(
-            "{:<20} {:<12} {:<10} {}",
+            "{:<20} {:<12} {}",
             session.name,
             session.task_id,
             if active { "yes" } else { "no" },
-            session.created_at.format("%Y-%m-%d %H:%M"),
         );
     }
 
