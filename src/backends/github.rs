@@ -198,6 +198,29 @@ impl ExternalBackend for GitHubBackend {
             .collect())
     }
 
+    /// List all tasks (open and closed) in a single API call.
+    ///
+    /// This fetches all issues with state=all and filters by status labels locally.
+    /// More efficient than making 7 separate calls to `list_by_status`.
+    async fn list_all_tasks(&self) -> anyhow::Result<Vec<ExternalTask>> {
+        let issues = self.gh.list_all_issues(&self.repo).await?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
+            .map(|issue| ExternalTask {
+                id: ExternalId(issue.number.to_string()),
+                title: issue.title,
+                body: issue.body.unwrap_or_default(),
+                state: issue.state,
+                labels: issue.labels.into_iter().map(|l| l.name).collect(),
+                author: issue.user.login,
+                created_at: issue.created_at,
+                updated_at: issue.updated_at,
+                url: issue.html_url,
+            })
+            .collect())
+    }
+
     /// List open issues that have no `status:*` label (unprocessed) or have `status:new`.
     async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
         let issues = self.gh.list_all_open_issues(&self.repo).await?;

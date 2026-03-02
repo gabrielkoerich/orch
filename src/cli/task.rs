@@ -156,24 +156,28 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         Status::NeedsReview,
     ];
 
+    // Fetch all tasks in a single API call, then filter locally
+    let all_tasks = backend.list_all_tasks().await?;
+
     let mut counts = Vec::new();
     for s in &statuses {
-        let tasks = backend.list_by_status(*s).await?;
-        counts.push((s, tasks.len()));
+        let label = s.as_label();
+        let filtered: Vec<_> = all_tasks
+            .iter()
+            .filter(|t| t.labels.contains(&label.to_string()))
+            .collect();
+        counts.push((s, filtered.len()));
     }
 
-    // Calculate total cost across all tasks
+    // Calculate total cost across all tasks (reuse the fetched data)
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
     let mut total_cost: f64 = 0.0;
 
-    for s in &statuses {
-        let tasks = backend.list_by_status(*s).await?;
-        for task in tasks {
-            total_input_tokens += sidecar::get_u64(&task.id.0, "input_tokens");
-            total_output_tokens += sidecar::get_u64(&task.id.0, "output_tokens");
-            total_cost += sidecar::get_f64(&task.id.0, "total_cost_usd");
-        }
+    for task in &all_tasks {
+        total_input_tokens += sidecar::get_u64(&task.id.0, "input_tokens");
+        total_output_tokens += sidecar::get_u64(&task.id.0, "output_tokens");
+        total_cost += sidecar::get_f64(&task.id.0, "total_cost_usd");
     }
 
     if json {

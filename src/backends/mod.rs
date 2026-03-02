@@ -166,6 +166,30 @@ pub trait ExternalBackend: Send + Sync {
     /// List tasks by status.
     async fn list_by_status(&self, status: Status) -> anyhow::Result<Vec<ExternalTask>>;
 
+    /// List all tasks (open and closed) in a single API call.
+    ///
+    /// This is more efficient than calling `list_by_status` for each status
+    /// when you need counts or details for all statuses.
+    async fn list_all_tasks(&self) -> anyhow::Result<Vec<ExternalTask>> {
+        // Default implementation falls back to calling list_by_status for each status
+        // This will be overridden by GitHub backend for efficiency
+        let statuses = [
+            Status::New,
+            Status::Routed,
+            Status::InProgress,
+            Status::Done,
+            Status::Blocked,
+            Status::InReview,
+            Status::NeedsReview,
+        ];
+        let mut all_tasks = Vec::new();
+        for status in statuses {
+            let tasks = self.list_by_status(status).await?;
+            all_tasks.extend(tasks);
+        }
+        Ok(all_tasks)
+    }
+
     /// List open tasks that are routable — no `status:*` label yet, or `status:new`.
     ///
     /// Default implementation falls back to `list_by_status(New)`.
