@@ -50,7 +50,7 @@ Conversation history:
 ## Task fields reference
 
 Each task has: id, title, status, agent, labels, parent_id, body, summary.
-- Status lifecycle: new → routed → in_progress → blocked → needs_review → done
+- Status lifecycle: new → routed → in_progress → needs_review → in_review → done (blocked = needs human intervention)
 - Agent: "claude", "codex", "opencode", or empty (waiting to be picked up)
 
 ## Rules
