@@ -801,7 +801,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Merge detection (auto-close after PR merge) — see `check_merged_prs()` in `src/engine/cleanup.rs:229`
 - [x] Dashboard/reporting CLI command — see `src/cli/dashboard.rs`
 - [x] Graceful shutdown with session handoff — see `src/engine/mod.rs` serve() loop (signal handlers at line 770+)
-- [ ] Slack channel integration
+- [x] Slack channel integration — `src/channels/slack.rs` (polling via `conversations.history`, `chat.postMessage`, `auth.test` health check; wired in `src/engine/mod.rs:311-323`)
 - [x] Context file per issue (persistent context accumulation) — see `src/engine/runner/context.rs:40-45`
 
 ---
@@ -1249,7 +1249,7 @@ Last updated: 2026-03-01 (366 tests, ~98% parity)
 | Skills Sync (auto-clone skill repos) | Implemented | Done | See `skills_sync()` in `src/engine/sync.rs:263` (PR #158) |
 | Merge detection (auto-close after PR merge) | Implemented | Done | See `check_merged_prs()` in `src/engine/cleanup.rs` |
 | Graceful shutdown with session handoff | Implemented | Done | See `src/engine/mod.rs` serve() loop |
-| Slack channel integration | Missing | Low | Future channel addition |
+| Slack channel integration | Implemented | Done | `src/channels/slack.rs` — polling + `chat.postMessage`, wired in `src/engine/mod.rs:311-323` |
 | Context file per issue | Implemented | Done | See `src/engine/runner/context.rs:40-45` `load_task_context()` |
 
 ### Config Architecture
@@ -1357,4 +1357,11 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 ### Feature Gaps (Low Priority)
 
 - [x] Skills sync from config (auto-clone skill repos) — see `src/engine/sync.rs:263` (PR #158)
-- [ ] Slack channel integration — future channel addition
+- [x] Slack channel integration — `src/channels/slack.rs` implemented and wired into engine
+
+### Open Issues
+
+| Issue | Title | Root Cause |
+|-------|-------|-----------|
+| #316 | `orch stream` live output never arrives | `stream_task()` creates a fresh Transport with no CaptureService — `src/cli/mod.rs:294` |
+| #317 | Webhook deduplication missing | `handle_webhook` ignores `x-github-delivery` header — `src/channels/github.rs:194` |
