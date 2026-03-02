@@ -15,6 +15,7 @@
 pub mod config;
 mod llm;
 mod selection;
+mod strategies;
 pub mod weights;
 
 pub use config::RouterConfig;
@@ -126,10 +127,6 @@ impl Router {
     }
 
     /// Get the first available agent.
-    fn first_available_agent(&self) -> Option<String> {
-        self.available_agents.first().cloned()
-    }
-
     /// Pick next agent via round-robin (for review or other non-task routing).
     pub fn next_round_robin_agent(&self) -> Option<String> {
         if self.available_agents.is_empty() {
@@ -155,9 +152,9 @@ impl Router {
     /// 5. After max_route_attempts LLM failures, fall back to round-robin
     pub async fn route(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         // 1. Check for explicit agent label
-        if let Some(agent) = self.extract_agent_from_labels(&task.labels) {
+        if let Some(agent) = strategies::extract_agent_from_labels(&self.config.agents, &task.labels) {
             if self.is_agent_available(&agent) {
-                let complexity = self.extract_complexity_from_labels(&task.labels);
+                let complexity = strategies::extract_complexity_from_labels(&task.labels);
                 let model = self.config.model_for_complexity(&agent, &complexity);
                 let profile = AgentProfile {
                     role: format!("{} specialist", agent),
@@ -181,13 +178,13 @@ impl Router {
 
         // 2. Weighted round-robin — capacity-based selection
         if self.config.weighted_round_robin {
-            return self.route_weighted_round_robin(task);
+            return strategies::route_via_weighted_round_robin(&self.available_agents, &self.weights, &self.config, task);
         }
 
         // 3. Round-robin mode — use stateful round-robin
         if self.config.mode == "round_robin" {
             tracing::debug!(task_id = %task.id.0, "routing via round-robin mode");
-            return self.route_round_robin_stateful(task);
+            return strategies::route_via_round_robin_stateful(&self.available_agents, &self.config, task);
         }
 
         // 3. LLM-based routing with retry tracking
@@ -200,7 +197,7 @@ impl Router {
                 max = self.config.max_route_attempts,
                 "max LLM route attempts reached, falling back to round-robin"
             );
-            return self.route_round_robin_stateful(task);
+            return strategies::route_via_round_robin_stateful(&self.available_agents, &self.config, task);
         }
 
         // Log routing start (before await)
@@ -231,9 +228,9 @@ impl Router {
                         "falling back to round-robin after {} failed attempts",
                         new_attempts
                     );
-                    self.route_round_robin_stateful(task)
+                    strategies::route_via_round_robin_stateful(&self.available_agents, &self.config, task)
                 } else {
-                    self.route_fallback(task)
+                    strategies::route_via_fallback(&self.available_agents, &self.config, task)
                 }
             }
         }
@@ -252,241 +249,11 @@ impl Router {
         crate::sidecar::set(task_id, &[format!("route_attempts={}", attempts)])
     }
 
-    /// Extract agent from labels (e.g., "agent:claude" -> "claude").
-    /// Accepts any agent from the configured agents list.
-    fn extract_agent_from_labels(&self, labels: &[String]) -> Option<String> {
-        for label in labels {
-            if let Some(agent) = label.strip_prefix("agent:") {
-                let agent = agent.to_lowercase();
-                if self.config.agents.iter().any(|a| a == &agent) {
-                    return Some(agent);
-                }
-            }
-        }
-        None
-    }
-
-    /// Extract complexity from labels (e.g., "complexity:simple" -> "simple").
-    fn extract_complexity_from_labels(&self, labels: &[String]) -> String {
-        for label in labels {
-            if let Some(comp) = label.strip_prefix("complexity:") {
-                let comp = comp.to_lowercase();
-                if ["simple", "medium", "complex"].contains(&comp.as_str()) {
-                    return comp;
-                }
-            }
-        }
-        "medium".to_string()
-    }
-
-    /// Route using round-robin algorithm (task-ID based, stateless).
-    ///
-    /// Kept for backward compatibility and unit tests. The project prefers
-    /// the stateful `route_round_robin_stateful` (which persists an index),
-    /// but this stateless modulo-based implementation is intentionally
-    /// retained to allow deterministic selection based on task ID and for
-    /// existing tests that exercise the legacy behavior.
-    fn route_round_robin(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
-        let agents = &self.available_agents;
-        if agents.is_empty() {
-            anyhow::bail!("no agent CLIs found in PATH");
-        }
-
-        // Parse task ID as number for modulo operation
-        let task_num: usize = task.id.0.parse().unwrap_or(0);
-        let agent_idx = task_num % agents.len();
-        let agent = agents[agent_idx].clone();
-
-        let profile = AgentProfile {
-            role: "general".to_string(),
-            skills: vec![],
-            tools: self.config.allowed_tools.clone(),
-            constraints: vec![],
-        };
-
-        Ok(RouteResult {
-            agent: agent.clone(),
-            model: self.config.model_for_complexity(&agent, "medium"),
-            complexity: "medium".to_string(),
-            reason: format!("round_robin (task {} % {} agents)", task.id.0, agents.len()),
-            profile,
-            selected_skills: self.config.default_skills.clone(),
-            warning: None,
-        })
-    }
-
-    /// Stateful round-robin: cycles through agents using a persistent index,
-    /// skipping the last-used agent when possible.
-    fn route_round_robin_stateful(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
-        let agents = &self.available_agents;
-        if agents.is_empty() {
-            anyhow::bail!("no agent CLIs found in PATH");
-        }
-
-        // Get current round-robin index from sidecar KV
-        let current_idx: usize = crate::sidecar::get("_router", "rr_index")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        // Get last routed agent
-        let last_agent = crate::sidecar::get("_router", "last_agent").ok();
-
-        // Pick the next agent, skipping last-used if we have >1 agent
-        let mut agent_idx = current_idx % agents.len();
-        if agents.len() > 1 {
-            if let Some(ref last) = last_agent {
-                if agents.get(agent_idx).map(|a| a.as_str()) == Some(last.as_str()) {
-                    agent_idx = (agent_idx + 1) % agents.len();
-                }
-            }
-        }
-
-        let agent = agents[agent_idx].clone();
-
-        // Persist the next index and last agent
-        let next_idx = (agent_idx + 1) % agents.len();
-        if let Err(e) = crate::sidecar::set(
-            "_router",
-            &[
-                format!("rr_index={}", next_idx),
-                format!("last_agent={}", agent),
-            ],
-        ) {
-            tracing::warn!(error = ?e, "failed to persist round-robin state");
-        }
-
-        let complexity = self.extract_complexity_from_labels(&task.labels);
-        let model = self.config.model_for_complexity(&agent, &complexity);
-
-        let profile = AgentProfile {
-            role: "general".to_string(),
-            skills: vec![],
-            tools: self.config.allowed_tools.clone(),
-            constraints: vec![],
-        };
-
-        Ok(RouteResult {
-            agent: agent.clone(),
-            model,
-            complexity,
-            reason: format!(
-                "round_robin (index {} of {} agents)",
-                agent_idx,
-                agents.len()
-            ),
-            profile,
-            selected_skills: self.config.default_skills.clone(),
-            warning: None,
-        })
-    }
-
-    /// Weighted round-robin: selects an agent based on capacity weights.
-    ///
-    /// Agents with higher weights (more capacity) get more tasks.
-    /// Rate-limited agents have reduced weights and receive fewer tasks.
-    fn route_weighted_round_robin(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
-        let agents = &self.available_agents;
-        if agents.is_empty() {
-            anyhow::bail!("no agent CLIs found in PATH");
-        }
-
-        let agent = self
-            .weights
-            .weighted_select(agents, &task.id.0)
-            .unwrap_or_else(|| agents[0].clone());
-
-        let weight = self.weights.get_weight(&agent);
-        let complexity = self.extract_complexity_from_labels(&task.labels);
-        let model = self.config.model_for_complexity(&agent, &complexity);
-
-        // Build weight summary for reason
-        let weight_summary: Vec<String> = self
-            .weights
-            .snapshot()
-            .iter()
-            .filter(|(a, _, _)| agents.contains(a))
-            .map(|(a, w, _)| format!("{a}={w:.2}"))
-            .collect();
-
-        let profile = AgentProfile {
-            role: "general".to_string(),
-            skills: vec![],
-            tools: self.config.allowed_tools.clone(),
-            constraints: vec![],
-        };
-
-        // Track last agent
-        let _ = crate::sidecar::set("_router", &[format!("last_agent={}", agent)]);
-
-        let reason = format!(
-            "weighted_round_robin (weight={weight:.2}, weights=[{}])",
-            weight_summary.join(", ")
-        );
-
-        tracing::info!(
-            task_id = %task.id.0,
-            agent = %agent,
-            weight,
-            "weighted round-robin selected agent"
-        );
-
-        Ok(RouteResult {
-            agent,
-            model,
-            complexity,
-            reason,
-            profile,
-            selected_skills: self.config.default_skills.clone(),
-            warning: None,
-        })
-    }
-
     /// Route using LLM classification. Delegates to `self.llm_router`.
     async fn route_with_llm(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         self.llm_router
             .route_with_llm(task, &self.available_agents, &self.config)
             .await
-    }
-
-    /// Fallback routing when LLM fails.
-    ///
-    /// If `fallback_executor` is "round_robin", uses round-robin selection.
-    /// Otherwise uses the named agent, falling back to first available.
-    fn route_fallback(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
-        if self.config.fallback_executor == "round_robin" {
-            return self.route_round_robin(task).map(|mut r| {
-                r.reason = format!("router failed; fallback round_robin → {}", r.agent);
-                r
-            });
-        }
-
-        let agent = if self.is_agent_available(&self.config.fallback_executor) {
-            self.config.fallback_executor.clone()
-        } else {
-            self.first_available_agent()
-                .ok_or_else(|| anyhow::anyhow!("no agents available"))?
-        };
-
-        let complexity = self.extract_complexity_from_labels(&task.labels);
-        let model = self.config.model_for_complexity(&agent, &complexity);
-
-        let profile = AgentProfile {
-            role: "general".to_string(),
-            skills: vec![],
-            tools: self.config.allowed_tools.clone(),
-            constraints: vec![],
-        };
-
-        Ok(RouteResult {
-            agent: agent.clone(),
-            model,
-            complexity,
-            reason: format!("router failed; fallback to {agent}"),
-            profile,
-            selected_skills: self.config.default_skills.clone(),
-            warning: None,
-        })
     }
 
     /// Record a rate limit event for an agent, reducing its routing weight.
@@ -569,9 +336,9 @@ mod tests {
     use crate::backends::{ExternalId, ExternalTask};
     use super::config::DEFAULT_AGENTS;
     use super::llm::LlmRouteResponse;
+    use super::strategies;
     use super::weights::{
-        AgentWeights, DEFAULT_WEIGHT, MIN_WEIGHT, RATE_LIMIT_DECAY, RECOVERY_DELAY, RECOVERY_RATE,
-        RateLimitState,
+        AgentWeights, DEFAULT_WEIGHT, MIN_WEIGHT, RATE_LIMIT_DECAY, RECOVERY_DELAY, RateLimitState,
     };
     use std::time::{Duration, Instant};
 
@@ -609,31 +376,30 @@ mod tests {
     #[test]
     fn extract_agent_from_labels() {
         let config = RouterConfig::default();
-        let router = Router::new(config);
 
         assert_eq!(
-            router.extract_agent_from_labels(&["agent:claude".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["agent:claude".to_string()]),
             Some("claude".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&["agent:codex".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["agent:codex".to_string()]),
             Some("codex".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&["agent:opencode".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["agent:opencode".to_string()]),
             Some("opencode".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&["status:new".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["status:new".to_string()]),
             None
         );
         // Verify kimi and minimax are recognized from labels
         assert_eq!(
-            router.extract_agent_from_labels(&["agent:kimi".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["agent:kimi".to_string()]),
             Some("kimi".to_string())
         );
         assert_eq!(
-            router.extract_agent_from_labels(&["agent:minimax".to_string()]),
+            strategies::extract_agent_from_labels(&config.agents, &["agent:minimax".to_string()]),
             Some("minimax".to_string())
         );
     }
@@ -648,23 +414,20 @@ mod tests {
 
     #[test]
     fn extract_complexity_from_labels() {
-        let config = RouterConfig::default();
-        let router = Router::new(config);
-
         assert_eq!(
-            router.extract_complexity_from_labels(&["complexity:simple".to_string()]),
+            strategies::extract_complexity_from_labels(&["complexity:simple".to_string()]),
             "simple"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&["complexity:medium".to_string()]),
+            strategies::extract_complexity_from_labels(&["complexity:medium".to_string()]),
             "medium"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&["complexity:complex".to_string()]),
+            strategies::extract_complexity_from_labels(&["complexity:complex".to_string()]),
             "complex"
         );
         assert_eq!(
-            router.extract_complexity_from_labels(&["status:new".to_string()]),
+            strategies::extract_complexity_from_labels(&["status:new".to_string()]),
             "medium"
         );
     }
@@ -1001,7 +764,7 @@ Hope that helps!"#;
         };
 
         let task = create_test_task("1", "Test task", vec![]);
-        let result = router.route_round_robin(&task).unwrap();
+        let result = strategies::route_via_round_robin(&router.available_agents, &router.config, &task).unwrap();
 
         // Task 1 % 2 agents = agent at index 1 = codex
         assert_eq!(result.agent, "codex");
