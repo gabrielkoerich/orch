@@ -14,14 +14,14 @@
 
 pub mod config;
 mod llm;
+mod selection;
+pub mod weights;
 
 pub use config::RouterConfig;
+pub use weights::AgentWeights;
 
 use crate::backends::ExternalTask;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use llm::LlmRouter;
 
@@ -55,237 +55,6 @@ pub struct AgentProfile {
     pub tools: Vec<String>,
     /// Constraints for this task
     pub constraints: Vec<String>,
-}
-
-/// Default weight for agents with full capacity.
-const DEFAULT_WEIGHT: f64 = 1.0;
-
-/// Minimum weight — an agent never drops below this (still gets occasional tasks).
-const MIN_WEIGHT: f64 = 0.05;
-
-/// How much to reduce weight on each rate limit hit (multiplicative decay).
-const RATE_LIMIT_DECAY: f64 = 0.3;
-
-/// Duration after which a rate-limited agent starts recovering weight.
-const RECOVERY_DELAY: Duration = Duration::from_secs(60);
-
-/// Per-tick weight recovery amount (additive, applied each routing call).
-const RECOVERY_RATE: f64 = 0.1;
-
-/// Global sequence counter to decorrelate hash inputs across rapid calls.
-static HASH_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Rate limit state for a single agent.
-#[derive(Debug, Clone)]
-pub struct RateLimitState {
-    /// Current routing weight (0.0..=1.0). Higher = more tasks.
-    pub weight: f64,
-    /// When the last rate limit error was recorded.
-    pub last_limited_at: Option<Instant>,
-    /// How many consecutive rate limit hits.
-    pub consecutive_hits: u32,
-}
-
-impl Default for RateLimitState {
-    fn default() -> Self {
-        Self {
-            weight: DEFAULT_WEIGHT,
-            last_limited_at: None,
-            consecutive_hits: 0,
-        }
-    }
-}
-
-impl RateLimitState {
-    /// Record a rate limit event — decay the weight.
-    pub fn record_rate_limit(&mut self) {
-        self.consecutive_hits += 1;
-        self.weight = (self.weight * RATE_LIMIT_DECAY).max(MIN_WEIGHT);
-        self.last_limited_at = Some(Instant::now());
-    }
-
-    /// Record a successful completion — bump weight back toward 1.0.
-    pub fn record_success(&mut self) {
-        self.consecutive_hits = 0;
-        self.weight = (self.weight + RECOVERY_RATE).min(DEFAULT_WEIGHT);
-    }
-
-    /// Tick recovery: if enough time has passed since the last limit, gradually restore.
-    pub fn maybe_recover(&mut self) {
-        if let Some(last) = self.last_limited_at {
-            if last.elapsed() >= RECOVERY_DELAY {
-                self.weight = (self.weight + RECOVERY_RATE).min(DEFAULT_WEIGHT);
-                if self.weight >= DEFAULT_WEIGHT {
-                    self.last_limited_at = None;
-                    self.consecutive_hits = 0;
-                }
-            }
-        }
-    }
-
-    /// Is this agent currently rate-limited (weight below full)?
-    pub fn is_limited(&self) -> bool {
-        self.weight < DEFAULT_WEIGHT
-    }
-}
-
-/// Tracks per-agent weights for weighted round-robin routing.
-#[derive(Debug, Clone, Default)]
-pub struct AgentWeights {
-    pub states: HashMap<String, RateLimitState>,
-}
-
-impl AgentWeights {
-    /// Ensure all available agents have an entry.
-    pub fn ensure_agents(&mut self, agents: &[String]) {
-        for agent in agents {
-            self.states.entry(agent.clone()).or_default();
-        }
-    }
-
-    /// Record a rate limit event for an agent.
-    pub fn record_rate_limit(&mut self, agent: &str) {
-        self.states
-            .entry(agent.to_string())
-            .or_default()
-            .record_rate_limit();
-        tracing::info!(
-            agent,
-            weight = self.states[agent].weight,
-            hits = self.states[agent].consecutive_hits,
-            "agent weight reduced (rate limit)"
-        );
-    }
-
-    /// Record a successful task completion for an agent.
-    pub fn record_success(&mut self, agent: &str) {
-        self.states
-            .entry(agent.to_string())
-            .or_default()
-            .record_success();
-    }
-
-    /// Tick recovery for all agents.
-    pub fn tick_recovery(&mut self) {
-        for (agent, state) in &mut self.states {
-            let was_limited = state.is_limited();
-            state.maybe_recover();
-            if was_limited && !state.is_limited() {
-                tracing::info!(agent, "agent weight fully recovered");
-            }
-        }
-    }
-
-    /// Select an agent by weighted probability from the given list.
-    ///
-    /// Uses a simple weighted random selection: each agent's probability is
-    /// proportional to its weight. If all weights are zero (shouldn't happen
-    /// due to MIN_WEIGHT), falls back to uniform selection.
-    pub fn weighted_select(&self, agents: &[String], task_id: &str) -> Option<String> {
-        if agents.is_empty() {
-            return None;
-        }
-
-        let weights: Vec<f64> = agents
-            .iter()
-            .map(|a| {
-                self.states
-                    .get(a)
-                    .map(|s| s.weight)
-                    .unwrap_or(DEFAULT_WEIGHT)
-            })
-            .collect();
-
-        let total: f64 = weights.iter().sum();
-        if total <= 0.0 {
-            // Safety fallback: uniform random
-            let idx = simple_hash_index_for(agents.len(), task_id);
-            return Some(agents[idx].clone());
-        }
-
-        // Deterministic-ish selection using a hash of the current time
-        // to avoid requiring rand crate. Good enough for load distribution.
-        let pick = simple_hash_fraction_for(task_id) * total;
-        let mut cumulative = 0.0;
-        for (i, w) in weights.iter().enumerate() {
-            cumulative += w;
-            if pick < cumulative {
-                return Some(agents[i].clone());
-            }
-        }
-
-        // Rounding edge case — return last agent
-        Some(agents.last().unwrap().clone())
-    }
-
-    /// Get the current weight for an agent.
-    pub fn get_weight(&self, agent: &str) -> f64 {
-        self.states
-            .get(agent)
-            .map(|s| s.weight)
-            .unwrap_or(DEFAULT_WEIGHT)
-    }
-
-    /// Get a snapshot of all agent weights (for logging/debugging).
-    pub fn snapshot(&self) -> Vec<(String, f64, u32)> {
-        let mut snap: Vec<_> = self
-            .states
-            .iter()
-            .map(|(a, s)| (a.clone(), s.weight, s.consecutive_hits))
-            .collect();
-        snap.sort_by(|a, b| a.0.cmp(&b.0));
-        snap
-    }
-}
-
-/// Simple deterministic-ish fraction [0.0, 1.0) based on time + task data.
-/// Not cryptographic, but sufficient for load distribution.
-fn simple_hash_fraction_for(task_id: &str) -> f64 {
-    // Use SystemTime since Instant::now().elapsed() measures time since
-    // the instant was created and is nearly always ~0 here. SystemTime
-    // gives a clock relative to the UNIX epoch which varies across calls.
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-
-    let seq = HASH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let task_hash = hash_task_id(task_id);
-    let seed = nanos ^ seq ^ task_hash;
-
-    // Mix bits using a simple hash
-    let hash = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (hash % 10000) as f64 / 10000.0
-}
-
-/// Simple index selection using instant-based hash.
-fn simple_hash_index_for(len: usize, task_id: &str) -> usize {
-    if len == 0 {
-        return 0;
-    }
-
-    // Use SystemTime for a variable seed instead of Instant::now().elapsed().
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-
-    let seq = HASH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let task_hash = hash_task_id(task_id);
-    let seed = nanos ^ seq ^ task_hash;
-
-    let hash = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (hash as usize) % len
-}
-
-fn hash_task_id(task_id: &str) -> u64 {
-    task_id
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
 }
 
 /// The agent router.
@@ -800,6 +569,11 @@ mod tests {
     use crate::backends::{ExternalId, ExternalTask};
     use super::config::DEFAULT_AGENTS;
     use super::llm::LlmRouteResponse;
+    use super::weights::{
+        AgentWeights, DEFAULT_WEIGHT, MIN_WEIGHT, RATE_LIMIT_DECAY, RECOVERY_DELAY, RECOVERY_RATE,
+        RateLimitState,
+    };
+    use std::time::{Duration, Instant};
 
     // Test-only delegates so tests can call router.parse_llm_response() and
     // router.check_routing_sanity() directly without referencing llm_router.
