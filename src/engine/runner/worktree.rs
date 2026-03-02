@@ -27,7 +27,7 @@ pub fn branch_name(task_id: &str, title: &str) -> String {
     let raw: String = title
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
 
     // Collapse consecutive dashes and trim
@@ -413,6 +413,33 @@ mod tests {
         let name = branch_name("10", "--- ??? ---");
         assert_eq!(name, "gh-task-10");
         assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn branch_name_chinese_chars_no_panic() {
+        // Non-ASCII alphanumeric chars must not be kept in the slug — byte-offset
+        // truncation at &slug[..40] would panic if a multi-byte char straddles byte 40.
+        let name = branch_name("265", "implement 用户认证 user auth");
+        assert!(name.starts_with("gh-task-265-"));
+        assert!(!name.is_empty());
+        let slug = name.strip_prefix("gh-task-265-").unwrap();
+        assert!(slug.len() <= 40, "slug too long: {}", slug.len());
+        assert!(slug.is_ascii(), "slug contains non-ASCII: {slug}");
+    }
+
+    #[test]
+    fn branch_name_emoji_no_panic() {
+        let name = branch_name("265", "fix 🚀 deployment pipeline 🔥");
+        assert!(name.starts_with("gh-task-265-"));
+        let slug = name.strip_prefix("gh-task-265-").unwrap();
+        assert!(slug.is_ascii(), "slug contains non-ASCII: {slug}");
+    }
+
+    #[test]
+    fn branch_name_all_non_ascii_falls_back_to_task_id() {
+        // Title with only non-ASCII chars → empty slug → task-id only fallback
+        let name = branch_name("265", "用户认证 실행 тест");
+        assert_eq!(name, "gh-task-265");
     }
 
     #[test]
