@@ -344,9 +344,9 @@ async fn execute_command(
         }
 
         OwnerCommand::Review => {
-            backend.update_status(task_id, Status::InReview).await?;
+            backend.update_status(task_id, Status::NeedsReview).await?;
             Ok(
-                "`/review` — set `status:in_review`, review agent will pick up on next sync"
+                "`/review` — set `status:needs_review`, review agent will pick up on next tick"
                     .to_string(),
             )
         }

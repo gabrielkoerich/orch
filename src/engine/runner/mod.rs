@@ -460,7 +460,7 @@ impl TaskRunner {
                 // If agent said "done" but NO PR (push failed, no changes, etc.), don't mark done
                 // — that would close the task without delivering any code.
                 let final_status = if resp.status == "done" && has_pr {
-                    "in_review"
+                    "needs_review"
                 } else if resp.status == "done" && !has_pr {
                     tracing::warn!(
                         task_id,

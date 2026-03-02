@@ -500,17 +500,29 @@ pub async fn serve() -> anyhow::Result<()> {
     // Channel for weight signals from task runners back to the router
     let (weight_tx, mut weight_rx) = mpsc::channel::<WeightSignal>(64);
 
-    // Reset stale review_started flags on startup (prevents stuck reviews after restart)
+    // Reset stale InReview tasks on startup — if a review agent was running when
+    // the engine restarted, the tmux session is gone. Move back to NeedsReview
+    // so the next tick re-triggers the review agent.
     for engine in &project_engines {
         if let Ok(in_review) = engine.backend.list_by_status(Status::InReview).await {
             for task in &in_review {
-                let _ = sidecar::set(&task.id.0, &["review_started=false".to_string()]);
+                if let Err(e) = engine
+                    .backend
+                    .update_status(&task.id, Status::NeedsReview)
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        err = %e,
+                        "failed to reset stale InReview task on startup"
+                    );
+                }
             }
             if !in_review.is_empty() {
                 tracing::info!(
                     repo = %engine.repo,
                     count = in_review.len(),
-                    "reset review_started flags on startup"
+                    "reset stale InReview tasks to NeedsReview on startup"
                 );
             }
         }
@@ -1052,65 +1064,73 @@ async fn tick_dispatch_tasks(
                         summary: summary.clone(),
                     });
 
-                    // Trigger review agent for in_review tasks (PR exists, needs review)
+                    // Trigger review agent for needs_review tasks (PR exists, queued for review)
                     tracing::debug!(task_id, %status, "checking review trigger");
-                    if status == "in_review" {
+                    if status == "needs_review" {
                         let enable_review = config::get("workflow.enable_review_agent")
                             .map(|v| v != "false")
                             .unwrap_or(true);
-                        // Guard against duplicate review spawns
-                        let already_reviewing = sidecar::get(&task_id, "review_started")
-                            .map(|v| v == "true")
-                            .unwrap_or(false);
-                        tracing::info!(
-                            task_id,
-                            enable_review,
-                            already_reviewing,
-                            "review gate check"
-                        );
-                        if enable_review && !already_reviewing {
-                            let _ = sidecar::set(&task_id, &["review_started=true".to_string()]);
-                            let backend_clone = backend.clone();
-                            let tmux_clone = tmux.clone();
-                            let task_owned_clone = task_owned.clone();
-                            let router_for_review = router_clone.clone();
-                            let task_id_for_review = task_id.clone();
-                            tokio::spawn(async move {
-                                match review_and_merge(
-                                    &task_owned_clone,
-                                    &backend_clone,
-                                    &tmux_clone,
-                                    &repo_owned,
-                                    &router_for_review,
+                        tracing::info!(task_id, enable_review, "review gate check");
+                        if enable_review {
+                            // Transition to InReview — this IS the guard against duplicates
+                            if let Err(e) = backend
+                                .update_status(
+                                    &crate::backends::ExternalId(task_id.clone()),
+                                    Status::InReview,
                                 )
                                 .await
-                                {
-                                    Ok(ReviewDecision::Failed(reason)) => {
-                                        tracing::error!(
-                                            task_id = task_id_for_review,
-                                            reason,
-                                            "review agent failed — resetting review_started for retry"
-                                        );
-                                        // Reset so the next tick retries with a different agent
-                                        let _ = sidecar::set(
-                                            &task_id_for_review,
-                                            &["review_started=false".to_string()],
-                                        );
+                            {
+                                tracing::warn!(task_id, err = %e, "failed to transition to InReview");
+                            } else {
+                                let backend_clone = backend.clone();
+                                let tmux_clone = tmux.clone();
+                                let task_owned_clone = task_owned.clone();
+                                let router_for_review = router_clone.clone();
+                                let task_id_for_review = task_id.clone();
+                                tokio::spawn(async move {
+                                    match review_and_merge(
+                                        &task_owned_clone,
+                                        &backend_clone,
+                                        &tmux_clone,
+                                        &repo_owned,
+                                        &router_for_review,
+                                    )
+                                    .await
+                                    {
+                                        Ok(ReviewDecision::Failed(reason)) => {
+                                            tracing::error!(
+                                                task_id = task_id_for_review,
+                                                reason,
+                                                "review agent failed — resetting to NeedsReview for retry"
+                                            );
+                                            let _ = backend_clone
+                                                .update_status(
+                                                    &crate::backends::ExternalId(
+                                                        task_id_for_review,
+                                                    ),
+                                                    Status::NeedsReview,
+                                                )
+                                                .await;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                task_id = task_id_for_review,
+                                                error = %e,
+                                                "review_and_merge failed — resetting to NeedsReview for retry"
+                                            );
+                                            let _ = backend_clone
+                                                .update_status(
+                                                    &crate::backends::ExternalId(
+                                                        task_id_for_review,
+                                                    ),
+                                                    Status::NeedsReview,
+                                                )
+                                                .await;
+                                        }
+                                        Ok(_) => {} // Approve or RequestChanges handled inside
                                     }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            task_id = task_id_for_review,
-                                            error = %e,
-                                            "review_and_merge failed — resetting review_started for retry"
-                                        );
-                                        let _ = sidecar::set(
-                                            &task_id_for_review,
-                                            &["review_started=false".to_string()],
-                                        );
-                                    }
-                                    Ok(_) => {} // Approve or RequestChanges handled inside
-                                }
-                            });
+                                });
+                            }
                         }
                     }
                 }
@@ -1310,48 +1330,77 @@ async fn sync_tick(
         tracing::warn!(err = %e, "PR review failed");
     }
 
-    // 5. Trigger review agent for in_review tasks not yet reviewed
+    // 5. Trigger review agent for needs_review tasks (catch-up for any missed in main tick)
     let enable_review = config::get("workflow.enable_review_agent")
         .map(|v| v != "false")
         .unwrap_or(true);
     if enable_review {
+        if let Ok(needs_review) = backend.list_by_status(Status::NeedsReview).await {
+            for task in needs_review {
+                let task_id = &task.id.0;
+                // Only trigger review for tasks that have a branch (i.e., PR exists)
+                let has_branch = sidecar::get(task_id, "branch")
+                    .map(|b| !b.is_empty())
+                    .unwrap_or(false);
+                if !has_branch {
+                    continue;
+                }
+                tracing::info!(task_id, "triggering review agent for needs_review task");
+                // Transition to InReview — this IS the guard against duplicates
+                if let Err(e) = backend.update_status(&task.id, Status::InReview).await {
+                    tracing::warn!(task_id, err = %e, "failed to transition to InReview");
+                    continue;
+                }
+                let backend_c = backend.clone();
+                let tmux_c = tmux.clone();
+                let task_c = task.clone();
+                let repo_s = repo.to_string();
+                let router_c = router.clone();
+                tokio::spawn(async move {
+                    let tid = task_c.id.0.clone();
+                    match review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c).await {
+                        Ok(ReviewDecision::Failed(reason)) => {
+                            tracing::error!(
+                                task_id = tid,
+                                reason,
+                                "review agent failed — resetting to NeedsReview for retry"
+                            );
+                            let _ = backend_c
+                                .update_status(
+                                    &crate::backends::ExternalId(tid),
+                                    Status::NeedsReview,
+                                )
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = tid, error = %e,
+                                "review_and_merge failed — resetting to NeedsReview for retry"
+                            );
+                            let _ = backend_c
+                                .update_status(
+                                    &crate::backends::ExternalId(tid),
+                                    Status::NeedsReview,
+                                )
+                                .await;
+                        }
+                        Ok(_) => {}
+                    }
+                });
+            }
+        }
+
+        // Detect stale InReview tasks (review agent crashed, no active tmux session)
         if let Ok(in_review) = backend.list_by_status(Status::InReview).await {
             for task in in_review {
-                let task_id = &task.id.0;
-                let already = sidecar::get(task_id, "review_started")
-                    .map(|v| v == "true")
-                    .unwrap_or(false);
-                if !already {
-                    tracing::info!(task_id, "triggering review agent for in_review task");
-                    let _ = sidecar::set(task_id, &["review_started=true".to_string()]);
-                    let backend_c = backend.clone();
-                    let tmux_c = tmux.clone();
-                    let task_c = task.clone();
-                    let repo_s = repo.to_string();
-                    let router_c = router.clone();
-                    tokio::spawn(async move {
-                        let tid = task_c.id.0.clone();
-                        match review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c)
-                            .await
-                        {
-                            Ok(ReviewDecision::Failed(reason)) => {
-                                tracing::error!(
-                                    task_id = tid,
-                                    reason,
-                                    "review agent failed — resetting for retry"
-                                );
-                                let _ = sidecar::set(&tid, &["review_started=false".to_string()]);
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    task_id = tid, error = %e,
-                                    "review_and_merge failed — resetting for retry"
-                                );
-                                let _ = sidecar::set(&tid, &["review_started=false".to_string()]);
-                            }
-                            Ok(_) => {}
-                        }
-                    });
+                let review_session = format!("{}-review", task.id.0);
+                let has_session = tmux.session_exists(&review_session).await;
+                if !has_session {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        "InReview task has no active review session — resetting to NeedsReview"
+                    );
+                    let _ = backend.update_status(&task.id, Status::NeedsReview).await;
                 }
             }
         }
@@ -1640,16 +1689,21 @@ async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
 
 /// Check for merged PRs and update task status accordingly.
 ///
-/// Queries status:in_review tasks, checks if their PR is merged,
-/// and updates status to done if merged.
+/// Queries status:in_review and status:needs_review tasks, checks if their PR
+/// is merged, and updates status to done if merged.
 async fn check_merged_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<()> {
     let in_review_tasks = backend.list_by_status(Status::InReview).await?;
+    let needs_review_tasks = backend.list_by_status(Status::NeedsReview).await?;
+    let all_review_tasks: Vec<_> = in_review_tasks
+        .into_iter()
+        .chain(needs_review_tasks)
+        .collect();
     tracing::debug!(
-        count = in_review_tasks.len(),
-        "checking in_review tasks for merged PRs"
+        count = all_review_tasks.len(),
+        "checking review tasks for merged PRs"
     );
 
-    for task in in_review_tasks {
+    for task in all_review_tasks {
         let task_id = &task.id.0;
 
         // Get branch from sidecar
@@ -1948,10 +2002,10 @@ async fn review_open_prs(
                             task_id,
                             pr_number,
                             retries,
-                            "PR approved but merge conflict retry limit reached — needs human review"
+                            "PR approved but merge conflict retry limit reached — blocking for human review"
                         );
-                        if let Err(e) = backend.update_status(&task.id, Status::NeedsReview).await {
-                            tracing::warn!(task_id, err = %e, "failed to set NeedsReview");
+                        if let Err(e) = backend.update_status(&task.id, Status::Blocked).await {
+                            tracing::warn!(task_id, err = %e, "failed to set Blocked");
                         }
                         continue;
                     }
@@ -1963,14 +2017,14 @@ async fn review_open_prs(
                     );
                     if let Err(e) = sidecar::set(
                         task_id,
-                        &[
-                            "review_started=false".to_string(),
-                            format!("merge_conflict_retries={}", retries + 1),
-                        ],
+                        &[format!("merge_conflict_retries={}", retries + 1)],
                     ) {
-                        tracing::warn!(task_id, err = %e, "failed to reset review_started flag");
+                        tracing::warn!(task_id, err = %e, "failed to update merge_conflict_retries");
                     }
-                    // Keep InReview — next tick re-triggers review agent
+                    // Set NeedsReview — next tick re-triggers review agent
+                    if let Err(e) = backend.update_status(&task.id, Status::NeedsReview).await {
+                        tracing::warn!(task_id, err = %e, "failed to set NeedsReview for conflict retry");
+                    }
                     continue;
                 }
 
@@ -2128,10 +2182,6 @@ async fn review_open_prs(
                 tracing::warn!(task_id, err = %e, "failed to update last_review_ts");
             }
 
-            // Re-dispatch: reset review_started so the next completion triggers review again
-            if let Err(e) = sidecar::set(task_id, &["review_started=false".to_string()]) {
-                tracing::warn!(task_id, err = %e, "failed to reset review_started");
-            }
             if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
                 tracing::warn!(task_id, err = %e, "failed to set status to routed for re-dispatch");
             } else {
@@ -2531,9 +2581,9 @@ async fn auto_merge_pr(
                 if start.elapsed() >= max_wait {
                     tracing::warn!(
                         task_id = task.id.0,
-                        "CI failing, re-dispatching agent to fix"
+                        "CI failing — setting NeedsReview so review agent can fix"
                     );
-                    backend.update_status(&task.id, Status::Routed).await?;
+                    backend.update_status(&task.id, Status::NeedsReview).await?;
                     return Ok(());
                 }
             }
@@ -2541,8 +2591,8 @@ async fn auto_merge_pr(
                 // pending
                 if start.elapsed() >= max_wait {
                     tracing::warn!(task_id = task.id.0, "CI checks still pending after timeout");
-                    // Keep in_review so the next engine tick re-checks
-                    backend.update_status(&task.id, Status::InReview).await?;
+                    // Set NeedsReview so the next engine tick re-triggers review
+                    backend.update_status(&task.id, Status::NeedsReview).await?;
                     return Ok(());
                 }
             }
@@ -2574,7 +2624,7 @@ async fn auto_merge_pr(
                     retries,
                     "merge conflict retry limit reached"
                 );
-                backend.update_status(&task.id, Status::NeedsReview).await?;
+                backend.update_status(&task.id, Status::Blocked).await?;
                 let _ = gh
                     .add_comment(
                         repo,
@@ -2595,18 +2645,16 @@ async fn auto_merge_pr(
             );
             let _ = sidecar::set(
                 &task.id.0,
-                &[
-                    "review_started=false".to_string(),
-                    format!("merge_conflict_retries={}", retries + 1),
-                ],
+                &[format!("merge_conflict_retries={}", retries + 1)],
             );
-            // Keep InReview — next tick will re-trigger review agent
+            // Set NeedsReview — next tick will re-trigger review agent
+            backend.update_status(&task.id, Status::NeedsReview).await?;
             return Ok(());
         }
 
         // Non-conflict merge failure (permissions, branch protection, etc.)
-        tracing::error!(task_id = task.id.0, error = %e, "merge failed");
-        backend.update_status(&task.id, Status::NeedsReview).await?;
+        tracing::error!(task_id = task.id.0, error = %e, "merge failed — blocking for human review");
+        backend.update_status(&task.id, Status::Blocked).await?;
         let _ = gh
             .add_comment(
                 repo,
@@ -2677,9 +2725,9 @@ async fn handle_review_changes(
             task_id = task.id.0,
             review_cycles,
             max_cycles,
-            "max review cycles exceeded, escalating to human"
+            "max review cycles exceeded, blocking for human review"
         );
-        backend.update_status(&task.id, Status::NeedsReview).await?;
+        backend.update_status(&task.id, Status::Blocked).await?;
         let escalation = format!(
             "🔍 Review agent requested changes after {} cycles. Escalating to human.\n\n**Review Notes:**\n{}",
             review_cycles, notes
@@ -2730,7 +2778,6 @@ async fn handle_review_changes(
             format!("review_cycles={}", review_cycles + 1),
             format!("review_notes={}", notes),
             format!("pr_review_context={}", review_context),
-            "review_started=false".to_string(),
             "status=routed".to_string(),
         ],
     );
