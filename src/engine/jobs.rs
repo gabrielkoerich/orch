@@ -673,9 +673,9 @@ struct ImprovementIssue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
     use crate::db::Db;
+    use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
     /// Minimal backend that always returns a configurable error from `get_task`,
@@ -818,16 +818,22 @@ mod tests {
 
     #[test]
     fn is_not_found_error_detects_404() {
-        let e = anyhow::anyhow!("GitHub API GET https://api.github.com/repos/foo/bar/issues/1 failed (404): Not Found");
+        let e = anyhow::anyhow!(
+            "GitHub API GET https://api.github.com/repos/foo/bar/issues/1 failed (404): Not Found"
+        );
         assert!(is_not_found_error(&e));
     }
 
     #[test]
     fn is_not_found_error_ignores_transient() {
-        let rate_limit = anyhow::anyhow!("GitHub API GET https://api.github.com/... failed (429): rate limit exceeded");
+        let rate_limit = anyhow::anyhow!(
+            "GitHub API GET https://api.github.com/... failed (429): rate limit exceeded"
+        );
         assert!(!is_not_found_error(&rate_limit));
 
-        let server_err = anyhow::anyhow!("GitHub API GET https://api.github.com/... failed (500): Internal Server Error");
+        let server_err = anyhow::anyhow!(
+            "GitHub API GET https://api.github.com/... failed (500): Internal Server Error"
+        );
         assert!(!is_not_found_error(&server_err));
 
         let network_err = anyhow::anyhow!("connection refused");
