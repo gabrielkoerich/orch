@@ -8,18 +8,28 @@
 //! 5. Handles errors (reroute on limits, fallback agents)
 //! 6. Auto-commits, pushes, and creates PRs
 //! 7. Updates status labels and posts result comments
+//!
+//! Submodules handle the heavy lifting:
+//! - [`task_init`] — guard checks, worktree setup, and invocation building
+//! - [`session`] — tmux session lifecycle and output collection
+//! - [`response_handler`] — success path: commit, push, PR, token storage, budget
+//! - [`fallback`] — error classification and recovery strategies
 
 pub mod agent;
 pub mod agents;
 pub mod context;
+pub mod fallback;
 pub mod git_ops;
 pub mod response;
+pub mod response_handler;
+pub mod session;
+pub mod task_init;
 pub mod worktree;
 
-use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
+use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::db::{Db, InsertTaskMetric};
-use crate::engine::router::{get_route_result, RouteResult};
+use crate::engine::router::RouteResult;
 use crate::security;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
@@ -27,7 +37,6 @@ use chrono::Utc;
 pub use response::WeightSignal;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::time::{timeout, Duration};
 
 /// Task runner configuration.
 pub struct TaskRunner {
@@ -57,9 +66,6 @@ impl TaskRunner {
         self
     }
 
-    /// Maximum task execution time (30 minutes).
-    const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-
     /// Run a task through the full execution pipeline.
     ///
     /// This is the main entry point called by the engine dispatch loop.
@@ -80,217 +86,41 @@ impl TaskRunner {
             "starting task execution"
         );
 
-        // Load sidecar state
-        let attempts: u32 = sidecar::get(task_id, "attempts")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        // Guard: skip needs_review tasks
-        let current_status = sidecar::get(task_id, "status").unwrap_or_default();
-        if current_status == "needs_review" {
-            tracing::info!(task_id, "skipping needs_review task");
-            return Ok(());
-        }
-
-        // Check max attempts
-        let max_attempts: u32 = config::get("workflow.max_attempts")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
-
-        if attempts >= max_attempts {
-            tracing::warn!(
-                task_id,
-                attempts,
-                max_attempts,
-                "exceeded max attempts, blocking task"
-            );
-            // Set sidecar status to blocked — run_with_context() will propagate
-            // to GitHub. Owner can /retry to reset attempts and re-dispatch.
-            sidecar::set(
-                task_id,
-                &[
-                    "status=blocked".to_string(),
-                    format!(
-                        "last_error=exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset."
-                    ),
-                ],
-            )?;
-            return Ok(());
-        }
+        // Check task guards; returns None if task should be skipped
+        let attempts = match task_init::check_guards(task_id)? {
+            Some(a) => a,
+            None => return Ok(()),
+        };
 
         // Resolve project directory
         let project_dir = self.resolve_project_dir()?;
 
-        // Load title from sidecar for branch naming (set by run_with_context before run())
-        let title_for_branch = sidecar::get(task_id, "title").unwrap_or_default();
-
-        // Set up worktree
-        let wt = worktree::setup_worktree(task_id, &title_for_branch, &project_dir).await?;
-
-        // Rebase worktree on default branch to pick up latest changes.
-        // This prevents non-fast-forward push failures when the task is re-dispatched.
-        git_ops::rebase_on_default(&wt.work_dir, &wt.default_branch).await;
-
-        // Get routing result
-        let route_result = get_route_result(task_id).ok();
-
-        let agent_name = agent
-            .map(String::from)
-            .or_else(|| route_result.as_ref().map(|r| r.agent.clone()))
-            .unwrap_or_else(|| "claude".to_string());
-
-        let model_name = model
-            .map(String::from)
-            .or_else(|| route_result.as_ref().and_then(|r| r.model.clone()));
-
-        // Build a minimal ExternalTask for prompt building
-        let task_title =
-            sidecar::get(task_id, "title").unwrap_or_else(|_| format!("Task #{task_id}"));
-        let task_body = sidecar::get(task_id, "body").unwrap_or_default();
-        let pseudo_task = ExternalTask {
-            id: ExternalId(task_id.to_string()),
-            title: task_title.clone(),
-            body: task_body,
-            state: "open".to_string(),
-            labels: vec![],
-            author: String::new(),
-            created_at: String::new(),
-            updated_at: String::new(),
-            url: String::new(),
-        };
-
-        let selected_skills = route_result
-            .as_ref()
-            .map(|r| r.selected_skills.clone())
-            .unwrap_or_default();
-
-        // Build full context: memory, issue comments, and parent context are all loaded here
-        let ctx = context::build_full_context(
-            &pseudo_task,
+        // Prepare task: worktree, context, prompts, and agent invocation
+        let init = task_init::prepare_task(
+            task_id,
+            agent,
+            model,
             backend,
-            &wt.work_dir,
-            &wt.default_branch,
+            &self.repo,
+            &project_dir,
             attempts,
-            &selected_skills,
+        )
+        .await?;
+
+        // Run agent session: spawn in tmux, wait for completion, collect output
+        let (tmux, tmux_session, session_output) = session::run_agent_session(
+            task_id,
+            &init.invocation,
+            &init.attempt_dir,
+            &self.orch_home,
         )
         .await;
-
-        // Build prompts
-        let system_prompt = agent::build_system_prompt(&pseudo_task, &ctx, route_result.as_ref());
-        let agent_message = agent::build_agent_message(&pseudo_task, &ctx, attempts);
-
-        // Git identity
-        let git_name = config::get("git.name").unwrap_or_else(|_| format!("{agent_name}[bot]"));
-        let git_email = config::get("git.email")
-            .unwrap_or_else(|_| format!("{agent_name}[bot]@users.noreply.github.com"));
-
-        // Output file in per-task attempt directory (attempt = attempts + 1, set below)
-        let next_attempt = attempts + 1;
-        let attempt_dir = crate::home::task_attempt_dir(&self.repo, task_id, next_attempt)?;
-        let output_file = attempt_dir.join("output.json");
-
-        // Build sandbox disallowed tools
-        let mut disallowed_tools = vec!["Bash(rm *)".to_string(), "Bash(rm -*)".to_string()];
-
-        // Sandbox: block access to main project dir
-        if wt.work_dir != wt.main_project_dir {
-            let main_str = wt.main_project_dir.to_string_lossy();
-            disallowed_tools.extend([
-                format!("Bash(cd {main_str}*)"),
-                format!("Read({main_str}/*)"),
-                format!("Write({main_str}/*)"),
-                format!("Edit({main_str}/*)"),
-            ]);
-        }
-
-        // Timeout
-        let timeout_seconds: u64 = config::get("workflow.timeout_seconds")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1800);
-
-        // Build agent invocation
-        let model_for_invocation = model_name.clone();
-        let invocation = agent::AgentInvocation {
-            agent: agent_name.clone(),
-            model: model_for_invocation,
-            work_dir: wt.work_dir.clone(),
-            system_prompt,
-            agent_message,
-            task_id: task_id.to_string(),
-            disallowed_tools,
-            git_author_name: git_name,
-            git_author_email: git_email,
-            output_file: output_file.clone(),
-            timeout_seconds,
-            repo: self.repo.clone(),
-            attempt: next_attempt,
-        };
-
-        // Increment attempts
-        let new_attempts = attempts + 1;
-        sidecar::set(task_id, &[format!("attempts={new_attempts}")])?;
-
-        // Spawn in tmux
-        let tmux = TmuxManager::new();
-        let session = agent::spawn_in_tmux(&tmux, &invocation).await?;
-
-        // Wait for completion with timeout
-        let poll_interval = Duration::from_secs(5);
-        let wait_result = timeout(
-            Self::TASK_TIMEOUT,
-            tmux.wait_for_completion(&session, poll_interval),
-        )
-        .await;
-
-        match wait_result {
-            Ok(Ok(_output)) => {
-                tracing::info!(task_id, "agent session completed");
-            }
-            Ok(Err(e)) => {
-                tracing::error!(task_id, ?e, "error waiting for session");
-            }
-            Err(_) => {
-                tracing::error!(task_id, "agent timed out after 30 minutes");
-                tmux.kill_session(&session).await?;
-            }
-        }
-
-        // Read exit code — check per-task attempt dir first, fall back to legacy
-        let exit_code: i32 = {
-            let attempt_exit = attempt_dir.join("exit.txt");
-            let legacy_exit =
-                sidecar::state_file(&format!("exit-{task_id}.txt")).unwrap_or_else(|_| {
-                    self.orch_home
-                        .join("state")
-                        .join(format!("exit-{task_id}.txt"))
-                });
-
-            std::fs::read_to_string(&attempt_exit)
-                .or_else(|_| std::fs::read_to_string(&legacy_exit))
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(-1)
-        };
-
-        // Get per-agent runner for parsing
-        let agent_runner = agents::get_runner(&agent_name);
-
-        // Read raw output + stderr
-        let raw_stdout = response::read_output_file(task_id, &output_file, &self.repo);
-        let stderr_path_attempt = attempt_dir.join("stderr.txt");
-        let stderr_path_legacy = sidecar::state_file(&format!("stderr-{task_id}.txt"))
-            .unwrap_or_else(|_| PathBuf::from(format!("/tmp/stderr-{task_id}.txt")));
-        let raw_stderr = std::fs::read_to_string(&stderr_path_attempt)
-            .or_else(|_| std::fs::read_to_string(&stderr_path_legacy))
-            .unwrap_or_default();
 
         // Log raw output for debugging agent failures
-        let stdout_len = raw_stdout.len();
-        let stderr_len = raw_stderr.len();
-        let stdout_tail: String = raw_stdout
+        let stdout_len = session_output.raw_stdout.len();
+        let stderr_len = session_output.raw_stderr.len();
+        let stdout_tail: String = session_output
+            .raw_stdout
             .chars()
             .rev()
             .take(500)
@@ -298,7 +128,8 @@ impl TaskRunner {
             .chars()
             .rev()
             .collect();
-        let stderr_tail: String = raw_stderr
+        let stderr_tail: String = session_output
+            .raw_stderr
             .chars()
             .rev()
             .take(500)
@@ -308,7 +139,7 @@ impl TaskRunner {
             .collect();
         tracing::info!(
             task_id,
-            exit_code,
+            exit_code = session_output.exit_code,
             stdout_len,
             stderr_len,
             stdout_tail = %stdout_tail,
@@ -317,451 +148,95 @@ impl TaskRunner {
         );
 
         // Use agent-specific parsing when exit code is 0, fall back to classify_error
-        let parse_result = if exit_code == 0 && !raw_stdout.is_empty() {
-            agent_runner.parse_response(&raw_stdout)
-        } else if exit_code != 0 {
-            Err(agent_runner.classify_error(exit_code, &raw_stdout, &raw_stderr))
+        let agent_runner = agents::get_runner(&init.agent_name);
+        let parse_result = if session_output.exit_code == 0 && !session_output.raw_stdout.is_empty()
+        {
+            agent_runner.parse_response(&session_output.raw_stdout)
+        } else if session_output.exit_code != 0 {
+            Err(agent_runner.classify_error(
+                session_output.exit_code,
+                &session_output.raw_stdout,
+                &session_output.raw_stderr,
+            ))
         } else {
             // Exit 0 but empty output — check stderr for clues
-            let combined = format!("{raw_stdout}{raw_stderr}");
-            Err(agents::patterns::classify_from_text(exit_code, &combined))
+            let combined = format!("{}{}", session_output.raw_stdout, session_output.raw_stderr);
+            Err(agents::patterns::classify_from_text(
+                session_output.exit_code,
+                &combined,
+            ))
         };
 
         // Write structured result.json for deterministic testing and debugging
-        {
-            let result_json = match &parse_result {
-                Ok(parsed) => {
-                    serde_json::json!({
-                        "outcome": "success",
-                        "agent": agent_name,
-                        "model": model_name.as_deref().unwrap_or("default"),
-                        "exit_code": exit_code,
-                        "attempt": new_attempts,
-                        "status": parsed.response.status,
-                        "summary": parsed.response.summary,
-                        "input_tokens": parsed.input_tokens,
-                        "output_tokens": parsed.output_tokens,
-                        "duration_ms": parsed.duration_ms,
-                        "files": parsed.response.files,
-                        "accomplished": parsed.response.accomplished,
-                        "remaining": parsed.response.remaining,
-                        "error": parsed.response.error,
-                        "learnings": parsed.response.learnings,
-                        "delegations": parsed.response.delegations.iter()
-                            .map(|d| serde_json::json!({"title": d.title, "body": d.body}))
-                            .collect::<Vec<_>>(),
-                    })
-                }
-                Err(agent_err) => {
-                    serde_json::json!({
-                        "outcome": "error",
-                        "agent": agent_name,
-                        "model": model_name.as_deref().unwrap_or("default"),
-                        "exit_code": exit_code,
-                        "attempt": new_attempts,
-                        "error_class": agents::error_class_name(agent_err),
-                        "error_message": agent_err.to_string(),
-                        "stderr_tail": safe_utf8_tail(&raw_stderr, 2000),
-                        "stdout_tail": safe_utf8_tail(&raw_stdout, 2000),
-                    })
-                }
-            };
-            if let Err(e) = std::fs::write(
-                attempt_dir.join("result.json"),
-                serde_json::to_string_pretty(&result_json).unwrap_or_default(),
-            ) {
-                tracing::debug!(task_id, ?e, "failed to write result.json");
-            }
-        }
+        response_handler::write_result_json(
+            &init.attempt_dir,
+            task_id,
+            &init.agent_name,
+            init.model_name.as_deref(),
+            session_output.exit_code,
+            init.new_attempts,
+            &parse_result,
+            &session_output.raw_stdout,
+            &session_output.raw_stderr,
+        );
 
+        // Handle outcome: success or error recovery
         match parse_result {
             Ok(parsed) => {
-                let resp = parsed.response;
-                tracing::info!(
+                if response_handler::handle_success(
                     task_id,
-                    status = resp.status,
-                    summary = resp.summary,
-                    "agent completed successfully"
-                );
-
-                // Auto-commit, push, create PR
-                let mut has_pr = false;
-                if resp.status == "done" || resp.status == "in_progress" {
-                    if let Err(e) = git_ops::auto_commit(
-                        &wt.work_dir,
-                        task_id,
-                        &task_title,
-                        &agent_name,
-                        new_attempts,
-                    )
-                    .await
-                    {
-                        tracing::error!(task_id, error = ?e, "auto commit failed");
-                        sidecar::set(task_id, &[format!("last_error=auto commit failed: {e}")])?;
-                    }
-
-                    // Push
-                    let push_ok =
-                        match git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch)
-                            .await
-                        {
-                            Ok(_) => true,
-                            Err(e) => {
-                                tracing::error!(task_id, error = ?e, "push failed");
-                                sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
-                                false
-                            }
-                        };
-
-                    // Create PR (skip if push failed)
-                    if !push_ok {
-                        tracing::warn!(task_id, "skipping PR creation due to push failure");
-                    } else {
-                        match git_ops::create_pr_if_needed(
-                            &wt.work_dir,
-                            &wt.branch,
-                            &task_title,
-                            &resp.summary,
-                            &resp.accomplished,
-                            &resp.remaining,
-                            &resp.files,
-                            task_id,
-                            &agent_name,
-                        )
-                        .await
-                        {
-                            Ok(Some(_url)) => has_pr = true,
-                            Ok(None) => {
-                                // PR already existed
-                                has_pr = true;
-                            }
-                            Err(e) => {
-                                tracing::error!(task_id, error = ?e, "create PR failed");
-                                sidecar::set(
-                                    task_id,
-                                    &[format!("last_error=create PR failed: {e}")],
-                                )?;
-                            }
-                        }
-                    }
-                }
-
-                // Store delegations in sidecar if present (processed by run_with_context)
-                if !resp.delegations.is_empty() {
-                    if let Ok(delegations_json) = serde_json::to_string(&resp.delegations) {
-                        sidecar::set(task_id, &[format!("delegations={delegations_json}")])?;
-                    }
-                }
-
-                // Store result in sidecar
-                // If agent said "done" and a PR exists, send to review before merge.
-                // If agent said "done", no PR, and no delegations — work is complete
-                // (e.g., review/analysis jobs that create issues but no code changes).
-                // If agent said "done", no PR, but has delegations — blocked on children.
-                let has_delegations = !resp.delegations.is_empty();
-                let final_status = if resp.status == "done" && has_pr {
-                    "needs_review"
-                } else if resp.status == "done" && !has_pr && has_delegations {
-                    tracing::info!(
-                        task_id,
-                        "agent reported done with delegations but no PR — setting blocked"
-                    );
-                    "blocked"
-                } else if resp.status == "done" && !has_pr {
-                    tracing::info!(
-                        task_id,
-                        "agent reported done with no PR and no delegations — marking done"
-                    );
-                    "done"
-                } else {
-                    &resp.status
-                };
-                sidecar::set(
-                    task_id,
-                    &[
-                        format!("status={final_status}"),
-                        format!("summary={}", resp.summary),
-                    ],
-                )?;
-
-                // Store token usage — prefer agent-parsed tokens, fall back to response
-                let input_tokens = parsed.input_tokens.or(resp.input_tokens);
-                let output_tokens = parsed.output_tokens.or(resp.output_tokens);
-                if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
-                    let model = model_name.as_deref().unwrap_or("haiku");
-                    if let Err(e) = sidecar::store_token_usage(task_id, input, output, model) {
-                        tracing::warn!(task_id, ?e, "failed to store token usage");
-                    }
-                }
-
-                // Store learnings for memory (for future retries)
-                response::store_learnings_from_response(
-                    task_id,
-                    new_attempts,
-                    &agent_name,
-                    model_name.as_deref(),
-                    &resp,
-                    resp.error.as_deref(),
-                );
-
-                // Check token budget with warning thresholds
-                let max_tokens: u64 = config::get("max_tokens_per_task")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(100_000);
-
-                let total_tokens = sidecar::get_total_tokens(task_id);
-                let cost = sidecar::get_cost_estimate(task_id);
-                let warning_threshold = (max_tokens as f64 * 0.8) as u64;
-
-                if total_tokens > max_tokens {
-                    tracing::warn!(task_id, total_tokens, max_tokens, "exceeded token budget");
-                    sidecar::set(
-                        task_id,
-                        &[
-                            "status=needs_review".to_string(),
-                            format!(
-                                "last_error=token budget exceeded: {}/{} tokens (${:.4})",
-                                total_tokens, max_tokens, cost.total_cost_usd
-                            ),
-                            "budget_exceeded=true".to_string(),
-                        ],
-                    )?;
+                    parsed,
+                    &init.wt,
+                    &init.task_title,
+                    &init.agent_name,
+                    init.model_name.as_deref(),
+                    init.new_attempts,
+                )
+                .await?
+                {
+                    // Token budget exceeded — sidecar already updated, return without
+                    // tmux cleanup or metrics (preserves original behavior)
                     return Ok(());
-                } else if total_tokens > warning_threshold {
-                    let pct = (total_tokens as f64 / max_tokens as f64 * 100.0) as u32;
-                    tracing::warn!(
-                        task_id,
-                        total_tokens,
-                        max_tokens,
-                        pct,
-                        "approaching token budget"
-                    );
-                    sidecar::set(
-                        task_id,
-                        &[format!(
-                            "budget_warning={}% of budget used ({}/{} tokens, ${:.4})",
-                            pct, total_tokens, max_tokens, cost.total_cost_usd
-                        )],
-                    )?;
                 }
-
-                // Note: done → in_review transition is handled by the engine
-                // after triggering the review agent (engine/mod.rs)
             }
             Err(agent_err) => {
-                tracing::warn!(
-                    task_id,
-                    agent = agent_name,
-                    error = %agent_err,
-                    "agent error, attempting recovery"
-                );
-
-                // Map AgentError to RetryableError for the existing handle_failover()
-                let (retryable, error_msg) = match &agent_err {
-                    agents::AgentError::RateLimit { message, .. } => (
-                        response::RetryableError::UsageLimit,
-                        format!("{agent_name} rate limit: {message}"),
-                    ),
-                    agents::AgentError::Auth { message } => (
-                        response::RetryableError::AuthError,
-                        format!("{agent_name} auth error: {message}"),
-                    ),
-                    agents::AgentError::Timeout { elapsed } => (
-                        response::RetryableError::Timeout,
-                        format!("{agent_name} timed out after {}s", elapsed.as_secs()),
-                    ),
-                    agents::AgentError::MissingTool { tool } => (
-                        response::RetryableError::MissingTooling,
-                        format!("missing tool: {tool}"),
-                    ),
-                    agents::AgentError::ModelUnavailable { model, .. } => {
-                        // Record model-specific cooldown (1 hour ban)
-                        response::record_model_failure(&agent_name, model);
-
-                        // Try next model before switching agent
-                        let models = agent_runner.available_models();
-                        let current_model = model_name.as_deref().unwrap_or("");
-                        let next_model = models.iter().find(|m| {
-                            m.as_str() != current_model
-                                && m.as_str() != model
-                                && !response::is_model_in_cooldown(&agent_name, m)
-                        });
-                        if let Some(next) = next_model {
-                            tracing::info!(task_id, model = %next, "retrying with different model");
-                            sidecar::set(
-                                task_id,
-                                &[
-                                    format!("model={next}"),
-                                    "status=new".to_string(),
-                                    format!("last_error=model {model} unavailable, trying {next}"),
-                                ],
-                            )?;
-                            // Skip normal failover — we're retrying same agent with different model
-                            self.record_metrics(
-                                task_id,
-                                &agent_name,
-                                &model_name,
-                                &route_result,
-                                &started_at,
-                                attempts,
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                        (
-                            response::RetryableError::Failed,
-                            format!("model {model} unavailable"),
-                        )
-                    }
-                    agents::AgentError::ContextOverflow { .. } => {
-                        // Could truncate and retry, but for now treat as failed
-                        (
-                            response::RetryableError::Failed,
-                            format!("{agent_name} context overflow"),
-                        )
-                    }
-                    agents::AgentError::WaitingForInput { message } => {
-                        // Requires human — skip failover, go straight to needs_review
-                        sidecar::set(
-                            task_id,
-                            &[
-                                "status=needs_review".to_string(),
-                                format!("last_error=waiting for input: {message}"),
-                            ],
-                        )?;
-                        self.record_metrics(
-                            task_id,
-                            &agent_name,
-                            &model_name,
-                            &route_result,
-                            &started_at,
-                            attempts,
-                        )
-                        .await;
-                        return Ok(());
-                    }
-                    agents::AgentError::PermissionDenied { message } => (
-                        response::RetryableError::Failed,
-                        format!("permission denied: {message}"),
-                    ),
-                    agents::AgentError::InvalidResponse { .. } => (
-                        response::RetryableError::Failed,
-                        format!("{agent_name} invalid response"),
-                    ),
-                    agents::AgentError::AgentFailed { message } => (
-                        response::RetryableError::Failed,
-                        format!("{agent_name} failed: {message}"),
-                    ),
-                    agents::AgentError::Unknown { exit_code, message } => (
-                        response::RetryableError::Failed,
-                        format!("{agent_name} exit {exit_code}: {message}"),
-                    ),
-                };
-
-                // Record rate limit in DB for rate-limit and auth errors
-                if let Some(ref db) = self.db {
-                    let error_type_str = match retryable {
-                        response::RetryableError::UsageLimit => "rate",
-                        response::RetryableError::AuthError => "budget",
-                        _ => "error",
-                    };
-                    let _ = db
-                        .record_rate_limit(&agent_name, error_type_str, Some(task_id))
-                        .await;
+                if matches!(
+                    fallback::handle_error(
+                        task_id,
+                        &agent_err,
+                        &init.agent_name,
+                        &*agent_runner,
+                        init.model_name.as_deref(),
+                        init.new_attempts,
+                        self.db.as_ref(),
+                    )
+                    .await?,
+                    fallback::ErrorHandleResult::EarlyReturn
+                ) {
+                    // Task rerouted — record metrics then return (skip tmux cleanup)
+                    self.record_metrics(
+                        task_id,
+                        &init.agent_name,
+                        &init.model_name,
+                        &init.route_result,
+                        &started_at,
+                        attempts,
+                    )
+                    .await;
+                    return Ok(());
                 }
-
-                // Try free models as last resort before giving up
-                let chain = response::get_reroute_chain(task_id);
-                let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
-                    .iter()
-                    .filter(|a| crate::cmd_cache::command_exists(a))
-                    .map(|s| s.to_string())
-                    .collect();
-
-                let all_agents_tried = {
-                    let chain_set: std::collections::HashSet<&str> = if chain.is_empty() {
-                        std::collections::HashSet::new()
-                    } else {
-                        chain.split(',').collect()
-                    };
-                    !available
-                        .iter()
-                        .any(|a| a != &agent_name && !chain_set.contains(a.as_str()))
-                };
-
-                if all_agents_tried {
-                    // All agents exhausted — try free models via opencode
-                    let free = agent_runner.free_models();
-                    if !free.is_empty() {
-                        let tried_models: String =
-                            sidecar::get(task_id, "model_reroute_chain").unwrap_or_default();
-                        let tried_set: std::collections::HashSet<&str> =
-                            tried_models.split(',').filter(|s| !s.is_empty()).collect();
-
-                        if let Some(free_model) =
-                            free.iter().find(|m| !tried_set.contains(m.as_str()))
-                        {
-                            tracing::info!(task_id, model = %free_model, "last resort: trying free model via opencode");
-                            let new_tried = if tried_models.is_empty() {
-                                free_model.clone()
-                            } else {
-                                format!("{tried_models},{free_model}")
-                            };
-                            sidecar::set(
-                                task_id,
-                                &[
-                                    "agent=opencode".to_string(),
-                                    format!("model={free_model}"),
-                                    "status=new".to_string(),
-                                    format!("model_reroute_chain={new_tried}"),
-                                    format!("last_error=all agents exhausted, trying free model {free_model}"),
-                                ],
-                            )?;
-                            self.record_metrics(
-                                task_id,
-                                &agent_name,
-                                &model_name,
-                                &route_result,
-                                &started_at,
-                                attempts,
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                    }
-                }
-
-                let rerouted =
-                    response::handle_failover(task_id, &agent_name, retryable, &error_msg);
-                if !rerouted {
-                    tracing::warn!(task_id, "failover exhausted, task marked needs_review");
-                }
-
-                // Store failure memory for retry learning
-                response::store_failure_memory(
-                    task_id,
-                    new_attempts,
-                    &agent_name,
-                    model_name.as_deref(),
-                    &error_msg,
-                );
             }
         }
 
         // Kill tmux session if still alive
-        if tmux.session_exists(&session).await {
-            if let Err(e) = tmux.kill_session(&session).await {
-                tracing::warn!(task_id, error = ?e, "failed to kill tmux session");
-            }
-        }
+        session::cleanup_session(task_id, &tmux, &tmux_session).await;
 
         // Record metrics
         self.record_metrics(
             task_id,
-            &agent_name,
-            &model_name,
-            &route_result,
+            &init.agent_name,
+            &init.model_name,
+            &init.route_result,
             &started_at,
             attempts,
         )
@@ -1143,25 +618,11 @@ impl TaskRunner {
     }
 }
 
-/// Return the last `max_bytes` of `s`, walking forward to the nearest UTF-8
-/// character boundary so the slice is always valid.
-fn safe_utf8_tail(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let start = s.len() - max_bytes;
-    // Walk forward from `start` until we land on a char boundary
-    let mut idx = start;
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    &s[idx..]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
+    use crate::engine::runner::response_handler::safe_utf8_tail;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
