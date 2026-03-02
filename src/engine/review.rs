@@ -1062,7 +1062,9 @@ mod tests {
             comments: vec![
                 GitHubReviewComment {
                     id: 1,
-                    user: GitHubUser { login: "reviewer".to_string() },
+                    user: GitHubUser {
+                        login: "reviewer".to_string(),
+                    },
                     body: "Fix this issue".to_string(),
                     path: "src/main.rs".to_string(),
                     line: Some(10),
@@ -1079,7 +1081,9 @@ mod tests {
                 },
                 GitHubReviewComment {
                     id: 2,
-                    user: GitHubUser { login: "reviewer".to_string() },
+                    user: GitHubUser {
+                        login: "reviewer".to_string(),
+                    },
                     body: "".to_string(),
                     path: "src/lib.rs".to_string(),
                     line: Some(20),
@@ -1094,7 +1098,9 @@ mod tests {
                 },
                 GitHubReviewComment {
                     id: 3,
-                    user: GitHubUser { login: "reviewer".to_string() },
+                    user: GitHubUser {
+                        login: "reviewer".to_string(),
+                    },
                     body: "Reply to this".to_string(),
                     path: "src/lib.rs".to_string(),
                     line: Some(30),

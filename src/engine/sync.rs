@@ -105,10 +105,7 @@ pub(crate) async fn sync_tick(
                                 "review agent failed — resetting to NeedsReview for retry"
                             );
                             let _ = backend_c
-                                .update_status(
-                                    &ExternalId(tid),
-                                    Status::NeedsReview,
-                                )
+                                .update_status(&ExternalId(tid), Status::NeedsReview)
                                 .await;
                         }
                         Err(e) => {
@@ -117,10 +114,7 @@ pub(crate) async fn sync_tick(
                                 "review_and_merge failed — resetting to NeedsReview for retry"
                             );
                             let _ = backend_c
-                                .update_status(
-                                    &ExternalId(tid),
-                                    Status::NeedsReview,
-                                )
+                                .update_status(&ExternalId(tid), Status::NeedsReview)
                                 .await;
                         }
                         Ok(_) => {}

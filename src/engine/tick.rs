@@ -3,8 +3,9 @@
 //! The engine ticks every ~10 seconds. Each tick runs six sequential phases:
 //! 1. Poll tmux for finished sessions
 //! 2. Recover stuck in-progress tasks
-//! 3a. Route new tasks to agents
-//! 3b. Dispatch routed tasks (spawn agents)
+//! 3. Route and dispatch:
+//!    - 3a. Route new tasks to agents
+//!    - 3b. Dispatch routed tasks (spawn agents)
 //! 4. Unblock parents whose children are all done
 //! 5. Run cron job scheduler
 
