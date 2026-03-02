@@ -116,64 +116,6 @@ jobs:
           path: dist/orch-${{ matrix.arch }}
           retention-days: 1
 
-  # Create universal binary from arm64 and x86_64 builds
-  create-universal:
-    needs: [build-macos]
-    runs-on: macos-latest
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - name: Download arm64 binary
-        uses: actions/download-artifact@v4
-        with:
-          name: orch-arm64
-          path: dist/arm64
-
-      - name: Download x86_64 binary
-        uses: actions/download-artifact@v4
-        with:
-          name: orch-x86_64
-          path: dist/x86_64
-
-      - name: Create universal binary with lipo
-        run: |
-          mkdir -p dist/universal
-          lipo -create \
-            dist/arm64/orch-arm64 \
-            dist/x86_64/orch-x86_64 \
-            -output dist/universal/orch
-          chmod +x dist/universal/orch
-
-          # Verify universal binary
-          echo "Universal binary architectures:"
-          lipo -archs dist/universal/orch
-          echo ""
-          echo "Binary info:"
-          file dist/universal/orch
-          echo ""
-          echo "Binary size:"
-          ls -lh dist/universal/orch
-
-      - name: Test universal binary
-        run: |
-          # Test that the binary runs
-          ./dist/universal/orch --version
-
-      - name: Package for release
-        run: |
-          cd dist/universal
-          tar czf ../orch-macos-universal.tar.gz orch
-          cd ..
-          echo "Archive contents:"
-          tar tzf orch-macos-universal.tar.gz
-          ls -lh orch-macos-universal.tar.gz
-
-      - name: Upload universal binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: orch-macos-universal
-          path: dist/orch-macos-universal.tar.gz
-          retention-days: 1
-
   # Determine if a release is needed and what version to use
   check-release:
     needs: [test, secrets]
@@ -262,7 +204,7 @@ jobs:
 
   # Create GitHub release with binaries
   release:
-    needs: [check-release, create-universal]
+    needs: [check-release, build-macos]
     if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
     runs-on: ubuntu-latest
     steps:
@@ -348,9 +290,11 @@ jobs:
           cd ..
           cat checksums.txt
 
-          # Get the universal binary checksum for Homebrew
-          UNIVERSAL_SHA=$(grep "orch-macos-universal.tar.gz" checksums.txt | awk '{print $1}')
-          echo "universal_sha=$UNIVERSAL_SHA" >> "$GITHUB_OUTPUT"
+          # Get checksums for each architecture
+          ARM64_SHA=$(grep "orch-arm64/orch-arm64" checksums.txt | awk '{print $1}')
+          X86_64_SHA=$(grep "orch-x86_64/orch-x86_64" checksums.txt | awk '{print $1}')
+          echo "arm64_sha=$ARM64_SHA" >> "$GITHUB_OUTPUT"
+          echo "x86_64_sha=$X86_64_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         env:
@@ -363,7 +307,6 @@ jobs:
             --notes-file release_notes.md \
             artifacts/orch-arm64/orch-arm64 \
             artifacts/orch-x86_64/orch-x86_64 \
-            artifacts/orch-macos-universal/orch-macos-universal.tar.gz \
             checksums.txt
 
           echo "Created release $VERSION"
@@ -376,15 +319,19 @@ jobs:
           VERSION_NO_V="${VERSION#v}"
           REPO="${{ github.repository }}"
           TAP_REPO="gabrielkoerich/homebrew-tap"
-          UNIVERSAL_SHA="${{ steps.checksums.outputs.universal_sha }}"
+          ARM64_SHA="${{ steps.checksums.outputs.arm64_sha }}"
+          X86_64_SHA="${{ steps.checksums.outputs.x86_64_sha }}"
 
-          # URL for the universal binary tarball
-          URL="https://github.com/${REPO}/releases/download/${VERSION}/orch-macos-universal.tar.gz"
+          # URLs for each architecture binary
+          ARM64_URL="https://github.com/${REPO}/releases/download/${VERSION}/orch-arm64"
+          X86_64_URL="https://github.com/${REPO}/releases/download/${VERSION}/orch-x86_64"
 
           echo "Updating formula with:"
           echo "  Version: $VERSION_NO_V"
-          echo "  URL: $URL"
-          echo "  SHA256: $UNIVERSAL_SHA"
+          echo "  ARM64 URL: $ARM64_URL"
+          echo "  ARM64 SHA256: $ARM64_SHA"
+          echo "  x86_64 URL: $X86_64_URL"
+          echo "  x86_64 SHA256: $X86_64_SHA"
 
           if [ -z "${TAP_TOKEN}" ]; then
             echo "HOMEBREW_TAP_TOKEN secret is required to push to ${TAP_REPO}"
@@ -404,11 +351,11 @@ jobs:
 
             on_macos do
               if Hardware::CPU.arm?
-                url "URL_PLACEHOLDER"
-                sha256 "SHA256_PLACEHOLDER"
+                url "ARM64_URL_PLACEHOLDER"
+                sha256 "ARM64_SHA256_PLACEHOLDER"
               else
-                url "URL_PLACEHOLDER"
-                sha256 "SHA256_PLACEHOLDER"
+                url "X86_64_URL_PLACEHOLDER"
+                sha256 "X86_64_SHA256_PLACEHOLDER"
               end
             end
 
@@ -416,7 +363,8 @@ jobs:
             depends_on "tmux"
 
             def install
-              bin.install "orch"
+              bin.install "orch-arm64" => "orch" if Hardware::CPU.arm?
+              bin.install "orch-x86_64" => "orch" if Hardware::CPU.intel?
 
               # Install additional resources
               (libexec/"prompts").install Dir["prompts/*"] if (buildpath/"prompts").exist?
@@ -457,8 +405,10 @@ jobs:
 
           # Replace placeholders
           sed -i "s/VERSION_PLACEHOLDER/${VERSION_NO_V}/g" tap-repo/Formula/orch.rb
-          sed -i "s|URL_PLACEHOLDER|${URL}|g" tap-repo/Formula/orch.rb
-          sed -i "s/SHA256_PLACEHOLDER/${UNIVERSAL_SHA}/g" tap-repo/Formula/orch.rb
+          sed -i "s|ARM64_URL_PLACEHOLDER|${ARM64_URL}|g" tap-repo/Formula/orch.rb
+          sed -i "s/ARM64_SHA256_PLACEHOLDER/${ARM64_SHA}/g" tap-repo/Formula/orch.rb
+          sed -i "s|X86_64_URL_PLACEHOLDER|${X86_64_URL}|g" tap-repo/Formula/orch.rb
+          sed -i "s/X86_64_SHA256_PLACEHOLDER/${X86_64_SHA}/g" tap-repo/Formula/orch.rb
 
           # Display the formula
           echo "--- Generated Formula ---"
