@@ -673,7 +673,7 @@ mod tests {
     #[test]
     fn parse_fixture_route_response_string() {
         let router = make_router();
-        let response = include_str!("../../tests/fixtures/route-response-string.json");
+        let response = include_str!("../../../tests/fixtures/route-response-string.json");
         let resp = router.parse_llm_response(response).unwrap();
         // Fixture should parse without error and produce a valid agent name
         assert!(!resp.executor.is_empty(), "executor must not be empty");
@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn parse_fixture_route_response_object() {
         let router = make_router();
-        let response = include_str!("../../tests/fixtures/route-response-object.json");
+        let response = include_str!("../../../tests/fixtures/route-response-object.json");
         let resp = router.parse_llm_response(response).unwrap();
         assert!(!resp.executor.is_empty(), "executor must not be empty");
     }
@@ -690,7 +690,7 @@ mod tests {
     #[test]
     fn parse_fixture_route_response_markdown() {
         let router = make_router();
-        let response = include_str!("../../tests/fixtures/route-response-markdown.json");
+        let response = include_str!("../../../tests/fixtures/route-response-markdown.json");
         let resp = router.parse_llm_response(response).unwrap();
         assert!(!resp.executor.is_empty(), "executor must not be empty");
     }
