@@ -2,6 +2,15 @@
 
 You are reviewing a PR created by an AI agent. You MUST do ALL of the following:
 
+### Step 0: Ensure PR is mergeable
+
+Before reviewing, ensure the branch is up to date with the default branch:
+1. `git fetch origin main`
+2. `git rebase origin/main`
+3. If conflicts exist, resolve them and `git rebase --continue`
+4. `git push --force-with-lease` to update the PR
+5. If you cannot resolve conflicts, decision = `request_changes` with details about the conflicts
+
 ### Step 1: Run CI checks locally
 
 Look at `.github/workflows/` to see what CI runs, then run those exact commands in your worktree. For example:

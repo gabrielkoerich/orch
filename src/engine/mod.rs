@@ -1877,18 +1877,35 @@ async fn review_open_prs(
                     .unwrap_or(false);
 
                 if is_conflicting {
+                    let retries = sidecar::get_u64(task_id, "merge_conflict_retries");
+                    if retries >= 3 {
+                        tracing::error!(
+                            task_id,
+                            pr_number,
+                            retries,
+                            "PR approved but merge conflict retry limit reached — needs human review"
+                        );
+                        if let Err(e) = backend.update_status(&task.id, Status::NeedsReview).await {
+                            tracing::warn!(task_id, err = %e, "failed to set NeedsReview");
+                        }
+                        continue;
+                    }
                     tracing::info!(
                         task_id,
                         pr_number,
-                        "PR approved but has merge conflicts — re-dispatching agent to rebase"
+                        retries,
+                        "PR approved but has merge conflicts — re-triggering review agent to rebase"
                     );
-                    // Reset review_started flag so agent can be re-dispatched
-                    if let Err(e) = sidecar::set(task_id, &["review_started=".to_string()]) {
+                    if let Err(e) = sidecar::set(
+                        task_id,
+                        &[
+                            "review_started=false".to_string(),
+                            format!("merge_conflict_retries={}", retries + 1),
+                        ],
+                    ) {
                         tracing::warn!(task_id, err = %e, "failed to reset review_started flag");
                     }
-                    if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
-                        tracing::warn!(task_id, err = %e, "failed to re-route conflicting PR");
-                    }
+                    // Keep InReview — next tick re-triggers review agent
                     continue;
                 }
 
@@ -2143,43 +2160,8 @@ async fn review_and_merge(
         }
     };
 
-    // 3. Rebase with main to resolve conflicts before review
+    // 3. Build diff context (rebase is handled by the review agent via prompt)
     let default_branch = config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
-    {
-        let wt = &worktree_path;
-        // Fetch latest main
-        let fetch = tokio::process::Command::new("git")
-            .args(["fetch", "origin", &default_branch])
-            .current_dir(wt)
-            .output()
-            .await;
-        if let Ok(out) = fetch {
-            if out.status.success() {
-                let rebase = tokio::process::Command::new("git")
-                    .args(["rebase", &format!("origin/{default_branch}")])
-                    .current_dir(wt)
-                    .output()
-                    .await;
-                match rebase {
-                    Ok(out) if out.status.success() => {
-                        tracing::info!(task_id = task.id.0, "rebased with {default_branch}");
-                    }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        tracing::warn!(task_id = task.id.0, stderr = %stderr, "rebase failed, aborting");
-                        let _ = tokio::process::Command::new("git")
-                            .args(["rebase", "--abort"])
-                            .current_dir(wt)
-                            .output()
-                            .await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(task_id = task.id.0, error = %e, "rebase command failed");
-                    }
-                }
-            }
-        }
-    }
     let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
 
@@ -2513,7 +2495,51 @@ async fn auto_merge_pr(
 
     // 5. Merge via gh CLI
     if let Err(e) = gh.merge_pr(repo, pr_number, true).await {
-        // Merge failed (conflicts, branch protection, etc.)
+        let err_msg = e.to_string().to_lowercase();
+        let is_conflict = err_msg.contains("405")
+            || err_msg.contains("not mergeable")
+            || err_msg.contains("merge conflict");
+
+        if is_conflict {
+            // Merge failed due to conflicts — re-trigger review agent to rebase
+            let retries = sidecar::get_u64(&task.id.0, "merge_conflict_retries");
+            if retries >= 3 {
+                tracing::error!(
+                    task_id = task.id.0,
+                    retries,
+                    "merge conflict retry limit reached"
+                );
+                backend.update_status(&task.id, Status::NeedsReview).await?;
+                let _ = gh
+                    .add_comment(
+                        repo,
+                        &pr_number.to_string(),
+                        &format!(
+                            "Auto-merge failed after {} conflict retries: {}",
+                            retries, e
+                        ),
+                    )
+                    .await;
+                return Err(e);
+            }
+            tracing::warn!(
+                task_id = task.id.0,
+                retries,
+                error = %e,
+                "merge failed due to conflicts — re-triggering review agent to rebase"
+            );
+            let _ = sidecar::set(
+                &task.id.0,
+                &[
+                    "review_started=false".to_string(),
+                    format!("merge_conflict_retries={}", retries + 1),
+                ],
+            );
+            // Keep InReview — next tick will re-trigger review agent
+            return Ok(());
+        }
+
+        // Non-conflict merge failure (permissions, branch protection, etc.)
         tracing::error!(task_id = task.id.0, error = %e, "merge failed");
         backend.update_status(&task.id, Status::NeedsReview).await?;
         let _ = gh
