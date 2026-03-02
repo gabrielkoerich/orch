@@ -261,7 +261,10 @@ pub(crate) async fn tick_dispatch_tasks(
         {
             let guard = dispatching.lock().unwrap();
             if guard.contains(&dispatch_key) {
-                tracing::debug!(task_id = task.id.0, "task already dispatching, skipping duplicate");
+                tracing::debug!(
+                    task_id = task.id.0,
+                    "task already dispatching, skipping duplicate"
+                );
                 continue;
             }
         }
