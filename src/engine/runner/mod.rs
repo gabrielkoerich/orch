@@ -452,9 +452,17 @@ impl TaskRunner {
                 }
 
                 // Store result in sidecar
-                // If agent said "done" and a PR exists, set in_review instead
+                // If agent said "done" and a PR exists, set in_review (needs review before merge).
+                // If agent said "done" but NO PR (push failed, no changes, etc.), don't mark done
+                // — that would close the task without delivering any code.
                 let final_status = if resp.status == "done" && has_pr {
                     "in_review"
+                } else if resp.status == "done" && !has_pr {
+                    tracing::warn!(
+                        task_id,
+                        "agent reported done but no PR exists (push failed or no changes) — setting needs_review"
+                    );
+                    "needs_review"
                 } else {
                     &resp.status
                 };

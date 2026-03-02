@@ -132,7 +132,11 @@ impl EngineConfig {
             config.auto_create_followup_on_changes = !val.eq_ignore_ascii_case("false");
         }
 
+        // Check auto_close_task_on_approval first; fall back to workflow.auto_close
+        // (common config uses "auto_close: true" which should also enable approval handling)
         if let Ok(val) = crate::config::get("workflow.auto_close_task_on_approval") {
+            config.auto_close_task_on_approval = val.eq_ignore_ascii_case("true");
+        } else if let Ok(val) = crate::config::get("workflow.auto_close") {
             config.auto_close_task_on_approval = val.eq_ignore_ascii_case("true");
         }
 
@@ -1703,14 +1707,37 @@ async fn review_open_prs(
         // Get branch from sidecar
         let branch = match sidecar::get(task_id, "branch") {
             Ok(b) if !b.is_empty() => b,
-            _ => continue,
+            _ => {
+                // No branch info — task is stuck in_review with no PR.
+                // Move to needs_review so it doesn't poll forever.
+                tracing::warn!(
+                    task_id,
+                    "in_review task has no branch info — setting needs_review"
+                );
+                if let Err(e) = backend.update_status(&task.id, Status::NeedsReview).await {
+                    tracing::warn!(task_id, err = %e, "failed to update status");
+                }
+                continue;
+            }
         };
 
         // Get PR number from branch
         let pr_number = match gh.get_pr_number(repo, &branch).await {
             Ok(Some(n)) => n,
             Ok(None) => {
-                tracing::debug!(task_id, branch = %branch, "no open PR found");
+                // No open PR for this branch. Check if it was already merged.
+                let merged = gh.is_pr_merged(repo, &branch).await.unwrap_or(false);
+                if merged {
+                    tracing::info!(task_id, branch = %branch, "PR already merged, marking done");
+                    if let Err(e) = backend.update_status(&task.id, Status::Done).await {
+                        tracing::warn!(task_id, err = %e, "failed to update status to done");
+                    }
+                } else {
+                    tracing::warn!(task_id, branch = %branch, "in_review but no open PR — re-dispatching");
+                    if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
+                        tracing::warn!(task_id, err = %e, "failed to update status to routed");
+                    }
+                }
                 continue;
             }
             Err(e) => {
