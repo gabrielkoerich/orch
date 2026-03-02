@@ -156,16 +156,16 @@ in_progress → needs_review → in_review → done
 
 | Transition | Owner | Location | Trigger |
 |---|---|---|---|
-| new → routed | engine tick | `engine/mod.rs` | LLM router assigns agent + complexity |
-| routed → in_progress | engine dispatch | `engine/mod.rs` | Agent spawned in tmux |
+| new → routed | engine tick | `engine/tick.rs` | LLM router assigns agent + complexity |
+| routed → in_progress | engine dispatch | `engine/tick.rs` | Agent spawned in tmux |
 | in_progress → needs_review | runner | `runner/mod.rs` | Agent completes + PR exists |
 | in_progress → done | runner | `runner/mod.rs` | Agent completes, no PR created |
-| needs_review → in_review | engine tick/sync | `engine/mod.rs` | Review agent spawned (status transition is the guard) |
-| in_review → done | engine | `engine/mod.rs` (auto_merge_pr) | PR approved + merged |
-| in_review → routed | engine | `engine/mod.rs` (review_open_prs / handle_review_changes) | Changes requested → re-dispatch |
-| in_review → needs_review | engine | `engine/mod.rs` | Review agent failed/crashed, conflict/CI retry |
-| in_review → blocked | engine | `engine/mod.rs` | Merge conflict retries ≥ 3, non-conflict merge failure, max review cycles exceeded |
-| stale in_review → needs_review | sync tick | `engine/mod.rs` | No active tmux review session detected |
+| needs_review → in_review | engine tick/sync | `engine/tick.rs`, `engine/sync.rs` | Review agent spawned (status transition is the guard) |
+| in_review → done | engine | `engine/review.rs` (auto_merge_pr) | PR approved + merged |
+| in_review → routed | engine | `engine/review.rs` (review_open_prs / handle_review_changes) | Changes requested → re-dispatch |
+| in_review → needs_review | engine | `engine/review.rs` | Review agent failed/crashed, conflict/CI retry |
+| in_review → blocked | engine | `engine/review.rs` | Merge conflict retries ≥ 3, non-conflict merge failure, max review cycles exceeded |
+| stale in_review → needs_review | sync tick | `engine/sync.rs` | No active tmux review session detected |
 
 **Review agent**: triggered by engine when a task is in `needs_review` and has a branch. The engine transitions the task to `in_review` before spawning — the status itself is the duplicate guard (no sidecar flags needed). On failure, the engine resets to `needs_review` for retry.
 
@@ -835,12 +835,17 @@ src/
 │   └── discord.rs           # Discord gateway websocket (stub)
 │
 ├── engine/
-│   ├── mod.rs               # Engine struct, event loop (10s tick + 120s sync), PR review integration
+│   ├── mod.rs               # Engine struct, config, project init, main event loop (serve)
+│   ├── tick.rs              # Core tick phases: session polling, stuck recovery, routing, dispatch, unblock
+│   ├── sync.rs              # Sync tick: worktree cleanup, PR review trigger, mentions, skills sync
+│   ├── review.rs            # PR review pipeline: review agent, auto-merge, change handling, review_open_prs
+│   ├── cleanup.rs           # Worktree cleanup, branch deletion, merged-PR detection
 │   ├── tasks.rs             # TaskManager — unified internal + external CRUD
 │   ├── internal_tasks.rs    # Internal task SQLite operations
 │   ├── router.rs            # Agent selection strategies (label, round-robin, weighted, circuit breaker) — 1,919 lines
 │   ├── llm_router.rs        # LlmRouter — prompt building, LLM call, response parsing, skills catalog — 511 lines
 │   ├── jobs.rs              # Cron scheduler + self-review job (metrics → improvement issues)
+│   ├── commands.rs          # Owner /slash command scanning (/retry, /reroute, /block, etc.)
 │   └── runner/
 │       ├── mod.rs           # TaskRunner — orchestrates full task lifecycle
 │       ├── context.rs       # Prompt context building (project instructions, repo tree, etc.)
@@ -929,7 +934,7 @@ Unified notification dispatch that broadcasts task completion events to all conf
 
 ### PR Review Integration
 
-**Location:** `src/engine/mod.rs` (`review_open_prs()`)
+**Location:** `src/engine/review.rs` (`review_open_prs()`)
 
 Automatically creates follow-up tasks when a PR receives a `CHANGES_REQUESTED` review. This closes the feedback loop between code review and agent execution.
 
@@ -1219,7 +1224,7 @@ Last updated: 2026-03-01 (366 tests, ~98% parity)
 | Project-aware tmux naming (`orch-{project}-{id}`) | `src/tmux.rs`, `src/engine/mod.rs` | — |
 | Simplified service management (brew wrapper) | `src/cli/service.rs` | — |
 | Permission rules per-agent translation | `src/engine/runner/agents/` | — |
-| PR review integration | `src/engine/mod.rs` | PR #125 |
+| PR review integration | `src/engine/review.rs` | PR #125 |
 | Agent memory across retries | `src/sidecar.rs` | PR #122 |
 | Self-improvement loop | `src/engine/jobs.rs` | PR #120 |
 | Polling fallback for webhooks | `src/channels/github.rs` | PR #131 |
@@ -1231,15 +1236,15 @@ Last updated: 2026-03-01 (366 tests, ~98% parity)
 | `orch project add/remove/list` CLI | Implemented | Done | See `src/cli/mod.rs:484-710` |
 | Wire Telegram/Discord into engine loop | Implemented | Done | See `src/channels/telegram.rs`, `src/channels/discord.rs`, `src/engine/mod.rs:251-296` |
 | Mention detection via webhooks | Implemented | Done | Polling works, webhook receives events via `start_webhook_server()` in `src/channels/github.rs` |
-| Review Agent + Auto-Merge | Implemented | Done | See `src/engine/mod.rs:1768-2100+` `review_and_merge()` function |
-| PR Review Comments → Fix Dispatch | Implemented | Done | See `src/engine/mod.rs:1469-1700+` `review_open_prs()` function |
+| Review Agent + Auto-Merge | Implemented | Done | See `src/engine/review.rs` `review_and_merge()` function |
+| PR Review Comments → Fix Dispatch | Implemented | Done | See `src/engine/review.rs` `review_open_prs()` function |
 | Dashboard CLI | Implemented | Done | See `src/cli/dashboard.rs` - `orch dashboard` command |
 | Task Tree CLI | Implemented | Done | See `src/cli/tree.rs` - `orch task tree` command |
 | Owner commands (issue comment commands) | Implemented | Done | Issue #179 - see `src/engine/commands.rs` for `/retry`, `/reroute`, `/block` |
 | Child task delegation (auto-spawn subtasks) | Implemented | Done | Issue #178 - see `src/engine/runner/mod.rs:1003-1070` |
 | Skills Sync (auto-clone skill repos) | Missing | Low | Config exists but no sync implementation |
-| Merge detection (auto-close after PR merge) | Implemented | Done | See `check_merged_prs()` in `src/engine/mod.rs:1405-1452` |
-| Graceful shutdown with session handoff | Implemented | Done | See `src/engine/mod.rs:681-705` |
+| Merge detection (auto-close after PR merge) | Implemented | Done | See `check_merged_prs()` in `src/engine/cleanup.rs` |
+| Graceful shutdown with session handoff | Implemented | Done | See `src/engine/mod.rs` serve() loop |
 | Slack channel integration | Missing | Low | Future channel addition |
 | Context file per issue | Implemented | Done | See `src/engine/runner/context.rs:40-45` `load_task_context()` |
 
@@ -1317,7 +1322,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 | Issue | Title | Priority | Description |
 |-------|-------|----------|-------------|
-| #228 | Decompose `engine/mod.rs` into focused submodules | High | Extract PR review workflow (~804 lines) into `pr_review.rs`, sync operations (~340 lines) into `sync_ops.rs`. Break down `serve()` (503 lines) and `tick()` (401 lines) into named phases. See issue for full plan. |
+| #228/#283 | Decompose `engine/mod.rs` into focused submodules | **Done** | Extracted into `tick.rs`, `sync.rs`, `review.rs`, `cleanup.rs`. mod.rs is now the thin orchestrator (~800 lines). |
 | #257 | Extract LLM routing from `router.rs` into `engine/llm_router.rs` | Medium | The ~390-line LLM inference section (route_with_llm, call_router_llm, parse_llm_response, build_routing_prompt, skills catalog) is a self-contained unit mixed into router.rs. Extract into a dedicated `LlmRouter` struct in `src/engine/llm_router.rs`. |
 | #258 | Add `cargo-llvm-cov` coverage tracking to CI | Low | 366 tests but no coverage metrics. Add `cargo-llvm-cov` to `.github/workflows/ci.yml`, upload LCOV artifact on each PR. Makes refactoring (#228, #257) safe to validate. |
 
@@ -1331,16 +1336,16 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | #112 | Wire webhook server into engine | Webhook server integrated via `start_webhook_server()` in `src/channels/github.rs` |
 | #178 | Task delegation processing | `src/engine/runner/mod.rs:1003-1070` — spawns child tasks from `delegations` field |
 | #179 | Owner slash commands | `src/engine/commands.rs` — `/retry`, `/reroute [agent]`, `/block [reason]`, `/unblock`, `/close`, `/review` |
-| #143 | PR Review Integration | `src/engine/mod.rs` — processes `changes_requested` reviews and re-dispatches tasks |
-| - | Review Agent + Auto-Merge | `review_and_merge()` in `src/engine/mod.rs` |
-| - | Merge Detection | `check_merged_prs()` in `src/engine/mod.rs` |
+| #143 | PR Review Integration | `src/engine/review.rs` — processes `changes_requested` reviews and re-dispatches tasks |
+| - | Review Agent + Auto-Merge | `review_and_merge()` in `src/engine/review.rs` |
+| - | Merge Detection | `check_merged_prs()` in `src/engine/cleanup.rs` |
 | - | Dashboard CLI | `orch dashboard` in `src/cli/dashboard.rs` |
 | - | Task Tree CLI | `orch task tree` in `src/cli/tree.rs` |
-| - | Graceful Shutdown | SIGTERM/SIGINT handlers in `src/engine/mod.rs` |
+| - | Graceful Shutdown | SIGTERM/SIGINT handlers in `src/engine/mod.rs` (serve loop) |
 
 ### Code Quality
 
-- [ ] `src/engine/mod.rs` — 2,760 lines, needs decomposition (#228, in review)
+- [x] `src/engine/mod.rs` — decomposed into tick.rs, sync.rs, review.rs, cleanup.rs (#283)
 - [x] `src/engine/router.rs` — extracted LLM routing into `llm_router.rs` (#257); now 1,919 lines
 - [ ] `src/engine/runner/mod.rs` — 45KB coordinator; largest file in runner module
 - [ ] No test coverage tooling in CI (#258) — 366 tests exist but coverage metrics not tracked

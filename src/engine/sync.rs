@@ -1,0 +1,359 @@
+//! Sync tick — periodic operations that run less frequently than the core tick.
+//!
+//! The sync tick runs every ~45 seconds and handles:
+//! - Worktree cleanup for done tasks
+//! - Merged-PR detection
+//! - @mention scanning and internal task creation
+//! - PR review processing and follow-up dispatch
+//! - Stale InReview detection
+//! - Owner /slash command scanning
+//! - Skill repository syncing
+
+use crate::backends::{ExternalBackend, ExternalId, Status};
+use crate::cmd::CommandErrorContext;
+use crate::config;
+use crate::db::{Db, TaskStatus};
+use crate::engine::router::Router;
+use crate::sidecar::{self, REPO_CONTEXT};
+use crate::tmux::TmuxManager;
+use std::sync::Arc;
+use tokio::process::Command;
+use tokio::sync::RwLock;
+
+use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
+use super::review::{review_and_merge, review_open_prs, ReviewDecision};
+use super::EngineConfig;
+
+/// Sync tick — runs every 45s.
+///
+/// Handles less-frequent operations:
+/// - Cleanup finished worktrees
+/// - Check for merged PRs → mark tasks done
+/// - Scan for @mentions
+pub(crate) async fn sync_tick(
+    backend: &Arc<dyn ExternalBackend>,
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    db: &Arc<Db>,
+    config: &EngineConfig,
+    router: &Arc<RwLock<Router>>,
+) -> anyhow::Result<()> {
+    tracing::debug!("sync tick");
+
+    // 1. Cleanup worktrees for done tasks
+    if let Err(e) = cleanup_done_worktrees(backend, repo).await {
+        tracing::warn!(err = %e, "worktree cleanup failed");
+    }
+
+    // 2. Check for merged PRs (in_review → done)
+    if let Err(e) = check_merged_prs(backend).await {
+        tracing::warn!(err = %e, "PR merge check failed");
+    }
+
+    // 3. Scan for @mentions
+    if let Err(e) = scan_mentions(backend, db).await {
+        tracing::warn!(err = %e, "mention scan failed");
+    }
+
+    // 4. Review open PRs (parse review comments, create follow-ups)
+    if let Err(e) = review_open_prs(backend, db, repo, config).await {
+        tracing::warn!(err = %e, "PR review failed");
+    }
+
+    // 5. Trigger review agent for needs_review tasks (catch-up for any missed in main tick)
+    let enable_review = config::get("workflow.enable_review_agent")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+    if enable_review {
+        if let Ok(needs_review) = backend.list_by_status(Status::NeedsReview).await {
+            for task in needs_review {
+                let task_id = &task.id.0;
+                // Only trigger review for tasks that have a branch (i.e., PR exists)
+                let has_branch = sidecar::get(task_id, "branch")
+                    .map(|b| !b.is_empty())
+                    .unwrap_or(false);
+                if !has_branch {
+                    continue;
+                }
+                tracing::info!(task_id, "triggering review agent for needs_review task");
+                // Transition to InReview — this IS the guard against duplicates
+                if let Err(e) = backend.update_status(&task.id, Status::InReview).await {
+                    tracing::warn!(task_id, err = %e, "failed to transition to InReview");
+                    continue;
+                }
+                // Record timestamp so stale detection can apply a grace period
+                let _ = sidecar::set(
+                    task_id,
+                    &[format!(
+                        "in_review_since={}",
+                        chrono::Utc::now().timestamp()
+                    )],
+                );
+                let backend_c = backend.clone();
+                let tmux_c = tmux.clone();
+                let task_c = task.clone();
+                let repo_s = repo.to_string();
+                let router_c = router.clone();
+                let repo_ctx = repo_s.clone();
+                tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
+                    let tid = task_c.id.0.clone();
+                    match review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c).await {
+                        Ok(ReviewDecision::Failed(reason)) => {
+                            tracing::error!(
+                                task_id = tid,
+                                reason,
+                                "review agent failed — resetting to NeedsReview for retry"
+                            );
+                            let _ = backend_c
+                                .update_status(&ExternalId(tid), Status::NeedsReview)
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                task_id = tid, error = %e,
+                                "review_and_merge failed — resetting to NeedsReview for retry"
+                            );
+                            let _ = backend_c
+                                .update_status(&ExternalId(tid), Status::NeedsReview)
+                                .await;
+                        }
+                        Ok(_) => {}
+                    }
+                }));
+            }
+        }
+
+        // Detect stale InReview tasks (review agent crashed, no active tmux session).
+        // Apply a 90-second grace period so the freshly-spawned review agent has time
+        // to create its tmux session before we consider it stale.
+        if let Ok(in_review) = backend.list_by_status(Status::InReview).await {
+            let now_ts = chrono::Utc::now().timestamp();
+            for task in in_review {
+                let review_task_id = format!("{}-review", task.id.0);
+                let review_session = tmux.session_name(repo, &review_task_id);
+                let has_session = tmux.session_exists(&review_session).await;
+                if !has_session {
+                    let in_review_since = sidecar::get(&task.id.0, "in_review_since")
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(now_ts);
+                    let age_secs = now_ts - in_review_since;
+                    if age_secs < 90 {
+                        tracing::debug!(
+                            task_id = task.id.0,
+                            age_secs,
+                            "InReview task has no session yet — within grace period, skipping"
+                        );
+                        continue;
+                    }
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        session = %review_session,
+                        age_secs,
+                        "InReview task has no active review session — resetting to NeedsReview"
+                    );
+                    let _ = backend.update_status(&task.id, Status::NeedsReview).await;
+                }
+            }
+        }
+    }
+
+    // 6. Scan for owner /slash commands in issue comments
+    if let Err(e) = super::commands::scan_commands(backend, db, repo).await {
+        tracing::warn!(err = %e, "owner command scan failed");
+    }
+
+    // 7. Sync skill repositories
+    if let Err(e) = skills_sync().await {
+        tracing::warn!(err = %e, "skills sync failed");
+    }
+
+    Ok(())
+}
+
+/// Scan for @mentions and create internal tasks.
+///
+/// Checks recent issue comments for @orchestrator mentions,
+/// creates internal tasks, and acknowledges them.
+async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyhow::Result<()> {
+    // Get the current user (for mention detection)
+    let current_user = match backend.get_authenticated_user().await {
+        Ok(Some(u)) => format!("@{}", u),
+        Ok(None) => {
+            tracing::debug!("backend does not support user identity, skipping mentions");
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to get current user, skipping mentions");
+            return Ok(());
+        }
+    };
+
+    // Use persisted cursor if available, otherwise fall back to 24h ago
+    let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
+    let since_str = match db.kv_get("mentions_last_checked").await {
+        Ok(Some(ts)) => ts,
+        _ => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    };
+
+    let mentions = match backend.get_mentions(&since_str).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to get mentions");
+            return Ok(());
+        }
+    };
+
+    // Get existing mention tasks across ALL statuses to avoid duplicates.
+    // Only checking New status would miss tasks that progressed to InProgress/Done,
+    // causing duplicate tasks on the next sync tick within the 24h window.
+    let mut existing_mentions = std::collections::HashSet::new();
+    for status in &[
+        TaskStatus::New,
+        TaskStatus::InProgress,
+        TaskStatus::Done,
+        TaskStatus::Blocked,
+        TaskStatus::Routed,
+        TaskStatus::InReview,
+        TaskStatus::NeedsReview,
+    ] {
+        let tasks = db.list_internal_tasks_by_status(*status).await?;
+        for t in tasks {
+            if t.source == "mention" {
+                existing_mentions.insert(t.source_id.clone());
+            }
+        }
+    }
+
+    for mention in mentions {
+        // Skip if already processed
+        if existing_mentions.contains(&mention.id) {
+            continue;
+        }
+
+        if !mention.body.contains(&current_user) && !mention.body.contains("@orchestrator") {
+            continue;
+        }
+
+        // Create internal task for this mention
+        let title = format!("Respond to mention by @{}", mention.author);
+        let task_body = format!("Mention by @{}:\n\n{}", mention.author, mention.body);
+
+        let task_id = db
+            .create_internal_task(&title, &task_body, "mention", &mention.id)
+            .await?;
+
+        tracing::info!(task_id, mention_id = %mention.id, "created mention task");
+    }
+
+    // Persist cursor so the next sync tick only fetches newer comments
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    if let Err(e) = db.kv_set("mentions_last_checked", &now).await {
+        tracing::warn!(err = %e, "failed to persist mentions cursor");
+    }
+
+    Ok(())
+}
+
+/// Sync skill repositories from config.
+///
+/// Reads the `skills:` list from config and clones/pulls each repository
+/// to `~/.orch/skills/{repo}/`. This keeps skill documentation up-to-date
+/// for agents.
+async fn skills_sync() -> anyhow::Result<()> {
+    let skills = match crate::config::get_skills() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(err = %e, "no skills configured");
+            return Ok(());
+        }
+    };
+
+    if skills.is_empty() {
+        tracing::debug!("no skills configured, skipping sync");
+        return Ok(());
+    }
+
+    let skills_base = crate::home::skills_dir()?;
+    let git_timeout = std::time::Duration::from_secs(60);
+
+    for skill in skills {
+        // Validate repo format to prevent path traversal
+        if skill.repo.contains("..") || skill.repo.matches('/').count() != 1 {
+            tracing::warn!(repo = %skill.repo, "invalid skill repo format, expected 'owner/repo'");
+            continue;
+        }
+
+        let repo_dir = skills_base.join(&skill.repo);
+        let repo_url = format!("https://github.com/{}.git", skill.repo);
+
+        if repo_dir.exists() {
+            // Pull latest changes with timeout
+            tracing::debug!(repo = %skill.repo, "pulling skill repo");
+            let pull_result = tokio::time::timeout(
+                git_timeout,
+                Command::new("git")
+                    .args(["pull", "--ff-only", "--prune"])
+                    .current_dir(&repo_dir)
+                    .output_with_context(),
+            )
+            .await;
+
+            match pull_result {
+                Ok(Ok(output)) if !output.status.success() => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(repo = %skill.repo, err = %stderr, "git pull failed");
+                }
+                Ok(Ok(_)) => {
+                    tracing::debug!(repo = %skill.repo, "skill repo updated");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(repo = %skill.repo, err = %e, "git pull error");
+                }
+                Err(_) => {
+                    tracing::warn!(repo = %skill.repo, "git pull timed out after 60s");
+                }
+            }
+        } else {
+            // Clone the repository (shallow for efficiency)
+            tracing::debug!(repo = %skill.repo, "cloning skill repo");
+            let parent = repo_dir
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("skill repo path has no parent directory"))?;
+            std::fs::create_dir_all(parent)?;
+            let repo_dir_str = repo_dir
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("skill repo path is not valid UTF-8"))?;
+
+            let clone_result = tokio::time::timeout(
+                git_timeout,
+                Command::new("git")
+                    .args(["clone", "--depth", "1", &repo_url, repo_dir_str])
+                    .output_with_context(),
+            )
+            .await;
+
+            match clone_result {
+                Ok(Ok(output)) if !output.status.success() => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(repo = %skill.repo, err = %stderr, "git clone failed");
+                    // Clean up partial clone to allow retry on next tick
+                    let _ = std::fs::remove_dir_all(&repo_dir);
+                }
+                Ok(Ok(_)) => {
+                    tracing::info!(repo = %skill.repo, "skill repo cloned");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(repo = %skill.repo, err = %e, "git clone error");
+                    let _ = std::fs::remove_dir_all(&repo_dir);
+                }
+                Err(_) => {
+                    tracing::warn!(repo = %skill.repo, "git clone timed out after 60s");
+                    let _ = std::fs::remove_dir_all(&repo_dir);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
