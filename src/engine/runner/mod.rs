@@ -456,17 +456,25 @@ impl TaskRunner {
                 }
 
                 // Store result in sidecar
-                // If agent said "done" and a PR exists, set in_review (needs review before merge).
-                // If agent said "done" but NO PR (push failed, no changes, etc.), don't mark done
-                // — that would close the task without delivering any code.
+                // If agent said "done" and a PR exists, send to review before merge.
+                // If agent said "done", no PR, and no delegations — work is complete
+                // (e.g., review/analysis jobs that create issues but no code changes).
+                // If agent said "done", no PR, but has delegations — blocked on children.
+                let has_delegations = !resp.delegations.is_empty();
                 let final_status = if resp.status == "done" && has_pr {
                     "needs_review"
-                } else if resp.status == "done" && !has_pr {
-                    tracing::warn!(
+                } else if resp.status == "done" && !has_pr && has_delegations {
+                    tracing::info!(
                         task_id,
-                        "agent reported done but no PR exists (push failed or no changes) — setting needs_review"
+                        "agent reported done with delegations but no PR — setting blocked"
                     );
-                    "needs_review"
+                    "blocked"
+                } else if resp.status == "done" && !has_pr {
+                    tracing::info!(
+                        task_id,
+                        "agent reported done with no PR and no delegations — marking done"
+                    );
+                    "done"
                 } else {
                     &resp.status
                 };

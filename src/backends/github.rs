@@ -138,6 +138,23 @@ impl ExternalBackend for GitHubBackend {
                             }
                         }
                     }
+
+                    // Auto-close issue when status → Done (if auto_close enabled)
+                    if status == Status::Done {
+                        let auto_close = crate::config::get("workflow.auto_close")
+                            .map(|v| v == "true")
+                            .unwrap_or(true);
+                        if auto_close {
+                            if let Err(e) = self.gh.close_issue(&self.repo, &id.0).await {
+                                tracing::warn!(
+                                    task_id = id.0,
+                                    err = %e,
+                                    "auto-close issue failed (non-fatal)"
+                                );
+                            }
+                        }
+                    }
+
                     return Ok(());
                 }
                 Err(e) => {
