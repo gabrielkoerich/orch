@@ -30,6 +30,8 @@ pub(crate) enum ReviewDecision {
     },
     /// Review agent failed or crashed (reason stored for logging).
     Failed(String),
+    /// No PR exists — nothing to review, task marked done directly.
+    Skipped,
 }
 
 /// Review open PRs - re-dispatch agent to address review feedback.
@@ -442,12 +444,91 @@ pub(crate) async fn review_and_merge(
             n
         }
         Ok(None) => {
-            tracing::warn!(
-                task_id = task.id.0,
-                branch = %branch_name,
-                "no open PR found, skipping review"
-            );
-            return Ok(ReviewDecision::Failed("no open PR".to_string()));
+            // No open PR — check if branch has commits ahead of default branch.
+            // If yes: agent forgot to create PR, try to create one and retry review.
+            // If no: read-only task (e.g. code review), safe to mark done.
+            let default_branch =
+                config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+            let has_commits = tokio::process::Command::new("git")
+                .args([
+                    "-C",
+                    worktree_path.to_str().unwrap_or("."),
+                    "rev-list",
+                    "--count",
+                    &format!("origin/{default_branch}..HEAD"),
+                ])
+                .output()
+                .await
+                .ok()
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+                .unwrap_or(0)
+                > 0;
+
+            if has_commits {
+                // Branch has unpushed or un-PR'd work — try to create a PR
+                tracing::warn!(
+                    task_id = task.id.0,
+                    branch = %branch_name,
+                    "no open PR but branch has commits — attempting to create PR"
+                );
+                // Push first in case agent forgot
+                let _ = tokio::process::Command::new("git")
+                    .args(["-C", worktree_path.to_str().unwrap_or("."), "push", "-u", "origin", &branch_name])
+                    .output()
+                    .await;
+                // Try to create PR
+                let pr_result = tokio::process::Command::new("gh")
+                    .args([
+                        "pr",
+                        "create",
+                        "--repo", repo,
+                        "--head", &branch_name,
+                        "--title", &task.title,
+                        "--body", &format!("Resolves #{}\n\nAuto-created by orch review gate (agent forgot to open PR)", task.id.0),
+                    ])
+                    .current_dir(&worktree_path)
+                    .output()
+                    .await;
+                match pr_result {
+                    Ok(o) if o.status.success() => {
+                        tracing::info!(
+                            task_id = task.id.0,
+                            branch = %branch_name,
+                            "created missing PR — retrying review"
+                        );
+                        // Return Failed to trigger retry, now with a PR
+                        return Ok(ReviewDecision::Failed("created missing PR, retry".to_string()));
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        tracing::error!(
+                            task_id = task.id.0,
+                            branch = %branch_name,
+                            stderr = %stderr,
+                            "failed to create missing PR — work may be stuck"
+                        );
+                        return Ok(ReviewDecision::Failed(format!("no PR, create failed: {stderr}")));
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            task_id = task.id.0,
+                            error = %e,
+                            "failed to run gh pr create"
+                        );
+                        return Ok(ReviewDecision::Failed(format!("no PR, gh error: {e}")));
+                    }
+                }
+            } else {
+                tracing::info!(
+                    task_id = task.id.0,
+                    branch = %branch_name,
+                    "no open PR and no commits on branch — marking task done"
+                );
+                let _ = backend
+                    .update_status(&task.id, crate::backends::Status::Done)
+                    .await;
+                return Ok(ReviewDecision::Skipped);
+            }
         }
         Err(e) => {
             tracing::warn!(

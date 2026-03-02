@@ -226,10 +226,14 @@ pub async fn handle_success(
 
     if total_tokens > max_tokens {
         tracing::warn!(task_id, total_tokens, max_tokens, "exceeded token budget");
+        // Only override to needs_review if there's a PR to review;
+        // otherwise keep the already-computed final_status (e.g. "done" for
+        // read-only tasks with no code changes).
+        let budget_status = if has_pr { "needs_review" } else { final_status };
         sidecar::set(
             task_id,
             &[
-                "status=needs_review".to_string(),
+                format!("status={budget_status}"),
                 format!(
                     "last_error=token budget exceeded: {}/{} tokens (${:.4})",
                     total_tokens, max_tokens, cost.total_cost_usd
