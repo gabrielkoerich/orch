@@ -827,7 +827,8 @@ src/
 │   ├── mod.rs               # Engine struct, event loop (10s tick + 120s sync), PR review integration
 │   ├── tasks.rs             # TaskManager — unified internal + external CRUD
 │   ├── internal_tasks.rs    # Internal task SQLite operations
-│   ├── router.rs            # Agent routing (label, round-robin, LLM, circuit breaker)
+│   ├── router.rs            # Agent routing (label, round-robin, weighted — selection strategies)
+│   ├── llm_router.rs        # [planned #257] LLM-based task classification (route_with_llm, skills catalog)
 │   ├── jobs.rs              # Cron scheduler + self-review job (metrics → improvement issues)
 │   └── runner/
 │       ├── mod.rs           # TaskRunner — orchestrates full task lifecycle
@@ -1305,12 +1306,14 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | Issue | Title | Priority | Description |
 |-------|-------|----------|-------------|
 | #228 | Decompose `engine/mod.rs` into focused submodules | High | Extract PR review workflow (~804 lines) into `pr_review.rs`, sync operations (~340 lines) into `sync_ops.rs`. Break down `serve()` (503 lines) and `tick()` (401 lines) into named phases. See issue for full plan. |
-| #230 | Break `tick()` into named phases | Medium | Extract 4-5 phases of the 401-line `tick()` function into independent methods for readability and testability. Pure refactoring, no behavior change. |
+| #257 | Extract LLM routing from `router.rs` into `engine/llm_router.rs` | Medium | The ~390-line LLM inference section (route_with_llm, call_router_llm, parse_llm_response, build_routing_prompt, skills catalog) is a self-contained unit mixed into router.rs. Extract into a dedicated `LlmRouter` struct in `src/engine/llm_router.rs`. |
+| #258 | Add `cargo-llvm-cov` coverage tracking to CI | Low | 366 tests but no coverage metrics. Add `cargo-llvm-cov` to `.github/workflows/ci.yml`, upload LCOV artifact on each PR. Makes refactoring (#228, #257) safe to validate. |
 
 ### Recently Closed
 
 | Issue | Title | Description |
 |-------|-------|-------------|
+| #230 | Break `tick()` into named phases | Extracted 4-5 phases of the `tick()` function into independent methods. |
 | #144 | Cost Tracking CLI and Budget Enforcement | `orch cost` command in `src/cli/cost.rs` — per-task and aggregate cost reporting |
 | #145 | Webhook Server Production Hardening | Graceful shutdown, webhook event handling in `src/channels/github.rs` |
 | #112 | Wire webhook server into engine | Webhook server integrated via `start_webhook_server()` in `src/channels/github.rs` |
@@ -1325,11 +1328,10 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 ### Code Quality
 
-- [ ] `src/engine/mod.rs` — 2,687 lines, needs decomposition (#228)
-- [ ] `src/engine/router.rs` — 2,356 lines, well-structured but large; consider extracting LLM response parsing
-- [ ] `src/engine/runner/mod.rs` — 45KB, largest runner file; review for extraction opportunities
-- [ ] No test coverage tooling configured — add `cargo-llvm-cov` or `tarpaulin` to CI
-- [ ] 366 unit tests exist but coverage metrics not tracked
+- [ ] `src/engine/mod.rs` — 2,760 lines, needs decomposition (#228, in review)
+- [ ] `src/engine/router.rs` — 2,356 lines; extract LLM routing into `llm_router.rs` (#257)
+- [ ] `src/engine/runner/mod.rs` — 45KB coordinator; largest file in runner module
+- [ ] No test coverage tooling in CI (#258) — 366 tests exist but coverage metrics not tracked
 
 ### Feature Gaps (Low Priority)
 
