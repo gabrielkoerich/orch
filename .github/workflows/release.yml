@@ -22,6 +22,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -39,8 +42,14 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
-      - name: Run tests
-        run: cargo test
+      - name: Run tests with coverage
+        run: cargo llvm-cov --lcov --output-path lcov.info
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
 
   secrets:
     runs-on: ubuntu-latest

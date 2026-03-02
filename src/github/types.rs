@@ -29,6 +29,30 @@ pub struct GitHubUser {
     pub login: String,
 }
 
+/// Pull request details from the GitHub API.
+/// The `mergeable` field indicates if the PR can be merged:
+/// - `true` - PR can be merged
+/// - `false` - PR has merge conflicts (CONFLICTING)
+/// - `null` - GitHub is still computing mergeability
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubPullRequest {
+    pub number: u64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: String,
+    pub head: GitHubBranchRef,
+    pub base: GitHubBranchRef,
+    pub mergeable: Option<bool>,
+    pub merged: Option<bool>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubBranchRef {
+    pub ref_field: String,
+    pub sha: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubComment {
     pub id: u64,
