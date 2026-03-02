@@ -514,6 +514,21 @@ impl GhHttp {
             .collect())
     }
 
+    /// List all issues (open and closed, no label filter, paginated).
+    ///
+    /// This is more efficient than making separate calls for open and closed.
+    pub async fn list_all_issues(&self, repo: &str) -> anyhow::Result<Vec<GitHubIssue>> {
+        let url = format!("{GITHUB_API}/repos/{repo}/issues");
+        let all: Vec<GitHubIssue> = self
+            .get_all_pages(&url, &[("state", "all"), ("per_page", "100")])
+            .await?;
+        // GitHub /issues API returns PRs too — filter them out
+        Ok(all
+            .into_iter()
+            .filter(|i| i.pull_request.is_none())
+            .collect())
+    }
+
     /// Add labels to an issue.
     pub async fn add_labels(
         &self,

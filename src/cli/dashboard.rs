@@ -25,15 +25,23 @@ pub async fn dashboard() -> anyhow::Result<()> {
         Status::Blocked,
     ];
 
+    // Fetch all tasks in a single API call, then filter locally
+    let all_tasks = backend.list_all_tasks().await?;
+
     let mut counts: Vec<(Status, usize)> = Vec::new();
     let mut total = 0usize;
     let mut done_tasks = Vec::new();
     for s in &statuses {
-        let list = backend.list_by_status(*s).await?;
-        total += list.len();
-        counts.push((*s, list.len()));
+        let label = s.as_label();
+        let filtered: Vec<_> = all_tasks
+            .iter()
+            .filter(|t| t.labels.contains(&label.to_string()))
+            .cloned()
+            .collect();
+        total += filtered.len();
+        counts.push((*s, filtered.len()));
         if *s == Status::Done {
-            done_tasks = list;
+            done_tasks = filtered;
         }
     }
 
