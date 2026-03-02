@@ -10,7 +10,10 @@ use super::types::{
     GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview, GitHubReviewComment,
 };
 use reqwest::{header, Client, Response, StatusCode};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
 use std::time::{Duration, Instant};
 use urlencoding;
 
@@ -24,11 +27,13 @@ struct RateLimit {
     remaining: Option<u32>,
     /// UTC epoch second when the window resets.
     reset_at: Option<u64>,
-    /// Exponential backoff after a 403 (fallback when headers are absent).
+    /// Hard backoff after a 403/429 (fallback when reset time is absent).
     backoff_until: Option<Instant>,
     backoff_delay: Duration,
     backoff_base: Duration,
     backoff_max: Duration,
+    /// Proactively throttle when remaining drops below this threshold (default 10).
+    throttle_threshold: u32,
 }
 
 impl RateLimit {
@@ -41,6 +46,10 @@ impl RateLimit {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(900);
+        let threshold = crate::config::get("gh.rate_limit.throttle_threshold")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(10);
 
         Self {
             remaining: None,
@@ -49,6 +58,7 @@ impl RateLimit {
             backoff_delay: Duration::ZERO,
             backoff_base: Duration::from_secs(base),
             backoff_max: Duration::from_secs(max),
+            throttle_threshold: threshold,
         }
     }
 
@@ -62,7 +72,7 @@ impl RateLimit {
         }
     }
 
-    /// Record a successful call — reset backoff.
+    /// Record a successful call — reset hard backoff.
     fn record_success(&mut self) {
         if self.backoff_delay > Duration::ZERO {
             tracing::info!("GitHub backoff cleared after successful API call");
@@ -71,8 +81,29 @@ impl RateLimit {
         self.backoff_until = None;
     }
 
-    /// Record a 403 — escalate exponential backoff.
+    /// Record a 403/429 — use reset_at timestamp if available, else exponential backoff.
     fn record_rate_limit(&mut self) {
+        METRIC_RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
+
+        // Prefer reset_at when available — avoids over-waiting with exponential backoff
+        if let Some(reset_epoch) = self.reset_at {
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if reset_epoch > now_epoch {
+                let wait_secs = reset_epoch - now_epoch + 1;
+                self.backoff_delay = Duration::from_secs(wait_secs);
+                self.backoff_until = Some(Instant::now() + self.backoff_delay);
+                tracing::warn!(
+                    wait_secs,
+                    "GitHub rate limit hit, waiting until reset time"
+                );
+                return;
+            }
+        }
+
+        // Fall back to exponential backoff when reset time is unknown
         self.backoff_delay = if self.backoff_delay.is_zero() {
             self.backoff_base
         } else {
@@ -81,39 +112,77 @@ impl RateLimit {
         self.backoff_until = Some(Instant::now() + self.backoff_delay);
         tracing::warn!(
             delay_secs = self.backoff_delay.as_secs(),
-            "GitHub rate limit hit, backing off"
+            "GitHub rate limit hit, backing off (no reset header)"
         );
     }
 
-    /// Returns remaining backoff/pause duration, or None if free to proceed.
-    fn is_active(&self) -> Option<Duration> {
-        // 1. Check exponential backoff (403-triggered)
+    /// Returns remaining hard-backoff duration (post-403/429), or None.
+    fn backoff_remaining(&self) -> Option<Duration> {
         if let Some(until) = self.backoff_until {
             let now = Instant::now();
             if now < until {
                 return Some(until - now);
             }
         }
-        // 2. Proactive pause: if remaining == 0, wait until reset
-        if self.remaining == Some(0) {
-            if let Some(reset_epoch) = self.reset_at {
-                let now_epoch = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                if now_epoch < reset_epoch {
-                    return Some(Duration::from_secs(reset_epoch - now_epoch));
+        None
+    }
+
+    /// Returns how long to proactively wait when approaching the rate limit.
+    ///
+    /// Returns Some only when:
+    /// - not already in hard backoff,
+    /// - `remaining` is known and below `throttle_threshold`, and
+    /// - `reset_at` is known and in the future.
+    fn proactive_wait_duration(&self) -> Option<Duration> {
+        // Don't double-throttle when already in hard backoff
+        if self.backoff_remaining().is_some() {
+            return None;
+        }
+        if let Some(remaining) = self.remaining {
+            if remaining < self.throttle_threshold {
+                if let Some(reset_epoch) = self.reset_at {
+                    let now_epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if now_epoch < reset_epoch {
+                        return Some(Duration::from_secs(reset_epoch - now_epoch + 1));
+                    }
                 }
             }
         }
         None
     }
+
+    /// Combined check: backoff or proactive throttle. Used by engine's is_rate_limited().
+    fn is_active(&self) -> Option<Duration> {
+        self.backoff_remaining().or_else(|| self.proactive_wait_duration())
+    }
+
+    /// Clear remaining/reset state after a proactive wait (values are now stale).
+    fn clear_proactive_state(&mut self) {
+        self.remaining = None;
+        self.reset_at = None;
+    }
 }
 
 // ── Global state ─────────────────────────────────────────────────────
 
-static RATE_LIMIT: std::sync::LazyLock<Mutex<RateLimit>> =
+static REST_RATE_LIMIT: std::sync::LazyLock<Mutex<RateLimit>> =
     std::sync::LazyLock::new(|| Mutex::new(RateLimit::new()));
+
+/// Separate rate-limit tracker for the GraphQL endpoint (distinct quota from REST).
+static GRAPHQL_RATE_LIMIT: std::sync::LazyLock<Mutex<RateLimit>> =
+    std::sync::LazyLock::new(|| Mutex::new(RateLimit::new()));
+
+// ── Rate-limit metrics ────────────────────────────────────────────────
+
+/// Total 403/429 rate-limit responses received (REST + GraphQL).
+static METRIC_RATE_LIMIT_HITS: AtomicU64 = AtomicU64::new(0);
+/// Times proactive throttling slept before sending a request.
+static METRIC_PROACTIVE_THROTTLES: AtomicU64 = AtomicU64::new(0);
+/// Total seconds spent waiting due to proactive throttle or hard backoff.
+static METRIC_WAIT_SECS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 // ── GhHttp client ────────────────────────────────────────────────────
 
@@ -139,15 +208,17 @@ impl GhHttp {
         Self { client, token }
     }
 
-    // ── Rate-limit helpers (static, like the old GhCli) ──────────
+    // ── Rate-limit helpers ────────────────────────────────────────
 
-    /// Check if the GitHub API is currently rate-limited.
+    /// Check if the REST GitHub API is currently rate-limited (backoff or approaching limit).
+    /// Used by the engine to decide whether to skip a tick.
     pub fn is_rate_limited() -> Option<Duration> {
-        RATE_LIMIT.lock().ok().and_then(|rl| rl.is_active())
+        REST_RATE_LIMIT.lock().ok().and_then(|rl| rl.is_active())
     }
 
+    /// Fail fast if the REST API is in hard backoff (post-403/429).
     fn check_backoff() -> anyhow::Result<()> {
-        if let Some(remaining) = Self::is_rate_limited() {
+        if let Some(remaining) = REST_RATE_LIMIT.lock().ok().and_then(|rl| rl.backoff_remaining()) {
             anyhow::bail!(
                 "GitHub API rate-limited, backoff active for {}s",
                 remaining.as_secs()
@@ -156,8 +227,64 @@ impl GhHttp {
         Ok(())
     }
 
+    /// Fail fast if the GraphQL API is in hard backoff (post-403/429).
+    fn check_graphql_backoff() -> anyhow::Result<()> {
+        if let Some(remaining) =
+            GRAPHQL_RATE_LIMIT.lock().ok().and_then(|rl| rl.backoff_remaining())
+        {
+            anyhow::bail!(
+                "GitHub GraphQL API rate-limited, backoff active for {}s",
+                remaining.as_secs()
+            );
+        }
+        Ok(())
+    }
+
+    /// Proactively sleep if the REST API quota is running low (remaining < threshold).
+    /// Clears stale header state after sleeping so the next request gets fresh values.
+    async fn proactive_throttle_rest() {
+        let wait = REST_RATE_LIMIT
+            .lock()
+            .ok()
+            .and_then(|rl| rl.proactive_wait_duration());
+        if let Some(d) = wait {
+            let secs = d.as_secs().max(1);
+            METRIC_PROACTIVE_THROTTLES.fetch_add(1, Ordering::Relaxed);
+            METRIC_WAIT_SECS_TOTAL.fetch_add(secs, Ordering::Relaxed);
+            tracing::warn!(
+                wait_secs = secs,
+                "approaching GitHub REST rate limit, throttling until reset"
+            );
+            tokio::time::sleep(d).await;
+            if let Ok(mut rl) = REST_RATE_LIMIT.lock() {
+                rl.clear_proactive_state();
+            }
+        }
+    }
+
+    /// Proactively sleep if the GraphQL API quota is running low (remaining < threshold).
+    async fn proactive_throttle_graphql() {
+        let wait = GRAPHQL_RATE_LIMIT
+            .lock()
+            .ok()
+            .and_then(|rl| rl.proactive_wait_duration());
+        if let Some(d) = wait {
+            let secs = d.as_secs().max(1);
+            METRIC_PROACTIVE_THROTTLES.fetch_add(1, Ordering::Relaxed);
+            METRIC_WAIT_SECS_TOTAL.fetch_add(secs, Ordering::Relaxed);
+            tracing::warn!(
+                wait_secs = secs,
+                "approaching GitHub GraphQL rate limit, throttling until reset"
+            );
+            tokio::time::sleep(d).await;
+            if let Ok(mut rl) = GRAPHQL_RATE_LIMIT.lock() {
+                rl.clear_proactive_state();
+            }
+        }
+    }
+
     fn record_response(resp: &Response) {
-        if let Ok(mut rl) = RATE_LIMIT.lock() {
+        if let Ok(mut rl) = REST_RATE_LIMIT.lock() {
             rl.update_from_headers(resp.headers());
             // Only backoff on 429 (always rate limit) — 403 requires body inspection
             // which is handled in maybe_record_rate_limit_from_body().
@@ -169,7 +296,18 @@ impl GhHttp {
         }
     }
 
-    /// Check response body for rate-limit signals on 403 responses.
+    fn record_graphql_response(resp: &Response) {
+        if let Ok(mut rl) = GRAPHQL_RATE_LIMIT.lock() {
+            rl.update_from_headers(resp.headers());
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                rl.record_rate_limit();
+            } else if resp.status().is_success() {
+                rl.record_success();
+            }
+        }
+    }
+
+    /// Check response body for rate-limit signals on 403 responses (REST).
     /// Not all 403s are rate limits — some are permission errors.
     fn maybe_record_rate_limit_from_body(status: StatusCode, body: &str) {
         if status == StatusCode::FORBIDDEN {
@@ -178,7 +316,22 @@ impl GhHttp {
                 || lower.contains("abuse detection")
                 || lower.contains("secondary rate")
             {
-                if let Ok(mut rl) = RATE_LIMIT.lock() {
+                if let Ok(mut rl) = REST_RATE_LIMIT.lock() {
+                    rl.record_rate_limit();
+                }
+            }
+        }
+    }
+
+    /// Check response body for rate-limit signals on 403 responses (GraphQL).
+    fn maybe_record_graphql_rate_limit_from_body(status: StatusCode, body: &str) {
+        if status == StatusCode::FORBIDDEN {
+            let lower = body.to_lowercase();
+            if lower.contains("rate limit")
+                || lower.contains("abuse detection")
+                || lower.contains("secondary rate")
+            {
+                if let Ok(mut rl) = GRAPHQL_RATE_LIMIT.lock() {
                     rl.record_rate_limit();
                 }
             }
@@ -186,7 +339,7 @@ impl GhHttp {
     }
 
     fn record_success() {
-        if let Ok(mut rl) = RATE_LIMIT.lock() {
+        if let Ok(mut rl) = REST_RATE_LIMIT.lock() {
             rl.record_success();
         }
     }
@@ -199,6 +352,7 @@ impl GhHttp {
 
     /// GET request, returns deserialized JSON.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
+        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let resp = self
             .client
@@ -220,6 +374,7 @@ impl GhHttp {
 
     /// GET raw bytes (for endpoints that return non-JSON or we parse manually).
     async fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let resp = self
             .client
@@ -245,6 +400,7 @@ impl GhHttp {
         url: &str,
         query: &[(&str, &str)],
     ) -> anyhow::Result<T> {
+        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let resp = self
             .client
@@ -267,6 +423,7 @@ impl GhHttp {
 
     /// POST with JSON body, returns raw response text.
     async fn post_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
+        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let resp = self
             .client
@@ -299,6 +456,7 @@ impl GhHttp {
 
     /// PATCH with JSON body, returns raw response.
     async fn patch_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
+        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let resp = self
             .client
@@ -321,6 +479,7 @@ impl GhHttp {
 
     /// DELETE request.
     async fn delete(&self, url: &str) -> anyhow::Result<StatusCode> {
+        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let resp = self
             .client
@@ -346,6 +505,7 @@ impl GhHttp {
         url: &str,
         query: &[(&str, &str)],
     ) -> anyhow::Result<Vec<T>> {
+        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let mut all: Vec<T> = Vec::new();
         let mut next_url: Option<String> = None;
@@ -396,13 +556,14 @@ impl GhHttp {
         Ok(all)
     }
 
-    /// POST to the GraphQL endpoint.
+    /// POST to the GraphQL endpoint. Uses separate rate-limit tracking from REST.
     async fn graphql_request(
         &self,
         query: &str,
         extra_headers: &[(&str, &str)],
     ) -> anyhow::Result<serde_json::Value> {
-        Self::check_backoff()?;
+        Self::proactive_throttle_graphql().await;
+        Self::check_graphql_backoff()?;
         let body = serde_json::json!({ "query": query });
         let mut req = self
             .client
@@ -417,14 +578,13 @@ impl GhHttp {
         }
 
         let resp = req.send().await?;
-        Self::record_response(&resp);
+        Self::record_graphql_response(&resp);
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            Self::maybe_record_rate_limit_from_body(status, &text);
+            Self::maybe_record_graphql_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub GraphQL failed ({status}): {text}");
         }
-        Self::record_success();
         Ok(serde_json::from_str(&text)?)
     }
 
@@ -732,6 +892,7 @@ impl GhHttp {
 
     /// Check if a user is a collaborator.
     pub async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
+        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/collaborators/{username}");
         let resp = self
@@ -781,6 +942,7 @@ impl GhHttp {
         pr_number: u64,
         delete_branch: bool,
     ) -> anyhow::Result<()> {
+        Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/merge");
         let payload = serde_json::json!({ "merge_method": "squash" });
@@ -1017,6 +1179,36 @@ impl GhHttp {
     }
 }
 
+// ── Public metrics ───────────────────────────────────────────────────
+
+/// Snapshot of GitHub API rate-limit metrics.
+#[derive(Debug, Clone)]
+pub struct RateLimitMetrics {
+    /// Total 403/429 rate-limit responses received (REST + GraphQL combined).
+    pub hits: u64,
+    /// Times proactive throttling slept before sending a request.
+    pub proactive_throttles: u64,
+    /// Total seconds spent waiting due to proactive throttle or hard backoff.
+    pub wait_secs: u64,
+    /// Current REST remaining quota (None if not yet observed).
+    pub rest_remaining: Option<u32>,
+    /// Current GraphQL remaining quota (None if not yet observed).
+    pub graphql_remaining: Option<u32>,
+}
+
+/// Return a snapshot of GitHub API rate-limit metrics.
+pub fn rate_limit_metrics() -> RateLimitMetrics {
+    let rest_remaining = REST_RATE_LIMIT.lock().ok().and_then(|rl| rl.remaining);
+    let graphql_remaining = GRAPHQL_RATE_LIMIT.lock().ok().and_then(|rl| rl.remaining);
+    RateLimitMetrics {
+        hits: METRIC_RATE_LIMIT_HITS.load(Ordering::Relaxed),
+        proactive_throttles: METRIC_PROACTIVE_THROTTLES.load(Ordering::Relaxed),
+        wait_secs: METRIC_WAIT_SECS_TOTAL.load(Ordering::Relaxed),
+        rest_remaining,
+        graphql_remaining,
+    }
+}
+
 // ── Token resolution ─────────────────────────────────────────────────
 
 /// Resolve a GitHub token: `GH_TOKEN` env → `GITHUB_TOKEN` env → `gh auth token`.
@@ -1148,29 +1340,27 @@ mod tests {
         assert_eq!(parse_link_next(&headers), None);
     }
 
-    #[test]
-    fn rate_limit_inactive_by_default() {
-        let rl = RateLimit {
+    fn make_rl(base_secs: u64, max_secs: u64) -> RateLimit {
+        RateLimit {
             remaining: None,
             reset_at: None,
             backoff_until: None,
             backoff_delay: Duration::ZERO,
-            backoff_base: Duration::from_secs(30),
-            backoff_max: Duration::from_secs(900),
-        };
+            backoff_base: Duration::from_secs(base_secs),
+            backoff_max: Duration::from_secs(max_secs),
+            throttle_threshold: 10,
+        }
+    }
+
+    #[test]
+    fn rate_limit_inactive_by_default() {
+        let rl = make_rl(30, 900);
         assert!(rl.is_active().is_none());
     }
 
     #[test]
     fn rate_limit_backoff_activates() {
-        let mut rl = RateLimit {
-            remaining: None,
-            reset_at: None,
-            backoff_until: None,
-            backoff_delay: Duration::ZERO,
-            backoff_base: Duration::from_secs(5),
-            backoff_max: Duration::from_secs(60),
-        };
+        let mut rl = make_rl(5, 60);
         rl.record_rate_limit();
         assert!(rl.is_active().is_some());
         assert_eq!(rl.backoff_delay, Duration::from_secs(5));
@@ -1178,14 +1368,7 @@ mod tests {
 
     #[test]
     fn rate_limit_backoff_doubles() {
-        let mut rl = RateLimit {
-            remaining: None,
-            reset_at: None,
-            backoff_until: None,
-            backoff_delay: Duration::ZERO,
-            backoff_base: Duration::from_secs(5),
-            backoff_max: Duration::from_secs(60),
-        };
+        let mut rl = make_rl(5, 60);
         rl.record_rate_limit();
         assert_eq!(rl.backoff_delay, Duration::from_secs(5));
         rl.record_rate_limit();
@@ -1196,14 +1379,7 @@ mod tests {
 
     #[test]
     fn rate_limit_backoff_caps_at_max() {
-        let mut rl = RateLimit {
-            remaining: None,
-            reset_at: None,
-            backoff_until: None,
-            backoff_delay: Duration::ZERO,
-            backoff_base: Duration::from_secs(30),
-            backoff_max: Duration::from_secs(60),
-        };
+        let mut rl = make_rl(30, 60);
         rl.record_rate_limit(); // 30
         rl.record_rate_limit(); // 60
         rl.record_rate_limit(); // capped at 60
@@ -1212,14 +1388,7 @@ mod tests {
 
     #[test]
     fn rate_limit_success_resets() {
-        let mut rl = RateLimit {
-            remaining: None,
-            reset_at: None,
-            backoff_until: None,
-            backoff_delay: Duration::ZERO,
-            backoff_base: Duration::from_secs(5),
-            backoff_max: Duration::from_secs(60),
-        };
+        let mut rl = make_rl(5, 60);
         rl.record_rate_limit();
         assert!(rl.is_active().is_some());
         rl.record_success();
@@ -1229,15 +1398,8 @@ mod tests {
 
     #[test]
     fn rate_limit_proactive_pause() {
-        let mut rl = RateLimit {
-            remaining: None,
-            reset_at: None,
-            backoff_until: None,
-            backoff_delay: Duration::ZERO,
-            backoff_base: Duration::from_secs(30),
-            backoff_max: Duration::from_secs(900),
-        };
-        // Simulate: 0 remaining, reset 60s in the future
+        let mut rl = make_rl(30, 900);
+        // Simulate: 0 remaining (below default threshold of 10), reset 60s in the future
         rl.remaining = Some(0);
         let future_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1247,7 +1409,41 @@ mod tests {
         rl.reset_at = Some(future_epoch);
         let pause = rl.is_active();
         assert!(pause.is_some());
-        // Should be roughly 60 seconds (within tolerance)
-        assert!(pause.unwrap().as_secs() <= 61);
+        // Should be roughly 60 seconds (within tolerance, +1s buffer added)
+        assert!(pause.unwrap().as_secs() <= 62);
+    }
+
+    #[test]
+    fn rate_limit_proactive_pause_threshold() {
+        let mut rl = make_rl(30, 900);
+        // remaining=15 is above default threshold of 10 — no proactive wait
+        rl.remaining = Some(15);
+        let future_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        rl.reset_at = Some(future_epoch);
+        assert!(rl.is_active().is_none());
+
+        // remaining=5 is below threshold — proactive wait activates
+        rl.remaining = Some(5);
+        assert!(rl.is_active().is_some());
+    }
+
+    #[test]
+    fn rate_limit_uses_reset_at_for_backoff() {
+        let mut rl = make_rl(30, 900);
+        // Set reset_at to 45s in the future
+        let future_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 45;
+        rl.reset_at = Some(future_epoch);
+        rl.record_rate_limit();
+        // Backoff should use reset_at (~46s) not the base (30s)
+        assert!(rl.backoff_delay.as_secs() >= 45);
+        assert!(rl.backoff_delay.as_secs() <= 47);
     }
 }
