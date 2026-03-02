@@ -235,6 +235,7 @@ pub(crate) async fn tick_dispatch_tasks(
     weight_tx: &mpsc::Sender<WeightSignal>,
     transport: &Arc<Transport>,
     router_arc: &Arc<RwLock<Router>>,
+    dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase3b.dispatch").entered();
     // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
@@ -250,6 +251,21 @@ pub(crate) async fn tick_dispatch_tasks(
     }
 
     for task in dispatchable {
+        // In-memory guard: prevents double-dispatch due to GitHub API eventual consistency.
+        // After update_status(InProgress), the label removal fires a webhook that can
+        // trigger an immediate tick. GitHub's search index may not yet reflect the label
+        // change, so list_by_status(Routed) can still return this task. The tmux session
+        // does not exist until the runner completes worktree setup (~10s later), so the
+        // session_exists check alone is insufficient.
+        let dispatch_key = format!("{}/{}", repo, task.id.0);
+        {
+            let guard = dispatching.lock().unwrap();
+            if guard.contains(&dispatch_key) {
+                tracing::debug!(task_id = task.id.0, "task already dispatching, skipping duplicate");
+                continue;
+            }
+        }
+
         // Check if already running (has active session)
         let session_name = tmux.session_name(repo, &task.id.0);
         if tmux.session_exists(&session_name).await {
@@ -273,6 +289,14 @@ pub(crate) async fn tick_dispatch_tasks(
             continue;
         }
 
+        // Insert into dispatching set after successful status update.
+        // This prevents the webhook-triggered tick (fired by label removal during
+        // update_status) from re-dispatching the same task.
+        {
+            let mut guard = dispatching.lock().unwrap();
+            guard.insert(dispatch_key.clone());
+        }
+
         // Register session for capture
         let session_name = tmux.session_name(repo, &task_id);
         capture.register_session(&task_id, &session_name).await;
@@ -288,6 +312,7 @@ pub(crate) async fn tick_dispatch_tasks(
         let task_owned = task.clone();
         let weight_tx = weight_tx.clone();
         let repo_owned = repo.to_string();
+        let dispatching_for_cleanup = dispatching.clone();
 
         // Load routing result from sidecar (stored during Phase 3a)
         let route_result = get_route_result(&task_id).ok();
@@ -433,6 +458,12 @@ pub(crate) async fn tick_dispatch_tasks(
             // Unregister session from capture
             capture.unregister_session(&task_id_for_cleanup).await;
 
+            // Remove from dispatching set so the task can be re-dispatched if needed
+            {
+                let mut guard = dispatching_for_cleanup.lock().unwrap();
+                guard.remove(&dispatch_key);
+            }
+
             // Release the semaphore permit
             drop(permit);
         }));
@@ -533,6 +564,7 @@ pub(crate) async fn tick(
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
     transport: &Arc<Transport>,
+    dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
     tick_check_session_completions(tmux, repo, capture).await?;
@@ -549,6 +581,7 @@ pub(crate) async fn tick(
         weight_tx,
         transport,
         router_arc,
+        dispatching,
     )
     .await?;
     tick_unblock_parents(backend, task_manager).await?;

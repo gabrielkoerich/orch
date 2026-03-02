@@ -517,6 +517,15 @@ pub async fn serve() -> anyhow::Result<()> {
     // Concurrency limiter (shared across all projects)
     let semaphore = Arc::new(Semaphore::new(config.max_parallel));
 
+    // In-memory dispatch guard: tracks task IDs currently being dispatched.
+    // Guards against GitHub API eventual consistency — after update_status(InProgress),
+    // the label-removal webhook can trigger an immediate tick where list_by_status(Routed)
+    // still returns the task (search index propagation delay). The tmux session does not
+    // exist until the runner completes worktree setup (~10s later), so session_exists
+    // alone is insufficient. Keyed by "{repo}/{task_id}".
+    let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
     // Subscribe to config file changes for hot reload
     let mut config_rx = crate::config::subscribe();
 
@@ -651,6 +660,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &engine.task_manager,
                                 &weight_tx,
                                 &transport,
+                                &dispatching,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
                             }
@@ -722,6 +732,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &engine.task_manager,
                                 &weight_tx,
                                 &transport,
+                                &dispatching,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
                             }
