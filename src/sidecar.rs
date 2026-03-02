@@ -14,6 +14,13 @@ use serde_json::Value;
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::path::PathBuf;
 
+tokio::task_local! {
+    /// Repo slug (e.g. "owner/repo") propagated into spawned async tasks
+    /// so that sidecar path resolution can scope files per-repo without
+    /// requiring every call-site to pass the repo explicitly.
+    pub static REPO_CONTEXT: String;
+}
+
 /// Token usage for an agent run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TokenUsage {
@@ -117,9 +124,10 @@ fn sidecar_path(task_id: &str) -> anyhow::Result<PathBuf> {
 
 /// Get the path to a task's sidecar file, optionally scoped to a repo.
 fn sidecar_path_for_repo(task_id: &str, repo: Option<&str>) -> anyhow::Result<PathBuf> {
-    // Try to resolve repo
+    // Try to resolve repo: explicit arg > task-local > CWD-based config
     let repo_slug = repo
         .map(String::from)
+        .or_else(|| REPO_CONTEXT.try_with(|r| r.clone()).ok())
         .or_else(|| crate::config::get_current_repo().ok());
 
     if let Some(ref repo) = repo_slug {
@@ -129,10 +137,14 @@ fn sidecar_path_for_repo(task_id: &str, repo: Option<&str>) -> anyhow::Result<Pa
             if new_path.exists() {
                 return Ok(new_path);
             }
-            // Check legacy flat path
+            // Auto-migrate flat file to per-repo path on first access
             let legacy = state_file(&format!("{task_id}.json"))?;
             if legacy.exists() {
-                return Ok(legacy);
+                if let Some(parent) = new_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(&legacy, &new_path)?;
+                return Ok(new_path);
             }
             // New file — use per-task dir
             return Ok(new_path);

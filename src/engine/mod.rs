@@ -38,7 +38,7 @@ use crate::engine::router::{get_route_result, Router};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::github::types::{GitHubReviewComment, PullRequestReview};
-use crate::sidecar;
+use crate::sidecar::{self, REPO_CONTEXT};
 use crate::tmux::TmuxManager;
 use runner::{TaskRunner, WeightSignal};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -575,9 +575,12 @@ pub async fn serve() -> anyhow::Result<()> {
                 // no new routing, dispatch, or sync work.
                 if is_draining {
                     for engine in &project_engines {
-                        if let Err(e) = tick_check_session_completions(&tmux, &engine.repo, &capture_for_tick).await {
-                            tracing::debug!(repo = %engine.repo, ?e, "session completion check failed during drain");
-                        }
+                        let repo = engine.repo.clone();
+                        REPO_CONTEXT.scope(repo, async {
+                            if let Err(e) = tick_check_session_completions(&tmux, &engine.repo, &capture_for_tick).await {
+                                tracing::debug!(repo = %engine.repo, ?e, "session completion check failed during drain");
+                            }
+                        }).await;
                     }
 
                     // Check if all sessions have finished
@@ -605,33 +608,39 @@ pub async fn serve() -> anyhow::Result<()> {
                     // Core tick: poll tasks for all projects
                     let router_guard = router.read().await;
                     for engine in &project_engines {
-                        if let Err(e) = tick(
-                            &engine.backend,
-                            &tmux,
-                            &engine.repo,
-                            &engine.runner,
-                            &capture_for_tick,
-                            &semaphore,
-                            &config,
-                            &jobs_path,
-                            &db,
-                            &router_guard,
-                            &router,
-                            &engine.task_manager,
-                            &weight_tx,
-                            &transport,
-                        ).await {
-                            tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
-                        }
+                        let repo = engine.repo.clone();
+                        REPO_CONTEXT.scope(repo, async {
+                            if let Err(e) = tick(
+                                &engine.backend,
+                                &tmux,
+                                &engine.repo,
+                                &engine.runner,
+                                &capture_for_tick,
+                                &semaphore,
+                                &config,
+                                &jobs_path,
+                                &db,
+                                &router_guard,
+                                &router,
+                                &engine.task_manager,
+                                &weight_tx,
+                                &transport,
+                            ).await {
+                                tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
+                            }
+                        }).await;
                     }
                     drop(router_guard);
 
                     // Periodic sync (less frequent)
                     if last_sync.elapsed() >= config.sync_interval {
                         for engine in &project_engines {
-                            if let Err(e) = sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config, &router).await {
-                                tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
-                            }
+                            let repo = engine.repo.clone();
+                            REPO_CONTEXT.scope(repo, async {
+                                if let Err(e) = sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config, &router).await {
+                                    tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
+                                }
+                            }).await;
                         }
                         last_sync = std::time::Instant::now();
                     }
@@ -670,24 +679,27 @@ pub async fn serve() -> anyhow::Result<()> {
 
                     let router_guard = router.read().await;
                     for engine in &project_engines {
-                        if let Err(e) = tick(
-                            &engine.backend,
-                            &tmux,
-                            &engine.repo,
-                            &engine.runner,
-                            &capture_for_tick,
-                            &semaphore,
-                            &config,
-                            &jobs_path,
-                            &db,
-                            &router_guard,
-                            &router,
-                            &engine.task_manager,
-                            &weight_tx,
-                            &transport,
-                        ).await {
-                            tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
-                        }
+                        let repo = engine.repo.clone();
+                        REPO_CONTEXT.scope(repo, async {
+                            if let Err(e) = tick(
+                                &engine.backend,
+                                &tmux,
+                                &engine.repo,
+                                &engine.runner,
+                                &capture_for_tick,
+                                &semaphore,
+                                &config,
+                                &jobs_path,
+                                &db,
+                                &router_guard,
+                                &router,
+                                &engine.task_manager,
+                                &weight_tx,
+                                &transport,
+                            ).await {
+                                tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
+                            }
+                        }).await;
                     }
                     drop(router_guard);
                 }
@@ -1034,7 +1046,8 @@ async fn tick_dispatch_tasks(
             .map(|r| r.agent.clone())
             .unwrap_or_else(|| "claude".to_string());
 
-        tokio::spawn(async move {
+        let repo_ctx = repo_owned.clone();
+        tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
             // Note: Using tracing::info_span directly without holding across await
             // to avoid Send issues with EnteredSpan
             tracing::info!(task_id, "dispatching task");
@@ -1087,7 +1100,8 @@ async fn tick_dispatch_tasks(
                                 let task_owned_clone = task_owned.clone();
                                 let router_for_review = router_clone.clone();
                                 let task_id_for_review = task_id.clone();
-                                tokio::spawn(async move {
+                                let repo_ctx = repo_owned.clone();
+                                tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                                     match review_and_merge(
                                         &task_owned_clone,
                                         &backend_clone,
@@ -1129,7 +1143,7 @@ async fn tick_dispatch_tasks(
                                         }
                                         Ok(_) => {} // Approve or RequestChanges handled inside
                                     }
-                                });
+                                }));
                             }
                         }
                     }
@@ -1171,7 +1185,7 @@ async fn tick_dispatch_tasks(
 
             // Release the semaphore permit
             drop(permit);
-        });
+        }));
     }
     Ok(())
 }
@@ -1356,7 +1370,8 @@ async fn sync_tick(
                 let task_c = task.clone();
                 let repo_s = repo.to_string();
                 let router_c = router.clone();
-                tokio::spawn(async move {
+                let repo_ctx = repo_s.clone();
+                tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                     let tid = task_c.id.0.clone();
                     match review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c).await {
                         Ok(ReviewDecision::Failed(reason)) => {
@@ -1386,7 +1401,7 @@ async fn sync_tick(
                         }
                         Ok(_) => {}
                     }
-                });
+                }));
             }
         }
 
@@ -1607,7 +1622,7 @@ async fn cleanup_done_worktrees(
                 }
             }
 
-            // Delete branch from the main repo root (worktree is already gone)
+            // Delete local and remote branch from the main repo root (worktree is already gone)
             if let Some(ref br) = branch {
                 let branch_delete_result = Command::new("git")
                     .args(["-C", &repo_root, "branch", "-D", br])
@@ -1616,14 +1631,33 @@ async fn cleanup_done_worktrees(
 
                 match branch_delete_result {
                     Ok(output) if output.status.success() => {
-                        tracing::info!(task_id, branch = %br, "branch deleted");
+                        tracing::info!(task_id, branch = %br, "local branch deleted");
                     }
                     Ok(output) => {
                         let stderr = String::from_utf8_lossy(&output.stderr);
-                        tracing::debug!(task_id, err = %stderr, "branch delete skipped (may not exist)");
+                        tracing::debug!(task_id, err = %stderr, "local branch delete skipped (may not exist)");
                     }
                     Err(e) => {
-                        tracing::warn!(task_id, err = %e, "failed to delete branch");
+                        tracing::warn!(task_id, err = %e, "failed to delete local branch");
+                    }
+                }
+
+                // Delete remote branch
+                let remote_delete = Command::new("git")
+                    .args(["-C", &repo_root, "push", "origin", "--delete", br])
+                    .output_with_context()
+                    .await;
+
+                match remote_delete {
+                    Ok(output) if output.status.success() => {
+                        tracing::info!(task_id, branch = %br, "remote branch deleted");
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        tracing::debug!(task_id, err = %stderr, "remote branch delete skipped");
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id, err = %e, "failed to delete remote branch");
                     }
                 }
             }
@@ -2665,24 +2699,13 @@ async fn auto_merge_pr(
         return Err(e);
     }
 
-    // 6. Update status to done
+    // 6. Update status to done (auto-closes the issue via backend)
     backend.update_status(&task.id, Status::Done).await?;
 
-    // 7. Close issue if auto_close enabled
-    let auto_close = config::get("workflow.auto_close")
-        .map(|v| v == "true")
-        .unwrap_or(true);
-
-    if auto_close {
-        if let Err(e) = gh.close_issue(repo, &task.id.0).await {
-            tracing::warn!(task_id = task.id.0, error = %e, "failed to close issue after merge");
-        }
-    }
-
-    // 8. Mark worktree for cleanup
+    // 7. Mark worktree for cleanup
     let _ = sidecar::set(&task.id.0, &["worktree_cleaned=false".to_string()]);
 
-    // 9. Post final comment on the PR
+    // 8. Post final comment on the PR
     let _ = gh
         .add_comment(
             repo,
