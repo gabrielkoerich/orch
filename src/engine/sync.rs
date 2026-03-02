@@ -99,24 +99,27 @@ pub(crate) async fn sync_tick(
                 let repo_ctx = repo_s.clone();
                 tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                     let tid = task_c.id.0.clone();
-                    let needs_reset = match review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c).await {
-                        Ok(ReviewDecision::Failed(reason)) => {
-                            tracing::error!(
-                                task_id = tid,
-                                reason,
-                                "review agent failed — resetting to NeedsReview for retry"
-                            );
-                            true
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                task_id = tid, error = %e,
-                                "review_and_merge failed — resetting to NeedsReview for retry"
-                            );
-                            true
-                        }
-                        Ok(_) => false,
-                    };
+                    let needs_reset =
+                        match review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c)
+                            .await
+                        {
+                            Ok(ReviewDecision::Failed(reason)) => {
+                                tracing::error!(
+                                    task_id = tid,
+                                    reason,
+                                    "review agent failed — resetting to NeedsReview for retry"
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    task_id = tid, error = %e,
+                                    "review_and_merge failed — resetting to NeedsReview for retry"
+                                );
+                                true
+                            }
+                            Ok(_) => false,
+                        };
                     if needs_reset {
                         reset_to_needs_review_with_retry(&backend_c, &tid).await;
                     }
@@ -484,7 +487,11 @@ mod tests {
         let backend = CountingBackend::new(0);
         let backend_arc: Arc<dyn ExternalBackend> = backend.clone();
         reset_to_needs_review_with_retry(&backend_arc, "task-1").await;
-        assert_eq!(backend.call_count(), 1, "should call update_status exactly once");
+        assert_eq!(
+            backend.call_count(),
+            1,
+            "should call update_status exactly once"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -502,6 +509,10 @@ mod tests {
         let backend = CountingBackend::new(10);
         let backend_arc: Arc<dyn ExternalBackend> = backend.clone();
         reset_to_needs_review_with_retry(&backend_arc, "task-1").await;
-        assert_eq!(backend.call_count(), 3, "should attempt exactly 3 times then give up");
+        assert_eq!(
+            backend.call_count(),
+            3,
+            "should attempt exactly 3 times then give up"
+        );
     }
 }
