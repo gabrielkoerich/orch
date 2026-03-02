@@ -875,7 +875,9 @@ mod tests {
         }
 
         // Should have received exactly one message.
-        let msg = rx.try_recv().expect("first delivery should produce a message");
+        let msg = rx
+            .try_recv()
+            .expect("first delivery should produce a message");
         assert_eq!(msg.thread_id, "200");
         assert!(rx.try_recv().is_err(), "no second message yet");
 
@@ -932,7 +934,9 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
         }
 
-        let msg2 = rx.try_recv().expect("different delivery ID should produce a message");
+        let msg2 = rx
+            .try_recv()
+            .expect("different delivery ID should produce a message");
         assert_eq!(msg2.thread_id, "200");
     }
 }
