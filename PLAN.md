@@ -827,8 +827,8 @@ src/
 │   ├── mod.rs               # Engine struct, event loop (10s tick + 120s sync), PR review integration
 │   ├── tasks.rs             # TaskManager — unified internal + external CRUD
 │   ├── internal_tasks.rs    # Internal task SQLite operations
-│   ├── router.rs            # Agent routing (label, round-robin, weighted — selection strategies)
-│   ├── llm_router.rs        # [planned #257] LLM-based task classification (route_with_llm, skills catalog)
+│   ├── router.rs            # Agent selection strategies (label, round-robin, weighted, circuit breaker) — 1,919 lines
+│   ├── llm_router.rs        # LlmRouter — prompt building, LLM call, response parsing, skills catalog — 511 lines
 │   ├── jobs.rs              # Cron scheduler + self-review job (metrics → improvement issues)
 │   └── runner/
 │       ├── mod.rs           # TaskRunner — orchestrates full task lifecycle
@@ -1330,7 +1330,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 ### Code Quality
 
 - [ ] `src/engine/mod.rs` — 2,760 lines, needs decomposition (#228, in review)
-- [ ] `src/engine/router.rs` — 2,356 lines; extract LLM routing into `llm_router.rs` (#257)
+- [x] `src/engine/router.rs` — extracted LLM routing into `llm_router.rs` (#257); now 1,919 lines
 - [ ] `src/engine/runner/mod.rs` — 45KB coordinator; largest file in runner module
 - [ ] No test coverage tooling in CI (#258) — 366 tests exist but coverage metrics not tracked
 
