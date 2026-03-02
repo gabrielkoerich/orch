@@ -172,7 +172,11 @@ impl ExternalBackend for GitHubBackend {
     async fn list_by_status(&self, status: Status) -> anyhow::Result<Vec<ExternalTask>> {
         // Done issues are auto-closed by the engine, so we must query state=all
         // to find them. All other statuses only live on open issues.
-        let state = if status == Status::Done { "all" } else { "open" };
+        let state = if status == Status::Done {
+            "all"
+        } else {
+            "open"
+        };
         let issues = self
             .gh
             .list_issues_with_state(&self.repo, status.as_label(), state)
