@@ -1157,3 +1157,334 @@ fn safe_utf8_tail(s: &str, max_bytes: usize) -> &str {
     }
     &s[idx..]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::{ExternalId, ExternalTask, Mention, Status};
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    // ── safe_utf8_tail ───────────────────────────────────────────────────────
+
+    #[test]
+    fn safe_utf8_tail_short_string_returned_as_is() {
+        assert_eq!(safe_utf8_tail("hello", 100), "hello");
+        assert_eq!(safe_utf8_tail("", 10), "");
+    }
+
+    #[test]
+    fn safe_utf8_tail_truncates_ascii() {
+        let s = "abcdefghij"; // 10 bytes
+        assert_eq!(safe_utf8_tail(s, 5), "fghij");
+        assert_eq!(safe_utf8_tail(s, 10), "abcdefghij");
+    }
+
+    #[test]
+    fn safe_utf8_tail_handles_multibyte_boundary() {
+        // "日本語" is 3 chars × 3 bytes each = 9 bytes total
+        let s = "日本語";
+        assert_eq!(s.len(), 9);
+        // Cutting at 8 bytes lands in the middle of "語" (3 bytes at 6..9).
+        // safe_utf8_tail should walk forward to the next boundary at 9 (end) rather
+        // than panicking on an invalid slice.
+        let tail = safe_utf8_tail(s, 8);
+        assert!(
+            s.ends_with(tail),
+            "tail must be a valid suffix of the original"
+        );
+        assert!(
+            std::str::from_utf8(tail.as_bytes()).is_ok(),
+            "tail must be valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn safe_utf8_tail_handles_mixed_ascii_and_multibyte() {
+        let s = "hello日本語world"; // ascii + CJK + ascii
+        for max_bytes in [1, 3, 5, 7, 11, 13, 20, 100] {
+            let tail = safe_utf8_tail(s, max_bytes);
+            assert!(
+                std::str::from_utf8(tail.as_bytes()).is_ok(),
+                "max_bytes={max_bytes}: tail must be valid UTF-8"
+            );
+            assert!(
+                s.ends_with(tail),
+                "max_bytes={max_bytes}: tail must be a suffix of original"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_utf8_tail_exact_boundary() {
+        let s = "abcdef"; // 6 bytes
+        assert_eq!(safe_utf8_tail(s, 6), "abcdef"); // exactly fits
+        assert_eq!(safe_utf8_tail(s, 0), ""); // empty tail
+    }
+
+    // ── resolve_project_dir ──────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_project_dir_uses_project_dir_env() {
+        // When PROJECT_DIR env var is set, it should always win.
+        let runner = TaskRunner::new("owner/repo".to_string());
+
+        // Use a temp dir so the path exists
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        // Temporarily set the env var — note: tests run in parallel so we use a
+        // dedicated key that only this test touches. std::env::set_var is not
+        // thread-safe in general, but the subsequent call is synchronous and
+        // isolated to the temp dir created above.
+        std::env::set_var("PROJECT_DIR", &dir_str);
+        let result = runner.resolve_project_dir();
+        std::env::remove_var("PROJECT_DIR");
+
+        assert!(
+            result.is_ok(),
+            "resolve_project_dir should succeed with PROJECT_DIR set"
+        );
+        assert_eq!(result.unwrap(), dir.path());
+    }
+
+    #[test]
+    fn resolve_project_dir_empty_project_dir_env_falls_through() {
+        // An empty PROJECT_DIR should be ignored and fall through to other logic.
+        let runner = TaskRunner::new("owner/testrepo-nonexistent".to_string());
+        std::env::set_var("PROJECT_DIR", "");
+        let result = runner.resolve_project_dir();
+        std::env::remove_var("PROJECT_DIR");
+
+        // Should succeed (falls back to current dir) without panicking.
+        assert!(result.is_ok());
+    }
+
+    // ── mock backend for process_delegations ─────────────────────────────────
+
+    struct TrackingBackend {
+        sub_tasks_created: Arc<Mutex<Vec<(String, String)>>>, // (title, parent_id)
+        status_updates: Arc<Mutex<Vec<(String, Status)>>>,
+        comments: Arc<Mutex<Vec<(String, String)>>>, // (id, body)
+    }
+
+    impl TrackingBackend {
+        fn new() -> Self {
+            Self {
+                sub_tasks_created: Arc::new(Mutex::new(vec![])),
+                status_updates: Arc::new(Mutex::new(vec![])),
+                comments: Arc::new(Mutex::new(vec![])),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::backends::ExternalBackend for TrackingBackend {
+        fn name(&self) -> &str {
+            "tracking"
+        }
+        async fn create_task(
+            &self,
+            _t: &str,
+            _b: &str,
+            _l: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("new".to_string()))
+        }
+        async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask> {
+            Ok(ExternalTask {
+                id: id.clone(),
+                title: "".to_string(),
+                body: "".to_string(),
+                state: "open".to_string(),
+                labels: vec![],
+                author: "".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                url: "".to_string(),
+            })
+        }
+        async fn list_by_status(&self, _s: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+        async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()> {
+            self.comments
+                .lock()
+                .unwrap()
+                .push((id.0.clone(), body.to_string()));
+            Ok(())
+        }
+        async fn set_labels(&self, _id: &ExternalId, _l: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_label(&self, _id: &ExternalId, _l: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+        async fn create_sub_task(
+            &self,
+            parent: &ExternalId,
+            title: &str,
+            _body: &str,
+            _l: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            self.sub_tasks_created
+                .lock()
+                .unwrap()
+                .push((title.to_string(), parent.0.clone()));
+            Ok(ExternalId(format!("child-{}", title)))
+        }
+        async fn ensure_status_label(&self, _l: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn has_open_issue_with_title(&self, _t: &str, _l: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn is_pr_merged(&self, _b: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn get_mentions(&self, _s: &str) -> anyhow::Result<Vec<Mention>> {
+            Ok(vec![])
+        }
+        async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+            self.status_updates
+                .lock()
+                .unwrap()
+                .push((id.0.clone(), status));
+            Ok(())
+        }
+    }
+
+    fn make_task(id: &str) -> ExternalTask {
+        ExternalTask {
+            id: ExternalId(id.to_string()),
+            title: format!("Task {id}"),
+            body: "".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "bot".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "".to_string(),
+        }
+    }
+
+    // ── process_delegations ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn process_delegations_creates_subtasks_and_blocks_parent() {
+        let runner = TaskRunner::new("owner/repo".to_string());
+        let parent = make_task("99");
+        let backend = Arc::new(TrackingBackend::new());
+        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> = backend.clone();
+
+        let delegations = vec![
+            crate::parser::Delegation {
+                title: "Subtask A".to_string(),
+                body: "Do A".to_string(),
+                labels: vec!["enhancement".to_string()],
+            },
+            crate::parser::Delegation {
+                title: "Subtask B".to_string(),
+                body: "Do B".to_string(),
+                labels: vec![],
+            },
+        ];
+
+        runner
+            .process_delegations(&parent, &delegations, &backend_dyn)
+            .await
+            .unwrap();
+
+        // Two sub-tasks should have been created
+        let created = backend.sub_tasks_created.lock().unwrap();
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[0].1, "99", "parent id should be 99");
+        assert!(
+            created.iter().any(|(t, _)| t == "Subtask A"),
+            "Subtask A should be created"
+        );
+        assert!(
+            created.iter().any(|(t, _)| t == "Subtask B"),
+            "Subtask B should be created"
+        );
+        drop(created);
+
+        // Parent should be marked blocked
+        let updates = backend.status_updates.lock().unwrap();
+        assert!(
+            updates
+                .iter()
+                .any(|(id, s)| id == "99" && *s == Status::Blocked),
+            "parent should be blocked"
+        );
+        drop(updates);
+
+        // A comment summarising the delegations should be posted
+        let comments = backend.comments.lock().unwrap();
+        assert!(
+            !comments.is_empty(),
+            "a delegation summary comment should be posted"
+        );
+        let comment_body = &comments[0].1;
+        assert!(
+            comment_body.contains("Subtask A"),
+            "summary should mention Subtask A"
+        );
+        assert!(
+            comment_body.contains("Subtask B"),
+            "summary should mention Subtask B"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_delegations_single_subtask() {
+        let runner = TaskRunner::new("owner/repo".to_string());
+        let parent = make_task("101");
+        let backend = Arc::new(TrackingBackend::new());
+        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> = backend.clone();
+
+        let delegations = vec![crate::parser::Delegation {
+            title: "Only Child".to_string(),
+            body: "Do only child".to_string(),
+            labels: vec!["feature".to_string()],
+        }];
+
+        runner
+            .process_delegations(&parent, &delegations, &backend_dyn)
+            .await
+            .unwrap();
+
+        let created = backend.sub_tasks_created.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0, "Only Child");
+        drop(created);
+
+        let updates = backend.status_updates.lock().unwrap();
+        assert!(
+            updates
+                .iter()
+                .any(|(id, s)| id == "101" && *s == Status::Blocked),
+            "parent should be blocked"
+        );
+        drop(updates);
+
+        let comments = backend.comments.lock().unwrap();
+        let body = &comments[0].1;
+        assert!(
+            body.contains("1 subtask"),
+            "comment should count one subtask"
+        );
+    }
+}

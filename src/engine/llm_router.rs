@@ -509,3 +509,276 @@ impl LlmRouter {
             .join(format!("route-prompt-{task_id}.txt"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::{ExternalId, ExternalTask};
+    use crate::engine::router::AgentProfile;
+
+    fn make_router() -> LlmRouter {
+        LlmRouter::new()
+    }
+
+    fn make_task(labels: Vec<&str>) -> ExternalTask {
+        ExternalTask {
+            id: ExternalId("42".to_string()),
+            title: "Test task".to_string(),
+            body: "Test body".to_string(),
+            state: "open".to_string(),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            author: "testuser".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://github.com/test/test/issues/42".to_string(),
+        }
+    }
+
+    fn make_profile(skills: Vec<&str>) -> AgentProfile {
+        AgentProfile {
+            role: "developer".to_string(),
+            skills: skills.iter().map(|s| s.to_string()).collect(),
+            tools: vec!["git".to_string()],
+            constraints: vec![],
+        }
+    }
+
+    // ── parse_llm_response ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_direct_json_executor_field() {
+        let router = make_router();
+        let json = r#"{"executor":"claude","complexity":"medium","reason":"good fit"}"#;
+        let resp = router.parse_llm_response(json).unwrap();
+        assert_eq!(resp.executor, "claude");
+        assert_eq!(resp.complexity, "medium");
+    }
+
+    #[test]
+    fn parse_direct_json_agent_alias() {
+        // LLM sometimes returns "agent" instead of "executor"
+        let router = make_router();
+        let json = r#"{"agent":"codex","complexity":"simple","reason":"straightforward"}"#;
+        let resp = router.parse_llm_response(json).unwrap();
+        assert_eq!(resp.executor, "codex");
+    }
+
+    #[test]
+    fn parse_full_json_with_profile() {
+        let router = make_router();
+        let json = r#"{
+            "executor": "opencode",
+            "complexity": "complex",
+            "reason": "needs refactoring",
+            "profile": {
+                "role": "architect",
+                "skills": ["rust", "design"],
+                "tools": ["git", "rg"],
+                "constraints": ["no unsafe"]
+            },
+            "selected_skills": ["gh"]
+        }"#;
+        let resp = router.parse_llm_response(json).unwrap();
+        assert_eq!(resp.executor, "opencode");
+        assert_eq!(resp.complexity, "complex");
+        assert_eq!(resp.profile.role, "architect");
+        assert_eq!(resp.profile.skills, vec!["rust", "design"]);
+        assert_eq!(resp.selected_skills, vec!["gh"]);
+    }
+
+    #[test]
+    fn parse_claude_envelope_string_result() {
+        // Claude --output-format json wraps the result in a {"type":"result","result":"..."} envelope
+        let router = make_router();
+        let inner = r#"{"executor":"claude","complexity":"medium","reason":"test"}"#;
+        let envelope = format!(
+            r#"{{"type":"result","subtype":"text","is_error":false,"result":"{}","usage":{{"input":10,"output":5}}}}"#,
+            inner.replace('"', "\\\"")
+        );
+        let resp = router.parse_llm_response(&envelope).unwrap();
+        assert_eq!(resp.executor, "claude");
+    }
+
+    #[test]
+    fn parse_claude_envelope_object_result() {
+        // When result is already a JSON object (not a string)
+        let router = make_router();
+        let envelope = r#"{"type":"result","is_error":false,"result":{"executor":"kimi","complexity":"simple","reason":"fast"}}"#;
+        let resp = router.parse_llm_response(envelope).unwrap();
+        assert_eq!(resp.executor, "kimi");
+    }
+
+    #[test]
+    fn parse_claude_error_envelope() {
+        let router = make_router();
+        let envelope = r#"{"type":"result","is_error":true,"result":"auth error: invalid key"}"#;
+        let err = router.parse_llm_response(envelope).unwrap_err();
+        assert!(
+            err.to_string().contains("error"),
+            "should surface the error"
+        );
+    }
+
+    #[test]
+    fn parse_markdown_json_fenced_block() {
+        let router = make_router();
+        let md = "Here is my routing decision:\n\n```json\n{\"executor\":\"codex\",\"complexity\":\"simple\",\"reason\":\"easy\"}\n```\n\nDone.";
+        let resp = router.parse_llm_response(md).unwrap();
+        assert_eq!(resp.executor, "codex");
+    }
+
+    #[test]
+    fn parse_markdown_plain_fenced_block() {
+        let router = make_router();
+        let md = "```\n{\"executor\":\"minimax\",\"complexity\":\"medium\",\"reason\":\"ok\"}\n```";
+        let resp = router.parse_llm_response(md).unwrap();
+        assert_eq!(resp.executor, "minimax");
+    }
+
+    #[test]
+    fn parse_embedded_json_in_prose() {
+        let router = make_router();
+        let text = r#"I analyzed the task. My decision is {"executor":"claude","complexity":"complex","reason":"hard task"}. Please proceed."#;
+        let resp = router.parse_llm_response(text).unwrap();
+        assert_eq!(resp.executor, "claude");
+        assert_eq!(resp.complexity, "complex");
+    }
+
+    #[test]
+    fn parse_empty_response_fails() {
+        let router = make_router();
+        assert!(router.parse_llm_response("").is_err());
+        assert!(router.parse_llm_response("   ").is_err());
+    }
+
+    #[test]
+    fn parse_invalid_response_fails() {
+        let router = make_router();
+        assert!(router.parse_llm_response("not json at all").is_err());
+        assert!(router.parse_llm_response("{ invalid json }").is_err());
+    }
+
+    #[test]
+    fn parse_defaults_apply_for_missing_fields() {
+        // Only "executor" is required — other fields should default
+        let router = make_router();
+        let json = r#"{"executor":"claude"}"#;
+        let resp = router.parse_llm_response(json).unwrap();
+        assert_eq!(resp.executor, "claude");
+        assert_eq!(resp.complexity, "");
+        assert_eq!(resp.reason, "");
+        assert!(resp.selected_skills.is_empty());
+    }
+
+    #[test]
+    fn parse_fixture_route_response_string() {
+        let router = make_router();
+        let response = include_str!("../../tests/fixtures/route-response-string.json");
+        let resp = router.parse_llm_response(response).unwrap();
+        // Fixture should parse without error and produce a valid agent name
+        assert!(!resp.executor.is_empty(), "executor must not be empty");
+    }
+
+    #[test]
+    fn parse_fixture_route_response_object() {
+        let router = make_router();
+        let response = include_str!("../../tests/fixtures/route-response-object.json");
+        let resp = router.parse_llm_response(response).unwrap();
+        assert!(!resp.executor.is_empty(), "executor must not be empty");
+    }
+
+    #[test]
+    fn parse_fixture_route_response_markdown() {
+        let router = make_router();
+        let response = include_str!("../../tests/fixtures/route-response-markdown.json");
+        let resp = router.parse_llm_response(response).unwrap();
+        assert!(!resp.executor.is_empty(), "executor must not be empty");
+    }
+
+    // ── check_routing_sanity ─────────────────────────────────────────────────
+
+    #[test]
+    fn sanity_warns_backend_task_routed_to_claude() {
+        let router = make_router();
+        let task = make_task(vec!["backend", "priority:high"]);
+        let profile = make_profile(vec!["rust"]);
+        let warning = router.check_routing_sanity(&task, "claude", &profile);
+        assert!(
+            warning.is_some(),
+            "should warn when backend task goes to claude"
+        );
+        assert!(warning.unwrap().contains("backend"));
+    }
+
+    #[test]
+    fn sanity_warns_api_label_routed_to_claude() {
+        let router = make_router();
+        let task = make_task(vec!["api", "feature"]);
+        let profile = make_profile(vec!["rest"]);
+        let warning = router.check_routing_sanity(&task, "claude", &profile);
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn sanity_warns_docs_task_routed_to_codex() {
+        let router = make_router();
+        let task = make_task(vec!["documentation"]);
+        let profile = make_profile(vec!["writing"]);
+        let warning = router.check_routing_sanity(&task, "codex", &profile);
+        assert!(
+            warning.is_some(),
+            "should warn when docs task goes to codex"
+        );
+        assert!(warning.unwrap().contains("docs"));
+    }
+
+    #[test]
+    fn sanity_warns_writing_label_routed_to_codex() {
+        let router = make_router();
+        let task = make_task(vec!["writing"]);
+        let profile = make_profile(vec!["markdown"]);
+        let warning = router.check_routing_sanity(&task, "codex", &profile);
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn sanity_warns_empty_skills_in_profile() {
+        let router = make_router();
+        let task = make_task(vec!["feature"]);
+        let profile = make_profile(vec![]); // no skills
+        let warning = router.check_routing_sanity(&task, "opencode", &profile);
+        assert!(warning.is_some(), "should warn when profile has no skills");
+        assert!(warning.unwrap().contains("skills"));
+    }
+
+    #[test]
+    fn sanity_no_warning_for_clean_routing() {
+        let router = make_router();
+        let task = make_task(vec!["feature", "rust"]);
+        let profile = make_profile(vec!["rust", "async"]);
+        let warning = router.check_routing_sanity(&task, "claude", &profile);
+        assert!(warning.is_none(), "no warning expected for clean routing");
+    }
+
+    #[test]
+    fn sanity_no_warning_backend_to_codex() {
+        // Backend label to codex is fine — only backend→claude warns
+        let router = make_router();
+        let task = make_task(vec!["backend"]);
+        let profile = make_profile(vec!["node"]);
+        let warning = router.check_routing_sanity(&task, "codex", &profile);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn sanity_case_insensitive_label_matching() {
+        let router = make_router();
+        let task = make_task(vec!["Backend", "API"]); // mixed case
+        let profile = make_profile(vec!["rust"]);
+        let warning = router.check_routing_sanity(&task, "claude", &profile);
+        assert!(
+            warning.is_some(),
+            "label matching should be case-insensitive"
+        );
+    }
+}

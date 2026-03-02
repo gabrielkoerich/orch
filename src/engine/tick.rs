@@ -557,3 +557,260 @@ pub(crate) async fn tick(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::{ExternalId, ExternalTask, Mention, Status};
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    // ── minimal mock backend ─────────────────────────────────────────────────
+
+    /// Configurable mock backend for tick tests.
+    struct MockBackend {
+        /// Tasks returned by `list_by_status(Blocked)`.
+        blocked_tasks: Vec<ExternalTask>,
+        /// Sub-issues map: task_id → list of child ExternalIds.
+        sub_issues: std::collections::HashMap<String, Vec<ExternalId>>,
+        /// Tasks returned by `get_task`. Keyed by id.0.
+        tasks_by_id: std::collections::HashMap<String, ExternalTask>,
+        /// Recorded `update_status` calls.
+        status_updates: Arc<Mutex<Vec<(String, Status)>>>,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                blocked_tasks: vec![],
+                sub_issues: Default::default(),
+                tasks_by_id: Default::default(),
+                status_updates: Arc::new(Mutex::new(vec![])),
+            }
+        }
+    }
+
+    fn make_task(id: &str, labels: &[&str]) -> ExternalTask {
+        ExternalTask {
+            id: ExternalId(id.to_string()),
+            title: format!("Task {id}"),
+            body: "".to_string(),
+            state: "open".to_string(),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            author: "bot".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: format!("https://github.com/test/test/issues/{id}"),
+        }
+    }
+
+    #[async_trait]
+    impl ExternalBackend for MockBackend {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn create_task(
+            &self,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("new".to_string()))
+        }
+        async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask> {
+            self.tasks_by_id
+                .get(&id.0)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("task not found: {}", id.0))
+        }
+        async fn list_by_status(&self, status: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            if status == Status::Blocked {
+                Ok(self.blocked_tasks.clone())
+            } else {
+                Ok(vec![])
+            }
+        }
+        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+        async fn post_comment(&self, _id: &ExternalId, _body: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_labels(&self, _id: &ExternalId, _labels: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_label(&self, _id: &ExternalId, _label: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_sub_issues(&self, id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(self.sub_issues.get(&id.0).cloned().unwrap_or_default())
+        }
+        async fn create_sub_task(
+            &self,
+            _parent: &ExternalId,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("child".to_string()))
+        }
+        async fn ensure_status_label(&self, _label: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn has_open_issue_with_title(
+            &self,
+            _title: &str,
+            _label: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn is_pr_merged(&self, _branch: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+            Ok(Some("testbot".to_string()))
+        }
+        async fn get_mentions(&self, _since: &str) -> anyhow::Result<Vec<Mention>> {
+            Ok(vec![])
+        }
+        async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+            self.status_updates
+                .lock()
+                .unwrap()
+                .push((id.0.clone(), status));
+            Ok(())
+        }
+    }
+
+    fn make_task_manager(backend: Arc<dyn ExternalBackend>) -> Arc<TaskManager> {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        Arc::new(TaskManager::new(db, backend))
+    }
+
+    // ── tick_unblock_parents ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unblock_parents_unblocks_when_all_children_done() {
+        let mut mock = MockBackend::new();
+
+        // Blocked parent with two done children
+        let parent = make_task("10", &["status:blocked"]);
+        mock.blocked_tasks.push(parent.clone());
+        mock.sub_issues.insert(
+            "10".to_string(),
+            vec![ExternalId("11".to_string()), ExternalId("12".to_string())],
+        );
+        mock.tasks_by_id
+            .insert("11".to_string(), make_task("11", &["status:done"]));
+        mock.tasks_by_id
+            .insert("12".to_string(), make_task("12", &["status:done"]));
+
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = make_task_manager(backend.clone());
+
+        tick_unblock_parents(&backend, &task_manager).await.unwrap();
+
+        let updates = status_updates.lock().unwrap();
+        assert_eq!(updates.len(), 1, "parent should be unblocked");
+        assert_eq!(updates[0], ("10".to_string(), Status::New));
+    }
+
+    #[tokio::test]
+    async fn unblock_parents_skips_when_child_not_done() {
+        let mut mock = MockBackend::new();
+
+        let parent = make_task("20", &["status:blocked"]);
+        mock.blocked_tasks.push(parent.clone());
+        mock.sub_issues.insert(
+            "20".to_string(),
+            vec![ExternalId("21".to_string()), ExternalId("22".to_string())],
+        );
+        // Child 21 is done, child 22 is still in_progress
+        mock.tasks_by_id
+            .insert("21".to_string(), make_task("21", &["status:done"]));
+        mock.tasks_by_id
+            .insert("22".to_string(), make_task("22", &["status:in_progress"]));
+
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = make_task_manager(backend.clone());
+
+        tick_unblock_parents(&backend, &task_manager).await.unwrap();
+
+        let updates = status_updates.lock().unwrap();
+        assert!(
+            updates.is_empty(),
+            "should not unblock when a child is still running"
+        );
+    }
+
+    #[tokio::test]
+    async fn unblock_parents_skips_task_with_no_children() {
+        let mut mock = MockBackend::new();
+
+        // Blocked task with no sub-issues (blocked for a different reason)
+        let parent = make_task("30", &["status:blocked"]);
+        mock.blocked_tasks.push(parent.clone());
+        // No entry in sub_issues → get_sub_issues returns []
+
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = make_task_manager(backend.clone());
+
+        tick_unblock_parents(&backend, &task_manager).await.unwrap();
+
+        let updates = status_updates.lock().unwrap();
+        assert!(
+            updates.is_empty(),
+            "should not unblock tasks with no sub-issues"
+        );
+    }
+
+    #[tokio::test]
+    async fn unblock_parents_no_blocked_tasks() {
+        let mock = MockBackend::new(); // no blocked tasks
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = make_task_manager(backend.clone());
+
+        tick_unblock_parents(&backend, &task_manager).await.unwrap();
+
+        assert!(status_updates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unblock_parents_handles_multiple_blocked_tasks() {
+        let mut mock = MockBackend::new();
+
+        // Task 40: all children done → should unblock
+        let t40 = make_task("40", &["status:blocked"]);
+        mock.blocked_tasks.push(t40);
+        mock.sub_issues
+            .insert("40".to_string(), vec![ExternalId("41".to_string())]);
+        mock.tasks_by_id
+            .insert("41".to_string(), make_task("41", &["status:done"]));
+
+        // Task 50: child not done → should stay blocked
+        let t50 = make_task("50", &["status:blocked"]);
+        mock.blocked_tasks.push(t50);
+        mock.sub_issues
+            .insert("50".to_string(), vec![ExternalId("51".to_string())]);
+        mock.tasks_by_id
+            .insert("51".to_string(), make_task("51", &["status:in_progress"]));
+
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = make_task_manager(backend.clone());
+
+        tick_unblock_parents(&backend, &task_manager).await.unwrap();
+
+        let updates = status_updates.lock().unwrap();
+        assert_eq!(updates.len(), 1, "only one parent should be unblocked");
+        assert_eq!(updates[0].0, "40", "task 40 should be unblocked");
+        assert_eq!(updates[0].1, Status::New);
+    }
+}
