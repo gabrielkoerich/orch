@@ -141,24 +141,35 @@ sequenceDiagram
 ### Task Lifecycle (Status Flow)
 
 ```
-new → routed → in_progress → in_review → done
-                    ↑              │
-                    └──────────────┘
-                  (changes requested)
+in_progress → needs_review → in_review → done
+                  ▲              │
+                  │              ├── approve + merge → done
+                  │              ├── request_changes → routed → ... → needs_review
+                  │              ├── conflicts/CI/merge fail → needs_review (retry)
+                  │              └── 3x retry limit → blocked
+                  └──────────────┘
 ```
+
+`needs_review` = "PR ready, queued for review agent"
+`in_review` = "review agent actively working"
+`blocked` = only status requiring human intervention
 
 | Transition | Owner | Location | Trigger |
 |---|---|---|---|
 | new → routed | engine tick | `engine/mod.rs` | LLM router assigns agent + complexity |
 | routed → in_progress | engine dispatch | `engine/mod.rs` | Agent spawned in tmux |
-| in_progress → in_review | runner | `runner/mod.rs` | Agent completes + PR exists |
+| in_progress → needs_review | runner | `runner/mod.rs` | Agent completes + PR exists |
 | in_progress → done | runner | `runner/mod.rs` | Agent completes, no PR created |
-| in_review → done | sync tick | `engine/mod.rs` (review_open_prs / auto_merge) | PR approved + merged |
-| in_review → routed | sync tick | `engine/mod.rs` (review_open_prs) | Changes requested → re-dispatch (resets `review_started`) |
+| needs_review → in_review | engine tick/sync | `engine/mod.rs` | Review agent spawned (status transition is the guard) |
+| in_review → done | engine | `engine/mod.rs` (auto_merge_pr) | PR approved + merged |
+| in_review → routed | engine | `engine/mod.rs` (review_open_prs / handle_review_changes) | Changes requested → re-dispatch |
+| in_review → needs_review | engine | `engine/mod.rs` | Review agent failed/crashed, conflict/CI retry |
+| in_review → blocked | engine | `engine/mod.rs` | Merge conflict retries ≥ 3, non-conflict merge failure, max review cycles exceeded |
+| stale in_review → needs_review | sync tick | `engine/mod.rs` | No active tmux review session detected |
 
-**Review agent**: triggered by engine when runner completes with `in_review`. Guarded by `review_started=true` sidecar flag to prevent duplicates. Reset on re-dispatch.
+**Review agent**: triggered by engine when a task is in `needs_review` and has a branch. The engine transitions the task to `in_review` before spawning — the status itself is the duplicate guard (no sidecar flags needed). On failure, the engine resets to `needs_review` for retry.
 
-**Key invariant**: `done` means task is finished (PR merged or no code changes). `in_review` means PR exists and awaits review. The runner decides: if agent said "done" AND a PR exists → `in_review`; otherwise → agent's reported status.
+**Key invariant**: `done` means task is finished (PR merged or no code changes). `needs_review` means PR exists and is queued for review. `in_review` means a review agent is actively running. `blocked` means human intervention is required. The runner decides: if agent said "done" AND a PR exists → `needs_review`; otherwise → agent's reported status.
 
 ### Subprocess Cost Per Tick (Measured)
 
