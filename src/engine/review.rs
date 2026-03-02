@@ -460,7 +460,12 @@ pub(crate) async fn review_and_merge(
                 .output()
                 .await
                 .ok()
-                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+                .and_then(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                })
                 .unwrap_or(0)
                 > 0;
 
@@ -473,7 +478,14 @@ pub(crate) async fn review_and_merge(
                 );
                 // Push first in case agent forgot
                 let _ = tokio::process::Command::new("git")
-                    .args(["-C", worktree_path.to_str().unwrap_or("."), "push", "-u", "origin", &branch_name])
+                    .args([
+                        "-C",
+                        worktree_path.to_str().unwrap_or("."),
+                        "push",
+                        "-u",
+                        "origin",
+                        &branch_name,
+                    ])
                     .output()
                     .await;
                 // Try to create PR
@@ -497,7 +509,9 @@ pub(crate) async fn review_and_merge(
                             "created missing PR — retrying review"
                         );
                         // Return Failed to trigger retry, now with a PR
-                        return Ok(ReviewDecision::Failed("created missing PR, retry".to_string()));
+                        return Ok(ReviewDecision::Failed(
+                            "created missing PR, retry".to_string(),
+                        ));
                     }
                     Ok(o) => {
                         let stderr = String::from_utf8_lossy(&o.stderr);
@@ -507,7 +521,9 @@ pub(crate) async fn review_and_merge(
                             stderr = %stderr,
                             "failed to create missing PR — work may be stuck"
                         );
-                        return Ok(ReviewDecision::Failed(format!("no PR, create failed: {stderr}")));
+                        return Ok(ReviewDecision::Failed(format!(
+                            "no PR, create failed: {stderr}"
+                        )));
                     }
                     Err(e) => {
                         tracing::error!(
