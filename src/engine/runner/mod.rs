@@ -337,7 +337,7 @@ impl TaskRunner {
             };
 
             if let Err(e) = db.insert_task_metric(metric).await {
-                tracing::warn!(task_id, ?e, "failed to record task metrics");
+                tracing::error!(task_id, ?e, "failed to record task metrics");
             }
         }
     }
