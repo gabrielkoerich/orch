@@ -82,11 +82,7 @@ fn collect_output(
     let exit_code: i32 = {
         let attempt_exit = attempt_dir.join("exit.txt");
         let legacy_exit = sidecar::state_file(&format!("exit-{task_id}.txt"))
-            .unwrap_or_else(|_| {
-                orch_home
-                    .join("state")
-                    .join(format!("exit-{task_id}.txt"))
-            });
+            .unwrap_or_else(|_| orch_home.join("state").join(format!("exit-{task_id}.txt")));
 
         std::fs::read_to_string(&attempt_exit)
             .or_else(|_| std::fs::read_to_string(&legacy_exit))
@@ -96,8 +92,7 @@ fn collect_output(
     };
 
     // Read raw output + stderr
-    let raw_stdout =
-        response::read_output_file(task_id, &invocation.output_file, &invocation.repo);
+    let raw_stdout = response::read_output_file(task_id, &invocation.output_file, &invocation.repo);
 
     let stderr_path_attempt = attempt_dir.join("stderr.txt");
     let stderr_path_legacy = sidecar::state_file(&format!("stderr-{task_id}.txt"))

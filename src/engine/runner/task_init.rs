@@ -70,8 +70,7 @@ pub fn check_guards(task_id: &str) -> anyhow::Result<Option<u32>> {
 
 /// Build a minimal `ExternalTask` from sidecar state for prompt building.
 pub fn build_pseudo_task(task_id: &str) -> ExternalTask {
-    let task_title =
-        sidecar::get(task_id, "title").unwrap_or_else(|_| format!("Task #{task_id}"));
+    let task_title = sidecar::get(task_id, "title").unwrap_or_else(|_| format!("Task #{task_id}"));
     let task_body = sidecar::get(task_id, "body").unwrap_or_default();
     ExternalTask {
         id: ExternalId(task_id.to_string()),

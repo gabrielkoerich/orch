@@ -108,9 +108,13 @@ impl TaskRunner {
         .await?;
 
         // Run agent session: spawn in tmux, wait for completion, collect output
-        let (tmux, tmux_session, session_output) =
-            session::run_agent_session(task_id, &init.invocation, &init.attempt_dir, &self.orch_home)
-                .await;
+        let (tmux, tmux_session, session_output) = session::run_agent_session(
+            task_id,
+            &init.invocation,
+            &init.attempt_dir,
+            &self.orch_home,
+        )
+        .await;
 
         // Log raw output for debugging agent failures
         let stdout_len = session_output.raw_stdout.len();
@@ -145,7 +149,8 @@ impl TaskRunner {
 
         // Use agent-specific parsing when exit code is 0, fall back to classify_error
         let agent_runner = agents::get_runner(&init.agent_name);
-        let parse_result = if session_output.exit_code == 0 && !session_output.raw_stdout.is_empty() {
+        let parse_result = if session_output.exit_code == 0 && !session_output.raw_stdout.is_empty()
+        {
             agent_runner.parse_response(&session_output.raw_stdout)
         } else if session_output.exit_code != 0 {
             Err(agent_runner.classify_error(
@@ -613,25 +618,11 @@ impl TaskRunner {
     }
 }
 
-/// Return the last `max_bytes` of `s`, walking forward to the nearest UTF-8
-/// character boundary so the slice is always valid.
-pub fn safe_utf8_tail(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let start = s.len() - max_bytes;
-    // Walk forward from `start` until we land on a char boundary
-    let mut idx = start;
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    &s[idx..]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
+    use crate::engine::runner::response_handler::safe_utf8_tail;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 

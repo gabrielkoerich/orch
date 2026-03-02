@@ -177,9 +177,7 @@ pub async fn handle_error(
                         format!("model={free_model}"),
                         "status=new".to_string(),
                         format!("model_reroute_chain={new_tried}"),
-                        format!(
-                            "last_error=all agents exhausted, trying free model {free_model}"
-                        ),
+                        format!("last_error=all agents exhausted, trying free model {free_model}"),
                     ],
                 )?;
                 return Ok(ErrorHandleResult::EarlyReturn);

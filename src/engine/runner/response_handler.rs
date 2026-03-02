@@ -109,23 +109,22 @@ pub async fn handle_success(
     let mut has_pr = false;
     if resp.status == "done" || resp.status == "in_progress" {
         if let Err(e) =
-            git_ops::auto_commit(&wt.work_dir, task_id, task_title, agent_name, new_attempts)
-                .await
+            git_ops::auto_commit(&wt.work_dir, task_id, task_title, agent_name, new_attempts).await
         {
             tracing::error!(task_id, error = ?e, "auto commit failed");
             sidecar::set(task_id, &[format!("last_error=auto commit failed: {e}")])?;
         }
 
         // Push
-        let push_ok =
-            match git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::error!(task_id, error = ?e, "push failed");
-                    sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
-                    false
-                }
-            };
+        let push_ok = match git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::error!(task_id, error = ?e, "push failed");
+                sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
+                false
+            }
+        };
 
         // Create PR (skip if push failed)
         if !push_ok {
