@@ -152,7 +152,9 @@ impl Router {
     /// 5. After max_route_attempts LLM failures, fall back to round-robin
     pub async fn route(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         // 1. Check for explicit agent label
-        if let Some(agent) = strategies::extract_agent_from_labels(&self.config.agents, &task.labels) {
+        if let Some(agent) =
+            strategies::extract_agent_from_labels(&self.config.agents, &task.labels)
+        {
             if self.is_agent_available(&agent) {
                 let complexity = strategies::extract_complexity_from_labels(&task.labels);
                 let model = self.config.model_for_complexity(&agent, &complexity);
@@ -178,13 +180,22 @@ impl Router {
 
         // 2. Weighted round-robin — capacity-based selection
         if self.config.weighted_round_robin {
-            return strategies::route_via_weighted_round_robin(&self.available_agents, &self.weights, &self.config, task);
+            return strategies::route_via_weighted_round_robin(
+                &self.available_agents,
+                &self.weights,
+                &self.config,
+                task,
+            );
         }
 
         // 3. Round-robin mode — use stateful round-robin
         if self.config.mode == "round_robin" {
             tracing::debug!(task_id = %task.id.0, "routing via round-robin mode");
-            return strategies::route_via_round_robin_stateful(&self.available_agents, &self.config, task);
+            return strategies::route_via_round_robin_stateful(
+                &self.available_agents,
+                &self.config,
+                task,
+            );
         }
 
         // 3. LLM-based routing with retry tracking
@@ -197,7 +208,11 @@ impl Router {
                 max = self.config.max_route_attempts,
                 "max LLM route attempts reached, falling back to round-robin"
             );
-            return strategies::route_via_round_robin_stateful(&self.available_agents, &self.config, task);
+            return strategies::route_via_round_robin_stateful(
+                &self.available_agents,
+                &self.config,
+                task,
+            );
         }
 
         // Log routing start (before await)
@@ -228,7 +243,11 @@ impl Router {
                         "falling back to round-robin after {} failed attempts",
                         new_attempts
                     );
-                    strategies::route_via_round_robin_stateful(&self.available_agents, &self.config, task)
+                    strategies::route_via_round_robin_stateful(
+                        &self.available_agents,
+                        &self.config,
+                        task,
+                    )
                 } else {
                     strategies::route_via_fallback(&self.available_agents, &self.config, task)
                 }
@@ -332,14 +351,14 @@ pub fn get_route_result(task_id: &str) -> anyhow::Result<RouteResult> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::backends::{ExternalId, ExternalTask};
     use super::config::DEFAULT_AGENTS;
     use super::llm::LlmRouteResponse;
     use super::strategies;
     use super::weights::{
-        AgentWeights, DEFAULT_WEIGHT, MIN_WEIGHT, RATE_LIMIT_DECAY, RECOVERY_DELAY, RateLimitState,
+        AgentWeights, RateLimitState, DEFAULT_WEIGHT, MIN_WEIGHT, RATE_LIMIT_DECAY, RECOVERY_DELAY,
     };
+    use super::*;
+    use crate::backends::{ExternalId, ExternalTask};
     use std::time::{Duration, Instant};
 
     // Test-only delegates so tests can call router.parse_llm_response() and
@@ -764,7 +783,9 @@ Hope that helps!"#;
         };
 
         let task = create_test_task("1", "Test task", vec![]);
-        let result = strategies::route_via_round_robin(&router.available_agents, &router.config, &task).unwrap();
+        let result =
+            strategies::route_via_round_robin(&router.available_agents, &router.config, &task)
+                .unwrap();
 
         // Task 1 % 2 agents = agent at index 1 = codex
         assert_eq!(result.agent, "codex");

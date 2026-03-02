@@ -13,9 +13,9 @@
 
 use crate::backends::ExternalTask;
 
-use super::{AgentProfile, RouteResult};
 use super::config::RouterConfig;
 use super::weights::AgentWeights;
+use super::{AgentProfile, RouteResult};
 
 /// Extract an explicit `agent:*` label from the task, if present and valid.
 ///
