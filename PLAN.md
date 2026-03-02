@@ -1337,6 +1337,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | #230 | Break `tick()` into named phases | Extracted 4-5 phases of the `tick()` function into independent methods. |
 | #144 | Cost Tracking CLI and Budget Enforcement | `orch cost` command in `src/cli/cost.rs` — per-task and aggregate cost reporting |
 | #145 | Webhook Server Production Hardening | Graceful shutdown, webhook event handling in `src/channels/github.rs` |
+| #316 | `orch stream` live output never arrives | `stream_task()` now starts its own `CaptureService` to poll tmux — `src/cli/mod.rs:304-316` |
 | #317 | Webhook deduplication | In-memory `x-github-delivery` dedup in `src/channels/github.rs` — 2h eviction window, silently ACKs duplicate deliveries |
 | #112 | Wire webhook server into engine | Webhook server integrated via `start_webhook_server()` in `src/channels/github.rs` |
 | #178 | Task delegation processing | `src/engine/runner/mod.rs:1003-1070` — spawns child tasks from `delegations` field |
@@ -1364,5 +1365,4 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 | Issue | Title | Root Cause |
 |-------|-------|-----------|
-| #316 | `orch stream` live output never arrives | `stream_task()` creates a fresh Transport with no CaptureService — `src/cli/mod.rs:294` |
 | #317 | Webhook deduplication missing | `handle_webhook` ignores `x-github-delivery` header — `src/channels/github.rs:194` |
