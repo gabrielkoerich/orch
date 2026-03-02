@@ -475,11 +475,23 @@ impl GhHttp {
 
     /// List issues filtered by a label (paginated).
     pub async fn list_issues(&self, repo: &str, label: &str) -> anyhow::Result<Vec<GitHubIssue>> {
+        self.list_issues_with_state(repo, label, "open").await
+    }
+
+    /// List issues filtered by a label and issue state (paginated).
+    ///
+    /// `state` is passed directly to the GitHub API: `"open"`, `"closed"`, or `"all"`.
+    pub async fn list_issues_with_state(
+        &self,
+        repo: &str,
+        label: &str,
+        state: &str,
+    ) -> anyhow::Result<Vec<GitHubIssue>> {
         let url = format!("{GITHUB_API}/repos/{repo}/issues");
         let all: Vec<GitHubIssue> = self
             .get_all_pages(
                 &url,
-                &[("labels", label), ("state", "open"), ("per_page", "100")],
+                &[("labels", label), ("state", state), ("per_page", "100")],
             )
             .await?;
         // GitHub /issues API returns PRs too — filter them out
