@@ -13,14 +13,14 @@
 //! 6. Track last routed agent to distribute load across agents
 
 use crate::backends::ExternalTask;
-use crate::cmd::CommandErrorContext;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use super::llm_router::LlmRouter;
 
 /// Result of routing a task to an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -536,36 +536,8 @@ pub struct Router {
     pub available_agents: Vec<String>,
     /// Per-agent rate limit weights (used when weighted_round_robin is enabled)
     pub weights: AgentWeights,
-    /// Cached skills catalog loaded once at startup to avoid blocking I/O in async context
-    skills_catalog: std::sync::Mutex<Option<String>>,
-}
-
-/// Response from the LLM router.
-#[derive(Debug, Deserialize)]
-struct LlmRouteResponse {
-    /// The selected agent. Accepts both "executor" and "agent" from the LLM.
-    #[serde(alias = "agent")]
-    executor: String,
-    #[serde(default)]
-    complexity: String,
-    #[serde(default)]
-    reason: String,
-    #[serde(default)]
-    profile: LlmAgentProfile,
-    #[serde(default)]
-    selected_skills: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct LlmAgentProfile {
-    #[serde(default)]
-    role: String,
-    #[serde(default)]
-    skills: Vec<String>,
-    #[serde(default)]
-    tools: Vec<String>,
-    #[serde(default)]
-    constraints: Vec<String>,
+    /// LLM routing subsystem
+    llm_router: LlmRouter,
 }
 
 impl Router {
@@ -574,12 +546,11 @@ impl Router {
         let available_agents = Self::discover_agents(&config.agents);
         let mut weights = AgentWeights::default();
         weights.ensure_agents(&available_agents);
-        let skills_catalog = std::sync::Mutex::new(None);
         Self {
             config,
             available_agents,
             weights,
-            skills_catalog,
+            llm_router: LlmRouter::new(),
         }
     }
 
@@ -943,388 +914,11 @@ impl Router {
         })
     }
 
-    /// Route using LLM classification.
+    /// Route using LLM classification. Delegates to `self.llm_router`.
     async fn route_with_llm(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
-        if self.available_agents.is_empty() {
-            anyhow::bail!("no agent CLIs found in PATH");
-        }
-
-        // Build the routing prompt
-        let prompt = self.build_routing_prompt(task)?;
-
-        // Save prompt to file for debugging
-        let prompt_path = self.route_prompt_path(&task.id.0);
-        if let Some(parent) = prompt_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        let _ = tokio::fs::write(&prompt_path, &prompt).await;
-
-        // Call the LLM router
-        let response = self.call_router_llm(&prompt).await?;
-
-        tracing::info!(
-            task_id = task.id.0,
-            response_len = response.len(),
-            response_preview = %if response.len() > 500 { &response[..500] } else { &response },
-            "LLM router raw response"
-        );
-
-        // Save raw response for debugging (next to the prompt file)
-        let response_path =
-            crate::home::state_dir().map(|d| d.join(format!("route-response-{}.txt", task.id.0)));
-        if let Ok(path) = response_path {
-            let _ = std::fs::write(&path, &response);
-        }
-
-        // Parse the response
-        let llm_response: LlmRouteResponse = self.parse_llm_response(&response)?;
-
-        // Validate the selected agent
-        let mut agent = llm_response.executor.to_lowercase();
-        if !self.is_agent_available(&agent) {
-            let first_available = self.first_available_agent().unwrap_or_default();
-            tracing::warn!(
-                requested = %agent,
-                fallback = %first_available,
-                "selected agent not available, using fallback"
-            );
-            agent = first_available;
-        }
-
-        // Build the profile
-        let mut profile = AgentProfile {
-            role: llm_response.profile.role,
-            skills: llm_response.profile.skills,
-            tools: if llm_response.profile.tools.is_empty() {
-                self.config.allowed_tools.clone()
-            } else {
-                llm_response.profile.tools
-            },
-            constraints: llm_response.profile.constraints,
-        };
-
-        // Ensure tools includes allowed_tools
-        for tool in &self.config.allowed_tools {
-            if !profile.tools.contains(tool) {
-                profile.tools.push(tool.clone());
-            }
-        }
-
-        // Determine complexity
-        let complexity = if llm_response.complexity.is_empty() {
-            "medium".to_string()
-        } else {
-            llm_response.complexity.to_lowercase()
-        };
-
-        // Get model for complexity
-        let model = self.config.model_for_complexity(&agent, &complexity);
-
-        // Build selected skills list
-        let mut selected_skills = llm_response.selected_skills;
-        for skill in &self.config.default_skills {
-            if !selected_skills.contains(skill) {
-                selected_skills.push(skill.clone());
-            }
-        }
-
-        // Run sanity checks
-        let warning = self.check_routing_sanity(task, &agent, &profile);
-
-        // Track last routed agent for distribution
-        if let Err(e) = crate::sidecar::set("_router", &[format!("last_agent={}", agent)]) {
-            tracing::warn!(error = ?e, "failed to persist last_agent");
-        }
-
-        Ok(RouteResult {
-            agent,
-            model,
-            complexity,
-            reason: llm_response.reason,
-            profile,
-            selected_skills,
-            warning,
-        })
-    }
-
-    /// Build the routing prompt from the template.
-    fn build_routing_prompt(&self, task: &ExternalTask) -> anyhow::Result<String> {
-        let template = include_str!("../../prompts/route.md");
-
-        // Build available agents string
-        let available_agents = self.available_agents.join(", ");
-
-        // Build labels string
-        let labels = task.labels.join(", ");
-
-        // Load skills catalog if available
-        let skills_catalog = self.load_skills_catalog();
-
-        // Simple template substitution
-        let prompt = template
-            .replace("{{AVAILABLE_AGENTS}}", &available_agents)
-            .replace("{{SKILLS_CATALOG}}", &skills_catalog)
-            .replace("{{TASK_ID}}", &task.id.0)
-            .replace("{{TASK_TITLE}}", &task.title)
-            .replace("{{TASK_LABELS}}", &labels)
-            .replace("{{TASK_BODY}}", &task.body);
-
-        Ok(prompt)
-    }
-
-    /// Load skills catalog from skills.yml or skills directory.
-    /// Cached after first load to avoid blocking I/O in async context.
-    fn load_skills_catalog(&self) -> String {
-        // Check cache first
-        if let Ok(cache) = self.skills_catalog.lock() {
-            if let Some(ref catalog) = *cache {
-                return catalog.clone();
-            }
-        }
-
-        // Load and cache
-        let catalog = self.load_skills_catalog_uncached();
-
-        if let Ok(mut cache) = self.skills_catalog.lock() {
-            *cache = Some(catalog.clone());
-        }
-
-        catalog
-    }
-
-    /// Load skills catalog without caching (internal implementation).
-    fn load_skills_catalog_uncached(&self) -> String {
-        // Try skills.yml in current directory
-        if let Ok(content) = std::fs::read_to_string("skills.yml") {
-            if let Ok(yaml) = serde_yml::from_str::<serde_yml::Value>(&content) {
-                if let Some(skills) = yaml.get("skills") {
-                    if let Ok(json) = serde_json::to_string(skills) {
-                        return json;
-                    }
-                }
-            }
-        }
-
-        // Try ORCH_HOME/skills directory
-        if let Ok(orch_home) = std::env::var("ORCH_HOME") {
-            let skills_dir = PathBuf::from(orch_home).join("skills");
-            if let Ok(catalog) = self.build_skills_catalog_from_dir(&skills_dir) {
-                return catalog;
-            }
-        }
-
-        // Try ~/.orch/skills
-        if let Ok(skills_dir) = crate::home::skills_dir() {
-            if let Ok(catalog) = self.build_skills_catalog_from_dir(&skills_dir) {
-                return catalog;
-            }
-        }
-
-        // Return empty array as default
-        "[]".to_string()
-    }
-
-    /// Build skills catalog from a directory.
-    fn build_skills_catalog_from_dir(&self, dir: &PathBuf) -> anyhow::Result<String> {
-        if !dir.exists() {
-            anyhow::bail!("skills directory does not exist");
-        }
-
-        let mut skills = Vec::new();
-
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                let skill_id = path.file_name().unwrap_or_default().to_string_lossy();
-                let skill_file = path.join("SKILL.md");
-
-                if skill_file.exists() {
-                    // Read SKILL.md for metadata
-                    let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
-
-                    // Extract name from first line (title)
-                    let name = content
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .trim_start_matches("# ")
-                        .to_string();
-
-                    skills.push(serde_json::json!({
-                        "id": skill_id,
-                        "name": name,
-                    }));
-                }
-            }
-        }
-
-        Ok(serde_json::to_string(&skills)?)
-    }
-
-    /// Call the router LLM to classify the task.
-    async fn call_router_llm(&self, prompt: &str) -> anyhow::Result<String> {
-        let timeout_secs = self.config.timeout_seconds;
-        let timeout_duration = Duration::from_secs(timeout_secs);
-
-        let output = match self.config.router_agent.as_str() {
-            "claude" => {
-                let mut cmd = tokio::process::Command::new("claude");
-                cmd.env_remove("CLAUDECODE"); // allow nested invocation
-                cmd.arg("--output-format").arg("json").arg("--print");
-
-                if !self.config.router_model.is_empty() {
-                    cmd.arg("--model").arg(&self.config.router_model);
-                }
-
-                cmd.arg(prompt);
-
-                tokio::time::timeout(timeout_duration, cmd.output_with_context()).await
-            }
-            "codex" => {
-                let mut cmd = tokio::process::Command::new("codex");
-                cmd.arg("exec").arg("--json");
-
-                if !self.config.router_model.is_empty() {
-                    cmd.arg("--model").arg(&self.config.router_model);
-                }
-
-                cmd.arg(prompt);
-
-                tokio::time::timeout(timeout_duration, cmd.output_with_context()).await
-            }
-            "opencode" => {
-                let mut cmd = tokio::process::Command::new("opencode");
-                cmd.arg("run").arg("--format").arg("json").arg(prompt);
-
-                tokio::time::timeout(timeout_duration, cmd.output_with_context()).await
-            }
-            _ => {
-                anyhow::bail!("unknown router agent: {}", self.config.router_agent);
-            }
-        };
-
-        match output {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                tracing::debug!(
-                    exit_code = output.status.code().unwrap_or(-1),
-                    stdout_len = stdout.len(),
-                    stderr_len = stderr.len(),
-                    "router LLM command completed"
-                );
-                if !output.status.success() {
-                    tracing::warn!(
-                        stderr = %stderr,
-                        stdout = %stdout,
-                        "router LLM command failed"
-                    );
-                    anyhow::bail!("router LLM failed: {stderr}");
-                }
-                if stdout.is_empty() {
-                    tracing::warn!(
-                        stderr = %stderr,
-                        "router LLM returned empty stdout"
-                    );
-                    anyhow::bail!("router LLM returned empty response");
-                }
-                Ok(stdout)
-            }
-            Ok(Err(e)) => Err(e),
-            Err(_) => anyhow::bail!("router LLM timed out after {timeout_secs}s"),
-        }
-    }
-
-    /// Parse the LLM response into a structured format.
-    ///
-    /// Handles: direct JSON, Claude `--output-format json` envelopes,
-    /// markdown code blocks, and raw text with embedded JSON.
-    fn parse_llm_response(&self, response: &str) -> anyhow::Result<LlmRouteResponse> {
-        let trimmed = response.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!("empty LLM response");
-        }
-
-        // Step 1: Unwrap Claude JSON envelope if present.
-        // Claude --output-format json returns {"type":"result","result":"...","usage":{...}}
-        // The inner "result" field contains the actual LLM text.
-        let inner = if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if val.get("type").and_then(|v| v.as_str()) == Some("result") {
-                if let Some(is_error) = val.get("is_error").and_then(|v| v.as_bool()) {
-                    if is_error {
-                        let msg = val
-                            .get("result")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown error");
-                        anyhow::bail!("router LLM returned error: {msg}");
-                    }
-                }
-                if let Some(r) = val.get("result").and_then(|v| v.as_str()) {
-                    // result is a string — unwrap it
-                    tracing::debug!(
-                        result_len = r.len(),
-                        "unwrapped Claude JSON envelope (string)"
-                    );
-                    r.to_string()
-                } else if let Some(obj) = val.get("result").filter(|v| v.is_object()) {
-                    // result is a JSON object — serialize it back for parsing
-                    tracing::debug!("unwrapped Claude JSON envelope (object)");
-                    obj.to_string()
-                } else {
-                    trimmed.to_string()
-                }
-            } else {
-                trimmed.to_string()
-            }
-        } else {
-            trimmed.to_string()
-        };
-
-        let text = inner.trim();
-
-        // Step 2: Try to parse directly as JSON
-        if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(text) {
-            return Ok(parsed);
-        }
-
-        // Step 3: Try to extract JSON from markdown code blocks
-        if let Some(json_start) = text.find("```json") {
-            let after_start = &text[json_start + 7..];
-            if let Some(json_end) = after_start.find("```") {
-                let json_str = &after_start[..json_end].trim();
-                if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
-                    return Ok(parsed);
-                }
-            }
-        }
-
-        // Try without json specifier
-        if let Some(json_start) = text.find("```") {
-            let after_start = &text[json_start + 3..];
-            if let Some(json_end) = after_start.find("```") {
-                let json_str = &after_start[..json_end].trim();
-                if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
-                    return Ok(parsed);
-                }
-            }
-        }
-
-        // Step 4: Try to find JSON object between curly braces
-        if let Some(start) = text.find('{') {
-            if let Some(end) = text.rfind('}') {
-                let json_str = &text[start..=end];
-                if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
-                    return Ok(parsed);
-                }
-            }
-        }
-
-        anyhow::bail!(
-            "could not parse LLM response as JSON: {}",
-            &text[..text.len().min(200)]
-        )
+        self.llm_router
+            .route_with_llm(task, &self.available_agents, &self.config)
+            .await
     }
 
     /// Fallback routing when LLM fails.
@@ -1365,55 +959,6 @@ impl Router {
             selected_skills: self.config.default_skills.clone(),
             warning: None,
         })
-    }
-
-    /// Run sanity checks on routing decision.
-    fn check_routing_sanity(
-        &self,
-        task: &ExternalTask,
-        agent: &str,
-        profile: &AgentProfile,
-    ) -> Option<String> {
-        let labels_lower: Vec<String> = task.labels.iter().map(|l| l.to_lowercase()).collect();
-
-        // Check for backend tasks routed to claude
-        let backend_labels: Vec<_> = labels_lower
-            .iter()
-            .filter(|l| {
-                l.contains("backend")
-                    || l.contains("api")
-                    || l.contains("database")
-                    || l.contains("db")
-            })
-            .collect();
-
-        if !backend_labels.is_empty() && agent == "claude" {
-            return Some("backend-labeled task routed to claude".to_string());
-        }
-
-        // Check for docs tasks routed to codex
-        let docs_labels: Vec<_> = labels_lower
-            .iter()
-            .filter(|l| l.contains("docs") || l.contains("documentation") || l.contains("writing"))
-            .collect();
-
-        if !docs_labels.is_empty() && agent == "codex" {
-            return Some("docs-labeled task routed to codex".to_string());
-        }
-
-        // Check for missing skills
-        if profile.skills.is_empty() {
-            return Some("profile missing skills".to_string());
-        }
-
-        None
-    }
-
-    /// Get the path for saving route prompts.
-    fn route_prompt_path(&self, task_id: &str) -> PathBuf {
-        crate::home::state_dir()
-            .unwrap_or_else(|_| PathBuf::from("/tmp").join(".orch").join(".orch"))
-            .join(format!("route-prompt-{task_id}.txt"))
     }
 
     /// Record a rate limit event for an agent, reducing its routing weight.
@@ -1531,6 +1076,24 @@ pub fn get_route_result(task_id: &str) -> anyhow::Result<RouteResult> {
 mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask};
+    use crate::engine::llm_router::LlmRouteResponse;
+
+    // Test-only delegates so tests can call router.parse_llm_response() and
+    // router.check_routing_sanity() directly without referencing llm_router.
+    impl Router {
+        fn parse_llm_response(&self, response: &str) -> anyhow::Result<LlmRouteResponse> {
+            self.llm_router.parse_llm_response(response)
+        }
+
+        fn check_routing_sanity(
+            &self,
+            task: &ExternalTask,
+            agent: &str,
+            profile: &AgentProfile,
+        ) -> Option<String> {
+            self.llm_router.check_routing_sanity(task, agent, profile)
+        }
+    }
 
     fn create_test_task(id: &str, title: &str, labels: Vec<String>) -> ExternalTask {
         ExternalTask {
@@ -1937,7 +1500,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            skills_catalog: std::sync::Mutex::new(None),
+            llm_router: LlmRouter::new(),
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -1958,7 +1521,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            skills_catalog: std::sync::Mutex::new(None),
+            llm_router: LlmRouter::new(),
         };
 
         let task = create_test_task("1", "Test", vec!["agent:claude".to_string()]);
@@ -2008,7 +1571,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            skills_catalog: std::sync::Mutex::new(None),
+            llm_router: LlmRouter::new(),
         };
 
         // Reload — should re-read config and remain valid
@@ -2287,7 +1850,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            skills_catalog: std::sync::Mutex::new(None),
+            llm_router: LlmRouter::new(),
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -2316,7 +1879,7 @@ Hope that helps!"#;
             config,
             available_agents: agents,
             weights,
-            skills_catalog: std::sync::Mutex::new(None),
+            llm_router: LlmRouter::new(),
         };
 
         // Label override should take precedence over weighted routing

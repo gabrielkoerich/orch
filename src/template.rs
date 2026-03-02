@@ -83,6 +83,19 @@ pub fn render_template(template_path: &str, extra_vars: &[String]) -> Result<Str
     render_template_with_vars(&data, &vars)
 }
 
+pub fn render_and_print(template_path: &str, extra_vars: &[String]) -> io::Result<()> {
+    match render_template(template_path, extra_vars) {
+        Ok(output) => {
+            io::stdout().write_all(output.as_bytes())?;
+            Ok(())
+        }
+        Err(e) => {
+            io::stderr().write_all(e.as_bytes())?;
+            Err(io::Error::other(e))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,18 +131,5 @@ mod tests {
         let result =
             render_template(f.path().to_str().unwrap(), &["MY_VAR=hello".to_string()]).unwrap();
         assert_eq!(result.trim(), "value=hello");
-    }
-}
-
-pub fn render_and_print(template_path: &str, extra_vars: &[String]) -> io::Result<()> {
-    match render_template(template_path, extra_vars) {
-        Ok(output) => {
-            io::stdout().write_all(output.as_bytes())?;
-            Ok(())
-        }
-        Err(e) => {
-            io::stderr().write_all(e.as_bytes())?;
-            Err(io::Error::other(e))
-        }
     }
 }
