@@ -338,7 +338,10 @@ pub(crate) async fn check_merged_prs(backend: &Arc<dyn ExternalBackend>) -> anyh
 ///
 /// Checks recent issue comments for @orchestrator mentions,
 /// creates internal tasks, and acknowledges them.
-pub(crate) async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyhow::Result<()> {
+pub(crate) async fn scan_mentions(
+    backend: &Arc<dyn ExternalBackend>,
+    db: &Arc<Db>,
+) -> anyhow::Result<()> {
     // Get the current user (for mention detection)
     let current_user = match backend.get_authenticated_user().await {
         Ok(Some(u)) => format!("@{}", u),

@@ -35,8 +35,8 @@ use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage
 use crate::config;
 use crate::db::Db;
 use crate::engine::router::{get_route_result, Router};
-use crate::github::http::GhHttp;
 use crate::engine::tasks::TaskManager;
+use crate::github::http::GhHttp;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use runner::{TaskRunner, WeightSignal};
@@ -533,9 +533,18 @@ async fn tick(
 
     // Phase 3b: Dispatch routed tasks
     dispatch_routed_tasks(
-        backend, tmux, repo, runner, capture, semaphore,
-        router_arc, task_manager, weight_tx, transport,
-    ).await?;
+        backend,
+        tmux,
+        repo,
+        runner,
+        capture,
+        semaphore,
+        router_arc,
+        task_manager,
+        weight_tx,
+        transport,
+    )
+    .await?;
 
     // Phase 4: Unblock parents (blocked tasks whose children are all done)
     unblock_parent_tasks(backend, task_manager).await?;
@@ -1001,8 +1010,10 @@ async fn sync_tick(
                     let repo_s = repo.to_string();
                     let router_c = router.clone();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            pr_review::review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c).await
+                        if let Err(e) = pr_review::review_and_merge(
+                            &task_c, &backend_c, &tmux_c, &repo_s, &router_c,
+                        )
+                        .await
                         {
                             tracing::error!(
                                 task_id = task_c.id.0,
@@ -1131,10 +1142,7 @@ fn spawn_channel_message_handlers(
 ///
 /// Reads task completion notifications from the transport layer and forwards
 /// them to Telegram, Discord, etc. based on the configured notification level.
-fn spawn_notification_dispatcher(
-    transport: &Arc<Transport>,
-    channels: &Arc<ChannelRegistry>,
-) {
+fn spawn_notification_dispatcher(transport: &Arc<Transport>, channels: &Arc<ChannelRegistry>) {
     let mut notification_rx = transport.subscribe_notifications();
     let channels = channels.clone();
     tokio::spawn(async move {
@@ -1260,12 +1268,6 @@ async fn setup_webhook(
         healthy: true,
     }
 }
-
-
-
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -1412,5 +1414,4 @@ mod tests {
             "@@ -8,5 +8,5 @@ fn main() {\n-    let x = 1;\n+    let x = 2;"
         );
     }
-
 }
