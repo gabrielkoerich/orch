@@ -1330,7 +1330,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 - [ ] `src/engine/mod.rs` — 2,760 lines, needs decomposition (#228, in review)
 - [ ] `src/engine/router.rs` — 2,356 lines; extract LLM routing into `llm_router.rs` (#257)
-- [ ] `src/engine/runner/mod.rs` — 45KB coordinator; largest file in runner module
+- [x] `src/engine/runner/mod.rs` — decomposed: 1,126 lines + `agent.rs`, `context.rs`, `git_ops.rs`, `response.rs`, `worktree.rs`, `agents/` (claude, codex, opencode)
 - [ ] No test coverage tooling in CI (#258) — 366 tests exist but coverage metrics not tracked
 
 ### Feature Gaps (Low Priority)
