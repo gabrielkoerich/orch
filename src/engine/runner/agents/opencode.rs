@@ -219,22 +219,34 @@ impl AgentRunner for OpenCodeRunner {
     ) -> String {
         let model_flag = model.map(|m| format!("--model {m}")).unwrap_or_default();
 
-        // OpenCode permission control via opencode.json config file.
-        // Translate allowed_tools into OpenCode permission keys.
+        // OpenCode permission control via XDG_CONFIG_HOME override.
+        //
+        // We write our own opencode.json to .orch-opencode/opencode/opencode.json
+        // and set XDG_CONFIG_HOME=.orch-opencode so opencode reads ONLY our config,
+        // bypassing the user's global ~/.config/opencode/opencode.json (which has
+        // "edit":"ask" and "external_directory":"ask" that block agent file edits
+        // and git operations on the main repo's .git directory).
         let config_setup = if permissions.autonomous {
             let permission_json = translate_permissions_to_opencode(&permissions.allowed_tools);
             format!(
-                r#"mkdir -p .opencode && echo '{permission_json}' > .opencode/config.json
+                r#"mkdir -p .orch-opencode/opencode && echo '{permission_json}' > .orch-opencode/opencode/opencode.json
 "#
             )
         } else {
             String::new()
         };
 
+        let xdg_prefix = if permissions.autonomous {
+            "XDG_CONFIG_HOME=.orch-opencode "
+        } else {
+            ""
+        };
+
         format!(
-            r#"{config_setup}cat "{sys_file}" "{msg_file}" | {timeout_cmd} opencode run {model_flag} \
+            r#"{config_setup}cat "{sys_file}" "{msg_file}" | {xdg_prefix}{timeout_cmd} opencode run {model_flag} \
   --format json -"#,
             config_setup = config_setup,
+            xdg_prefix = xdg_prefix,
             sys_file = sys_file,
             msg_file = msg_file,
             timeout_cmd = timeout_cmd,
@@ -346,6 +358,9 @@ const OPENCODE_PERMISSION_KEYS: &[&str] = &[
     "todoread",
     "question",
     "codesearch",
+    // Allow access to files outside the worktree (e.g. git's main repo .git dir
+    // which is referenced by the worktree's .git symlink for fetch/push operations).
+    "external_directory",
 ];
 
 /// Translate allowed_tools into an OpenCode config JSON string.
@@ -382,7 +397,11 @@ fn translate_permissions_to_opencode(allowed_tools: &[String]) -> String {
     // Build permission object
     let mut entries = Vec::new();
     for key in OPENCODE_PERMISSION_KEYS {
-        let action = if allowed_keys.contains(key) {
+        let action = if *key == "external_directory" {
+            // Always allow external directory access — agents need this for git
+            // operations that touch the main repo's .git directory from a worktree.
+            "allow"
+        } else if allowed_keys.contains(key) {
             "allow"
         } else {
             "deny"
@@ -590,10 +609,14 @@ mod tests {
         assert!(cmd.contains("opencode run"));
         assert!(cmd.contains("--model anthropic/claude-sonnet-4-20250514"));
         assert!(cmd.contains("--format json"));
-        // Autonomous mode should write permission config
+        // Autonomous mode should write permission config and set XDG_CONFIG_HOME
         assert!(
-            cmd.contains("config.json"),
+            cmd.contains("opencode.json"),
             "expected permission config setup, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("XDG_CONFIG_HOME=.orch-opencode"),
+            "expected XDG_CONFIG_HOME override, got: {cmd}"
         );
     }
 

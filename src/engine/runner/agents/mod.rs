@@ -637,12 +637,16 @@ mod tests {
             "codex default: expected --full-auto, got: {cmd}"
         );
 
-        // OpenCode: should have permission config for autonomous mode
+        // OpenCode: should write permission config and override XDG_CONFIG_HOME
         let opencode = get_runner("opencode");
         let cmd = opencode.build_command(None, "", sys, msg, &perms);
         assert!(
-            cmd.contains("config.json"),
+            cmd.contains("opencode.json"),
             "opencode default: should write permission config, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("XDG_CONFIG_HOME=.orch-opencode"),
+            "opencode default: should set XDG_CONFIG_HOME, got: {cmd}"
         );
     }
 
