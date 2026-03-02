@@ -5,6 +5,7 @@ pub mod service;
 pub mod task;
 pub mod tree;
 
+use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
@@ -300,9 +301,19 @@ pub async fn stream_task(task_id: &str) -> anyhow::Result<()> {
         .bind(task_id, &session_name, "cli", "stream")
         .await;
 
+    // Start a CaptureService to poll the tmux session and push chunks to transport.
+    // This is necessary because the CLI's Transport is isolated from the engine's.
+    let capture = Arc::new(CaptureService::new(transport.clone()));
+    capture.register_session(task_id, &session_name).await;
+    let capture_handle = tokio::spawn({
+        let capture = capture.clone();
+        async move { capture.run().await }
+    });
+
     let mut rx = match transport.subscribe(task_id).await {
         Some(rx) => rx,
         None => {
+            capture_handle.abort();
             anyhow::bail!("no active session for task {}", task_id);
         }
     };
@@ -334,6 +345,10 @@ pub async fn stream_task(task_id: &str) -> anyhow::Result<()> {
             }
         }
     }
+
+    // Clean up: unregister and stop capture
+    capture.unregister_session(task_id).await;
+    capture_handle.abort();
 
     Ok(())
 }

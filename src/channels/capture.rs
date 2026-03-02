@@ -92,6 +92,27 @@ impl CaptureService {
         }
     }
 
+    /// Run the capture loop while there are registered sessions.
+    ///
+    /// This returns when no more sessions are registered, making it suitable
+    /// for CLI streaming where the capture should stop when the session ends.
+    pub async fn run(&self) {
+        let mut interval = tokio::time::interval(self.interval);
+
+        loop {
+            interval.tick().await;
+
+            // Check if there are any sessions to capture
+            let has_sessions = !self.buffers.read().await.is_empty();
+            if !has_sessions {
+                tracing::debug!("no sessions registered, capture loop exiting");
+                break;
+            }
+
+            self.tick().await;
+        }
+    }
+
     /// Run one tick of the capture loop.
     async fn tick(&self) {
         let buffers = self.buffers.read().await;
