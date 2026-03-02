@@ -508,6 +508,56 @@ pub(crate) async fn tick_job_scheduler(
     jobs::tick(jobs_path, backend, db).await
 }
 
+/// Core tick — runs every 10s.
+///
+/// Delegates to named phase functions in order:
+/// 1. `tick_check_session_completions` — poll tmux for finished sessions
+/// 2. `tick_recover_stuck_tasks`       — reset in_progress tasks with no active session
+/// 3. `tick_route_tasks`               — route status:new tasks to an agent
+/// 4. `tick_dispatch_tasks`            — spawn agents for status:routed tasks
+/// 5. `tick_unblock_parents`           — unblock parents whose sub-issues are all done
+/// 6. `tick_job_scheduler`             — fire due cron jobs
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn tick(
+    backend: &Arc<dyn ExternalBackend>,
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    runner: &Arc<TaskRunner>,
+    capture: &Arc<CaptureService>,
+    semaphore: &Arc<Semaphore>,
+    config: &EngineConfig,
+    jobs_path: &std::path::PathBuf,
+    db: &Arc<Db>,
+    router: &Router,
+    router_arc: &Arc<RwLock<Router>>,
+    task_manager: &Arc<TaskManager>,
+    weight_tx: &mpsc::Sender<WeightSignal>,
+    transport: &Arc<Transport>,
+) -> anyhow::Result<()> {
+    let _tick_span = tracing::info_span!("engine.tick").entered();
+    tick_check_session_completions(tmux, repo, capture).await?;
+    tick_recover_stuck_tasks(backend, tmux, repo, task_manager, config).await?;
+    tick_route_tasks(backend, task_manager, router).await?;
+    tick_dispatch_tasks(
+        backend,
+        tmux,
+        repo,
+        runner,
+        capture,
+        semaphore,
+        task_manager,
+        weight_tx,
+        transport,
+        router_arc,
+    )
+    .await?;
+    tick_unblock_parents(backend, task_manager).await?;
+    if let Err(e) = tick_job_scheduler(jobs_path, backend, db).await {
+        tracing::error!(?e, "job scheduler tick failed");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,10 +587,6 @@ mod tests {
                 tasks_by_id: Default::default(),
                 status_updates: Arc::new(Mutex::new(vec![])),
             }
-        }
-
-        fn status_updates(&self) -> Vec<(String, Status)> {
-            self.status_updates.lock().unwrap().clone()
         }
     }
 
@@ -590,11 +636,7 @@ mod tests {
         async fn post_comment(&self, _id: &ExternalId, _body: &str) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn set_labels(
-            &self,
-            _id: &ExternalId,
-            _labels: &[String],
-        ) -> anyhow::Result<()> {
+        async fn set_labels(&self, _id: &ExternalId, _labels: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         async fn remove_label(&self, _id: &ExternalId, _label: &str) -> anyhow::Result<()> {
@@ -634,11 +676,7 @@ mod tests {
         async fn get_mentions(&self, _since: &str) -> anyhow::Result<Vec<Mention>> {
             Ok(vec![])
         }
-        async fn update_status(
-            &self,
-            id: &ExternalId,
-            status: Status,
-        ) -> anyhow::Result<()> {
+        async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
             self.status_updates
                 .lock()
                 .unwrap()
@@ -661,8 +699,10 @@ mod tests {
         // Blocked parent with two done children
         let parent = make_task("10", &["status:blocked"]);
         mock.blocked_tasks.push(parent.clone());
-        mock.sub_issues
-            .insert("10".to_string(), vec![ExternalId("11".to_string()), ExternalId("12".to_string())]);
+        mock.sub_issues.insert(
+            "10".to_string(),
+            vec![ExternalId("11".to_string()), ExternalId("12".to_string())],
+        );
         mock.tasks_by_id
             .insert("11".to_string(), make_task("11", &["status:done"]));
         mock.tasks_by_id
@@ -672,9 +712,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = make_task_manager(backend.clone());
 
-        tick_unblock_parents(&backend, &task_manager)
-            .await
-            .unwrap();
+        tick_unblock_parents(&backend, &task_manager).await.unwrap();
 
         let updates = status_updates.lock().unwrap();
         assert_eq!(updates.len(), 1, "parent should be unblocked");
@@ -687,8 +725,10 @@ mod tests {
 
         let parent = make_task("20", &["status:blocked"]);
         mock.blocked_tasks.push(parent.clone());
-        mock.sub_issues
-            .insert("20".to_string(), vec![ExternalId("21".to_string()), ExternalId("22".to_string())]);
+        mock.sub_issues.insert(
+            "20".to_string(),
+            vec![ExternalId("21".to_string()), ExternalId("22".to_string())],
+        );
         // Child 21 is done, child 22 is still in_progress
         mock.tasks_by_id
             .insert("21".to_string(), make_task("21", &["status:done"]));
@@ -699,12 +739,13 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = make_task_manager(backend.clone());
 
-        tick_unblock_parents(&backend, &task_manager)
-            .await
-            .unwrap();
+        tick_unblock_parents(&backend, &task_manager).await.unwrap();
 
         let updates = status_updates.lock().unwrap();
-        assert!(updates.is_empty(), "should not unblock when a child is still running");
+        assert!(
+            updates.is_empty(),
+            "should not unblock when a child is still running"
+        );
     }
 
     #[tokio::test]
@@ -720,9 +761,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = make_task_manager(backend.clone());
 
-        tick_unblock_parents(&backend, &task_manager)
-            .await
-            .unwrap();
+        tick_unblock_parents(&backend, &task_manager).await.unwrap();
 
         let updates = status_updates.lock().unwrap();
         assert!(
@@ -738,9 +777,7 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = make_task_manager(backend.clone());
 
-        tick_unblock_parents(&backend, &task_manager)
-            .await
-            .unwrap();
+        tick_unblock_parents(&backend, &task_manager).await.unwrap();
 
         assert!(status_updates.lock().unwrap().is_empty());
     }
@@ -769,63 +806,11 @@ mod tests {
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
         let task_manager = make_task_manager(backend.clone());
 
-        tick_unblock_parents(&backend, &task_manager)
-            .await
-            .unwrap();
+        tick_unblock_parents(&backend, &task_manager).await.unwrap();
 
         let updates = status_updates.lock().unwrap();
         assert_eq!(updates.len(), 1, "only one parent should be unblocked");
         assert_eq!(updates[0].0, "40", "task 40 should be unblocked");
         assert_eq!(updates[0].1, Status::New);
     }
-}
-
-/// Core tick — runs every 10s.
-///
-/// Delegates to named phase functions in order:
-/// 1. `tick_check_session_completions` — poll tmux for finished sessions
-/// 2. `tick_recover_stuck_tasks`       — reset in_progress tasks with no active session
-/// 3. `tick_route_tasks`               — route status:new tasks to an agent
-/// 4. `tick_dispatch_tasks`            — spawn agents for status:routed tasks
-/// 5. `tick_unblock_parents`           — unblock parents whose sub-issues are all done
-/// 6. `tick_job_scheduler`             — fire due cron jobs
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn tick(
-    backend: &Arc<dyn ExternalBackend>,
-    tmux: &Arc<TmuxManager>,
-    repo: &str,
-    runner: &Arc<TaskRunner>,
-    capture: &Arc<CaptureService>,
-    semaphore: &Arc<Semaphore>,
-    config: &EngineConfig,
-    jobs_path: &std::path::PathBuf,
-    db: &Arc<Db>,
-    router: &Router,
-    router_arc: &Arc<RwLock<Router>>,
-    task_manager: &Arc<TaskManager>,
-    weight_tx: &mpsc::Sender<WeightSignal>,
-    transport: &Arc<Transport>,
-) -> anyhow::Result<()> {
-    let _tick_span = tracing::info_span!("engine.tick").entered();
-    tick_check_session_completions(tmux, repo, capture).await?;
-    tick_recover_stuck_tasks(backend, tmux, repo, task_manager, config).await?;
-    tick_route_tasks(backend, task_manager, router).await?;
-    tick_dispatch_tasks(
-        backend,
-        tmux,
-        repo,
-        runner,
-        capture,
-        semaphore,
-        task_manager,
-        weight_tx,
-        transport,
-        router_arc,
-    )
-    .await?;
-    tick_unblock_parents(backend, task_manager).await?;
-    if let Err(e) = tick_job_scheduler(jobs_path, backend, db).await {
-        tracing::error!(?e, "job scheduler tick failed");
-    }
-    Ok(())
 }

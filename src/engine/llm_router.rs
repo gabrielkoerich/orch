@@ -613,7 +613,10 @@ mod tests {
         let router = make_router();
         let envelope = r#"{"type":"result","is_error":true,"result":"auth error: invalid key"}"#;
         let err = router.parse_llm_response(envelope).unwrap_err();
-        assert!(err.to_string().contains("error"), "should surface the error");
+        assert!(
+            err.to_string().contains("error"),
+            "should surface the error"
+        );
     }
 
     #[test]
@@ -635,8 +638,7 @@ mod tests {
     #[test]
     fn parse_embedded_json_in_prose() {
         let router = make_router();
-        let text =
-            r#"I analyzed the task. My decision is {"executor":"claude","complexity":"complex","reason":"hard task"}. Please proceed."#;
+        let text = r#"I analyzed the task. My decision is {"executor":"claude","complexity":"complex","reason":"hard task"}. Please proceed."#;
         let resp = router.parse_llm_response(text).unwrap();
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "complex");
@@ -774,6 +776,9 @@ mod tests {
         let task = make_task(vec!["Backend", "API"]); // mixed case
         let profile = make_profile(vec!["rust"]);
         let warning = router.check_routing_sanity(&task, "claude", &profile);
-        assert!(warning.is_some(), "label matching should be case-insensitive");
+        assert!(
+            warning.is_some(),
+            "label matching should be case-insensitive"
+        );
     }
 }

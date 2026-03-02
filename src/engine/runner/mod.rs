@@ -1189,8 +1189,14 @@ mod tests {
         // safe_utf8_tail should walk forward to the next boundary at 9 (end) rather
         // than panicking on an invalid slice.
         let tail = safe_utf8_tail(s, 8);
-        assert!(s.ends_with(tail), "tail must be a valid suffix of the original");
-        assert!(std::str::from_utf8(tail.as_bytes()).is_ok(), "tail must be valid UTF-8");
+        assert!(
+            s.ends_with(tail),
+            "tail must be a valid suffix of the original"
+        );
+        assert!(
+            std::str::from_utf8(tail.as_bytes()).is_ok(),
+            "tail must be valid UTF-8"
+        );
     }
 
     #[test]
@@ -1235,7 +1241,10 @@ mod tests {
         let result = runner.resolve_project_dir();
         std::env::remove_var("PROJECT_DIR");
 
-        assert!(result.is_ok(), "resolve_project_dir should succeed with PROJECT_DIR set");
+        assert!(
+            result.is_ok(),
+            "resolve_project_dir should succeed with PROJECT_DIR set"
+        );
         assert_eq!(result.unwrap(), dir.path());
     }
 
@@ -1271,8 +1280,15 @@ mod tests {
 
     #[async_trait]
     impl crate::backends::ExternalBackend for TrackingBackend {
-        fn name(&self) -> &str { "tracking" }
-        async fn create_task(&self, _t: &str, _b: &str, _l: &[String]) -> anyhow::Result<ExternalId> {
+        fn name(&self) -> &str {
+            "tracking"
+        }
+        async fn create_task(
+            &self,
+            _t: &str,
+            _b: &str,
+            _l: &[String],
+        ) -> anyhow::Result<ExternalId> {
             Ok(ExternalId("new".to_string()))
         }
         async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask> {
@@ -1288,27 +1304,64 @@ mod tests {
                 url: "".to_string(),
             })
         }
-        async fn list_by_status(&self, _s: Status) -> anyhow::Result<Vec<ExternalTask>> { Ok(vec![]) }
-        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> { Ok(vec![]) }
+        async fn list_by_status(&self, _s: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
         async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()> {
-            self.comments.lock().unwrap().push((id.0.clone(), body.to_string()));
+            self.comments
+                .lock()
+                .unwrap()
+                .push((id.0.clone(), body.to_string()));
             Ok(())
         }
-        async fn set_labels(&self, _id: &ExternalId, _l: &[String]) -> anyhow::Result<()> { Ok(()) }
-        async fn remove_label(&self, _id: &ExternalId, _l: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> { Ok(vec![]) }
-        async fn create_sub_task(&self, parent: &ExternalId, title: &str, _body: &str, _l: &[String]) -> anyhow::Result<ExternalId> {
-            self.sub_tasks_created.lock().unwrap().push((title.to_string(), parent.0.clone()));
+        async fn set_labels(&self, _id: &ExternalId, _l: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_label(&self, _id: &ExternalId, _l: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+        async fn create_sub_task(
+            &self,
+            parent: &ExternalId,
+            title: &str,
+            _body: &str,
+            _l: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            self.sub_tasks_created
+                .lock()
+                .unwrap()
+                .push((title.to_string(), parent.0.clone()));
             Ok(ExternalId(format!("child-{}", title)))
         }
-        async fn ensure_status_label(&self, _l: &str) -> anyhow::Result<()> { Ok(()) }
-        async fn has_open_issue_with_title(&self, _t: &str, _l: &str) -> anyhow::Result<bool> { Ok(false) }
-        async fn health_check(&self) -> anyhow::Result<()> { Ok(()) }
-        async fn is_pr_merged(&self, _b: &str) -> anyhow::Result<bool> { Ok(false) }
-        async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> { Ok(None) }
-        async fn get_mentions(&self, _s: &str) -> anyhow::Result<Vec<Mention>> { Ok(vec![]) }
+        async fn ensure_status_label(&self, _l: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn has_open_issue_with_title(&self, _t: &str, _l: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn is_pr_merged(&self, _b: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn get_mentions(&self, _s: &str) -> anyhow::Result<Vec<Mention>> {
+            Ok(vec![])
+        }
         async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
-            self.status_updates.lock().unwrap().push((id.0.clone(), status));
+            self.status_updates
+                .lock()
+                .unwrap()
+                .push((id.0.clone(), status));
             Ok(())
         }
     }
@@ -1371,17 +1424,28 @@ mod tests {
         // Parent should be marked blocked
         let updates = backend.status_updates.lock().unwrap();
         assert!(
-            updates.iter().any(|(id, s)| id == "99" && *s == Status::Blocked),
+            updates
+                .iter()
+                .any(|(id, s)| id == "99" && *s == Status::Blocked),
             "parent should be blocked"
         );
         drop(updates);
 
         // A comment summarising the delegations should be posted
         let comments = backend.comments.lock().unwrap();
-        assert!(!comments.is_empty(), "a delegation summary comment should be posted");
+        assert!(
+            !comments.is_empty(),
+            "a delegation summary comment should be posted"
+        );
         let comment_body = &comments[0].1;
-        assert!(comment_body.contains("Subtask A"), "summary should mention Subtask A");
-        assert!(comment_body.contains("Subtask B"), "summary should mention Subtask B");
+        assert!(
+            comment_body.contains("Subtask A"),
+            "summary should mention Subtask A"
+        );
+        assert!(
+            comment_body.contains("Subtask B"),
+            "summary should mention Subtask B"
+        );
     }
 
     #[tokio::test]
@@ -1409,13 +1473,18 @@ mod tests {
 
         let updates = backend.status_updates.lock().unwrap();
         assert!(
-            updates.iter().any(|(id, s)| id == "101" && *s == Status::Blocked),
+            updates
+                .iter()
+                .any(|(id, s)| id == "101" && *s == Status::Blocked),
             "parent should be blocked"
         );
         drop(updates);
 
         let comments = backend.comments.lock().unwrap();
         let body = &comments[0].1;
-        assert!(body.contains("1 subtask"), "comment should count one subtask");
+        assert!(
+            body.contains("1 subtask"),
+            "comment should count one subtask"
+        );
     }
 }
