@@ -147,13 +147,15 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         .unwrap_or(true);
 
     if pty_enabled {
+        // Build env var slice for tmux.create_session
+        let env_slice: Vec<(&str, &str)> = env_map.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let session = tmux
             .create_session(
                 &inv.repo,
                 &inv.task_id,
                 &inv.work_dir.to_string_lossy(),
                 "cat",
-                None,
+                env_slice.as_slice(),
             )
             .await?;
 
