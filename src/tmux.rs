@@ -54,19 +54,30 @@ impl TmuxManager {
         task_id: &str,
         working_dir: &str,
         command: &str,
+        env: Option<&std::collections::HashMap<String, String>>,
     ) -> anyhow::Result<String> {
         let name = self.session_name(repo, task_id);
 
-        let output = Command::new("tmux")
-            .args([
-                "new-session",
-                "-d", // detached
-                "-s",
-                &name, // session name
-                "-c",
-                working_dir,
-                command,
-            ])
+        let mut cmd = Command::new("tmux");
+        cmd.arg("new-session");
+        cmd.arg("-d"); // detached
+        cmd.arg("-s");
+        cmd.arg(&name);
+        cmd.arg("-c");
+        cmd.arg(working_dir);
+
+        // Inject environment variables into the new session if provided.
+        if let Some(map) = env {
+            for (k, v) in map {
+                // tmux -e expects VAR=VAL
+                cmd.arg("-e");
+                cmd.arg(format!("{}={}", k, v));
+            }
+        }
+
+        cmd.arg(command);
+
+        let output = cmd
             .output_with_context()
             .await
             .context("spawning tmux session")?;
