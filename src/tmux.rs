@@ -366,19 +366,6 @@ mod tests {
         let _ = tmux.kill_session(&session).await;
     }
 
-    /// Verify that GH_TOKEN is NOT passed via create_session env parameter.
-    /// This is a static verification that the code doesn't include GH_TOKEN in the env map.
-    #[test]
-    fn test_create_session_does_not_include_gh_token_in_env_docs() {
-        // This test documents the expected behavior:
-        // GH_TOKEN should be set via set_session_env AFTER session creation,
-        // NOT passed in the env parameter to create_session.
-        //
-        // The implementation in agent.rs demonstrates this:
-        // 1. Create session with non-secret env vars (GIT_AUTHOR_NAME, etc.)
-        // 2. After session exists, call tmux.set_session_env(session, "GH_TOKEN", token)
-        //
-        // This test passes if the implementation follows this pattern.
-        assert!(true, "GH_TOKEN handling documented in code comments");
-    }
+    // NOTE: No static test for GH_TOKEN handling here; behavior is enforced
+    // by the call sites (runner code) and covered by session env helper tests.
 }
