@@ -1357,7 +1357,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 - [x] `src/engine/mod.rs` — decomposed into tick.rs, sync.rs, review.rs, cleanup.rs (#283)
 - [x] `src/engine/router.rs` — extracted LLM routing into `router/llm.rs` (`LlmRouter` struct) (#257)
 - [x] `src/engine/runner/mod.rs` — decomposed into task_init.rs, session.rs, response_handler.rs, fallback.rs (#295)
-- [x] `cargo-llvm-cov` added to CI (#258) — runs on every push via `release.yml`, uploads LCOV artifact
+- [x] `cargo-llvm-cov` added to CI (#258) — runs on every push via `release.yml`, uploads LCOV artifact; `romeovs/lcov-reporter-action` posts coverage % on PRs
 
 ### Feature Gaps (Low Priority)
 
