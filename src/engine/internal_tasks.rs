@@ -11,7 +11,6 @@
 
 #![allow(dead_code)]
 
-use crate::backends::Status;
 use crate::db::Db;
 use anyhow::Context;
 use rusqlite::OptionalExtension;
@@ -297,33 +296,6 @@ pub async fn get_internal_task_results(
     Ok(results)
 }
 
-/// Convert Status enum to internal task status string.
-pub fn status_to_string(status: Status) -> &'static str {
-    match status {
-        Status::New => "new",
-        Status::Routed => "routed",
-        Status::InProgress => "in_progress",
-        Status::Done => "done",
-        Status::Blocked => "blocked",
-        Status::InReview => "in_review",
-        Status::NeedsReview => "needs_review",
-    }
-}
-
-/// Convert internal task status string to Status enum.
-pub fn string_to_status(status: &str) -> Option<Status> {
-    match status {
-        "new" => Some(Status::New),
-        "routed" => Some(Status::Routed),
-        "in_progress" => Some(Status::InProgress),
-        "done" => Some(Status::Done),
-        "blocked" => Some(Status::Blocked),
-        "in_review" => Some(Status::InReview),
-        "needs_review" => Some(Status::NeedsReview),
-        _ => None,
-    }
-}
-
 /// Count internal tasks by status (for dashboard).
 pub async fn count_internal_tasks_by_status(db: &Db) -> anyhow::Result<Vec<(String, i64)>> {
     let conn = db.conn().await;
@@ -355,6 +327,7 @@ pub async fn count_internal_tasks_by_status(db: &Db) -> anyhow::Result<Vec<(Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::TaskStatus;
 
     async fn setup_test_db() -> Db {
         let db = Db::open_memory().unwrap();
@@ -448,12 +421,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_conversions() {
-        assert_eq!(status_to_string(Status::New), "new");
-        assert_eq!(status_to_string(Status::InProgress), "in_progress");
-        assert_eq!(status_to_string(Status::Done), "done");
+        // Use TaskStatus from db.rs (consolidated status conversion)
+        assert_eq!(TaskStatus::New.as_str(), "new");
+        assert_eq!(TaskStatus::InProgress.as_str(), "in_progress");
+        assert_eq!(TaskStatus::Done.as_str(), "done");
 
-        assert_eq!(string_to_status("new"), Some(Status::New));
-        assert_eq!(string_to_status("in_progress"), Some(Status::InProgress));
-        assert_eq!(string_to_status("invalid"), None);
+        assert_eq!(TaskStatus::from_str("new"), Some(TaskStatus::New));
+        assert_eq!(
+            TaskStatus::from_str("in_progress"),
+            Some(TaskStatus::InProgress)
+        );
+        assert_eq!(TaskStatus::from_str("invalid"), None);
     }
 }
