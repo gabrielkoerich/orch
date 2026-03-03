@@ -9,7 +9,7 @@ The orchestrator uses an LLM-as-classifier to route each task to the best agent.
 ## How It Works
 
 1. `route_task.sh` sends the task title, body, labels, and the skills catalog to a lightweight LLM (default: `claude --model haiku --print`).
-2. The router LLM returns JSON:
+2. The router LLM returns JSON (or the CLI parser normalizes simple string responses into JSON):
    ```json
    {
      "executor": "claude",
@@ -25,7 +25,7 @@ The orchestrator uses an LLM-as-classifier to route each task to the best agent.
      "selected_skills": ["solana-best-practices"]
    }
    ```
-3. Sanity checks run — e.g. warns if a backend task gets routed to claude, or a docs task to codex.
+3. Sanity checks run — e.g. warns if a backend task gets routed to claude, or a docs task to codex. If the router fails repeatedly, the router falls back to `router.fallback_executor` and increments a route-failure counter.
 4. If the router fails, it falls back to `config.yml`'s `router.fallback_executor` (default: `codex`).
 
 ## Config

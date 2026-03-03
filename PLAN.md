@@ -167,6 +167,14 @@ in_progress → needs_review → in_review → done
 | in_review → blocked | engine | `engine/review.rs` | Merge conflict retries ≥ 3, non-conflict merge failure, max review cycles exceeded |
 | stale in_review → needs_review | sync tick | `engine/sync.rs` | No active tmux review session detected |
 
+### Recent doc updates (docs/content)
+
+- Updated docs to reflect actual runtime paths (`~/.orch`), worktree layout, and sidecar locations
+- Documented that `GH_TOKEN` is injected into runner env at spawn time and that agents should not call GitHub directly
+- Clarified that jobs are per-project in `.orch.yml` (preferred) and scheduler runs from engine tick
+- Changed max-attempts behavior: repeated failures now move tasks to `needs_review` and forced `agent:*` labels are removed
+- Review agent selection clarifications: review agent excludes the original task agent to avoid self-review
+
 **Review agent**: triggered by engine when a task is in `needs_review` and has a branch. The engine transitions the task to `in_review` before spawning — the status itself is the duplicate guard (no sidecar flags needed). On failure, the engine resets to `needs_review` for retry.
 
 **Key invariant**: `done` means task is finished (PR merged or no code changes). `needs_review` means PR exists and is queued for review. `in_review` means a review agent is actively running. `blocked` means human intervention is required. The runner decides: if agent said "done" AND a PR exists → `needs_review`; otherwise → agent's reported status.

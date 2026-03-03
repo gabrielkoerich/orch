@@ -34,18 +34,18 @@ GitHub metadata (optional): `gh_issue_number`, `gh_url`, `gh_state`, `gh_updated
 ## Task Lifecycle
 
 ```
-new → routed → in_progress → done → in_review
+new → routed → in_progress → needs_review → in_review → done (merged)
+                            → done (no PR)
                             → blocked
-                            → needs_review
 ```
 
 - **new** — task created (via `task add`, `gh pull`, or `jobs tick`)
 - **routed** — LLM router assigned agent, model, profile, skills
 - **in_progress** — agent is running
-- **done** — agent completed successfully (no open PR)
-- **in_review** — agent completed and a PR is open (triggers review agent if enabled)
-- **blocked** — agent hit a blocker, crashed, or exceeded max attempts
-- **needs_review** — agent needs human help, or review agent requested changes
+- **done** — PR merged (or agent completed with no code changes)
+- **in_review** — review agent is actively running on the PR
+- **blocked** — agent hit a blocker or crashed and requires human intervention (rare)
+- **needs_review** — agent needs human help, or review agent requested changes. After repeated failures the engine moves tasks to `needs_review` and removes any forced `agent:*` label so an owner can reassign.
 
 ## Delegation & Decomposition
 

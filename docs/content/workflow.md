@@ -41,18 +41,18 @@ Expected outcome:
 ## Task Lifecycle
 
 ```
-new → routed → in_progress → done → in_review → (merged externally)
+new → routed → in_progress → needs_review → in_review → done (merged)
+                            → done (no PR)
                             → blocked
-                            → needs_review
 ```
 
 - **new**: task created (via `add` or `jobs_tick`)
 - **routed**: LLM router assigned agent, model, profile, skills
 - **in_progress**: agent is running
-- **done**: agent completed successfully (no open PR)
-- **in_review**: agent completed and a PR is open (review agent fires if enabled)
-- **blocked**: agent hit a blocker or crashed
-- **needs_review**: agent needs human help, or review agent requested changes
+- **done**: PR merged (or agent completed with no code changes)
+- **in_review**: review agent is actively running on the PR
+- **blocked**: agent hit a blocker or crashed (rare; human intervention needed)
+- **needs_review**: PR exists and is queued for review, or max attempts exceeded
 
 ## Poll Loop
 
@@ -69,16 +69,16 @@ new → routed → in_progress → done → in_review → (merged externally)
 
 The orchestrator creates worktrees before launching agents. Agents do NOT create worktrees themselves.
 
-**Worktree path:** `~/.orchestrator/worktrees/<project>/gh-task-<issue>-<slug>`
+**Worktree path:** `~/.orch/worktrees/<project>/<branch>/`
 
 **Steps:**
 1. `gh issue develop <issue> --base main --name <branch>` — registers branch with GitHub
 2. `git branch <branch> main` — creates branch from main
-3. `git worktree add ~/.orchestrator/worktrees/<project>/<branch> <branch>` — creates worktree
+3. `git worktree add ~/.orch/worktrees/<project>/<branch> <branch>` — creates worktree
 4. Agent runs inside the worktree directory (`PROJECT_DIR` is set to worktree)
 
 **After agent finishes:**
-- Orchestrator pushes the branch (`git push -u origin <branch>`) if there are unpushed commits
+- Orchestrator pushes the branch (`git push -u origin <branch>`) if there are unpushed commits. The runner injects `GH_TOKEN` into the spawned runner environment so agents do not need to authenticate with `gh` themselves and agents should avoid calling GitHub directly.
 - Agent should NOT run `git push` itself
 
 ## Agent Invocation
@@ -135,4 +135,4 @@ Note: `stuck_timeout` is separate from the task execution timeout. Task executio
 
 ## Max Attempts
 
-Default: 10 attempts per task (configurable via `config.yml`). After max attempts, task goes to `blocked` with error. Retry loop detection: if the same error repeats 3 times, task goes to `needs_review` instead of retrying.
+Default: 10 attempts per task (configurable via `config.yml`). After max attempts, task goes to `needs_review` (not `blocked`) and the forced `agent:*` label is removed so an owner can reassign or inspect the task. Retry loop detection: if the same error repeats 3 times, task also goes to `needs_review` instead of retrying.

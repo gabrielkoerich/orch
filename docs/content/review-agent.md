@@ -11,7 +11,7 @@ The review agent automatically reviews pull requests after an agent completes a 
 1. Agent completes a task and returns `status: done`
 2. Orchestrator detects an open PR on the task's branch → sets status to `in_review`
 3. If `enable_review_agent` is `true`, the review agent runs:
-   - Picks the **opposite agent** (first available agent different from the executor)
+   - Picks the **opposite agent** (first available agent different from the executor). The review agent excludes the original task's executor from selection to avoid self-review.
    - Fetches the PR diff via `gh pr diff`
    - Sends the diff, task summary, and files changed to the review agent
    - Parses the review decision
