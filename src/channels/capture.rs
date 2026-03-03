@@ -13,9 +13,12 @@ use crate::channels::tmux;
 use crate::channels::transport::Transport;
 use crate::channels::OutputChunk;
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+pub(crate) const MAX_OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Buffer for tracking session output state.
 #[derive(Debug, Clone)]
@@ -26,6 +29,10 @@ pub struct OutputBuffer {
     pub task_id: String,
     /// Content from the last capture
     pub last_content: String,
+    /// Byte length of the last capture
+    pub last_len: usize,
+    /// Hash of the last capture (for dedup)
+    pub last_hash: Option<[u8; 32]>,
     /// When the last capture occurred
     pub last_capture: DateTime<Utc>,
 }
@@ -56,6 +63,8 @@ impl CaptureService {
             session: session.to_string(),
             task_id: task_id.to_string(),
             last_content: String::new(),
+            last_len: 0,
+            last_hash: None,
             last_capture: Utc::now(),
         };
         self.buffers
@@ -160,45 +169,73 @@ impl CaptureService {
                     },
                 };
 
-                // Diff against previous content
-                if current_content != buffer.last_content {
-                    let new_content = if buffer.last_content.is_empty() {
-                        current_content.clone()
-                    } else {
-                        match current_content.find(&buffer.last_content) {
-                            Some(_pos) => {
-                                let last_pos = current_content.rfind(&buffer.last_content);
-                                if let Some(last) = last_pos {
-                                    let offset = last + buffer.last_content.len();
-                                    if offset < current_content.len() {
-                                        current_content[offset..].to_string()
-                                    } else {
-                                        String::new()
-                                    }
-                                } else {
-                                    current_content.clone()
-                                }
-                            }
-                            None => current_content.clone(),
-                        }
-                    };
-
-                    if !new_content.is_empty() {
-                        let chunk = OutputChunk {
-                            content: new_content,
-                            is_final: false,
-                        };
-                        self.transport.push_output(&task_id, chunk).await;
-                    }
-
-                    // Update buffer
+                let new_content = {
                     let mut buffers = self.buffers.write().await;
-                    if let Some(buf) = buffers.get_mut(&task_id) {
-                        buf.last_content = current_content;
-                        buf.last_capture = Utc::now();
-                    }
+                    buffers
+                        .get_mut(&task_id)
+                        .and_then(|buf| buf.diff_and_update(&current_content))
+                };
+
+                if let Some(new_content) = new_content {
+                    let chunk = OutputChunk {
+                        content: new_content,
+                        is_final: false,
+                    };
+                    self.transport.push_output(&task_id, chunk).await;
                 }
             }
         }
     }
+}
+
+impl OutputBuffer {
+    pub(crate) fn diff_and_update(&mut self, current_content: &str) -> Option<String> {
+        let current_bytes = current_content.as_bytes();
+        let current_len = current_bytes.len();
+        let current_hash = hash_bytes(current_bytes);
+
+        if self.last_len == current_len && self.last_hash == Some(current_hash) {
+            self.last_capture = Utc::now();
+            return None;
+        }
+
+        let new_content = if self.last_len >= current_len {
+            current_content.to_string()
+        } else {
+            let mut offset = self.last_len.min(current_len);
+            while offset < current_len && !current_content.is_char_boundary(offset) {
+                offset += 1;
+            }
+            String::from_utf8_lossy(&current_bytes[offset..]).to_string()
+        };
+
+        self.last_len = current_len;
+        self.last_hash = Some(current_hash);
+        self.last_content = cap_content(current_content);
+        self.last_capture = Utc::now();
+
+        if new_content.is_empty() {
+            None
+        } else {
+            Some(new_content)
+        }
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn cap_content(content: &str) -> String {
+    if content.len() <= MAX_OUTPUT_BUFFER_BYTES {
+        return content.to_string();
+    }
+
+    let mut start = content.len() - MAX_OUTPUT_BUFFER_BYTES;
+    while start < content.len() && !content.is_char_boundary(start) {
+        start += 1;
+    }
+    content[start..].to_string()
 }
