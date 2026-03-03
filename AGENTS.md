@@ -288,6 +288,22 @@ The routing prompt template is at `prompts/route.md`. It includes:
 
 See [specs.md](specs.md) for architecture overview, what's working, what's not, and improvement ideas.
 
+## Required checks before every commit
+
+Always run these before committing — CI enforces them and will fail otherwise:
+
+```bash
+cargo fmt -- --check        # formatting
+cargo clippy -- -D warnings # lints (warnings are errors)
+cargo test                  # unit tests
+```
+
+Or all at once:
+
+```bash
+cargo fmt && cargo clippy -- -D warnings && cargo test
+```
+
 ## Release pipeline
 
 1. Push to `main`

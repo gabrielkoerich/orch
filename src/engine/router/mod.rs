@@ -143,7 +143,7 @@ impl Router {
         let n = self.available_agents.len();
         let agent = (0..n)
             .map(|offset| &self.available_agents[(idx + offset) % n])
-            .find(|a| exclude.map_or(true, |ex| a.as_str() != ex))
+            .find(|a| exclude != Some(a.as_str()))
             .cloned()
             .or_else(|| self.available_agents.get(idx % n).cloned())?;
 
