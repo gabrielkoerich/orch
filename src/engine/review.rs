@@ -535,6 +535,23 @@ pub(crate) async fn review_and_merge(
                     }
                 }
             } else {
+                // No PR and no commits. Distinguish two cases:
+                // 1. Agent genuinely completed a read-only task (no last_error) → mark done.
+                // 2. Agent failed before doing any work (last_error set) → re-route.
+                let last_error = sidecar::get(&task.id.0, "last_error").unwrap_or_default();
+                if !last_error.is_empty() {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        branch = %branch_name,
+                        error = %last_error,
+                        "no PR and no commits but agent reported error — re-routing for retry"
+                    );
+                    let _ = backend
+                        .update_status(&task.id, crate::backends::Status::New)
+                        .await;
+                    // Return Skipped so the caller does NOT reset to NeedsReview.
+                    return Ok(ReviewDecision::Skipped);
+                }
                 tracing::info!(
                     task_id = task.id.0,
                     branch = %branch_name,
