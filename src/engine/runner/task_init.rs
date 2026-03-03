@@ -5,7 +5,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::config;
-use crate::engine::router::{get_route_result, RouteResult};
+use crate::engine::router::get_route_result;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,6 @@ pub struct TaskInitResult {
     pub invocation: agent::AgentInvocation,
     pub attempt_dir: PathBuf,
     pub new_attempts: u32,
-    pub route_result: Option<RouteResult>,
 }
 
 /// Check task guards and return the current attempt count.
@@ -214,6 +213,5 @@ pub async fn prepare_task(
         invocation,
         attempt_dir,
         new_attempts: next_attempt,
-        route_result,
     })
 }

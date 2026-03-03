@@ -228,6 +228,7 @@ impl TaskRunner {
     }
 
     /// Record task execution metrics to the database.
+    #[allow(clippy::too_many_arguments)]
     async fn record_metrics(
         &self,
         task_id: &str,
@@ -431,7 +432,7 @@ impl TaskRunner {
                 task_id,
                 &agent_name,
                 &model.map(|s| s.to_string()),
-                &route_result.map(|r| r.clone()),
+                &route_result.cloned(),
                 &started_at,
                 attempts,
                 &status,
@@ -494,7 +495,7 @@ impl TaskRunner {
             let cost = sidecar::get_cost_estimate(task_id);
             let total_tokens = sidecar::get_total_tokens(task_id);
             raw_comment.push_str(&format!(
-                "\n\n> **Budget exceeded**: {} tokens used (${{:.4}}). Task paused for review.",
+                "\n\n> **Budget exceeded**: {} tokens used (${:.4}). Task paused for review.",
                 total_tokens, cost.total_cost_usd
             ));
         } else if !budget_warning.is_empty() {
