@@ -41,7 +41,57 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `gh.backoff` | `mode` | Rate-limit behavior: `wait` or `skip` | `"wait"` |
 | `gh.backoff` | `base_seconds` | Initial backoff duration in seconds | `30` |
 | `gh.backoff` | `max_seconds` | Max backoff duration in seconds | `900` |
+| `gh.auth` | `mode` | Auth method: `auto`, `token`, `github_app`, or `gh_cli` | `"auto"` |
+| `gh.auth` | `token` | Personal Access Token (for `mode: token`) | `""` |
+| `gh.auth` | `app_id` | GitHub App ID (for `mode: github_app`) | `""` |
+| `gh.auth` | `private_key` | Path to GitHub App private key PEM file | `""` |
+| `gh.auth` | `installation_id` | Specific installation ID (auto-detected if empty) | `""` |
+| `gh.auth` | `allow_gh_fallback` | Allow `gh auth token` fallback (not recommended for services) | `false` |
 | `model_map` | `simple/medium/complex` | Agent-specific model names per complexity level | `{}` |
+
+## Authentication
+
+The orchestrator supports three authentication methods for GitHub API access:
+
+### Personal Access Token (PAT)
+
+```yaml
+gh:
+  auth:
+    mode: token
+    token: "ghp_xxxxxxxxxxxxxxxxxxxx"  # Or use GH_TOKEN/GITHUB_TOKEN env var
+```
+
+Create tokens at [GitHub Settings → Developer settings → Personal access tokens](https://github.com/settings/tokens).
+
+### GitHub App
+
+Recommended for organization automation with better audit trails:
+
+```yaml
+gh:
+  auth:
+    mode: github_app
+    app_id: "123456"
+    private_key: "/path/to/app-private-key.pem"
+    # Optional: specific installation ID (auto-detected if not set)
+    # installation_id: "78901234"
+```
+
+The orchestrator automatically:
+- Generates JWTs from your App credentials
+- Exchanges JWTs for installation access tokens
+- Refreshes tokens before they expire (valid for 1 hour)
+
+### gh CLI (Legacy)
+
+```yaml
+gh:
+  auth:
+    mode: gh_cli
+```
+
+Requires `gh auth login` to be run interactively. Not recommended for service environments.
 
 ## Per-Project Config
 

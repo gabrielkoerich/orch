@@ -181,12 +181,12 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         let backend: Arc<dyn ExternalBackend> =
             Arc::new(crate::backends::github::GitHubBackend::new(repo.clone()));
 
-        // Health check — verifies `gh auth status` succeeds
+        // Health check — verifies GitHub authentication is configured and working
         if let Err(e) = backend.health_check().await {
             tracing::warn!(
                 repo = %repo,
                 error = %e,
-                "backend health check failed (`gh auth status`), skipping project"
+                "backend health check failed (GitHub auth), skipping project"
             );
             continue;
         }
@@ -216,7 +216,11 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
             .unwrap_or_else(|_| "~/.orch/config.yml".to_string());
         anyhow::bail!(
             "no valid projects configured — all backends failed health checks. \
-             Config: {config_path}. Run `orch init` to set up a project."
+             GitHub Authentication: \
+             Set GH_TOKEN or GITHUB_TOKEN environment variables, OR \
+             Configure gh.auth in {}. \
+             See docs for GitHub App authentication setup.",
+            config_path
         );
     }
 

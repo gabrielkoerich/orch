@@ -3,12 +3,16 @@
 //! Uses a shared `reqwest::Client` with connection pooling, reads rate-limit
 //! headers proactively, and supports concurrent requests via `tokio::join!`.
 //!
-//! Auth: reads token from `gh auth token` once at startup, falls back to
-//! `GITHUB_TOKEN` / `GH_TOKEN` env vars.
+//! Auth: uses the token resolver from `auth` module which supports:
+//!   - Personal Access Token (GH_TOKEN / GITHUB_TOKEN env vars, or gh.auth.token config)
+//!   - GitHub App authentication (JWT-based with automatic installation token refresh)
+//!   - Legacy gh CLI fallback (optional, disabled by default)
 
+use super::auth;
 use super::types::{
     GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview, GitHubReviewComment,
 };
+use anyhow::Context;
 use reqwest::{header, Client, Response, StatusCode};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -193,9 +197,9 @@ pub struct GhHttp {
 }
 
 impl GhHttp {
-    /// Create a new client. Reads the GitHub token once (env var → `gh auth token`).
+    /// Create a new client. Reads the GitHub token using the auth resolver.
     pub fn new() -> Self {
-        let token = resolve_token();
+        let token = auth::resolve_token_sync();
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
@@ -204,6 +208,20 @@ impl GhHttp {
             .expect("failed to build reqwest client");
 
         Self { client, token }
+    }
+
+    /// Create a new client with a custom token resolver.
+    #[allow(dead_code)]
+    pub fn with_resolver(resolver: &dyn auth::TokenResolver) -> anyhow::Result<Self> {
+        let token = resolver.resolve_token()?;
+        let client = Client::builder()
+            .user_agent("orch/0.1 (reqwest)")
+            .pool_max_idle_per_host(4)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build reqwest client");
+
+        Ok(Self { client, token })
     }
 
     // ── Rate-limit helpers ────────────────────────────────────────
@@ -609,9 +627,86 @@ impl GhHttp {
     }
 
     /// Verify authentication by fetching the current user.
+    ///
+    /// Returns detailed error messages for common auth failures to help
+    /// users diagnose configuration issues at startup.
     pub async fn auth_status(&self) -> anyhow::Result<()> {
-        let _: serde_json::Value = self.get_json(&format!("{GITHUB_API}/user")).await?;
-        Ok(())
+        match self
+            .get_json::<serde_json::Value>(&format!("{GITHUB_API}/user"))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let err_str = e.to_string();
+
+                // Provide helpful error messages for common auth failures
+                if err_str.contains("401") || err_str.contains("Bad credentials") {
+                    anyhow::bail!(
+                        "GitHub authentication failed: Invalid or expired token. \
+                         Check your GH_TOKEN/GITHUB_TOKEN environment variables, \
+                         or gh.auth configuration in ~/.orch/config.yml. \
+                         Run `orch auth check` to verify your setup."
+                    );
+                }
+
+                if err_str.contains("403") && err_str.contains("rate limit") {
+                    anyhow::bail!(
+                        "GitHub API rate limited. Wait before retrying, \
+                         or check your token's rate limit quota."
+                    );
+                }
+
+                Err(e)
+            }
+        }
+    }
+
+    /// Verify authentication using a specific resolver.
+    ///
+    /// This performs a health check without requiring a GhHttp instance.
+    #[allow(dead_code)]
+    pub async fn check_auth_with_resolver(
+        resolver: &dyn crate::github::auth::TokenResolver,
+    ) -> anyhow::Result<()> {
+        // First, do a basic health check
+        resolver.health_check()?;
+
+        // Then verify the token actually works by making an API call
+        let token = resolver.resolve_token()?;
+        let client = Client::builder()
+            .user_agent("orch/0.1 (reqwest)")
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build reqwest client");
+
+        let resp = client
+            .get(format!("{GITHUB_API}/user"))
+            .header(header::AUTHORIZATION, format!("Bearer {}", token))
+            .header(header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .context("failed to connect to GitHub API")?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+
+        if status == StatusCode::UNAUTHORIZED {
+            anyhow::bail!(
+                "GitHub authentication failed: Invalid or expired token ({}). \
+                 Token source: {}. \
+                 Check your GH_TOKEN/GITHUB_TOKEN environment variables, \
+                 or gh.auth configuration in ~/.orch/config.yml.",
+                body,
+                resolver.auth_method()
+            );
+        }
+
+        anyhow::bail!("GitHub API auth check failed ({}): {}", status, body)
     }
 
     /// Create a GitHub issue.
@@ -1215,48 +1310,19 @@ pub fn rate_limit_metrics() -> RateLimitMetrics {
 
 // ── Token resolution ─────────────────────────────────────────────────
 
-/// Resolve a GitHub token: `GH_TOKEN` env → `GITHUB_TOKEN` env → `gh auth token`.
+/// Resolve a GitHub token using the auth module resolver.
+///
+/// Delegates to `auth::resolve_token_sync()` which supports:
+/// - Personal Access Token (GH_TOKEN/GITHUB_TOKEN env vars or config)
+/// - GitHub App authentication (JWT-based with installation tokens)
+/// - Legacy gh CLI fallback (if enabled via config)
+#[allow(dead_code)]
 fn resolve_token() -> String {
-    if let Ok(t) = std::env::var("GH_TOKEN") {
-        if !t.is_empty() {
-            return t;
-        }
-    }
-    if let Ok(t) = std::env::var("GITHUB_TOKEN") {
-        if !t.is_empty() {
-            return t;
-        }
-    }
-    // Fall back to `gh auth token`
-    match std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !token.is_empty() {
-                return token;
-            }
-        }
-        _ => {}
-    }
-    // Try common gh install paths for launchd environments
-    for path in &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
-        if let Ok(out) = std::process::Command::new(path)
-            .args(["auth", "token"])
-            .output()
-        {
-            if out.status.success() {
-                let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !token.is_empty() {
-                    return token;
-                }
-            }
-        }
-    }
-    tracing::error!("no GitHub token found: set GH_TOKEN, GITHUB_TOKEN, or run `gh auth login`");
-    String::new()
+    auth::resolve_token_sync()
 }
+
+/// Re-export auth module types for convenience.
+pub use super::auth::TokenResolver;
 
 // ── Link header parser ───────────────────────────────────────────────
 

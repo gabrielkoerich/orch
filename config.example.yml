@@ -104,6 +104,40 @@ gh:
     mode: "wait"
     base_seconds: 30
     max_seconds: 900
+  # GitHub authentication configuration
+  # The orchestrator supports multiple auth methods:
+  #
+  # Option 1: Personal Access Token (classic or fine-grained)
+  # - Set GH_TOKEN or GITHUB_TOKEN environment variable, OR
+  # - Configure gh.auth.token below
+  #
+  # Option 2: GitHub App (recommended for organization automation)
+  # - Install the app on your repository/organization
+  # - Configure gh.auth.app_id and private_key below
+  #
+  # Option 3: gh CLI (legacy, not recommended for services)
+  # - Set gh.auth.allow_gh_fallback: true
+  auth:
+    # Auth mode: "auto" | "token" | "github_app" | "gh_cli"
+    # - "auto": Try token first, then GitHub App (default)
+    # - "token": Use Personal Access Token only
+    # - "github_app": Use GitHub App authentication
+    # - "gh_cli": Use `gh auth token` (requires gh CLI login)
+    mode: "auto"
+
+    # Personal Access Token (for mode: "token" or "auto")
+    # If not set, falls back to GH_TOKEN / GITHUB_TOKEN env vars
+    # token: "ghp_xxxxxxxxxxxxxxxxxxxx"
+
+    # GitHub App credentials (for mode: "github_app" or "auto")
+    # app_id: "123456"
+    # private_key: "/path/to/app-private-key.pem"
+    # Optional: specific installation ID (auto-detected if not set)
+    # installation_id: "78901234"
+
+    # Legacy gh CLI fallback (default: false)
+    # When true, falls back to `gh auth token` if other methods fail
+    # allow_gh_fallback: false
 
 # GitHub webhook server for instant event delivery (bypasses polling)
 webhook:
