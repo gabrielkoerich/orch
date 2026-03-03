@@ -57,9 +57,9 @@ pub struct AgentInvocation {
 
 /// Build the runner script content that tmux will execute.
 ///
-/// The script sets up environment, runs the agent, captures output and exit code.
-/// Delegates agent-specific command building to the `AgentRunner` trait, which
-/// translates unified `PermissionRules` into each agent's native CLI flags.
+/// NOTE: This function is deprecated in the new PTY-based flow but kept for
+/// tests and backwards compatibility. New code should use `spawn_in_tmux`
+/// which no longer writes runner scripts to disk.
 pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
     // Use per-task attempt directory for artifacts (per-repo isolation)
     let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
@@ -120,27 +120,10 @@ pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
         &permissions,
     );
 
-    // Resolve GH_TOKEN at script-generation time so agents don't need to call gh auth.
-    // Prefer existing env var, fall back to `gh auth token` (orch is not sandboxed).
-    let gh_token_line = std::env::var("GH_TOKEN")
-        .or_else(|_| std::env::var("GITHUB_TOKEN"))
-        .ok()
-        .filter(|t| !t.is_empty())
-        .or_else(|| {
-            std::process::Command::new("gh")
-                .args(["auth", "token"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-        })
-        .map(|token| format!("export GH_TOKEN=\"{token}\""))
-        .unwrap_or_else(|| {
-            tracing::warn!("gh auth token not available; agents may not have GitHub access");
-            String::new()
-        });
+    // Do not resolve or embed GH_TOKEN into on-disk scripts. Tokens should not be
+    // written to persistent files. If a calling path needs GH_TOKEN, it should
+    // inject it into the process environment (e.g., via tmux -e or PTY spawn).
+    let gh_token_line = String::new();
 
     Ok(format!(
         r#"#!/usr/bin/env bash
@@ -189,27 +172,115 @@ exit $CMD_STATUS
 ///
 /// Returns the tmux session name.
 pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow::Result<String> {
-    let script_content = build_runner_script(inv)?;
-
-    // Write runner script to per-task attempt dir
+    // Prepare attempt directory and prompt files (system + message).
     let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
-    let script_path = attempt_dir.join("runner.sh");
-    std::fs::write(&script_path, &script_content)?;
+    std::fs::create_dir_all(&attempt_dir)?;
 
-    // Make executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+    let sys_file = attempt_dir.join("prompt-sys.md");
+    let msg_file = attempt_dir.join("prompt-msg.md");
+    // Build unified permission rules and sys content like build_runner_script did
+    let mut permissions = super::agents::PermissionRules::from_config();
+    if !inv.disallowed_tools.is_empty() {
+        for tool in &inv.disallowed_tools {
+            if !permissions.disallowed_tools.contains(tool) {
+                permissions.disallowed_tools.push(tool.clone());
+            }
+        }
     }
+    permissions.allowed_edit_paths.push(inv.work_dir.clone());
 
-    let command = format!("bash {}", script_path.display());
+    let sys_content = if !permissions.allowed_tools.is_empty() {
+        let tools_list = permissions
+            .allowed_tools
+            .iter()
+            .map(|t| format!("- {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut vars = HashMap::new();
+        vars.insert("TOOLS_LIST".to_string(), tools_list);
+        let tools_prompt = render_prompt_template(ALLOWED_TOOLS_TEMPLATE, vars);
+        format!("{}\n\n{}", inv.system_prompt, tools_prompt)
+    } else {
+        inv.system_prompt.clone()
+    };
+
+    std::fs::write(&sys_file, &sys_content)?;
+    std::fs::write(&msg_file, &inv.agent_message)?;
+
+    // Build agent command using per-agent runner
+    let runner = super::agents::get_runner(&inv.agent);
+    let timeout_cmd = if inv.timeout_seconds > 0 {
+        format!("timeout {}", inv.timeout_seconds)
+    } else {
+        String::new()
+    };
+    let agent_cmd = runner.build_command(
+        inv.model.as_deref(),
+        &timeout_cmd,
+        &sys_file.to_string_lossy(),
+        &msg_file.to_string_lossy(),
+        &permissions,
+    );
+
+    // Resolve GH token without writing it to disk
+    let gh_token = std::env::var("GH_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok()
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            std::process::Command::new("gh")
+                .args(["auth", "token"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+        });
+
+    // Prepare environment map for tmux session (does not write to disk)
+    let mut env = std::collections::HashMap::new();
+    if let Some(token) = gh_token {
+        env.insert("GH_TOKEN".to_string(), token);
+    }
+    env.insert("GIT_AUTHOR_NAME".to_string(), inv.git_author_name.clone());
+    env.insert(
+        "GIT_COMMITTER_NAME".to_string(),
+        inv.git_author_name.clone(),
+    );
+    env.insert("GIT_AUTHOR_EMAIL".to_string(), inv.git_author_email.clone());
+    env.insert(
+        "GIT_COMMITTER_EMAIL".to_string(),
+        inv.git_author_email.clone(),
+    );
+    env.insert("TASK_ID".to_string(), inv.task_id.clone());
+    env.insert(
+        "OUTPUT_FILE".to_string(),
+        inv.output_file.display().to_string(),
+    );
+
+    // Build shell command that runs agent, captures stdout/stderr and exit status
+    // We avoid creating a runner.sh on disk by passing a shell -lc command to tmux.
+    let status_file = attempt_dir.join("exit.txt");
+    let stderr_file = attempt_dir.join("stderr.txt");
+    let work_dir = inv.work_dir.to_string_lossy();
+
+    let command = format!(
+        "unset CLAUDECODE; cd '{work_dir}'; RESPONSE=$({agent_cmd} 2> '{stderr}'); CMD_STATUS=$?; printf '%s' \"$RESPONSE\" > '{out}'; echo \"$CMD_STATUS\" > '{status}'; exit $CMD_STATUS",
+        agent_cmd = agent_cmd,
+        stderr = stderr_file.display(),
+        out = inv.output_file.display(),
+        status = status_file.display(),
+        work_dir = work_dir,
+    );
+
     let session = tmux
         .create_session(
             &inv.repo,
             &inv.task_id,
             &inv.work_dir.to_string_lossy(),
             &command,
+            Some(&env),
         )
         .await?;
 

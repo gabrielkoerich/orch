@@ -52,6 +52,8 @@ pub struct Transport {
     thread_to_task: Arc<RwLock<HashMap<String, String>>>,
     /// Broadcast sender for task completion notifications
     notification_tx: broadcast::Sender<TaskNotification>,
+    /// Last seen output per task (for PTY-backed sessions)
+    last_output: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl Transport {
@@ -61,6 +63,7 @@ impl Transport {
             bindings: Arc::new(RwLock::new(HashMap::new())),
             thread_to_task: Arc::new(RwLock::new(HashMap::new())),
             notification_tx,
+            last_output: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -98,8 +101,21 @@ impl Transport {
         let bindings = self.bindings.read().await;
         if let Some(binding) = bindings.get(task_id) {
             // Ignore send errors (no active receivers)
-            let _ = binding.output_tx.send(chunk);
+            let _ = binding.output_tx.send(chunk.clone());
         }
+        // Update last_output cache regardless of subscribers so capture service
+        // can read the latest PTY-managed session content.
+        if !chunk.content.is_empty() {
+            let mut last = self.last_output.write().await;
+            let entry = last.entry(task_id.to_string()).or_insert_with(String::new);
+            entry.push_str(&chunk.content);
+        }
+    }
+
+    /// Return the last seen output for a task, if any.
+    pub async fn get_session_output(&self, task_id: &str) -> Option<String> {
+        let last = self.last_output.read().await;
+        last.get(task_id).cloned()
     }
 
     /// Route an incoming message to the appropriate handler.

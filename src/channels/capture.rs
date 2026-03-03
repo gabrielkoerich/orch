@@ -127,81 +127,75 @@ impl CaptureService {
             };
 
             if let Some(buffer) = buffer {
-                match tmux::capture_pane(&buffer.session).await {
-                    Ok(current_content) => {
-                        // Diff against previous content
-                        if current_content != buffer.last_content {
-                            // Find the new content (everything after the last known content)
-                            let new_content = if buffer.last_content.is_empty() {
-                                current_content.clone()
-                            } else {
-                                // Find where the old content ends in the new content
-                                match current_content.find(&buffer.last_content) {
-                                    Some(_pos) => {
-                                        // New content is everything after the old content
-                                        // But we need to handle the case where the old content
-                                        // appears multiple times - use the last occurrence
-                                        let last_pos = current_content.rfind(&buffer.last_content);
-                                        if let Some(last) = last_pos {
-                                            let offset = last + buffer.last_content.len();
-                                            if offset < current_content.len() {
-                                                current_content[offset..].to_string()
-                                            } else {
-                                                String::new()
-                                            }
-                                        } else {
-                                            current_content.clone()
-                                        }
-                                    }
-                                    None => current_content.clone(),
-                                }
-                            };
-
-                            if !new_content.is_empty() {
+                // Prefer transport-backed PTY output if available (engine-managed PTYs)
+                let current_content = match self.transport.get_session_output(&buffer.task_id).await
+                {
+                    Some(s) => s,
+                    None => match tmux::capture_pane(&buffer.session).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            // If tmux capture failed, check if session ended
+                            if tmux::is_session_dead(&buffer.session).await {
+                                tracing::info!(
+                                    task_id,
+                                    session = buffer.session,
+                                    "session ended, sending final chunk"
+                                );
                                 let chunk = OutputChunk {
-                                    content: new_content,
-                                    is_final: false,
+                                    content: String::new(),
+                                    is_final: true,
                                 };
                                 self.transport.push_output(&task_id, chunk).await;
+                                self.unregister_session(&task_id).await;
+                            } else {
+                                tracing::trace!(
+                                    task_id,
+                                    session = buffer.session,
+                                    ?e,
+                                    "capture failed (transient)"
+                                );
                             }
+                            continue;
+                        }
+                    },
+                };
 
-                            // Update buffer
-                            let mut buffers = self.buffers.write().await;
-                            if let Some(buf) = buffers.get_mut(&task_id) {
-                                buf.last_content = current_content;
-                                buf.last_capture = Utc::now();
+                // Diff against previous content
+                if current_content != buffer.last_content {
+                    let new_content = if buffer.last_content.is_empty() {
+                        current_content.clone()
+                    } else {
+                        match current_content.find(&buffer.last_content) {
+                            Some(_pos) => {
+                                let last_pos = current_content.rfind(&buffer.last_content);
+                                if let Some(last) = last_pos {
+                                    let offset = last + buffer.last_content.len();
+                                    if offset < current_content.len() {
+                                        current_content[offset..].to_string()
+                                    } else {
+                                        String::new()
+                                    }
+                                } else {
+                                    current_content.clone()
+                                }
                             }
+                            None => current_content.clone(),
                         }
+                    };
+
+                    if !new_content.is_empty() {
+                        let chunk = OutputChunk {
+                            content: new_content,
+                            is_final: false,
+                        };
+                        self.transport.push_output(&task_id, chunk).await;
                     }
-                    Err(e) => {
-                        // Check if session is dead (no longer exists).
-                        // This is a best-effort check — `tmux has-session` is spawned
-                        // on every capture failure, including transient ones. For alive
-                        // sessions with transient failures, the overhead is minimal
-                        // (one extra subprocess per poll cycle).
-                        if tmux::is_session_dead(&buffer.session).await {
-                            tracing::info!(
-                                task_id,
-                                session = buffer.session,
-                                "session ended, sending final chunk"
-                            );
-                            // Send final chunk to signal stream termination
-                            let chunk = OutputChunk {
-                                content: String::new(),
-                                is_final: true,
-                            };
-                            self.transport.push_output(&task_id, chunk).await;
-                            // Unregister immediately — prevents re-processing on next tick
-                            self.unregister_session(&task_id).await;
-                        } else {
-                            // Session still exists but capture failed transiently
-                            tracing::trace!(
-                                task_id,
-                                session = buffer.session,
-                                ?e,
-                                "capture failed (transient)"
-                            );
-                        }
+
+                    // Update buffer
+                    let mut buffers = self.buffers.write().await;
+                    if let Some(buf) = buffers.get_mut(&task_id) {
+                        buf.last_content = current_content;
+                        buf.last_capture = Utc::now();
                     }
                 }
             }
