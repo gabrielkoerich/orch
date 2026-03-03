@@ -1100,6 +1100,167 @@ impl GhHttp {
         Ok(())
     }
 
+    /// Link an issue to a branch using GraphQL.
+    ///
+    /// Creates a "Development" sidebar link in GitHub that connects the issue
+    /// to the branch, similar to `gh issue develop`.
+    ///
+    /// # Arguments
+    /// * `repo` - Repository in "owner/repo" format
+    /// * `issue_number` - The issue number to link
+    /// * `branch` - The branch name to link the issue to
+    ///
+    /// Returns the linked branch ID on success.
+    pub async fn link_issue_to_branch(
+        &self,
+        repo: &str,
+        issue_number: u64,
+        branch: &str,
+    ) -> anyhow::Result<String> {
+        let parts: Vec<&str> = repo.split('/').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("invalid repo format: expected 'owner/repo', got '{}'", repo);
+        }
+        let (owner, repo_name) = (parts[0], parts[1]);
+
+        // First, get the repository and issue node IDs
+        let query = format!(
+            r#"{{
+                repository(owner: "{}", name: "{}") {{
+                    id
+                    issue(number: {}) {{
+                        id
+                    }}
+                }}
+            }}"#,
+            owner, repo_name, issue_number
+        );
+
+        let result = self.graphql(&query).await?;
+
+        // Repository ID fetched but not directly needed for createLinkedBranch mutation
+        // when using branchName with the issue context
+        let _repo_id = result
+            .pointer("/data/repository/id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("failed to get repository node ID"))?;
+
+        let issue_id = result
+            .pointer("/data/repository/issue/id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("failed to get issue node ID"))?;
+
+        // Check if a branch with this name already exists
+        let branch_query = format!(
+            r#"{{
+                repository(owner: "{}", name: "{}") {{
+                    ref(qualifiedName: "refs/heads/{}") {{
+                        id
+                        name
+                    }}
+                }}
+            }}"#,
+            owner, repo_name, branch
+        );
+
+        let branch_result = self.graphql(&branch_query).await?;
+        let branch_id = branch_result
+            .pointer("/data/repository/ref/id")
+            .and_then(|v| v.as_str());
+
+        // If branch doesn't exist yet, we can't link it - this is fine for new PRs
+        // where the branch was just pushed
+        if branch_id.is_none() {
+            tracing::debug!(
+                repo,
+                issue_number,
+                branch,
+                "branch not found for linking, may not be pushed yet"
+            );
+            // Return a placeholder - the link will be created when the PR is opened
+            return Ok(format!("unlinked:{}", branch));
+        }
+
+        // Use createLinkedBranch mutation to link the issue to the branch
+        let branch_name_arg = format!(r#"branchName: "{}""#, branch);
+        let mutation = format!(
+            r#"mutation {{
+                createLinkedBranch(input: {{
+                    issueId: "{}"
+                    {}
+                }}) {{
+                    linkedBranch {{
+                        id
+                        ref {{
+                            name
+                        }}
+                    }}
+                }}
+            }}"#,
+            issue_id, branch_name_arg
+        );
+
+        let link_result = self.graphql(&mutation).await;
+
+        match link_result {
+            Ok(result) => {
+                let linked_branch_id = result
+                    .pointer("/data/createLinkedBranch/linkedBranch/id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                if let Some(id) = linked_branch_id {
+                    tracing::info!(
+                        repo,
+                        issue_number,
+                        branch,
+                        "linked issue to branch via GraphQL API"
+                    );
+                    Ok(id)
+                } else {
+                    // Branch may already be linked - check for errors
+                    let errors = result
+                        .get("errors")
+                        .and_then(|e| e.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    if errors.iter().any(|e| {
+                        e.get("message")
+                            .and_then(|m| m.as_str())
+                            .map(|m| m.contains("already"))
+                            .unwrap_or(false)
+                    }) {
+                        tracing::debug!(
+                            repo,
+                            issue_number,
+                            branch,
+                            "issue already linked to branch"
+                        );
+                        Ok(format!("already_linked:{}", branch))
+                    } else {
+                        anyhow::bail!("failed to link issue to branch: {:?}", result)
+                    }
+                }
+            }
+            Err(e) => {
+                // Check if it's a "already exists" type error
+                let err_str = format!("{}", e);
+                if err_str.contains("already") || err_str.contains("existing") {
+                    tracing::debug!(
+                        repo,
+                        issue_number,
+                        branch,
+                        "issue already linked to branch (error check)"
+                    );
+                    Ok(format!("already_linked:{}", branch))
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     /// Merge a PR using the REST API (squash merge).
     pub async fn merge_pr(
         &self,

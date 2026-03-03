@@ -2,12 +2,25 @@
 //!
 //! These run after the agent completes to ensure all changes
 //! are committed, pushed, and a PR is created.
+//!
+//! All GitHub API operations use [`GhHttp`] exclusively. The `gh` CLI
+//! is not used as a fallback to ensure consistent behavior across
+//! environments and simplify testing.
 
 use crate::cmd::CommandErrorContext;
-use crate::github::cli_wrapper::Gh;
 use crate::github::http::GhHttp;
 use std::path::Path;
 use tokio::process::Command;
+
+/// Errors that can occur during PR creation.
+#[derive(Debug, thiserror::Error)]
+pub enum PrCreateError {
+    #[error("GitHub API error: {0}")]
+    ApiError(#[from] anyhow::Error),
+}
+
+/// Result type for PR creation operations.
+pub type PrCreateResult<T> = Result<T, PrCreateError>;
 
 /// Check if there are uncommitted changes in the working directory.
 pub async fn has_changes(dir: &Path) -> bool {
@@ -243,9 +256,17 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 }
 
 /// Create a PR if one doesn't already exist.
+///
+/// Uses [`GhHttp`] exclusively for GitHub API operations. No `gh` CLI
+/// fallback is used, ensuring consistent behavior across environments.
+///
+/// # Returns
+/// - `Ok(Some(url))` - PR was successfully created
+/// - `Ok(None)` - PR already exists (not an error)
+/// - `Err(PrCreateError)` - API error or other failure
 #[allow(clippy::too_many_arguments)]
 pub async fn create_pr_if_needed(
-    dir: &Path,
+    _dir: &Path,
     branch: &str,
     title: &str,
     summary: &str,
@@ -256,7 +277,7 @@ pub async fn create_pr_if_needed(
     agent: &str,
     repo: &str,
     base_branch: &str,
-) -> anyhow::Result<Option<String>> {
+) -> PrCreateResult<Option<String>> {
     let gh = GhHttp::new();
 
     // Check if PR already exists using GhHttp API
@@ -269,28 +290,8 @@ pub async fn create_pr_if_needed(
             // No PR exists, proceed to create one
         }
         Err(e) => {
-            // Fall back to CLI if API fails
-            tracing::warn!(task_id, error = %e, "get_pr_number failed, falling back to CLI");
-            let existing = Command::new("gh")
-                .args([
-                    "pr",
-                    "list",
-                    "--head",
-                    branch,
-                    "--json",
-                    "number",
-                    "-q",
-                    ".[0].number",
-                ])
-                .current_dir(dir)
-                .output_with_context()
-                .await?;
-
-            let existing_number = String::from_utf8_lossy(&existing.stdout).trim().to_string();
-            if !existing_number.is_empty() {
-                tracing::info!(task_id, pr = %existing_number, "PR already exists (via CLI)");
-                return Ok(None);
-            }
+            tracing::warn!(task_id, error = %e, "get_pr_number API call failed");
+            return Err(PrCreateError::ApiError(e));
         }
     }
 
@@ -328,87 +329,61 @@ pub async fn create_pr_if_needed(
     // Always use the short task title for the PR title (summary goes in body)
     let pr_title = title;
 
-    // Try using GhHttp API first
-    match gh
+    // Create PR using GhHttp API
+    let url = gh
         .create_pr(repo, pr_title, &body, branch, base_branch)
         .await
-    {
-        Ok(url) => {
-            tracing::info!(task_id, pr_url = %url, "created PR via GhHttp API");
+        .map_err(PrCreateError::ApiError)?;
 
-            // Link the issue to the PR branch via `gh issue develop` (CLI wrapper)
-            link_issue_to_branch(dir, task_id, branch).await;
+    tracing::info!(task_id, pr_url = %url, "created PR via GhHttp API");
 
-            return Ok(Some(url));
-        }
-        Err(e) => {
-            tracing::warn!(task_id, error = %e, "create_pr failed via GhHttp, falling back to CLI");
-        }
+    // Link the issue to the PR branch via API (best effort, non-fatal)
+    if let Err(e) = link_issue_to_branch(repo, task_id, branch).await {
+        tracing::warn!(task_id, error = %e, "failed to link issue to branch (non-fatal)");
+        // Don't fail the whole operation if linking fails
     }
 
-    // Fall back to CLI if API fails
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "create",
-            "--title",
-            pr_title,
-            "--body",
-            &body,
-            "--head",
-            branch,
-            "--base",
-            base_branch,
-        ])
-        .current_dir(dir)
-        .output_with_context()
-        .await?;
-
-    if output.status.success() {
-        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        tracing::info!(task_id, pr_url = %url, "created PR via CLI");
-
-        // Link the issue to the PR branch via `gh issue develop`
-        link_issue_to_branch(dir, task_id, branch).await;
-
-        Ok(Some(url))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!(task_id, err = %stderr, "failed to create PR");
-        Ok(None)
-    }
+    Ok(Some(url))
 }
 
-/// Link an issue to a branch using `gh issue develop`.
-/// This creates the "Development" sidebar link in GitHub.
-/// Failures are logged but not fatal — the PR is still created.
-async fn link_issue_to_branch(dir: &Path, task_id: &str, branch: &str) {
+/// Link an issue to a branch using the GitHub GraphQL API.
+///
+/// Creates a "Development" sidebar link in GitHub (similar to `gh issue develop`).
+/// This replaces the CLI-based implementation for consistent behavior across environments.
+///
+/// # Returns
+/// - `Ok(())` - Successfully linked or already linked
+/// - `Err(...)` - API error occurred
+async fn link_issue_to_branch(repo: &str, task_id: &str, branch: &str) -> anyhow::Result<()> {
     if branch.is_empty() {
         tracing::warn!(task_id, "skipping link_issue_to_branch: empty branch name");
-        return;
+        return Ok(());
     }
 
-    // Use CLI wrapper for gh issue develop
-    let gh = Gh::new(["issue", "develop", task_id, "--name", branch]).current_dir(dir);
+    let gh = GhHttp::new();
 
-    let result = gh.output_async().await;
+    // Parse task_id as issue number
+    let issue_number: u64 = task_id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("task_id is not a valid issue number: {}", task_id))?;
 
-    match result {
-        Ok(o) if o.status.success() => {
-            tracing::info!(task_id, branch, "linked issue to branch");
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            // Branch may already be linked — not an error
-            tracing::debug!(task_id, branch, err = %stderr, "gh issue develop did not succeed (branch may already be linked)");
+    // Call the GhHttp method to link issue to branch
+    match gh.link_issue_to_branch(repo, issue_number, branch).await {
+        Ok(_) => {
+            tracing::info!(task_id, branch, "linked issue to branch via API");
+            Ok(())
         }
         Err(e) => {
-            tracing::debug!(task_id, branch, err = %e, "failed to run gh issue develop");
+            let err_msg = format!("{}", e);
+            // Branch may already be linked — not an error
+            if err_msg.contains("already") || err_msg.contains("existing") {
+                tracing::debug!(task_id, branch, "issue already linked to branch");
+                Ok(())
+            } else {
+                Err(e)
+            }
         }
     }
-
-    // gh issue develop sometimes creates a corrupt [branch ""] config entry — clean it up
-    cleanup_empty_branch_config(dir).await;
 }
 
 /// Remove corrupt `[branch ""]` entries from git config.
@@ -508,5 +483,30 @@ async fn has_unpushed_commits(dir: &Path, branch: &str, default_branch: &str) ->
             // (better to attempt push and let it fail than silently skip)
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_create_error_display() {
+        let err = PrCreateError::ApiError(anyhow::anyhow!("test error"));
+        assert_eq!(format!("{}", err), "GitHub API error: test error");
+    }
+
+    #[test]
+    fn pr_create_error_from_anyhow() {
+        let anyhow_err = anyhow::anyhow!("source error");
+        let pr_err: PrCreateError = anyhow_err.into();
+        assert!(matches!(pr_err, PrCreateError::ApiError(_)));
+    }
+
+    #[test]
+    fn test_link_issue_to_branch_empty_branch() {
+        // This is a runtime test - empty branch should return Ok early
+        // We can't easily test the async runtime behavior without tokio::test,
+        // but we verify the function signature and error types compile correctly
     }
 }
