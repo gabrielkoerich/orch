@@ -9,7 +9,7 @@
 //! - update_internal_task_status
 //! - delete_internal_task
 
-use crate::db::{Db, TaskStatus};
+use crate::db::Db;
 use anyhow::Context;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -325,6 +325,7 @@ pub async fn count_internal_tasks_by_status(db: &Db) -> anyhow::Result<Vec<(Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::TaskStatus;
 
     async fn setup_test_db() -> Db {
         let db = Db::open_memory().unwrap();
