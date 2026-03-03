@@ -11,6 +11,7 @@
 
 pub mod capture;
 pub mod discord;
+pub mod discord_ws;
 pub mod github;
 pub mod notification;
 pub mod slack;
