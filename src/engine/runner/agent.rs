@@ -55,119 +55,6 @@ pub struct AgentInvocation {
     pub attempt: u32,
 }
 
-/// Build the runner script content that tmux will execute.
-///
-/// NOTE: This function is deprecated in the new PTY-based flow but kept for
-/// tests and backwards compatibility. New code should use `spawn_in_tmux`
-/// which no longer writes runner scripts to disk.
-pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
-    // Use per-task attempt directory for artifacts (per-repo isolation)
-    let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
-
-    let sys_file = attempt_dir.join("prompt-sys.md");
-    let msg_file = attempt_dir.join("prompt-msg.md");
-    let status_file = attempt_dir.join("exit.txt");
-
-    std::fs::create_dir_all(&attempt_dir)?;
-
-    let timeout_cmd = if inv.timeout_seconds > 0 {
-        format!("timeout {}", inv.timeout_seconds)
-    } else {
-        String::new()
-    };
-
-    // Build unified permission rules from config + invocation
-    let mut permissions = super::agents::PermissionRules::from_config();
-
-    // Merge invocation-specific disallowed tools into the unified rules
-    if !inv.disallowed_tools.is_empty() {
-        for tool in &inv.disallowed_tools {
-            if !permissions.disallowed_tools.contains(tool) {
-                permissions.disallowed_tools.push(tool.clone());
-            }
-        }
-    }
-
-    // Restrict edits to the working directory (worktree)
-    permissions.allowed_edit_paths.push(inv.work_dir.clone());
-
-    // Write prompt files with allowed tools appended to system prompt
-    let sys_content = if !permissions.allowed_tools.is_empty() {
-        let tools_list = permissions
-            .allowed_tools
-            .iter()
-            .map(|t| format!("- {t}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut vars = HashMap::new();
-        vars.insert("TOOLS_LIST".to_string(), tools_list);
-        let tools_prompt = render_prompt_template(ALLOWED_TOOLS_TEMPLATE, vars);
-        format!("{}\n\n{}", inv.system_prompt, tools_prompt)
-    } else {
-        inv.system_prompt.clone()
-    };
-
-    std::fs::write(&sys_file, &sys_content)?;
-    std::fs::write(&msg_file, &inv.agent_message)?;
-
-    // Get the per-agent runner and delegate command building
-    let runner = super::agents::get_runner(&inv.agent);
-    let agent_cmd = runner.build_command(
-        inv.model.as_deref(),
-        &timeout_cmd,
-        &sys_file.to_string_lossy(),
-        &msg_file.to_string_lossy(),
-        &permissions,
-    );
-
-    // Do not resolve or embed GH_TOKEN into on-disk scripts. Tokens should not be
-    // written to persistent files. If a calling path needs GH_TOKEN, it should
-    // inject it into the process environment (e.g., via tmux -e or PTY spawn).
-    let gh_token_line = String::new();
-
-    Ok(format!(
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-
-# Environment
-[ -f "$HOME/.path" ] && source "$HOME/.path"
-[ -f "$HOME/.private" ] && source "$HOME/.private"
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-{gh_token_line}
-export GIT_AUTHOR_NAME="{git_name}"
-export GIT_COMMITTER_NAME="{git_name}"
-export GIT_AUTHOR_EMAIL="{git_email}"
-export GIT_COMMITTER_EMAIL="{git_email}"
-export TASK_ID="{task_id}"
-export OUTPUT_FILE="{output_file}"
-unset CLAUDECODE  # allow nested claude invocations from orchestrator
-
-cd "{work_dir}"
-
-# Run agent
-RESPONSE=$({agent_cmd} 2>"{attempt_dir}/stderr.txt") || CMD_STATUS=$?
-CMD_STATUS=${{CMD_STATUS:-0}}
-
-# Save response
-printf '%s' "$RESPONSE" > "{output_file}"
-
-# Save exit status
-echo "$CMD_STATUS" > "{status_file}"
-
-exit $CMD_STATUS
-"#,
-        gh_token_line = gh_token_line,
-        git_name = inv.git_author_name,
-        git_email = inv.git_author_email,
-        task_id = inv.task_id,
-        output_file = inv.output_file.display(),
-        work_dir = inv.work_dir.display(),
-        agent_cmd = agent_cmd,
-        attempt_dir = attempt_dir.display(),
-        status_file = status_file.display(),
-    ))
-}
-
 /// Spawn the agent in a tmux session.
 ///
 /// Returns the tmux session name.
@@ -178,7 +65,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
 
     let sys_file = attempt_dir.join("prompt-sys.md");
     let msg_file = attempt_dir.join("prompt-msg.md");
-    // Build unified permission rules and sys content like build_runner_script did
+    // Build unified permission rules and sys content
     let mut permissions = super::agents::PermissionRules::from_config();
     if !inv.disallowed_tools.is_empty() {
         for tool in &inv.disallowed_tools {
