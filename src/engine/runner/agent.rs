@@ -116,11 +116,10 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         tracing::warn!("gh auth token not available; agents may not have GitHub access");
     }
 
-    // Prepare environment map for tmux session (does not write to disk)
+    // Prepare non-secret environment map for tmux session.
+    // GH_TOKEN is injected via set_session_env after session creation to avoid
+    // exposing it in process arguments or on-disk artifacts.
     let mut env = std::collections::HashMap::new();
-    if let Some(token) = gh_token {
-        env.insert("GH_TOKEN".to_string(), token);
-    }
     env.insert("GIT_AUTHOR_NAME".to_string(), inv.git_author_name.clone());
     env.insert(
         "GIT_COMMITTER_NAME".to_string(),
@@ -161,6 +160,14 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
             Some(&env),
         )
         .await?;
+
+    // Inject GH_TOKEN via tmux set-environment after session creation.
+    // This avoids exposing the token in process arguments or on-disk files.
+    if let Some(ref token) = gh_token {
+        if let Err(e) = tmux.set_session_env(&session, "GH_TOKEN", token).await {
+            tracing::warn!(task_id = inv.task_id, error = %e, "failed to set GH_TOKEN in tmux session");
+        }
+    }
 
     tracing::info!(
         task_id = inv.task_id,
