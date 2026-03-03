@@ -536,15 +536,22 @@ pub(crate) async fn review_and_merge(
                 }
             } else {
                 // No PR and no commits. Distinguish two cases:
-                // 1. Agent genuinely completed a read-only task (no last_error) → mark done.
-                // 2. Agent failed before doing any work (last_error set) → re-route.
-                let last_error = sidecar::get(&task.id.0, "last_error").unwrap_or_default();
-                if !last_error.is_empty() {
+                // 1. Agent failed before doing any work (sidecar status=needs_review) → re-route.
+                //    The error may be in `summary` or `last_error`; status is the reliable signal.
+                // 2. Agent genuinely completed a read-only task (sidecar status=done/in_review) → mark done.
+                let sidecar_status = sidecar::get(&task.id.0, "status").unwrap_or_default();
+                if sidecar_status == "needs_review" {
+                    let reason = if !agent_summary.is_empty() {
+                        agent_summary.clone()
+                    } else {
+                        sidecar::get(&task.id.0, "last_error").unwrap_or_default()
+                    };
                     tracing::warn!(
                         task_id = task.id.0,
                         branch = %branch_name,
-                        error = %last_error,
-                        "no PR and no commits but agent reported error — re-routing for retry"
+                        sidecar_status,
+                        reason = %reason,
+                        "no PR and no commits but agent status=needs_review — re-routing for retry"
                     );
                     let _ = backend
                         .update_status(&task.id, crate::backends::Status::New)
