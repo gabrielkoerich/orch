@@ -69,6 +69,7 @@ impl Gh {
     }
 
     /// Set a timeout for the command.
+    #[allow(dead_code)]
     pub fn timeout(mut self, duration: Duration) -> Self {
         self.timeout = duration;
         self
@@ -274,6 +275,7 @@ pub fn is_available() -> bool {
 /// 1. `GH_TOKEN` environment variable
 /// 2. `GITHUB_TOKEN` environment variable
 /// 3. `gh auth token` CLI command
+#[allow(dead_code)]
 pub fn resolve_token() -> Option<String> {
     // Priority 1: GH_TOKEN env var
     if let Ok(t) = std::env::var("GH_TOKEN") {
