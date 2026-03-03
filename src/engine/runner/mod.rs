@@ -502,9 +502,11 @@ impl TaskRunner {
             raw_comment.push_str(&format!("\n\n> **Budget warning**: {budget_warning}"));
         }
 
-        // Append agent/model attribution footer
-        let model_str = model.map(|m| format!(" / {m}")).unwrap_or_default();
-        raw_comment.push_str(&format!("\n\n<!-- agent: {agent_name}{model_str} -->"));
+        // Append visible attribution footer (matches PR body style)
+        let model_str = model.map(|m| format!(" using {m}")).unwrap_or_default();
+        raw_comment.push_str(&format!(
+            "\n\n---\n*Created by {agent_name}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
+        ));
 
         // Scan for leaked secrets and redact if needed
         let comment = if security::has_leaks(&raw_comment) {
