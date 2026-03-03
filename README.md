@@ -100,11 +100,14 @@ The orchestrator automatically generates JWTs and refreshes installation tokens 
 
 ### gh CLI (Legacy)
 
+The project prefers native HTTP auth using `GH_TOKEN`/`GITHUB_TOKEN` or GitHub App credentials. The `gh` CLI is supported as a legacy interactive option but not required by the Homebrew formula.
+
 ```bash
+# Optional, legacy interactive flow
 gh auth login  # Run interactively
 ```
 
-See [Configuration](#configuration) for more auth options.
+See [Configuration](#configuration) for details and run `orch auth check` to verify your setup.
 
 ### Security: Service Deployments (Homebrew / launchd)
 

@@ -91,7 +91,7 @@ gh:
     mode: gh_cli
 ```
 
-Requires `gh auth login` to be run interactively. Not recommended for service environments.
+Requires `gh auth login` to be run interactively. Not recommended for service environments — prefer `GH_TOKEN`/`GITHUB_TOKEN` or GitHub App credentials and run `orch auth check`.
 
 ## Per-Project Config
 
