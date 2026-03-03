@@ -600,7 +600,11 @@ pub(crate) async fn review_and_merge(
     let task_agent = sidecar::get(&task.id.0, "agent").unwrap_or_default();
     let review_agent = {
         let r = router.read().await;
-        let exclude = if task_agent.is_empty() { None } else { Some(task_agent.as_str()) };
+        let exclude = if task_agent.is_empty() {
+            None
+        } else {
+            Some(task_agent.as_str())
+        };
         r.next_round_robin_agent(exclude)
             .unwrap_or_else(|| "claude".to_string())
     };
