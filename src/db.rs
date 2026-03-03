@@ -335,11 +335,11 @@ impl Db {
         Ok(result)
     }
 
-    /// Insert a new task metric record. Prunes records older than 30 days on each insert.
+    /// Insert a new task metric record.
     pub async fn insert_task_metric(&self, metric: InsertTaskMetric<'_>) -> anyhow::Result<i64> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "DELETE FROM task_metrics WHERE completed_at < datetime('now', '-30 days')",
+            "DELETE FROM task_metrics WHERE completed_at < datetime('now', '-90 days')",
             [],
         )?;
         conn.execute(
