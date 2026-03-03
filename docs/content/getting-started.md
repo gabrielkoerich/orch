@@ -22,7 +22,7 @@ brew install --cask codex         # Codex (if available)
 brew install opencode             # OpenCode
 ```
 
-Optional: `gh` for GitHub sync, `bats` for tests.
+Optional: `gh` for GitHub sync (legacy interactive flows), `bats` for tests.
 
 ## Quick Start
 
@@ -90,13 +90,14 @@ The orchestrator automatically exchanges the App credentials for installation to
 
 ### Option 3: gh CLI (Legacy)
 
-If you prefer using the GitHub CLI's authentication:
+The `gh` CLI may be used as an interactive, legacy fallback. The project prefers using `GH_TOKEN`/`GITHUB_TOKEN` or GitHub App credentials for services.
 
 ```bash
+# Optional interactive flow
 gh auth login
 ```
 
-Then enable fallback in config:
+Enable fallback in config if you want `gh` to be used:
 
 ```yaml
 gh:
@@ -107,7 +108,7 @@ gh:
     # allow_gh_fallback: true
 ```
 
-**Note:** The `gh CLI` method is not recommended for service environments (launchd/systemd) as it requires an interactive login session.
+**Note:** The `gh` CLI method is not recommended for service environments (launchd/systemd) as it requires an interactive login session.
 
 ### Security: Service Deployments (Homebrew / launchd)
 

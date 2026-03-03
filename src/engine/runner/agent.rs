@@ -109,13 +109,29 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         &permissions,
     );
 
+    // Resolve GH_TOKEN at script-generation time so agents don't need to call gh auth.
+    // Prefer the native auth resolver (GhHttp / auth::create_resolver) but keep
+    // the CLI wrapper's resolve_token() as a non-fatal fallback for environments
+    // that still rely on interactive `gh` sessions.
+    let gh_token = if let Ok(resolver) = crate::github::auth::create_resolver() {
+        // Try primary resolver without falling back to gh CLI
+        match resolver.resolve_token() {
+            Ok(t) if !t.is_empty() => Some(t),
+            _ => crate::github::cli_wrapper::resolve_token(),
+        }
+    } else {
+        crate::github::cli_wrapper::resolve_token()
+    };
+    if gh_token.is_none() {
+        tracing::warn!("gh auth token not available; agents may not have GitHub access");
+    }
+
     // Resolve the GitHub token and prepare environment variables to inject
     // into the tmux session. Do NOT write the token to disk or embed it in
     // the runner script.
-    let gh_token = crate::github::http::resolve_token();
     let mut env_map = std::collections::HashMap::new();
-    if !gh_token.is_empty() {
-        env_map.insert("GH_TOKEN".to_string(), gh_token);
+    if let Some(token) = gh_token {
+        env_map.insert("GH_TOKEN".to_string(), token);
     }
     env_map.insert("GIT_AUTHOR_NAME".to_string(), inv.git_author_name.clone());
     env_map.insert(

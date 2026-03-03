@@ -8,7 +8,17 @@ Tasks are stored in GitHub Issues (when `gh.enabled: true`) and mirrored to a lo
 
 ## Setup
 
-1. Install and authenticate:
+1. Install and authenticate (preferred methods shown):
+
+```bash
+# Recommended: set a Personal Access Token (non-interactive)
+export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+
+# Or: configure GitHub App credentials in ~/.orch/config.yml
+```
+
+Optional legacy interactive flow:
+
 ```bash
 gh auth login
 ```
