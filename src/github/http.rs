@@ -221,7 +221,9 @@ impl GhHttp {
     /// Create a new client with a custom token resolver.
     #[allow(dead_code)]
     pub fn with_resolver(resolver: &dyn auth::TokenResolver) -> anyhow::Result<Self> {
-        let token = resolver.resolve_token()?;
+        let token = tokio::runtime::Handle::try_current()
+            .map_err(|e| anyhow::anyhow!("no tokio runtime: {}", e))?
+            .block_on(resolver.resolve_token())?;
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
@@ -717,7 +719,7 @@ impl GhHttp {
         resolver.health_check()?;
 
         // Then verify the token actually works by making an API call
-        let token = resolver.resolve_token()?;
+        let token = resolver.resolve_token().await?;
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .timeout(Duration::from_secs(30))

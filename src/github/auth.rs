@@ -90,19 +90,17 @@ impl AsyncResolverAdapter {
 #[async_trait]
 impl AsyncTokenResolver for AsyncResolverAdapter {
     async fn resolve_token(&self) -> anyhow::Result<String> {
-        let inner = self.inner.clone();
-        let res = tokio::task::spawn_blocking(move || inner.resolve_token())
-            .await
-            .context("token resolution task panicked")?;
-        res
+        // The inner TokenResolver is async, so we can just call it directly.
+        // spawn_blocking is not needed here since resolve_token() returns a Future.
+        self.inner.resolve_token().await
     }
 
     async fn health_check(&self) -> anyhow::Result<()> {
+        // health_check is synchronous, so we use spawn_blocking to avoid blocking.
         let inner = self.inner.clone();
-        let res = tokio::task::spawn_blocking(move || inner.health_check())
+        tokio::task::spawn_blocking(move || inner.health_check())
             .await
-            .context("health check task panicked")?;
-        res
+            .context("health check task panicked")?
     }
 
     fn auth_method(&self) -> &'static str {
