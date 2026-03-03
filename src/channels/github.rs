@@ -28,6 +28,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Deduplication window: 2 hours (GitHub retries within ~1 hour).
 const DEDUP_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
+/// Cap the deduplication map to avoid unbounded memory growth.
+const MAX_SEEN_DELIVERIES: usize = 50_000;
 
 #[derive(Clone)]
 struct WebhookState {
@@ -199,6 +201,21 @@ fn parse_github_event(
     None
 }
 
+fn prune_seen_deliveries(seen: &mut HashMap<String, Instant>, now: Instant) {
+    let cutoff = now.checked_sub(DEDUP_WINDOW).unwrap_or(now);
+    seen.retain(|_, t| *t > cutoff);
+
+    if seen.len() > MAX_SEEN_DELIVERIES {
+        let mut entries: Vec<(String, Instant)> =
+            seen.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_by_key(|(_, t)| *t);
+        let overflow = entries.len().saturating_sub(MAX_SEEN_DELIVERIES);
+        for (key, _) in entries.into_iter().take(overflow) {
+            seen.remove(&key);
+        }
+    }
+}
+
 async fn handle_webhook(
     State(state): State<WebhookState>,
     headers: axum::http::HeaderMap,
@@ -224,17 +241,15 @@ async fn handle_webhook(
 
     if !delivery_id.is_empty() {
         let mut seen = state.seen_deliveries.lock().await;
-        // Evict entries older than the dedup window before checking.
-        let cutoff = Instant::now()
-            .checked_sub(DEDUP_WINDOW)
-            .unwrap_or(Instant::now());
-        seen.retain(|_, t| *t > cutoff);
+        let now = Instant::now();
+        // Evict entries older than the dedup window and cap size before checking.
+        prune_seen_deliveries(&mut seen, now);
 
         if seen.contains_key(&delivery_id) {
             tracing::debug!(delivery_id = %delivery_id, "duplicate webhook delivery, skipping");
             return (StatusCode::OK, "OK");
         }
-        seen.insert(delivery_id, Instant::now());
+        seen.insert(delivery_id, now);
     }
 
     let payload: WebhookPayload = match serde_json::from_slice(&body) {
@@ -615,6 +630,27 @@ mod tests {
         assert!(
             verify_signature(secret, payload, &signature),
             "correct signature should verify"
+        );
+    }
+
+    #[test]
+    fn test_prune_seen_deliveries_caps_size() {
+        let mut seen = HashMap::new();
+        let now = Instant::now();
+
+        for i in 0..(MAX_SEEN_DELIVERIES + 10) {
+            let key = format!("id-{}", i);
+            let offset = Duration::from_millis(i as u64);
+            seen.insert(key, now - offset);
+        }
+
+        prune_seen_deliveries(&mut seen, now);
+
+        assert_eq!(seen.len(), MAX_SEEN_DELIVERIES);
+        assert!(seen.contains_key("id-0"), "newest entry should remain");
+        assert!(
+            !seen.contains_key(&format!("id-{}", MAX_SEEN_DELIVERIES + 9)),
+            "oldest entries should be evicted"
         );
     }
 
