@@ -373,21 +373,21 @@ In v1, the tmux bridge changes this completely:
 
 ## What Stays in Bash
 
-> **Update (v1):** Almost everything originally planned to stay in bash has been ported to Rust.
-> The only remaining bash dependency is the shell scripts generated at runtime for tmux sessions
-> (agents need a real terminal environment).
+> **Update (v1.1):** Almost everything originally planned to stay in bash has been ported to Rust.
+> Agent invocation now prefers a PTY-based runner (no on-disk runner scripts). A legacy tmux
+> command runner remains as a fallback behind a config flag.
 
 | Component | Status | Notes |
 |-----------|--------|-------|
 | ~~`run_task.sh`~~ | **Ported to Rust** | `src/engine/runner/` — context, worktree, agent, response, git_ops |
 | ~~Git operations~~ | **Ported to Rust** | `src/engine/runner/git_ops.rs` — auto-commit, push, PR creation via `tokio::process::Command` |
 | ~~`gh pr create/merge`~~ | **Ported to Rust** | `git_ops::create_pr_if_needed()` via `gh` CLI subprocess |
-| Agent invocation | **Hybrid** | Rust builds the command, generates a runner script, tmux executes it |
+| Agent invocation | **PTY-first** | Rust spawns agent CLIs under a PTY and streams into tmux; legacy tmux command runner behind config |
 | ~~`justfile`~~ | **Deleted** | All recipes ported to native `orch` CLI subcommands |
 | Prompt templates | **Unchanged** | Markdown files in `prompts/`, rendered by Rust `template.rs` |
 | Config | **Consolidated** | Per-project `.orch.yml` + `~/.orch/config.yml` global (see [Config Architecture](#config-architecture)) |
 
-**Principle:** Rust owns the entire lifecycle. The only bash left is the thin runner scripts that tmux executes (agents need a real TTY). All orchestration logic, git operations, and API calls are native Rust.
+**Principle:** Rust owns the entire lifecycle. PTY-based agent spawning preserves TTY semantics without runner scripts; the legacy tmux command runner remains as a fallback only. All orchestration logic, git operations, and API calls are native Rust.
 
 ---
 
@@ -404,7 +404,7 @@ In v1, the tmux bridge changes this completely:
 | GitHub API calls | `gh` CLI + `jq` parsing | Native reqwest HTTP + `serde` | **Done** |
 | Task execution | `run_task.sh` (bash) | `src/engine/runner/` (Rust) | **Done** |
 | Git operations | bash `git` + `gh pr` | `runner/git_ops.rs` | **Done** |
-| Agent invocation | bash script | `runner/agent.rs` | **Done** |
+| Agent invocation | bash script | `runner/agent.rs` (PTY runner + tmux fallback) | **Done** |
 | Mention detection | `gh_mentions.sh` (polling) | Rust polling (webhook future) | **Done** (polling) |
 | PR review trigger | `review_prs.sh` (polling) | Rust polling (webhook future) | **Done** (polling) |
 | Sidecar I/O | `jq` read/write | Direct file I/O | **Done** |
@@ -1294,13 +1294,14 @@ New layout (per-repo, per-task, per-attempt):
     1/
       prompt-sys.md
       prompt-msg.md
-      runner.sh
       exit.txt
       stderr.txt
       output.json
     2/  (retry)
       ...
 ```
+
+PTY runner removes `runner.sh` from the attempt folder; legacy tmux command mode still uses an in-memory shell command but does not write scripts to disk.
 
 Benefits: per-repo isolation (no issue number collisions), per-attempt separation (retries don't overwrite), easy cleanup. Legacy flat paths still work as fallback for reads.
 
@@ -1311,6 +1312,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | Crate | Purpose | Status |
 |-------|---------|--------|
 | `tokio` | Async runtime | In use |
+| `portable-pty` | PTY spawning for agent runner | In use |
 | `serde` / `serde_json` / `serde_yml` | Serialization | In use |
 | `clap` / `clap_complete` | CLI parsing + shell completions | In use |
 | `chrono` | Timestamps | In use |
