@@ -72,11 +72,16 @@ pub trait AsyncTokenResolver: Send + Sync {
 /// Adapter that wraps a synchronous `TokenResolver` and exposes an async API
 /// by delegating calls to `tokio::task::spawn_blocking` to avoid blocking
 /// the async runtime.
+///
+/// This type is part of the async token resolver infrastructure (see issue #391).
+/// It will be wired into GhHttp startup once the migration is complete.
+#[allow(dead_code)]
 pub struct AsyncResolverAdapter {
     inner: Arc<dyn TokenResolver>,
 }
 
 impl AsyncResolverAdapter {
+    #[allow(dead_code)]
     pub fn new(inner: Arc<dyn TokenResolver>) -> Self {
         Self { inner }
     }
@@ -671,6 +676,9 @@ pub fn create_resolver() -> anyhow::Result<Box<dyn TokenResolver>> {
 /// Create an async resolver by adapting the synchronous resolver via
 /// `AsyncResolverAdapter`. This is useful for callers that need to await
 /// token refresh (e.g., GhHttp async flows).
+///
+/// Will be called from GhHttp startup as part of issue #391 migration.
+#[allow(dead_code)]
 pub fn create_async_resolver() -> anyhow::Result<std::sync::Arc<dyn AsyncTokenResolver>> {
     let sync = create_resolver()?;
     Ok(std::sync::Arc::new(AsyncResolverAdapter::new(
