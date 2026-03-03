@@ -130,6 +130,7 @@ pub async fn handle_success(
         if !push_ok {
             tracing::warn!(task_id, "skipping PR creation due to push failure");
         } else {
+            let repo = crate::config::get_current_repo().unwrap_or_default();
             match git_ops::create_pr_if_needed(
                 &wt.work_dir,
                 &wt.branch,
@@ -140,6 +141,8 @@ pub async fn handle_success(
                 &resp.files,
                 task_id,
                 agent_name,
+                &repo,
+                &wt.default_branch,
             )
             .await
             {

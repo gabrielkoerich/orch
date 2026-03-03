@@ -14,6 +14,7 @@ use super::types::{
 };
 use anyhow::Context;
 use reqwest::{header, Client, Response, StatusCode};
+use serde::Serialize;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
@@ -950,6 +951,71 @@ impl GhHttp {
             .and_then(|n| n.as_u64())
             .ok_or_else(|| anyhow::anyhow!("PR missing number field"))
             .map(Some)
+    }
+
+    /// Create a new pull request.
+    ///
+    /// # Arguments
+    /// * `repo` - Repository in "owner/repo" format
+    /// * `title` - PR title
+    /// * `body` - PR body/description
+    /// * `head` - Branch name to create PR from
+    /// * `base` - Base branch to merge into (e.g., "main")
+    ///
+    /// Returns the created PR's URL on success.
+    pub async fn create_pr(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> anyhow::Result<String> {
+        use reqwest::header;
+
+        Self::proactive_throttle_rest().await;
+        Self::check_backoff()?;
+        let url = format!("{GITHUB_API}/repos/{repo}/pulls");
+
+        #[derive(Serialize)]
+        struct CreatePullRequest<'a> {
+            title: &'a str,
+            body: &'a str,
+            head: &'a str,
+            base: &'a str,
+        }
+
+        let payload = CreatePullRequest {
+            title,
+            body,
+            head,
+            base,
+        };
+
+        let response = self
+            .client
+            .post(&url)
+            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::ACCEPT, "application/vnd.github+json")
+            .header(header::USER_AGENT, "orchestrator")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&payload)
+            .send()
+            .await?;
+
+        Self::record_response(&response);
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            Self::maybe_record_rate_limit_from_body(status, &text);
+            anyhow::bail!("GitHub API POST {url} failed ({status}): {text}");
+        }
+
+        let pr: serde_json::Value = serde_json::from_str(&text)?;
+        pr.get("html_url")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("failed to get PR URL from response: {:?}", pr))
     }
 
     /// Get PR details by PR number.

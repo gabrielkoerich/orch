@@ -109,21 +109,12 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         &permissions,
     );
 
-    // Resolve GH token without writing it to disk
-    let gh_token = std::env::var("GH_TOKEN")
-        .or_else(|_| std::env::var("GITHUB_TOKEN"))
-        .ok()
-        .filter(|t| !t.is_empty())
-        .or_else(|| {
-            std::process::Command::new("gh")
-                .args(["auth", "token"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-        });
+    // Resolve GH_TOKEN at script-generation time so agents don't need to call gh auth.
+    // Use the CLI wrapper for consistent token resolution with launchd fallback paths.
+    let gh_token = crate::github::cli_wrapper::resolve_token();
+    if gh_token.is_none() {
+        tracing::warn!("gh auth token not available; agents may not have GitHub access");
+    }
 
     // Prepare environment map for tmux session (does not write to disk)
     let mut env = std::collections::HashMap::new();
