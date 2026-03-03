@@ -264,21 +264,35 @@ impl TaskRunner {
         let duration_seconds = (completed_at - *started_at).num_milliseconds() as f64 / 1000.0;
 
         let final_status = sidecar::get(task_id, "status").unwrap_or_default();
-        let outcome = match final_status.as_str() {
-            "done" | "in_progress" | "in_review" => "success",
-            "needs_review" => {
-                let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
-                if last_error.contains("timeout") {
-                    "timeout"
-                } else if last_error.contains("rate limit") || last_error.contains("usage") {
-                    "rate_limit"
-                } else if last_error.contains("auth") || last_error.contains("billing") {
-                    "auth_error"
-                } else {
-                    "failed"
+        // Prefer the explicitly stored error_type set during error handling.
+        // Fall back to parsing last_error strings for backward compat with
+        // older sidecar entries that predate explicit error_type storage.
+        let explicit_error_type = sidecar::get(task_id, "error_type").unwrap_or_default();
+        let classify_error = |stored: &str, last_error: &str| -> &'static str {
+            match stored {
+                "timeout" => "timeout",
+                "rate_limit" => "rate_limit",
+                "auth_error" => "auth_error",
+                _ if !stored.is_empty() => "failed",
+                _ => {
+                    if last_error.contains("timeout") {
+                        "timeout"
+                    } else if last_error.contains("rate limit") || last_error.contains("usage") {
+                        "rate_limit"
+                    } else if last_error.contains("auth") || last_error.contains("billing") {
+                        "auth_error"
+                    } else {
+                        "failed"
+                    }
                 }
             }
-            "new" => "rerouted",
+        };
+        let outcome = match final_status.as_str() {
+            "done" | "in_progress" | "in_review" => "success",
+            "needs_review" | "new" => {
+                let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
+                classify_error(&explicit_error_type, &last_error)
+            }
             _ => "unknown",
         };
 
@@ -290,7 +304,13 @@ impl TaskRunner {
         .unwrap_or(0);
 
         if let Some(ref db) = self.db {
-            let error_type: Option<String> = sidecar::get(task_id, "last_error").ok();
+            // Use the explicit classified error type stored during error handling.
+            // Only set for failed/rerouted outcomes; None for successful tasks.
+            let error_type: Option<String> = if outcome == "success" {
+                None
+            } else {
+                Some(outcome.to_string())
+            };
 
             // Read cost data from sidecar
             let usage = sidecar::get_token_usage(task_id);

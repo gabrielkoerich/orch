@@ -312,6 +312,19 @@ pub enum RetryableError {
     MissingTooling,
 }
 
+impl RetryableError {
+    /// Return a short classified string for this error type, stored in sidecar
+    /// and used for DB metrics rather than parsing `last_error` strings.
+    pub fn type_str(self) -> &'static str {
+        match self {
+            RetryableError::Timeout => "timeout",
+            RetryableError::UsageLimit => "rate_limit",
+            RetryableError::AuthError => "auth_error",
+            RetryableError::Failed | RetryableError::MissingTooling => "failed",
+        }
+    }
+}
+
 /// Handle failover for any retryable error type.
 /// Returns true if the task was rerouted, false if it should be marked needs_review.
 ///
@@ -353,6 +366,7 @@ pub fn handle_failover(
             &[
                 "status=needs_review".to_string(),
                 format!("last_error={error_message} (all agents exhausted)"),
+                format!("error_type={}", error_type.type_str()),
             ],
         ) {
             tracing::error!(task_id, ?e, "failed to update task status during failover");
@@ -383,6 +397,7 @@ pub fn handle_failover(
                 "model=".to_string(),
                 "status=new".to_string(),
                 format!("last_error={error_message}, rerouted to {next}"),
+                format!("error_type={}", error_type.type_str()),
             ],
         ) {
             tracing::error!(task_id, ?e, "failed to update task status during failover");
@@ -397,6 +412,7 @@ pub fn handle_failover(
         &[
             "status=needs_review".to_string(),
             format!("last_error={error_message}, no fallback agents"),
+            format!("error_type={}", error_type.type_str()),
         ],
     ) {
         tracing::error!(task_id, ?e, "failed to update task status during failover");
@@ -606,6 +622,15 @@ pub fn store_failure_memory(
 mod tests {
     use super::*;
     use crate::engine::runner::agents::{patterns, AgentError};
+
+    #[test]
+    fn retryable_type_str_returns_correct_labels() {
+        assert_eq!(RetryableError::Timeout.type_str(), "timeout");
+        assert_eq!(RetryableError::UsageLimit.type_str(), "rate_limit");
+        assert_eq!(RetryableError::AuthError.type_str(), "auth_error");
+        assert_eq!(RetryableError::Failed.type_str(), "failed");
+        assert_eq!(RetryableError::MissingTooling.type_str(), "failed");
+    }
 
     #[test]
     fn is_usage_limit_detects_rate_limit() {

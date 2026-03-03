@@ -77,6 +77,7 @@ pub async fn handle_error(
                         format!("model={next}"),
                         "status=new".to_string(),
                         format!("last_error=model {model} unavailable, trying {next}"),
+                        "error_type=failed".to_string(),
                     ],
                 )?;
                 // Skip normal failover — we're retrying same agent with different model
@@ -101,6 +102,7 @@ pub async fn handle_error(
                 &[
                     "status=needs_review".to_string(),
                     format!("last_error=waiting for input: {message}"),
+                    "error_type=failed".to_string(),
                 ],
             )?;
             return Ok(ErrorHandleResult::EarlyReturn);
@@ -178,6 +180,7 @@ pub async fn handle_error(
                         "status=new".to_string(),
                         format!("model_reroute_chain={new_tried}"),
                         format!("last_error=all agents exhausted, trying free model {free_model}"),
+                        format!("error_type={}", retryable.type_str()),
                     ],
                 )?;
                 return Ok(ErrorHandleResult::EarlyReturn);
