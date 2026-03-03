@@ -335,9 +335,13 @@ impl Db {
         Ok(result)
     }
 
-    /// Insert a new task metric record.
+    /// Insert a new task metric record. Prunes records older than 30 days on each insert.
     pub async fn insert_task_metric(&self, metric: InsertTaskMetric<'_>) -> anyhow::Result<i64> {
         let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM task_metrics WHERE completed_at < datetime('now', '-30 days')",
+            [],
+        )?;
         conn.execute(
             "INSERT INTO task_metrics (task_id, agent, model, complexity, outcome, duration_seconds, started_at, completed_at, attempts, files_changed, error_type, input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
