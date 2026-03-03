@@ -553,6 +553,12 @@ pub(crate) async fn review_and_merge(
                         reason = %reason,
                         "no PR and no commits but agent status=needs_review — re-routing for retry"
                     );
+                    // Clear sidecar status so the runner guard (which skips needs_review)
+                    // does not block the re-dispatched task.
+                    let _ = sidecar::set(
+                        &task.id.0,
+                        &["status=new".to_string(), "last_error=".to_string()],
+                    );
                     let _ = backend
                         .update_status(&task.id, crate::backends::Status::New)
                         .await;

@@ -86,10 +86,14 @@ impl TaskRunner {
             "starting task execution"
         );
 
-        // Check task guards; returns None if task should be skipped
+        // Check task guards; returns None if task should be skipped.
+        // Set a sidecar marker so run_with_context knows not to post stale results.
         let attempts = match task_init::check_guards(task_id, &self.repo).await {
             Ok(Some(a)) => a,
-            Ok(None) => return Ok(()),
+            Ok(None) => {
+                let _ = sidecar::set(task_id, &["guard_skipped=true".to_string()]);
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
 
@@ -369,6 +373,14 @@ impl TaskRunner {
 
         // Run the task
         self.run(task_id, agent, model, Some(&**backend)).await?;
+
+        // If the runner guard skipped the task (e.g. sidecar status=needs_review),
+        // do not re-post stale sidecar data as a new comment.
+        if sidecar::get(task_id, "guard_skipped").unwrap_or_default() == "true" {
+            let _ = sidecar::set(task_id, &["guard_skipped=".to_string()]);
+            tracing::info!(task_id, "guard skipped task — not posting stale result");
+            return Ok(WeightSignal::None);
+        }
 
         // Process delegations if the agent requested subtasks
         let delegations_raw = sidecar::get(task_id, "delegations").unwrap_or_default();
