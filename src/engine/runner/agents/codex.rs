@@ -37,6 +37,7 @@
 
 use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules, SandboxLevel};
 use crate::parser;
+use std::collections::HashMap;
 
 /// Runner for Codex agent.
 pub struct CodexRunner;
@@ -270,6 +271,57 @@ impl AgentRunner for CodexRunner {
             model_flag = model_flag,
             permission_flags = permission_flags,
         )
+    }
+
+    fn build_pty_command(
+        &self,
+        model: Option<&str>,
+        sys_file: &std::path::PathBuf,
+        msg_file: &std::path::PathBuf,
+        permissions: &PermissionRules,
+        _work_dir: &std::path::PathBuf,
+    ) -> anyhow::Result<super::PtyCommand> {
+        let mut args = Vec::new();
+        if let Some(m) = model {
+            args.push("--model".to_string());
+            args.push(m.to_string());
+        }
+
+        if permissions.autonomous {
+            match permissions.sandbox {
+                SandboxLevel::FullAccess => {
+                    args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+                }
+                _ => args.push("--full-auto".to_string()),
+            }
+        } else {
+            let sandbox = match permissions.sandbox {
+                SandboxLevel::WorkspaceWrite | SandboxLevel::None => "workspace-write",
+                SandboxLevel::FullAccess => "danger-full-access",
+            };
+            args.push("--ask-for-approval".to_string());
+            args.push("suggest".to_string());
+            args.push("--sandbox".to_string());
+            args.push(sandbox.to_string());
+        }
+
+        args.push("-c".to_string());
+        args.push("sandbox_workspace_write.network_access=true".to_string());
+        args.push("-c".to_string());
+        args.push("shell_environment_policy.inherit=all".to_string());
+        args.push("exec".to_string());
+        args.push("--json".to_string());
+        args.push("-".to_string());
+
+        let mut stdin = std::fs::read(sys_file)?;
+        stdin.extend(std::fs::read(msg_file)?);
+
+        Ok(super::PtyCommand {
+            program: "codex".to_string(),
+            args,
+            stdin,
+            env: HashMap::new(),
+        })
     }
 
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {

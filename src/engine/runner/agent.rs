@@ -1,7 +1,7 @@
 //! Agent command building + tmux invocation.
 //!
 //! Supports Claude, Codex, OpenCode (plus Kimi/MiniMax as Claude aliases).
-//! Generates a runner shell script that tmux executes — agents need a real terminal.
+//! Prefers PTY-based spawning to preserve terminal semantics without on-disk scripts.
 
 use crate::template::render_template_str;
 use crate::tmux::TmuxManager;
@@ -96,18 +96,6 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
 
     // Build agent command using per-agent runner
     let runner = super::agents::get_runner(&inv.agent);
-    let timeout_cmd = if inv.timeout_seconds > 0 {
-        format!("timeout {}", inv.timeout_seconds)
-    } else {
-        String::new()
-    };
-    let agent_cmd = runner.build_command(
-        inv.model.as_deref(),
-        &timeout_cmd,
-        &sys_file.to_string_lossy(),
-        &msg_file.to_string_lossy(),
-        &permissions,
-    );
 
     // Resolve GH_TOKEN at script-generation time so agents don't need to call gh auth.
     // Prefer the native auth resolver (GhHttp / auth::create_resolver) but keep
@@ -148,8 +136,97 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
 
     // Build shell command that runs agent, captures stdout/stderr and exit status.
     // We avoid creating a runner.sh on disk by passing a shell -lc command to tmux.
+
+    // Clone env_map for branch-specific use (PTY code expects `env`).
+    let env: std::collections::HashMap<String, String> = env_map.clone();
     let status_file = attempt_dir.join("exit.txt");
     let stderr_file = attempt_dir.join("stderr.txt");
+
+    let pty_enabled = crate::config::get("runner.pty.enabled")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(true);
+
+    if pty_enabled {
+        let session = tmux
+            .create_session(
+                &inv.repo,
+                &inv.task_id,
+                &inv.work_dir.to_string_lossy(),
+                "cat",
+                None,
+            )
+            .await?;
+
+        for (k, v) in &env {
+            tmux.set_session_env(&session, k, v).await.ok();
+        }
+
+        let pty_command = runner.build_pty_command(
+            inv.model.as_deref(),
+            &sys_file,
+            &msg_file,
+            &permissions,
+            &inv.work_dir,
+        )?;
+
+        let super::agents::PtyCommand {
+            program,
+            args,
+            stdin: stdin_payload,
+            env: extra_env,
+        } = pty_command;
+        let mut pty_env = env.clone();
+        for (k, v) in extra_env {
+            pty_env.insert(k, v);
+        }
+
+        let mut pty_handle = super::pty::spawn_agent_in_pty(&super::pty::PtyInvocation {
+            program,
+            args,
+            cwd: inv.work_dir.clone(),
+            env: pty_env,
+            timeout_seconds: inv.timeout_seconds,
+        })?;
+
+        pty_handle.write_stdin(&stdin_payload)?;
+
+        super::pty::attach_pty_to_tmux(
+            pty_handle,
+            super::pty::PtyAttachSession {
+                tmux: tmux.clone(),
+                session: session.clone(),
+                output_path: inv.output_file.clone(),
+                stderr_path: stderr_file,
+                exit_path: status_file,
+                timeout_seconds: inv.timeout_seconds,
+            },
+        )?;
+
+        tracing::info!(
+            task_id = inv.task_id,
+            agent = inv.agent,
+            session = %session,
+            "agent spawned in tmux (pty)"
+        );
+
+        return Ok(session);
+    }
+
+    let timeout_cmd = if inv.timeout_seconds > 0 {
+        format!("timeout {}", inv.timeout_seconds)
+    } else {
+        String::new()
+    };
+    let agent_cmd = runner.build_command(
+        inv.model.as_deref(),
+        &timeout_cmd,
+        &sys_file.to_string_lossy(),
+        &msg_file.to_string_lossy(),
+        &permissions,
+    );
+
+    // Build shell command that runs agent, captures stdout/stderr and exit status
+    // We avoid creating a runner.sh on disk by passing a shell -lc command to tmux.
     let work_dir = inv.work_dir.to_string_lossy();
 
     let command = format!(
@@ -176,6 +253,11 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
             env_vec.as_slice(),
         )
         .await?;
+
+    // Ensure non-secret environment variables are set in the session (best-effort).
+    for (k, v) in &env {
+        tmux.set_session_env(&session, k, v).await.ok();
+    }
 
     // Inject GH_TOKEN via tmux set-environment after session creation.
     // This avoids exposing the token in process arguments or on-disk files.
