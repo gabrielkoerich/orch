@@ -1335,16 +1335,13 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 ## TODO — Remaining Work
 
-### Open Issues
-
-| Issue | Title | Priority | Description |
-|-------|-------|----------|-------------|
-| — | PR coverage comments | Low | `cargo-llvm-cov` runs in CI (`release.yml`) and uploads LCOV artifact, but coverage percentage is not surfaced on PRs. Add `codecov/codecov-action` or similar to comment on each PR with coverage delta. |
+*No open items — all planned features implemented.*
 
 ### Recently Closed
 
 | Issue | Title | Description |
 |-------|-------|-------------|
+| #361 | PR coverage comments | `romeovs/lcov-reporter-action@v0.4.0` comments coverage % on each PR — `.github/workflows/release.yml:52-57` |
 | #230 | Break `tick()` into named phases | Extracted 4-5 phases of the `tick()` function into independent methods. |
 | #144 | Cost Tracking CLI and Budget Enforcement | `orch cost` command in `src/cli/cost.rs` — per-task and aggregate cost reporting |
 | #145 | Webhook Server Production Hardening | Graceful shutdown, webhook event handling in `src/channels/github.rs` |
