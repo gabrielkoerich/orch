@@ -120,6 +120,28 @@ pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
         &permissions,
     );
 
+    // Resolve GH_TOKEN at script-generation time so agents don't need to call gh auth.
+    // Prefer existing env var, fall back to `gh auth token` (orch is not sandboxed).
+    let gh_token_line = std::env::var("GH_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok()
+        .filter(|t| !t.is_empty())
+        .or_else(|| {
+            std::process::Command::new("gh")
+                .args(["auth", "token"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+        })
+        .map(|token| format!("export GH_TOKEN=\"{token}\""))
+        .unwrap_or_else(|| {
+            tracing::warn!("gh auth token not available; agents may not have GitHub access");
+            String::new()
+        });
+
     Ok(format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -128,6 +150,7 @@ set -euo pipefail
 [ -f "$HOME/.path" ] && source "$HOME/.path"
 [ -f "$HOME/.private" ] && source "$HOME/.private"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+{gh_token_line}
 export GIT_AUTHOR_NAME="{git_name}"
 export GIT_COMMITTER_NAME="{git_name}"
 export GIT_AUTHOR_EMAIL="{git_email}"
@@ -150,6 +173,7 @@ echo "$CMD_STATUS" > "{status_file}"
 
 exit $CMD_STATUS
 "#,
+        gh_token_line = gh_token_line,
         git_name = inv.git_author_name,
         git_email = inv.git_author_email,
         task_id = inv.task_id,
