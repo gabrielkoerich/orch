@@ -20,7 +20,7 @@ An autonomous task orchestrator that delegates work to AI coding agents (Claude,
 ## Installation
 
 ```bash
-brew tap gabrielkoerich/orch
+brew tap gabrielkoerich/homebrew-tap
 brew install orch
 ```
 
