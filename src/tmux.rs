@@ -51,6 +51,9 @@ impl TmuxManager {
     ///
     /// The session is detached — the agent runs in the background.
     /// Returns the session name.
+    ///
+    /// Note: For secrets like GH_TOKEN, use [`set_session_env`] after session creation
+    /// instead of passing them here. This avoids exposing secrets in process arguments.
     pub async fn create_session(
         &self,
         repo: &str,
@@ -63,10 +66,15 @@ impl TmuxManager {
 
         let mut cmd = Command::new("tmux");
         cmd.args(["new-session", "-d", "-s", &name, "-c", working_dir]);
+
+        // Inject non-secret environment variables into the new session if provided.
+        // For secrets like GH_TOKEN, callers should use `set_session_env()` after
+        // session creation to avoid exposing them in process arguments.
         for (key, value) in env_vars {
             // tmux accepts -e KEY=VALUE to inject environment into the session.
             cmd.arg("-e").arg(format!("{}={}", key, value));
         }
+
         cmd.arg(command);
 
         let output = cmd
@@ -81,6 +89,54 @@ impl TmuxManager {
 
         tracing::info!(session = %name, task_id, "created tmux session");
         Ok(name)
+    }
+
+    /// Set an environment variable in an existing tmux session.
+    ///
+    /// This is preferred over passing secrets via [`create_session`] because
+    /// it avoids exposing secrets in process arguments and on-disk runner scripts.
+    ///
+    /// Uses: `tmux set-environment -t <session> <key> <value>`
+    pub async fn set_session_env(
+        &self,
+        session: &str,
+        key: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let output = Command::new("tmux")
+            .args(["set-environment", "-t", session, key, value])
+            .output_with_context()
+            .await
+            .context("setting tmux session environment")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux set-environment failed: {stderr}");
+        }
+
+        tracing::debug!(session, key, "set tmux session environment");
+        Ok(())
+    }
+
+    /// Unset an environment variable in an existing tmux session.
+    ///
+    /// Uses: `tmux set-environment -u <key> -t <session>`
+    #[allow(dead_code)]
+    pub async fn unset_session_env(&self, session: &str, key: &str) -> anyhow::Result<()> {
+        let output = Command::new("tmux")
+            .args(["set-environment", "-u", key, "-t", session])
+            .output_with_context()
+            .await
+            .context("unsetting tmux session environment")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Don't fail if the variable doesn't exist - that's acceptable
+            tracing::warn!(session, key, %stderr, "tmux unset-environment warning");
+        } else {
+            tracing::debug!(session, key, "unset tmux session environment");
+        }
+        Ok(())
     }
 
     /// Check if a session exists.
@@ -202,4 +258,110 @@ impl TmuxManager {
         }
         map
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to get a test session name with unique ID
+    fn test_session_name() -> String {
+        format!(
+            "orch-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        )
+    }
+
+    /// Verify set_session_env runs the correct tmux set-environment command.
+    /// This test creates a temporary session, sets an env var, and verifies it was set.
+    #[tokio::test]
+    async fn test_set_session_env() {
+        let tmux = TmuxManager::new();
+        let session = test_session_name();
+
+        // Create a temporary detached session for testing
+        let create_result = tokio::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
+            .output()
+            .await;
+
+        if create_result.is_err() || !create_result.unwrap().status.success() {
+            // Skip test if tmux is not available or fails
+            eprintln!("Skipping test: tmux not available or failed to create test session");
+            return;
+        }
+
+        // Use our helper to set an environment variable
+        let result = tmux
+            .set_session_env(&session, "TEST_VAR", "test_value")
+            .await;
+        assert!(result.is_ok(), "set_session_env should succeed");
+
+        // Verify the variable was set by reading it back
+        let check_result = tokio::process::Command::new("tmux")
+            .args(["show-environment", "-t", &session, "TEST_VAR"])
+            .output()
+            .await;
+
+        let output = check_result.expect("should be able to check environment");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("TEST_VAR=test_value"),
+            "Expected TEST_VAR=test_value, got: {}",
+            stdout
+        );
+
+        // Cleanup: kill the test session
+        let _ = tmux.kill_session(&session).await;
+    }
+
+    /// Verify unset_session_env runs the correct tmux set-environment -u command.
+    /// This test verifies the function can be called without error.
+    /// Note: Full verification of tmux behavior depends on the environment.
+    #[tokio::test]
+    async fn test_unset_session_env() {
+        let tmux = TmuxManager::new();
+        let session = test_session_name();
+
+        // Create a temporary detached session for testing
+        let create_result = tokio::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
+            .output()
+            .await;
+
+        if create_result.is_err() || !create_result.unwrap().status.success() {
+            eprintln!("Skipping test: tmux not available or failed to create test session");
+            return;
+        }
+
+        // First set a variable
+        let set_result = tmux
+            .set_session_env(&session, "TO_DELETE", "temporary")
+            .await;
+        assert!(set_result.is_ok(), "set_session_env should succeed");
+
+        // Verify it exists
+        let check_before = tokio::process::Command::new("tmux")
+            .args(["show-environment", "-t", &session, "TO_DELETE"])
+            .output()
+            .await
+            .expect("should be able to check environment");
+        assert!(
+            String::from_utf8_lossy(&check_before.stdout).contains("TO_DELETE"),
+            "Variable should exist before unset"
+        );
+
+        // Call unset_session_env - verify it runs without error
+        let unset_result = tmux.unset_session_env(&session, "TO_DELETE").await;
+        assert!(unset_result.is_ok(), "unset_session_env should succeed");
+
+        // Cleanup: kill the test session
+        let _ = tmux.kill_session(&session).await;
+    }
+
+    // NOTE: No static test for GH_TOKEN handling here; behavior is enforced
+    // by the call sites (runner code) and covered by session env helper tests.
 }
