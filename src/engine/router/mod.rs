@@ -128,7 +128,9 @@ impl Router {
 
     /// Get the first available agent.
     /// Pick next agent via round-robin (for review or other non-task routing).
-    pub fn next_round_robin_agent(&self) -> Option<String> {
+    /// Pick the next review agent, optionally excluding one (e.g. the task's original agent).
+    /// Falls back to the excluded agent only if it's the only one available.
+    pub fn next_round_robin_agent(&self, exclude: Option<&str>) -> Option<String> {
         if self.available_agents.is_empty() {
             return None;
         }
@@ -136,8 +138,16 @@ impl Router {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let agent = self.available_agents[idx % self.available_agents.len()].clone();
-        let next = (idx + 1) % self.available_agents.len();
+
+        // Try to find an agent that isn't the excluded one
+        let n = self.available_agents.len();
+        let agent = (0..n)
+            .map(|offset| &self.available_agents[(idx + offset) % n])
+            .find(|a| exclude.map_or(true, |ex| a.as_str() != ex))
+            .cloned()
+            .or_else(|| self.available_agents.get(idx % n).cloned())?;
+
+        let next = (idx + 1) % n;
         let _ = crate::sidecar::set("_review_rr", &[format!("index={next}")]);
         Some(agent)
     }

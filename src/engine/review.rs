@@ -596,10 +596,12 @@ pub(crate) async fn review_and_merge(
     let review_prompt =
         runner::agent::build_review_prompt(task, &agent_summary, &git_diff, &git_log);
 
-    // 5. Pick review agent via round-robin
+    // 5. Pick review agent via round-robin, excluding the agent that did the work
+    let task_agent = sidecar::get(&task.id.0, "agent").unwrap_or_default();
     let review_agent = {
         let r = router.read().await;
-        r.next_round_robin_agent()
+        let exclude = if task_agent.is_empty() { None } else { Some(task_agent.as_str()) };
+        r.next_round_robin_agent(exclude)
             .unwrap_or_else(|| "claude".to_string())
     };
     let review_model = get_model_for_complexity("review", &review_agent);
