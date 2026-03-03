@@ -450,7 +450,7 @@ impl Db {
         })
     }
 
-    /// Record a rate limit event.
+    /// Record a rate limit event. Prunes records older than 30 days on each insert.
     pub async fn record_rate_limit(
         &self,
         agent: &str,
@@ -458,6 +458,10 @@ impl Db {
         task_id: Option<&str>,
     ) -> anyhow::Result<i64> {
         let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM rate_limits WHERE occurred_at < datetime('now', '-30 days')",
+            [],
+        )?;
         conn.execute(
             "INSERT INTO rate_limits (agent, limit_type, occurred_at, task_id) VALUES (?1, ?2, datetime('now'), ?3)",
             rusqlite::params![agent, limit_type, task_id],
