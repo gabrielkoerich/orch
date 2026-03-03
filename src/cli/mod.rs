@@ -10,7 +10,6 @@ use crate::channels::transport::Transport;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::tasks::TaskManager;
-use crate::github::cli_wrapper::Gh;
 use anyhow::Context;
 use std::sync::Arc;
 use tokio::sync::broadcast;
