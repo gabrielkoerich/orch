@@ -59,10 +59,6 @@ struct PostMessageResponse {
 struct AuthTestResponse {
     ok: bool,
     error: Option<String>,
-    #[allow(dead_code)]
-    user_id: Option<String>,
-    #[allow(dead_code)]
-    bot_id: Option<String>,
 }
 
 impl SlackChannel {
