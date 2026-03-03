@@ -258,10 +258,10 @@ impl AgentRunner for OpenCodeRunner {
     fn build_pty_command(
         &self,
         model: Option<&str>,
-        sys_file: &std::path::PathBuf,
-        msg_file: &std::path::PathBuf,
+        sys_file: &std::path::Path,
+        msg_file: &std::path::Path,
         permissions: &PermissionRules,
-        work_dir: &std::path::PathBuf,
+        work_dir: &std::path::Path,
     ) -> anyhow::Result<super::PtyCommand> {
         let mut args = vec!["run".to_string()];
         if let Some(m) = model {
@@ -452,7 +452,7 @@ pub(crate) fn translate_permissions_to_opencode(allowed_tools: &[String]) -> Str
 }
 
 fn prepare_opencode_config(
-    work_dir: &std::path::PathBuf,
+    work_dir: &std::path::Path,
     allowed_tools: &[String],
 ) -> anyhow::Result<()> {
     let permission_json = translate_permissions_to_opencode(allowed_tools);

@@ -185,7 +185,6 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
             args,
             cwd: inv.work_dir.clone(),
             env: pty_env,
-            timeout_seconds: inv.timeout_seconds,
         })?;
 
         pty_handle.write_stdin(&stdin_payload)?;

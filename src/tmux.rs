@@ -119,26 +119,6 @@ impl TmuxManager {
         Ok(())
     }
 
-    /// Unset an environment variable in an existing tmux session.
-    ///
-    /// Uses: `tmux set-environment -u <key> -t <session>`
-    pub async fn unset_session_env(&self, session: &str, key: &str) -> anyhow::Result<()> {
-        let output = Command::new("tmux")
-            .args(["set-environment", "-u", key, "-t", session])
-            .output_with_context()
-            .await
-            .context("unsetting tmux session environment")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Don't fail if the variable doesn't exist - that's acceptable
-            tracing::warn!(session, key, %stderr, "tmux unset-environment warning");
-        } else {
-            tracing::debug!(session, key, "unset tmux session environment");
-        }
-        Ok(())
-    }
-
     /// Send literal text into a session's active pane.
     pub async fn send_text(&self, session: &str, text: &str) -> anyhow::Result<()> {
         let output = Command::new("tmux")
@@ -149,7 +129,6 @@ impl TmuxManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("send-keys failed for {session}: {stderr}");
->>>>>>> 3b8a4b0 (Resolve rebase conflicts for PTY runner integration)
         }
         Ok(())
     }

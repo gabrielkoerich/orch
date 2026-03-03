@@ -18,7 +18,6 @@ pub struct PtyInvocation {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
-    pub timeout_seconds: u64,
 }
 
 /// Handle to a spawned PTY child and IO streams.
@@ -138,7 +137,7 @@ pub fn attach_pty_to_tmux(pty: PtyHandle, session: PtyAttachSession) -> anyhow::
     tokio::spawn(async move {
         let wait_handle = tokio::task::spawn_blocking(move || {
             let mut guard = child_handle.lock().unwrap();
-            guard.wait().map(|status| status.exit_code())
+            guard.wait().map(|status| status.exit_code() as i32)
         });
 
         let exit_code = if timeout_seconds > 0 {
@@ -229,6 +228,7 @@ pub(crate) fn stream_pty_output(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn run_pty_to_completion(
     pty: PtyHandle,
     output_path: &PathBuf,
@@ -245,7 +245,7 @@ pub(crate) fn run_pty_to_completion(
 
     let mut guard = child.lock().unwrap();
     let status = guard.wait().context("waiting for PTY child")?;
-    Ok(status.exit_code())
+    Ok(status.exit_code() as i32)
 }
 
 #[cfg(test)]
@@ -268,7 +268,6 @@ mod tests {
             ],
             cwd: dir.path().to_path_buf(),
             env: HashMap::new(),
-            timeout_seconds: 0,
         };
 
         let pty = spawn_agent_in_pty(&invocation).expect("spawn pty");

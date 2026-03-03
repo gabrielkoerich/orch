@@ -233,10 +233,10 @@ pub trait AgentRunner: Send + Sync {
     fn build_pty_command(
         &self,
         model: Option<&str>,
-        sys_file: &PathBuf,
-        msg_file: &PathBuf,
+        sys_file: &std::path::Path,
+        msg_file: &std::path::Path,
         permissions: &PermissionRules,
-        work_dir: &PathBuf,
+        work_dir: &std::path::Path,
     ) -> anyhow::Result<PtyCommand>;
 
     /// Parse raw stdout into a ParsedResponse.

@@ -276,10 +276,10 @@ impl AgentRunner for CodexRunner {
     fn build_pty_command(
         &self,
         model: Option<&str>,
-        sys_file: &std::path::PathBuf,
-        msg_file: &std::path::PathBuf,
+        sys_file: &std::path::Path,
+        msg_file: &std::path::Path,
         permissions: &PermissionRules,
-        _work_dir: &std::path::PathBuf,
+        _work_dir: &std::path::Path,
     ) -> anyhow::Result<super::PtyCommand> {
         let mut args = Vec::new();
         if let Some(m) = model {
