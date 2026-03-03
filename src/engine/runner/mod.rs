@@ -76,9 +76,6 @@ impl TaskRunner {
         model: Option<&str>,
         backend: Option<&dyn ExternalBackend>,
     ) -> anyhow::Result<()> {
-        // Record start time for metrics
-        let started_at = Utc::now();
-
         tracing::info!(
             task_id,
             agent = agent.unwrap_or("default"),
@@ -218,16 +215,7 @@ impl TaskRunner {
                     .await?,
                     fallback::ErrorHandleResult::EarlyReturn
                 ) {
-                    // Task rerouted — record metrics then return (skip tmux cleanup)
-                    self.record_metrics(
-                        task_id,
-                        &init.agent_name,
-                        &init.model_name,
-                        &init.route_result,
-                        &started_at,
-                        attempts,
-                    )
-                    .await;
+                    // Task rerouted — return (metrics recorded in run_with_context)
                     return Ok(());
                 }
             }
@@ -235,17 +223,6 @@ impl TaskRunner {
 
         // Kill tmux session if still alive
         session::cleanup_session(task_id, &tmux, &tmux_session).await;
-
-        // Record metrics
-        self.record_metrics(
-            task_id,
-            &init.agent_name,
-            &init.model_name,
-            &init.route_result,
-            &started_at,
-            attempts,
-        )
-        .await;
 
         Ok(())
     }
@@ -259,39 +236,27 @@ impl TaskRunner {
         route_result: &Option<RouteResult>,
         started_at: &chrono::DateTime<Utc>,
         attempts: u32,
+        final_status: &str,
+        error_type: Option<&str>,
     ) {
         let completed_at = Utc::now();
         let duration_seconds = (completed_at - *started_at).num_milliseconds() as f64 / 1000.0;
 
-        let final_status = sidecar::get(task_id, "status").unwrap_or_default();
-        // Prefer the explicitly stored error_type set during error handling.
-        // Fall back to parsing last_error strings for backward compat with
-        // older sidecar entries that predate explicit error_type storage.
-        let explicit_error_type = sidecar::get(task_id, "error_type").unwrap_or_default();
-        let classify_error = |stored: &str, last_error: &str| -> &'static str {
-            match stored {
-                "timeout" => "timeout",
-                "rate_limit" => "rate_limit",
-                "auth_error" => "auth_error",
-                _ if !stored.is_empty() => "failed",
-                _ => {
-                    if last_error.contains("timeout") {
-                        "timeout"
-                    } else if last_error.contains("rate limit") || last_error.contains("usage") {
-                        "rate_limit"
-                    } else if last_error.contains("auth") || last_error.contains("billing") {
-                        "auth_error"
-                    } else {
-                        "failed"
-                    }
-                }
-            }
-        };
-        let outcome = match final_status.as_str() {
+        // Classify outcome based on the final status and optional error_type/last_error
+        let outcome = match final_status {
             "done" | "in_progress" | "in_review" => "success",
-            "needs_review" | "new" => {
-                let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
-                classify_error(&explicit_error_type, &last_error)
+            "new" => "rerouted",
+            "needs_review" => {
+                let last_error = error_type.unwrap_or("");
+                if last_error.contains("timeout") {
+                    "timeout"
+                } else if last_error.contains("rate limit") || last_error.contains("usage") {
+                    "rate_limit"
+                } else if last_error.contains("auth") || last_error.contains("billing") {
+                    "auth_error"
+                } else {
+                    "failed"
+                }
             }
             _ => "unknown",
         };
@@ -304,9 +269,8 @@ impl TaskRunner {
         .unwrap_or(0);
 
         if let Some(ref db) = self.db {
-            // Use the explicit classified error type stored during error handling.
-            // Only set for failed/rerouted outcomes; None for successful tasks.
-            let error_type: Option<String> = if outcome == "success" {
+            // Only set error_type for non-success outcomes
+            let db_error_type: Option<String> = if outcome == "success" {
                 None
             } else {
                 Some(outcome.to_string())
@@ -352,7 +316,7 @@ impl TaskRunner {
                 completed_at: &completed_at,
                 attempts: attempts as i32 + 1,
                 files_changed: files_changed as i32,
-                error_type: error_type.as_deref(),
+                error_type: db_error_type.as_deref(),
                 input_tokens,
                 output_tokens,
                 input_cost_usd: input_cost,
@@ -382,6 +346,9 @@ impl TaskRunner {
         let agent_name = agent.unwrap_or("claude").to_string();
         let model = route_result.and_then(|r| r.model.as_deref());
 
+        // Record start time for metrics (before any work begins)
+        let started_at = Utc::now();
+
         // Store task info in sidecar for prompt building
         sidecar::set(
             task_id,
@@ -396,7 +363,9 @@ impl TaskRunner {
 
         // If the runner guard skipped the task (e.g. sidecar status=needs_review),
         // do not re-post stale sidecar data as a new comment.
-        if sidecar::get(task_id, "guard_skipped").unwrap_or_default() == "true" {
+        let was_guard_skipped =
+            sidecar::get(task_id, "guard_skipped").unwrap_or_default() == "true";
+        if was_guard_skipped {
             let _ = sidecar::set(task_id, &["guard_skipped=".to_string()]);
             tracing::info!(task_id, "guard skipped task — not posting stale result");
             return Ok(WeightSignal::None);
@@ -452,6 +421,29 @@ impl TaskRunner {
             ],
         )?;
 
+        // Record metrics AFTER sidecar is fully updated (fixes race condition)
+        if !was_guard_skipped {
+            let attempts: u32 = sidecar::get(task_id, "attempts")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            self.record_metrics(
+                task_id,
+                &agent_name,
+                &model.map(|s| s.to_string()),
+                &route_result.map(|r| r.clone()),
+                &started_at,
+                attempts,
+                &status,
+                if last_error.is_empty() {
+                    None
+                } else {
+                    Some(&last_error)
+                },
+            )
+            .await;
+        }
+
         // If task was rerouted (status=new after run), update GitHub agent label
         // so the router doesn't re-route back to the same failed agent.
         if status == "new" {
@@ -502,7 +494,7 @@ impl TaskRunner {
             let cost = sidecar::get_cost_estimate(task_id);
             let total_tokens = sidecar::get_total_tokens(task_id);
             raw_comment.push_str(&format!(
-                "\n\n> **Budget exceeded**: {} tokens used (${:.4}). Task paused for review.",
+                "\n\n> **Budget exceeded**: {} tokens used (${{:.4}}). Task paused for review.",
                 total_tokens, cost.total_cost_usd
             ));
         } else if !budget_warning.is_empty() {
