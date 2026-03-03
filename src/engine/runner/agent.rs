@@ -109,35 +109,32 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         &permissions,
     );
 
-    // Resolve GH_TOKEN at script-generation time so agents don't need to call gh auth.
-    // Use the CLI wrapper for consistent token resolution with launchd fallback paths.
-    let gh_token = crate::github::cli_wrapper::resolve_token();
-    if gh_token.is_none() {
-        tracing::warn!("gh auth token not available; agents may not have GitHub access");
+    // Resolve the GitHub token and prepare environment variables to inject
+    // into the tmux session. Do NOT write the token to disk or embed it in
+    // the runner script.
+    let gh_token = crate::github::http::resolve_token();
+    let mut env_map = std::collections::HashMap::new();
+    if !gh_token.is_empty() {
+        env_map.insert("GH_TOKEN".to_string(), gh_token);
     }
-
-    // Prepare environment map for tmux session (does not write to disk)
-    let mut env = std::collections::HashMap::new();
-    if let Some(token) = gh_token {
-        env.insert("GH_TOKEN".to_string(), token);
     }
-    env.insert("GIT_AUTHOR_NAME".to_string(), inv.git_author_name.clone());
-    env.insert(
+    env_map.insert("GIT_AUTHOR_NAME".to_string(), inv.git_author_name.clone());
+    env_map.insert(
         "GIT_COMMITTER_NAME".to_string(),
         inv.git_author_name.clone(),
     );
-    env.insert("GIT_AUTHOR_EMAIL".to_string(), inv.git_author_email.clone());
-    env.insert(
+    env_map.insert("GIT_AUTHOR_EMAIL".to_string(), inv.git_author_email.clone());
+    env_map.insert(
         "GIT_COMMITTER_EMAIL".to_string(),
         inv.git_author_email.clone(),
     );
-    env.insert("TASK_ID".to_string(), inv.task_id.clone());
-    env.insert(
+    env_map.insert("TASK_ID".to_string(), inv.task_id.clone());
+    env_map.insert(
         "OUTPUT_FILE".to_string(),
         inv.output_file.display().to_string(),
     );
 
-    // Build shell command that runs agent, captures stdout/stderr and exit status
+    // Build shell command that runs agent, captures stdout/stderr and exit status.
     // We avoid creating a runner.sh on disk by passing a shell -lc command to tmux.
     let status_file = attempt_dir.join("exit.txt");
     let stderr_file = attempt_dir.join("stderr.txt");
@@ -152,13 +149,16 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         work_dir = work_dir,
     );
 
+    // Convert env_map to a slice of (&str, &str) pairs for tmux.create_session.
+    let env_vec: Vec<(&str, &str)> = env_map.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
     let session = tmux
         .create_session(
             &inv.repo,
             &inv.task_id,
             &inv.work_dir.to_string_lossy(),
             &command,
-            Some(&env),
+            env_vec.as_slice(),
         )
         .await?;
 
@@ -331,4 +331,76 @@ pub fn build_review_prompt(
 /// Build the system prompt for the review agent.
 pub fn review_system_prompt() -> String {
     render_prompt_template(REVIEW_SYSTEM_TEMPLATE, HashMap::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // Use a unique owner/repo that won't conflict with home.rs parallel tests
+    // which clean up under "test-owner" and "owner".
+    const TEST_REPO: &str = "orch-runner-test/token-check";
+
+    fn test_invocation(task_id: &str) -> AgentInvocation {
+        AgentInvocation {
+            agent: "claude".to_string(),
+            model: None,
+            work_dir: PathBuf::from("/tmp"),
+            system_prompt: "test system prompt".to_string(),
+            agent_message: "test message".to_string(),
+            task_id: task_id.to_string(),
+            disallowed_tools: vec![],
+            git_author_name: "Test Bot".to_string(),
+            git_author_email: "bot@example.com".to_string(),
+            output_file: PathBuf::from("/tmp/test-output.json"),
+            timeout_seconds: 0,
+            repo: TEST_REPO.to_string(),
+            attempt: 1,
+        }
+    }
+
+    fn cleanup_test_state(task_id: &str) {
+        if let Ok(dir) = crate::home::task_attempt_dir(TEST_REPO, task_id, 1) {
+            // Remove the task directory (two parents up from attempt/1/)
+            if let Some(task_dir) = dir.parent().and_then(|p| p.parent()) {
+                let _ = std::fs::remove_dir_all(task_dir);
+            }
+        }
+    }
+
+    #[test]
+    fn runner_script_does_not_contain_gh_token() {
+        // Set a recognisable fake token to verify it never lands in the script.
+        let fake_token = "ghp_FAKE_TOKEN_SHOULD_NOT_APPEAR_IN_SCRIPT";
+        std::env::set_var("GH_TOKEN", fake_token);
+
+        let inv = test_invocation("token-present");
+        let script = build_runner_script(&inv).expect("build_runner_script failed");
+        cleanup_test_state("token-present");
+
+        assert!(
+            !script.contains(fake_token),
+            "runner script must not contain the GH_TOKEN value"
+        );
+        assert!(
+            !script.contains("export GH_TOKEN"),
+            "runner script must not have a GH_TOKEN export line"
+        );
+    }
+
+    #[test]
+    fn runner_script_does_not_contain_gh_token_when_unset() {
+        std::env::remove_var("GH_TOKEN");
+        std::env::remove_var("GITHUB_TOKEN");
+
+        let inv = test_invocation("token-absent");
+        let script = build_runner_script(&inv).expect("build_runner_script failed");
+        cleanup_test_state("token-absent");
+
+        assert!(
+            !script.contains("GH_TOKEN"),
+            "runner script must not reference GH_TOKEN at all"
+        );
+    }
 }

@@ -1382,9 +1382,9 @@ pub fn rate_limit_metrics() -> RateLimitMetrics {
 /// - Personal Access Token (GH_TOKEN/GITHUB_TOKEN env vars or config)
 /// - GitHub App authentication (JWT-based with installation tokens)
 /// - Legacy gh CLI fallback (if enabled via config)
-#[allow(dead_code)]
-fn resolve_token() -> String {
+pub fn resolve_token() -> String {
     auth::resolve_token_sync()
+}
 }
 
 /// Re-export auth module types for convenience.
