@@ -15,8 +15,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::cmd::CommandErrorContext;
-use crate::db::{Db, ErrorStat, MetricsSummary, SlowTaskInfo};
-use crate::engine::internal_tasks::{create_internal_task_with_source, get_internal_task};
+use crate::db::{Db, ErrorStat, MetricsSummary, SlowTaskInfo, TaskStatus};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -239,30 +238,30 @@ pub async fn tick(
                 // Parse "internal:{id}" format
                 if let Some(internal_id_str) = task_id_clone.strip_prefix("internal:") {
                     if let Ok(internal_id) = internal_id_str.parse::<i64>() {
-                        match get_internal_task(db, internal_id).await {
-                            Ok(Some(task)) => {
-                                match task.status.as_str() {
-                                    "new" | "routed" | "in_progress" => true,
-                                    _ => false, // Terminal state (done, blocked, needs_review, etc.)
+                        match db.get_internal_task(internal_id).await {
+                            Ok(task) => match task.status {
+                                TaskStatus::New | TaskStatus::Routed | TaskStatus::InProgress => {
+                                    true
                                 }
-                            }
-                            Ok(None) => {
-                                // Task not found — clear active_task_id
-                                tracing::warn!(
-                                    job_id = job.id,
-                                    task_id = task_id_clone,
-                                    "internal task not found, clearing active_task_id"
-                                );
-                                should_clear_task_id = true;
-                                false
-                            }
+                                _ => false, // Terminal state (done, blocked, needs_review, etc.)
+                            },
                             Err(e) => {
-                                tracing::warn!(
-                                    job_id = job.id,
-                                    task_id = task_id_clone,
-                                    ?e,
-                                    "cannot fetch internal task, clearing active_task_id"
-                                );
+                                if let Some(rusqlite::Error::QueryReturnedNoRows) =
+                                    e.downcast_ref::<rusqlite::Error>()
+                                {
+                                    tracing::warn!(
+                                        job_id = job.id,
+                                        task_id = task_id_clone,
+                                        "internal task not found, clearing active_task_id"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        job_id = job.id,
+                                        task_id = task_id_clone,
+                                        ?e,
+                                        "cannot fetch internal task, clearing active_task_id"
+                                    );
+                                }
                                 should_clear_task_id = true;
                                 false
                             }
@@ -344,14 +343,9 @@ pub async fn tick(
                         }
                     } else {
                         // Create internal (SQLite) task
-                        match create_internal_task_with_source(
-                            db,
-                            &template.title,
-                            &template.body,
-                            "cron",
-                            &job.id,
-                        )
-                        .await
+                        match db
+                            .create_internal_task(&template.title, &template.body, "cron", &job.id)
+                            .await
                         {
                             Ok(internal_id) => {
                                 let task_id = format!("internal:{}", internal_id);
