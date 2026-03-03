@@ -364,7 +364,21 @@ pub(crate) async fn tick_dispatch_tasks(
                             .unwrap_or(true);
                         tracing::info!(task_id, enable_review, "review gate check");
                         if enable_review {
-                            // Transition to InReview — this IS the guard against duplicates
+                            // Use a separate dispatch key for review to prevent duplicate review agents.
+                            // The regular dispatch key is still held by this task runner until completion.
+                            let review_dispatch_key = format!("{}/review/{}", repo_owned, task_id);
+                            {
+                                let guard = dispatching_for_cleanup.lock().unwrap();
+                                if guard.contains(&review_dispatch_key) {
+                                    tracing::debug!(
+                                        task_id,
+                                        "review agent already dispatching, skipping duplicate"
+                                    );
+                                    return;
+                                }
+                            }
+
+                            // Transition to InReview
                             if let Err(e) = backend
                                 .update_status(
                                     &ExternalId(task_id.clone()),
@@ -374,22 +388,37 @@ pub(crate) async fn tick_dispatch_tasks(
                             {
                                 tracing::warn!(task_id, err = %e, "failed to transition to InReview");
                             } else {
+                                // Insert review dispatch key BEFORE spawning to guard against duplicates
+                                {
+                                    let mut guard = dispatching_for_cleanup.lock().unwrap();
+                                    guard.insert(review_dispatch_key.clone());
+                                }
+
                                 let backend_clone = backend.clone();
                                 let tmux_clone = tmux.clone();
                                 let task_owned_clone = task_owned.clone();
                                 let router_for_review = router_clone.clone();
                                 let task_id_for_review = task_id.clone();
                                 let repo_ctx = repo_owned.clone();
+                                let dispatching_for_review = dispatching_for_cleanup.clone();
+                                let review_dispatch_key_for_cleanup = review_dispatch_key.clone();
                                 tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
-                                    match review_and_merge(
+                                    let result = review_and_merge(
                                         &task_owned_clone,
                                         &backend_clone,
                                         &tmux_clone,
                                         &repo_owned,
                                         &router_for_review,
                                     )
-                                    .await
+                                    .await;
+
+                                    // Remove review dispatch key when done
                                     {
+                                        let mut guard = dispatching_for_review.lock().unwrap();
+                                        guard.remove(&review_dispatch_key_for_cleanup);
+                                    }
+
+                                    match result {
                                         Ok(ReviewDecision::Failed(reason)) => {
                                             tracing::error!(
                                                 task_id = task_id_for_review,

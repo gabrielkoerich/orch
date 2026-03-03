@@ -37,6 +37,7 @@ pub(crate) async fn sync_tick(
     db: &Arc<Db>,
     config: &EngineConfig,
     router: &Arc<RwLock<Router>>,
+    dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
 
@@ -75,10 +76,35 @@ pub(crate) async fn sync_tick(
                 if !has_branch {
                     continue;
                 }
+
+                // Guard against duplicate review agent dispatch
+                let review_dispatch_key = format!("{}/review/{}", repo, task_id);
+                {
+                    let guard = dispatching.lock().unwrap();
+                    if guard.contains(&review_dispatch_key) {
+                        tracing::debug!(
+                            task_id,
+                            "review agent already dispatching, skipping duplicate"
+                        );
+                        continue;
+                    }
+                }
+
                 tracing::info!(task_id, "triggering review agent for needs_review task");
-                // Transition to InReview — this IS the guard against duplicates
+                // Insert review dispatch key BEFORE status transition to guard against duplicates
+                {
+                    let mut guard = dispatching.lock().unwrap();
+                    guard.insert(review_dispatch_key.clone());
+                }
+
+                // Transition to InReview
                 if let Err(e) = backend.update_status(&task.id, Status::InReview).await {
                     tracing::warn!(task_id, err = %e, "failed to transition to InReview");
+                    // Remove the dispatch key on failure so it can be retried
+                    {
+                        let mut guard = dispatching.lock().unwrap();
+                        guard.remove(&review_dispatch_key);
+                    }
                     continue;
                 }
                 // Record timestamp so stale detection can apply a grace period
@@ -97,6 +123,8 @@ pub(crate) async fn sync_tick(
                 let repo_s = repo.to_string();
                 let router_c = router.clone();
                 let repo_ctx = repo_s.clone();
+                let dispatching_c = dispatching.clone();
+                let review_dispatch_key_c = review_dispatch_key.clone();
                 tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                     let tid = task_c.id.0.clone();
                     let needs_reset =
@@ -120,6 +148,13 @@ pub(crate) async fn sync_tick(
                             }
                             Ok(_) => false,
                         };
+
+                    // Remove review dispatch key when done
+                    {
+                        let mut guard = dispatching_c.lock().unwrap();
+                        guard.remove(&review_dispatch_key_c);
+                    }
+
                     if needs_reset {
                         reset_to_needs_review_with_retry(&backend_c, &tid).await;
                     }
