@@ -4,6 +4,8 @@
 //! are committed, pushed, and a PR is created.
 
 use crate::cmd::CommandErrorContext;
+use crate::github::cli_wrapper::Gh;
+use crate::github::http::GhHttp;
 use std::path::Path;
 use tokio::process::Command;
 
@@ -252,27 +254,44 @@ pub async fn create_pr_if_needed(
     files: &[String],
     task_id: &str,
     agent: &str,
+    repo: &str,
+    base_branch: &str,
 ) -> anyhow::Result<Option<String>> {
-    // Check if PR already exists (before creating span to avoid Send issues)
-    let existing = Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--json",
-            "number",
-            "-q",
-            ".[0].number",
-        ])
-        .current_dir(dir)
-        .output_with_context()
-        .await?;
+    let gh = GhHttp::new();
 
-    let existing_number = String::from_utf8_lossy(&existing.stdout).trim().to_string();
-    if !existing_number.is_empty() {
-        tracing::info!(task_id, pr = %existing_number, "PR already exists");
-        return Ok(None);
+    // Check if PR already exists using GhHttp API
+    match gh.get_pr_number(repo, branch).await {
+        Ok(Some(pr_number)) => {
+            tracing::info!(task_id, pr = pr_number, "PR already exists");
+            return Ok(None);
+        }
+        Ok(None) => {
+            // No PR exists, proceed to create one
+        }
+        Err(e) => {
+            // Fall back to CLI if API fails
+            tracing::warn!(task_id, error = %e, "get_pr_number failed, falling back to CLI");
+            let existing = Command::new("gh")
+                .args([
+                    "pr",
+                    "list",
+                    "--head",
+                    branch,
+                    "--json",
+                    "number",
+                    "-q",
+                    ".[0].number",
+                ])
+                .current_dir(dir)
+                .output_with_context()
+                .await?;
+
+            let existing_number = String::from_utf8_lossy(&existing.stdout).trim().to_string();
+            if !existing_number.is_empty() {
+                tracing::info!(task_id, pr = %existing_number, "PR already exists (via CLI)");
+                return Ok(None);
+            }
+        }
     }
 
     // Build PR body
@@ -309,9 +328,37 @@ pub async fn create_pr_if_needed(
     // Always use the short task title for the PR title (summary goes in body)
     let pr_title = title;
 
+    // Try using GhHttp API first
+    match gh
+        .create_pr(repo, pr_title, &body, branch, base_branch)
+        .await
+    {
+        Ok(url) => {
+            tracing::info!(task_id, pr_url = %url, "created PR via GhHttp API");
+
+            // Link the issue to the PR branch via `gh issue develop` (CLI wrapper)
+            link_issue_to_branch(dir, task_id, branch).await;
+
+            return Ok(Some(url));
+        }
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "create_pr failed via GhHttp, falling back to CLI");
+        }
+    }
+
+    // Fall back to CLI if API fails
     let output = Command::new("gh")
         .args([
-            "pr", "create", "--title", pr_title, "--body", &body, "--head", branch,
+            "pr",
+            "create",
+            "--title",
+            pr_title,
+            "--body",
+            &body,
+            "--head",
+            branch,
+            "--base",
+            base_branch,
         ])
         .current_dir(dir)
         .output_with_context()
@@ -319,7 +366,7 @@ pub async fn create_pr_if_needed(
 
     if output.status.success() {
         let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        tracing::info!(task_id, pr_url = %url, "created PR");
+        tracing::info!(task_id, pr_url = %url, "created PR via CLI");
 
         // Link the issue to the PR branch via `gh issue develop`
         link_issue_to_branch(dir, task_id, branch).await;
@@ -341,11 +388,10 @@ async fn link_issue_to_branch(dir: &Path, task_id: &str, branch: &str) {
         return;
     }
 
-    let result = Command::new("gh")
-        .args(["issue", "develop", task_id, "--name", branch])
-        .current_dir(dir)
-        .output_with_context()
-        .await;
+    // Use CLI wrapper for gh issue develop
+    let gh = Gh::new(["issue", "develop", task_id, "--name", branch]).current_dir(dir);
+
+    let result = gh.output_async().await;
 
     match result {
         Ok(o) if o.status.success() => {

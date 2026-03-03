@@ -4,6 +4,7 @@
 //! Worktrees are stored at `~/.orch/worktrees/<project>/<branch>/`.
 
 use crate::cmd::CommandErrorContext;
+use crate::github::cli_wrapper::Gh;
 use crate::sidecar;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -299,21 +300,20 @@ pub async fn setup_worktree(
     // a corrupt `[branch ""]` entry to .git/config that breaks subsequent git pushes.
     if !branch_name_str.is_empty() {
         let repo_slug = crate::config::get_current_repo().unwrap_or_default();
-        let link_output = Command::new("gh")
-            .args([
-                "issue",
-                "develop",
-                task_id,
-                "--base",
-                &default_branch,
-                "--branch-repo",
-                &repo_slug,
-                "--name",
-                &branch_name_str,
-            ])
-            .current_dir(&main_dir)
-            .output_with_context()
-            .await;
+        // Use CLI wrapper for gh issue develop
+        let gh = Gh::new([
+            "issue",
+            "develop",
+            task_id,
+            "--base",
+            &default_branch,
+            "--branch-repo",
+            &repo_slug,
+            "--name",
+            &branch_name_str,
+        ])
+        .current_dir(&main_dir);
+        let link_output = gh.output_async().await;
         match link_output {
             Ok(o) if o.status.success() => {
                 tracing::info!(task_id, branch = %branch_name_str, "linked branch to issue");

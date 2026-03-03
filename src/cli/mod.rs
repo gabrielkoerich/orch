@@ -10,6 +10,7 @@ use crate::channels::transport::Transport;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::tasks::TaskManager;
+use crate::github::cli_wrapper::Gh;
 use anyhow::Context;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -29,19 +30,16 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     let repo_value = match repo {
         Some(r) => r,
         None => {
-            // Try to detect from git remote
-            let output = std::process::Command::new("gh")
-                .args([
-                    "repo",
-                    "view",
-                    "--json",
-                    "nameWithOwner",
-                    "-q",
-                    ".nameWithOwner",
-                ])
-                .output_with_context();
-
-            match output {
+            // Try to detect from git remote using CLI wrapper
+            let gh = Gh::new([
+                "repo",
+                "view",
+                "--json",
+                "nameWithOwner",
+                "-q",
+                ".nameWithOwner",
+            ]);
+            match gh.output() {
                 Ok(o) if o.status.success() => {
                     String::from_utf8_lossy(&o.stdout).trim().to_string()
                 }

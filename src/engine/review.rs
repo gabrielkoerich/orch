@@ -488,50 +488,84 @@ pub(crate) async fn review_and_merge(
                     ])
                     .output()
                     .await;
-                // Try to create PR
-                let pr_result = tokio::process::Command::new("gh")
-                    .args([
-                        "pr",
-                        "create",
-                        "--repo", repo,
-                        "--head", &branch_name,
-                        "--title", &task.title,
-                        "--body", &format!("Resolves #{}\n\nAuto-created by orch review gate (agent forgot to open PR)", task.id.0),
-                    ])
-                    .current_dir(&worktree_path)
-                    .output()
-                    .await;
-                match pr_result {
-                    Ok(o) if o.status.success() => {
+                // Try to create PR using GhHttp API first
+                let default_branch =
+                    config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+                let pr_body = format!(
+                    "Resolves #{}\n\nAuto-created by orch review gate (agent forgot to open PR)",
+                    task.id.0
+                );
+                let gh = GhHttp::new();
+                match gh
+                    .create_pr(repo, &task.title, &pr_body, &branch_name, &default_branch)
+                    .await
+                {
+                    Ok(_url) => {
                         tracing::info!(
                             task_id = task.id.0,
                             branch = %branch_name,
-                            "created missing PR — retrying review"
+                            "created missing PR via GhHttp — retrying review"
                         );
-                        // Return Failed to trigger retry, now with a PR
                         return Ok(ReviewDecision::Failed(
                             "created missing PR, retry".to_string(),
                         ));
                     }
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        tracing::error!(
+                    Err(e) => {
+                        tracing::warn!(
                             task_id = task.id.0,
                             branch = %branch_name,
-                            stderr = %stderr,
-                            "failed to create missing PR — work may be stuck"
-                        );
-                        return Ok(ReviewDecision::Failed(format!(
-                            "no PR, create failed: {stderr}"
-                        )));
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            task_id = task.id.0,
                             error = %e,
-                            "failed to run gh pr create"
+                            "create_pr failed via GhHttp, falling back to CLI"
                         );
-                        return Ok(ReviewDecision::Failed(format!("no PR, gh error: {e}")));
+                        // Fall back to CLI
+                        let pr_result = tokio::process::Command::new("gh")
+                            .args([
+                                "pr",
+                                "create",
+                                "--repo",
+                                repo,
+                                "--head",
+                                &branch_name,
+                                "--title",
+                                &task.title,
+                                "--body",
+                                &pr_body,
+                            ])
+                            .current_dir(&worktree_path)
+                            .output()
+                            .await;
+                        match pr_result {
+                            Ok(o) if o.status.success() => {
+                                tracing::info!(
+                                    task_id = task.id.0,
+                                    branch = %branch_name,
+                                    "created missing PR via CLI — retrying review"
+                                );
+                                return Ok(ReviewDecision::Failed(
+                                    "created missing PR, retry".to_string(),
+                                ));
+                            }
+                            Ok(o) => {
+                                let stderr = String::from_utf8_lossy(&o.stderr);
+                                tracing::error!(
+                                    task_id = task.id.0,
+                                    branch = %branch_name,
+                                    stderr = %stderr,
+                                    "failed to create missing PR — work may be stuck"
+                                );
+                                return Ok(ReviewDecision::Failed(format!(
+                                    "no PR, create failed: {stderr}"
+                                )));
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    task_id = task.id.0,
+                                    error = %e,
+                                    "failed to run gh pr create"
+                                );
+                                return Ok(ReviewDecision::Failed(format!("no PR, gh error: {e}")));
+                            }
+                        }
                     }
                 }
             } else {

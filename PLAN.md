@@ -795,6 +795,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Permission rules per-agent translation (PermissionRules → native CLI flags)
 - [x] Global `allowed_tools` config with per-agent translation — PR #163 merged
 - [x] Migrate GitHub API from `gh` CLI to native reqwest HTTP client — PR #203 merged
+- [x] Add safe `gh` CLI wrapper with fallback paths for launchd environments — PR #374 merged
 - [x] System prompt file passed to Codex and OpenCode agents — PR #201 merged
 - [x] Dead code cleanup: removed legacy `RunResult`/`collect_response` from response.rs
 
