@@ -7,10 +7,10 @@ class Orch < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/gabrielkoerich/orch/releases/download/v0.1.0/orch-macos-universal.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "44e3d4d6ad14351869d301a6ac4daff57c3f601fb2251ca05a4f3c620080d43f"
     else
       url "https://github.com/gabrielkoerich/orch/releases/download/v0.1.0/orch-macos-universal.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "44e3d4d6ad14351869d301a6ac4daff57c3f601fb2251ca05a4f3c620080d43f"
     end
   end
 
