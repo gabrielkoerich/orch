@@ -316,6 +316,7 @@ pub(crate) async fn tick_dispatch_tasks(
         let weight_tx = weight_tx.clone();
         let repo_owned = repo.to_string();
         let dispatching_for_cleanup = dispatching.clone();
+        let dispatch_key_for_cleanup = dispatch_key.clone();
 
         // Load routing result from sidecar (stored during Phase 3a)
         let route_result = get_route_result(&task_id).ok();
@@ -464,7 +465,7 @@ pub(crate) async fn tick_dispatch_tasks(
             // Remove from dispatching set so the task can be re-dispatched if needed
             {
                 let mut guard = dispatching_for_cleanup.lock().unwrap();
-                guard.remove(&dispatch_key);
+                guard.remove(&dispatch_key_for_cleanup);
             }
 
             // Release the semaphore permit
