@@ -150,7 +150,10 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     );
 
     // Convert env_map to a slice of (&str, &str) pairs for tmux.create_session.
-    let env_vec: Vec<(&str, &str)> = env_map.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let env_vec: Vec<(&str, &str)> = env_map
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     let session = tmux
         .create_session(
