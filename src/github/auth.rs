@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -57,6 +58,51 @@ pub trait TokenResolver: Send + Sync {
     /// Get a descriptive name for this auth method (for logging).
     #[allow(dead_code)]
     fn auth_method(&self) -> &'static str;
+}
+
+/// Async counterpart to `TokenResolver` for code that needs to await token
+/// retrieval or health checks (e.g., GitHub App token refresh flows).
+#[async_trait]
+pub trait AsyncTokenResolver: Send + Sync {
+    async fn resolve_token(&self) -> anyhow::Result<String>;
+    async fn health_check(&self) -> anyhow::Result<()>;
+    fn auth_method(&self) -> &'static str;
+}
+
+/// Adapter that wraps a synchronous `TokenResolver` and exposes an async API
+/// by delegating calls to `tokio::task::spawn_blocking` to avoid blocking
+/// the async runtime.
+pub struct AsyncResolverAdapter {
+    inner: Arc<dyn TokenResolver>,
+}
+
+impl AsyncResolverAdapter {
+    pub fn new(inner: Arc<dyn TokenResolver>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl AsyncTokenResolver for AsyncResolverAdapter {
+    async fn resolve_token(&self) -> anyhow::Result<String> {
+        let inner = self.inner.clone();
+        let res = tokio::task::spawn_blocking(move || inner.resolve_token())
+            .await
+            .context("token resolution task panicked")?;
+        res
+    }
+
+    async fn health_check(&self) -> anyhow::Result<()> {
+        let inner = self.inner.clone();
+        let res = tokio::task::spawn_blocking(move || inner.health_check())
+            .await
+            .context("health check task panicked")?;
+        res
+    }
+
+    fn auth_method(&self) -> &'static str {
+        self.inner.auth_method()
+    }
 }
 
 /// Static token resolver for Personal Access Tokens.
@@ -620,6 +666,16 @@ impl TokenResolver for AutoResolver {
 /// Create the default token resolver from configuration.
 pub fn create_resolver() -> anyhow::Result<Box<dyn TokenResolver>> {
     AutoResolver::from_config().map(|r| Box::new(r) as Box<dyn TokenResolver>)
+}
+
+/// Create an async resolver by adapting the synchronous resolver via
+/// `AsyncResolverAdapter`. This is useful for callers that need to await
+/// token refresh (e.g., GhHttp async flows).
+pub fn create_async_resolver() -> anyhow::Result<std::sync::Arc<dyn AsyncTokenResolver>> {
+    let sync = create_resolver()?;
+    Ok(std::sync::Arc::new(AsyncResolverAdapter::new(
+        std::sync::Arc::from(sync),
+    )))
 }
 
 /// Synchronous token resolution for backwards compatibility.
