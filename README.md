@@ -67,6 +67,45 @@ The service automatically:
 4. Pushes branches and creates PRs
 5. Updates GitHub issue status and project board
 
+## GitHub Authentication
+
+Orch requires GitHub authentication to sync with issues and create PRs. Three methods are supported:
+
+### Personal Access Token (Recommended for individuals)
+
+```bash
+# Set as environment variable
+export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+
+# Or configure in ~/.orch/config.yml
+gh:
+  auth:
+    mode: token
+    token: "ghp_xxxxxxxxxxxxxxxxxxxx"
+```
+
+### GitHub App (Recommended for organizations)
+
+Better audit trails and scoped permissions for team automation:
+
+```yaml
+gh:
+  auth:
+    mode: github_app
+    app_id: "123456"
+    private_key: "/path/to/app-private-key.pem"
+```
+
+The orchestrator automatically generates JWTs and refreshes installation tokens before expiry.
+
+### gh CLI (Legacy)
+
+```bash
+gh auth login  # Run interactively
+```
+
+See [Configuration](#configuration) for more auth options.
+
 ## CLI Reference
 
 ### Service Management

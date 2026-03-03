@@ -78,6 +78,10 @@ hmac = "0.12"
 # Constant-time comparison for timing-safe signature verification
 subtle = "2"
 
+# GitHub App JWT authentication
+jsonwebtoken = "9"
+base64 = "0.22"
+
 # Async combinators (FuturesUnordered for concurrent routing)
 futures = "0.3"
 

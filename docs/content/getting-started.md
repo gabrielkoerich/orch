@@ -48,6 +48,67 @@ Bare clones live at `~/.orch/projects/<owner>/<repo>.git`. Agents always work in
 
 `orch` is a short alias for `orchestrator` — use `orch` for the lightweight CLI.
 
+## GitHub Authentication
+
+The orchestrator requires GitHub authentication to create issues, post comments, and manage PRs. Three auth methods are supported:
+
+### Option 1: Personal Access Token (Recommended for individuals)
+
+Create a token at [GitHub Settings → Developer settings → Personal access tokens](https://github.com/settings/tokens).
+
+```bash
+# Set as environment variable (add to ~/.zshrc or ~/.bashrc)
+export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+
+# Or configure in ~/.orch/config.yml
+gh:
+  auth:
+    mode: token
+    token: "ghp_xxxxxxxxxxxxxxxxxxxx"
+```
+
+### Option 2: GitHub App (Recommended for organizations)
+
+GitHub Apps provide better audit trails and scoped permissions for automation:
+
+1. Create a GitHub App in your organization settings
+2. Generate a private key and download the `.pem` file
+3. Install the app on your repositories
+4. Configure in `~/.orch/config.yml`:
+
+```yaml
+gh:
+  auth:
+    mode: github_app
+    app_id: "123456"
+    private_key: "/path/to/app-private-key.pem"
+    # Optional: specific installation ID (auto-detected if not set)
+    # installation_id: "78901234"
+```
+
+The orchestrator automatically exchanges the App credentials for installation tokens and refreshes them before expiry.
+
+### Option 3: gh CLI (Legacy)
+
+If you prefer using the GitHub CLI's authentication:
+
+```bash
+gh auth login
+```
+
+Then enable fallback in config:
+
+```yaml
+gh:
+  auth:
+    mode: gh_cli
+    # Or use auto mode with fallback enabled:
+    # mode: auto
+    # allow_gh_fallback: true
+```
+
+**Note:** The `gh CLI` method is not recommended for service environments (launchd/systemd) as it requires an interactive login session.
+
 ## Files
 
 All runtime state lives in `~/.orch/` (`ORCH_HOME`):
