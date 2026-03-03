@@ -364,94 +364,79 @@ pub(crate) async fn tick_dispatch_tasks(
                             .unwrap_or(true);
                         tracing::info!(task_id, enable_review, "review gate check");
                         if enable_review {
-                            // Use a separate dispatch key for review to prevent duplicate review agents.
-                            // The regular dispatch key is still held by this task runner until completion.
-                            let review_dispatch_key = format!("{}/review/{}", repo_owned, task_id);
-                            {
-                                let guard = dispatching_for_cleanup.lock().unwrap();
-                                if guard.contains(&review_dispatch_key) {
-                                    tracing::debug!(
-                                        task_id,
-                                        "review agent already dispatching, skipping duplicate"
-                                    );
-                                    return;
-                                }
-                            }
-
-                            // Transition to InReview
-                            if let Err(e) = backend
-                                .update_status(
-                                    &ExternalId(task_id.clone()),
-                                    Status::InReview,
-                                )
-                                .await
-                            {
-                                tracing::warn!(task_id, err = %e, "failed to transition to InReview");
+                            // Sidecar-based guard: prevents double-dispatch across tick invocations
+                            if sidecar::get(&task_id, "review_started").unwrap_or_default() == "true" {
+                                tracing::debug!(task_id, "review agent already started, skipping duplicate");
+                            } else if let Err(e) = sidecar::set(&task_id, &["review_started=true".to_string()]) {
+                                tracing::warn!(task_id, err = %e, "failed to set review_started guard, skipping review");
                             } else {
-                                // Insert review dispatch key BEFORE spawning to guard against duplicates
-                                {
-                                    let mut guard = dispatching_for_cleanup.lock().unwrap();
-                                    guard.insert(review_dispatch_key.clone());
-                                }
-
-                                let backend_clone = backend.clone();
-                                let tmux_clone = tmux.clone();
-                                let task_owned_clone = task_owned.clone();
-                                let router_for_review = router_clone.clone();
-                                let task_id_for_review = task_id.clone();
-                                let repo_ctx = repo_owned.clone();
-                                let dispatching_for_review = dispatching_for_cleanup.clone();
-                                let review_dispatch_key_for_cleanup = review_dispatch_key.clone();
-                                tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
-                                    let result = review_and_merge(
-                                        &task_owned_clone,
-                                        &backend_clone,
-                                        &tmux_clone,
-                                        &repo_owned,
-                                        &router_for_review,
+                                // Transition to InReview — this IS the guard against duplicates
+                                if let Err(e) = backend
+                                    .update_status(
+                                        &ExternalId(task_id.clone()),
+                                        Status::InReview,
                                     )
-                                    .await;
-
-                                    // Remove review dispatch key when done
-                                    {
-                                        let mut guard = dispatching_for_review.lock().unwrap();
-                                        guard.remove(&review_dispatch_key_for_cleanup);
-                                    }
-
-                                    match result {
-                                        Ok(ReviewDecision::Failed(reason)) => {
-                                            tracing::error!(
-                                                task_id = task_id_for_review,
-                                                reason,
-                                                "review agent failed — resetting to NeedsReview for retry"
-                                            );
-                                            let _ = backend_clone
-                                                .update_status(
-                                                    &ExternalId(
-                                                        task_id_for_review,
-                                                    ),
-                                                    Status::NeedsReview,
-                                                )
-                                                .await;
+                                    .await
+                                {
+                                    tracing::warn!(task_id, err = %e, "failed to transition to InReview");
+                                    // Clear the guard since we couldn't transition
+                                    let _ = sidecar::set(&task_id, &["review_started=false".to_string()]);
+                                } else {
+                                    let backend_clone = backend.clone();
+                                    let tmux_clone = tmux.clone();
+                                    let task_owned_clone = task_owned.clone();
+                                    let router_for_review = router_clone.clone();
+                                    let task_id_for_review = task_id.clone();
+                                    let repo_ctx = repo_owned.clone();
+                                    tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
+                                        match review_and_merge(
+                                            &task_owned_clone,
+                                            &backend_clone,
+                                            &tmux_clone,
+                                            &repo_owned,
+                                            &router_for_review,
+                                        )
+                                        .await
+                                        {
+                                            Ok(ReviewDecision::Failed(reason)) => {
+                                                tracing::error!(
+                                                    task_id = task_id_for_review,
+                                                    reason,
+                                                    "review agent failed — resetting to NeedsReview for retry"
+                                                );
+                                                let _ = backend_clone
+                                                    .update_status(
+                                                        &ExternalId(
+                                                            task_id_for_review.clone(),
+                                                        ),
+                                                        Status::NeedsReview,
+                                                    )
+                                                    .await;
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    task_id = task_id_for_review,
+                                                    error = %e,
+                                                    "review_and_merge failed — resetting to NeedsReview for retry"
+                                                );
+                                                let _ = backend_clone
+                                                    .update_status(
+                                                        &ExternalId(
+                                                            task_id_for_review.clone(),
+                                                        ),
+                                                        Status::NeedsReview,
+                                                    )
+                                                    .await;
+                                            }
+                                            Ok(_) => {} // Approve or RequestChanges handled inside
                                         }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                task_id = task_id_for_review,
-                                                error = %e,
-                                                "review_and_merge failed — resetting to NeedsReview for retry"
-                                            );
-                                            let _ = backend_clone
-                                                .update_status(
-                                                    &ExternalId(
-                                                        task_id_for_review,
-                                                    ),
-                                                    Status::NeedsReview,
-                                                )
-                                                .await;
+                                        // Clear the review_started guard so the task can be reviewed again
+                                        // if it returns to NeedsReview status
+                                        if let Err(e) = sidecar::set(&task_id_for_review, &["review_started=false".to_string()]) {
+                                            tracing::warn!(task_id = task_id_for_review, err = %e, "failed to clear review_started guard");
                                         }
-                                        Ok(_) => {} // Approve or RequestChanges handled inside
-                                    }
-                                }));
+                                    }));
+                                }
                             }
                         }
                     }
