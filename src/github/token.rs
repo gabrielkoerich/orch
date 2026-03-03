@@ -450,20 +450,28 @@ mod tests {
         assert!(resolver.allow_legacy_fallback);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn get_token_returns_none_when_no_env_set() {
-        // Ensure no env vars are set
+        // Ensure no env vars are set - set them explicitly to empty
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
-
+        // Also clear any cached token
         let resolver = TokenResolver::default_env();
+        resolver.clear_cache().await;
+
         let token = resolver.get_token().await.unwrap();
         assert!(token.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token() {
         // Only set GH_TOKEN, remove GITHUB_TOKEN
+        env::remove_var("GH_TOKEN");
+        env::remove_var("GITHUB_TOKEN");
+        // Clear cache first
+        let resolver = TokenResolver::default_env();
+        resolver.clear_cache().await;
+
         env::set_var("GH_TOKEN", "gh_token_value");
         env::remove_var("GITHUB_TOKEN");
 
@@ -474,26 +482,35 @@ mod tests {
         env::remove_var("GH_TOKEN");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn get_token_falls_back_to_github_token() {
-        // Remove GH_TOKEN, set GITHUB_TOKEN
+        // Clear environment first
         env::remove_var("GH_TOKEN");
+        env::remove_var("GITHUB_TOKEN");
+        let resolver = TokenResolver::default_env();
+        resolver.clear_cache().await;
+
+        // Now set GITHUB_TOKEN only
         env::set_var("GITHUB_TOKEN", "github_token_value");
 
-        let resolver = TokenResolver::default_env();
         let token = resolver.get_token().await.unwrap();
         assert_eq!(token, Some("github_token_value".to_string()));
 
         env::remove_var("GITHUB_TOKEN");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token_over_github_token() {
+        // Clear environment first
+        env::remove_var("GH_TOKEN");
+        env::remove_var("GITHUB_TOKEN");
+        let resolver = TokenResolver::default_env();
+        resolver.clear_cache().await;
+
         // Set both env vars
         env::set_var("GH_TOKEN", "gh_token_value");
         env::set_var("GITHUB_TOKEN", "github_token_value");
 
-        let resolver = TokenResolver::default_env();
         let token = resolver.get_token().await.unwrap();
         // GH_TOKEN should be preferred
         assert_eq!(token, Some("gh_token_value".to_string()));
@@ -502,13 +519,18 @@ mod tests {
         env::remove_var("GITHUB_TOKEN");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn get_token_ignores_empty_env_vars() {
+        // Clear environment first
+        env::remove_var("GH_TOKEN");
+        env::remove_var("GITHUB_TOKEN");
+        let resolver = TokenResolver::default_env();
+        resolver.clear_cache().await;
+
         // Set empty env vars
         env::set_var("GH_TOKEN", "");
         env::set_var("GITHUB_TOKEN", "");
 
-        let resolver = TokenResolver::default_env();
         let token = resolver.get_token().await.unwrap();
         assert!(token.is_none());
 
@@ -516,11 +538,16 @@ mod tests {
         env::remove_var("GITHUB_TOKEN");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn get_token_sync_env_mode() {
+        // Clear environment first
+        env::remove_var("GH_TOKEN");
+        env::remove_var("GITHUB_TOKEN");
+        let resolver = TokenResolver::default_env();
+        resolver.clear_cache().await;
+
         env::set_var("GH_TOKEN", "sync_test_token");
 
-        let resolver = TokenResolver::default_env();
         let token = resolver.get_token_sync().unwrap();
         assert_eq!(token, Some("sync_test_token".to_string()));
 
@@ -539,12 +566,16 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("async"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn clear_cache_clears_token() {
-        env::set_var("GH_TOKEN", "cached_token");
+        // Clear environment first
+        env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
-
         let resolver = TokenResolver::default_env();
+        resolver.clear_cache().await;
+
+        // Now set the env var
+        env::set_var("GH_TOKEN", "cached_token");
 
         // First call should cache the token
         let token1 = resolver.get_token().await.unwrap();

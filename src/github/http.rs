@@ -231,22 +231,6 @@ impl GhHttp {
         Self { client, token }
     }
 
-    /// Create a new client with a custom token resolver.
-    #[allow(dead_code)]
-    pub fn with_resolver(resolver: &dyn auth::TokenResolver) -> anyhow::Result<Self> {
-        let token = tokio::runtime::Handle::try_current()
-            .map_err(|e| anyhow::anyhow!("no tokio runtime: {}", e))?
-            .block_on(resolver.resolve_token())?;
-        let client = Client::builder()
-            .user_agent("orch/0.1 (reqwest)")
-            .pool_max_idle_per_host(4)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build reqwest client");
-
-        Ok(Self { client, token })
-    }
-
     // ── Rate-limit helpers ────────────────────────────────────────
 
     /// Check if the REST GitHub API is currently rate-limited (backoff or approaching limit).

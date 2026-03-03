@@ -602,7 +602,8 @@ mod tests {
         // not a string that would need to be embedded in a script.
         // The key security guarantee: we're NOT building a runner script anymore.
         // Tokens are injected directly into tmux session environment.
-        let token = crate::github::http::resolve_token();
+        let resolver = crate::github::token::TokenResolver::default_env();
+        let token = resolver.get_token_sync().ok().flatten().unwrap_or_default();
         // Token can be empty (no token configured) or a valid token string.
         // The important thing is it's passed via tmux -e flag, not written to disk.
         assert!(
