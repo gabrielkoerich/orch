@@ -20,8 +20,25 @@ pub(super) const MIN_WEIGHT: f64 = 0.05;
 /// How much to reduce weight on each rate limit hit (multiplicative decay).
 pub(super) const RATE_LIMIT_DECAY: f64 = 0.3;
 
+/// Generate jitter duration for recovery delay based on agent name.
+/// Uses a simple hash to create deterministic but varied jitter per agent.
+fn generate_recovery_jitter(agent: &str) -> Duration {
+    // Simple hash: sum of char values modulo a large prime
+    let hash: u64 = agent
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    // Map hash to 0..RECOVERY_JITTER_MAX range
+    let max_secs = RECOVERY_JITTER_MAX.as_secs();
+    let jitter_secs = hash % max_secs;
+    Duration::from_secs(jitter_secs)
+}
+
 /// Duration after which a rate-limited agent starts recovering weight.
 pub(super) const RECOVERY_DELAY: Duration = Duration::from_secs(60);
+
+/// Maximum jitter added to recovery delay to stagger agent recoveries.
+/// This prevents thundering herd where all agents recover simultaneously.
+pub(super) const RECOVERY_JITTER_MAX: Duration = Duration::from_secs(30);
 
 /// Per-tick weight recovery amount (additive, applied each routing call).
 pub(super) const RECOVERY_RATE: f64 = 0.1;
@@ -33,6 +50,8 @@ pub struct RateLimitState {
     pub weight: f64,
     /// When the last rate limit error was recorded.
     pub last_limited_at: Option<Instant>,
+    /// Jitter added to recovery delay to stagger recoveries (avoid thundering herd).
+    pub recovery_jitter: Duration,
     /// How many consecutive rate limit hits.
     pub consecutive_hits: u32,
 }
@@ -42,6 +61,7 @@ impl Default for RateLimitState {
         Self {
             weight: DEFAULT_WEIGHT,
             last_limited_at: None,
+            recovery_jitter: Duration::ZERO,
             consecutive_hits: 0,
         }
     }
@@ -49,6 +69,8 @@ impl Default for RateLimitState {
 
 impl RateLimitState {
     /// Record a rate limit event — decay the weight.
+    /// Note: Jitter is set at the AgentWeights level using the agent name.
+    #[allow(dead_code)]
     pub fn record_rate_limit(&mut self) {
         self.consecutive_hits += 1;
         self.weight = (self.weight * RATE_LIMIT_DECAY).max(MIN_WEIGHT);
@@ -61,13 +83,15 @@ impl RateLimitState {
         self.weight = (self.weight + RECOVERY_RATE).min(DEFAULT_WEIGHT);
     }
 
-    /// Tick recovery: if enough time has passed since the last limit, gradually restore.
+    /// Tick recovery: if enough time has passed since the last limit (plus jitter), gradually restore.
     pub fn maybe_recover(&mut self) {
         if let Some(last) = self.last_limited_at {
-            if last.elapsed() >= RECOVERY_DELAY {
+            let recovery_threshold = RECOVERY_DELAY + self.recovery_jitter;
+            if last.elapsed() >= recovery_threshold {
                 self.weight = (self.weight + RECOVERY_RATE).min(DEFAULT_WEIGHT);
                 if self.weight >= DEFAULT_WEIGHT {
                     self.last_limited_at = None;
+                    self.recovery_jitter = Duration::ZERO;
                     self.consecutive_hits = 0;
                 }
             }
@@ -96,14 +120,17 @@ impl AgentWeights {
 
     /// Record a rate limit event for an agent.
     pub fn record_rate_limit(&mut self, agent: &str) {
-        self.states
-            .entry(agent.to_string())
-            .or_default()
-            .record_rate_limit();
+        let state = self.states.entry(agent.to_string()).or_default();
+        state.consecutive_hits += 1;
+        state.weight = (state.weight * RATE_LIMIT_DECAY).max(MIN_WEIGHT);
+        state.last_limited_at = Some(Instant::now());
+        // Generate jitter to stagger recovery times across agents
+        state.recovery_jitter = generate_recovery_jitter(agent);
         tracing::info!(
             agent,
-            weight = self.states[agent].weight,
-            hits = self.states[agent].consecutive_hits,
+            weight = state.weight,
+            hits = state.consecutive_hits,
+            jitter_secs = state.recovery_jitter.as_secs(),
             "agent weight reduced (rate limit)"
         );
     }
