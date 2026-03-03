@@ -822,7 +822,7 @@ src/
 │
 ├── backends/
 │   ├── mod.rs               # ExternalBackend trait, ExternalTask, ExternalId, Status
-│   └── github.rs            # GitHub Issues implementation (via `gh api`)
+│   └── github.rs            # GitHub Issues implementation (native reqwest HTTP, PR #203)
 │
 ├── channels/
 │   ├── mod.rs               # Channel trait, IncomingMessage, OutgoingMessage
@@ -830,9 +830,10 @@ src/
 │   ├── capture.rs           # tmux output capture + diffing service
 │   ├── notification.rs      # Unified notification dispatch (levels, formatting, broadcast)
 │   ├── tmux.rs              # tmux channel (pane monitoring)
-│   ├── github.rs            # GitHub App: webhooks + polling
-│   ├── telegram.rs          # Telegram Bot API (long-poll)
-│   └── discord.rs           # Discord gateway websocket
+│   ├── github.rs            # GitHub channel: webhooks + polling fallback
+│   ├── telegram.rs          # Telegram Bot API (HTTP long-poll)
+│   ├── discord.rs           # Discord channel (HTTP polling)
+│   └── slack.rs             # Slack channel (conversations.history polling + chat.postMessage)
 │
 ├── engine/
 │   ├── mod.rs               # Engine struct, config, project init, main event loop (serve)
@@ -861,7 +862,11 @@ src/
 │       │   ├── claude.rs    # Claude/Kimi/MiniMax runner (JSON envelope parser)
 │       │   ├── codex.rs     # Codex runner (NDJSON stream parser)
 │       │   └── opencode.rs  # OpenCode runner (NDJSON parser + free model discovery)
-│       ├── response.rs      # Failover logic, cooldowns, weight signals, review parsing, memory storage
+│       ├── task_init.rs     # Task setup: sidecar init, guard checks, worktree bootstrap
+│       ├── session.rs       # tmux session lifecycle: create, watch, kill
+│       ├── response_handler.rs  # Post-run: parse agent response, status resolution, comment posting
+│       ├── fallback.rs      # Failover logic: cooldowns, reroute, agent weight signals
+│       ├── response.rs      # Legacy response helpers (review parsing, memory storage)
 │       └── git_ops.rs       # Auto-commit, push, PR creation, PR override detection
 │
 ├── github/
@@ -1211,7 +1216,7 @@ Note: `orch board` manages GitHub Projects V2 boards. `orch project` manages the
 
 ## Parity Audit — Feature Gaps
 
-Last updated: 2026-03-01 (366 tests, ~98% parity)
+Last updated: 2026-03-03 (366 tests, ~98% parity)
 
 ### Completed
 
@@ -1314,8 +1319,8 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | `async-trait` | Async trait support | In use |
 | `urlencoding` | URL encoding for labels | In use |
 | `axum` | Webhook HTTP server | In use |
-| `teloxide` | Telegram bot | Future (Phase 3) |
-| `serenity` | Discord bot | Future (Phase 3) |
+| `teloxide` | Telegram bot | Not used — implemented via raw HTTP polling in `src/channels/telegram.rs` |
+| `serenity` | Discord bot | Not used — implemented via raw HTTP polling in `src/channels/discord.rs` |
 | `cargo-llvm-cov` | Coverage tracking in CI | CI tooling |
 
 ---
@@ -1326,9 +1331,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 | Issue | Title | Priority | Description |
 |-------|-------|----------|-------------|
-| #228/#283 | Decompose `engine/mod.rs` into focused submodules | **Done** | Extracted into `tick.rs`, `sync.rs`, `review.rs`, `cleanup.rs`. mod.rs is now the thin orchestrator (~800 lines). |
-| #257 | Extract LLM routing from `router.rs` into `engine/llm_router.rs` | Medium | The ~390-line LLM inference section (route_with_llm, call_router_llm, parse_llm_response, build_routing_prompt, skills catalog) is a self-contained unit mixed into router.rs. Extract into a dedicated `LlmRouter` struct in `src/engine/llm_router.rs`. |
-| #258 | Add `cargo-llvm-cov` coverage tracking to CI | Low | 366 tests but no coverage metrics. Add `cargo-llvm-cov` to `.github/workflows/ci.yml`, upload LCOV artifact on each PR. Makes refactoring (#228, #257) safe to validate. |
+| — | PR coverage comments | Low | `cargo-llvm-cov` runs in CI (`release.yml`) and uploads LCOV artifact, but coverage percentage is not surfaced on PRs. Add `codecov/codecov-action` or similar to comment on each PR with coverage delta. |
 
 ### Recently Closed
 
@@ -1352,17 +1355,17 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 ### Code Quality
 
 - [x] `src/engine/mod.rs` — decomposed into tick.rs, sync.rs, review.rs, cleanup.rs (#283)
-- [x] `src/engine/router.rs` — extracted LLM routing into `llm_router.rs` (#257); now 1,919 lines
+- [x] `src/engine/router.rs` — extracted LLM routing into `router/llm.rs` (`LlmRouter` struct) (#257)
 - [x] `src/engine/runner/mod.rs` — decomposed into task_init.rs, session.rs, response_handler.rs, fallback.rs (#295)
-- [ ] No test coverage tooling in CI (#258) — 366 tests exist but coverage metrics not tracked
+- [x] `cargo-llvm-cov` added to CI (#258) — runs on every push via `release.yml`, uploads LCOV artifact
 
 ### Feature Gaps (Low Priority)
 
 - [x] Skills sync from config (auto-clone skill repos) — see `src/engine/sync.rs:263` (PR #158)
 - [x] Slack channel integration — `src/channels/slack.rs` implemented and wired into engine
 
-### Open Issues
+### Recently Closed (continued)
 
 | Issue | Title | Root Cause |
 |-------|-------|-----------|
-| #317 | Webhook deduplication missing | `handle_webhook` ignores `x-github-delivery` header — `src/channels/github.rs:194` |
+| #317 | Webhook deduplication | Fixed: in-memory `x-github-delivery` dedup in `src/channels/github.rs` — 2h eviction window, capped at 10k entries |
