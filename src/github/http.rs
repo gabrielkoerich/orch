@@ -1082,10 +1082,11 @@ impl GhHttp {
             base,
         };
 
+        let auth = self.auth_header().await?;
         let response = self
             .client
             .post(&url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header(header::USER_AGENT, "orchestrator")
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -1150,10 +1151,11 @@ impl GhHttp {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/collaborators/{username}");
+        let auth = self.auth_header().await?;
         let resp = self
             .client
             .get(&url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -1362,11 +1364,12 @@ impl GhHttp {
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/merge");
         let payload = serde_json::json!({ "merge_method": "squash" });
+        let auth = self.auth_header().await?;
         let resp = self
             .client
             .put(&url)
             .json(&payload)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
