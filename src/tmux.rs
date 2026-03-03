@@ -46,6 +46,9 @@ impl TmuxManager {
 
     /// Create a new tmux session for a task and run a command in it.
     ///
+    /// Environment variables in `env_vars` are injected into the session via
+    /// `tmux new-session -e KEY=VALUE` — they are not written to disk.
+    ///
     /// The session is detached — the agent runs in the background.
     /// Returns the session name.
     ///
@@ -57,26 +60,19 @@ impl TmuxManager {
         task_id: &str,
         working_dir: &str,
         command: &str,
-        env: Option<&std::collections::HashMap<String, String>>,
+        env_vars: &[(&str, &str)],
     ) -> anyhow::Result<String> {
         let name = self.session_name(repo, task_id);
 
         let mut cmd = Command::new("tmux");
-        cmd.arg("new-session");
-        cmd.arg("-d"); // detached
-        cmd.arg("-s");
-        cmd.arg(&name);
-        cmd.arg("-c");
-        cmd.arg(working_dir);
+        cmd.args(["new-session", "-d", "-s", &name, "-c", working_dir]);
 
         // Inject non-secret environment variables into the new session if provided.
-        // For secrets, use set_session_env() after session creation.
-        if let Some(map) = env {
-            for (k, v) in map {
-                // tmux -e expects VAR=VAL
-                cmd.arg("-e");
-                cmd.arg(format!("{}={}", k, v));
-            }
+        // For secrets like GH_TOKEN, callers should use `set_session_env()` after
+        // session creation to avoid exposing them in process arguments.
+        for (key, value) in env_vars {
+            // tmux accepts -e KEY=VALUE to inject environment into the session.
+            cmd.arg("-e").arg(format!("{}={}", key, value));
         }
 
         cmd.arg(command);

@@ -26,6 +26,7 @@
 //! ```
 
 use anyhow::Context;
+use async_trait::async_trait;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -40,12 +41,13 @@ const TOKEN_REFRESH_BUFFER: Duration = Duration::from_secs(300); // Refresh 5 mi
 // async token resolution is fully integrated
 #[allow(dead_code)]
 /// Token resolver trait — abstracts over different auth methods.
+#[async_trait]
 pub trait TokenResolver: Send + Sync {
     /// Resolve a valid GitHub API token.
     ///
     /// For PAT, this returns the static token.
     /// For GitHub App, this exchanges/returns a cached installation token.
-    fn resolve_token(&self) -> anyhow::Result<String>;
+    async fn resolve_token(&self) -> anyhow::Result<String>;
 
     /// Check if authentication is properly configured.
     #[allow(dead_code)]
@@ -93,8 +95,9 @@ impl StaticTokenResolver {
     }
 }
 
+#[async_trait]
 impl TokenResolver for StaticTokenResolver {
-    fn resolve_token(&self) -> anyhow::Result<String> {
+    async fn resolve_token(&self) -> anyhow::Result<String> {
         if self.token.is_empty() {
             anyhow::bail!("GitHub token is empty (from {})", self.source);
         }
@@ -389,21 +392,10 @@ struct InstallationTokenResponse {
     expires_at: String,
 }
 
+#[async_trait]
 impl TokenResolver for GitHubAppResolver {
-    fn resolve_token(&self) -> anyhow::Result<String> {
-        // Try to get a cached token first
-        match self.get_token_sync() {
-            Ok(token) => Ok(token),
-            Err(_) => {
-                // We need to refresh, but we're in a sync context.
-                // This shouldn't happen in normal operation since the async
-                // runtime should have refreshed the token.
-                tracing::warn!(
-                    "GitHub App token expired in sync context - will refresh on next async call"
-                );
-                anyhow::bail!("GitHub App token expired - refresh required")
-            }
-        }
+    async fn resolve_token(&self) -> anyhow::Result<String> {
+        self.get_installation_token().await
     }
 
     fn health_check(&self) -> anyhow::Result<()> {
@@ -453,8 +445,9 @@ impl GhCliResolver {
     }
 }
 
+#[async_trait]
 impl TokenResolver for GhCliResolver {
-    fn resolve_token(&self) -> anyhow::Result<String> {
+    async fn resolve_token(&self) -> anyhow::Result<String> {
         Self::resolve().context("gh CLI auth token not available - run `gh auth login`")
     }
 
@@ -545,11 +538,12 @@ impl AutoResolver {
     }
 }
 
+#[async_trait]
 impl TokenResolver for AutoResolver {
-    fn resolve_token(&self) -> anyhow::Result<String> {
+    async fn resolve_token(&self) -> anyhow::Result<String> {
         // Try primary resolver first
         if let Some(ref primary) = self.primary {
-            return primary.resolve_token();
+            return primary.resolve_token().await;
         }
 
         // Try gh CLI fallback if enabled
@@ -605,12 +599,23 @@ pub fn create_resolver() -> anyhow::Result<Box<dyn TokenResolver>> {
 ///
 /// This tries the auto-resolver first. For GitHub App auth, it may fail
 /// if the token needs to be refreshed. Use the async resolver in new code.
+#[allow(dead_code)]
 pub fn resolve_token_sync() -> String {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tracing::error!(
+            "resolve_token_sync called from async context; use async resolve_token instead"
+        );
+        return String::new();
+    }
+
     match create_resolver() {
-        Ok(resolver) => match resolver.resolve_token() {
-            Ok(token) => token,
-            Err(e) => {
-                tracing::error!("Failed to resolve GitHub token: {}", e);
+        Ok(resolver) => match tokio::runtime::Runtime::new()
+            .ok()
+            .and_then(|rt| rt.block_on(resolver.resolve_token()).ok())
+        {
+            Some(token) => token,
+            None => {
+                tracing::error!("Failed to resolve GitHub token synchronously");
                 String::new()
             }
         },
@@ -621,21 +626,47 @@ pub fn resolve_token_sync() -> String {
     }
 }
 
+/// Resolver that always returns an error.
+pub struct ErrorResolver {
+    message: String,
+}
+
+impl ErrorResolver {
+    pub fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+#[async_trait]
+impl TokenResolver for ErrorResolver {
+    async fn resolve_token(&self) -> anyhow::Result<String> {
+        anyhow::bail!(self.message.clone())
+    }
+
+    fn health_check(&self) -> anyhow::Result<()> {
+        anyhow::bail!(self.message.clone())
+    }
+
+    fn auth_method(&self) -> &'static str {
+        "none"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn static_token_resolver_returns_token() {
+    #[tokio::test]
+    async fn static_token_resolver_returns_token() {
         let resolver = StaticTokenResolver::new("test_token_123".to_string(), "test");
-        assert_eq!(resolver.resolve_token().unwrap(), "test_token_123");
+        assert_eq!(resolver.resolve_token().await.unwrap(), "test_token_123");
         assert_eq!(resolver.auth_method(), "personal_access_token");
     }
 
-    #[test]
-    fn static_token_resolver_fails_on_empty() {
+    #[tokio::test]
+    async fn static_token_resolver_fails_on_empty() {
         let resolver = StaticTokenResolver::new(String::new(), "test");
-        assert!(resolver.resolve_token().is_err());
+        assert!(resolver.resolve_token().await.is_err());
         assert!(resolver.health_check().is_err());
     }
 
@@ -672,13 +703,13 @@ mod tests {
         assert_eq!(resolver.auth_method(), "gh_cli");
     }
 
-    #[test]
-    fn auto_resolver_fails_without_config() {
+    #[tokio::test]
+    async fn auto_resolver_fails_without_config() {
         let resolver = AutoResolver {
             primary: None,
             allow_gh_fallback: false,
         };
-        assert!(resolver.resolve_token().is_err());
+        assert!(resolver.resolve_token().await.is_err());
         assert!(resolver.health_check().is_err());
     }
 

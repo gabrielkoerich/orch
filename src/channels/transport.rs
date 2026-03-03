@@ -32,6 +32,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
+const MAX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
+
 /// A live connection between a channel thread and a tmux session.
 #[derive(Debug, Clone)]
 pub struct SessionBinding {
@@ -98,17 +100,31 @@ impl Transport {
 
     /// Push an output chunk to all subscribers of a task.
     pub async fn push_output(&self, task_id: &str, chunk: OutputChunk) {
-        let bindings = self.bindings.read().await;
-        if let Some(binding) = bindings.get(task_id) {
-            // Ignore send errors (no active receivers)
-            let _ = binding.output_tx.send(chunk.clone());
+        if chunk.content.is_empty() {
+            let bindings = self.bindings.read().await;
+            if let Some(binding) = bindings.get(task_id) {
+                let _ = binding.output_tx.send(chunk.clone());
+            }
+            return;
         }
-        // Update last_output cache regardless of subscribers so capture service
-        // can read the latest PTY-managed session content.
-        if !chunk.content.is_empty() {
-            let mut last = self.last_output.write().await;
-            let entry = last.entry(task_id.to_string()).or_insert_with(String::new);
-            entry.push_str(&chunk.content);
+
+        let parts = split_chunks(&chunk.content, MAX_OUTPUT_CHUNK_BYTES);
+        let last_index = parts.len().saturating_sub(1);
+
+        for (idx, part) in parts.into_iter().enumerate() {
+            let part_chunk = OutputChunk {
+                content: part,
+                is_final: chunk.is_final && idx == last_index,
+            };
+            let bindings = self.bindings.read().await;
+            if let Some(binding) = bindings.get(task_id) {
+                let _ = binding.output_tx.send(part_chunk.clone());
+            }
+            if !part_chunk.content.is_empty() {
+                let mut last = self.last_output.write().await;
+                let entry = last.entry(task_id.to_string()).or_insert_with(String::new);
+                entry.push_str(&part_chunk.content);
+            }
         }
     }
 
@@ -157,6 +173,27 @@ impl Transport {
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<TaskNotification> {
         self.notification_tx.subscribe()
     }
+}
+
+fn split_chunks(content: &str, max_bytes: usize) -> Vec<String> {
+    if content.len() <= max_bytes {
+        return vec![content.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let total = content.len();
+
+    while start < total {
+        let mut end = (start + max_bytes).min(total);
+        while end < total && !content.is_char_boundary(end) {
+            end += 1;
+        }
+        chunks.push(content[start..end].to_string());
+        start = end;
+    }
+
+    chunks
 }
 
 /// How an incoming message should be handled.

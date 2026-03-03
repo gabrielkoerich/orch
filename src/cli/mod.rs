@@ -10,7 +10,6 @@ use crate::channels::transport::Transport;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::tasks::TaskManager;
-use crate::github::cli_wrapper::Gh;
 use anyhow::Context;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -30,18 +29,21 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     let repo_value = match repo {
         Some(r) => r,
         None => {
-            // Try to detect from git remote using CLI wrapper
-            let gh = Gh::new([
-                "repo",
-                "view",
-                "--json",
-                "nameWithOwner",
-                "-q",
-                ".nameWithOwner",
-            ]);
-            match gh.output() {
+            // Try to detect from git remote (origin) by reading the remote URL
+            let git_remote = std::process::Command::new("git")
+                .args(["config", "--get", "remote.origin.url"])
+                .output_with_context();
+
+            match git_remote {
                 Ok(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                    let url = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if let Some((owner, repo)) = parse_github_slug(&url) {
+                        format!("{}/{}", owner, repo)
+                    } else {
+                        eprintln!("Could not parse repository from git remote: {}", url);
+                        eprintln!("Use --repo OWNER/REPO");
+                        std::process::exit(1);
+                    }
                 }
                 _ => {
                     eprintln!("Could not detect repository. Use --repo OWNER/REPO");

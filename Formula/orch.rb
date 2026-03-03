@@ -10,7 +10,6 @@ class Orch < Formula
   url "UNIVERSAL_URL_PLACEHOLDER"
   sha256 "UNIVERSAL_SHA256_PLACEHOLDER"
 
-  depends_on "gh"
   depends_on "tmux"
 
   def install
@@ -42,8 +41,9 @@ class Orch < Formula
         brew install --cask codex         # Codex
         brew install opencode             # OpenCode
 
-      GitHub CLI (installed automatically):
-        gh auth login   # authenticate if not already logged in
+      GitHub authentication:
+        Set a Personal Access Token in `GH_TOKEN`/`GITHUB_TOKEN` or run `orch auth check` to verify your configuration.
+        # Interactive `gh auth login` is supported as a legacy option but is not required by this formula.
     EOS
   end
 

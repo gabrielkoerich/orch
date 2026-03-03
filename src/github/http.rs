@@ -17,7 +17,7 @@ use reqwest::{header, Client, Response, StatusCode};
 use serde::Serialize;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 use urlencoding;
@@ -194,13 +194,20 @@ static METRIC_WAIT_SECS_TOTAL: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct GhHttp {
     client: Client,
-    token: String,
+    resolver: Arc<dyn auth::TokenResolver>,
 }
 
 impl GhHttp {
     /// Create a new client. Reads the GitHub token using the auth resolver.
     pub fn new() -> Self {
-        let token = auth::resolve_token_sync();
+        let resolver = match auth::create_resolver() {
+            Ok(resolver) => resolver,
+            Err(err) => {
+                tracing::error!("Failed to create GitHub token resolver: {}", err);
+                Box::new(auth::ErrorResolver::new(err.to_string()))
+            }
+        };
+        let resolver = Arc::from(resolver);
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
@@ -208,13 +215,12 @@ impl GhHttp {
             .build()
             .expect("failed to build reqwest client");
 
-        Self { client, token }
+        Self { client, resolver }
     }
 
     /// Create a new client with a custom token resolver.
     #[allow(dead_code)]
-    pub fn with_resolver(resolver: &dyn auth::TokenResolver) -> anyhow::Result<Self> {
-        let token = resolver.resolve_token()?;
+    pub fn with_resolver(resolver: Arc<dyn auth::TokenResolver>) -> anyhow::Result<Self> {
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
@@ -222,7 +228,7 @@ impl GhHttp {
             .build()
             .expect("failed to build reqwest client");
 
-        Ok(Self { client, token })
+        Ok(Self { client, resolver })
     }
 
     // ── Rate-limit helpers ────────────────────────────────────────
@@ -369,18 +375,20 @@ impl GhHttp {
 
     // ── Low-level HTTP helpers ────────────────────────────────────
 
-    fn auth_header(&self) -> String {
-        format!("Bearer {}", self.token)
+    async fn auth_header(&self) -> anyhow::Result<String> {
+        let token = self.resolver.resolve_token().await?;
+        Ok(format!("Bearer {}", token))
     }
 
     /// GET request, returns deserialized JSON.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .get(url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -399,10 +407,11 @@ impl GhHttp {
     async fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .get(url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -425,11 +434,12 @@ impl GhHttp {
     ) -> anyhow::Result<T> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .get(url)
             .query(query)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -448,11 +458,12 @@ impl GhHttp {
     async fn post_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .post(url)
             .json(body)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -481,11 +492,12 @@ impl GhHttp {
     async fn patch_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .patch(url)
             .json(body)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -504,10 +516,11 @@ impl GhHttp {
     async fn delete(&self, url: &str) -> anyhow::Result<StatusCode> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .delete(url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -535,12 +548,13 @@ impl GhHttp {
         let mut is_first = true;
 
         loop {
+            let auth_header = self.auth_header().await?;
             let resp = if is_first {
                 is_first = false;
                 self.client
                     .get(url)
                     .query(query)
-                    .header(header::AUTHORIZATION, self.auth_header())
+                    .header(header::AUTHORIZATION, auth_header.clone())
                     .header(header::ACCEPT, "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", "2022-11-28")
                     .send()
@@ -549,7 +563,7 @@ impl GhHttp {
                 let u = next_url.as_ref().unwrap();
                 self.client
                     .get(u)
-                    .header(header::AUTHORIZATION, self.auth_header())
+                    .header(header::AUTHORIZATION, auth_header)
                     .header(header::ACCEPT, "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", "2022-11-28")
                     .send()
@@ -587,12 +601,13 @@ impl GhHttp {
     ) -> anyhow::Result<serde_json::Value> {
         Self::proactive_throttle_graphql().await;
         Self::check_graphql_backoff()?;
+        let auth_header = self.auth_header().await?;
         let body = serde_json::json!({ "query": query });
         let mut req = self
             .client
             .post(format!("{GITHUB_API}/graphql"))
             .json(&body)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
 
@@ -673,7 +688,7 @@ impl GhHttp {
         resolver.health_check()?;
 
         // Then verify the token actually works by making an API call
-        let token = resolver.resolve_token()?;
+        let token = resolver.resolve_token().await?;
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .timeout(Duration::from_secs(30))
@@ -992,10 +1007,11 @@ impl GhHttp {
             base,
         };
 
+        let auth_header = self.auth_header().await?;
         let response = self
             .client
             .post(&url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header(header::USER_AGENT, "orchestrator")
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -1060,10 +1076,11 @@ impl GhHttp {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/collaborators/{username}");
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .get(&url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -1100,6 +1117,167 @@ impl GhHttp {
         Ok(())
     }
 
+    /// Link an issue to a branch using GraphQL.
+    ///
+    /// Creates a "Development" sidebar link in GitHub that connects the issue
+    /// to the branch, similar to `gh issue develop`.
+    ///
+    /// # Arguments
+    /// * `repo` - Repository in "owner/repo" format
+    /// * `issue_number` - The issue number to link
+    /// * `branch` - The branch name to link the issue to
+    ///
+    /// Returns the linked branch ID on success.
+    pub async fn link_issue_to_branch(
+        &self,
+        repo: &str,
+        issue_number: u64,
+        branch: &str,
+    ) -> anyhow::Result<String> {
+        let parts: Vec<&str> = repo.split('/').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("invalid repo format: expected 'owner/repo', got '{}'", repo);
+        }
+        let (owner, repo_name) = (parts[0], parts[1]);
+
+        // First, get the repository and issue node IDs
+        let query = format!(
+            r#"{{
+                repository(owner: "{}", name: "{}") {{
+                    id
+                    issue(number: {}) {{
+                        id
+                    }}
+                }}
+            }}"#,
+            owner, repo_name, issue_number
+        );
+
+        let result = self.graphql(&query).await?;
+
+        // Repository ID fetched but not directly needed for createLinkedBranch mutation
+        // when using branchName with the issue context
+        let _repo_id = result
+            .pointer("/data/repository/id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("failed to get repository node ID"))?;
+
+        let issue_id = result
+            .pointer("/data/repository/issue/id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("failed to get issue node ID"))?;
+
+        // Check if a branch with this name already exists
+        let branch_query = format!(
+            r#"{{
+                repository(owner: "{}", name: "{}") {{
+                    ref(qualifiedName: "refs/heads/{}") {{
+                        id
+                        name
+                    }}
+                }}
+            }}"#,
+            owner, repo_name, branch
+        );
+
+        let branch_result = self.graphql(&branch_query).await?;
+        let branch_id = branch_result
+            .pointer("/data/repository/ref/id")
+            .and_then(|v| v.as_str());
+
+        // If branch doesn't exist yet, we can't link it - this is fine for new PRs
+        // where the branch was just pushed
+        if branch_id.is_none() {
+            tracing::debug!(
+                repo,
+                issue_number,
+                branch,
+                "branch not found for linking, may not be pushed yet"
+            );
+            // Return a placeholder - the link will be created when the PR is opened
+            return Ok(format!("unlinked:{}", branch));
+        }
+
+        // Use createLinkedBranch mutation to link the issue to the branch
+        let branch_name_arg = format!(r#"branchName: "{}""#, branch);
+        let mutation = format!(
+            r#"mutation {{
+                createLinkedBranch(input: {{
+                    issueId: "{}"
+                    {}
+                }}) {{
+                    linkedBranch {{
+                        id
+                        ref {{
+                            name
+                        }}
+                    }}
+                }}
+            }}"#,
+            issue_id, branch_name_arg
+        );
+
+        let link_result = self.graphql(&mutation).await;
+
+        match link_result {
+            Ok(result) => {
+                let linked_branch_id = result
+                    .pointer("/data/createLinkedBranch/linkedBranch/id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                if let Some(id) = linked_branch_id {
+                    tracing::info!(
+                        repo,
+                        issue_number,
+                        branch,
+                        "linked issue to branch via GraphQL API"
+                    );
+                    Ok(id)
+                } else {
+                    // Branch may already be linked - check for errors
+                    let errors = result
+                        .get("errors")
+                        .and_then(|e| e.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    if errors.iter().any(|e| {
+                        e.get("message")
+                            .and_then(|m| m.as_str())
+                            .map(|m| m.contains("already"))
+                            .unwrap_or(false)
+                    }) {
+                        tracing::debug!(
+                            repo,
+                            issue_number,
+                            branch,
+                            "issue already linked to branch"
+                        );
+                        Ok(format!("already_linked:{}", branch))
+                    } else {
+                        anyhow::bail!("failed to link issue to branch: {:?}", result)
+                    }
+                }
+            }
+            Err(e) => {
+                // Check if it's a "already exists" type error
+                let err_str = format!("{}", e);
+                if err_str.contains("already") || err_str.contains("existing") {
+                    tracing::debug!(
+                        repo,
+                        issue_number,
+                        branch,
+                        "issue already linked to branch (error check)"
+                    );
+                    Ok(format!("already_linked:{}", branch))
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     /// Merge a PR using the REST API (squash merge).
     pub async fn merge_pr(
         &self,
@@ -1111,11 +1289,12 @@ impl GhHttp {
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/merge");
         let payload = serde_json::json!({ "merge_method": "squash" });
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .put(&url)
             .json(&payload)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -1383,7 +1562,7 @@ pub fn rate_limit_metrics() -> RateLimitMetrics {
 /// - GitHub App authentication (JWT-based with installation tokens)
 /// - Legacy gh CLI fallback (if enabled via config)
 #[allow(dead_code)]
-fn resolve_token() -> String {
+pub fn resolve_token() -> String {
     auth::resolve_token_sync()
 }
 
