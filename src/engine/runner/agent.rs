@@ -126,24 +126,12 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         tracing::warn!("gh auth token not available; agents may not have GitHub access");
     }
 
-<<<<<<< HEAD
-    // Resolve the GitHub token and prepare environment variables to inject
-    // into the tmux session. Do NOT write the token to disk or embed it in
-    // the runner script.
-    let mut env_map = std::collections::HashMap::new();
-    if let Some(token) = gh_token {
-        env_map.insert("GH_TOKEN".to_string(), token);
-    }
-    env_map.insert("GIT_AUTHOR_NAME".to_string(), inv.git_author_name.clone());
-    env_map.insert(
-=======
     // Prepare non-secret environment map for tmux session.
     // GH_TOKEN is injected via set_session_env after session creation to avoid
     // exposing it in process arguments or on-disk artifacts.
-    let mut env = std::collections::HashMap::new();
-    env.insert("GIT_AUTHOR_NAME".to_string(), inv.git_author_name.clone());
-    env.insert(
->>>>>>> gh-task-389-add-tmux-session-env-helpers-and-avoid-e
+    let mut env_map = std::collections::HashMap::new();
+    env_map.insert("GIT_AUTHOR_NAME".to_string(), inv.git_author_name.clone());
+    env_map.insert(
         "GIT_COMMITTER_NAME".to_string(),
         inv.git_author_name.clone(),
     );
