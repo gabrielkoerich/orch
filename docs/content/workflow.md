@@ -69,16 +69,16 @@ new → routed → in_progress → done → in_review → (merged externally)
 
 The orchestrator creates worktrees before launching agents. Agents do NOT create worktrees themselves.
 
-**Worktree path:** `~/.orchestrator/worktrees/<project>/gh-task-<issue>-<slug>`
+**Worktree path:** `~/.orch/worktrees/<project>/<branch>/`
 
 **Steps:**
 1. `gh issue develop <issue> --base main --name <branch>` — registers branch with GitHub
 2. `git branch <branch> main` — creates branch from main
-3. `git worktree add ~/.orchestrator/worktrees/<project>/<branch> <branch>` — creates worktree
+3. `git worktree add ~/.orch/worktrees/<project>/<branch> <branch>` — creates worktree
 4. Agent runs inside the worktree directory (`PROJECT_DIR` is set to worktree)
 
 **After agent finishes:**
-- Orchestrator pushes the branch (`git push -u origin <branch>`) if there are unpushed commits
+- Orchestrator pushes the branch (`git push -u origin <branch>`) if there are unpushed commits. The runner injects `GH_TOKEN` into the spawned runner environment so agents do not need to authenticate with `gh` themselves and agents should avoid calling GitHub directly.
 - Agent should NOT run `git push` itself
 
 ## Agent Invocation

@@ -10,11 +10,11 @@ Once routed, agents run in full agentic mode with tool access:
 - **Codex**: `-q` flag (quiet non-interactive mode), `--json`, system+agent prompt combined
 - **OpenCode**: `opencode run --format json` with combined prompt
 
-Agents execute inside `$PROJECT_DIR` (the directory you ran `orchestrator` from), so they can read project files, edit code, and run commands.
+Agents execute inside an isolated git worktree created for the task (not your main repo), so they can read project files, edit code, and run commands.
 
 ## Agent Output
 
-The agent writes a JSON file to `.orchestrator/output-{task_id}.json`:
+The agent writes a JSON file to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json` and the orchestrator also stores a sidecar at `~/.orch/state/{repo}/tasks/{id}/sidecar.json`:
 
 ```json
 {
@@ -47,7 +47,7 @@ export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Orchestrator sources this file before launching agents, so any tool on your PATH will be available to agents.
+The orchestrator sources this file before launching agents, so any tool on your PATH will be available to agents when the runner is configured to inherit the shell environment.
 
 **Option 2: Default fallback**
 
@@ -62,7 +62,7 @@ If `~/.path` doesn't exist, orchestrator automatically adds common paths:
 
 ## Safety Rules
 
-Agents are constrained by rules in the system prompt:
+Agents are constrained by rules in the system prompt and by runner-enforced tool allowlists/denylists:
 
 - **No `rm`**: `--disallowedTools` blocks `rm` — agents must use `trash` (macOS) or `trash-put` (Linux)
 - **No commits to main**: agents must always work in feature branches
@@ -74,7 +74,7 @@ Agents are constrained by rules in the system prompt:
 
 The orchestrator creates worktrees before launching agents. Agents do NOT create worktrees themselves.
 
-**Path:** `~/.orchestrator/worktrees/<project>/gh-task-<issue>-<slug>` (or `task-<id>-<slug>` without an issue)
+**Path:** `~/.orch/worktrees/<project>/<branch>/` — worktrees are always placed under `~/.orch/worktrees` with a project/branch layout. Worktrees live in the orchestrator home directory (`ORCH_HOME`, default `~/.orch`) and are safe to remove by the cleanup process once branches are merged.
 
 **Steps:**
 1. `gh issue develop <issue> --base main --name <branch>` — registers branch with GitHub
@@ -82,7 +82,7 @@ The orchestrator creates worktrees before launching agents. Agents do NOT create
 3. `git worktree add <path> <branch>` — creates worktree
 4. Agent runs inside the worktree directory
 
-After agent finishes, orchestrator pushes the branch if there are unpushed commits.
+After an agent finishes, the orchestrator pushes the branch if there are unpushed commits. Note: the runner injects `GH_TOKEN` into the spawned runner environment so agents do not need to authenticate with `gh` themselves and agents are not expected to call GitHub directly. Attribution footers (for example: `Created by claude[bot] via Orch`) are added to issue and PR comments so it's clear which agent produced the content.
 
 ## Context Enrichment
 
@@ -97,7 +97,7 @@ Every agent receives a rich context built from multiple sources:
 | Last error | `tasks.yml` `.last_error` | On retries |
 | GitHub issue comments | GitHub API | If issue linked |
 | Prior run context | `contexts/task-{id}.md` | On retries |
-| Tool call summaries | `.orchestrator/tools-{id}.json` | On retries |
+| Tool call summaries | `.orch/tools-{id}.json` | On retries |
 | Repo tree | `git ls-files` | Always |
 | Project instructions | `CLAUDE.md` + `AGENTS.md` + `README.md` | If files exist |
 | Skills docs | `skills/{id}/SKILL.md` | If skills selected |
@@ -108,17 +108,25 @@ Every agent receives a rich context built from multiple sources:
 
 When a task fails:
 1. Error is recorded in `last_error` and `history`
-2. Task is blocked or set to `needs_review`
-3. A structured comment is posted on the linked GitHub issue
-4. A red `blocked` label is applied to the issue
-5. `@owner` is tagged for attention
+2. After repeated failures the task is moved to `needs_review` (human attention) instead of being permanently blocked; the orchestrator also removes any forced `agent:*` label so an owner can reassign or inspect the task. The change in behavior ensures tasks don't remain stuck with a forced agent after owner intervention is needed.
+3. A structured comment is posted on the linked GitHub issue with an attribution footer (for example: `Created by claude[bot] via Orch`) so it's clear which agent produced the comment
+4. A `needs_review` label is applied to the issue and the configured review owner is notified
 
-**Retry loop detection**: if the same error repeats 3 times (4+ attempts), the task is permanently blocked instead of retrying.
+**Retry loop detection**: if the same error repeats 3 times (4+ attempts), the task is moved to `needs_review` to avoid wasting cycles.
 
 **Max attempts**: default 10 per task (configurable via `workflow.max_attempts`).
 
 ```bash
 orch task retry <id>       # reset any task to new
-orch task unblock <id>     # reset a blocked task to new
-orch task unblock all      # reset all blocked tasks
+orch task unblock <id>     # reset a needs_review/stalled task to new
+orch task unblock all      # reset all needs_review/blocked tasks
 ```
+
+## Codex Sandbox Notes
+
+Codex supports multiple sandbox configurations. When a workspace-write sandbox is required the runner enables networking and inherits the shell environment to allow tools like `bun` and language runtimes to work. Recommended settings when enabling workspace-write sandboxing:
+
+- `sandbox_workspace_write.network_access=true`
+- `shell_environment_policy.inherit=all`
+
+These are configured by the orchestrator when spawning the Codex runner — do not rely on agents to set these themselves.

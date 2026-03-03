@@ -7,25 +7,17 @@ weight = 11
 ## Setup
 
 ```bash
-git clone https://github.com/gabrielkoerich/orchestrator.git
-cd orchestrator
-bats tests          # run tests
-just                # list available commands
+git clone https://github.com/gabrielkoerich/orch.git
+cd orch
+cargo test          # run tests (Rust unit/integration tests)
+just                # list available commands (project Make-like helper)
 ```
 
 Requires: `yq`, `jq`, `just`, `python3`, `rg`, `fd`, `bats`.
 
 ## Tests
 
-Tests use the [bats](https://github.com/bats-core/bats-core) framework:
-
-```bash
-bats tests                              # run all tests
-bats tests --filter "review"            # run matching tests
-bats tests/orchestrator.bats            # run specific file
-```
-
-All tests mock external tools (`gh`, `codex`, `claude`) to prevent real API calls. The `gh` mock (`tests/gh_mock.sh`) simulates GitHub's REST and GraphQL APIs using a local JSON file for state.
+Run unit and integration tests with `cargo test`. Integration tests mock external agents and the `gh` CLI where appropriate. See `tests/` for fixtures and mocked responses.
 
 ## ShellCheck / security audit
 
@@ -35,12 +27,11 @@ Bash treats backticks (`` `like this` ``) as command substitution inside double-
 
 ## Release Pipeline
 
-1. Push to `main` → CI runs tests
-2. Auto-tag from conventional commits (`feat:` = minor, `fix:` = patch)
-3. Generate changelog
-4. Create GitHub release
-5. Update `gabrielkoerich/homebrew-tap` Formula with new URL + SHA256
-6. `brew upgrade orchestrator` picks up the new version
+1. Push to `main` → CI runs tests and linters
+2. CI auto-tags from conventional commits
+3. CI generates changelog and creates GitHub release
+4. CI updates `gabrielkoerich/homebrew-tap` Formula and publishes the Homebrew package
+5. Users `brew upgrade orch` to install the new version
 
 ### Conventional Commits
 

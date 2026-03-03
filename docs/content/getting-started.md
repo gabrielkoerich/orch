@@ -7,18 +7,18 @@ weight = 1
 ## Install
 
 ```bash
-brew tap gabrielkoerich/tap
-brew install orchestrator
+brew tap gabrielkoerich/homebrew-tap
+brew install orch
 ```
 
 All dependencies (`yq`, `jq`, `just`, `python3`, `rg`, `fd`) are installed automatically.
 
 ### Agent CLIs
 
-Install at least one:
+Install at least one agent CLI:
 ```bash
-brew install --cask claude-code   # Claude
-brew install --cask codex         # Codex
+brew install --cask claude-code   # Claude (if available)
+brew install --cask codex         # Codex (if available)
 brew install opencode             # OpenCode
 ```
 
@@ -44,13 +44,13 @@ orch task add "title" -p owner/repo  # add a task to that project
 orch start                           # serve loop picks it up
 ```
 
-Bare clones live at `~/.orchestrator/projects/<owner>/<repo>.git`. Agents always work in worktrees — never in the main clone.
+Bare clones live at `~/.orch/projects/<owner>/<repo>.git`. Agents always work in worktrees — never in the main clone. Worktrees are under `~/.orch/worktrees/<project>/<branch>/`.
 
-`orch` is a short alias for `orchestrator` — both work interchangeably.
+`orch` is a short alias for `orchestrator` — use `orch` for the lightweight CLI.
 
 ## Files
 
-All runtime state lives in `~/.orchestrator/` (`ORCH_HOME`):
+All runtime state lives in `~/.orch/` (`ORCH_HOME`):
 
 | File | Description |
 |------|-------------|
@@ -62,7 +62,7 @@ All runtime state lives in `~/.orchestrator/` (`ORCH_HOME`):
 | `contexts/` | Persisted context files per task/profile |
 | `projects/` | Bare clones added via `project add` |
 | `worktrees/` | Agent worktrees (`<project>/<branch>/`) |
-| `.orchestrator/` | Runtime state (pid, logs, locks, output, tool history, prompts) |
+| `.orch/` | Runtime state (pid, logs, locks, output, tool history, prompts) |
 
 Source files:
 
@@ -82,8 +82,8 @@ Source files:
 
 1. **Add a task** to `tasks.yml` (or via `orchestrator task add`).
 2. **Route the task** with an LLM that chooses executor + builds a specialized profile and selects skills.
-3. **Run the task** with the chosen executor in agentic mode. The agent runs inside `$PROJECT_DIR` with full tool access.
-4. **Output**: the agent writes results to `.orchestrator/output-{task_id}.json`.
+3. **Run the task** with the chosen executor in agentic mode. The agent runs inside the worktree (`PROJECT_DIR`) with controlled tool access.
+4. **Output**: the agent writes results to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json` and the orchestrator also writes a machine-side sidecar (`~/.orch/state/{repo}/tasks/{id}/sidecar.json`).
 5. **Review**: if enabled, a different agent reviews the PR and posts a GitHub review.
 6. **Delegation**: if the agent returns `delegations`, child tasks are created and the parent is blocked until children finish.
 7. **Error handling**: if the agent fails or returns `blocked`, the error is commented on the GitHub issue with a `blocked` label.

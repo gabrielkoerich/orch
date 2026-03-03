@@ -44,8 +44,8 @@ new → routed → in_progress → done → in_review
 - **in_progress** — agent is running
 - **done** — agent completed successfully (no open PR)
 - **in_review** — agent completed and a PR is open (triggers review agent if enabled)
-- **blocked** — agent hit a blocker, crashed, or exceeded max attempts
-- **needs_review** — agent needs human help, or review agent requested changes
+- **blocked** — agent hit a blocker or crashed and requires human intervention (rare)
+- **needs_review** — agent needs human help, or review agent requested changes. After repeated failures the engine moves tasks to `needs_review` and removes any forced `agent:*` label so an owner can reassign.
 
 ## Delegation & Decomposition
 

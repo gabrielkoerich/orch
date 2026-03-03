@@ -4,7 +4,7 @@ description = "GitHub Issues as the native task backend"
 weight = 8
 +++
 
-Tasks are stored directly in **GitHub Issues** — no local database, no sync layer. The orchestrator reads and writes GitHub via the `gh` CLI.
+Tasks are stored in GitHub Issues (when `gh.enabled: true`) and mirrored to a local sidecar for runtime fields. The orchestrator centralizes GitHub API calls via the server and uses the `gh` CLI or REST client internally.
 
 ## Setup
 
@@ -132,4 +132,4 @@ Owner comments can also start with a slash command on the **first line** (case-i
 
 - The repo is resolved from `config.yml` or `gh repo view`
 - Tasks with `no_gh` or `local-only` labels are skipped
-- Agents never call GitHub directly; the orchestrator handles all API calls so it can back off safely
+- Agents never call GitHub directly; the orchestrator handles all API calls so it can back off safely. The runner injects `GH_TOKEN` at spawn time for convenience, but agents should not perform repository writes or API calls — the orchestrator performs these actions to maintain a single place for backoff and rate-limit handling.

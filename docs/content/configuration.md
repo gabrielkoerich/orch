@@ -4,7 +4,7 @@ description = "Config reference and per-project overrides"
 weight = 7
 +++
 
-All runtime configuration lives in `~/.orchestrator/config.yml`.
+All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless overridden via the `ORCH_HOME` environment variable.
 
 ## Config Reference
 
@@ -45,7 +45,7 @@ All runtime configuration lives in `~/.orchestrator/config.yml`.
 
 ## Per-Project Config
 
-Drop a `.orchestrator.yml` in your project root to override global config:
+Drop a `.orch.yml` or `.orchestrator.yml` in your project root to override global config (project-level keys take precedence over global).
 
 ```yaml
 # ~/projects/my-app/.orchestrator.yml
@@ -62,14 +62,14 @@ router:
 
 - Project config is deep-merged with global config (project wins)
 - The server restarts automatically when `.orchestrator.yml` changes
-- `gh_project_apply.sh` writes to global config, not the project overlay
+- `gh_project_apply.sh` / `orch project info --fix` writes project IDs into the global config overlay when run from the server context
 
 ## Skills
 
 Skills extend agent capabilities with specialized knowledge:
 
 ```yaml
-# ~/.orchestrator/skills.yml
+# ~/.orch/skills.yml (or ~/.orchestrator/skills.yml for backwards compatibility)
 repositories:
   - url: "https://github.com/user/skills-repo"
     commit: "abc123"

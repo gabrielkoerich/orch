@@ -1,14 +1,14 @@
-+++
+++
 title = "CLI Reference"
 description = "Commands, namespaces, and background service"
 weight = 6
-+++
+++ 
 
 ## Namespaces
 
 ```bash
 orch task list|tree|add|plan|route|run|next|poll|retry|unblock|agent|stream|watch|unlock
-orch service start|stop|restart|info|install|uninstall
+orch service start|stop|restart|status|install|uninstall
 orch gh pull|push|sync
 orch project info|create|list|add
 orch job add|list|remove|enable|disable|tick
@@ -17,23 +17,23 @@ orch skills list|sync
 
 Top-level shortcuts: `init`, `chat`, `status`, `dashboard`, `log`, `start`, `stop`, `restart`, `info`, `agents`, `version`.
 
-`orch` is a short alias for `orchestrator`.
+ `orch` is a short alias for `orchestrator`.
 
 ## Task Commands
 
 ```bash
-orch task add "title" "body" "labels"  # create a task
+orch task add "title" --body "body" --labels "comma,separated"  # create a task
 orch task add "title" -p owner/repo   # create a task for a managed project
-orch task plan "title" "body"          # create a decompose task
+orch task plan "title" "body"          # create a plan/decompose task
 orch task list                          # list tasks for current project
 orch task tree                          # show parent-child tree
 orch task route <id>                    # route a task to an agent
 orch task run <id>                      # run a specific task
 orch task next                          # route + run next pending task
-orch task poll                          # process all pending tasks
+orch task poll                          # process all pending tasks (runs routed tasks)
 orch task retry <id>                    # reset task to new
-orch task unblock <id>                  # reset blocked task to new
-orch task unblock all                   # reset all blocked tasks
+orch task unblock <id>                  # reset a needs_review/stalled task to new
+orch task unblock all                   # reset all needs_review/blocked tasks
 orch task agent <id> <agent>            # manually set task agent
 orch task watch                         # watch task status changes
 orch task unlock                        # clear stale locks
@@ -50,16 +50,16 @@ orch info                 # show server status (PID, uptime)
 
 With Homebrew:
 ```bash
-brew services start orchestrator    # start as launchd service
-brew services stop orchestrator
-brew services restart orchestrator
+brew services start orch    # start as launchd service
+brew services stop orch
+brew services restart orch
 ```
 
-The server runs `serve.sh` which ticks every 10 seconds:
-- Polls for new/routed tasks
-- Checks for stuck tasks
-- Runs due scheduled jobs
-- Syncs with GitHub (every 60s)
+The server runs a background service which ticks every `engine.tick_interval` seconds (default 10s):
+- Polls for new/routed tasks and runs them
+- Checks for stuck tasks and recovers or marks `needs_review`
+- Runs due scheduled jobs (per-project)
+- Syncs with GitHub (sync interval configurable; webhook mode preferred)
 
 Install as a launchd service (auto-starts on login):
 ```bash
@@ -73,7 +73,7 @@ orch service uninstall    # remove launchd plist
 orch chat
 ```
 
-Interactive mode with readline support. Talk to the orchestrator, add tasks, check status. Chat tasks run in the current `PROJECT_DIR` without worktrees.
+ Interactive mode with readline support. Talk to the orchestrator, add tasks, check status. Chat tasks run in the current `PROJECT_DIR` without worktrees.
 
 ## Dashboard & Status
 
@@ -110,12 +110,12 @@ orch agents                 # list available agents and their status
 
 | Log | Location |
 |-----|----------|
-| Server log | `~/.orchestrator/state/orchestrator.log` |
-| Server archive | `~/.orchestrator/state/orchestrator.archive.log` |
-| Jobs log | `~/.orchestrator/state/jobs.log` |
-| Per-task output | `~/.orchestrator/state/output-{id}.json` |
-| Per-task tools | `~/.orchestrator/state/tools-{id}.json` |
-| Per-task prompts | `~/.orchestrator/state/prompt-{id}.md` |
-| Task context | `~/.orchestrator/contexts/task-{id}.md` |
-| Brew stdout | `/opt/homebrew/var/log/orchestrator.log` |
-| Brew stderr | `/opt/homebrew/var/log/orchestrator.error.log` |
+| Server log | `~/.orch/state/orch.log` |
+| Server archive | `~/.orch/state/orch.archive.log` |
+| Jobs log | `~/.orch/state/jobs.log` |
+| Per-task output | `~/.orch/state/output-{id}.json` |
+| Per-task tools | `~/.orch/state/tools-{id}.json` |
+| Per-task prompts | `~/.orch/state/prompt-{id}.md` |
+| Task context | `~/.orch/contexts/task-{id}.md` |
+| Brew stdout | `/opt/homebrew/var/log/orch.log` |
+| Brew stderr | `/opt/homebrew/var/log/orch.error.log` |
