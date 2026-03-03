@@ -1566,7 +1566,6 @@ pub fn resolve_token() -> String {
     auth::resolve_token_sync()
 }
 
-
 /// Re-export auth module types for convenience.
 pub use super::auth::TokenResolver;
 

@@ -115,7 +115,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     // that still rely on interactive `gh` sessions.
     let gh_token = if let Ok(resolver) = crate::github::auth::create_resolver() {
         // Try primary resolver without falling back to gh CLI
-        match resolver.resolve_token() {
+        match resolver.resolve_token().await {
             Ok(t) if !t.is_empty() => Some(t),
             _ => crate::github::cli_wrapper::resolve_token(),
         }
