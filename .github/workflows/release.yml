@@ -49,6 +49,13 @@ jobs:
           name: coverage-lcov
           path: lcov.info
 
+      - name: Report coverage on PR
+        uses: romeovs/lcov-reporter-action@v0.4.0
+        if: github.event_name == 'pull_request'
+        with:
+          lcov-file: lcov.info
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
   secrets:
     runs-on: ubuntu-latest
     steps:
