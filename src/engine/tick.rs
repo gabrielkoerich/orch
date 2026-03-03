@@ -364,12 +364,27 @@ pub(crate) async fn tick_dispatch_tasks(
                             .unwrap_or(true);
                         tracing::info!(task_id, enable_review, "review gate check");
                         if enable_review {
-                            // Sidecar-based guard: prevents double-dispatch across tick invocations
-                            if sidecar::get(&task_id, "review_started").unwrap_or_default() == "true" {
-                                tracing::debug!(task_id, "review agent already started, skipping duplicate");
-                            } else if let Err(e) = sidecar::set(&task_id, &["review_started=true".to_string()]) {
-                                tracing::warn!(task_id, err = %e, "failed to set review_started guard, skipping review");
-                            } else {
+                            // Sidecar-based guard: prevents double-dispatch across tick invocations.
+                            // compare_and_swap holds the exclusive file lock across both the read
+                            // and write, eliminating the TOCTOU window that existed when get() and
+                            // set() were two separate calls.
+                            let claimed = match sidecar::compare_and_swap(
+                                &task_id,
+                                "review_started",
+                                "",
+                                "true",
+                            ) {
+                                Ok(false) => {
+                                    tracing::debug!(task_id, "review agent already started, skipping duplicate");
+                                    false
+                                }
+                                Err(e) => {
+                                    tracing::warn!(task_id, err = %e, "failed to set review_started guard, skipping review");
+                                    false
+                                }
+                                Ok(true) => true, // claimed — proceed to dispatch
+                            };
+                            if claimed {
                                 // Transition to InReview — this IS the guard against duplicates
                                 if let Err(e) = backend
                                     .update_status(
@@ -380,7 +395,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                 {
                                     tracing::warn!(task_id, err = %e, "failed to transition to InReview");
                                     // Clear the guard since we couldn't transition
-                                    let _ = sidecar::set(&task_id, &["review_started=false".to_string()]);
+                                    let _ = sidecar::set(&task_id, &["review_started=".to_string()]);
                                 } else {
                                     let backend_clone = backend.clone();
                                     let tmux_clone = tmux.clone();
@@ -432,7 +447,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                         }
                                         // Clear the review_started guard so the task can be reviewed again
                                         // if it returns to NeedsReview status
-                                        if let Err(e) = sidecar::set(&task_id_for_review, &["review_started=false".to_string()]) {
+                                        if let Err(e) = sidecar::set(&task_id_for_review, &["review_started=".to_string()]) {
                                             tracing::warn!(task_id = task_id_for_review, err = %e, "failed to clear review_started guard");
                                         }
                                     }));
