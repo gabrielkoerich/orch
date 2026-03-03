@@ -424,7 +424,10 @@ mod tests {
         assert_eq!(TaskStatus::Done.as_str(), "done");
 
         assert_eq!(TaskStatus::from_str("new"), Some(TaskStatus::New));
-        assert_eq!(TaskStatus::from_str("in_progress"), Some(TaskStatus::InProgress));
+        assert_eq!(
+            TaskStatus::from_str("in_progress"),
+            Some(TaskStatus::InProgress)
+        );
         assert_eq!(TaskStatus::from_str("invalid"), None);
     }
 }
