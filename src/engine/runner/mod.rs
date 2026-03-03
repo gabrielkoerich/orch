@@ -83,11 +83,35 @@ impl TaskRunner {
             "starting task execution"
         );
 
-        // Check task guards; returns None if task should be skipped.
+        // Check task guards; returns outcome indicating whether to proceed.
         // Set a sidecar marker so run_with_context knows not to post stale results.
         let attempts = match task_init::check_guards(task_id, &self.repo).await {
-            Ok(Some(a)) => a,
-            Ok(None) => {
+            Ok(task_init::GuardOutcome::Proceed(a)) => a,
+            Ok(task_init::GuardOutcome::Skip) => {
+                let _ = sidecar::set(task_id, &["guard_skipped=true".to_string()]);
+                return Ok(());
+            }
+            Ok(task_init::GuardOutcome::MaxAttempts) => {
+                // Update GitHub status to NeedsReview so engine stops re-dispatching.
+                if let Some(b) = backend {
+                    let id = crate::backends::ExternalId(task_id.to_string());
+                    let _ = b
+                        .update_status(&id, crate::backends::Status::NeedsReview)
+                        .await;
+
+                    // If this was label-forced to a specific agent, remove the agent label
+                    // so that /retry can route to a different agent instead of looping.
+                    let route_reason = sidecar::get(task_id, "route_reason").unwrap_or_default();
+                    if route_reason.starts_with("label agent:") {
+                        let agent_label = route_reason.trim_start_matches("label ");
+                        let gh = crate::github::http::GhHttp::new();
+                        if let Err(e) = gh.remove_label(&self.repo, task_id, agent_label).await {
+                            tracing::warn!(task_id, label = agent_label, err = %e, "failed to remove agent label after max attempts");
+                        } else {
+                            tracing::info!(task_id, label = agent_label, "removed forced agent label after max attempts — /retry will use free routing");
+                        }
+                    }
+                }
                 let _ = sidecar::set(task_id, &["guard_skipped=true".to_string()]);
                 return Ok(());
             }

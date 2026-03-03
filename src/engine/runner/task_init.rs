@@ -23,13 +23,20 @@ pub struct TaskInitResult {
     pub new_attempts: u32,
 }
 
-/// Check task guards and return the current attempt count.
-///
-/// Returns `None` if the task should be skipped (already logged/handled).
-/// Returns `Some(attempts)` if the task should proceed.
+/// Outcome of the guard check.
+pub enum GuardOutcome {
+    /// Task should proceed; returns current attempt count.
+    Proceed(u32),
+    /// Task should be skipped (already running, status=needs_review, etc.).
+    Skip,
+    /// Task has exceeded max attempts — caller should update GitHub to NeedsReview.
+    MaxAttempts,
+}
+
+/// Check task guards and return the outcome.
 ///
 /// Also checks for existing tmux sessions to prevent duplicate dispatch.
-pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<Option<u32>> {
+pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<GuardOutcome> {
     let attempts: u32 = sidecar::get(task_id, "attempts")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -39,7 +46,7 @@ pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<Option<u3
     let current_status = sidecar::get(task_id, "status").unwrap_or_default();
     if current_status == "needs_review" {
         tracing::info!(task_id, "skipping needs_review task");
-        return Ok(None);
+        return Ok(GuardOutcome::Skip);
     }
 
     // Guard: check if tmux session already exists (prevents duplicate dispatch)
@@ -51,7 +58,7 @@ pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<Option<u3
             session = %session_name,
             "skipping task: tmux session already exists"
         );
-        return Ok(None);
+        return Ok(GuardOutcome::Skip);
     }
 
     // Check max attempts
@@ -61,25 +68,20 @@ pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<Option<u3
         .unwrap_or(5);
 
     if attempts >= max_attempts {
-        tracing::warn!(
-            task_id,
-            attempts,
-            max_attempts,
-            "exceeded max attempts, blocking task"
-        );
+        tracing::warn!(task_id, attempts, max_attempts, "exceeded max attempts");
         sidecar::set(
             task_id,
             &[
-                "status=blocked".to_string(),
+                "status=needs_review".to_string(),
                 format!(
                     "last_error=exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset."
                 ),
             ],
         )?;
-        return Ok(None);
+        return Ok(GuardOutcome::MaxAttempts);
     }
 
-    Ok(Some(attempts))
+    Ok(GuardOutcome::Proceed(attempts))
 }
 
 /// Build a minimal `ExternalTask` from sidecar state for prompt building.

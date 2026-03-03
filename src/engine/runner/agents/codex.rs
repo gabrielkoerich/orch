@@ -261,6 +261,8 @@ impl AgentRunner for CodexRunner {
         format!(
             r#"cat "{sys_file}" "{msg_file}" | {timeout_cmd} codex {model_flag} \
   {permission_flags} \
+  -c 'sandbox_workspace_write.network_access=true' \
+  -c 'shell_environment_policy.inherit=all' \
   exec --json -"#,
             sys_file = sys_file,
             msg_file = msg_file,
