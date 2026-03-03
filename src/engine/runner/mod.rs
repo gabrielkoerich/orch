@@ -502,6 +502,10 @@ impl TaskRunner {
             raw_comment.push_str(&format!("\n\n> **Budget warning**: {budget_warning}"));
         }
 
+        // Append agent/model attribution footer
+        let model_str = model.map(|m| format!(" / {m}")).unwrap_or_default();
+        raw_comment.push_str(&format!("\n\n<!-- agent: {agent_name}{model_str} -->"));
+
         // Scan for leaked secrets and redact if needed
         let comment = if security::has_leaks(&raw_comment) {
             let leaks = security::scan(&raw_comment);
