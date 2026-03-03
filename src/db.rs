@@ -148,6 +148,7 @@ impl Db {
     }
 
     /// Get a reference to the connection (for running queries).
+    #[allow(dead_code)]
     pub async fn conn(&self) -> tokio::sync::MutexGuard<'_, Connection> {
         self.conn.lock().await
     }

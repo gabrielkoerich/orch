@@ -14,7 +14,6 @@
 
 pub mod cleanup;
 pub mod commands;
-pub mod internal_tasks;
 pub mod jobs;
 pub mod review;
 pub mod router;
