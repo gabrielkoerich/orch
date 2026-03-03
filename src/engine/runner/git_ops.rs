@@ -88,11 +88,15 @@ pub async fn auto_commit(
 /// Rebase the current branch on the default branch.
 ///
 /// Run before the agent starts to ensure the worktree has the latest code.
+/// Fetches both the default branch and the current branch so agents never
+/// need to run `git fetch` themselves (important for sandboxed agents like
+/// codex whose workspace-write sandbox blocks writes outside the worktree).
 /// Non-fatal: if rebase fails (conflicts), the agent may still be able to work.
 pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
-    // Fetch latest from origin first
+    // Fetch current branch (for retries with existing remote commits)
+    // and default branch (for rebase) in one call.
     let _ = Command::new("git")
-        .args(["fetch", "origin", default_branch])
+        .args(["fetch", "origin"])
         .current_dir(dir)
         .output_with_context()
         .await;
