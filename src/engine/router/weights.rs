@@ -70,7 +70,6 @@ impl Default for RateLimitState {
 impl RateLimitState {
     /// Record a rate limit event — decay the weight.
     /// Note: Jitter is set at the AgentWeights level using the agent name.
-    #[allow(dead_code)]
     pub fn record_rate_limit(&mut self) {
         self.consecutive_hits += 1;
         self.weight = (self.weight * RATE_LIMIT_DECAY).max(MIN_WEIGHT);
@@ -121,9 +120,7 @@ impl AgentWeights {
     /// Record a rate limit event for an agent.
     pub fn record_rate_limit(&mut self, agent: &str) {
         let state = self.states.entry(agent.to_string()).or_default();
-        state.consecutive_hits += 1;
-        state.weight = (state.weight * RATE_LIMIT_DECAY).max(MIN_WEIGHT);
-        state.last_limited_at = Some(Instant::now());
+        state.record_rate_limit();
         // Generate jitter to stagger recovery times across agents
         state.recovery_jitter = generate_recovery_jitter(agent);
         tracing::info!(
