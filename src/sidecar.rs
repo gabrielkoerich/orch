@@ -219,6 +219,33 @@ pub fn get(task_id: &str, field: &str) -> anyhow::Result<String> {
     }
 }
 
+/// Atomically compare-and-swap a sidecar field.
+///
+/// Reads the current value of `field` under an exclusive file lock.
+/// Missing fields are treated as empty string.
+/// If the current value equals `expected`, sets it to `new_value` and returns `Ok(true)`.
+/// Otherwise returns `Ok(false)` without modifying the file.
+///
+/// This prevents TOCTOU races where two callers both read the same value and both
+/// proceed to set it — only the one that wins the file lock will actually claim it.
+pub fn compare_and_swap(
+    task_id: &str,
+    field: &str,
+    expected: &str,
+    new_value: &str,
+) -> anyhow::Result<bool> {
+    let mut swapped = false;
+    with_locked_sidecar(task_id, |obj| {
+        let current = obj.get(field).and_then(|v| v.as_str()).unwrap_or("");
+        if current == expected {
+            obj.insert(field.to_string(), Value::String(new_value.to_string()));
+            swapped = true;
+        }
+        Ok(())
+    })?;
+    Ok(swapped)
+}
+
 /// Set one or more fields in a sidecar file.
 ///
 /// Each entry in `fields` is "key=value" format.
@@ -576,5 +603,80 @@ mod tests {
             deserialized.learnings,
             vec!["Use format! macro for string formatting"]
         );
+    }
+
+    /// Tests for `compare_and_swap` using the real sidecar path with a unique task ID.
+    ///
+    /// Uses the flat `~/.orch/state/{task_id}.json` path (no REPO_CONTEXT in tests).
+    #[test]
+    fn compare_and_swap_missing_field_matches_empty_expected() {
+        let task_id = format!(
+            "test-cas-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        );
+        // Ensure clean state
+        let _ = state_dir().map(|d| std::fs::remove_file(d.join(format!("{task_id}.json"))));
+
+        // Missing field treated as "" — CAS("", "true") should succeed
+        assert!(
+            compare_and_swap(&task_id, "review_started", "", "true").unwrap(),
+            "CAS should succeed when field is missing (treated as empty)"
+        );
+
+        // Already "true" — CAS("", "true") should fail (field is no longer "")
+        assert!(
+            !compare_and_swap(&task_id, "review_started", "", "true").unwrap(),
+            "CAS should fail when field is already 'true'"
+        );
+
+        // Clear to "" — CAS("", "true") should succeed again
+        set(&task_id, &["review_started=".to_string()]).unwrap();
+        assert!(
+            compare_and_swap(&task_id, "review_started", "", "true").unwrap(),
+            "CAS should succeed after field is cleared to empty"
+        );
+
+        // Cleanup
+        let _ = state_dir().map(|d| std::fs::remove_file(d.join(format!("{task_id}.json"))));
+    }
+
+    #[test]
+    fn compare_and_swap_wrong_expected_does_not_overwrite() {
+        let task_id = format!(
+            "test-cas-wrong-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        );
+        let _ = state_dir().map(|d| std::fs::remove_file(d.join(format!("{task_id}.json"))));
+
+        // Seed with "false"
+        set(&task_id, &["review_started=false".to_string()]).unwrap();
+
+        // CAS("", "true") should fail — actual value is "false", not ""
+        assert!(
+            !compare_and_swap(&task_id, "review_started", "", "true").unwrap(),
+            "CAS should fail when expected does not match actual value"
+        );
+
+        // Verify field was NOT modified
+        assert_eq!(
+            get(&task_id, "review_started").unwrap(),
+            "false",
+            "field should remain unchanged after failed CAS"
+        );
+
+        // CAS("false", "true") should succeed
+        assert!(
+            compare_and_swap(&task_id, "review_started", "false", "true").unwrap(),
+            "CAS should succeed when expected matches actual value"
+        );
+
+        // Cleanup
+        let _ = state_dir().map(|d| std::fs::remove_file(d.join(format!("{task_id}.json"))));
     }
 }

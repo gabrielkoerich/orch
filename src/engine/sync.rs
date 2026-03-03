@@ -79,20 +79,30 @@ pub(crate) async fn sync_tick(
                 // The main tick uses an in-memory HashSet, but sync_tick needs a persistent
                 // guard since it runs independently and the status transition to InReview
                 // is async and may not be visible immediately.
-                if sidecar::get(task_id, "review_started").unwrap_or_default() == "true" {
-                    tracing::debug!(task_id, "review agent already started, skipping duplicate");
-                    continue;
-                }
-                if let Err(e) = sidecar::set(task_id, &["review_started=true".to_string()]) {
-                    tracing::warn!(task_id, err = %e, "failed to set review_started guard, skipping review");
-                    continue;
+                //
+                // compare_and_swap holds the exclusive file lock across both the read and
+                // write, eliminating the TOCTOU window that existed when get() and set()
+                // were two separate calls.
+                match sidecar::compare_and_swap(task_id, "review_started", "", "true") {
+                    Ok(false) => {
+                        tracing::debug!(
+                            task_id,
+                            "review agent already started, skipping duplicate"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id, err = %e, "failed to set review_started guard, skipping review");
+                        continue;
+                    }
+                    Ok(true) => {} // claimed — proceed to dispatch
                 }
                 tracing::info!(task_id, "triggering review agent for needs_review task");
                 // Transition to InReview — this IS the guard against duplicates
                 if let Err(e) = backend.update_status(&task.id, Status::InReview).await {
                     tracing::warn!(task_id, err = %e, "failed to transition to InReview");
                     // Clear the guard on failure so it can be retried
-                    let _ = sidecar::set(task_id, &["review_started=false".to_string()]);
+                    let _ = sidecar::set(task_id, &["review_started=".to_string()]);
                     continue;
                 }
                 // Record timestamp so stale detection can apply a grace period
@@ -139,7 +149,7 @@ pub(crate) async fn sync_tick(
                     }
                     // Clear the review_started guard so the task can be reviewed again
                     // if it returns to NeedsReview status
-                    if let Err(e) = sidecar::set(&tid, &["review_started=false".to_string()]) {
+                    if let Err(e) = sidecar::set(&tid, &["review_started=".to_string()]) {
                         tracing::warn!(task_id = tid, err = %e, "failed to clear review_started guard");
                     }
                 }));
@@ -179,8 +189,7 @@ pub(crate) async fn sync_tick(
                         tracing::error!(task_id = %task.id.0, err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
                     }
                     // Clear the review_started guard so the task can be re-reviewed
-                    if let Err(e) = sidecar::set(&task.id.0, &["review_started=false".to_string()])
-                    {
+                    if let Err(e) = sidecar::set(&task.id.0, &["review_started=".to_string()]) {
                         tracing::warn!(task_id = %task.id.0, err = %e, "failed to clear review_started guard for stale task");
                     }
                 }
