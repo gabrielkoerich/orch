@@ -109,6 +109,38 @@ gh:
 
 **Note:** The `gh CLI` method is not recommended for service environments (launchd/systemd) as it requires an interactive login session.
 
+### Security: Service Deployments (Homebrew / launchd)
+
+When orch runs as a background service (`brew services start orch`), it does **not** inherit your shell environment. The service process starts with a minimal environment, so you must pass the token through one of these channels:
+
+**Option A — `~/.private` file** (recommended for local installs):
+
+```bash
+# Create ~/.private with mode 600
+echo 'export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"' >> ~/.private
+chmod 600 ~/.private
+```
+
+Runner scripts automatically source `~/.private` if it exists.
+
+**Option B — launchd `EnvironmentVariables`** in the plist (for system-wide installs):
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+  <key>GH_TOKEN</key>
+  <string>ghp_xxxxxxxxxxxxxxxxxxxx</string>
+</dict>
+```
+
+Edit your plist with `sudo launchctl edit <label>` or update it via the Homebrew formula.
+
+**Option C — GitHub App** (recommended for teams and CI):
+
+Use `mode: github_app` in `~/.orch/config.yml` — no long-lived token is stored; the service generates short-lived JWTs and installation tokens automatically.
+
+> **Security guarantee:** Orch never embeds `GH_TOKEN` in runner scripts on disk. Tokens are injected into the tmux session environment at spawn time (`tmux new-session -e GH_TOKEN=...`) and live only in process memory, not in `~/.orch/state/` artifacts.
+
 ## Files
 
 All runtime state lives in `~/.orch/` (`ORCH_HOME`):

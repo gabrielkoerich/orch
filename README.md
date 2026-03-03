@@ -106,6 +106,29 @@ gh auth login  # Run interactively
 
 See [Configuration](#configuration) for more auth options.
 
+### Security: Service Deployments (Homebrew / launchd)
+
+When running as a background service (e.g., `brew services start orch`), the service process does **not** inherit your shell environment. Pass the token securely:
+
+**Option A — `~/.private` file** (sourced automatically by runner scripts):
+```bash
+# ~/.private  (chmod 600)
+export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+```
+
+**Option B — launchd `EnvironmentVariables`** in the plist:
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+  <key>GH_TOKEN</key>
+  <string>ghp_xxxxxxxxxxxxxxxxxxxx</string>
+</dict>
+```
+
+**Option C — GitHub App** (recommended for teams): no long-lived token needed; the service exchanges a short-lived JWT for an installation token automatically.
+
+> **Important:** Orch never writes `GH_TOKEN` into runner scripts on disk. Tokens are injected into the tmux session environment at spawn time and exist only in process memory.
+
 ## CLI Reference
 
 ### Service Management
