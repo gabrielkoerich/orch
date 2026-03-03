@@ -17,7 +17,7 @@ use reqwest::{header, Client, Response, StatusCode};
 use serde::Serialize;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 use urlencoding;
@@ -194,13 +194,20 @@ static METRIC_WAIT_SECS_TOTAL: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct GhHttp {
     client: Client,
-    token: String,
+    resolver: Arc<dyn auth::TokenResolver>,
 }
 
 impl GhHttp {
     /// Create a new client. Reads the GitHub token using the auth resolver.
     pub fn new() -> Self {
-        let token = auth::resolve_token_sync();
+        let resolver = match auth::create_resolver() {
+            Ok(resolver) => resolver,
+            Err(err) => {
+                tracing::error!("Failed to create GitHub token resolver: {}", err);
+                Box::new(auth::ErrorResolver::new(err.to_string()))
+            }
+        };
+        let resolver = Arc::from(resolver);
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
@@ -208,13 +215,12 @@ impl GhHttp {
             .build()
             .expect("failed to build reqwest client");
 
-        Self { client, token }
+        Self { client, resolver }
     }
 
     /// Create a new client with a custom token resolver.
     #[allow(dead_code)]
-    pub fn with_resolver(resolver: &dyn auth::TokenResolver) -> anyhow::Result<Self> {
-        let token = resolver.resolve_token()?;
+    pub fn with_resolver(resolver: Arc<dyn auth::TokenResolver>) -> anyhow::Result<Self> {
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
@@ -222,7 +228,7 @@ impl GhHttp {
             .build()
             .expect("failed to build reqwest client");
 
-        Ok(Self { client, token })
+        Ok(Self { client, resolver })
     }
 
     // ── Rate-limit helpers ────────────────────────────────────────
@@ -369,18 +375,20 @@ impl GhHttp {
 
     // ── Low-level HTTP helpers ────────────────────────────────────
 
-    fn auth_header(&self) -> String {
-        format!("Bearer {}", self.token)
+    async fn auth_header(&self) -> anyhow::Result<String> {
+        let token = self.resolver.resolve_token().await?;
+        Ok(format!("Bearer {}", token))
     }
 
     /// GET request, returns deserialized JSON.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .get(url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -399,10 +407,11 @@ impl GhHttp {
     async fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .get(url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -425,11 +434,12 @@ impl GhHttp {
     ) -> anyhow::Result<T> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .get(url)
             .query(query)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -448,11 +458,12 @@ impl GhHttp {
     async fn post_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .post(url)
             .json(body)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -481,11 +492,12 @@ impl GhHttp {
     async fn patch_json_raw(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<String> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .patch(url)
             .json(body)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -504,10 +516,11 @@ impl GhHttp {
     async fn delete(&self, url: &str) -> anyhow::Result<StatusCode> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .delete(url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -535,12 +548,13 @@ impl GhHttp {
         let mut is_first = true;
 
         loop {
+            let auth_header = self.auth_header().await?;
             let resp = if is_first {
                 is_first = false;
                 self.client
                     .get(url)
                     .query(query)
-                    .header(header::AUTHORIZATION, self.auth_header())
+                    .header(header::AUTHORIZATION, auth_header.clone())
                     .header(header::ACCEPT, "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", "2022-11-28")
                     .send()
@@ -549,7 +563,7 @@ impl GhHttp {
                 let u = next_url.as_ref().unwrap();
                 self.client
                     .get(u)
-                    .header(header::AUTHORIZATION, self.auth_header())
+                    .header(header::AUTHORIZATION, auth_header)
                     .header(header::ACCEPT, "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", "2022-11-28")
                     .send()
@@ -587,12 +601,13 @@ impl GhHttp {
     ) -> anyhow::Result<serde_json::Value> {
         Self::proactive_throttle_graphql().await;
         Self::check_graphql_backoff()?;
+        let auth_header = self.auth_header().await?;
         let body = serde_json::json!({ "query": query });
         let mut req = self
             .client
             .post(format!("{GITHUB_API}/graphql"))
             .json(&body)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
 
@@ -673,7 +688,7 @@ impl GhHttp {
         resolver.health_check()?;
 
         // Then verify the token actually works by making an API call
-        let token = resolver.resolve_token()?;
+        let token = resolver.resolve_token().await?;
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .timeout(Duration::from_secs(30))
@@ -992,10 +1007,11 @@ impl GhHttp {
             base,
         };
 
+        let auth_header = self.auth_header().await?;
         let response = self
             .client
             .post(&url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header(header::USER_AGENT, "orchestrator")
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -1060,10 +1076,11 @@ impl GhHttp {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/collaborators/{username}");
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .get(&url)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -1272,11 +1289,12 @@ impl GhHttp {
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/merge");
         let payload = serde_json::json!({ "merge_method": "squash" });
+        let auth_header = self.auth_header().await?;
         let resp = self
             .client
             .put(&url)
             .json(&payload)
-            .header(header::AUTHORIZATION, self.auth_header())
+            .header(header::AUTHORIZATION, auth_header)
             .header(header::ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -1547,6 +1565,7 @@ pub fn rate_limit_metrics() -> RateLimitMetrics {
 pub fn resolve_token() -> String {
     auth::resolve_token_sync()
 }
+
 
 /// Re-export auth module types for convenience.
 pub use super::auth::TokenResolver;
