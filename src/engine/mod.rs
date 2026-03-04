@@ -24,7 +24,7 @@ pub mod tick;
 
 use crate::backends::ExternalBackend;
 use crate::channels::capture::CaptureService;
-use crate::channels::discord::DiscordChannel;
+use crate::channels::discord_ws::DiscordGateway;
 use crate::channels::github::start_webhook_server;
 use crate::channels::notification::NotificationLevel;
 use crate::channels::slack::SlackChannel;
@@ -297,16 +297,24 @@ pub async fn serve() -> anyhow::Result<()> {
         }
     }
 
-    // Try to initialize Discord channel
+    // Try to initialize Discord Gateway channel (websocket)
     if let Ok(token) = crate::config::get("channels.discord.bot_token") {
         if !token.is_empty() {
             let channel_id = crate::config::get("channels.discord.channel_id").ok();
-            let discord = DiscordChannel::new(token, channel_id);
+            let shard_id = crate::config::get("channels.discord.shard_id")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let shard_count = crate::config::get("channels.discord.shard_count")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1);
+            let discord = DiscordGateway::new(token, channel_id, shard_id, shard_count);
             if let Err(e) = discord.health_check().await {
-                tracing::warn!(?e, "discord channel health check failed, skipping");
+                tracing::warn!(?e, "discord gateway health check failed, skipping");
             } else {
                 channel_registry.register(Box::new(discord));
-                tracing::info!("discord channel registered");
+                tracing::info!(shard_id, shard_count, "discord gateway registered");
             }
         }
     }

@@ -50,6 +50,9 @@ regex = "1"
 # HTTP client for external APIs
 reqwest = { version = "0.12", features = ["json"] }
 
+# WebSocket client for Discord Gateway
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
 # Directory helpers
 dirs = "6"
 

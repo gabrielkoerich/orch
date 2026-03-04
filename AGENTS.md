@@ -58,6 +58,51 @@ This connects to the running task's tmux session and prints output as it arrives
 
 The capture loop diffs against the previous capture, so multiple clients streaming the same session each receive only new content — no duplicates.
 
+## Discord Gateway (Websocket)
+
+The Discord channel uses Discord's Gateway websocket API (`wss://gateway.discord.gg`) instead of HTTP polling. This delivers MESSAGE_CREATE events in real-time with sub-second latency and avoids repeated API requests.
+
+### How It Works
+
+1. **Connect** — Opens a persistent websocket connection to the Gateway URL
+2. **Hello** — Server sends `heartbeat_interval` (typically 41.25 s)
+3. **Identify** — Client sends bot token, intents, and shard info
+4. **Ready** — Server responds with `session_id` and `resume_gateway_url`
+5. **Events** — `MESSAGE_CREATE` dispatches arrive in real-time
+6. **Heartbeat** — Client sends `op=1` every `heartbeat_interval` ms; server ACKs with `op=11`
+7. **Reconnect** — On disconnect or server-requested reconnect, the client resumes with `session_id + seq`; falls back to re-identify on invalid session
+
+### Required Bot Token Scopes
+
+The bot token must have these **Gateway Intents** enabled in the [Discord Developer Portal](https://discord.com/developers/applications):
+
+| Intent | Bit | Required for |
+|--------|-----|-------------|
+| `GUILDS` | `1 << 0` | Receiving guild context |
+| `GUILD_MESSAGES` | `1 << 9` | MESSAGE_CREATE events in guilds |
+| `MESSAGE_CONTENT` | `1 << 15` | Reading message text (privileged) |
+
+> **Note:** `MESSAGE_CONTENT` is a privileged intent. Enable it in the bot's settings under *Privileged Gateway Intents* in the Discord Developer Portal.
+
+### Configuration
+
+```yaml
+channels:
+  discord:
+    bot_token: "${DISCORD_BOT_TOKEN}"   # Required: bot token from Discord Developer Portal
+    channel_id: "1234567890123456789"   # Optional: restrict to a single channel ID
+    shard_id: 0                          # Optional: shard index (default: 0)
+    shard_count: 1                       # Optional: total shards (default: 1)
+```
+
+Sharding is only needed for bots in 2 500+ guilds. For most deployments, the defaults (`shard_id: 0, shard_count: 1`) are correct.
+
+### Reconnect & Backoff
+
+- On disconnect, the gateway reconnects using the `resume_gateway_url` from READY + `session_id` + last sequence number
+- If the session is invalid (op=9 with `resumable=false`), the client re-identifies after a 5 s delay
+- Backoff starts at 1 s and doubles on each failed connect attempt, capping at 60 s
+
 ## Webhooks & Polling Fallback
 
 The orchestrator has two modes for receiving GitHub events:
