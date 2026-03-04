@@ -275,6 +275,7 @@ pub async fn create_pr_if_needed(
     files: &[String],
     task_id: &str,
     agent: &str,
+    model: Option<&str>,
     repo: &str,
     base_branch: &str,
 ) -> PrCreateResult<Option<String>> {
@@ -322,8 +323,9 @@ pub async fn create_pr_if_needed(
         }
     }
 
+    let model_str = model.map(|m| format!(" using `{m}`")).unwrap_or_default();
     body.push_str(&format!(
-        "\n\n---\n*Task #{task_id} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch)*"
+        "\n\n---\n*Task #{task_id} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
     ));
 
     // Always use the short task title for the PR title (summary goes in body)

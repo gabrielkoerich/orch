@@ -141,6 +141,7 @@ pub async fn handle_success(
                 &resp.files,
                 task_id,
                 agent_name,
+                model_name,
                 &repo,
                 &wt.default_branch,
             )
