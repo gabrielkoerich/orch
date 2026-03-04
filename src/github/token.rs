@@ -393,6 +393,10 @@ pub fn create_token_resolver() -> TokenResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use once_cell::sync::Lazy;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
     fn token_mode_from_config_env() {
@@ -450,8 +454,10 @@ mod tests {
         assert!(resolver.allow_legacy_fallback);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_returns_none_when_no_env_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Ensure no env vars are set - set them explicitly to empty
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
@@ -463,8 +469,10 @@ mod tests {
         assert!(token.is_none());
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Only set GH_TOKEN, remove GITHUB_TOKEN
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
@@ -482,8 +490,10 @@ mod tests {
         env::remove_var("GH_TOKEN");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_falls_back_to_github_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Clear environment first
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
@@ -499,8 +509,10 @@ mod tests {
         env::remove_var("GITHUB_TOKEN");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token_over_github_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Clear environment first
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
@@ -519,8 +531,10 @@ mod tests {
         env::remove_var("GITHUB_TOKEN");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_ignores_empty_env_vars() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Clear environment first
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
@@ -538,8 +552,10 @@ mod tests {
         env::remove_var("GITHUB_TOKEN");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_sync_env_mode() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Clear environment first
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
@@ -566,8 +582,10 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("async"));
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn clear_cache_clears_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Clear environment first
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
@@ -593,6 +611,7 @@ mod tests {
 
     #[test]
     fn resolve_env_token_returns_none_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
 
@@ -602,6 +621,7 @@ mod tests {
 
     #[test]
     fn resolve_env_token_prefers_gh_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
         env::set_var("GH_TOKEN", "gh_pref");
         env::set_var("GITHUB_TOKEN", "github_pref");
 
