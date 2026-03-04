@@ -203,7 +203,15 @@ pub struct GhHttp {
 impl GhHttp {
     /// Create a new client. Reads the GitHub token using the auth resolver.
     pub fn new() -> Self {
-        let token = auth::resolve_token_sync();
+        // Resolve token inline: env vars → config → gh CLI (cached 1h).
+        // GhHttp::new() is called from async context on every tick — must not block or warn.
+        let token = std::env::var("GH_TOKEN")
+            .or_else(|_| std::env::var("GITHUB_TOKEN"))
+            .ok()
+            .filter(|t| !t.is_empty())
+            .or_else(|| crate::config::get("gh.auth.token").ok().filter(|t| !t.is_empty()))
+            .or_else(auth::GhCliResolver::resolve)
+            .unwrap_or_default();
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
