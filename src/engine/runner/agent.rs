@@ -175,14 +175,11 @@ exit $CMD_STATUS
         inv.output_file.display().to_string(),
     );
 
-<<<<<<< HEAD
     // Build shell command that runs agent, captures stdout/stderr and exit status.
-    // We avoid creating a runner.sh on disk by passing a shell -lc command to tmux
-    // for PTY-disabled flows. For PTY-enabled flows we prefer spawning the
-    // agent in a pty and attaching it to the session.
+    // Prefer spawning in a PTY when enabled; otherwise write a runner script
+    // and execute it in a detached tmux session.
 
-    // Clone env_map for branch-specific use (PTY code expects `env`).
-    let env: std::collections::HashMap<String, String> = env.clone();
+    // Prepare auxiliary paths
     let status_file = attempt_dir.join("exit.txt");
     let stderr_file = attempt_dir.join("stderr.txt");
 
@@ -206,6 +203,7 @@ exit $CMD_STATUS
             )
             .await?;
 
+        // Ensure non-secret env vars are available in the session
         for (k, v) in &env {
             tmux.set_session_env(&session, k, v).await.ok();
         }
@@ -260,6 +258,7 @@ exit $CMD_STATUS
         return Ok(session);
     }
 
+    // Non-PTY flow: write runner script and execute it in tmux
     let timeout_cmd = if inv.timeout_seconds > 0 {
         format!("timeout {}", inv.timeout_seconds)
     } else {
@@ -273,20 +272,15 @@ exit $CMD_STATUS
         &permissions,
     );
 
-    // Build shell command that runs agent, captures stdout/stderr and exit status
-    // for non-PTY flows.
-    let work_dir = inv.work_dir.to_string_lossy();
-=======
     // Write runner script to per-task attempt dir
     let script_path = attempt_dir.join("runner.sh");
     let script_content = build_runner_script(inv, &agent_cmd, &attempt_dir)?;
->>>>>>> 277065c (Resolve rebase conflicts: integrate TokenResolver into agent runner and build runner script)
+    std::fs::write(&script_path, &script_content)?;
 
     // Make executable
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::write(&script_path, &script_content)?;
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
     }
 
@@ -313,10 +307,7 @@ exit $CMD_STATUS
     };
 
     // Convert env to a slice of (&str, &str) pairs for tmux.create_session.
-    let env_vec: Vec<(&str, &str)> = env
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
+    let env_vec: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
     let session = tmux
         .create_session(
@@ -328,24 +319,16 @@ exit $CMD_STATUS
         )
         .await?;
 
-<<<<<<< HEAD
     // Ensure non-secret environment variables are set in the session (best-effort).
     for (k, v) in &env {
         tmux.set_session_env(&session, k, v).await.ok();
     }
 
-    // Inject GH_TOKEN via tmux set-environment after session creation.
-    // This avoids exposing the token in process arguments or on-disk files.
-    if let Some(ref token) = gh_token {
-        if let Err(e) = tmux.set_session_env(&session, "GH_TOKEN", token).await {
-            tracing::warn!(task_id = inv.task_id, error = %e, "failed to set GH_TOKEN in tmux session");
-=======
     // Inject GitHub token into tmux session environment (if available)
     // This keeps tokens out of runner scripts and disk
     if let Some(token) = github_token {
         if let Err(e) = tmux.set_github_token(&session, &token, false).await {
             tracing::warn!(error = %e, session, "Failed to set GitHub token in tmux session");
->>>>>>> 277065c (Resolve rebase conflicts: integrate TokenResolver into agent runner and build runner script)
         }
     }
 
