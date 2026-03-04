@@ -4,6 +4,7 @@
 //! the bash orchestrator's `~/.orchestrator/` directory — both tools can
 //! run side by side without conflicts.
 
+use anyhow::Context;
 use std::path::PathBuf;
 
 /// The home directory name.
@@ -34,9 +35,25 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
     Ok(orch_home()?.join("config.yml"))
 }
 
-/// Get the path to the tasks database file (~/.orch/tasks.db).
+/// Get the path to the tasks database file (~/.orch/orch.db).
+///
+/// Also migrates `orchestrator.db` → `orch.db` transparently if the old file
+/// exists and the new one does not.
 pub fn db_path() -> anyhow::Result<PathBuf> {
-    Ok(orch_home()?.join("orchestrator.db"))
+    let home = orch_home()?;
+    let new_path = home.join("orch.db");
+    let old_path = home.join("orchestrator.db");
+    if old_path.exists() && !new_path.exists() {
+        std::fs::rename(&old_path, &new_path).with_context(|| {
+            format!(
+                "migrating database from {} to {}",
+                old_path.display(),
+                new_path.display()
+            )
+        })?;
+        tracing::info!("migrated database: orchestrator.db -> orch.db");
+    }
+    Ok(new_path)
 }
 
 /// Get the path to the worktrees directory (~/.orch/worktrees/).

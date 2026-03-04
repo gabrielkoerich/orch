@@ -10,8 +10,8 @@
 //! - `self-review`: analyzes task metrics and creates self-improvement issues
 //!
 //! For task jobs, the `external` field controls where the task is created:
-//! - `external: true` (default): Creates a GitHub Issue
-//! - `external: false`: Creates an internal SQLite task
+//! - `external: false` (default): Creates an internal SQLite task
+//! - `external: true`: Creates a GitHub Issue
 
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::cmd::CommandErrorContext;
@@ -40,7 +40,7 @@ pub struct Job {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default = "default_external")]
-    pub external: bool, // NEW: true = GitHub Issue, false = internal SQLite task
+    pub external: bool, // true = GitHub Issue, false (default) = internal SQLite task
     #[serde(default)]
     pub last_run: Option<String>,
     #[serde(default)]
@@ -70,7 +70,7 @@ fn default_enabled() -> bool {
 }
 
 fn default_external() -> bool {
-    true // Default to external (GitHub) for backward compatibility
+    false // Default to internal (SQLite) tasks
 }
 
 /// Top-level config structure (for reading jobs from .orch.yml / config.yml).
@@ -736,6 +736,7 @@ mod tests {
             r#"jobs:
   - id: test-job
     schedule: "* * * * *"
+    external: true
     task:
       title: Test task
       body: ""
@@ -776,6 +777,7 @@ mod tests {
             r#"jobs:
   - id: test-job
     schedule: "* * * * *"
+    external: true
     task:
       title: Test task
       body: ""

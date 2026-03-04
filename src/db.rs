@@ -86,7 +86,7 @@ pub struct InternalTask {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Default database path: `~/.orch/orchestrator.db`
+/// Default database path: `~/.orch/orch.db`
 pub fn default_path() -> anyhow::Result<PathBuf> {
     crate::home::db_path()
 }

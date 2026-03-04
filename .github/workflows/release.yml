@@ -70,7 +70,10 @@ jobs:
         with:
           args: detect --source . --config .gitleaks.toml --no-banner --redact --exit-code=1
 
-  # Cross-compile build jobs for macOS targets
+  # Cross-compile build jobs for macOS targets.
+  # NOTE: Do NOT add a skip check here. check-release is a dependency — if it
+  # is skipped (non-main) or outputs skip=true, GitHub Actions automatically
+  # skips this job. The release job handles the skip guard.
   build-macos:
     needs: [test, secrets, check-release]
     if: github.ref == 'refs/heads/main'
