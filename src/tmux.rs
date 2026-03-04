@@ -122,6 +122,7 @@ impl TmuxManager {
     /// Unset an environment variable in an existing tmux session.
     ///
     /// Uses: `tmux set-environment -u <key> -t <session>`
+    #[allow(dead_code)]
     pub async fn unset_session_env(&self, session: &str, key: &str) -> anyhow::Result<()> {
         let output = Command::new("tmux")
             .args(["set-environment", "-u", key, "-t", session])
