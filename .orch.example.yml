@@ -31,6 +31,10 @@ gh:
 #   auto_create_followup_on_changes: true
 #   auto_close_task_on_approval: false
 
+# runner:
+#   pty:
+#     enabled: true
+
 # router:
 #   agent: "claude"
 #   model: "haiku"

@@ -29,6 +29,7 @@
 use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
 use crate::cmd::SyncCommandErrorContext;
 use crate::parser;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// Runner for OpenCode agent.
@@ -254,6 +255,44 @@ impl AgentRunner for OpenCodeRunner {
         )
     }
 
+    fn build_pty_command(
+        &self,
+        model: Option<&str>,
+        sys_file: &std::path::Path,
+        msg_file: &std::path::Path,
+        permissions: &PermissionRules,
+        work_dir: &std::path::Path,
+    ) -> anyhow::Result<super::PtyCommand> {
+        let mut args = vec!["run".to_string()];
+        if let Some(m) = model {
+            args.push("--model".to_string());
+            args.push(m.to_string());
+        }
+        args.push("--format".to_string());
+        args.push("json".to_string());
+        args.push("-".to_string());
+
+        let mut env = HashMap::new();
+        if permissions.autonomous {
+            prepare_opencode_config(work_dir, &permissions.allowed_tools)?;
+            let xdg_home = work_dir.join(".orch-opencode");
+            env.insert(
+                "XDG_CONFIG_HOME".to_string(),
+                xdg_home.to_string_lossy().to_string(),
+            );
+        }
+
+        let mut stdin = std::fs::read(sys_file)?;
+        stdin.extend(std::fs::read(msg_file)?);
+
+        Ok(super::PtyCommand {
+            program: "opencode".to_string(),
+            args,
+            stdin,
+            env,
+        })
+    }
+
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -368,7 +407,7 @@ const OPENCODE_PERMISSION_KEYS: &[&str] = &[
 /// Maps Claude tool names to OpenCode permission keys.
 /// Tools in the allowed list get "allow", others get "deny".
 /// CLI commands (git, npm, etc.) are covered by the "bash" permission.
-fn translate_permissions_to_opencode(allowed_tools: &[String]) -> String {
+pub(crate) fn translate_permissions_to_opencode(allowed_tools: &[String]) -> String {
     if allowed_tools.is_empty() {
         // No restrictions: allow everything
         return r#"{"permission":"allow"}"#.to_string();
@@ -410,6 +449,17 @@ fn translate_permissions_to_opencode(allowed_tools: &[String]) -> String {
     }
 
     format!(r#"{{"permission":{{{}}}}}"#, entries.join(","))
+}
+
+fn prepare_opencode_config(
+    work_dir: &std::path::Path,
+    allowed_tools: &[String],
+) -> anyhow::Result<()> {
+    let permission_json = translate_permissions_to_opencode(allowed_tools);
+    let config_dir = work_dir.join(".orch-opencode").join("opencode");
+    std::fs::create_dir_all(&config_dir)?;
+    std::fs::write(config_dir.join("opencode.json"), permission_json)?;
+    Ok(())
 }
 
 /// Classify an OpenCode error message.

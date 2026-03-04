@@ -88,6 +88,9 @@ base64 = "0.22"
 # Async combinators (FuturesUnordered for concurrent routing)
 futures = "0.3"
 
+# PTY support for agent runners
+portable-pty = "0.8"
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
@@ -97,4 +100,3 @@ tower = { version = "0.5", features = ["util"] }
 opt-level = 3
 lto = true
 strip = true
-

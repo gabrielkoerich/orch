@@ -19,6 +19,7 @@ pub struct Session {
 }
 
 /// Manage tmux sessions for agent tasks.
+#[derive(Clone)]
 pub struct TmuxManager {
     /// Prefix for session names (e.g. "orch-")
     prefix: String,
@@ -135,6 +136,20 @@ impl TmuxManager {
             tracing::warn!(session, key, %stderr, "tmux unset-environment warning");
         } else {
             tracing::debug!(session, key, "unset tmux session environment");
+        }
+        Ok(())
+    }
+
+    /// Send literal text into a session's active pane.
+    pub async fn send_text(&self, session: &str, text: &str) -> anyhow::Result<()> {
+        let output = Command::new("tmux")
+            .args(["send-keys", "-t", session, "-l", text])
+            .output_with_context()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("send-keys failed for {session}: {stderr}");
         }
         Ok(())
     }

@@ -20,6 +20,7 @@ pub mod agents;
 pub mod context;
 pub mod fallback;
 pub mod git_ops;
+pub mod pty;
 pub mod response;
 pub mod response_handler;
 pub mod session;
@@ -68,14 +69,15 @@ impl TaskRunner {
 
     /// Run a task through the full execution pipeline.
     ///
-    /// This is the main entry point called by the engine dispatch loop.
+    /// Returns `Ok(None)` if the runner guard skipped the task (caller should not
+    /// post stale results). Returns `Ok(Some(status))` with the final task status.
     pub async fn run(
         &self,
         task_id: &str,
         agent: Option<&str>,
         model: Option<&str>,
         backend: Option<&dyn ExternalBackend>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         tracing::info!(
             task_id,
             agent = agent.unwrap_or("default"),
@@ -84,12 +86,10 @@ impl TaskRunner {
         );
 
         // Check task guards; returns outcome indicating whether to proceed.
-        // Set a sidecar marker so run_with_context knows not to post stale results.
         let attempts = match task_init::check_guards(task_id, &self.repo).await {
             Ok(task_init::GuardOutcome::Proceed(a)) => a,
             Ok(task_init::GuardOutcome::Skip) => {
-                let _ = sidecar::set(task_id, &["guard_skipped=true".to_string()]);
-                return Ok(());
+                return Ok(None);
             }
             Ok(task_init::GuardOutcome::MaxAttempts) => {
                 // Update GitHub status to NeedsReview so engine stops re-dispatching.
@@ -112,8 +112,7 @@ impl TaskRunner {
                         }
                     }
                 }
-                let _ = sidecar::set(task_id, &["guard_skipped=true".to_string()]);
-                return Ok(());
+                return Ok(Some("needs_review".to_string()));
             }
             Err(e) => return Err(e),
         };
@@ -207,9 +206,9 @@ impl TaskRunner {
         );
 
         // Handle outcome: success or error recovery
-        match parse_result {
+        let final_status = match parse_result {
             Ok(parsed) => {
-                if response_handler::handle_success(
+                let (status, budget_exceeded) = response_handler::handle_success(
                     task_id,
                     parsed,
                     &init.wt,
@@ -218,37 +217,39 @@ impl TaskRunner {
                     init.model_name.as_deref(),
                     init.new_attempts,
                 )
-                .await?
-                {
+                .await?;
+                if budget_exceeded {
                     // Token budget exceeded — sidecar already updated, return without
                     // tmux cleanup or metrics (preserves original behavior)
-                    return Ok(());
+                    return Ok(Some(status));
                 }
+                status
             }
             Err(agent_err) => {
-                if matches!(
-                    fallback::handle_error(
-                        task_id,
-                        &agent_err,
-                        &init.agent_name,
-                        &*agent_runner,
-                        init.model_name.as_deref(),
-                        init.new_attempts,
-                        self.db.as_ref(),
-                    )
-                    .await?,
-                    fallback::ErrorHandleResult::EarlyReturn
-                ) {
-                    // Task rerouted — return (metrics recorded in run_with_context)
-                    return Ok(());
+                match fallback::handle_error(
+                    task_id,
+                    &agent_err,
+                    &init.agent_name,
+                    &*agent_runner,
+                    init.model_name.as_deref(),
+                    init.new_attempts,
+                    self.db.as_ref(),
+                )
+                .await?
+                {
+                    fallback::ErrorHandleResult::EarlyReturn { status } => {
+                        // Task rerouted — return (metrics recorded in run_with_context)
+                        return Ok(Some(status));
+                    }
+                    fallback::ErrorHandleResult::Continue { status } => status,
                 }
             }
-        }
+        };
 
         // Kill tmux session if still alive
         session::cleanup_session(task_id, &tmux, &tmux_session).await;
 
-        Ok(())
+        Ok(Some(final_status))
     }
 
     /// Record task execution metrics to the database.
@@ -384,17 +385,14 @@ impl TaskRunner {
         )?;
 
         // Run the task
-        self.run(task_id, agent, model, Some(&**backend)).await?;
+        let run_status = self.run(task_id, agent, model, Some(&**backend)).await?;
 
-        // If the runner guard skipped the task (e.g. sidecar status=needs_review),
-        // do not re-post stale sidecar data as a new comment.
-        let was_guard_skipped =
-            sidecar::get(task_id, "guard_skipped").unwrap_or_default() == "true";
-        if was_guard_skipped {
-            let _ = sidecar::set(task_id, &["guard_skipped=".to_string()]);
+        // If the runner guard skipped the task, do not re-post stale data as a new comment.
+        if run_status.is_none() {
             tracing::info!(task_id, "guard skipped task — not posting stale result");
             return Ok(WeightSignal::None);
         }
+        let status = run_status.unwrap();
 
         // Process delegations if the agent requested subtasks
         let delegations_raw = sidecar::get(task_id, "delegations").unwrap_or_default();
@@ -412,7 +410,6 @@ impl TaskRunner {
         }
 
         // Post result to GitHub
-        let status = sidecar::get(task_id, "status").unwrap_or_default();
         let summary = sidecar::get(task_id, "summary").unwrap_or_default();
         let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
 
@@ -432,22 +429,8 @@ impl TaskRunner {
             WeightSignal::None
         };
 
-        // Write status to sidecar BEFORE updating GitHub (ensures atomicity)
-        sidecar::set(
-            task_id,
-            &[
-                format!("status={}", status),
-                format!("summary={}", summary),
-                format!("last_error={}", last_error),
-                format!(
-                    "status_confirmed_at={}",
-                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
-                ),
-            ],
-        )?;
-
-        // Record metrics AFTER sidecar is fully updated (fixes race condition)
-        if !was_guard_skipped {
+        // Record metrics
+        {
             let attempts: u32 = sidecar::get(task_id, "attempts")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -599,7 +582,6 @@ impl TaskRunner {
         }
 
         // Mark parent as blocked
-        sidecar::set(&parent_id.0, &["status=blocked".to_string()])?;
         backend.update_status(parent_id, Status::Blocked).await?;
 
         // Post summary comment on parent

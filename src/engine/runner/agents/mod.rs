@@ -10,6 +10,7 @@ pub mod codex;
 pub mod opencode;
 
 use crate::parser::AgentResponse;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -36,6 +37,14 @@ pub struct PermissionRules {
     /// When set, Edit/Write tools are scoped to these paths only.
     /// Set dynamically per invocation (not from config).
     pub allowed_edit_paths: Vec<PathBuf>,
+}
+
+/// PTY-friendly command representation.
+pub struct PtyCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub stdin: Vec<u8>,
+    pub env: HashMap<String, String>,
 }
 
 /// Sandbox level — how much filesystem access the agent gets.
@@ -206,11 +215,11 @@ pub trait AgentRunner: Send + Sync {
     #[cfg(test)]
     fn name(&self) -> &str;
 
-    /// Build the CLI command string for the runner shell script.
+    /// Build the CLI command string for the legacy tmux runner.
     ///
-    /// The returned string is substituted into the bash runner script
-    /// as the `RESPONSE=$(...)` command. The `permissions` struct carries
-    /// unified rules that each agent translates to its own CLI flags.
+    /// The returned string is embedded into a shell command that captures
+    /// output in the tmux session. The `permissions` struct carries unified
+    /// rules that each agent translates to its own CLI flags.
     fn build_command(
         &self,
         model: Option<&str>,
@@ -219,6 +228,16 @@ pub trait AgentRunner: Send + Sync {
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String;
+
+    /// Build a PTY-safe command with args and stdin content.
+    fn build_pty_command(
+        &self,
+        model: Option<&str>,
+        sys_file: &std::path::Path,
+        msg_file: &std::path::Path,
+        permissions: &PermissionRules,
+        work_dir: &std::path::Path,
+    ) -> anyhow::Result<PtyCommand>;
 
     /// Parse raw stdout into a ParsedResponse.
     ///

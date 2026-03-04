@@ -42,13 +42,6 @@ pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<GuardOutc
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    // Guard: skip needs_review tasks
-    let current_status = sidecar::get(task_id, "status").unwrap_or_default();
-    if current_status == "needs_review" {
-        tracing::info!(task_id, "skipping needs_review task");
-        return Ok(GuardOutcome::Skip);
-    }
-
     // Guard: check if tmux session already exists (prevents duplicate dispatch)
     let tmux = TmuxManager::new();
     let session_name = tmux.session_name(repo, task_id);
@@ -71,12 +64,9 @@ pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<GuardOutc
         tracing::warn!(task_id, attempts, max_attempts, "exceeded max attempts");
         sidecar::set(
             task_id,
-            &[
-                "status=needs_review".to_string(),
-                format!(
-                    "last_error=exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset."
-                ),
-            ],
+            &[format!(
+                "last_error=exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset."
+            )],
         )?;
         return Ok(GuardOutcome::MaxAttempts);
     }

@@ -228,6 +228,7 @@ pub fn get(task_id: &str, field: &str) -> anyhow::Result<String> {
 ///
 /// This prevents TOCTOU races where two callers both read the same value and both
 /// proceed to set it — only the one that wins the file lock will actually claim it.
+#[allow(dead_code)]
 pub fn compare_and_swap(
     task_id: &str,
     field: &str,

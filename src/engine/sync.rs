@@ -14,7 +14,7 @@ use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::Router;
-use crate::sidecar::{self, REPO_CONTEXT};
+use crate::sidecar::REPO_CONTEXT;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -68,52 +68,13 @@ pub(crate) async fn sync_tick(
         if let Ok(needs_review) = backend.list_by_status(Status::NeedsReview).await {
             for task in needs_review {
                 let task_id = &task.id.0;
-                // Only trigger review for tasks that have a branch (i.e., PR exists)
-                let has_branch = sidecar::get(task_id, "branch")
-                    .map(|b| !b.is_empty())
-                    .unwrap_or(false);
-                if !has_branch {
-                    continue;
-                }
-                // Sidecar-based guard: prevents double-dispatch across sync_tick invocations.
-                // The main tick uses an in-memory HashSet, but sync_tick needs a persistent
-                // guard since it runs independently and the status transition to InReview
-                // is async and may not be visible immediately.
-                //
-                // compare_and_swap holds the exclusive file lock across both the read and
-                // write, eliminating the TOCTOU window that existed when get() and set()
-                // were two separate calls.
-                match sidecar::compare_and_swap(task_id, "review_started", "", "true") {
-                    Ok(false) => {
-                        tracing::debug!(
-                            task_id,
-                            "review agent already started, skipping duplicate"
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(task_id, err = %e, "failed to set review_started guard, skipping review");
-                        continue;
-                    }
-                    Ok(true) => {} // claimed — proceed to dispatch
-                }
                 tracing::info!(task_id, "triggering review agent for needs_review task");
-                // Transition to InReview — this IS the guard against duplicates
+                // Transition to InReview — this IS the atomic guard against duplicates.
+                // The GitHub label update is idempotent; if another dispatch already claimed
+                // this task it will already be InReview and this update is a no-op.
                 if let Err(e) = backend.update_status(&task.id, Status::InReview).await {
                     tracing::warn!(task_id, err = %e, "failed to transition to InReview");
-                    // Clear the guard on failure so it can be retried
-                    let _ = sidecar::set(task_id, &["review_started=".to_string()]);
                     continue;
-                }
-                // Record timestamp so stale detection can apply a grace period
-                if let Err(e) = sidecar::set(
-                    task_id,
-                    &[format!(
-                        "in_review_since={}",
-                        chrono::Utc::now().timestamp()
-                    )],
-                ) {
-                    tracing::error!(task_id, err = %e, "failed to write in_review_since sidecar — stale detection grace period will not work");
                 }
                 let backend_c = backend.clone();
                 let tmux_c = tmux.clone();
@@ -147,50 +108,24 @@ pub(crate) async fn sync_tick(
                     if needs_reset {
                         reset_to_needs_review_with_retry(&backend_c, &tid).await;
                     }
-                    // Clear the review_started guard so the task can be reviewed again
-                    // if it returns to NeedsReview status
-                    if let Err(e) = sidecar::set(&tid, &["review_started=".to_string()]) {
-                        tracing::warn!(task_id = tid, err = %e, "failed to clear review_started guard");
-                    }
                 }));
             }
         }
 
         // Detect stale InReview tasks (review agent crashed, no active tmux session).
-        // Apply a 90-second grace period so the freshly-spawned review agent has time
-        // to create its tmux session before we consider it stale.
         if let Ok(in_review) = backend.list_by_status(Status::InReview).await {
-            let now_ts = chrono::Utc::now().timestamp();
             for task in in_review {
                 let review_task_id = format!("{}-review", task.id.0);
                 let review_session = tmux.session_name(repo, &review_task_id);
                 let has_session = tmux.session_exists(&review_session).await;
                 if !has_session {
-                    let in_review_since = sidecar::get(&task.id.0, "in_review_since")
-                        .ok()
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .unwrap_or(now_ts);
-                    let age_secs = now_ts - in_review_since;
-                    if age_secs < 90 {
-                        tracing::debug!(
-                            task_id = task.id.0,
-                            age_secs,
-                            "InReview task has no session yet — within grace period, skipping"
-                        );
-                        continue;
-                    }
                     tracing::warn!(
                         task_id = task.id.0,
                         session = %review_session,
-                        age_secs,
                         "InReview task has no active review session — resetting to NeedsReview"
                     );
                     if let Err(e) = backend.update_status(&task.id, Status::NeedsReview).await {
                         tracing::error!(task_id = %task.id.0, err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
-                    }
-                    // Clear the review_started guard so the task can be re-reviewed
-                    if let Err(e) = sidecar::set(&task.id.0, &["review_started=".to_string()]) {
-                        tracing::warn!(task_id = %task.id.0, err = %e, "failed to clear review_started guard for stale task");
                     }
                 }
             }
