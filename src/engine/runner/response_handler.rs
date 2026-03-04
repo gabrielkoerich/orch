@@ -107,6 +107,7 @@ pub async fn handle_success(
 
     // Auto-commit, push, create PR
     let mut has_pr = false;
+    let mut has_pushed = false;
     if resp.status == "done" || resp.status == "in_progress" {
         if let Err(e) =
             git_ops::auto_commit(&wt.work_dir, task_id, task_title, agent_name, new_attempts).await
@@ -118,7 +119,10 @@ pub async fn handle_success(
         // Push
         let push_ok = match git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await
         {
-            Ok(_) => true,
+            Ok(_) => {
+                has_pushed = true;
+                true
+            }
             Err(e) => {
                 tracing::error!(task_id, error = ?e, "push failed");
                 sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
@@ -169,6 +173,7 @@ pub async fn handle_success(
 
     // Store result in sidecar
     // If agent said "done" and a PR exists, send to review before merge.
+    // If agent said "done", pushed commits, but PR creation failed — review gate creates PR.
     // If agent said "done", no PR, and no delegations — work is complete
     // (e.g., review/analysis jobs that create issues but no code changes).
     // If agent said "done", no PR, but has delegations — blocked on children.
@@ -181,6 +186,13 @@ pub async fn handle_success(
             "agent reported done with delegations but no PR — setting blocked"
         );
         "blocked"
+    } else if resp.status == "done" && !has_pr && has_pushed {
+        // Push succeeded but PR creation failed — review gate will find commits and create the PR.
+        tracing::warn!(
+            task_id,
+            "agent done, commits pushed, but PR creation failed — routing to review gate"
+        );
+        "needs_review"
     } else if resp.status == "done" && !has_pr {
         tracing::info!(
             task_id,
