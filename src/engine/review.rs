@@ -961,20 +961,20 @@ pub(crate) async fn auto_merge_pr(
         match state.as_str() {
             "success" => break,
             "failure" => {
-                if start.elapsed() >= max_wait {
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        "CI failing — setting NeedsReview so review agent can fix"
-                    );
-                    backend.update_status(&task.id, Status::NeedsReview).await?;
-                    return Ok(());
-                }
+                // CI already in terminal failure — re-route immediately, don't wait
+                tracing::warn!(
+                    task_id = task.id.0,
+                    pr_number,
+                    failing,
+                    "CI failed — re-routing to agent to fix"
+                );
+                backend.update_status(&task.id, Status::NeedsReview).await?;
+                return Ok(());
             }
             _ => {
-                // pending
+                // pending — wait up to max_wait
                 if start.elapsed() >= max_wait {
                     tracing::warn!(task_id = task.id.0, "CI checks still pending after timeout");
-                    // Set NeedsReview so the next engine tick re-triggers review
                     backend.update_status(&task.id, Status::NeedsReview).await?;
                     return Ok(());
                 }
