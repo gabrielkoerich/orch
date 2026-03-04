@@ -41,12 +41,10 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `gh.backoff` | `mode` | Rate-limit behavior: `wait` or `skip` | `"wait"` |
 | `gh.backoff` | `base_seconds` | Initial backoff duration in seconds | `30` |
 | `gh.backoff` | `max_seconds` | Max backoff duration in seconds | `900` |
-| `gh.auth` | `mode` | Auth method: `auto`, `token`, `github_app`, or `gh_cli` | `"auto"` |
-| `gh.auth` | `token` | Personal Access Token (for `mode: token`) | `""` |
-| `gh.auth` | `app_id` | GitHub App ID (for `mode: github_app`) | `""` |
-| `gh.auth` | `private_key` | Path to GitHub App private key PEM file | `""` |
-| `gh.auth` | `installation_id` | Specific installation ID (auto-detected if empty) | `""` |
-| `gh.auth` | `allow_gh_fallback` | Fall back to `gh auth token` when no token is configured | `true` |
+| `github` | `token_mode` | Token resolution mode: `env`, `github_app`, or `legacy` | `"env"` |
+| `github` | `app_id` | GitHub App ID (for `token_mode: github_app`) | `""` |
+| `github` | `private_key_path` | Path to GitHub App private key (.pem) | `""` |
+| `github` | `allow_legacy_fallback` | Allow `gh auth token` fallback when primary mode fails | `false` |
 | `model_map` | `simple/medium/complex` | Agent-specific model names per complexity level | `{}` |
 
 ## Authentication
@@ -135,3 +133,55 @@ orch skills list    # show available skills
 ```
 
 Skills listed in `workflow.required_skills` are always injected into agent prompts. Other skills are selected per-task by the router.
+
+## GitHub Authentication
+
+Orch uses a centralized [`TokenResolver`](https://github.com/gabrielkoerich/orch/blob/main/src/github/token.rs) for GitHub API authentication. This provides secure, flexible token resolution without spawning subprocesses during per-task operations.
+
+### Token Resolution Modes
+
+| Mode | Description | Configuration |
+|------|-------------|---------------|
+| `env` (default) | Read from `GH_TOKEN` → `GITHUB_TOKEN` environment variables | `github.token_mode: env` |
+| `github_app` | Generate JWT from GitHub App credentials | `github.token_mode: github_app` |
+| `legacy` | Use `gh auth token` CLI command | `github.token_mode: legacy` |
+
+### Environment Variables (Default)
+
+The default mode reads tokens from environment variables (checked in order):
+
+```bash
+export GH_TOKEN="ghp_xxx"          # Preferred
+export GITHUB_TOKEN="ghp_xxx"      # Fallback
+```
+
+### GitHub App Authentication
+
+For GitHub App authentication, configure the App ID and private key path:
+
+```yaml
+# ~/.orch/config.yml
+github:
+  token_mode: github_app
+  app_id: "123456"
+  private_key_path: "/path/to/app.pem"
+```
+
+The TokenResolver automatically generates a JWT from the private key (valid for 9 minutes) and caches it until expiration.
+
+### Legacy Fallback
+
+To allow the legacy `gh auth token` CLI fallback when the primary mode fails:
+
+```yaml
+# ~/.orch/config.yml
+github:
+  token_mode: env
+  allow_legacy_fallback: true
+```
+
+This is useful when `gh` CLI is available but environment variables are not set.
+
+### Agent Session Tokens
+
+When spawning agents in tmux sessions, tokens are injected via the tmux session environment (`tmux set-environment`) rather than being embedded in runner scripts. This prevents token leakage to disk and enables centralized token rotation without restarting agents.

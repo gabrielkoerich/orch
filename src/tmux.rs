@@ -273,6 +273,79 @@ impl TmuxManager {
         }
         map
     }
+
+    // ── Environment variable helpers ───────────────────────────────────
+
+    /// Set an environment variable in a tmux session.
+    ///
+    /// This updates the tmux session environment, which will be inherited
+    /// by processes started in new windows/panes within the session.
+    pub async fn set_env(&self, session: &str, key: &str, value: &str) -> anyhow::Result<()> {
+        let output = Command::new("tmux")
+            .args(["set-environment", "-t", session, key, value])
+            .output_with_context()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux set-environment failed for {session}: {stderr}");
+        }
+
+        tracing::debug!(session, key, "set tmux environment variable");
+        Ok(())
+    }
+
+    /// Unset (remove) an environment variable from a tmux session.
+    #[allow(dead_code)]
+    pub async fn unset_env(&self, session: &str, key: &str) -> anyhow::Result<()> {
+        let output = Command::new("tmux")
+            .args(["set-environment", "-t", session, "-u", key])
+            .output_with_context()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux unset-environment failed for {session}: {stderr}");
+        }
+
+        tracing::debug!(session, key, "unset tmux environment variable");
+        Ok(())
+    }
+
+    /// Set multiple environment variables in a tmux session at once.
+    ///
+    /// This is a convenience method for setting multiple variables efficiently.
+    #[allow(dead_code)]
+    pub async fn set_env_batch(
+        &self,
+        session: &str,
+        vars: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        for (key, value) in vars {
+            self.set_env(session, key, value).await?;
+        }
+        Ok(())
+    }
+
+    /// Set the GitHub token in a tmux session environment.
+    ///
+    /// This is a convenience method that sets GH_TOKEN (and optionally
+    /// GITHUB_TOKEN) for agent sessions.
+    pub async fn set_github_token(
+        &self,
+        session: &str,
+        token: &str,
+        set_github_token_var: bool,
+    ) -> anyhow::Result<()> {
+        self.set_env(session, "GH_TOKEN", token).await?;
+
+        if set_github_token_var {
+            self.set_env(session, "GITHUB_TOKEN", token).await?;
+        }
+
+        tracing::debug!(session, "set GitHub token in tmux session environment");
+        Ok(())
+    }
 }
 
 #[cfg(test)]

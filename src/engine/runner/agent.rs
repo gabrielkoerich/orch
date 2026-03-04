@@ -3,6 +3,7 @@
 //! Supports Claude, Codex, OpenCode (plus Kimi/MiniMax as Claude aliases).
 //! Prefers PTY-based spawning to preserve terminal semantics without on-disk scripts.
 
+use crate::github::token::TokenResolver;
 use crate::template::render_template_str;
 use crate::tmux::TmuxManager;
 use std::collections::HashMap;
@@ -96,49 +97,92 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
 
     // Build agent command using per-agent runner
     let runner = super::agents::get_runner(&inv.agent);
-
-    // Resolve GH_TOKEN at script-generation time so agents don't need to call gh auth.
-    // Prefer the native auth resolver (GhHttp / auth::create_resolver) but keep
-    // the CLI wrapper's resolve_token() as a non-fatal fallback for environments
-    // that still rely on interactive `gh` sessions.
-    let gh_token = if let Ok(resolver) = crate::github::auth::create_resolver() {
-        // Try primary resolver without falling back to gh CLI
-        match resolver.resolve_token().await {
-            Ok(t) if !t.is_empty() => Some(t),
-            _ => crate::github::cli_wrapper::resolve_token(),
-        }
+    let timeout_cmd = if inv.timeout_seconds > 0 {
+        format!("timeout {}", inv.timeout_seconds)
     } else {
-        crate::github::cli_wrapper::resolve_token()
+        String::new()
     };
-    if gh_token.is_none() {
-        tracing::warn!("gh auth token not available; agents may not have GitHub access");
+    let agent_cmd = runner.build_command(
+        inv.model.as_deref(),
+        &timeout_cmd,
+        &sys_file.to_string_lossy(),
+        &msg_file.to_string_lossy(),
+        &permissions,
+    );
+    // Build the runner script content (saved to attempt dir)
+    fn build_runner_script(
+        inv: &AgentInvocation,
+        agent_cmd: &str,
+        attempt_dir: &std::path::Path,
+    ) -> anyhow::Result<String> {
+        let status_file = attempt_dir.join("exit.txt");
+        Ok(format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+
+# Environment
+[ -f "$HOME/.path" ] && source "$HOME/.path"
+[ -f "$HOME/.private" ] && source "$HOME/.private"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export GIT_AUTHOR_NAME="{git_name}"
+export GIT_COMMITTER_NAME="{git_name}"
+export GIT_AUTHOR_EMAIL="{git_email}"
+export GIT_COMMITTER_EMAIL="{git_email}"
+export TASK_ID="{task_id}"
+export OUTPUT_FILE="{output_file}"
+unset CLAUDECODE  # allow nested claude invocations from orchestrator
+
+cd "{work_dir}"
+
+# Run agent
+RESPONSE=$({agent_cmd} 2>"{attempt_dir}/stderr.txt") || CMD_STATUS=$?
+CMD_STATUS=${{CMD_STATUS:-0}}
+
+# Save response
+printf '%s' "$RESPONSE" > "{output_file}"
+
+# Save exit status
+echo "$CMD_STATUS" > "{status_file}"
+
+exit $CMD_STATUS
+"#,
+            git_name = inv.git_author_name,
+            git_email = inv.git_author_email,
+            task_id = inv.task_id,
+            output_file = inv.output_file.display(),
+            work_dir = inv.work_dir.display(),
+            agent_cmd = agent_cmd,
+            attempt_dir = attempt_dir.display(),
+            status_file = status_file.display(),
+        ))
     }
 
-    // Prepare non-secret environment map for tmux session.
-    // GH_TOKEN is injected via set_session_env after session creation to avoid
-    // exposing it in process arguments or on-disk artifacts.
-    let mut env_map = std::collections::HashMap::new();
-    env_map.insert("GIT_AUTHOR_NAME".to_string(), inv.git_author_name.clone());
-    env_map.insert(
+    // Prepare environment map for tmux session (does not write GH token to disk)
+    let mut env = std::collections::HashMap::new();
+    env.insert("GIT_AUTHOR_NAME".to_string(), inv.git_author_name.clone());
+    env.insert(
         "GIT_COMMITTER_NAME".to_string(),
         inv.git_author_name.clone(),
     );
-    env_map.insert("GIT_AUTHOR_EMAIL".to_string(), inv.git_author_email.clone());
-    env_map.insert(
+    env.insert("GIT_AUTHOR_EMAIL".to_string(), inv.git_author_email.clone());
+    env.insert(
         "GIT_COMMITTER_EMAIL".to_string(),
         inv.git_author_email.clone(),
     );
-    env_map.insert("TASK_ID".to_string(), inv.task_id.clone());
-    env_map.insert(
+    env.insert("TASK_ID".to_string(), inv.task_id.clone());
+    env.insert(
         "OUTPUT_FILE".to_string(),
         inv.output_file.display().to_string(),
     );
 
+<<<<<<< HEAD
     // Build shell command that runs agent, captures stdout/stderr and exit status.
-    // We avoid creating a runner.sh on disk by passing a shell -lc command to tmux.
+    // We avoid creating a runner.sh on disk by passing a shell -lc command to tmux
+    // for PTY-disabled flows. For PTY-enabled flows we prefer spawning the
+    // agent in a pty and attaching it to the session.
 
     // Clone env_map for branch-specific use (PTY code expects `env`).
-    let env: std::collections::HashMap<String, String> = env_map.clone();
+    let env: std::collections::HashMap<String, String> = env.clone();
     let status_file = attempt_dir.join("exit.txt");
     let stderr_file = attempt_dir.join("stderr.txt");
 
@@ -148,7 +192,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
 
     if pty_enabled {
         // Build env var slice for tmux.create_session
-        let env_slice: Vec<(&str, &str)> = env_map
+        let env_slice: Vec<(&str, &str)> = env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
@@ -230,20 +274,46 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     );
 
     // Build shell command that runs agent, captures stdout/stderr and exit status
-    // We avoid creating a runner.sh on disk by passing a shell -lc command to tmux.
+    // for non-PTY flows.
     let work_dir = inv.work_dir.to_string_lossy();
+=======
+    // Write runner script to per-task attempt dir
+    let script_path = attempt_dir.join("runner.sh");
+    let script_content = build_runner_script(inv, &agent_cmd, &attempt_dir)?;
+>>>>>>> 277065c (Resolve rebase conflicts: integrate TokenResolver into agent runner and build runner script)
 
-    let command = format!(
-        "unset CLAUDECODE; cd '{work_dir}'; RESPONSE=$({agent_cmd} 2> '{stderr}'); CMD_STATUS=$?; printf '%s' \"$RESPONSE\" > '{out}'; echo \"$CMD_STATUS\" > '{status}'; exit $CMD_STATUS",
-        agent_cmd = agent_cmd,
-        stderr = stderr_file.display(),
-        out = inv.output_file.display(),
-        status = status_file.display(),
-        work_dir = work_dir,
-    );
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&script_path, &script_content)?;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+    }
 
-    // Convert env_map to a slice of (&str, &str) pairs for tmux.create_session.
-    let env_vec: Vec<(&str, &str)> = env_map
+    let command = format!("bash {}", script_path.display());
+
+    // Resolve GitHub token using centralized TokenResolver
+    // This avoids embedding tokens in runner scripts and prevents gh CLI calls per-task
+    let token_resolver = TokenResolver::default_env();
+    let github_token = match token_resolver.get_token().await {
+        Ok(Some(token)) => {
+            tracing::debug!("Resolved GitHub token via TokenResolver for agent session");
+            Some(token)
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "No GitHub token available; set GH_TOKEN, GITHUB_TOKEN, or configure github.token_mode"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to resolve GitHub token");
+            None
+        }
+    };
+
+    // Convert env to a slice of (&str, &str) pairs for tmux.create_session.
+    let env_vec: Vec<(&str, &str)> = env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
@@ -258,6 +328,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         )
         .await?;
 
+<<<<<<< HEAD
     // Ensure non-secret environment variables are set in the session (best-effort).
     for (k, v) in &env {
         tmux.set_session_env(&session, k, v).await.ok();
@@ -268,6 +339,13 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     if let Some(ref token) = gh_token {
         if let Err(e) = tmux.set_session_env(&session, "GH_TOKEN", token).await {
             tracing::warn!(task_id = inv.task_id, error = %e, "failed to set GH_TOKEN in tmux session");
+=======
+    // Inject GitHub token into tmux session environment (if available)
+    // This keeps tokens out of runner scripts and disk
+    if let Some(token) = github_token {
+        if let Err(e) = tmux.set_github_token(&session, &token, false).await {
+            tracing::warn!(error = %e, session, "Failed to set GitHub token in tmux session");
+>>>>>>> 277065c (Resolve rebase conflicts: integrate TokenResolver into agent runner and build runner script)
         }
     }
 
