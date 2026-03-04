@@ -61,10 +61,8 @@ Create a token at [GitHub Settings → Developer settings → Personal access to
 export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 
 # Or configure in ~/.orch/config.yml
-gh:
-  auth:
-    mode: token
-    token: "ghp_xxxxxxxxxxxxxxxxxxxx"
+github:
+  token_mode: env
 ```
 
 ### Option 2: GitHub App (Recommended for organizations)
@@ -77,13 +75,10 @@ GitHub Apps provide better audit trails and scoped permissions for automation:
 4. Configure in `~/.orch/config.yml`:
 
 ```yaml
-gh:
-  auth:
-    mode: github_app
-    app_id: "123456"
-    private_key: "/path/to/app-private-key.pem"
-    # Optional: specific installation ID (auto-detected if not set)
-    # installation_id: "78901234"
+github:
+  token_mode: github_app
+  app_id: "123456"
+  private_key_path: "/path/to/app-private-key.pem"
 ```
 
 The orchestrator automatically exchanges the App credentials for installation tokens and refreshes them before expiry.
@@ -100,12 +95,11 @@ gh auth login
 Enable fallback in config if you want `gh` to be used:
 
 ```yaml
-gh:
-  auth:
-    mode: gh_cli
-    # Or use auto mode with fallback enabled:
-    # mode: auto
-    # allow_gh_fallback: true
+github:
+  token_mode: legacy
+  # Or use env mode with explicit fallback enabled:
+  # token_mode: env
+  # allow_legacy_fallback: true
 ```
 
 **Note:** The `gh` CLI method is not recommended for service environments (launchd/systemd) as it requires an interactive login session.
@@ -140,7 +134,7 @@ Edit your plist with `sudo launchctl edit <label>` or update it via the Homebrew
 
 Use `mode: github_app` in `~/.orch/config.yml` — no long-lived token is stored; the service generates short-lived JWTs and installation tokens automatically.
 
-> **Security guarantee:** Orch never embeds `GH_TOKEN` in runner scripts on disk. Tokens are injected into the tmux session environment at spawn time (`tmux new-session -e GH_TOKEN=...`) and live only in process memory, not in `~/.orch/state/` artifacts.
+> **Security guarantee:** Orch never embeds `GH_TOKEN` in runner scripts on disk. Tokens are injected into the tmux session environment at spawn time (via `tmux set-environment`) and live only in process memory, not in `~/.orch/state/` artifacts.
 
 ## Files
 

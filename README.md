@@ -80,10 +80,8 @@ Orch requires GitHub authentication to sync with issues and create PRs. Three me
 export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 
 # Or configure in ~/.orch/config.yml
-gh:
-  auth:
-    mode: token
-    token: "ghp_xxxxxxxxxxxxxxxxxxxx"
+github:
+  token_mode: env
 ```
 
 ### GitHub App (Recommended for organizations)
@@ -91,11 +89,10 @@ gh:
 Better audit trails and scoped permissions for team automation:
 
 ```yaml
-gh:
-  auth:
-    mode: github_app
-    app_id: "123456"
-    private_key: "/path/to/app-private-key.pem"
+github:
+  token_mode: github_app
+  app_id: "123456"
+  private_key_path: "/path/to/app-private-key.pem"
 ```
 
 The orchestrator automatically generates JWTs and refreshes installation tokens before expiry.
@@ -107,6 +104,21 @@ The project prefers native HTTP auth using `GH_TOKEN`/`GITHUB_TOKEN` or GitHub A
 ```bash
 # Optional, legacy interactive flow
 gh auth login  # Run interactively
+```
+
+Enable legacy mode explicitly in config if you want `gh` to be used:
+
+```yaml
+github:
+  token_mode: legacy
+```
+
+Or keep `env` and allow a fallback only if `GH_TOKEN`/`GITHUB_TOKEN` are missing:
+
+```yaml
+github:
+  token_mode: env
+  allow_legacy_fallback: true
 ```
 
 See [Configuration](#configuration) for details and run `orch auth check` to verify your setup.
