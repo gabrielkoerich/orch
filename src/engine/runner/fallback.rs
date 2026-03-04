@@ -13,9 +13,9 @@ use super::{agents, response};
 /// How `run()` should proceed after error handling.
 pub enum ErrorHandleResult {
     /// Task was rerouted — `run()` should record metrics then return early.
-    EarlyReturn,
+    EarlyReturn { status: String },
     /// Normal failover applied (or task marked needs_review) — proceed to cleanup + metrics.
-    Continue,
+    Continue { status: String },
 }
 
 /// Handle an agent error: classify it, attempt recovery strategies, and update sidecar.
@@ -75,13 +75,14 @@ pub async fn handle_error(
                     task_id,
                     &[
                         format!("model={next}"),
-                        "status=new".to_string(),
                         format!("last_error=model {model} unavailable, trying {next}"),
                         "error_type=failed".to_string(),
                     ],
                 )?;
                 // Skip normal failover — we're retrying same agent with different model
-                return Ok(ErrorHandleResult::EarlyReturn);
+                return Ok(ErrorHandleResult::EarlyReturn {
+                    status: "new".to_string(),
+                });
             }
             (
                 response::RetryableError::Failed,
@@ -100,12 +101,13 @@ pub async fn handle_error(
             sidecar::set(
                 task_id,
                 &[
-                    "status=needs_review".to_string(),
                     format!("last_error=waiting for input: {message}"),
                     "error_type=failed".to_string(),
                 ],
             )?;
-            return Ok(ErrorHandleResult::EarlyReturn);
+            return Ok(ErrorHandleResult::EarlyReturn {
+                status: "needs_review".to_string(),
+            });
         }
         agents::AgentError::PermissionDenied { message } => (
             response::RetryableError::Failed,
@@ -177,24 +179,25 @@ pub async fn handle_error(
                     &[
                         "agent=opencode".to_string(),
                         format!("model={free_model}"),
-                        "status=new".to_string(),
                         format!("model_reroute_chain={new_tried}"),
                         format!("last_error=all agents exhausted, trying free model {free_model}"),
                         format!("error_type={}", retryable.type_str()),
                     ],
                 )?;
-                return Ok(ErrorHandleResult::EarlyReturn);
+                return Ok(ErrorHandleResult::EarlyReturn {
+                    status: "new".to_string(),
+                });
             }
         }
     }
 
-    let rerouted = response::handle_failover(task_id, agent_name, retryable, &error_msg);
-    if !rerouted {
+    let status = response::handle_failover(task_id, agent_name, retryable, &error_msg);
+    if status == "needs_review" {
         tracing::warn!(task_id, "failover exhausted, task marked needs_review");
     }
 
     // Store failure memory for retry learning
     response::store_failure_memory(task_id, new_attempts, agent_name, model_name, &error_msg);
 
-    Ok(ErrorHandleResult::Continue)
+    Ok(ErrorHandleResult::Continue { status })
 }

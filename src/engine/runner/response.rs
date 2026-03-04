@@ -326,7 +326,7 @@ impl RetryableError {
 }
 
 /// Handle failover for any retryable error type.
-/// Returns true if the task was rerouted, false if it should be marked needs_review.
+/// Returns the resulting status string: "new" if rerouted, "needs_review" otherwise.
 ///
 /// Note: DB recording of rate limit events is handled by the caller (mod.rs)
 /// which has async context. This function only handles sidecar state + cooldowns.
@@ -335,7 +335,7 @@ pub fn handle_failover(
     agent_name: &str,
     error_type: RetryableError,
     error_message: &str,
-) -> bool {
+) -> String {
     // Get the reroute chain
     let chain = get_reroute_chain(task_id);
     let chain = update_reroute_chain(task_id, agent_name, &chain);
@@ -364,14 +364,13 @@ pub fn handle_failover(
         if let Err(e) = sidecar::set(
             task_id,
             &[
-                "status=needs_review".to_string(),
                 format!("last_error={error_message} (all agents exhausted)"),
                 format!("error_type={}", error_type.type_str()),
             ],
         ) {
             tracing::error!(task_id, ?e, "failed to update task status during failover");
         }
-        return false;
+        return "needs_review".to_string();
     }
 
     // Pick a fallback agent
@@ -395,14 +394,13 @@ pub fn handle_failover(
             &[
                 format!("agent={next}"),
                 "model=".to_string(),
-                "status=new".to_string(),
                 format!("last_error={error_message}, rerouted to {next}"),
                 format!("error_type={}", error_type.type_str()),
             ],
         ) {
             tracing::error!(task_id, ?e, "failed to update task status during failover");
         }
-        return true;
+        return "new".to_string();
     }
 
     // No fallback available
@@ -410,14 +408,13 @@ pub fn handle_failover(
     if let Err(e) = sidecar::set(
         task_id,
         &[
-            "status=needs_review".to_string(),
             format!("last_error={error_message}, no fallback agents"),
             format!("error_type={}", error_type.type_str()),
         ],
     ) {
         tracing::error!(task_id, ?e, "failed to update task status during failover");
     }
-    false
+    "needs_review".to_string()
 }
 
 /// Get the reroute chain from sidecar.

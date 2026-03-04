@@ -339,64 +339,53 @@ pub(crate) async fn tick_dispatch_tasks(
             {
                 Ok(signal) => {
                     tracing::info!(task_id, "task runner completed");
-                    // Send weight signal back to the router
-                    let _ = weight_tx.send(signal).await;
 
                     // Send task completion notification
-                    let status = sidecar::get(&task_id, "status").unwrap_or_default();
                     let summary = sidecar::get(&task_id, "summary").unwrap_or_default();
                     let duration = dispatch_start.elapsed().as_secs_f64();
+
+                    // Derive a display status from the weight signal for the notification.
+                    let display_status = match &signal {
+                        WeightSignal::Success { .. } => "done",
+                        WeightSignal::RateLimited { .. } => "new",
+                        WeightSignal::None => "needs_review",
+                    };
 
                     transport.push_notification(TaskNotification {
                         task_id: task_id.clone(),
                         title: task_owned.title.clone(),
-                        status: status.clone(),
+                        status: display_status.to_string(),
                         agent: agent_name.clone(),
                         duration_seconds: duration,
                         summary: summary.clone(),
                     });
 
-                    // Trigger review agent for needs_review tasks (PR exists, queued for review)
-                    tracing::debug!(task_id, %status, "checking review trigger");
-                    if status == "needs_review" {
+                    // Send weight signal back to the router
+                    let _ = weight_tx.send(signal).await;
+
+                    // Trigger review agent for needs_review tasks (PR exists, queued for review).
+                    // WeightSignal::None indicates the task needs attention (needs_review or failed);
+                    // the review gate handles the "no PR" case by re-routing the task.
+                    if display_status == "needs_review" {
                         let enable_review = config::get("workflow.enable_review_agent")
                             .map(|v| v != "false")
                             .unwrap_or(true);
                         tracing::info!(task_id, enable_review, "review gate check");
                         if enable_review {
-                            // Sidecar-based guard: prevents double-dispatch across tick invocations.
-                            // compare_and_swap holds the exclusive file lock across both the read
-                            // and write, eliminating the TOCTOU window that existed when get() and
-                            // set() were two separate calls.
-                            let claimed = match sidecar::compare_and_swap(
-                                &task_id,
-                                "review_started",
-                                "",
-                                "true",
-                            ) {
-                                Ok(false) => {
-                                    tracing::debug!(task_id, "review agent already started, skipping duplicate");
-                                    false
-                                }
+                            // Transition to InReview — this IS the atomic guard against duplicates.
+                            // The GitHub label update is idempotent; if the task is already InReview
+                            // no duplicate review will be spawned.
+                            match backend
+                                .update_status(
+                                    &ExternalId(task_id.clone()),
+                                    Status::InReview,
+                                )
+                                .await
+                            {
                                 Err(e) => {
-                                    tracing::warn!(task_id, err = %e, "failed to set review_started guard, skipping review");
-                                    false
-                                }
-                                Ok(true) => true, // claimed — proceed to dispatch
-                            };
-                            if claimed {
-                                // Transition to InReview — this IS the guard against duplicates
-                                if let Err(e) = backend
-                                    .update_status(
-                                        &ExternalId(task_id.clone()),
-                                        Status::InReview,
-                                    )
-                                    .await
-                                {
                                     tracing::warn!(task_id, err = %e, "failed to transition to InReview");
-                                    // Clear the guard since we couldn't transition
-                                    let _ = sidecar::set(&task_id, &["review_started=".to_string()]);
-                                } else {
+                                }
+                                Ok(_) => {
                                     let backend_clone = backend.clone();
                                     let tmux_clone = tmux.clone();
                                     let task_owned_clone = task_owned.clone();
@@ -444,11 +433,6 @@ pub(crate) async fn tick_dispatch_tasks(
                                                     .await;
                                             }
                                             Ok(_) => {} // Approve or RequestChanges handled inside
-                                        }
-                                        // Clear the review_started guard so the task can be reviewed again
-                                        // if it returns to NeedsReview status
-                                        if let Err(e) = sidecar::set(&task_id_for_review, &["review_started=".to_string()]) {
-                                            tracing::warn!(task_id = task_id_for_review, err = %e, "failed to clear review_started guard");
                                         }
                                     }));
                                 }

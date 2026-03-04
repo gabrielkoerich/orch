@@ -86,8 +86,8 @@ pub fn write_result_json(
 
 /// Handle a successful agent response: commit, push, PR, delegations, tokens, budget.
 ///
-/// Returns `Ok(true)` if the token budget was exceeded and `run()` should return
-/// early (without cleanup or metrics). Returns `Ok(false)` to continue normally.
+/// Returns `Ok((status, budget_exceeded))` where `status` is the final task status
+/// string and `budget_exceeded` is `true` if `run()` should return early.
 pub async fn handle_success(
     task_id: &str,
     parsed: agents::ParsedResponse,
@@ -96,7 +96,7 @@ pub async fn handle_success(
     agent_name: &str,
     model_name: Option<&str>,
     new_attempts: u32,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(String, bool)> {
     let resp = parsed.response;
     tracing::info!(
         task_id,
@@ -189,13 +189,7 @@ pub async fn handle_success(
     } else {
         &resp.status
     };
-    sidecar::set(
-        task_id,
-        &[
-            format!("status={final_status}"),
-            format!("summary={}", resp.summary),
-        ],
-    )?;
+    sidecar::set(task_id, &[format!("summary={}", resp.summary)])?;
 
     // Store token usage — prefer agent-parsed tokens, fall back to response
     let input_tokens = parsed.input_tokens.or(resp.input_tokens);
@@ -236,7 +230,6 @@ pub async fn handle_success(
         sidecar::set(
             task_id,
             &[
-                format!("status={budget_status}"),
                 format!(
                     "last_error=token budget exceeded: {}/{} tokens (${:.4})",
                     total_tokens, max_tokens, cost.total_cost_usd
@@ -244,7 +237,7 @@ pub async fn handle_success(
                 "budget_exceeded=true".to_string(),
             ],
         )?;
-        return Ok(true); // signal early return to caller
+        return Ok((budget_status.to_string(), true)); // signal early return to caller
     } else if total_tokens > warning_threshold {
         let pct = (total_tokens as f64 / max_tokens as f64 * 100.0) as u32;
         tracing::warn!(
@@ -265,5 +258,5 @@ pub async fn handle_success(
 
     // Note: done → in_review transition is handled by the engine
     // after triggering the review agent (engine/mod.rs)
-    Ok(false)
+    Ok((final_status.to_string(), false))
 }
