@@ -4,9 +4,10 @@
 //! headers proactively, and supports concurrent requests via `tokio::join!`.
 //!
 //! Auth: uses the centralized [`TokenResolver`] which supports:
-//! - `GH_TOKEN` / `GITHUB_TOKEN` environment variables (default)
+//! - `GH_TOKEN` / `GITHUB_TOKEN` environment variables
+//! - `gh.auth.token` config value
+//! - `gh auth token` CLI fallback (default — just run `gh auth login`)
 //! - GitHub App JWT generation (with app_id + private_key configuration)
-//! - Legacy `gh auth token` CLI fallback (if explicitly enabled)
 
 use super::token;
 use super::types::{
@@ -200,11 +201,9 @@ pub struct GhHttp {
 impl GhHttp {
     /// Create a new client using the centralized [`TokenResolver`].
     ///
-    /// The token is resolved once at startup using environment variables
-    /// (`GH_TOKEN` → `GITHUB_TOKEN`) by default. For GitHub App authentication,
-    /// use [`TokenResolver`] directly and call `get_token().await`.
-    ///
-    /// Legacy `gh auth token` fallback can be enabled via config `github.allow_legacy_fallback=true`.
+    /// Resolution order: `GH_TOKEN` → `GITHUB_TOKEN` → `gh.auth.token` config → `gh auth token` CLI.
+    /// The `gh auth token` fallback is enabled by default — just run `gh auth login` and it works.
+    /// Disable with `gh.allow_gh_fallback = false` in config.
     pub fn new() -> Self {
         let token_resolver = token::TokenResolver::default_env();
         let token = token_resolver
@@ -215,7 +214,7 @@ impl GhHttp {
 
         if token.is_empty() {
             tracing::warn!(
-                "No GitHub token found: set GH_TOKEN, GITHUB_TOKEN, or configure github.token_mode"
+                "No GitHub token found: set GH_TOKEN, GITHUB_TOKEN, or run `gh auth login`"
             );
         } else {
             tracing::debug!("GitHub token resolved via TokenResolver");

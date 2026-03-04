@@ -95,20 +95,8 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     std::fs::write(&sys_file, &sys_content)?;
     std::fs::write(&msg_file, &inv.agent_message)?;
 
-    // Build agent command using per-agent runner
+    // Build agent command using per-agent runner (used in non-PTY path below)
     let runner = super::agents::get_runner(&inv.agent);
-    let timeout_cmd = if inv.timeout_seconds > 0 {
-        format!("timeout {}", inv.timeout_seconds)
-    } else {
-        String::new()
-    };
-    let agent_cmd = runner.build_command(
-        inv.model.as_deref(),
-        &timeout_cmd,
-        &sys_file.to_string_lossy(),
-        &msg_file.to_string_lossy(),
-        &permissions,
-    );
     // Build the runner script content (saved to attempt dir)
     fn build_runner_script(
         inv: &AgentInvocation,
@@ -189,10 +177,8 @@ exit $CMD_STATUS
 
     if pty_enabled {
         // Build env var slice for tmux.create_session
-        let env_slice: Vec<(&str, &str)> = env
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
+        let env_slice: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let session = tmux
             .create_session(
                 &inv.repo,

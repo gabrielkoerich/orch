@@ -1,12 +1,18 @@
-//! Centralized GitHub token resolution — supports env vars, GitHub App JWT, and legacy CLI fallback.
+//! Centralized GitHub token resolution — supports env vars, GitHub App JWT, and gh CLI fallback.
 //!
 //! This module provides a [`TokenResolver`] that caches token resolution and supports multiple modes:
-//! - `env`: Read from `GH_TOKEN` or `GITHUB_TOKEN` environment variables
+//! - `env` (default): Read from `GH_TOKEN` or `GITHUB_TOKEN` env vars, then `gh.auth.token` config,
+//!   then `gh auth token` CLI (controlled by `allow_gh_fallback`, which defaults to `true`)
 //! - `github_app`: Generate JWT from app_id + private_key (for GitHub App authentication)
-//! - `legacy`: Use `gh auth token` CLI as fallback (only if explicitly enabled)
 //!
-//! The resolver is designed to be used throughout the application without spawning
-//! subprocesses during per-task operations.
+//! ## Default behavior
+//!
+//! Out of the box, `TokenResolver::default()` works with just `gh auth login` — no extra config needed.
+//! Resolution order:
+//! 1. `GH_TOKEN` environment variable
+//! 2. `GITHUB_TOKEN` environment variable
+//! 3. `gh.auth.token` config value
+//! 4. `gh auth token` CLI (via `allow_gh_fallback = true`)
 
 use anyhow::Context;
 use std::env;
@@ -17,7 +23,13 @@ use tokio::sync::RwLock;
 /// Token source mode for GitHub authentication.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum TokenMode {
-    /// Read from environment variables (`GH_TOKEN` → `GITHUB_TOKEN`).
+    /// Read from environment variables and config, with optional `gh auth token` fallback.
+    ///
+    /// Resolution order:
+    /// 1. `GH_TOKEN` env var
+    /// 2. `GITHUB_TOKEN` env var
+    /// 3. `gh.auth.token` config value
+    /// 4. `gh auth token` CLI (if `allow_gh_fallback` is enabled, which is the default)
     #[default]
     Env,
     /// GitHub App authentication with JWT generation.
@@ -27,8 +39,6 @@ pub enum TokenMode {
         /// Path to the private key file (.pem).
         private_key_path: String,
     },
-    /// Legacy fallback using `gh auth token` CLI.
-    Legacy,
 }
 
 impl TokenMode {
@@ -37,7 +47,6 @@ impl TokenMode {
     /// Supported values:
     /// - `"env"` → `TokenMode::Env`
     /// - `"github_app"` → `TokenMode::GitHubApp` (requires `app_id` and `private_key_path` config)
-    /// - `"legacy"` → `TokenMode::Legacy`
     #[allow(dead_code)]
     pub fn from_config(
         mode: &str,
@@ -58,7 +67,6 @@ impl TokenMode {
                     TokenMode::Env
                 }
             }
-            "legacy" => TokenMode::Legacy,
             _ => TokenMode::Env,
         }
     }
@@ -76,21 +84,34 @@ struct CachedToken {
 ///
 /// The resolver caches tokens and supports async resolution for modes that
 /// may require I/O (e.g., reading private key files).
+///
+/// ## Default setup
+///
+/// ```rust,ignore
+/// let resolver = TokenResolver::default(); // uses gh auth token if no env var set
+/// let token = resolver.get_token().await?;
+/// ```
 #[derive(Debug, Clone)]
 pub struct TokenResolver {
     mode: TokenMode,
-    /// Whether to allow gh CLI fallback when primary mode fails.
-    allow_legacy_fallback: bool,
+    /// Whether to fall back to `gh auth token` CLI when env vars and config are unset.
+    ///
+    /// Defaults to `true` — just run `gh auth login` and everything works.
+    /// Set to `false` only when you want to enforce explicit token configuration.
+    allow_gh_fallback: bool,
     /// Cached token with expiration tracking.
     cached: Arc<RwLock<Option<CachedToken>>>,
 }
 
 impl TokenResolver {
     /// Create a new TokenResolver with the specified mode.
+    ///
+    /// `allow_gh_fallback` defaults to `true` — `gh auth token` is tried last if env vars
+    /// and config are not set.
     pub fn new(mode: TokenMode) -> Self {
         Self {
             mode,
-            allow_legacy_fallback: false,
+            allow_gh_fallback: true,
             cached: Arc::new(RwLock::new(None)),
         }
     }
@@ -101,25 +122,27 @@ impl TokenResolver {
         mode_str: Option<&str>,
         app_id: Option<String>,
         private_key_path: Option<String>,
-        allow_legacy_fallback: bool,
+        allow_gh_fallback: bool,
     ) -> Self {
         let mode = TokenMode::from_config(mode_str.unwrap_or("env"), app_id, private_key_path);
         Self {
             mode,
-            allow_legacy_fallback,
+            allow_gh_fallback,
             cached: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Create a default TokenResolver using environment variables.
+    /// Create a default TokenResolver using environment variables with gh CLI fallback.
     pub fn default_env() -> Self {
         Self::new(TokenMode::Env)
     }
 
-    /// Enable or disable legacy gh CLI fallback.
+    /// Enable or disable `gh auth token` CLI fallback.
+    ///
+    /// Defaults to `true` — disable only to enforce explicit token configuration.
     #[allow(dead_code)]
-    pub fn with_legacy_fallback(mut self, enabled: bool) -> Self {
-        self.allow_legacy_fallback = enabled;
+    pub fn with_gh_fallback(mut self, enabled: bool) -> Self {
+        self.allow_gh_fallback = enabled;
         self
     }
 
@@ -168,12 +191,21 @@ impl TokenResolver {
 
     /// Get token synchronously (for contexts where async is not available).
     ///
-    /// This only works for Env and Legacy modes that don't require async I/O.
+    /// Works for Env mode (env vars, config, and gh CLI fallback).
     /// GitHub App mode requires async due to file reading.
     pub fn get_token_sync(&self) -> anyhow::Result<Option<String>> {
         match self.mode {
-            TokenMode::Env => Ok(Self::resolve_env_token()),
-            TokenMode::Legacy => Self::resolve_legacy_token(),
+            TokenMode::Env => {
+                // Try env vars + config first
+                if let Some(t) = Self::resolve_env_token() {
+                    return Ok(Some(t));
+                }
+                // gh CLI fallback
+                if self.allow_gh_fallback {
+                    return Self::resolve_gh_cli_token();
+                }
+                Ok(None)
+            }
             TokenMode::GitHubApp { .. } => {
                 // GitHub App requires async due to file I/O
                 Err(anyhow::anyhow!(
@@ -208,7 +240,6 @@ impl TokenResolver {
                 self.resolve_github_app_token(app_id, private_key_path)
                     .await?
             }
-            TokenMode::Legacy => Self::resolve_legacy_token()?,
         };
 
         // Return if we got a token from primary mode
@@ -216,16 +247,21 @@ impl TokenResolver {
             return Ok(token);
         }
 
-        // Try legacy fallback if enabled and primary mode failed
-        if self.allow_legacy_fallback && !matches!(self.mode, TokenMode::Legacy) {
-            tracing::debug!("Primary token mode failed, trying legacy gh CLI fallback");
-            return Self::resolve_legacy_token();
+        // gh CLI fallback — the default when nothing else is configured
+        if self.allow_gh_fallback {
+            tracing::debug!("No token in env/config — trying gh auth token CLI");
+            return Self::resolve_gh_cli_token();
         }
 
         Ok(None)
     }
 
-    /// Resolve token from environment variables.
+    /// Resolve token from environment variables and config.
+    ///
+    /// Checks (in order):
+    /// 1. `GH_TOKEN` env var
+    /// 2. `GITHUB_TOKEN` env var
+    /// 3. `gh.auth.token` config value
     fn resolve_env_token() -> Option<String> {
         if let Ok(t) = env::var("GH_TOKEN") {
             if !t.is_empty() {
@@ -239,11 +275,18 @@ impl TokenResolver {
                 return Some(t);
             }
         }
+        // Config-based token (explicit override in ~/.orch/config.yml)
+        if let Ok(t) = crate::config::get("gh.auth.token") {
+            if !t.is_empty() {
+                tracing::debug!("Resolved GitHub token from gh.auth.token config");
+                return Some(t);
+            }
+        }
         None
     }
 
-    /// Resolve token using gh CLI (legacy mode).
-    fn resolve_legacy_token() -> anyhow::Result<Option<String>> {
+    /// Resolve token using `gh auth token` CLI.
+    fn resolve_gh_cli_token() -> anyhow::Result<Option<String>> {
         tracing::debug!("Attempting to resolve GitHub token via gh CLI");
 
         // Try gh in PATH first
@@ -322,7 +365,7 @@ impl TokenResolver {
                 // JWT valid for 9 minutes (GitHub allows up to 10)
                 Some(now + 540)
             }
-            // Env and legacy tokens don't expire (they're managed externally)
+            // Env tokens don't expire (managed externally)
             _ => None,
         }
     }
@@ -375,19 +418,24 @@ fn generate_github_app_jwt(app_id: &str, private_key_pem: &str) -> anyhow::Resul
 
 /// Create a global token resolver from configuration.
 ///
+/// Resolution order:
+/// 1. `GH_TOKEN` / `GITHUB_TOKEN` env vars
+/// 2. `gh.auth.token` config value
+/// 3. `gh auth token` CLI (unless `gh.allow_gh_fallback = false`)
+///
 /// This is typically called once at application startup.
 #[allow(dead_code)]
 pub fn create_token_resolver() -> TokenResolver {
-    // Try to load configuration
     let mode = crate::config::get("github.token_mode").ok();
     let app_id = crate::config::get("github.app_id").ok();
     let private_key_path = crate::config::get("github.private_key_path").ok();
-    let allow_legacy = crate::config::get("github.allow_legacy_fallback")
+    // allow_gh_fallback defaults to true — gh auth login is all you need
+    let allow_gh_fallback = crate::config::get("gh.allow_gh_fallback")
         .ok()
-        .map(|s| s == "true" || s == "1")
-        .unwrap_or(false);
+        .map(|s| s != "false" && s != "0")
+        .unwrap_or(true);
 
-    TokenResolver::from_config(mode.as_deref(), app_id, private_key_path, allow_legacy)
+    TokenResolver::from_config(mode.as_deref(), app_id, private_key_path, allow_gh_fallback)
 }
 
 #[cfg(test)]
@@ -405,9 +453,9 @@ mod tests {
     }
 
     #[test]
-    fn token_mode_from_config_legacy() {
-        let mode = TokenMode::from_config("legacy", None, None);
-        assert!(matches!(mode, TokenMode::Legacy));
+    fn token_mode_from_config_unknown_defaults_to_env() {
+        let mode = TokenMode::from_config("unknown", None, None);
+        assert!(matches!(mode, TokenMode::Env));
     }
 
     #[test]
@@ -431,12 +479,6 @@ mod tests {
     }
 
     #[test]
-    fn token_mode_from_config_default() {
-        let mode = TokenMode::from_config("unknown", None, None);
-        assert!(matches!(mode, TokenMode::Env));
-    }
-
-    #[test]
     fn token_resolver_default_is_env() {
         let resolver = TokenResolver::default();
         assert!(matches!(resolver.mode(), TokenMode::Env));
@@ -449,20 +491,25 @@ mod tests {
     }
 
     #[test]
-    fn token_resolver_with_legacy_fallback() {
-        let resolver = TokenResolver::new(TokenMode::Env).with_legacy_fallback(true);
-        assert!(resolver.allow_legacy_fallback);
+    fn token_resolver_gh_fallback_enabled_by_default() {
+        let resolver = TokenResolver::new(TokenMode::Env);
+        assert!(resolver.allow_gh_fallback);
+    }
+
+    #[test]
+    fn token_resolver_with_gh_fallback() {
+        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
+        assert!(!resolver.allow_gh_fallback);
     }
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_returns_none_when_no_env_set() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // Ensure no env vars are set - set them explicitly to empty
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
-        // Also clear any cached token
-        let resolver = TokenResolver::default_env();
+        // Disable gh fallback so we don't actually call gh CLI in tests
+        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
         resolver.clear_cache().await;
 
         let token = resolver.get_token().await.unwrap();
@@ -473,17 +520,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // Only set GH_TOKEN, remove GITHUB_TOKEN
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
-        // Clear cache first
-        let resolver = TokenResolver::default_env();
+        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
         resolver.clear_cache().await;
 
         env::set_var("GH_TOKEN", "gh_token_value");
         env::remove_var("GITHUB_TOKEN");
 
-        let resolver = TokenResolver::default_env();
+        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
         let token = resolver.get_token().await.unwrap();
         assert_eq!(token, Some("gh_token_value".to_string()));
 
@@ -494,13 +539,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_falls_back_to_github_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // Clear environment first
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::default_env();
+        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
         resolver.clear_cache().await;
 
-        // Now set GITHUB_TOKEN only
         env::set_var("GITHUB_TOKEN", "github_token_value");
 
         let token = resolver.get_token().await.unwrap();
@@ -513,13 +556,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token_over_github_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // Clear environment first
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::default_env();
+        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
         resolver.clear_cache().await;
 
-        // Set both env vars
         env::set_var("GH_TOKEN", "gh_token_value");
         env::set_var("GITHUB_TOKEN", "github_token_value");
 
@@ -535,13 +576,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_ignores_empty_env_vars() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // Clear environment first
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::default_env();
+        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
         resolver.clear_cache().await;
 
-        // Set empty env vars
         env::set_var("GH_TOKEN", "");
         env::set_var("GITHUB_TOKEN", "");
 
@@ -556,10 +595,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_sync_env_mode() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // Clear environment first
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::default_env();
+        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
         resolver.clear_cache().await;
 
         env::set_var("GH_TOKEN", "sync_test_token");
@@ -586,13 +624,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn clear_cache_clears_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // Clear environment first
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::default_env();
+        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
         resolver.clear_cache().await;
 
-        // Now set the env var
         env::set_var("GH_TOKEN", "cached_token");
 
         // First call should cache the token

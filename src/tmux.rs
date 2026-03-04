@@ -92,7 +92,6 @@ impl TmuxManager {
         Ok(name)
     }
 
-<<<<<<< HEAD
     /// Set an environment variable in an existing tmux session.
     ///
     /// This is preferred over passing secrets via [`create_session`] because
@@ -130,8 +129,6 @@ impl TmuxManager {
         Ok(())
     }
 
-=======
->>>>>>> 92dfec2 (fix: address clippy warnings and stabilize tests)
     /// Check if a session exists.
     pub async fn session_exists(&self, session: &str) -> bool {
         Command::new("tmux")
