@@ -12,6 +12,18 @@ Once routed, agents run in full agentic mode with tool access:
 
 Agents execute inside an isolated git worktree created for the task (not your main repo), so they can read project files, edit code, and run commands.
 
+## PTY Runner
+
+Agent sessions now prefer a PTY-based runner. The orchestrator spawns agent CLIs directly under a pseudo-terminal, streams output into tmux, and avoids generating on-disk runner scripts. Prompt files remain in per-attempt directories for auditability.
+
+To fall back to the legacy tmux command runner:
+
+```yaml
+runner:
+  pty:
+    enabled: false
+```
+
 ## Agent Output
 
 The agent writes a JSON file to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json` and the orchestrator also stores a sidecar at `~/.orch/state/{repo}/tasks/{id}/sidecar.json`:

@@ -48,6 +48,7 @@
 use super::SandboxLevel;
 use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
 use crate::parser;
+use std::collections::HashMap;
 
 /// Runner for Claude-compatible agents (Claude, Kimi, MiniMax).
 pub struct ClaudeRunner {
@@ -214,6 +215,55 @@ impl AgentRunner for ClaudeRunner {
             sys_file = sys_file,
             msg_file = msg_file,
         )
+    }
+
+    fn build_pty_command(
+        &self,
+        model: Option<&str>,
+        sys_file: &std::path::Path,
+        msg_file: &std::path::Path,
+        permissions: &PermissionRules,
+        _work_dir: &std::path::Path,
+    ) -> anyhow::Result<super::PtyCommand> {
+        let mut args = vec!["-p".to_string()];
+        if let Some(m) = model {
+            args.push("--model".to_string());
+            args.push(m.to_string());
+        }
+
+        let permission_mode = if permissions.autonomous {
+            "bypassPermissions"
+        } else {
+            "acceptEdits"
+        };
+        args.push("--permission-mode".to_string());
+        args.push(permission_mode.to_string());
+        args.push("--output-format".to_string());
+        args.push("json".to_string());
+
+        if !permissions.allowed_tools.is_empty() {
+            let tools = translate_allowed_tools(
+                &permissions.allowed_tools,
+                &permissions.allowed_edit_paths,
+            );
+            args.push("--allowedTools".to_string());
+            args.push(tools.join(","));
+        } else if !permissions.disallowed_tools.is_empty() {
+            args.push("--disallowedTools".to_string());
+            args.push(permissions.disallowed_tools.join(","));
+        }
+
+        args.push("--append-system-prompt".to_string());
+        args.push(sys_file.to_string_lossy().to_string());
+
+        let stdin = std::fs::read(msg_file)?;
+
+        Ok(super::PtyCommand {
+            program: self.binary.clone(),
+            args,
+            stdin,
+            env: HashMap::new(),
+        })
     }
 
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
