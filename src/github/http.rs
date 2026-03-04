@@ -209,7 +209,11 @@ impl GhHttp {
             .or_else(|_| std::env::var("GITHUB_TOKEN"))
             .ok()
             .filter(|t| !t.is_empty())
-            .or_else(|| crate::config::get("gh.auth.token").ok().filter(|t| !t.is_empty()))
+            .or_else(|| {
+                crate::config::get("gh.auth.token")
+                    .ok()
+                    .filter(|t| !t.is_empty())
+            })
             .or_else(auth::GhCliResolver::resolve)
             .unwrap_or_default();
         let client = Client::builder()
