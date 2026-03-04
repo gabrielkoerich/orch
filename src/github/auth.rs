@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -57,6 +58,54 @@ pub trait TokenResolver: Send + Sync {
     /// Get a descriptive name for this auth method (for logging).
     #[allow(dead_code)]
     fn auth_method(&self) -> &'static str;
+}
+
+/// Async counterpart to `TokenResolver` for code that needs to await token
+/// retrieval or health checks (e.g., GitHub App token refresh flows).
+#[async_trait]
+pub trait AsyncTokenResolver: Send + Sync {
+    async fn resolve_token(&self) -> anyhow::Result<String>;
+    async fn health_check(&self) -> anyhow::Result<()>;
+    fn auth_method(&self) -> &'static str;
+}
+
+/// Adapter that wraps a synchronous `TokenResolver` and exposes an async API
+/// by delegating calls to `tokio::task::spawn_blocking` to avoid blocking
+/// the async runtime.
+///
+/// This type is part of the async token resolver infrastructure (see issue #391).
+/// It will be wired into GhHttp startup once the migration is complete.
+#[allow(dead_code)]
+pub struct AsyncResolverAdapter {
+    inner: Arc<dyn TokenResolver>,
+}
+
+impl AsyncResolverAdapter {
+    #[allow(dead_code)]
+    pub fn new(inner: Arc<dyn TokenResolver>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl AsyncTokenResolver for AsyncResolverAdapter {
+    async fn resolve_token(&self) -> anyhow::Result<String> {
+        // The inner TokenResolver is async, so we can just call it directly.
+        // spawn_blocking is not needed here since resolve_token() returns a Future.
+        self.inner.resolve_token().await
+    }
+
+    async fn health_check(&self) -> anyhow::Result<()> {
+        // health_check is synchronous, so we use spawn_blocking to avoid blocking.
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.health_check())
+            .await
+            .context("health check task panicked")?
+    }
+
+    fn auth_method(&self) -> &'static str {
+        self.inner.auth_method()
+    }
 }
 
 /// Static token resolver for Personal Access Tokens.
@@ -622,6 +671,19 @@ pub fn create_resolver() -> anyhow::Result<Box<dyn TokenResolver>> {
     AutoResolver::from_config().map(|r| Box::new(r) as Box<dyn TokenResolver>)
 }
 
+/// Create an async resolver by adapting the synchronous resolver via
+/// `AsyncResolverAdapter`. This is useful for callers that need to await
+/// token refresh (e.g., GhHttp async flows).
+///
+/// Will be called from GhHttp startup as part of issue #391 migration.
+#[allow(dead_code)]
+pub fn create_async_resolver() -> anyhow::Result<std::sync::Arc<dyn AsyncTokenResolver>> {
+    let sync = create_resolver()?;
+    Ok(std::sync::Arc::new(AsyncResolverAdapter::new(
+        std::sync::Arc::from(sync),
+    )))
+}
+
 /// Synchronous token resolution for backwards compatibility.
 ///
 /// This tries the auto-resolver first. For GitHub App auth, it may fail
@@ -654,11 +716,14 @@ pub fn resolve_token_sync() -> String {
 }
 
 /// Resolver that always returns an error.
+/// Reserved for future use when we need to report auth failures in resolver chain.
+#[allow(dead_code)]
 pub struct ErrorResolver {
     message: String,
 }
 
 impl ErrorResolver {
+    #[allow(dead_code)]
     pub fn new(message: String) -> Self {
         Self { message }
     }
