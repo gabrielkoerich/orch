@@ -105,28 +105,20 @@ gh:
     base_seconds: 30
     max_seconds: 900
   # GitHub authentication configuration
-  # The orchestrator supports multiple auth methods:
   #
-  # Option 1: Personal Access Token (classic or fine-grained)
-  # - Set GH_TOKEN or GITHUB_TOKEN environment variable, OR
-  # - Configure gh.auth.token below
+  # Default: uses `gh auth token` — just run `gh auth login` and it works.
   #
-  # Option 2: GitHub App (recommended for organization automation)
-  # - Install the app on your repository/organization
-  # - Configure gh.auth.app_id and private_key below
-  #
-  # Option 3: gh CLI (legacy, not recommended for services)
-  # - Set gh.auth.allow_gh_fallback: true
+  # For explicit token: set GH_TOKEN or GITHUB_TOKEN environment variable.
+  # For GitHub App (org automation): configure app_id and private_key below.
   auth:
     # Auth mode: "auto" | "token" | "github_app" | "gh_cli"
-    # - "auto": Try token first, then GitHub App (default)
-    # - "token": Use Personal Access Token only
+    # - "auto" (default): Try GH_TOKEN/GITHUB_TOKEN env vars, then GitHub App, then gh CLI
+    # - "token": Require Personal Access Token from env vars or gh.auth.token
     # - "github_app": Use GitHub App authentication
-    # - "gh_cli": Use `gh auth token` (requires gh CLI login)
+    # - "gh_cli": Always use `gh auth token`
     mode: "auto"
 
-    # Personal Access Token (for mode: "token" or "auto")
-    # If not set, falls back to GH_TOKEN / GITHUB_TOKEN env vars
+    # Personal Access Token (optional — set GH_TOKEN env var instead)
     # token: "ghp_xxxxxxxxxxxxxxxxxxxx"
 
     # GitHub App credentials (for mode: "github_app" or "auto")
@@ -135,9 +127,9 @@ gh:
     # Optional: specific installation ID (auto-detected if not set)
     # installation_id: "78901234"
 
-    # Legacy gh CLI fallback (default: false)
-    # When true, falls back to `gh auth token` if other methods fail
-    # allow_gh_fallback: false
+    # gh CLI fallback (default: true)
+    # Falls back to `gh auth token` when no token is otherwise configured
+    # allow_gh_fallback: true
 
 # GitHub webhook server for instant event delivery (bypasses polling)
 webhook:

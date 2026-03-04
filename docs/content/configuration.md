@@ -46,7 +46,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `gh.auth` | `app_id` | GitHub App ID (for `mode: github_app`) | `""` |
 | `gh.auth` | `private_key` | Path to GitHub App private key PEM file | `""` |
 | `gh.auth` | `installation_id` | Specific installation ID (auto-detected if empty) | `""` |
-| `gh.auth` | `allow_gh_fallback` | Allow `gh auth token` fallback (not recommended for services) | `false` |
+| `gh.auth` | `allow_gh_fallback` | Fall back to `gh auth token` when no token is configured | `true` |
 | `model_map` | `simple/medium/complex` | Agent-specific model names per complexity level | `{}` |
 
 ## Authentication

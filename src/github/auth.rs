@@ -1,16 +1,17 @@
 //! GitHub authentication — Token resolver supporting PAT and GitHub App auth.
 //!
 //! Provides multiple authentication modes:
+//! - **gh CLI (default)**: Uses `gh auth token` — just run `gh auth login` and you're done
 //! - **Personal Access Token (PAT)**: Static token from env vars or config
 //! - **GitHub App**: JWT-based auth with automatic installation token refresh
-//! - **Legacy gh CLI**: Fallback to `gh auth token` (optional, disabled by default)
 //!
 //! # Configuration
 //!
 //! Auth mode is selected via config `gh.auth.mode`:
+//! - `"auto"` (default) - Try GH_TOKEN/GITHUB_TOKEN env vars, then GitHub App, then gh CLI
 //! - `"token"` - Use PAT from `gh.auth.token` or `GH_TOKEN`/`GITHUB_TOKEN` env vars
 //! - `"github_app"` - Use GitHub App auth with `gh.auth.app_id` and `gh.auth.private_key`
-//! - `"auto"` - Try token first, then GitHub App, then fail
+//! - `"gh_cli"` - Always use `gh auth token`
 //!
 //! # Example
 //!
@@ -30,7 +31,7 @@ use async_trait::async_trait;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GITHUB_API: &str = "https://api.github.com";
@@ -422,12 +423,37 @@ impl TokenResolver for GitHubAppResolver {
 /// Legacy gh CLI token resolver.
 pub struct GhCliResolver;
 
-impl GhCliResolver {
-    /// Try to get token from gh CLI.
-    pub fn resolve() -> Option<String> {
-        // Try common gh install paths
-        let gh_paths = ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"];
+/// Cached gh CLI token with expiry (1 hour TTL).
+static GH_CLI_CACHE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+const GH_CLI_TOKEN_TTL: Duration = Duration::from_secs(3600);
 
+impl GhCliResolver {
+    /// Try to get token from gh CLI. Result is cached for 1 hour.
+    pub fn resolve() -> Option<String> {
+        // Check cache first
+        if let Ok(guard) = GH_CLI_CACHE.lock() {
+            if let Some((token, expires)) = guard.as_ref() {
+                if Instant::now() < *expires {
+                    return Some(token.clone());
+                }
+            }
+        }
+
+        // Resolve fresh
+        let token = Self::resolve_fresh();
+
+        // Cache the result
+        if let Some(ref t) = token {
+            if let Ok(mut guard) = GH_CLI_CACHE.lock() {
+                *guard = Some((t.clone(), Instant::now() + GH_CLI_TOKEN_TTL));
+            }
+        }
+
+        token
+    }
+
+    fn resolve_fresh() -> Option<String> {
+        let gh_paths = ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"];
         for gh in &gh_paths {
             if let Ok(out) = std::process::Command::new(gh)
                 .args(["auth", "token"])
@@ -476,7 +502,7 @@ impl AutoResolver {
     pub fn from_config() -> anyhow::Result<Self> {
         let allow_gh_fallback = crate::config::get("gh.auth.allow_gh_fallback")
             .map(|v| v == "true")
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         // Try to create the configured auth method
         let primary = Self::create_primary_resolver()?;
@@ -523,9 +549,10 @@ impl AutoResolver {
                     tracing::info!(app_id = %resolver.app_id, "Auto-detected GitHub auth: GitHub App");
                     return Ok(Some(Box::new(resolver)));
                 }
-                tracing::warn!(
-                    "No explicit GitHub auth configured, will try gh CLI fallback if enabled"
-                );
+                static LOGGED: OnceLock<()> = OnceLock::new();
+                LOGGED.get_or_init(|| {
+                    tracing::info!("No explicit GitHub auth configured — using gh CLI fallback");
+                });
                 Ok(None)
             }
             other => {
