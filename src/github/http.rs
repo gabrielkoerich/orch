@@ -3,12 +3,13 @@
 //! Uses a shared `reqwest::Client` with connection pooling, reads rate-limit
 //! headers proactively, and supports concurrent requests via `tokio::join!`.
 //!
-//! Auth: uses the token resolver from `auth` module which supports:
-//!   - Personal Access Token (GH_TOKEN / GITHUB_TOKEN env vars, or gh.auth.token config)
-//!   - GitHub App authentication (JWT-based with automatic installation token refresh)
-//!   - Legacy gh CLI fallback (optional, disabled by default)
+//! Auth: uses the centralized [`TokenResolver`] which supports:
+//! - `GH_TOKEN` / `GITHUB_TOKEN` environment variables
+//! - `gh.auth.token` config value
+//! - `gh auth token` CLI fallback (default — just run `gh auth login`)
+//! - GitHub App JWT generation (with app_id + private_key configuration)
 
-use super::auth;
+use super::token;
 use super::types::{
     GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview, GitHubReviewComment,
 };
@@ -194,48 +195,31 @@ static METRIC_WAIT_SECS_TOTAL: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct GhHttp {
     client: Client,
-    /// Optional cached token for sync resolver paths (PAT).
-    token: Option<String>,
-    /// Optional async resolver for GitHub App or adapters.
-    async_resolver: Option<std::sync::Arc<dyn crate::github::auth::AsyncTokenResolver>>,
+    token: String,
 }
 
 impl GhHttp {
-    /// Create a new client. Reads the GitHub token using the auth resolver.
+    /// Create a new client using the centralized [`TokenResolver`].
+    ///
+    /// Resolution order: `GH_TOKEN` → `GITHUB_TOKEN` → `gh.auth.token` config → `gh auth token` CLI.
+    /// The `gh auth token` fallback is enabled by default — just run `gh auth login` and it works.
+    /// Disable with `gh.allow_gh_fallback = false` in config.
     pub fn new() -> Self {
-        // Resolve token inline: env vars → config → gh CLI (cached 1h).
-        // GhHttp::new() is called from async context on every tick — must not block or warn.
-        let token = std::env::var("GH_TOKEN")
-            .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        let token_resolver = token::TokenResolver::default_env();
+        let token = token_resolver
+            .get_token_sync()
             .ok()
-            .filter(|t| !t.is_empty())
-            .or_else(|| {
-                crate::config::get("gh.auth.token")
-                    .ok()
-                    .filter(|t| !t.is_empty())
-            })
-            .or_else(auth::GhCliResolver::resolve)
+            .flatten()
             .unwrap_or_default();
-        let client = Client::builder()
-            .user_agent("orch/0.1 (reqwest)")
-            .pool_max_idle_per_host(4)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build reqwest client");
 
-        Self {
-            client,
-            token: Some(token),
-            async_resolver: None,
+        if token.is_empty() {
+            tracing::warn!(
+                "No GitHub token found: set GH_TOKEN, GITHUB_TOKEN, or run `gh auth login`"
+            );
+        } else {
+            tracing::debug!("GitHub token resolved via TokenResolver");
         }
-    }
 
-    /// Create a new client with a custom token resolver.
-    #[allow(dead_code)]
-    pub fn with_resolver(resolver: &dyn auth::TokenResolver) -> anyhow::Result<Self> {
-        let token = tokio::runtime::Handle::try_current()
-            .map_err(|e| anyhow::anyhow!("no tokio runtime: {}", e))?
-            .block_on(resolver.resolve_token())?;
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
@@ -243,30 +227,7 @@ impl GhHttp {
             .build()
             .expect("failed to build reqwest client");
 
-        Ok(Self {
-            client,
-            token: Some(token),
-            async_resolver: None,
-        })
-    }
-
-    /// Create a new client backed by an async token resolver.
-    #[allow(dead_code)]
-    pub fn with_async_resolver(
-        resolver: std::sync::Arc<dyn crate::github::auth::AsyncTokenResolver>,
-    ) -> anyhow::Result<Self> {
-        let client = Client::builder()
-            .user_agent("orch/0.1 (reqwest)")
-            .pool_max_idle_per_host(4)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build reqwest client");
-
-        Ok(Self {
-            client,
-            token: None,
-            async_resolver: Some(resolver),
-        })
+        Self { client, token }
     }
 
     // ── Rate-limit helpers ────────────────────────────────────────
@@ -414,12 +375,7 @@ impl GhHttp {
     // ── Low-level HTTP helpers ────────────────────────────────────
 
     async fn auth_header(&self) -> anyhow::Result<String> {
-        if let Some(ref resolver) = self.async_resolver {
-            let token = resolver.resolve_token().await?;
-            Ok(format!("Bearer {}", token))
-        } else {
-            Ok(format!("Bearer {}", self.token.clone().unwrap_or_default()))
-        }
+        Ok(format!("Bearer {}", self.token))
     }
 
     /// GET request, returns deserialized JSON.
@@ -1641,22 +1597,6 @@ pub fn rate_limit_metrics() -> RateLimitMetrics {
         graphql_remaining,
     }
 }
-
-// ── Token resolution ─────────────────────────────────────────────────
-
-/// Resolve a GitHub token using the auth module resolver.
-///
-/// Delegates to `auth::resolve_token_sync()` which supports:
-/// - Personal Access Token (GH_TOKEN/GITHUB_TOKEN env vars or config)
-/// - GitHub App authentication (JWT-based with installation tokens)
-/// - Legacy gh CLI fallback (if enabled via config)
-#[allow(dead_code)]
-pub fn resolve_token() -> String {
-    auth::resolve_token_sync()
-}
-
-/// Re-export auth module types for convenience.
-pub use super::auth::TokenResolver;
 
 // ── Link header parser ───────────────────────────────────────────────
 

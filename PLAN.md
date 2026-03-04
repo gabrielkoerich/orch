@@ -171,6 +171,7 @@ in_progress → needs_review → in_review → done
 
 - Updated docs to reflect actual runtime paths (`~/.orch`), worktree layout, and sidecar locations
 - Documented that `GH_TOKEN` is injected into runner env at spawn time and that agents should not call GitHub directly
+- Documented centralized GitHub token resolution (`github.token_mode`, GitHub App config, and `gh.allow_gh_fallback` (default true))
 - Clarified that jobs are per-project in `.orch.yml` (preferred) and scheduler runs from engine tick
 - Changed max-attempts behavior: repeated failures now move tasks to `needs_review` and forced `agent:*` labels are removed
 - Review agent selection clarifications: review agent excludes the original task agent to avoid self-review

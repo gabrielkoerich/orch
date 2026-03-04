@@ -662,7 +662,11 @@ mod tests {
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
     use crate::engine::runner::response_handler::safe_utf8_tail;
     use async_trait::async_trait;
+    use once_cell::sync::Lazy;
     use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     // ── safe_utf8_tail ───────────────────────────────────────────────────────
 
@@ -881,8 +885,14 @@ mod tests {
 
     // ── process_delegations ───────────────────────────────────────────────────
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn process_delegations_creates_subtasks_and_blocks_parent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp_home = TempDir::new().unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_home.path());
+
         let runner = TaskRunner::new("owner/repo".to_string());
         let parent = make_task("99");
         let backend = Arc::new(TrackingBackend::new());
@@ -945,10 +955,22 @@ mod tests {
             comment_body.contains("Subtask B"),
             "summary should mention Subtask B"
         );
+
+        if let Some(old_home) = old_home {
+            std::env::set_var("HOME", old_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn process_delegations_single_subtask() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp_home = TempDir::new().unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_home.path());
+
         let runner = TaskRunner::new("owner/repo".to_string());
         let parent = make_task("101");
         let backend = Arc::new(TrackingBackend::new());
@@ -985,5 +1007,11 @@ mod tests {
             body.contains("1 subtask"),
             "comment should count one subtask"
         );
+
+        if let Some(old_home) = old_home {
+            std::env::set_var("HOME", old_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 }

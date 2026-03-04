@@ -1,6 +1,7 @@
 //! GitHub Issues backend — native HTTP via `reqwest` with connection pooling.
 //!
-//! Auth is resolved once at startup: `GH_TOKEN` env → `GITHUB_TOKEN` env → `gh auth token`.
+//! Auth is resolved once at startup using the centralized [`TokenResolver`]
+//! (`GH_TOKEN` → `GITHUB_TOKEN` environment variables by default).
 
 use super::{ExternalBackend, ExternalId, ExternalTask, Mention, Status};
 use crate::github::http::{status_label_color, GhHttp};

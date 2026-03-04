@@ -63,7 +63,6 @@ export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 # Or configure in ~/.orch/config.yml
 gh:
   auth:
-    mode: token
     token: "ghp_xxxxxxxxxxxxxxxxxxxx"
 ```
 
@@ -77,38 +76,31 @@ GitHub Apps provide better audit trails and scoped permissions for automation:
 4. Configure in `~/.orch/config.yml`:
 
 ```yaml
-gh:
-  auth:
-    mode: github_app
-    app_id: "123456"
-    private_key: "/path/to/app-private-key.pem"
-    # Optional: specific installation ID (auto-detected if not set)
-    # installation_id: "78901234"
+github:
+  token_mode: github_app
+  app_id: "123456"
+  private_key_path: "/path/to/app-private-key.pem"
 ```
 
 The orchestrator automatically exchanges the App credentials for installation tokens and refreshes them before expiry.
 
-### Option 3: gh CLI (Legacy)
+### Option 3: gh CLI (Default fallback)
 
-The `gh` CLI may be used as an interactive, legacy fallback. The project prefers using `GH_TOKEN`/`GITHUB_TOKEN` or GitHub App credentials for services.
+The simplest setup — orch calls `gh auth token` automatically when no env var or config token is set:
 
 ```bash
-# Optional interactive flow
 gh auth login
 ```
 
-Enable fallback in config if you want `gh` to be used:
+That's it. No extra config needed. To disable this fallback:
 
 ```yaml
+# ~/.orch/config.yml
 gh:
-  auth:
-    mode: gh_cli
-    # Or use auto mode with fallback enabled:
-    # mode: auto
-    # allow_gh_fallback: true
+  allow_gh_fallback: false
 ```
 
-**Note:** The `gh` CLI method is not recommended for service environments (launchd/systemd) as it requires an interactive login session.
+**Note:** The `gh` CLI fallback is not recommended for service environments (launchd/systemd) as it requires an interactive login session. Use `GH_TOKEN` via `~/.private` or a GitHub App instead.
 
 ### Security: Service Deployments (Homebrew / launchd)
 
@@ -140,7 +132,7 @@ Edit your plist with `sudo launchctl edit <label>` or update it via the Homebrew
 
 Use `mode: github_app` in `~/.orch/config.yml` — no long-lived token is stored; the service generates short-lived JWTs and installation tokens automatically.
 
-> **Security guarantee:** Orch never embeds `GH_TOKEN` in runner scripts on disk. Tokens are injected into the tmux session environment at spawn time (`tmux new-session -e GH_TOKEN=...`) and live only in process memory, not in `~/.orch/state/` artifacts.
+> **Security guarantee:** Orch never embeds `GH_TOKEN` in runner scripts on disk. Tokens are injected into the tmux session environment at spawn time (via `tmux set-environment`) and live only in process memory, not in `~/.orch/state/` artifacts.
 
 ## Files
 

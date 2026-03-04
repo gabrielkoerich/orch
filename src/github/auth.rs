@@ -715,35 +715,6 @@ pub fn resolve_token_sync() -> String {
     }
 }
 
-/// Resolver that always returns an error.
-/// Reserved for future use when we need to report auth failures in resolver chain.
-#[allow(dead_code)]
-pub struct ErrorResolver {
-    message: String,
-}
-
-impl ErrorResolver {
-    #[allow(dead_code)]
-    pub fn new(message: String) -> Self {
-        Self { message }
-    }
-}
-
-#[async_trait]
-impl TokenResolver for ErrorResolver {
-    async fn resolve_token(&self) -> anyhow::Result<String> {
-        anyhow::bail!(self.message.clone())
-    }
-
-    fn health_check(&self) -> anyhow::Result<()> {
-        anyhow::bail!(self.message.clone())
-    }
-
-    fn auth_method(&self) -> &'static str {
-        "none"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

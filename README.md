@@ -82,7 +82,6 @@ export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 # Or configure in ~/.orch/config.yml
 gh:
   auth:
-    mode: token
     token: "ghp_xxxxxxxxxxxxxxxxxxxx"
 ```
 
@@ -91,22 +90,31 @@ gh:
 Better audit trails and scoped permissions for team automation:
 
 ```yaml
-gh:
-  auth:
-    mode: github_app
-    app_id: "123456"
-    private_key: "/path/to/app-private-key.pem"
+github:
+  token_mode: github_app
+  app_id: "123456"
+  private_key_path: "/path/to/app-private-key.pem"
 ```
 
 The orchestrator automatically generates JWTs and refreshes installation tokens before expiry.
 
-### gh CLI (Legacy)
+### gh CLI (Default fallback)
 
-The project prefers native HTTP auth using `GH_TOKEN`/`GITHUB_TOKEN` or GitHub App credentials. The `gh` CLI is supported as a legacy interactive option but not required by the Homebrew formula.
+The simplest setup — just authenticate once and everything works:
 
 ```bash
-# Optional, legacy interactive flow
-gh auth login  # Run interactively
+gh auth login
+```
+
+Orch calls `gh auth token` automatically when `GH_TOKEN`/`GITHUB_TOKEN` are not set.
+This fallback is enabled by default (`gh.allow_gh_fallback: true`).
+
+To disable it (enforce explicit token configuration):
+
+```yaml
+# ~/.orch/config.yml
+gh:
+  allow_gh_fallback: false
 ```
 
 See [Configuration](#configuration) for details and run `orch auth check` to verify your setup.

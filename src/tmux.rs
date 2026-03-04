@@ -53,7 +53,7 @@ impl TmuxManager {
     /// The session is detached — the agent runs in the background.
     /// Returns the session name.
     ///
-    /// Note: For secrets like GH_TOKEN, use [`set_session_env`] after session creation
+    /// Note: For secrets like GH_TOKEN, use [`set_env`] after session creation
     /// instead of passing them here. This avoids exposing secrets in process arguments.
     pub async fn create_session(
         &self,
@@ -69,7 +69,7 @@ impl TmuxManager {
         cmd.args(["new-session", "-d", "-s", &name, "-c", working_dir]);
 
         // Inject non-secret environment variables into the new session if provided.
-        // For secrets like GH_TOKEN, callers should use `set_session_env()` after
+        // For secrets like GH_TOKEN, callers should use `set_env()` after
         // session creation to avoid exposing them in process arguments.
         for (key, value) in env_vars {
             // tmux accepts -e KEY=VALUE to inject environment into the session.
@@ -104,19 +104,7 @@ impl TmuxManager {
         key: &str,
         value: &str,
     ) -> anyhow::Result<()> {
-        let output = Command::new("tmux")
-            .args(["set-environment", "-t", session, key, value])
-            .output_with_context()
-            .await
-            .context("setting tmux session environment")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("tmux set-environment failed: {stderr}");
-        }
-
-        tracing::debug!(session, key, "set tmux session environment");
-        Ok(())
+        self.set_env(session, key, value).await
     }
 
     /// Unset an environment variable in an existing tmux session.
@@ -124,20 +112,7 @@ impl TmuxManager {
     /// Uses: `tmux set-environment -u <key> -t <session>`
     #[allow(dead_code)]
     pub async fn unset_session_env(&self, session: &str, key: &str) -> anyhow::Result<()> {
-        let output = Command::new("tmux")
-            .args(["set-environment", "-u", key, "-t", session])
-            .output_with_context()
-            .await
-            .context("unsetting tmux session environment")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Don't fail if the variable doesn't exist - that's acceptable
-            tracing::warn!(session, key, %stderr, "tmux unset-environment warning");
-        } else {
-            tracing::debug!(session, key, "unset tmux session environment");
-        }
-        Ok(())
+        self.unset_env(session, key).await
     }
 
     /// Send literal text into a session's active pane.
@@ -273,6 +248,79 @@ impl TmuxManager {
         }
         map
     }
+
+    // ── Environment variable helpers ───────────────────────────────────
+
+    /// Set an environment variable in a tmux session.
+    ///
+    /// This updates the tmux session environment, which will be inherited
+    /// by processes started in new windows/panes within the session.
+    pub async fn set_env(&self, session: &str, key: &str, value: &str) -> anyhow::Result<()> {
+        let output = Command::new("tmux")
+            .args(["set-environment", "-t", session, key, value])
+            .output_with_context()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux set-environment failed for {session}: {stderr}");
+        }
+
+        tracing::debug!(session, key, "set tmux environment variable");
+        Ok(())
+    }
+
+    /// Unset (remove) an environment variable from a tmux session.
+    #[allow(dead_code)]
+    pub async fn unset_env(&self, session: &str, key: &str) -> anyhow::Result<()> {
+        let output = Command::new("tmux")
+            .args(["set-environment", "-t", session, "-u", key])
+            .output_with_context()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux unset-environment failed for {session}: {stderr}");
+        }
+
+        tracing::debug!(session, key, "unset tmux environment variable");
+        Ok(())
+    }
+
+    /// Set multiple environment variables in a tmux session at once.
+    ///
+    /// This is a convenience method for setting multiple variables efficiently.
+    #[allow(dead_code)]
+    pub async fn set_env_batch(
+        &self,
+        session: &str,
+        vars: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        for (key, value) in vars {
+            self.set_env(session, key, value).await?;
+        }
+        Ok(())
+    }
+
+    /// Set the GitHub token in a tmux session environment.
+    ///
+    /// This is a convenience method that sets GH_TOKEN (and optionally
+    /// GITHUB_TOKEN) for agent sessions.
+    pub async fn set_github_token(
+        &self,
+        session: &str,
+        token: &str,
+        set_github_token_var: bool,
+    ) -> anyhow::Result<()> {
+        self.set_env(session, "GH_TOKEN", token).await?;
+
+        if set_github_token_var {
+            self.set_env(session, "GITHUB_TOKEN", token).await?;
+        }
+
+        tracing::debug!(session, "set GitHub token in tmux session environment");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -290,10 +338,10 @@ mod tests {
         )
     }
 
-    /// Verify set_session_env runs the correct tmux set-environment command.
+    /// Verify set_env runs the correct tmux set-environment command.
     /// This test creates a temporary session, sets an env var, and verifies it was set.
     #[tokio::test]
-    async fn test_set_session_env() {
+    async fn test_set_env() {
         let tmux = TmuxManager::new();
         let session = test_session_name();
 
@@ -310,10 +358,8 @@ mod tests {
         }
 
         // Use our helper to set an environment variable
-        let result = tmux
-            .set_session_env(&session, "TEST_VAR", "test_value")
-            .await;
-        assert!(result.is_ok(), "set_session_env should succeed");
+        let result = tmux.set_env(&session, "TEST_VAR", "test_value").await;
+        assert!(result.is_ok(), "set_env should succeed");
 
         // Verify the variable was set by reading it back
         let check_result = tokio::process::Command::new("tmux")
@@ -333,11 +379,11 @@ mod tests {
         let _ = tmux.kill_session(&session).await;
     }
 
-    /// Verify unset_session_env runs the correct tmux set-environment -u command.
+    /// Verify unset_env runs the correct tmux set-environment -u command.
     /// This test verifies the function can be called without error.
     /// Note: Full verification of tmux behavior depends on the environment.
     #[tokio::test]
-    async fn test_unset_session_env() {
+    async fn test_unset_env() {
         let tmux = TmuxManager::new();
         let session = test_session_name();
 
@@ -353,10 +399,8 @@ mod tests {
         }
 
         // First set a variable
-        let set_result = tmux
-            .set_session_env(&session, "TO_DELETE", "temporary")
-            .await;
-        assert!(set_result.is_ok(), "set_session_env should succeed");
+        let set_result = tmux.set_env(&session, "TO_DELETE", "temporary").await;
+        assert!(set_result.is_ok(), "set_env should succeed");
 
         // Verify it exists
         let check_before = tokio::process::Command::new("tmux")
@@ -370,8 +414,8 @@ mod tests {
         );
 
         // Call unset_session_env - verify it runs without error
-        let unset_result = tmux.unset_session_env(&session, "TO_DELETE").await;
-        assert!(unset_result.is_ok(), "unset_session_env should succeed");
+        let unset_result = tmux.unset_env(&session, "TO_DELETE").await;
+        assert!(unset_result.is_ok(), "unset_env should succeed");
 
         // Cleanup: kill the test session
         let _ = tmux.kill_session(&session).await;
