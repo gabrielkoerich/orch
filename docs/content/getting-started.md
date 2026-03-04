@@ -61,8 +61,9 @@ Create a token at [GitHub Settings → Developer settings → Personal access to
 export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 
 # Or configure in ~/.orch/config.yml
-github:
-  token_mode: env
+gh:
+  auth:
+    token: "ghp_xxxxxxxxxxxxxxxxxxxx"
 ```
 
 ### Option 2: GitHub App (Recommended for organizations)
@@ -83,26 +84,23 @@ github:
 
 The orchestrator automatically exchanges the App credentials for installation tokens and refreshes them before expiry.
 
-### Option 3: gh CLI (Legacy)
+### Option 3: gh CLI (Default fallback)
 
-The `gh` CLI may be used as an interactive, legacy fallback. The project prefers using `GH_TOKEN`/`GITHUB_TOKEN` or GitHub App credentials for services.
+The simplest setup — orch calls `gh auth token` automatically when no env var or config token is set:
 
 ```bash
-# Optional interactive flow
 gh auth login
 ```
 
-Enable fallback in config if you want `gh` to be used:
+That's it. No extra config needed. To disable this fallback:
 
 ```yaml
-github:
-  token_mode: legacy
-  # Or use env mode with explicit fallback enabled:
-  # token_mode: env
-  # allow_legacy_fallback: true
+# ~/.orch/config.yml
+gh:
+  allow_gh_fallback: false
 ```
 
-**Note:** The `gh` CLI method is not recommended for service environments (launchd/systemd) as it requires an interactive login session.
+**Note:** The `gh` CLI fallback is not recommended for service environments (launchd/systemd) as it requires an interactive login session. Use `GH_TOKEN` via `~/.private` or a GitHub App instead.
 
 ### Security: Service Deployments (Homebrew / launchd)
 

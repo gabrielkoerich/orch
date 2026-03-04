@@ -80,8 +80,9 @@ Orch requires GitHub authentication to sync with issues and create PRs. Three me
 export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 
 # Or configure in ~/.orch/config.yml
-github:
-  token_mode: env
+gh:
+  auth:
+    token: "ghp_xxxxxxxxxxxxxxxxxxxx"
 ```
 
 ### GitHub App (Recommended for organizations)
@@ -97,28 +98,23 @@ github:
 
 The orchestrator automatically generates JWTs and refreshes installation tokens before expiry.
 
-### gh CLI (Legacy)
+### gh CLI (Default fallback)
 
-The project prefers native HTTP auth using `GH_TOKEN`/`GITHUB_TOKEN` or GitHub App credentials. The `gh` CLI is supported as a legacy interactive option but not required by the Homebrew formula.
+The simplest setup — just authenticate once and everything works:
 
 ```bash
-# Optional, legacy interactive flow
-gh auth login  # Run interactively
+gh auth login
 ```
 
-Enable legacy mode explicitly in config if you want `gh` to be used:
+Orch calls `gh auth token` automatically when `GH_TOKEN`/`GITHUB_TOKEN` are not set.
+This fallback is enabled by default (`gh.allow_gh_fallback: true`).
+
+To disable it (enforce explicit token configuration):
 
 ```yaml
-github:
-  token_mode: legacy
-```
-
-Or keep `env` and allow a fallback only if `GH_TOKEN`/`GITHUB_TOKEN` are missing:
-
-```yaml
-github:
-  token_mode: env
-  allow_legacy_fallback: true
+# ~/.orch/config.yml
+gh:
+  allow_gh_fallback: false
 ```
 
 See [Configuration](#configuration) for details and run `orch auth check` to verify your setup.

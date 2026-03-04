@@ -41,10 +41,11 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `gh.backoff` | `mode` | Rate-limit behavior: `wait` or `skip` | `"wait"` |
 | `gh.backoff` | `base_seconds` | Initial backoff duration in seconds | `30` |
 | `gh.backoff` | `max_seconds` | Max backoff duration in seconds | `900` |
-| `github` | `token_mode` | Token resolution mode: `env`, `github_app`, or `legacy` | `"env"` |
+| `gh` | `allow_gh_fallback` | Allow `gh auth token` CLI fallback when no token is set | `true` |
+| `gh` | `auth.token` | Explicit Personal Access Token | `""` |
+| `github` | `token_mode` | Token resolution mode: `env` or `github_app` | `"env"` |
 | `github` | `app_id` | GitHub App ID (for `token_mode: github_app`) | `""` |
 | `github` | `private_key_path` | Path to GitHub App private key (.pem) | `""` |
-| `github` | `allow_legacy_fallback` | Allow `gh auth token` fallback when primary mode fails | `false` |
 | `model_map` | `simple/medium/complex` | Agent-specific model names per complexity level | `{}` |
 
 ## Authentication
@@ -136,23 +137,28 @@ Skills listed in `workflow.required_skills` are always injected into agent promp
 
 ## GitHub Authentication
 
-Orch uses a centralized [`TokenResolver`](https://github.com/gabrielkoerich/orch/blob/main/src/github/token.rs) for GitHub API authentication. This provides secure, flexible token resolution without spawning subprocesses during per-task operations.
+Orch resolves GitHub tokens in this order — the first match wins:
 
-### Token Resolution Modes
+1. `GH_TOKEN` environment variable
+2. `GITHUB_TOKEN` environment variable
+3. `gh.auth.token` config value
+4. `gh auth token` CLI (enabled by default via `gh.allow_gh_fallback: true`)
 
-| Mode | Description | Configuration |
-|------|-------------|---------------|
-| `env` (default) | Read from `GH_TOKEN` → `GITHUB_TOKEN` environment variables | `github.token_mode: env` |
-| `github_app` | Generate JWT from GitHub App credentials | `github.token_mode: github_app` |
-| `legacy` | Use `gh auth token` CLI command | `github.token_mode: legacy` |
+The simplest setup is just `gh auth login`. No extra config needed.
 
-### Environment Variables (Default)
-
-The default mode reads tokens from environment variables (checked in order):
+### Environment Variables
 
 ```bash
-export GH_TOKEN="ghp_xxx"          # Preferred
-export GITHUB_TOKEN="ghp_xxx"      # Fallback
+export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+```
+
+### Explicit token in config
+
+```yaml
+# ~/.orch/config.yml
+gh:
+  auth:
+    token: "ghp_xxxxxxxxxxxxxxxxxxxx"
 ```
 
 ### GitHub App Authentication
@@ -167,20 +173,17 @@ github:
   private_key_path: "/path/to/app.pem"
 ```
 
-The TokenResolver automatically generates a JWT from the private key (valid for 9 minutes) and caches it until expiration.
+The resolver automatically generates a JWT from the private key (valid for 9 minutes) and caches it until expiration.
 
-### Legacy Fallback
+### Disable gh CLI fallback
 
-To allow the legacy `gh auth token` CLI fallback when the primary mode fails:
+The `gh auth token` fallback is enabled by default. To enforce explicit token configuration:
 
 ```yaml
 # ~/.orch/config.yml
-github:
-  token_mode: env
-  allow_legacy_fallback: true
+gh:
+  allow_gh_fallback: false
 ```
-
-This is useful when `gh` CLI is available but environment variables are not set.
 
 ### Agent Session Tokens
 
