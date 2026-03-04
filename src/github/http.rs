@@ -8,7 +8,7 @@
 //! - GitHub App JWT generation (with app_id + private_key configuration)
 //! - Legacy `gh auth token` CLI fallback (if explicitly enabled)
 
-use super::token::TokenResolver;
+use super::token;
 use super::types::{
     GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview, GitHubReviewComment,
 };
@@ -206,7 +206,7 @@ impl GhHttp {
     ///
     /// Legacy `gh auth token` fallback can be enabled via config `github.allow_legacy_fallback=true`.
     pub fn new() -> Self {
-        let token_resolver = TokenResolver::default_env();
+        let token_resolver = token::TokenResolver::default_env();
         let token = token_resolver
             .get_token_sync()
             .ok()
@@ -1615,7 +1615,7 @@ pub fn rate_limit_metrics() -> RateLimitMetrics {
     }
 }
 
-<// ── Link header parser ───────────────────────────────────────────────
+// ── Link header parser ───────────────────────────────────────────────
 
 /// Parse the `Link` header to find the `rel="next"` URL.
 fn parse_link_next(headers: &header::HeaderMap) -> Option<String> {

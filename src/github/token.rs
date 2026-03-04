@@ -542,6 +542,7 @@ mod tests {
     #[tokio::test]
     async fn clear_cache_clears_token() {
         env::set_var("GH_TOKEN", "cached_token");
+        env::remove_var("GITHUB_TOKEN");
 
         let resolver = TokenResolver::default_env();
 

@@ -515,6 +515,63 @@ pub fn build_review_prompt(
     render_prompt_template(REVIEW_PROMPT_TEMPLATE, vars)
 }
 
+/// Build the runner shell script contents for testing and inspection.
+///
+/// IMPORTANT: this must not embed secrets (GH_TOKEN) into the script.
+#[allow(dead_code)]
+pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
+    // Prepare attempt directory and prompt files
+    let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
+    std::fs::create_dir_all(&attempt_dir)?;
+
+    let sys_file = attempt_dir.join("prompt-sys.md");
+    let msg_file = attempt_dir.join("prompt-msg.md");
+
+    // Build unified permission rules and sys content (minimal translation)
+    let mut permissions = super::agents::PermissionRules::from_config();
+    if !inv.disallowed_tools.is_empty() {
+        for tool in &inv.disallowed_tools {
+            if !permissions.disallowed_tools.contains(tool) {
+                permissions.disallowed_tools.push(tool.clone());
+            }
+        }
+    }
+    permissions.allowed_edit_paths.push(inv.work_dir.clone());
+
+    let sys_content = inv.system_prompt.clone();
+    std::fs::write(&sys_file, &sys_content)?;
+    std::fs::write(&msg_file, &inv.agent_message)?;
+
+    // Build agent command using per-agent runner
+    let runner = super::agents::get_runner(&inv.agent);
+    let timeout_cmd = if inv.timeout_seconds > 0 {
+        format!("timeout {}", inv.timeout_seconds)
+    } else {
+        String::new()
+    };
+    let agent_cmd = runner.build_command(
+        inv.model.as_deref(),
+        &timeout_cmd,
+        &sys_file.to_string_lossy(),
+        &msg_file.to_string_lossy(),
+        &permissions,
+    );
+
+    let status_file = attempt_dir.join("exit.txt");
+    let stderr_file = attempt_dir.join("stderr.txt");
+
+    let script = format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nunset CLAUDECODE\ncd '{work_dir}'\nRESPONSE=$({agent_cmd} 2> '{stderr}')\nCMD_STATUS=$?\nprintf '%s' \"$RESPONSE\" > '{out}'\necho \"$CMD_STATUS\" > '{status}'\nexit $CMD_STATUS\n",
+        agent_cmd = agent_cmd,
+        stderr = stderr_file.display(),
+        out = inv.output_file.display(),
+        status = status_file.display(),
+        work_dir = inv.work_dir.to_string_lossy(),
+    );
+
+    Ok(script)
+}
+
 /// Build the system prompt for the review agent.
 pub fn review_system_prompt() -> String {
     render_prompt_template(REVIEW_SYSTEM_TEMPLATE, HashMap::new())
