@@ -73,8 +73,7 @@ jobs:
   # Cross-compile build jobs for macOS targets
   build-macos:
     needs: [test, secrets, check-release]
-    # Only run macOS cross-builds on main when check-release determined a release is needed
-    if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
+    if: github.ref == 'refs/heads/main'
     strategy:
       matrix:
         include:
@@ -177,33 +176,18 @@ jobs:
           LAST_TAG="${{ steps.check.outputs.last_tag }}"
 
           if [ -n "$LAST_TAG" ]; then
-            COMMITS_SUBJECTS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
-            COMMITS_BODIES=$(git log "$LAST_TAG"..HEAD --pretty=format:"%B")
+            COMMITS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
           else
-            COMMITS_SUBJECTS=$(git log --pretty=format:"%s")
-            COMMITS_BODIES=$(git log --pretty=format:"%B")
+            COMMITS=$(git log --pretty=format:"%s")
           fi
 
-          # Determine bump from conventional commits
-          # - breaking change subjects using ! (e.g. feat!: or feat(scope)!:) or
-          #   a BREAKING CHANGE: footer in the commit body → major
-          # - feat(...) → minor
-          # - otherwise → patch
+          # Determine bump from commit prefixes: BREAKING CHANGE: → major, feat: → minor, everything else → patch
           BUMP="patch"
-
-          # Major: subject uses the "!" breaking-change syntax
-          if echo "$COMMITS_SUBJECTS" | grep -qE '^[a-z]+(\(.*\))?!:'; then
-            BUMP="major"
-          fi
-
-          # Major: any commit body contains a BREAKING CHANGE: footer (case-insensitive)
-          if echo "$COMMITS_BODIES" | grep -qiE 'BREAKING CHANGE:'; then
-            BUMP="major"
-          fi
-
-          # Minor: any feat scope in subjects (only if we haven't already detected major)
-          if [ "$BUMP" != "major" ] && echo "$COMMITS_SUBJECTS" | grep -qE '^feat(\(.*\))?:'; then
+          if echo "$COMMITS" | grep -qE '^feat(\(.*\))?:'; then
             BUMP="minor"
+          fi
+          if echo "$COMMITS" | grep -qE '^BREAKING CHANGE:|^breaking(\(.*\))?:'; then
+            BUMP="major"
           fi
 
           if [ -z "$LAST_TAG" ]; then
