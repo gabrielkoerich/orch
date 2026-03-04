@@ -1,5 +1,7 @@
 # Orch
 
+[![CI](https://github.com/gabrielkoerich/orch/actions/workflows/release.yml/badge.svg)](https://github.com/gabrielkoerich/orch/actions/workflows/release.yml)
+
 An autonomous task orchestrator that delegates work to AI coding agents (Claude, Codex, OpenCode, Kimi, MiniMax). Runs as a background service, manages isolated worktrees, syncs with GitHub Issues, and handles the full task lifecycle from routing to PR creation.
 
 ## Features
