@@ -239,7 +239,14 @@ pub(crate) async fn review_open_prs(
                     comment_approved,
                     "PR approved but not yet merged — attempting auto-merge"
                 );
-                if let Err(e) = auto_merge_pr(&task, &branch, backend, repo).await {
+                // Get the task agent and model from sidecar for the footer
+                let task_agent =
+                    sidecar::get(&task.id.0, "agent").unwrap_or_else(|_| "orch".to_string());
+                let task_model =
+                    sidecar::get(&task.id.0, "model").unwrap_or_else(|_| "unknown".to_string());
+                if let Err(e) =
+                    auto_merge_pr(&task, &branch, backend, repo, &task_agent, &task_model).await
+                {
                     tracing::warn!(
                         task_id,
                         pr_number,
@@ -843,7 +850,16 @@ pub(crate) async fn review_and_merge(
         };
 
         if !pr_comment.is_empty() {
-            if let Err(e) = gh.add_comment(repo, &pr_num.to_string(), &pr_comment).await {
+            // Append attribution footer with review agent and model
+            let footer = format!(
+                "\n\n---\n*Reviewed by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
+                review_agent, review_model
+            );
+            let pr_comment_with_footer = format!("{}{}", pr_comment, footer);
+            if let Err(e) = gh
+                .add_comment(repo, &pr_num.to_string(), &pr_comment_with_footer)
+                .await
+            {
                 tracing::warn!(
                     task_id = task.id.0,
                     pr_number = pr_num,
@@ -862,7 +878,16 @@ pub(crate) async fn review_and_merge(
                 .unwrap_or(true);
 
             if auto_merge {
-                if let Err(e) = auto_merge_pr(task, &branch_name, backend, repo).await {
+                if let Err(e) = auto_merge_pr(
+                    task,
+                    &branch_name,
+                    backend,
+                    repo,
+                    &review_agent,
+                    &review_model,
+                )
+                .await
+                {
                     tracing::error!(
                         task_id = task.id.0,
                         pr_number = pr_number_early,
@@ -879,7 +904,17 @@ pub(crate) async fn review_and_merge(
             ref notes,
             ref issues,
         } => {
-            handle_review_changes(task, notes, issues, backend, repo, pr_number_early).await?;
+            handle_review_changes(
+                task,
+                notes,
+                issues,
+                backend,
+                repo,
+                pr_number_early,
+                &review_agent,
+                &review_model,
+            )
+            .await?;
             Ok(decision)
         }
         _ => Ok(decision),
@@ -896,6 +931,8 @@ pub(crate) async fn auto_merge_pr(
     branch: &str,
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
+    review_agent: &str,
+    review_model: &str,
 ) -> anyhow::Result<()> {
     // 1. Get PR number from branch
     let gh = GhHttp::new();
@@ -1008,14 +1045,19 @@ pub(crate) async fn auto_merge_pr(
                     "merge conflict retry limit reached"
                 );
                 backend.update_status(&task.id, Status::Blocked).await?;
+                let comment = format!(
+                    "Auto-merge failed after {} conflict retries: {}",
+                    retries, e
+                );
+                let footer = format!(
+                    "\n\n---\n*Commented by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
+                    review_agent, review_model
+                );
                 let _ = gh
                     .add_comment(
                         repo,
                         &pr_number.to_string(),
-                        &format!(
-                            "Auto-merge failed after {} conflict retries: {}",
-                            retries, e
-                        ),
+                        &format!("{}{}", comment, footer),
                     )
                     .await;
                 return Err(e);
@@ -1038,11 +1080,16 @@ pub(crate) async fn auto_merge_pr(
         // Non-conflict merge failure (permissions, branch protection, etc.)
         tracing::error!(task_id = task.id.0, error = %e, "merge failed — blocking for human review");
         backend.update_status(&task.id, Status::Blocked).await?;
+        let comment = format!("Auto-merge failed: {}", e);
+        let footer = format!(
+            "\n\n---\n*Commented by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
+            review_agent, review_model
+        );
         let _ = gh
             .add_comment(
                 repo,
                 &pr_number.to_string(),
-                &format!("Auto-merge failed: {}", e),
+                &format!("{}{}", comment, footer),
             )
             .await;
         return Err(e);
@@ -1058,11 +1105,16 @@ pub(crate) async fn auto_merge_pr(
     }
 
     // 8. Post final comment on the PR
+    let comment = "✅ PR reviewed, approved, and merged.";
+    let footer = format!(
+        "\n\n---\n*Reviewed by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
+        review_agent, review_model
+    );
     let _ = gh
         .add_comment(
             repo,
             &pr_number.to_string(),
-            "✅ PR reviewed, approved, and merged.",
+            &format!("{}{}", comment, footer),
         )
         .await;
 
@@ -1072,6 +1124,7 @@ pub(crate) async fn auto_merge_pr(
 }
 
 /// Handle review changes request — re-dispatch the original agent.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_review_changes(
     task: &ExternalTask,
     notes: &str,
@@ -1079,6 +1132,8 @@ pub(crate) async fn handle_review_changes(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     pr_number: u64,
+    review_agent: &str,
+    review_model: &str,
 ) -> anyhow::Result<()> {
     // 1. Check review cycle count (max 2 review rounds)
     let review_cycles: u32 = sidecar::get(&task.id.0, "review_cycles")
@@ -1107,7 +1162,14 @@ pub(crate) async fn handle_review_changes(
             "🔍 Review agent requested changes after {} cycles. Escalating to human.\n\n**Review Notes:**\n{}",
             review_cycles, notes
         );
-        if let Err(e) = gh.add_comment(repo, &pr_num_str, &escalation).await {
+        let footer = format!(
+            "\n\n---\n*Commented by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
+            review_agent, review_model
+        );
+        if let Err(e) = gh
+            .add_comment(repo, &pr_num_str, &format!("{}{}", escalation, footer))
+            .await
+        {
             tracing::warn!(task_id = task.id.0, pr_number, err = %e, "failed to post escalation comment on PR");
         }
         return Ok(());
@@ -1137,7 +1199,14 @@ pub(crate) async fn handle_review_changes(
         }
     }
 
-    if let Err(e) = gh.add_comment(repo, &pr_num_str, &comment).await {
+    let footer = format!(
+        "\n\n---\n*Reviewed by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
+        review_agent, review_model
+    );
+    if let Err(e) = gh
+        .add_comment(repo, &pr_num_str, &format!("{}{}", comment, footer))
+        .await
+    {
         tracing::warn!(task_id = task.id.0, pr_number, err = %e, "failed to post review comment on PR");
     }
 
