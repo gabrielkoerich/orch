@@ -716,11 +716,14 @@ pub fn resolve_token_sync() -> String {
 }
 
 /// Resolver that always returns an error.
+/// Reserved for future use when we need to report auth failures in resolver chain.
+#[allow(dead_code)]
 pub struct ErrorResolver {
     message: String,
 }
 
 impl ErrorResolver {
+    #[allow(dead_code)]
     pub fn new(message: String) -> Self {
         Self { message }
     }
