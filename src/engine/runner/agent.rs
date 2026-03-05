@@ -1,7 +1,7 @@
 //! Agent command building + tmux invocation.
 //!
 //! Supports Claude, Codex, OpenCode (plus Kimi/MiniMax as Claude aliases).
-//! Prefers PTY-based spawning to preserve terminal semantics without on-disk scripts.
+//! Runs the agent via a runner.sh script executed as the tmux session shell.
 
 use crate::template::render_template_str;
 use crate::tmux::TmuxManager;
@@ -160,88 +160,7 @@ exit $CMD_STATUS
         inv.output_file.display().to_string(),
     );
 
-    // Build shell command that runs agent, captures stdout/stderr and exit status.
-    // Prefer spawning in a PTY when enabled; otherwise write a runner script
-    // and execute it in a detached tmux session.
-
-    // Prepare auxiliary paths
-    let status_file = attempt_dir.join("exit.txt");
-    let stderr_file = attempt_dir.join("stderr.txt");
-
-    let pty_enabled = crate::config::get("runner.pty.enabled")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(true);
-
-    if pty_enabled {
-        // Build env var slice for tmux.create_session
-        let env_slice: Vec<(&str, &str)> =
-            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let session = tmux
-            .create_session(
-                &inv.repo,
-                &inv.task_id,
-                &inv.work_dir.to_string_lossy(),
-                "cat",
-                env_slice.as_slice(),
-            )
-            .await?;
-
-        // Ensure non-secret env vars are available in the session
-        for (k, v) in &env {
-            tmux.set_session_env(&session, k, v).await.ok();
-        }
-
-        let pty_command = runner.build_pty_command(
-            inv.model.as_deref(),
-            &sys_file,
-            &msg_file,
-            &permissions,
-            &inv.work_dir,
-        )?;
-
-        let super::agents::PtyCommand {
-            program,
-            args,
-            stdin: stdin_payload,
-            env: extra_env,
-        } = pty_command;
-        let mut pty_env = env.clone();
-        for (k, v) in extra_env {
-            pty_env.insert(k, v);
-        }
-
-        let mut pty_handle = super::pty::spawn_agent_in_pty(&super::pty::PtyInvocation {
-            program,
-            args,
-            cwd: inv.work_dir.clone(),
-            env: pty_env,
-        })?;
-
-        pty_handle.write_stdin(&stdin_payload)?;
-
-        super::pty::attach_pty_to_tmux(
-            pty_handle,
-            super::pty::PtyAttachSession {
-                tmux: tmux.clone(),
-                session: session.clone(),
-                output_path: inv.output_file.clone(),
-                stderr_path: stderr_file,
-                exit_path: status_file,
-                timeout_seconds: inv.timeout_seconds,
-            },
-        )?;
-
-        tracing::info!(
-            task_id = inv.task_id,
-            agent = inv.agent,
-            session = %session,
-            "agent spawned in tmux (pty)"
-        );
-
-        return Ok(session);
-    }
-
-    // Non-PTY flow: write runner script and execute it in tmux
+    // Write runner script and execute it in a detached tmux session.
     let timeout_cmd = if inv.timeout_seconds > 0 {
         format!("timeout {}", inv.timeout_seconds)
     } else {

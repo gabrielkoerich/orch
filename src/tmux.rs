@@ -115,20 +115,6 @@ impl TmuxManager {
         self.unset_env(session, key).await
     }
 
-    /// Send literal text into a session's active pane.
-    pub async fn send_text(&self, session: &str, text: &str) -> anyhow::Result<()> {
-        let output = Command::new("tmux")
-            .args(["send-keys", "-t", session, "-l", text])
-            .output_with_context()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("send-keys failed for {session}: {stderr}");
-        }
-        Ok(())
-    }
-
     /// Check if a session exists.
     pub async fn session_exists(&self, session: &str) -> bool {
         Command::new("tmux")

@@ -20,7 +20,6 @@ pub mod agents;
 pub mod context;
 pub mod fallback;
 pub mod git_ops;
-pub mod pty;
 pub mod response;
 pub mod response_handler;
 pub mod session;
