@@ -338,9 +338,8 @@ mod tests {
     #[test]
     fn test_gh_auth_token() {
         let token = resolve_token();
-        if token.is_some() {
-            // Token should be a reasonable length
-            assert!(token.unwrap().len() >= 10);
+        if let Some(t) = token {
+            assert!(t.len() >= 10);
         }
     }
 
