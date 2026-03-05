@@ -15,8 +15,9 @@ use axum::{
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -26,18 +27,219 @@ struct GhUser {
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Deduplication window: 2 hours (GitHub retries within ~1 hour).
-const DEDUP_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
-/// Cap the deduplication map to avoid unbounded memory growth.
-const MAX_SEEN_DELIVERIES: usize = 50_000;
+/// Default deduplication window: 2 hours (GitHub retries within ~1 hour).
+const DEFAULT_DEDUP_WINDOW_SECS: u64 = 2 * 60 * 60;
+/// Default cap on deduplication map to avoid unbounded memory growth.
+const DEFAULT_MAX_SEEN_DELIVERIES: usize = 50_000;
+
+// ---------------------------------------------------------------------------
+// DedupStore — pluggable delivery deduplication
+// ---------------------------------------------------------------------------
+
+/// Metrics snapshot from the dedup store.
+#[derive(serde::Serialize, Clone, Copy)]
+pub struct DedupMetrics {
+    /// Number of entries currently in the store.
+    pub seen_count: usize,
+    /// Total duplicate deliveries rejected since process start.
+    pub duplicate_count: u64,
+    /// Total new deliveries inserted since process start.
+    pub inserted_count: u64,
+}
+
+struct DedupInner {
+    /// delivery_id → unix timestamp (secs) when first seen.
+    entries: HashMap<String, u64>,
+    duplicate_count: u64,
+    inserted_count: u64,
+}
+
+/// Deduplication store — hides the backing implementation behind a clean API.
+///
+/// Two variants are supported:
+/// - **In-memory** (`new_in_memory`): default, fastest, state lost on restart.
+/// - **File-backed** (`new_filebacked`): persists to a JSON file so dedup state
+///   survives process restarts (prevents re-processing of GitHub retries after a
+///   restart within the dedup window).
+#[derive(Clone)]
+pub struct DedupStore {
+    inner: Arc<tokio::sync::Mutex<DedupInner>>,
+    /// `Some(path)` enables file-backed persistence.
+    file_path: Option<PathBuf>,
+    window_secs: u64,
+    max_size: usize,
+}
+
+impl DedupStore {
+    /// Create an in-memory dedup store with the given window and size cap.
+    pub fn new_in_memory(window_secs: u64, max_size: usize) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(DedupInner {
+                entries: HashMap::new(),
+                duplicate_count: 0,
+                inserted_count: 0,
+            })),
+            file_path: None,
+            window_secs,
+            max_size,
+        }
+    }
+
+    /// Create a file-backed dedup store.
+    ///
+    /// On construction the file is loaded (if it exists) and expired entries are
+    /// filtered out. On each new insertion the state is flushed to disk so it
+    /// survives process restarts within the dedup window.
+    pub fn new_filebacked(path: PathBuf, window_secs: u64, max_size: usize) -> Self {
+        let entries = load_dedup_file(&path, window_secs);
+        tracing::info!(
+            path = %path.display(),
+            loaded = entries.len(),
+            "loaded webhook dedup state from file"
+        );
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(DedupInner {
+                entries,
+                duplicate_count: 0,
+                inserted_count: 0,
+            })),
+            file_path: Some(path),
+            window_secs,
+            max_size,
+        }
+    }
+
+    /// Check whether `delivery_id` is new and, if so, record it.
+    ///
+    /// Returns `true` if the delivery is new (should be processed) or
+    /// `false` if it is a duplicate (should be silently ACKed).
+    pub async fn check_and_insert(&self, delivery_id: &str) -> bool {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let (is_new, flush_entries) = {
+            let mut inner = self.inner.lock().await;
+            // Evict time-expired entries first.
+            let cutoff = now_secs.saturating_sub(self.window_secs);
+            inner.entries.retain(|_, ts| *ts > cutoff);
+
+            if inner.entries.contains_key(delivery_id) {
+                inner.duplicate_count += 1;
+                (false, None)
+            } else {
+                inner.entries.insert(delivery_id.to_string(), now_secs);
+                inner.inserted_count += 1;
+                // Enforce size cap after insertion so the store never exceeds max_size.
+                enforce_size_cap(&mut inner.entries, self.max_size);
+                // Snapshot for file flush only when file-backed.
+                let snap = self.file_path.is_some().then(|| inner.entries.clone());
+                (true, snap)
+            }
+        };
+
+        // Flush outside the mutex to keep the critical section short.
+        if let (Some(path), Some(entries)) = (&self.file_path, flush_entries) {
+            flush_dedup_file(path, &entries);
+        }
+
+        is_new
+    }
+
+    /// Return a metrics snapshot (non-blocking).
+    pub async fn metrics(&self) -> DedupMetrics {
+        let inner = self.inner.lock().await;
+        DedupMetrics {
+            seen_count: inner.entries.len(),
+            duplicate_count: inner.duplicate_count,
+            inserted_count: inner.inserted_count,
+        }
+    }
+}
+
+/// Evict the oldest entries until the map is at most `max_size`.
+fn enforce_size_cap(entries: &mut HashMap<String, u64>, max_size: usize) {
+    if entries.len() > max_size {
+        let mut sorted: Vec<(String, u64)> = entries.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        sorted.sort_by_key(|(_, t)| *t);
+        let overflow = sorted.len().saturating_sub(max_size);
+        for (key, _) in sorted.into_iter().take(overflow) {
+            entries.remove(&key);
+        }
+    }
+}
+
+/// Evict expired entries and enforce the size cap (oldest evicted first).
+/// Used directly in tests; `check_and_insert` uses inline expiry + `enforce_size_cap`.
+#[cfg(test)]
+fn prune_dedup_inner(inner: &mut DedupInner, now_secs: u64, window_secs: u64, max_size: usize) {
+    let cutoff = now_secs.saturating_sub(window_secs);
+    inner.entries.retain(|_, ts| *ts > cutoff);
+    enforce_size_cap(&mut inner.entries, max_size);
+}
+
+/// Load dedup state from a JSON file, filtering out entries older than `window_secs`.
+fn load_dedup_file(path: &Path, window_secs: u64) -> HashMap<String, u64> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct FileFormat {
+        entries: HashMap<String, u64>,
+    }
+
+    let parsed: FileFormat = match serde_json::from_str(&content) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(?e, path = %path.display(), "failed to parse webhook dedup file, starting fresh");
+            return HashMap::new();
+        }
+    };
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cutoff = now_secs.saturating_sub(window_secs);
+    parsed
+        .entries
+        .into_iter()
+        .filter(|(_, ts)| *ts > cutoff)
+        .collect()
+}
+
+/// Persist the dedup entries to a JSON file.
+fn flush_dedup_file(path: &Path, entries: &HashMap<String, u64>) {
+    #[derive(serde::Serialize)]
+    struct FileFormat<'a> {
+        entries: &'a HashMap<String, u64>,
+    }
+
+    match serde_json::to_string(&FileFormat { entries }) {
+        Ok(content) => {
+            if let Err(e) = std::fs::write(path, content) {
+                tracing::warn!(?e, path = %path.display(), "failed to flush webhook dedup state");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(?e, "failed to serialize webhook dedup state");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Webhook server
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct WebhookState {
     secret: String,
     repo: String,
     tx: tokio::sync::mpsc::Sender<IncomingMessage>,
-    /// In-memory delivery deduplication: delivery_id → time first seen.
-    seen_deliveries: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+    dedup_store: DedupStore,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -201,21 +403,6 @@ fn parse_github_event(
     None
 }
 
-fn prune_seen_deliveries(seen: &mut HashMap<String, Instant>, now: Instant) {
-    let cutoff = now.checked_sub(DEDUP_WINDOW).unwrap_or(now);
-    seen.retain(|_, t| *t > cutoff);
-
-    if seen.len() > MAX_SEEN_DELIVERIES {
-        let mut entries: Vec<(String, Instant)> =
-            seen.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        entries.sort_by_key(|(_, t)| *t);
-        let overflow = entries.len().saturating_sub(MAX_SEEN_DELIVERIES);
-        for (key, _) in entries.into_iter().take(overflow) {
-            seen.remove(&key);
-        }
-    }
-}
-
 async fn handle_webhook(
     State(state): State<WebhookState>,
     headers: axum::http::HeaderMap,
@@ -239,17 +426,9 @@ async fn handle_webhook(
         .unwrap_or("")
         .to_string();
 
-    if !delivery_id.is_empty() {
-        let mut seen = state.seen_deliveries.lock().await;
-        let now = Instant::now();
-        // Evict entries older than the dedup window and cap size before checking.
-        prune_seen_deliveries(&mut seen, now);
-
-        if seen.contains_key(&delivery_id) {
-            tracing::debug!(delivery_id = %delivery_id, "duplicate webhook delivery, skipping");
-            return (StatusCode::OK, "OK");
-        }
-        seen.insert(delivery_id, now);
+    if !delivery_id.is_empty() && !state.dedup_store.check_and_insert(&delivery_id).await {
+        tracing::debug!(delivery_id = %delivery_id, "duplicate webhook delivery, skipping");
+        return (StatusCode::OK, "OK");
     }
 
     let payload: WebhookPayload = match serde_json::from_slice(&body) {
@@ -274,8 +453,17 @@ async fn handle_webhook(
     (StatusCode::OK, "OK")
 }
 
-async fn webhook_health() -> impl IntoResponse {
-    (StatusCode::OK, "OK")
+/// Health endpoint — returns JSON with dedup store metrics.
+///
+/// Response: `{"ok": true, "seen_count": N, "duplicate_count": N, "inserted_count": N}`
+async fn webhook_health(State(state): State<WebhookState>) -> impl IntoResponse {
+    let metrics = state.dedup_store.metrics().await;
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "seen_count": metrics.seen_count,
+        "duplicate_count": metrics.duplicate_count,
+        "inserted_count": metrics.inserted_count,
+    }))
 }
 
 /// Check if the webhook server is healthy by pinging its local health endpoint.
@@ -286,6 +474,8 @@ async fn webhook_health() -> impl IntoResponse {
 ///
 /// Returns `(healthy, failure_reason)`.  `failure_reason` is `Some` when
 /// unhealthy and cleared (i.e. `None`) when the check succeeds.
+///
+/// Logs dedup store metrics (seen_count, duplicate_count) at `debug` level for observability.
 pub async fn check_webhook_health(port: u16) -> (bool, Option<String>) {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -299,7 +489,22 @@ pub async fn check_webhook_health(port: u16) -> (bool, Option<String>) {
     };
     let url = format!("http://localhost:{}/health", port);
     match client.get(&url).send().await {
-        Ok(response) if response.status().is_success() => (true, None),
+        Ok(response) if response.status().is_success() => {
+            // Log dedup metrics from the health endpoint response.
+            if let Ok(body) = response.json::<serde_json::Value>().await {
+                let seen = body.get("seen_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let dupes = body
+                    .get("duplicate_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                tracing::debug!(
+                    seen_count = seen,
+                    duplicate_count = dupes,
+                    "webhook health ok"
+                );
+            }
+            (true, None)
+        }
         Ok(response) => {
             let reason = format!("health endpoint returned {}", response.status());
             (false, Some(reason))
@@ -338,7 +543,6 @@ pub fn webhook_backoff_delay(attempt: u32) -> std::time::Duration {
         % 500;
     std::time::Duration::from_millis(bounded_ms + jitter_ms)
 }
-
 pub async fn start_webhook_server(
     port: u16,
     secret: String,
@@ -347,19 +551,47 @@ pub async fn start_webhook_server(
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
 
+    let window_secs = crate::config::get("webhook.dedup_window_seconds")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DEDUP_WINDOW_SECS);
+
+    let max_size = crate::config::get("webhook.max_seen_deliveries")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_SEEN_DELIVERIES);
+
+    let store_type =
+        crate::config::get("webhook.dedup_store").unwrap_or_else(|_| "memory".to_string());
+
+    let dedup_store = if store_type == "file" {
+        let path = crate::home::orch_home()
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .join("webhook_dedup.json");
+        DedupStore::new_filebacked(path, window_secs, max_size)
+    } else {
+        DedupStore::new_in_memory(window_secs, max_size)
+    };
+
+    tracing::info!(
+        port,
+        dedup_store = %store_type,
+        dedup_window_secs = window_secs,
+        max_seen_deliveries = max_size,
+        "starting webhook server"
+    );
+
     let state = WebhookState {
         secret,
         repo,
         tx,
-        seen_deliveries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        dedup_store,
     };
 
     let app = Router::new()
         .route("/health", get(webhook_health))
         .route("/webhook", post(handle_webhook))
         .with_state(state);
-
-    tracing::info!(port = port, "starting webhook server");
 
     axum::serve(listener, app).await?;
 
@@ -671,23 +903,135 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_prune_seen_deliveries_caps_size() {
-        let mut seen = HashMap::new();
-        let now = Instant::now();
+    // ---------------------------------------------------------------------------
+    // DedupStore unit tests
+    // ---------------------------------------------------------------------------
 
-        for i in 0..(MAX_SEEN_DELIVERIES + 10) {
-            let key = format!("id-{}", i);
-            let offset = Duration::from_millis(i as u64);
-            seen.insert(key, now - offset);
+    #[tokio::test]
+    async fn test_dedup_store_new_entry_is_accepted() {
+        let store = DedupStore::new_in_memory(7200, 50_000);
+        assert!(
+            store.check_and_insert("delivery-1").await,
+            "first insertion should return true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_store_duplicate_is_rejected() {
+        let store = DedupStore::new_in_memory(7200, 50_000);
+        assert!(store.check_and_insert("delivery-1").await);
+        assert!(
+            !store.check_and_insert("delivery-1").await,
+            "duplicate should return false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_store_metrics_track_counts() {
+        let store = DedupStore::new_in_memory(7200, 50_000);
+
+        store.check_and_insert("d1").await;
+        store.check_and_insert("d2").await;
+        store.check_and_insert("d1").await; // duplicate
+
+        let m = store.metrics().await;
+        assert_eq!(m.seen_count, 2, "two unique IDs stored");
+        assert_eq!(m.inserted_count, 2, "two insertions");
+        assert_eq!(m.duplicate_count, 1, "one duplicate");
+    }
+
+    #[tokio::test]
+    async fn test_dedup_store_caps_size() {
+        let max = 10usize;
+        let store = DedupStore::new_in_memory(7200, max);
+
+        // Insert max + 5 entries; each with a unique ID.
+        for i in 0..(max + 5) {
+            store.check_and_insert(&format!("d-{}", i)).await;
         }
 
-        prune_seen_deliveries(&mut seen, now);
-
-        assert_eq!(seen.len(), MAX_SEEN_DELIVERIES);
-        assert!(seen.contains_key("id-0"), "newest entry should remain");
+        let m = store.metrics().await;
         assert!(
-            !seen.contains_key(&format!("id-{}", MAX_SEEN_DELIVERIES + 9)),
+            m.seen_count <= max,
+            "seen_count {} should not exceed max {}",
+            m.seen_count,
+            max
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_store_filebacked_persists_across_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dedup.json");
+
+        // First instance — insert an entry.
+        {
+            let store = DedupStore::new_filebacked(path.clone(), 7200, 50_000);
+            store.check_and_insert("delivery-persisted").await;
+        }
+
+        // Second instance — load from same file; should still see the entry as duplicate.
+        {
+            let store = DedupStore::new_filebacked(path.clone(), 7200, 50_000);
+            assert!(
+                !store.check_and_insert("delivery-persisted").await,
+                "entry loaded from file should be treated as duplicate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dedup_store_filebacked_expired_entries_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dedup.json");
+
+        // Write a file with an entry that is already expired (timestamp = 0).
+        let content = r#"{"entries":{"old-delivery":0}}"#;
+        std::fs::write(&path, content).unwrap();
+
+        // Load with a 1-second window; the entry (ts=0) is long expired.
+        let store = DedupStore::new_filebacked(path, 1, 50_000);
+        assert!(
+            store.check_and_insert("old-delivery").await,
+            "expired entry should not block new delivery with same ID"
+        );
+    }
+
+    #[test]
+    fn test_prune_dedup_inner_caps_size() {
+        let mut inner = DedupInner {
+            entries: HashMap::new(),
+            duplicate_count: 0,
+            inserted_count: 0,
+        };
+        // Use a real-world-scale timestamp so subtracting offsets doesn't underflow.
+        let now_secs: u64 = 1_700_000_000;
+
+        for i in 0..(DEFAULT_MAX_SEEN_DELIVERIES + 10) {
+            inner
+                .entries
+                .insert(format!("id-{}", i), now_secs - i as u64);
+        }
+
+        // Use a window large enough so none of the test entries expire (they span
+        // DEFAULT_MAX_SEEN_DELIVERIES + 10 seconds from now_secs).
+        let large_window = (DEFAULT_MAX_SEEN_DELIVERIES + 100) as u64;
+        prune_dedup_inner(
+            &mut inner,
+            now_secs,
+            large_window,
+            DEFAULT_MAX_SEEN_DELIVERIES,
+        );
+
+        assert_eq!(inner.entries.len(), DEFAULT_MAX_SEEN_DELIVERIES);
+        assert!(
+            inner.entries.contains_key("id-0"),
+            "newest entry should remain"
+        );
+        assert!(
+            !inner
+                .entries
+                .contains_key(&format!("id-{}", DEFAULT_MAX_SEEN_DELIVERIES + 9)),
             "oldest entries should be evicted"
         );
     }
@@ -707,7 +1051,7 @@ mod tests {
             secret: String::new(), // empty secret = skip verification
             repo: "owner/repo".to_string(),
             tx,
-            seen_deliveries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dedup_store: DedupStore::new_in_memory(7200, 50_000),
         };
 
         let app = Router::new()
@@ -761,7 +1105,7 @@ mod tests {
             secret: String::new(),
             repo: "owner/repo".to_string(),
             tx,
-            seen_deliveries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dedup_store: DedupStore::new_in_memory(7200, 50_000),
         };
 
         let app = Router::new()
@@ -813,7 +1157,7 @@ mod tests {
             secret: String::new(),
             repo: "owner/repo".to_string(),
             tx,
-            seen_deliveries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dedup_store: DedupStore::new_in_memory(7200, 50_000),
         };
 
         let app = Router::new()
@@ -867,7 +1211,7 @@ mod tests {
             secret: "real-secret".to_string(),
             repo: "owner/repo".to_string(),
             tx,
-            seen_deliveries: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dedup_store: DedupStore::new_in_memory(7200, 50_000),
         };
 
         let app = Router::new()
@@ -903,7 +1247,7 @@ mod tests {
     }
 
     /// Deduplication test: same x-github-delivery ID sent twice → only one message
-    /// processed by the engine.
+    /// processed by the engine. Also verifies metrics are recorded correctly.
     #[tokio::test]
     async fn test_webhook_deduplication_same_delivery_id() {
         use axum::body::Body;
@@ -912,8 +1256,8 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
 
-        // Shared seen_deliveries — both requests use the same state.
-        let seen_deliveries = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        // Shared dedup store — both requests use the same state.
+        let dedup_store = DedupStore::new_in_memory(7200, 50_000);
 
         let body_json = serde_json::json!({
             "action": "opened",
@@ -931,7 +1275,7 @@ mod tests {
                 secret: String::new(),
                 repo: "owner/repo".to_string(),
                 tx: tx.clone(),
-                seen_deliveries: seen_deliveries.clone(),
+                dedup_store: dedup_store.clone(),
             };
             let app = Router::new()
                 .route("/webhook", post(handle_webhook))
@@ -961,7 +1305,7 @@ mod tests {
                 secret: String::new(),
                 repo: "owner/repo".to_string(),
                 tx: tx.clone(),
-                seen_deliveries: seen_deliveries.clone(),
+                dedup_store: dedup_store.clone(),
             };
             let app = Router::new()
                 .route("/webhook", post(handle_webhook))
@@ -985,13 +1329,19 @@ mod tests {
             "duplicate delivery should not produce a second message"
         );
 
+        // Verify metrics: 1 inserted, 1 duplicate.
+        let m = dedup_store.metrics().await;
+        assert_eq!(m.inserted_count, 1, "one unique delivery inserted");
+        assert_eq!(m.duplicate_count, 1, "one duplicate rejected");
+        assert_eq!(m.seen_count, 1, "one entry in store");
+
         // Third delivery with a DIFFERENT delivery ID — should be processed normally.
         {
             let state = WebhookState {
                 secret: String::new(),
                 repo: "owner/repo".to_string(),
                 tx: tx.clone(),
-                seen_deliveries: seen_deliveries.clone(),
+                dedup_store: dedup_store.clone(),
             };
             let app = Router::new()
                 .route("/webhook", post(handle_webhook))
@@ -1012,6 +1362,56 @@ mod tests {
             .try_recv()
             .expect("different delivery ID should produce a message");
         assert_eq!(msg2.thread_id, "200");
+
+        // Final metrics check.
+        let m = dedup_store.metrics().await;
+        assert_eq!(m.inserted_count, 2, "two unique deliveries inserted total");
+        assert_eq!(m.duplicate_count, 1, "still one duplicate");
+    }
+
+    /// Health endpoint test: verify it returns JSON with dedup metrics.
+    #[tokio::test]
+    async fn test_health_endpoint_returns_json_metrics() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<IncomingMessage>(16);
+        let dedup_store = DedupStore::new_in_memory(7200, 50_000);
+
+        // Pre-populate with one entry and one duplicate for metrics.
+        dedup_store.check_and_insert("health-test-1").await;
+        dedup_store.check_and_insert("health-test-1").await;
+
+        let state = WebhookState {
+            secret: String::new(),
+            repo: "owner/repo".to_string(),
+            tx,
+            dedup_store,
+        };
+
+        let app = Router::new()
+            .route("/health", get(webhook_health))
+            .with_state(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["seen_count"], 1);
+        assert_eq!(json["inserted_count"], 1);
+        assert_eq!(json["duplicate_count"], 1);
     }
 
     /// Verify that `is_transient_bind_error` correctly classifies EADDRINUSE.
