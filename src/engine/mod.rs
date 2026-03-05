@@ -183,6 +183,8 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     }
 
     let mut engines = Vec::new();
+    let mut auth_failures = 0usize;
+    let mut network_failures = 0usize;
 
     for repo in repos {
         tracing::info!(repo = %repo, "initializing project engine");
@@ -197,17 +199,20 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
             if err_str.contains("401")
                 || err_str.contains("Bad credentials")
                 || err_str.contains("authentication")
+                || err_str.contains("No GitHub token")
             {
+                auth_failures += 1;
                 tracing::warn!(
                     repo = %repo,
                     error = %e,
-                    "GitHub auth failed for project — run `gh auth login`"
+                    "GitHub auth failed — run `gh auth login`"
                 );
             } else {
+                network_failures += 1;
                 tracing::warn!(
                     repo = %repo,
                     error = %e,
-                    "GitHub connection failed for project (network unavailable?)"
+                    "GitHub unreachable (network unavailable?)"
                 );
             }
             continue;
@@ -233,7 +238,15 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     }
 
     if engines.is_empty() {
-        anyhow::bail!("all project backends failed — GitHub connection or auth error (retrying)");
+        if auth_failures > 0 && network_failures == 0 {
+            anyhow::bail!("GitHub auth failed for all projects — run `gh auth login`");
+        } else if network_failures > 0 && auth_failures == 0 {
+            anyhow::bail!("GitHub unreachable for all projects — check network connectivity");
+        } else {
+            anyhow::bail!(
+                "all project backends failed ({auth_failures} auth, {network_failures} network)"
+            );
+        }
     }
 
     Ok(engines)
