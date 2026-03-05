@@ -172,6 +172,16 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     let repos = config::get_projects()?;
     tracing::info!(repos = ?repos, "loading projects from config");
 
+    if repos.is_empty() {
+        let config_path = crate::home::config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "~/.orch/config.yml".to_string());
+        anyhow::bail!(
+            "no projects configured — add repos under `projects:` in {}",
+            config_path
+        );
+    }
+
     let mut engines = Vec::new();
 
     for repo in repos {
@@ -181,13 +191,25 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         let backend: Arc<dyn ExternalBackend> =
             Arc::new(crate::backends::github::GitHubBackend::new(repo.clone()));
 
-        // Health check — verifies GitHub authentication is configured and working
+        // Health check — verifies network and GitHub authentication
         if let Err(e) = backend.health_check().await {
-            tracing::warn!(
-                repo = %repo,
-                error = %e,
-                "backend health check failed (GitHub auth), skipping project"
-            );
+            let err_str = e.to_string();
+            if err_str.contains("401")
+                || err_str.contains("Bad credentials")
+                || err_str.contains("authentication")
+            {
+                tracing::warn!(
+                    repo = %repo,
+                    error = %e,
+                    "GitHub auth failed for project — run `gh auth login`"
+                );
+            } else {
+                tracing::warn!(
+                    repo = %repo,
+                    error = %e,
+                    "GitHub connection failed for project (network unavailable?)"
+                );
+            }
             continue;
         }
         tracing::info!(repo = %repo, backend = backend.name(), "backend connected");
@@ -211,17 +233,7 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     }
 
     if engines.is_empty() {
-        let config_path = crate::home::config_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "~/.orch/config.yml".to_string());
-        anyhow::bail!(
-            "no valid projects configured — all backends failed health checks. \
-             GitHub Authentication: \
-             Set GH_TOKEN or GITHUB_TOKEN environment variables, OR \
-             Configure gh.auth in {}. \
-             See docs for GitHub App authentication setup.",
-            config_path
-        );
+        anyhow::bail!("all project backends failed — GitHub connection or auth error (retrying)");
     }
 
     Ok(engines)

@@ -3,6 +3,7 @@
 //! Supports Claude, Codex, OpenCode (plus Kimi/MiniMax as Claude aliases).
 //! Prefers PTY-based spawning to preserve terminal semantics without on-disk scripts.
 
+#[cfg(test)]
 use crate::github::token::TokenResolver;
 use crate::template::render_template_str;
 use crate::tmux::TmuxManager;
@@ -270,10 +271,8 @@ exit $CMD_STATUS
 
     let command = format!("bash {}", script_path.display());
 
-    // Resolve GitHub token using centralized TokenResolver
-    // This avoids embedding tokens in runner scripts and prevents gh CLI calls per-task
-    let token_resolver = TokenResolver::default_env();
-    let github_token = match token_resolver.get_token().await {
+    // Resolve GitHub token via the process-wide shared resolver (cached after first call)
+    let github_token = match crate::github::token::shared().get_token().await {
         Ok(Some(token)) => {
             tracing::debug!("Resolved GitHub token via TokenResolver for agent session");
             Some(token)

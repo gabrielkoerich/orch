@@ -16,7 +16,7 @@
 
 use anyhow::Context;
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
@@ -193,6 +193,7 @@ impl TokenResolver {
     ///
     /// Works for Env mode (env vars, config, and gh CLI fallback).
     /// GitHub App mode requires async due to file reading.
+    #[allow(dead_code)]
     pub fn get_token_sync(&self) -> anyhow::Result<Option<String>> {
         match self.mode {
             TokenMode::Env => {
@@ -369,6 +370,20 @@ impl TokenResolver {
             _ => None,
         }
     }
+}
+
+/// Process-wide shared [`TokenResolver`].
+///
+/// Initialized once on first call. All callers (GhHttp, agent runner, etc.)
+/// share the same instance so the token is resolved once — via GH_TOKEN,
+/// GITHUB_TOKEN, or `gh auth token` CLI — and cached for the life of the process.
+static SHARED_RESOLVER: OnceLock<Arc<TokenResolver>> = OnceLock::new();
+
+/// Get the process-wide shared token resolver.
+pub fn shared() -> Arc<TokenResolver> {
+    SHARED_RESOLVER
+        .get_or_init(|| Arc::new(TokenResolver::default_env()))
+        .clone()
 }
 
 impl Default for TokenResolver {

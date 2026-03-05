@@ -18,7 +18,7 @@ use reqwest::{header, Client, Response, StatusCode};
 use serde::Serialize;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 use urlencoding;
@@ -188,6 +188,8 @@ static METRIC_PROACTIVE_THROTTLES: AtomicU64 = AtomicU64::new(0);
 /// Total seconds spent waiting due to proactive throttle or hard backoff.
 static METRIC_WAIT_SECS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+// ── Shared token resolver ────────────────────────────────────────────
+
 // ── GhHttp client ────────────────────────────────────────────────────
 
 /// Native HTTP client for the GitHub API with connection pooling and
@@ -195,31 +197,18 @@ static METRIC_WAIT_SECS_TOTAL: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct GhHttp {
     client: Client,
-    token: String,
+    token_resolver: Arc<token::TokenResolver>,
 }
 
 impl GhHttp {
-    /// Create a new client using the centralized [`TokenResolver`].
+    /// Create a new client backed by the process-wide shared [`TokenResolver`].
     ///
-    /// Resolution order: `GH_TOKEN` → `GITHUB_TOKEN` → `gh.auth.token` config → `gh auth token` CLI.
-    /// The `gh auth token` fallback is enabled by default — just run `gh auth login` and it works.
-    /// Disable with `gh.allow_gh_fallback = false` in config.
+    /// Token is resolved lazily on first request:
+    ///   GH_TOKEN → GITHUB_TOKEN → gh.auth.token config → gh auth token CLI
+    /// The result is cached in the shared resolver for the life of the process,
+    /// so `gh auth token` is only called once regardless of how many instances
+    /// are created.
     pub fn new() -> Self {
-        let token_resolver = token::TokenResolver::default_env();
-        let token = token_resolver
-            .get_token_sync()
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-
-        if token.is_empty() {
-            tracing::warn!(
-                "No GitHub token found: set GH_TOKEN, GITHUB_TOKEN, or run `gh auth login`"
-            );
-        } else {
-            tracing::debug!("GitHub token resolved via TokenResolver");
-        }
-
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
@@ -227,7 +216,10 @@ impl GhHttp {
             .build()
             .expect("failed to build reqwest client");
 
-        Self { client, token }
+        Self {
+            client,
+            token_resolver: token::shared(),
+        }
     }
 
     // ── Rate-limit helpers ────────────────────────────────────────
@@ -375,7 +367,10 @@ impl GhHttp {
     // ── Low-level HTTP helpers ────────────────────────────────────
 
     async fn auth_header(&self) -> anyhow::Result<String> {
-        Ok(format!("Bearer {}", self.token))
+        match self.token_resolver.get_token().await? {
+            Some(token) if !token.is_empty() => Ok(format!("Bearer {token}")),
+            _ => anyhow::bail!("No GitHub token available — run `gh auth login` or set GH_TOKEN"),
+        }
     }
 
     /// GET request, returns deserialized JSON.
