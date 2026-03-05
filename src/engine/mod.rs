@@ -205,14 +205,14 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
                 tracing::warn!(
                     repo = %repo,
                     error = %e,
-                    "GitHub auth failed — run `gh auth login`"
+                    "GitHub auth failed for {repo} — run `gh auth login`"
                 );
             } else {
                 network_failures += 1;
                 tracing::warn!(
                     repo = %repo,
                     error = %e,
-                    "GitHub unreachable (network unavailable?)"
+                    "GitHub unreachable for {repo} (network unavailable?)"
                 );
             }
             continue;
