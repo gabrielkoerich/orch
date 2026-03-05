@@ -24,6 +24,10 @@ pub struct WorktreeSetup {
 ///
 /// Format: `gh-task-{issue}-{slug}` where slug is lowercase, non-alphanum→`-`, max 40 chars.
 pub fn branch_name(task_id: &str, title: &str) -> String {
+    // Sanitize task_id for use in branch names (e.g. "internal:8" → "internal-8")
+    let task_id = task_id.replace(':', "-");
+    let task_id = task_id.as_str();
+
     let raw: String = title
         .to_lowercase()
         .chars()
