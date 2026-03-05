@@ -279,6 +279,21 @@ impl AgentRunner for ClaudeRunner {
         let combined = format!("{stdout}\n{stderr}");
         super::patterns::classify_from_text(exit_code, &combined)
     }
+
+    fn router_command(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let mut cmd = tokio::process::Command::new(&self.binary);
+        cmd.env_remove("CLAUDECODE"); // allow nested invocation
+        cmd.arg("--output-format").arg("json").arg("--print");
+        if let Some(m) = model {
+            cmd.arg("--model").arg(m);
+        }
+        cmd.arg(prompt);
+        Ok(cmd)
+    }
 }
 
 /// Known Claude Code native tool names.

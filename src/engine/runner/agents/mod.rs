@@ -260,6 +260,17 @@ pub trait AgentRunner: Send + Sync {
     fn free_models(&self) -> Vec<String> {
         vec![]
     }
+
+    /// Build a minimal CLI command for LLM-based routing.
+    ///
+    /// The command should run the agent with `prompt` as the sole task and
+    /// return structured (JSON or NDJSON) output on stdout. Used by the router
+    /// to classify tasks without launching a full agent session.
+    fn router_command(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<tokio::process::Command>;
 }
 
 /// Get the appropriate AgentRunner implementation for an agent name.

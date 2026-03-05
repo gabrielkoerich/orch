@@ -365,6 +365,20 @@ impl AgentRunner for OpenCodeRunner {
             "openai/gpt-4.1".to_string(),
         ]
     }
+
+    fn router_command(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let mut cmd = tokio::process::Command::new("opencode");
+        cmd.arg("run").arg("--format").arg("json");
+        if let Some(m) = model {
+            cmd.arg("--model").arg(m);
+        }
+        cmd.arg(prompt);
+        Ok(cmd)
+    }
 }
 
 /// Map from unified allowed_tools names to OpenCode permission keys.

@@ -301,43 +301,14 @@ impl LlmRouter {
         let timeout_secs = config.timeout_seconds;
         let timeout_duration = Duration::from_secs(timeout_secs);
 
-        let output = match config.router_agent.as_str() {
-            // claude-compatible CLIs (claude, kimi, minimax) share the same flag interface
-            agent @ ("claude" | "kimi" | "minimax") => {
-                let mut cmd = tokio::process::Command::new(agent);
-                cmd.env_remove("CLAUDECODE"); // allow nested invocation
-                cmd.arg("--output-format").arg("json").arg("--print");
-
-                if !config.router_model.is_empty() {
-                    cmd.arg("--model").arg(&config.router_model);
-                }
-
-                cmd.arg(prompt);
-
-                tokio::time::timeout(timeout_duration, cmd.output_with_context()).await
-            }
-            "codex" => {
-                let mut cmd = tokio::process::Command::new("codex");
-                cmd.arg("exec").arg("--json");
-
-                if !config.router_model.is_empty() {
-                    cmd.arg("--model").arg(&config.router_model);
-                }
-
-                cmd.arg(prompt);
-
-                tokio::time::timeout(timeout_duration, cmd.output_with_context()).await
-            }
-            "opencode" => {
-                let mut cmd = tokio::process::Command::new("opencode");
-                cmd.arg("run").arg("--format").arg("json").arg(prompt);
-
-                tokio::time::timeout(timeout_duration, cmd.output_with_context()).await
-            }
-            _ => {
-                anyhow::bail!("unknown router agent: {}", config.router_agent);
-            }
+        let model = if config.router_model.is_empty() {
+            None
+        } else {
+            Some(config.router_model.as_str())
         };
+        let mut cmd = crate::engine::runner::agents::get_runner(&config.router_agent)
+            .router_command(prompt, model)?;
+        let output = tokio::time::timeout(timeout_duration, cmd.output_with_context()).await;
 
         match output {
             Ok(Ok(output)) => {

@@ -383,6 +383,20 @@ impl AgentRunner for CodexRunner {
         let combined = format!("{stdout}\n{stderr}");
         super::patterns::classify_from_text(exit_code, &combined)
     }
+
+    fn router_command(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let mut cmd = tokio::process::Command::new("codex");
+        cmd.arg("exec").arg("--json");
+        if let Some(m) = model {
+            cmd.arg("--model").arg(m);
+        }
+        cmd.arg(prompt);
+        Ok(cmd)
+    }
 }
 
 /// Try to extract a model name from an error message.
