@@ -35,6 +35,10 @@ pub struct OutputBuffer {
     pub last_hash: Option<[u8; 32]>,
     /// When the last capture occurred
     pub last_capture: DateTime<Utc>,
+    /// Whether the session has been seen alive at least once.
+    /// Prevents firing "session ended" for sessions that were registered
+    /// before the tmux session was actually created.
+    pub seen_alive: bool,
 }
 
 /// Service that captures tmux pane output and broadcasts to transport.
@@ -66,6 +70,7 @@ impl CaptureService {
             last_len: 0,
             last_hash: None,
             last_capture: Utc::now(),
+            seen_alive: false,
         };
         self.buffers
             .write()
@@ -143,8 +148,11 @@ impl CaptureService {
                     None => match tmux::capture_pane(&buffer.session).await {
                         Ok(s) => s,
                         Err(e) => {
-                            // If tmux capture failed, check if session ended
-                            if tmux::is_session_dead(&buffer.session).await {
+                            // Only fire "session ended" if the session was seen alive before.
+                            // Prevents false positives when the session is registered before
+                            // the tmux session is actually created (race between registration
+                            // and session creation).
+                            if buffer.seen_alive && tmux::is_session_dead(&buffer.session).await {
                                 tracing::info!(
                                     task_id,
                                     session = buffer.session,
@@ -171,9 +179,12 @@ impl CaptureService {
 
                 let new_content = {
                     let mut buffers = self.buffers.write().await;
-                    buffers
-                        .get_mut(&task_id)
-                        .and_then(|buf| buf.diff_and_update(&current_content))
+                    if let Some(buf) = buffers.get_mut(&task_id) {
+                        buf.seen_alive = true;
+                        buf.diff_and_update(&current_content)
+                    } else {
+                        None
+                    }
                 };
 
                 if let Some(new_content) = new_content {

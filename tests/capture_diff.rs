@@ -46,6 +46,7 @@ fn buffer() -> OutputBuffer {
         last_len: 0,
         last_hash: None,
         last_capture: chrono::Utc::now(),
+        seen_alive: false,
     }
 }
 
