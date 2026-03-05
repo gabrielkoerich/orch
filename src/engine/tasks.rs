@@ -185,7 +185,10 @@ impl TaskManager {
         let mut tasks = self.backend.list_routable().await?;
 
         // Include internal tasks with New status so the engine can dispatch them.
-        let internal_new = self.db.list_internal_tasks_by_status(TaskStatus::New).await?;
+        let internal_new = self
+            .db
+            .list_internal_tasks_by_status(TaskStatus::New)
+            .await?;
         for t in internal_new {
             tasks.push(ExternalTask {
                 id: ExternalId(format!("internal:{}", t.id)),

@@ -190,8 +190,15 @@ pub(crate) async fn tick_route_tasks(
 
                 if is_internal_id(&task.id.0) {
                     // Internal tasks: update DB status, skip GitHub label ops.
-                    if let Err(e) = task_manager.update_task_status(&task.id, Status::Routed).await {
-                        tracing::warn!(task_id = task.id.0, ?e, "failed to set internal status:routed");
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::Routed)
+                        .await
+                    {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            ?e,
+                            "failed to set internal status:routed"
+                        );
                     }
                 } else {
                     // Add agent and complexity labels (additive — does not remove existing labels)
@@ -314,7 +321,9 @@ pub(crate) async fn tick_dispatch_tasks(
         // Mark in_progress BEFORE spawning to prevent double dispatch.
         let task_id = task.id.0.clone();
         let set_in_progress_result = if is_internal_id(&task_id) {
-            task_manager.update_task_status(&task.id, Status::InProgress).await
+            task_manager
+                .update_task_status(&task.id, Status::InProgress)
+                .await
         } else {
             backend.update_status(&task.id, Status::InProgress).await
         };
