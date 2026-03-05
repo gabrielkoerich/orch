@@ -82,6 +82,33 @@ fn ensure_path() {
     }
 }
 
+/// Load `export KEY=VALUE` lines from `~/.private` into the process environment.
+///
+/// Called once at startup so all child processes (router LLM, agent runners)
+/// inherit tokens like KIMI_API_KEY without requiring a shell source.
+fn load_private_env() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = format!("{home}/.private");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        // Match: export KEY="value" or export KEY=value
+        let Some(rest) = line.strip_prefix("export ") else {
+            continue;
+        };
+        let Some((key, val)) = rest.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim().trim_matches('"');
+        if !key.is_empty() && std::env::var(key).is_err() {
+            std::env::set_var(key, val);
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "orch", version = env!("ORCH_VERSION"), about = "Orch — The Agent Orchestrator")]
 struct Cli {
@@ -389,6 +416,11 @@ async fn main() -> anyhow::Result<()> {
     // launchd services inherit a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
     // that excludes Homebrew, Cargo, npm globals, etc.
     ensure_path();
+
+    // Load private environment variables from ~/.private into the process.
+    // This makes tokens (KIMI_API_KEY, etc.) available to all child processes
+    // (router, agents) without requiring the shell to source the file first.
+    load_private_env();
 
     tracing_subscriber::fmt()
         .with_env_filter(
