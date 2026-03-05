@@ -3,8 +3,6 @@
 //! Supports Claude, Codex, OpenCode (plus Kimi/MiniMax as Claude aliases).
 //! Prefers PTY-based spawning to preserve terminal semantics without on-disk scripts.
 
-#[cfg(test)]
-use crate::github::token::TokenResolver;
 use crate::template::render_template_str;
 use crate::tmux::TmuxManager;
 use std::collections::HashMap;
