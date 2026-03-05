@@ -73,63 +73,8 @@ jobs:
         with:
           args: detect --source . --config .gitleaks.toml --no-banner --redact --exit-code=1
 
-  # Cross-compile build jobs for macOS targets.
-  # NOTE: Do NOT add a skip check here. check-release is a dependency — if it
-  # is skipped (non-main) or outputs skip=true, GitHub Actions automatically
-  # skips this job. The release job handles the skip guard.
-  build-macos:
-    needs: [test, secrets, check-release]
-    if: github.ref == 'refs/heads/main'
-    strategy:
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            arch: arm64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            arch: x86_64
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
-        env:
-          ORCH_BUILD_VERSION: ${{ needs.check-release.outputs.version }}
-
-      - name: Package binary
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/orch dist/orch-${{ matrix.arch }}
-          chmod +x dist/orch-${{ matrix.arch }}
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: orch-${{ matrix.arch }}
-          path: dist/orch-${{ matrix.arch }}
-          retention-days: 1
-
   # Determine if a release is needed and what version to use
   check-release:
-    needs: [test, secrets]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
@@ -213,9 +158,62 @@ jobs:
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $NEW_VERSION (${BUMP} bump)"
 
+  # Cross-compile build jobs for macOS targets.
+  # NOTE: Do NOT add a skip check here. check-release is a dependency — if it
+  # is skipped (non-main) or outputs skip=true, GitHub Actions automatically
+  # skips this job. The release job handles the skip guard.
+  build-macos:
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            arch: arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          ORCH_BUILD_VERSION: ${{ needs.check-release.outputs.version }}
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/orch dist/orch-${{ matrix.arch }}
+          chmod +x dist/orch-${{ matrix.arch }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orch-${{ matrix.arch }}
+          path: dist/orch-${{ matrix.arch }}
+          retention-days: 1
+
   # Create GitHub release with binaries
   release:
-    needs: [check-release, build-macos]
+    needs: [test, secrets, check-release, build-macos]
     if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
     runs-on: ubuntu-latest
     permissions:
