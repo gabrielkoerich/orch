@@ -163,6 +163,7 @@ jobs:
   # is skipped (non-main) or outputs skip=true, GitHub Actions automatically
   # skips this job. The release job handles the skip guard.
   build-macos:
+    needs: [check-release]
     if: github.ref == 'refs/heads/main'
     strategy:
       matrix:
