@@ -488,6 +488,11 @@ pub async fn serve() -> anyhow::Result<()> {
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    // Shared status updated by the server-spawn task and the health-check loop.
+    let webhook_status = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::webhook_status::WebhookStatus::default(),
+    ));
+
     if webhook_enabled {
         let port: u16 = crate::config::get("webhook.port")
             .ok()
@@ -502,10 +507,74 @@ pub async fn serve() -> anyhow::Result<()> {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingMessage>(64);
 
-        // Spawn the HTTP server (runs until shutdown)
+        // Initialise status: configured, not yet healthy.
+        {
+            let mut s = webhook_status.lock().unwrap();
+            s.configured = true;
+            s.port = Some(port);
+            s.healthy = false;
+            s.fallback_mode = false;
+            s.save();
+        }
+
+        // Spawn the HTTP server with exponential-backoff retry on transient
+        // bind errors (e.g. EADDRINUSE).  After MAX_ATTEMPTS the engine falls
+        // back to polling and updates the shared status accordingly.
+        const WEBHOOK_MAX_ATTEMPTS: u32 = 5;
+        let status_for_spawn = webhook_status.clone();
         tokio::spawn(async move {
-            if let Err(e) = start_webhook_server(port, secret, webhook_repo, tx).await {
-                tracing::error!(?e, "webhook server failed");
+            use crate::channels::github::{is_transient_bind_error, webhook_backoff_delay};
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                tracing::info!(attempt, port, "attempting to start webhook server");
+                match start_webhook_server(port, secret.clone(), webhook_repo.clone(), tx.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::info!(attempt, "webhook server exited cleanly");
+                        break;
+                    }
+                    Err(e) => {
+                        let reason = e.to_string();
+                        tracing::error!(attempt, %reason, "webhook server failed");
+                        if attempt >= WEBHOOK_MAX_ATTEMPTS || !is_transient_bind_error(&e) {
+                            let kind = if attempt >= WEBHOOK_MAX_ATTEMPTS {
+                                "max attempts reached"
+                            } else {
+                                "non-transient error"
+                            };
+                            tracing::error!(
+                                attempt,
+                                %reason,
+                                kind,
+                                orch_webhook_in_fallback = true,
+                                "webhook server giving up, switching to polling fallback"
+                            );
+                            let mut s = status_for_spawn.lock().unwrap();
+                            s.fallback_mode = true;
+                            s.healthy = false;
+                            s.last_failure_reason = Some(reason);
+                            s.startup_attempts = attempt;
+                            s.save();
+                            break;
+                        }
+                        let delay = webhook_backoff_delay(attempt);
+                        tracing::warn!(
+                            attempt,
+                            delay_ms = delay.as_millis(),
+                            %reason,
+                            "webhook bind failed (transient), retrying with backoff"
+                        );
+                        {
+                            let mut s = status_for_spawn.lock().unwrap();
+                            s.startup_attempts = attempt;
+                            s.last_failure_reason = Some(reason);
+                            s.save();
+                        }
+                        tokio::time::sleep(delay).await;
+                    }
+                }
             }
         });
 
@@ -528,11 +597,20 @@ pub async fn serve() -> anyhow::Result<()> {
         });
 
         webhook_healthy = true;
-        tracing::info!(port, "webhook server started");
+        tracing::info!(port, orch_webhook_up = true, "webhook server started");
     } else {
         webhook_port = None;
         webhook_healthy = false;
-        tracing::info!("webhook server disabled, using polling fallback mode");
+        {
+            let mut s = webhook_status.lock().unwrap();
+            s.configured = false;
+            s.fallback_mode = true;
+            s.save();
+        }
+        tracing::info!(
+            orch_webhook_in_fallback = true,
+            "webhook server disabled, using polling fallback mode"
+        );
     }
 
     // Agent router (selects agent + model per task) - shared across projects
@@ -731,14 +809,32 @@ pub async fn serve() -> anyhow::Result<()> {
 
                     if last_webhook_health_check.elapsed() >= health_check_interval {
                         if let Some(port) = webhook_port {
-                            let health = crate::channels::github::check_webhook_health(port).await;
+                            let (health, failure_reason) =
+                                crate::channels::github::check_webhook_health(port).await;
                             if health != webhook_healthy {
                                 webhook_healthy = health;
                                 if webhook_healthy {
-                                    tracing::info!(port, "webhook health restored");
+                                    tracing::info!(port, orch_webhook_up = true, "webhook health restored");
                                 } else {
-                                    tracing::warn!(port, "webhook health check failed");
+                                    tracing::warn!(
+                                        port,
+                                        orch_webhook_up = false,
+                                        reason = failure_reason.as_deref().unwrap_or("unknown"),
+                                        "webhook health check failed"
+                                    );
                                 }
+                            }
+                            // Persist updated status.
+                            {
+                                let mut s = webhook_status.lock().unwrap();
+                                s.healthy = health;
+                                s.last_check_utc = Some(chrono::Utc::now());
+                                if health {
+                                    s.last_failure_reason = None;
+                                } else if failure_reason.is_some() {
+                                    s.last_failure_reason = failure_reason;
+                                }
+                                s.save();
                             }
                         }
                         last_webhook_health_check = std::time::Instant::now();

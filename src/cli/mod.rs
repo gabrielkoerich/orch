@@ -4,6 +4,7 @@ pub mod job;
 pub mod service;
 pub mod task;
 pub mod tree;
+pub mod webhook;
 
 use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;

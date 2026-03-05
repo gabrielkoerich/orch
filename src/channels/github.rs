@@ -283,7 +283,10 @@ async fn webhook_health() -> impl IntoResponse {
 /// This only verifies the local HTTP listener is running. It does NOT verify
 /// that GitHub can reach the endpoint (NAT/firewall) or that the webhook
 /// secret is valid.
-pub async fn check_webhook_health(port: u16) -> bool {
+///
+/// Returns `(healthy, failure_reason)`.  `failure_reason` is `Some` when
+/// unhealthy and cleared (i.e. `None`) when the check succeeds.
+pub async fn check_webhook_health(port: u16) -> (bool, Option<String>) {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -291,14 +294,49 @@ pub async fn check_webhook_health(port: u16) -> bool {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(?e, "failed to build HTTP client for webhook health check");
-            return false;
+            return (false, Some(format!("failed to build HTTP client: {e}")));
         }
     };
     let url = format!("http://localhost:{}/health", port);
     match client.get(&url).send().await {
-        Ok(response) => response.status().is_success(),
-        Err(_) => false,
+        Ok(response) if response.status().is_success() => (true, None),
+        Ok(response) => {
+            let reason = format!("health endpoint returned {}", response.status());
+            (false, Some(reason))
+        }
+        Err(e) => (false, Some(format!("health check request failed: {e}"))),
     }
+}
+
+/// Return `true` when `e` represents a transient TCP bind error (e.g. port
+/// already in use) that is worth retrying.
+pub fn is_transient_bind_error(e: &anyhow::Error) -> bool {
+    for cause in e.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_err.kind(),
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AddrNotAvailable
+            );
+        }
+    }
+    false
+}
+
+/// Compute an exponential-backoff delay for webhook startup retries.
+///
+/// Uses subsecond wall-clock bits as a cheap jitter source — no `rand` crate
+/// needed.  Delay is capped at 30 s.
+pub fn webhook_backoff_delay(attempt: u32) -> std::time::Duration {
+    let base_ms: u64 = 500;
+    let max_ms: u64 = 30_000;
+    let exp_ms = base_ms.saturating_mul(1u64 << (attempt.saturating_sub(1)).min(6));
+    let bounded_ms = exp_ms.min(max_ms);
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_millis() as u64
+        % 500;
+    std::time::Duration::from_millis(bounded_ms + jitter_ms)
 }
 
 pub async fn start_webhook_server(
@@ -974,5 +1012,63 @@ mod tests {
             .try_recv()
             .expect("different delivery ID should produce a message");
         assert_eq!(msg2.thread_id, "200");
+    }
+
+    /// Verify that `is_transient_bind_error` correctly classifies EADDRINUSE.
+    #[test]
+    fn test_is_transient_bind_error_addr_in_use() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let err = anyhow::anyhow!(io_err);
+        assert!(is_transient_bind_error(&err));
+    }
+
+    /// Verify that non-bind errors are not classified as transient.
+    #[test]
+    fn test_is_transient_bind_error_other_error() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let err = anyhow::anyhow!(io_err);
+        assert!(!is_transient_bind_error(&err));
+    }
+
+    /// Verify that `webhook_backoff_delay` respects the 30 s cap.
+    #[test]
+    fn test_webhook_backoff_delay_cap() {
+        // At attempt 10 (well past the exponent cap) the base delay should be
+        // capped at 30 000 ms plus up to 499 ms of jitter.
+        let delay = webhook_backoff_delay(10);
+        assert!(
+            delay.as_millis() <= 30_500,
+            "delay exceeded 30 s cap + jitter: {:?}",
+            delay
+        );
+        assert!(
+            delay.as_millis() >= 500,
+            "delay should be at least base: {:?}",
+            delay
+        );
+    }
+
+    /// Integration test: a double-bind on the same `0.0.0.0` address fails
+    /// with EADDRINUSE, and `is_transient_bind_error` correctly classifies it.
+    ///
+    /// We test the bind step directly (not the full `start_webhook_server`)
+    /// because `axum::serve` runs until shutdown and would hang the test
+    /// suite if the first bind accidentally succeeded.
+    #[tokio::test]
+    async fn test_start_webhook_server_port_in_use() {
+        // Hold a listener on 0.0.0.0 (the same bind address used by start_webhook_server).
+        let holder = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = holder.local_addr().unwrap().port();
+
+        // A second bind on the same address+port must fail.
+        let result = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await;
+        drop(holder);
+
+        let io_err = result.expect_err("expected EADDRINUSE on duplicate bind");
+        let anyhow_err = anyhow::anyhow!(io_err);
+        assert!(
+            is_transient_bind_error(&anyhow_err),
+            "EADDRINUSE should be classified as transient: {anyhow_err}"
+        );
     }
 }

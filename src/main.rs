@@ -14,6 +14,7 @@ pub mod security;
 mod sidecar;
 mod template;
 mod tmux;
+mod webhook_status;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
@@ -219,6 +220,17 @@ enum Commands {
         /// Shell type
         shell: Shell,
     },
+    /// Webhook server management
+    Webhook {
+        #[command(subcommand)]
+        action: WebhookAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WebhookAction {
+    /// Show webhook server health status
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -624,6 +636,11 @@ async fn main() -> anyhow::Result<()> {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "orch", &mut std::io::stdout());
         }
+        Commands::Webhook { action } => match action {
+            WebhookAction::Status => {
+                cli::webhook::status()?;
+            }
+        },
     }
 
     Ok(())
