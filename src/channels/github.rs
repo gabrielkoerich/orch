@@ -15,6 +15,7 @@ use axum::{
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,6 +46,8 @@ pub struct DedupMetrics {
     pub duplicate_count: u64,
     /// Total new deliveries inserted since process start.
     pub inserted_count: u64,
+    /// Total entries evicted due to TTL or size cap.
+    pub evicted_count: u64,
 }
 
 struct DedupInner {
@@ -52,13 +55,14 @@ struct DedupInner {
     entries: HashMap<String, u64>,
     duplicate_count: u64,
     inserted_count: u64,
+    evicted_count: u64,
 }
 
 /// Deduplication store — hides the backing implementation behind a clean API.
 ///
 /// Two variants are supported:
 /// - **In-memory** (`new_in_memory`): default, fastest, state lost on restart.
-/// - **File-backed** (`new_filebacked`): persists to a JSON file so dedup state
+/// - **File-backed** (`new_filebacked`): persists to a file so dedup state
 ///   survives process restarts (prevents re-processing of GitHub retries after a
 ///   restart within the dedup window).
 #[derive(Clone)]
@@ -68,20 +72,33 @@ pub struct DedupStore {
     file_path: Option<PathBuf>,
     window_secs: u64,
     max_size: usize,
+    metrics_enabled: bool,
 }
 
 impl DedupStore {
     /// Create an in-memory dedup store with the given window and size cap.
+    #[cfg(test)]
     pub fn new_in_memory(window_secs: u64, max_size: usize) -> Self {
+        Self::new_in_memory_with_metrics(window_secs, max_size, true)
+    }
+
+    /// Create an in-memory dedup store with optional metrics.
+    pub fn new_in_memory_with_metrics(
+        window_secs: u64,
+        max_size: usize,
+        metrics_enabled: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(tokio::sync::Mutex::new(DedupInner {
                 entries: HashMap::new(),
                 duplicate_count: 0,
                 inserted_count: 0,
+                evicted_count: 0,
             })),
             file_path: None,
             window_secs,
             max_size,
+            metrics_enabled,
         }
     }
 
@@ -90,7 +107,18 @@ impl DedupStore {
     /// On construction the file is loaded (if it exists) and expired entries are
     /// filtered out. On each new insertion the state is flushed to disk so it
     /// survives process restarts within the dedup window.
+    #[cfg(test)]
     pub fn new_filebacked(path: PathBuf, window_secs: u64, max_size: usize) -> Self {
+        Self::new_filebacked_with_metrics(path, window_secs, max_size, true)
+    }
+
+    /// Create a file-backed dedup store with optional metrics.
+    pub fn new_filebacked_with_metrics(
+        path: PathBuf,
+        window_secs: u64,
+        max_size: usize,
+        metrics_enabled: bool,
+    ) -> Self {
         let entries = load_dedup_file(&path, window_secs);
         tracing::info!(
             path = %path.display(),
@@ -102,10 +130,12 @@ impl DedupStore {
                 entries,
                 duplicate_count: 0,
                 inserted_count: 0,
+                evicted_count: 0,
             })),
             file_path: Some(path),
             window_secs,
             max_size,
+            metrics_enabled,
         }
     }
 
@@ -123,16 +153,32 @@ impl DedupStore {
             let mut inner = self.inner.lock().await;
             // Evict time-expired entries first.
             let cutoff = now_secs.saturating_sub(self.window_secs);
-            inner.entries.retain(|_, ts| *ts > cutoff);
+            let mut expired = 0usize;
+            if self.metrics_enabled {
+                let before = inner.entries.len();
+                inner.entries.retain(|_, ts| *ts > cutoff);
+                expired = before.saturating_sub(inner.entries.len());
+            } else {
+                inner.entries.retain(|_, ts| *ts > cutoff);
+            }
 
             if inner.entries.contains_key(delivery_id) {
-                inner.duplicate_count += 1;
+                if self.metrics_enabled {
+                    inner.duplicate_count += 1;
+                    inner.evicted_count += expired as u64;
+                }
                 (false, None)
             } else {
                 inner.entries.insert(delivery_id.to_string(), now_secs);
-                inner.inserted_count += 1;
+                if self.metrics_enabled {
+                    inner.inserted_count += 1;
+                }
                 // Enforce size cap after insertion so the store never exceeds max_size.
-                enforce_size_cap(&mut inner.entries, self.max_size);
+                let evicted_size = enforce_size_cap(&mut inner.entries, self.max_size);
+                if self.metrics_enabled {
+                    inner.evicted_count += expired as u64;
+                    inner.evicted_count += evicted_size as u64;
+                }
                 // Snapshot for file flush only when file-backed.
                 let snap = self.file_path.is_some().then(|| inner.entries.clone());
                 (true, snap)
@@ -152,22 +198,41 @@ impl DedupStore {
         let inner = self.inner.lock().await;
         DedupMetrics {
             seen_count: inner.entries.len(),
-            duplicate_count: inner.duplicate_count,
-            inserted_count: inner.inserted_count,
+            duplicate_count: if self.metrics_enabled {
+                inner.duplicate_count
+            } else {
+                0
+            },
+            inserted_count: if self.metrics_enabled {
+                inner.inserted_count
+            } else {
+                0
+            },
+            evicted_count: if self.metrics_enabled {
+                inner.evicted_count
+            } else {
+                0
+            },
         }
+    }
+
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics_enabled
     }
 }
 
 /// Evict the oldest entries until the map is at most `max_size`.
-fn enforce_size_cap(entries: &mut HashMap<String, u64>, max_size: usize) {
-    if entries.len() > max_size {
-        let mut sorted: Vec<(String, u64)> = entries.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        sorted.sort_by_key(|(_, t)| *t);
-        let overflow = sorted.len().saturating_sub(max_size);
-        for (key, _) in sorted.into_iter().take(overflow) {
-            entries.remove(&key);
-        }
+fn enforce_size_cap(entries: &mut HashMap<String, u64>, max_size: usize) -> usize {
+    if entries.len() <= max_size {
+        return 0;
     }
+    let mut sorted: Vec<(String, u64)> = entries.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    sorted.sort_by_key(|(_, t)| *t);
+    let overflow = sorted.len().saturating_sub(max_size);
+    for (key, _) in sorted.into_iter().take(overflow) {
+        entries.remove(&key);
+    }
+    overflow
 }
 
 /// Evict expired entries and enforce the size cap (oldest evicted first).
@@ -220,7 +285,7 @@ fn flush_dedup_file(path: &Path, entries: &HashMap<String, u64>) {
 
     match serde_json::to_string(&FileFormat { entries }) {
         Ok(content) => {
-            if let Err(e) = std::fs::write(path, content) {
+            if let Err(e) = atomic_write(path, &content) {
                 tracing::warn!(?e, path = %path.display(), "failed to flush webhook dedup state");
             }
         }
@@ -228,6 +293,24 @@ fn flush_dedup_file(path: &Path, entries: &HashMap<String, u64>) {
             tracing::warn!(?e, "failed to serialize webhook dedup state");
         }
     }
+}
+
+fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = path.with_extension(format!("db.tmp.{}", std::process::id()));
+    let mut file = std::fs::File::create(&tmp_path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp_path, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +510,17 @@ async fn handle_webhook(
         .to_string();
 
     if !delivery_id.is_empty() && !state.dedup_store.check_and_insert(&delivery_id).await {
-        tracing::debug!(delivery_id = %delivery_id, "duplicate webhook delivery, skipping");
+        if state.dedup_store.metrics_enabled() {
+            let metrics = state.dedup_store.metrics().await;
+            tracing::debug!(
+                delivery_id = %delivery_id,
+                seen_count = metrics.seen_count,
+                duplicate_count = metrics.duplicate_count,
+                "duplicate webhook delivery, skipping"
+            );
+        } else {
+            tracing::debug!(delivery_id = %delivery_id, "duplicate webhook delivery, skipping");
+        }
         return (StatusCode::OK, "OK");
     }
 
@@ -453,16 +546,14 @@ async fn handle_webhook(
     (StatusCode::OK, "OK")
 }
 
-/// Health endpoint — returns JSON with dedup store metrics.
+/// Health endpoint — returns JSON with dedup store status.
 ///
-/// Response: `{"ok": true, "seen_count": N, "duplicate_count": N, "inserted_count": N}`
+/// Response: `{"ok": true, "seen_count": N}`
 async fn webhook_health(State(state): State<WebhookState>) -> impl IntoResponse {
     let metrics = state.dedup_store.metrics().await;
     axum::Json(serde_json::json!({
         "ok": true,
-        "seen_count": metrics.seen_count,
-        "duplicate_count": metrics.duplicate_count,
-        "inserted_count": metrics.inserted_count,
+        "seen_count": metrics.seen_count
     }))
 }
 
@@ -543,6 +634,16 @@ pub fn webhook_backoff_delay(attempt: u32) -> std::time::Duration {
         % 500;
     std::time::Duration::from_millis(bounded_ms + jitter_ms)
 }
+
+/// Start the webhook HTTP server.
+///
+/// Dedup configuration is read from the global config:
+/// - `webhook.dedup_window_seconds` (default: 7200)
+/// - `webhook.max_seen_deliveries` (default: 50000)
+/// - `webhook.dedup_store`: `"memory"` (default) or `"file"` — file-backed
+///   variant persists dedup state across restarts to `{data_dir}/webhook_dedup.db`.
+/// - `webhook.dedup_path`: override the file-backed path (optional).
+/// - `webhook.dedup_metrics`: `"true"` (default) to enable metrics; `"false"` to disable.
 pub async fn start_webhook_server(
     port: u16,
     secret: String,
@@ -564,13 +665,22 @@ pub async fn start_webhook_server(
     let store_type =
         crate::config::get("webhook.dedup_store").unwrap_or_else(|_| "memory".to_string());
 
+    let metrics_enabled = crate::config::get("webhook.dedup_metrics")
+        .map(|v| v == "true")
+        .unwrap_or(true);
+
     let dedup_store = if store_type == "file" {
-        let path = crate::home::orch_home()
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-            .join("webhook_dedup.json");
-        DedupStore::new_filebacked(path, window_secs, max_size)
+        let path = crate::config::get("webhook.dedup_path")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                crate::home::orch_home()
+                    .unwrap_or_else(|_| PathBuf::from("/tmp"))
+                    .join("webhook_dedup.db")
+            });
+        DedupStore::new_filebacked_with_metrics(path, window_secs, max_size, metrics_enabled)
     } else {
-        DedupStore::new_in_memory(window_secs, max_size)
+        DedupStore::new_in_memory_with_metrics(window_secs, max_size, metrics_enabled)
     };
 
     tracing::info!(
@@ -578,6 +688,7 @@ pub async fn start_webhook_server(
         dedup_store = %store_type,
         dedup_window_secs = window_secs,
         max_seen_deliveries = max_size,
+        dedup_metrics = metrics_enabled,
         "starting webhook server"
     );
 
@@ -907,6 +1018,12 @@ mod tests {
     // DedupStore unit tests
     // ---------------------------------------------------------------------------
 
+    #[test]
+    fn test_dedup_store_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DedupStore>();
+    }
+
     #[tokio::test]
     async fn test_dedup_store_new_entry_is_accepted() {
         let store = DedupStore::new_in_memory(7200, 50_000);
@@ -1003,6 +1120,7 @@ mod tests {
             entries: HashMap::new(),
             duplicate_count: 0,
             inserted_count: 0,
+            evicted_count: 0,
         };
         // Use a real-world-scale timestamp so subtracting offsets doesn't underflow.
         let now_secs: u64 = 1_700_000_000;
@@ -1369,7 +1487,7 @@ mod tests {
         assert_eq!(m.duplicate_count, 1, "still one duplicate");
     }
 
-    /// Health endpoint test: verify it returns JSON with dedup metrics.
+    /// Health endpoint test: verify it returns JSON with dedup status.
     #[tokio::test]
     async fn test_health_endpoint_returns_json_metrics() {
         use axum::body::Body;
@@ -1410,8 +1528,6 @@ mod tests {
 
         assert_eq!(json["ok"], true);
         assert_eq!(json["seen_count"], 1);
-        assert_eq!(json["inserted_count"], 1);
-        assert_eq!(json["duplicate_count"], 1);
     }
 
     /// Verify that `is_transient_bind_error` correctly classifies EADDRINUSE.
