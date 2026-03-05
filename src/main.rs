@@ -432,7 +432,8 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Serve => {
-            tracing::info!(version = env!("ORCH_VERSION"), "starting orch serve");
+            let _span = tracing::info_span!("orch", version = env!("ORCH_VERSION")).entered();
+            tracing::info!("starting orch serve");
             engine::serve().await?;
         }
         Commands::Version => {
