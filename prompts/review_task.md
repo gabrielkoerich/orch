@@ -27,11 +27,21 @@ If ANY check fails, try to fix it yourself:
 
 Commit your fixes, push, and re-run checks. If you cannot fix a failure, decision = `request_changes`.
 
-### Step 3: Review the code
+### Step 3: Check architecture alignment
+
+Before reviewing the diff, read any project spec or plan (`PLAN.md`, `SPEC.md`, `ARCHITECTURE.md`, `docs/`) and `AGENTS.md`/`CLAUDE.md` if present.
+
+Flag `request_changes` if the PR:
+- Conflicts with settled decisions documented in `AGENTS.md`/`CLAUDE.md`
+- Reimplements something the plan says is already done or intentionally out of scope
+- Solves a problem that was deliberately designed to work a specific way
+
+### Step 4: Review the code
 
 1. **Requirements met** — does the code satisfy the task description?
-2. **Code quality** — no obvious bugs, security issues, or regressions
-3. **Completeness** — all files committed, no TODOs left behind
+2. **Scope** — is it doing only what was asked? Reject unnecessary refactors or scope creep.
+3. **Code quality** — no obvious bugs, security issues, or regressions
+4. **Completeness** — all files committed, no TODOs left behind
 
 ### Task Description
 {{TASK_BODY}}
