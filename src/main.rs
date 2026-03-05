@@ -109,6 +109,31 @@ fn load_private_env() {
     }
 }
 
+/// Resolve GitHub token at startup and set GH_TOKEN if not already present.
+///
+/// This ensures the token is available to all child processes (agent runners,
+/// router) even when running as a launchd service where GH_TOKEN isn't in the
+/// environment and `gh auth token` may take time to resolve lazily.
+///
+/// Resolution order: GH_TOKEN → GITHUB_TOKEN → gh auth token CLI
+fn resolve_gh_token() {
+    if std::env::var("GH_TOKEN").is_ok() || std::env::var("GITHUB_TOKEN").is_ok() {
+        return;
+    }
+    // Try gh auth token CLI
+    if let Ok(output) = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+    {
+        if output.status.success() {
+            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !token.is_empty() {
+                std::env::set_var("GH_TOKEN", &token);
+            }
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "orch", version = env!("ORCH_VERSION"), about = "Orch — The Agent Orchestrator")]
 struct Cli {
@@ -421,6 +446,7 @@ async fn main() -> anyhow::Result<()> {
     // This makes tokens (KIMI_API_KEY, etc.) available to all child processes
     // (router, agents) without requiring the shell to source the file first.
     load_private_env();
+    resolve_gh_token();
 
     tracing_subscriber::fmt()
         .with_env_filter(
