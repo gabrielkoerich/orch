@@ -37,6 +37,7 @@ use crate::db::Db;
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{rate_limit_metrics, GhHttp};
+use crate::github::token;
 use crate::sidecar::REPO_CONTEXT;
 use crate::tmux::TmuxManager;
 use runner::WeightSignal;
@@ -250,6 +251,45 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     }
 
     Ok(engines)
+}
+
+async fn auth_available_for_webhook() -> Result<bool, String> {
+    tokio::task::spawn_blocking(|| token::shared().is_auth_available())
+        .await
+        .map_err(|e| format!("auth probe task failed: {e}"))?
+}
+
+async fn enforce_webhook_auth_gate(webhook_enabled: bool) -> bool {
+    if !webhook_enabled {
+        return false;
+    }
+
+    match auth_available_for_webhook().await {
+        Ok(true) => true,
+        Ok(false) => {
+            let metrics = token::gh_fallback_metrics();
+            tracing::warn!(
+                gh_fallback_attempts = metrics.attempts,
+                gh_fallback_successes = metrics.successes,
+                gh_fallback_failures = metrics.failures,
+                "GitHub auth unavailable; disabling webhook and using polling fallback mode. \
+                 Configure GH_TOKEN/GITHUB_TOKEN, gh.auth.token, or run `gh auth login`."
+            );
+            false
+        }
+        Err(e) => {
+            let metrics = token::gh_fallback_metrics();
+            tracing::warn!(
+                error = %e,
+                gh_fallback_attempts = metrics.attempts,
+                gh_fallback_successes = metrics.successes,
+                gh_fallback_failures = metrics.failures,
+                "GitHub auth probe failed; disabling webhook and using polling fallback mode. \
+                 Configure GH_TOKEN/GITHUB_TOKEN, gh.auth.token, or run `gh auth login`."
+            );
+            false
+        }
+    }
 }
 
 /// Start the orchestrator service.
@@ -484,9 +524,11 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut webhook_healthy: bool;
     let mut last_webhook_health_check = std::time::Instant::now();
     // Start webhook server if configured
-    let webhook_enabled = crate::config::get("webhook.enabled")
+    let mut webhook_enabled = crate::config::get("webhook.enabled")
         .map(|v| v == "true")
         .unwrap_or(false);
+
+    webhook_enabled = enforce_webhook_auth_gate(webhook_enabled).await;
 
     if webhook_enabled {
         let port: u16 = crate::config::get("webhook.port")
@@ -887,6 +929,36 @@ pub async fn serve() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use once_cell::sync::Lazy;
+    use std::env;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct BufferGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferWriter {
+        type Writer = BufferGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufferGuard(self.0.clone())
+        }
+    }
+
+    impl Write for BufferGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut locked = self.0.lock().unwrap();
+            locked.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn engine_config_defaults() {
@@ -928,5 +1000,40 @@ mod tests {
             "no_session_stuck_timeout ({}) exceeds 15 minutes",
             config.no_session_stuck_timeout
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn webhook_auth_gate_disables_webhook_when_gh_missing() {
+        {
+            let _guard = ENV_LOCK.lock().unwrap();
+            env::remove_var("GH_TOKEN");
+            env::remove_var("GITHUB_TOKEN");
+            env::set_var("ORCH_GH_CLI_CANDIDATES", "/nonexistent/orch-gh");
+        }
+
+        let resolver = token::shared();
+        resolver.clear_cache().await;
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufferWriter(buffer.clone()))
+            .with_ansi(false)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let enabled = enforce_webhook_auth_gate(true).await;
+        assert!(!enabled);
+
+        let metrics = token::gh_fallback_metrics();
+        assert!(metrics.attempts >= 1);
+        assert!(metrics.failures >= 1);
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("polling fallback mode"));
+
+        {
+            let _guard = ENV_LOCK.lock().unwrap();
+            env::remove_var("ORCH_GH_CLI_CANDIDATES");
+        }
     }
 }

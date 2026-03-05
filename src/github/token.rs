@@ -16,7 +16,12 @@
 
 use anyhow::Context;
 use std::env;
+use std::fmt;
+use std::io::Read;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
@@ -102,6 +107,96 @@ pub struct TokenResolver {
     /// Cached token with expiration tracking.
     cached: Arc<RwLock<Option<CachedToken>>>,
 }
+
+#[derive(Debug, Clone)]
+pub struct GhFallbackMetrics {
+    pub attempts: u64,
+    pub successes: u64,
+    pub failures: u64,
+}
+
+static GH_FALLBACK_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static GH_FALLBACK_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static GH_FALLBACK_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+pub fn gh_fallback_metrics() -> GhFallbackMetrics {
+    GhFallbackMetrics {
+        attempts: GH_FALLBACK_ATTEMPTS.load(Ordering::Relaxed),
+        successes: GH_FALLBACK_SUCCESSES.load(Ordering::Relaxed),
+        failures: GH_FALLBACK_FAILURES.load(Ordering::Relaxed),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TokenCliError {
+    NotFound { attempted: Vec<String> },
+    Timeout { gh_path: String, timeout: Duration },
+    CommandFailed { gh_path: String, stderr: String },
+    EmptyOutput { gh_path: String },
+    SpawnFailed { gh_path: String, error: String },
+}
+
+impl fmt::Display for TokenCliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenCliError::NotFound { attempted } => {
+                write!(
+                    f,
+                    "gh CLI not found at any of the expected locations: {}. \
+                     Install gh (https://cli.github.com/) or set GH_TOKEN/GITHUB_TOKEN, \
+                     or configure gh.auth.token in ~/.orch/config.yml. \
+                     For launchd, ensure PATH includes /opt/homebrew/bin or /usr/local/bin.",
+                    attempted.join(", ")
+                )
+            }
+            TokenCliError::Timeout { gh_path, timeout } => {
+                write!(
+                    f,
+                    "gh auth token timed out after {}s using {}. \
+                     Verify gh is responsive with `gh auth status`, or set GH_TOKEN/GITHUB_TOKEN.",
+                    timeout.as_secs(),
+                    gh_path
+                )
+            }
+            TokenCliError::CommandFailed { gh_path, stderr } => {
+                let stderr = stderr.trim();
+                if stderr.is_empty() {
+                    write!(
+                        f,
+                        "gh auth token failed using {} with no stderr output. \
+                         Run `gh auth status` and `gh auth login`, or set GH_TOKEN/GITHUB_TOKEN.",
+                        gh_path
+                    )
+                } else {
+                    write!(
+                        f,
+                        "gh auth token failed using {}: {}. \
+                         Run `gh auth login` or set GH_TOKEN/GITHUB_TOKEN.",
+                        gh_path, stderr
+                    )
+                }
+            }
+            TokenCliError::EmptyOutput { gh_path } => {
+                write!(
+                    f,
+                    "gh auth token returned empty output using {}. \
+                     Run `gh auth login` or set GH_TOKEN/GITHUB_TOKEN.",
+                    gh_path
+                )
+            }
+            TokenCliError::SpawnFailed { gh_path, error } => {
+                write!(
+                    f,
+                    "Failed to execute gh CLI at {}: {}. \
+                     Ensure gh is installed and executable, or set GH_TOKEN/GITHUB_TOKEN.",
+                    gh_path, error
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TokenCliError {}
 
 impl TokenResolver {
     /// Create a new TokenResolver with the specified mode.
@@ -189,6 +284,29 @@ impl TokenResolver {
         Ok(token)
     }
 
+    /// Fast health probe for GitHub authentication availability.
+    ///
+    /// Returns Ok(true) when a token is available or can be resolved,
+    /// Ok(false) when fallback is disabled and no token is configured,
+    /// Err with actionable context when gh CLI fails or is missing.
+    pub fn is_auth_available(&self) -> Result<bool, String> {
+        if let Some(token) = Self::resolve_env_token() {
+            if !token.is_empty() {
+                return Ok(true);
+            }
+        }
+
+        if !self.allow_gh_fallback {
+            return Ok(false);
+        }
+
+        match Self::resolve_gh_cli_token() {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Get token synchronously (for contexts where async is not available).
     ///
     /// Works for Env mode (env vars, config, and gh CLI fallback).
@@ -203,7 +321,7 @@ impl TokenResolver {
                 }
                 // gh CLI fallback
                 if self.allow_gh_fallback {
-                    return Self::resolve_gh_cli_token();
+                    return Self::resolve_gh_cli_token().map_err(anyhow::Error::from);
                 }
                 Ok(None)
             }
@@ -251,7 +369,7 @@ impl TokenResolver {
         // gh CLI fallback — the default when nothing else is configured
         if self.allow_gh_fallback {
             tracing::debug!("No token in env/config — trying gh auth token CLI");
-            return Self::resolve_gh_cli_token();
+            return Self::resolve_gh_cli_token().map_err(anyhow::Error::from);
         }
 
         Ok(None)
@@ -287,46 +405,71 @@ impl TokenResolver {
     }
 
     /// Resolve token using `gh auth token` CLI.
-    fn resolve_gh_cli_token() -> anyhow::Result<Option<String>> {
+    fn resolve_gh_cli_token() -> Result<Option<String>, TokenCliError> {
         tracing::debug!("Attempting to resolve GitHub token via gh CLI");
+        GH_FALLBACK_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
 
-        // Try gh in PATH first
-        if let Some(token) = Self::try_gh_command("gh")? {
-            return Ok(Some(token));
-        }
+        let candidates = gh_candidate_paths();
+        let mut attempted = Vec::new();
 
-        // Try common gh install paths for launchd/Homebrew environments
-        for path in &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
-            if let Some(token) = Self::try_gh_command(path)? {
-                return Ok(Some(token));
+        for path in candidates {
+            attempted.push(path.clone());
+            match Self::try_gh_command(&path) {
+                Ok(Some(token)) => {
+                    GH_FALLBACK_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(gh_path = %path, "Resolved GitHub token via gh CLI");
+                    return Ok(Some(token));
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    GH_FALLBACK_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(gh_path = %path, error = %e, "gh auth token failed");
+                    return Err(e);
+                }
             }
         }
 
-        Ok(None)
+        GH_FALLBACK_FAILURES.fetch_add(1, Ordering::Relaxed);
+        Err(TokenCliError::NotFound { attempted })
     }
 
     /// Try to get token from a specific gh binary path.
-    fn try_gh_command(gh_path: &str) -> anyhow::Result<Option<String>> {
-        match std::process::Command::new(gh_path)
+    fn try_gh_command(gh_path: &str) -> Result<Option<String>, TokenCliError> {
+        let mut child = match Command::new(gh_path)
             .args(["auth", "token"])
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
         {
-            Ok(out) if out.status.success() => {
-                let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !token.is_empty() {
-                    tracing::debug!(gh_path, "Resolved GitHub token via gh CLI");
-                    return Ok(Some(token));
-                }
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                tracing::debug!(gh_path, %stderr, "gh auth token failed");
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
             }
             Err(e) => {
-                tracing::debug!(gh_path, error = %e, "Failed to execute gh command");
+                return Err(TokenCliError::SpawnFailed {
+                    gh_path: gh_path.to_string(),
+                    error: e.to_string(),
+                });
             }
+        };
+
+        let output = wait_with_timeout(&mut child, gh_path, Duration::from_secs(3))?;
+
+        if output.status.success() {
+            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !token.is_empty() {
+                return Ok(Some(token));
+            }
+            return Err(TokenCliError::EmptyOutput {
+                gh_path: gh_path.to_string(),
+            });
         }
-        Ok(None)
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Err(TokenCliError::CommandFailed {
+            gh_path: gh_path.to_string(),
+            stderr,
+        })
     }
 
     /// Resolve token for GitHub App (JWT-based).
@@ -368,6 +511,69 @@ impl TokenResolver {
             }
             // Env tokens don't expire (managed externally)
             _ => None,
+        }
+    }
+}
+
+fn gh_candidate_paths() -> Vec<String> {
+    if let Ok(custom) = env::var("ORCH_GH_CLI_CANDIDATES") {
+        let paths: Vec<String> = custom
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+
+    vec![
+        "gh".to_string(),
+        "/opt/homebrew/bin/gh".to_string(),
+        "/usr/local/bin/gh".to_string(),
+    ]
+}
+
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    gh_path: &str,
+    timeout: Duration,
+) -> Result<Output, TokenCliError> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_end(&mut stderr);
+                }
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(TokenCliError::Timeout {
+                        gh_path: gh_path.to_string(),
+                        timeout,
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(TokenCliError::SpawnFailed {
+                    gh_path: gh_path.to_string(),
+                    error: e.to_string(),
+                });
+            }
         }
     }
 }
@@ -458,8 +664,20 @@ mod tests {
     use super::*;
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
+    use tempfile::tempdir;
 
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    #[cfg(unix)]
+    fn write_gh_script(dir: &std::path::Path, contents: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("gh");
+        std::fs::write(&path, contents).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
 
     #[test]
     fn token_mode_from_config_env() {
@@ -681,5 +899,43 @@ mod tests {
 
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
+    }
+
+    #[test]
+    fn try_gh_command_missing_gh_returns_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let missing = "/nonexistent/orch-gh";
+        let result = TokenResolver::try_gh_command(missing);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_gh_command_unauthenticated_returns_error_with_stderr() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let gh_path = write_gh_script(
+            dir.path(),
+            "#!/bin/sh\necho \"not logged in\" 1>&2\nexit 1\n",
+        );
+
+        let result = TokenResolver::try_gh_command(gh_path.to_str().unwrap());
+        match result {
+            Err(TokenCliError::CommandFailed { stderr, .. }) => {
+                assert!(stderr.contains("not logged in"));
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_gh_command_authenticated_returns_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let gh_path = write_gh_script(dir.path(), "#!/bin/sh\necho \"token-123\"\n");
+
+        let result = TokenResolver::try_gh_command(gh_path.to_str().unwrap());
+        assert_eq!(result.unwrap(), Some("token-123".to_string()));
     }
 }
