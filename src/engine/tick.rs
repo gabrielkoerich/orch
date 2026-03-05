@@ -408,8 +408,9 @@ pub(crate) async fn tick_dispatch_tasks(
                     // For internal tasks: update DB status and skip GitHub-specific ops.
                     if is_internal_id(&task_id) {
                         let final_status = match display_status {
-                            "new" => Status::New, // rate-limited → retry
-                            _ => Status::Done,    // all completions → done
+                            "done" => Status::Done,
+                            "new" => Status::New,
+                            _ => Status::NeedsReview,
                         };
                         if let Err(e) = task_manager_for_spawn
                             .update_task_status(&ExternalId(task_id.clone()), final_status)
