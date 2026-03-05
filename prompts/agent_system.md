@@ -62,7 +62,7 @@ Everything outside your current working directory is **read-only**. Never `cd ..
      - A bullet list of key changes organized by area (e.g., "### Changes")
      - Which files were modified and what each change does
      - Any important design decisions or trade-offs
-   - **Do NOT** include `Closes #<issue>` or any issue references — the issue is already linked to the branch via `gh issue develop`.
+   - **Do NOT** include `Closes #<issue>` or keyword issue references — the orchestrator links the branch to the issue via the GitHub API.
 
 Do NOT skip any of these steps. If you only make changes without committing and pushing, your work will be lost.
 

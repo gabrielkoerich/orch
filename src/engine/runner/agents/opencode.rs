@@ -237,8 +237,11 @@ impl AgentRunner for OpenCodeRunner {
             String::new()
         };
 
+        // When overriding XDG_CONFIG_HOME to isolate opencode's config, gh CLI
+        // would also look in the override directory and fail to authenticate.
+        // GH_CONFIG_DIR pins gh to its actual config regardless of XDG_CONFIG_HOME.
         let xdg_prefix = if permissions.autonomous {
-            "XDG_CONFIG_HOME=.orch-opencode "
+            "XDG_CONFIG_HOME=.orch-opencode GH_CONFIG_DIR=$HOME/.config/gh "
         } else {
             ""
         };
@@ -632,6 +635,10 @@ mod tests {
         assert!(
             cmd.contains("XDG_CONFIG_HOME=.orch-opencode"),
             "expected XDG_CONFIG_HOME override, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("GH_CONFIG_DIR=$HOME/.config/gh"),
+            "expected GH_CONFIG_DIR to preserve gh auth, got: {cmd}"
         );
     }
 

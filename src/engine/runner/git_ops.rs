@@ -285,6 +285,13 @@ pub async fn create_pr_if_needed(
     match gh.get_pr_number(repo, branch).await {
         Ok(Some(pr_number)) => {
             tracing::info!(task_id, pr = pr_number, "PR already exists");
+            // Append attribution footer if the agent created the PR without one.
+            append_pr_footer_if_missing(&gh, repo, pr_number, task_id, agent, model).await;
+            // Link the issue to the branch — the agent may have created the PR
+            // via CLI, bypassing the orchestrator's link step.
+            if let Err(e) = link_issue_to_branch(repo, task_id, branch).await {
+                tracing::warn!(task_id, error = %e, "failed to link issue to branch (non-fatal)");
+            }
             return Ok(None);
         }
         Ok(None) => {
@@ -346,6 +353,53 @@ pub async fn create_pr_if_needed(
     }
 
     Ok(Some(url))
+}
+
+/// Append the Orch attribution footer to an existing PR body if not already present.
+///
+/// Called when the agent created the PR directly (bypassing the orchestrator's
+/// `create_pr_if_needed`), so the footer was never added by `build_pr_body`.
+async fn append_pr_footer_if_missing(
+    gh: &GhHttp,
+    repo: &str,
+    pr_number: u64,
+    task_id: &str,
+    agent: &str,
+    model: Option<&str>,
+) {
+    // Only run for numeric task IDs (GitHub issues)
+    if task_id.parse::<u64>().is_err() {
+        return;
+    }
+
+    let pr = match gh.get_pr(repo, pr_number).await {
+        Ok(pr) => pr,
+        Err(e) => {
+            tracing::debug!(task_id, error = %e, "failed to fetch PR for footer check");
+            return;
+        }
+    };
+
+    let body = pr.body.unwrap_or_default();
+    if body.contains("via [Orch]") {
+        return; // Footer already present
+    }
+
+    let model_str = model.map(|m| format!(" using `{m}`")).unwrap_or_default();
+    let footer = format!(
+        "\n\n---\n*Task #{task_id} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
+    );
+    let new_body = format!("{body}{footer}");
+
+    if let Err(e) = gh.update_pr_body(repo, pr_number, &new_body).await {
+        tracing::warn!(task_id, error = %e, "failed to append footer to PR (non-fatal)");
+    } else {
+        tracing::info!(
+            task_id,
+            pr = pr_number,
+            "appended attribution footer to agent-created PR"
+        );
+    }
 }
 
 /// Link an issue to a branch using the GitHub GraphQL API.

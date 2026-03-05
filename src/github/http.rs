@@ -1008,6 +1008,19 @@ impl GhHttp {
         .await
     }
 
+    /// Update the body of a pull request.
+    pub async fn update_pr_body(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}");
+        let payload = serde_json::json!({ "body": body });
+        self.patch_json_raw(&url, &payload).await?;
+        Ok(())
+    }
+
     /// Close a GitHub issue.
     pub async fn close_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
         let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}");
