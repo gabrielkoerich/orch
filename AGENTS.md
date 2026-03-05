@@ -338,15 +338,15 @@ See [specs.md](specs.md) for architecture overview, what's working, what's not, 
 Always run these before committing — CI enforces them and will fail otherwise:
 
 ```bash
-cargo fmt -- --check        # formatting
-cargo clippy -- -D warnings # lints (warnings are errors)
-cargo test                  # unit tests
+cargo fmt -- --check                    # formatting
+cargo clippy --all-targets -- -D warnings # lints (warnings are errors, incl. test code)
+cargo test                              # unit tests
 ```
 
 Or all at once:
 
 ```bash
-cargo fmt && cargo clippy -- -D warnings && cargo test
+cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
 ## Release pipeline
