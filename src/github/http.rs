@@ -13,7 +13,6 @@ use super::token;
 use super::types::{
     GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview, GitHubReviewComment,
 };
-use anyhow::Context;
 use reqwest::{header, Client, Response, StatusCode};
 use serde::Serialize;
 use std::sync::{
@@ -669,100 +668,6 @@ impl GhHttp {
                 Err(e)
             }
         }
-    }
-
-    /// Verify authentication using a specific resolver.
-    ///
-    /// This performs a health check without requiring a GhHttp instance.
-    #[allow(dead_code)]
-    pub async fn check_auth_with_resolver(
-        resolver: &dyn crate::github::auth::TokenResolver,
-    ) -> anyhow::Result<()> {
-        // First, do a basic health check
-        resolver.health_check()?;
-
-        // Then verify the token actually works by making an API call
-        let token = resolver.resolve_token().await?;
-        let client = Client::builder()
-            .user_agent("orch/0.1 (reqwest)")
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build reqwest client");
-
-        let resp = client
-            .get(format!("{GITHUB_API}/user"))
-            .header(header::AUTHORIZATION, format!("Bearer {}", token))
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .context("failed to connect to GitHub API")?;
-
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(());
-        }
-
-        let body = resp.text().await.unwrap_or_default();
-
-        if status == StatusCode::UNAUTHORIZED {
-            anyhow::bail!(
-                "GitHub authentication failed: Invalid or expired token ({}). \
-                 Token source: {}. \
-                 Check your GH_TOKEN/GITHUB_TOKEN environment variables, \
-                 or gh.auth configuration in ~/.orch/config.yml.",
-                body,
-                resolver.auth_method()
-            );
-        }
-
-        anyhow::bail!("GitHub API auth check failed ({}): {}", status, body)
-    }
-
-    /// Async version of auth check using an async resolver.
-    #[allow(dead_code)]
-    pub async fn check_auth_with_async_resolver(
-        resolver: &dyn crate::github::auth::AsyncTokenResolver,
-    ) -> anyhow::Result<()> {
-        // First, do an async health check
-        resolver.health_check().await?;
-
-        // Then verify the token actually works by making an API call
-        let token = resolver.resolve_token().await?;
-        let client = Client::builder()
-            .user_agent("orch/0.1 (reqwest)")
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build reqwest client");
-
-        let resp = client
-            .get(format!("{GITHUB_API}/user"))
-            .header(header::AUTHORIZATION, format!("Bearer {}", token))
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .context("failed to connect to GitHub API")?;
-
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(());
-        }
-
-        let body = resp.text().await.unwrap_or_default();
-
-        if status == StatusCode::UNAUTHORIZED {
-            anyhow::bail!(
-                "GitHub authentication failed: Invalid or expired token ({}). \n\
-                 Token source: {}. \n\
-                 Check your GH_TOKEN/GITHUB_TOKEN environment variables, \n\
-                 or gh.auth configuration in ~/.orch/config.yml.",
-                body,
-                resolver.auth_method()
-            );
-        }
-
-        anyhow::bail!("GitHub API auth check failed ({}): {}", status, body)
     }
 
     /// Create a GitHub issue.
