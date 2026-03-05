@@ -219,6 +219,17 @@ enum Commands {
         /// Shell type
         shell: Shell,
     },
+    /// GitHub authentication management
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Check GitHub token resolution and authentication status
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -624,6 +635,11 @@ async fn main() -> anyhow::Result<()> {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "orch", &mut std::io::stdout());
         }
+        Commands::Auth { action } => match action {
+            AuthAction::Check => {
+                cli::auth_check().await?;
+            }
+        },
     }
 
     Ok(())

@@ -202,10 +202,14 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
                 || err_str.contains("No GitHub token")
             {
                 auth_failures += 1;
-                tracing::warn!(
+                tracing::error!(
                     repo = %repo,
                     error = %e,
-                    "GitHub auth failed for {repo} — run `gh auth login`"
+                    "GitHub auth failed for {repo}. \
+                    To fix: (1) run `gh auth login`, \
+                    (2) set GH_TOKEN env var, \
+                    or (3) add gh.auth.token to ~/.orch/config.yml. \
+                    Run `orch auth check` to diagnose."
                 );
             } else {
                 network_failures += 1;
@@ -239,7 +243,11 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
 
     if engines.is_empty() {
         if auth_failures > 0 && network_failures == 0 {
-            anyhow::bail!("GitHub auth failed for all projects — run `gh auth login`");
+            anyhow::bail!(
+                "GitHub auth failed for all projects. \
+                Run `orch auth check` for diagnosis, \
+                then `gh auth login` or set GH_TOKEN."
+            );
         } else if network_failures > 0 && auth_failures == 0 {
             anyhow::bail!("GitHub unreachable for all projects — check network connectivity");
         } else {

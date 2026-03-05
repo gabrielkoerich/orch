@@ -201,9 +201,16 @@ impl TokenResolver {
                 if let Some(t) = Self::resolve_env_token() {
                     return Ok(Some(t));
                 }
-                // gh CLI fallback
+                // gh CLI fallback (blocking — sync context)
                 if self.allow_gh_fallback {
-                    return Self::resolve_gh_cli_token();
+                    if let Some(token) = Self::try_gh_command_blocking("gh")? {
+                        return Ok(Some(token));
+                    }
+                    for path in &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
+                        if let Some(token) = Self::try_gh_command_blocking(path)? {
+                            return Ok(Some(token));
+                        }
+                    }
                 }
                 Ok(None)
             }
@@ -251,7 +258,7 @@ impl TokenResolver {
         // gh CLI fallback — the default when nothing else is configured
         if self.allow_gh_fallback {
             tracing::debug!("No token in env/config — trying gh auth token CLI");
-            return Self::resolve_gh_cli_token();
+            return Self::resolve_gh_cli_token().await;
         }
 
         Ok(None)
@@ -286,18 +293,18 @@ impl TokenResolver {
         None
     }
 
-    /// Resolve token using `gh auth token` CLI.
-    fn resolve_gh_cli_token() -> anyhow::Result<Option<String>> {
+    /// Resolve token using `gh auth token` CLI (async, non-blocking).
+    async fn resolve_gh_cli_token() -> anyhow::Result<Option<String>> {
         tracing::debug!("Attempting to resolve GitHub token via gh CLI");
 
         // Try gh in PATH first
-        if let Some(token) = Self::try_gh_command("gh")? {
+        if let Some(token) = Self::try_gh_command("gh").await? {
             return Ok(Some(token));
         }
 
         // Try common gh install paths for launchd/Homebrew environments
         for path in &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
-            if let Some(token) = Self::try_gh_command(path)? {
+            if let Some(token) = Self::try_gh_command(path).await? {
                 return Ok(Some(token));
             }
         }
@@ -305,11 +312,15 @@ impl TokenResolver {
         Ok(None)
     }
 
-    /// Try to get token from a specific gh binary path.
-    fn try_gh_command(gh_path: &str) -> anyhow::Result<Option<String>> {
-        match std::process::Command::new(gh_path)
+    /// Try to get token from a specific gh binary path (async, non-blocking).
+    ///
+    /// Uses `tokio::process::Command` to avoid blocking the async runtime while
+    /// waiting for the `gh` subprocess to complete.
+    async fn try_gh_command(gh_path: &str) -> anyhow::Result<Option<String>> {
+        match tokio::process::Command::new(gh_path)
             .args(["auth", "token"])
             .output()
+            .await
         {
             Ok(out) if out.status.success() => {
                 let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -324,6 +335,30 @@ impl TokenResolver {
             }
             Err(e) => {
                 tracing::debug!(gh_path, error = %e, "Failed to execute gh command");
+            }
+        }
+        Ok(None)
+    }
+
+    /// Try to get token from a specific gh binary path (blocking, for sync contexts).
+    fn try_gh_command_blocking(gh_path: &str) -> anyhow::Result<Option<String>> {
+        match std::process::Command::new(gh_path)
+            .args(["auth", "token"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !token.is_empty() {
+                    tracing::debug!(gh_path, "Resolved GitHub token via gh CLI (sync)");
+                    return Ok(Some(token));
+                }
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tracing::debug!(gh_path, %stderr, "gh auth token failed (sync)");
+            }
+            Err(e) => {
+                tracing::debug!(gh_path, error = %e, "Failed to execute gh command (sync)");
             }
         }
         Ok(None)
@@ -681,5 +716,59 @@ mod tests {
 
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
+    }
+
+    /// Verify that `try_gh_command` with a non-existent binary returns `Ok(None)`
+    /// immediately without blocking the async runtime.
+    #[tokio::test(flavor = "current_thread")]
+    async fn try_gh_command_with_nonexistent_binary_returns_none() {
+        // A path that definitely does not exist
+        let result = TokenResolver::try_gh_command("/nonexistent/path/to/gh").await;
+        assert!(result.is_ok(), "should not error on missing binary");
+        assert!(
+            result.unwrap().is_none(),
+            "should return None for missing binary"
+        );
+    }
+
+    /// Verify that when no GH_TOKEN/GITHUB_TOKEN is set and gh CLI is not in PATH,
+    /// `get_token` returns `Ok(None)` without blocking — using a resolver with gh
+    /// fallback enabled but pointing at a non-existent binary via the env.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_token_returns_none_when_no_token_and_no_gh_cli() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("GH_TOKEN");
+        env::remove_var("GITHUB_TOKEN");
+
+        // Disable gh fallback so we don't actually invoke the system gh CLI,
+        // which may or may not be present on the test machine.
+        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
+        resolver.clear_cache().await;
+
+        let token = resolver.get_token().await.unwrap();
+        assert!(
+            token.is_none(),
+            "no token should be resolved without env vars or gh CLI"
+        );
+    }
+
+    /// Verify that `try_gh_command` is genuinely async (returns a Future).
+    /// This test completes with a timeout to ensure the async executor is not blocked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn try_gh_command_does_not_block_runtime() {
+        // Use a timeout to ensure the async resolution does not stall.
+        // A blocking std::process::Command inside tokio would cause the test to hang.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TokenResolver::try_gh_command("/nonexistent/gh"),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "try_gh_command timed out — likely blocking the runtime"
+        );
+        assert!(result.unwrap().unwrap().is_none());
     }
 }

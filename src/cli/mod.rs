@@ -722,6 +722,80 @@ fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
         .map(String::from)
 }
 
+/// Check GitHub authentication status and token resolution.
+///
+/// Tries each token source in order and reports which one succeeds.
+/// Exits with code 0 on success, 1 if no token is found.
+pub async fn auth_check() -> anyhow::Result<()> {
+    use crate::github::token::TokenResolver;
+
+    println!("Checking GitHub authentication...");
+    println!();
+
+    // Check env vars
+    let gh_token = std::env::var("GH_TOKEN").ok().filter(|t| !t.is_empty());
+    let github_token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+    let config_token = crate::config::get("gh.auth.token")
+        .ok()
+        .filter(|t| !t.is_empty());
+
+    println!(
+        "  GH_TOKEN env var:        {}",
+        if gh_token.is_some() { "set" } else { "not set" }
+    );
+    println!(
+        "  GITHUB_TOKEN env var:    {}",
+        if github_token.is_some() {
+            "set"
+        } else {
+            "not set"
+        }
+    );
+    println!(
+        "  gh.auth.token config:    {}",
+        if config_token.is_some() {
+            "set"
+        } else {
+            "not set"
+        }
+    );
+
+    // Check if gh CLI is available
+    let gh_in_path = which::which("gh").is_ok();
+    println!(
+        "  gh CLI in PATH:          {}",
+        if gh_in_path { "yes" } else { "no" }
+    );
+
+    println!();
+
+    // Try full resolution
+    let resolver = TokenResolver::default_env();
+    match resolver.get_token().await {
+        Ok(Some(_)) => {
+            println!("  Status: OK — GitHub token resolved successfully");
+            Ok(())
+        }
+        Ok(None) => {
+            println!("  Status: FAILED — no GitHub token found");
+            println!();
+            println!("To fix, choose one of:");
+            println!("  1. Run: gh auth login");
+            println!("  2. Set: export GH_TOKEN=ghp_your_token");
+            println!("  3. Add gh.auth.token to ~/.orch/config.yml");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            println!("  Status: ERROR — {e}");
+            println!();
+            println!("To fix, choose one of:");
+            println!("  1. Run: gh auth login");
+            println!("  2. Set: export GH_TOKEN=ghp_your_token");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Initialize task manager with database and backend.
 pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
     use crate::backends::github::GitHubBackend;
