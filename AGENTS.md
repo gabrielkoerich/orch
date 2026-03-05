@@ -414,19 +414,6 @@ Modes:
 - `danger-full-access` — no sandbox (for tasks needing bun, solana-test-validator, etc.)
 - `none` — bypasses all Codex sandboxing (orchestrator is the sandbox)
 
-## PTY Runner (Agent Sessions)
-
-Agent sessions now prefer a PTY-based runner that spawns the agent CLI directly and streams output into tmux, avoiding on-disk runner scripts. Prompt files are still written to per-attempt directories for auditability.
-
-**Config toggle**:
-```yaml
-runner:
-  pty:
-    enabled: true
-```
-
-**Fallback**: If `runner.pty.enabled` is set to `false`, the runner uses the legacy tmux `new-session ... <command>` flow.
-
 ## Landing the Plane (Session Completion)
 
 **When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
