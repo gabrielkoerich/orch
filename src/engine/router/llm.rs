@@ -302,8 +302,9 @@ impl LlmRouter {
         let timeout_duration = Duration::from_secs(timeout_secs);
 
         let output = match config.router_agent.as_str() {
-            "claude" => {
-                let mut cmd = tokio::process::Command::new("claude");
+            // claude-compatible CLIs (claude, kimi, minimax) share the same flag interface
+            agent @ ("claude" | "kimi" | "minimax") => {
+                let mut cmd = tokio::process::Command::new(agent);
                 cmd.env_remove("CLAUDECODE"); // allow nested invocation
                 cmd.arg("--output-format").arg("json").arg("--print");
 

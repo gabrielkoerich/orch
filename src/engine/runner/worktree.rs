@@ -299,7 +299,7 @@ pub async fn setup_worktree(
     // Guard against empty branch name — calling `gh issue develop --name ""` writes
     // a corrupt `[branch ""]` entry to .git/config that breaks subsequent git pushes.
     if !branch_name_str.is_empty() {
-        let repo_slug = crate::config::get_current_repo().unwrap_or_default();
+        let repo_slug = crate::config::get_repo_for_project(&main_dir).unwrap_or_default();
         // Use CLI wrapper for gh issue develop
         let gh = Gh::new([
             "issue",
