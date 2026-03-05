@@ -306,6 +306,18 @@ impl TokenResolver {
     }
 
     /// Try to get token from a specific gh binary path.
+    ///
+    /// # Why `std::process::Command` (blocking) is intentional here
+    ///
+    /// This looks like a "blocking call in async context" antipattern, but it is not a problem:
+    /// - `resolve_fresh()` is only called from `get_token()` under a write-lock
+    /// - The result is immediately cached: env tokens forever, gh CLI tokens for 1 hour
+    /// - This executes AT MOST once per hour, typically once at startup
+    /// - A one-time ~100ms call does not meaningfully block the Tokio runtime
+    ///
+    /// DO NOT replace this with `spawn_blocking` or `tokio::process::Command` —
+    /// the added complexity is not justified and previous attempts to "fix" this
+    /// broke the auth flow. See issues #418 and #421 (closed as invalid).
     fn try_gh_command(gh_path: &str) -> anyhow::Result<Option<String>> {
         match std::process::Command::new(gh_path)
             .args(["auth", "token"])

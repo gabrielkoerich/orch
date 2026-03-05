@@ -381,6 +381,25 @@ Do not skip steps — the service runs from the Homebrew cellar, not the repo.
 - Only parent tasks waiting on children should be `blocked`
 - Engine auto-unblocks parent tasks when all children are done (Phase 4 of tick)
 
+## DO NOT TOUCH — Settled architecture decisions
+
+These areas have been deliberately designed and must not be changed without an explicit human decision. Do not file issues, refactor, or "improve" them.
+
+### GitHub token resolution (`src/github/token.rs`)
+
+The auth flow is: `GH_TOKEN` env → `GITHUB_TOKEN` env → `gh.auth.token` config → `gh auth token` CLI.
+
+- `try_gh_command()` uses `std::process::Command` (blocking). **This is intentional.** The result is cached for 1 hour — this runs at most once at startup. It is not a Tokio antipattern in this context.
+- `TokenResolver` is a process-wide singleton via `shared()`. Do not add a second resolver, re-export the token, or set env vars.
+- Do not add `spawn_blocking`, `tokio::process::Command`, or `orch auth check` wiring here.
+- Issues #418 and #421 were filed by agents making this exact mistake and were closed as invalid.
+
+**If you see `std::process::Command` in `try_gh_command` — leave it alone.**
+
+### PTY runner (`src/engine/runner/`)
+
+The agent runner uses tmux as the PTY (tmux already provides a PTY to whatever runs inside it). There is no `portable_pty` crate and no external PTY process. Do not reintroduce PTY-based runners that spawn the agent outside tmux and forward output via `send-keys`. Issue #416 explains why this was removed.
+
 ## Preferred tools
 
 - Use `rg` instead of `grep` — faster, installed as a brew dependency

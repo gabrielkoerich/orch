@@ -2,6 +2,14 @@
 
 > Communicate with your agents from anywhere — Discord, Telegram, GitHub, or direct tmux attach.
 
+## ⚠️ DO NOT TOUCH — Settled decisions
+
+Before creating any issues or making changes, read `AGENTS.md` for the full list. Key settled areas:
+
+- **`src/github/token.rs` — GitHub token resolution**: Stable and intentional. `try_gh_command()` uses `std::process::Command` (blocking) — correct, result is cached for 1h. Do NOT refactor, add `spawn_blocking`, or file issues about this. Issues #418 and #421 were closed as invalid.
+- **`src/engine/runner/` — Agent runner**: Tmux IS the PTY. Agents run inside the tmux session shell. Do NOT reintroduce external PTY runners. Issue #416 explains the removal.
+- **`src/github/auth.rs`**: Deleted — was dead code. Do not recreate it.
+
 ## Table of Contents
 
 1. [Current Architecture (v0)](#current-architecture-v0)
