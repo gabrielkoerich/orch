@@ -30,6 +30,7 @@ use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::db::{Db, InsertTaskMetric};
 use crate::engine::router::RouteResult;
+use crate::engine::tasks::is_internal_id;
 use crate::security;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
@@ -468,6 +469,11 @@ impl TaskRunner {
                     "updated GitHub agent label after failover"
                 );
             }
+        }
+
+        // Internal tasks: skip GitHub status/comment updates — dispatch phase handles status.
+        if is_internal_id(task_id) {
+            return Ok(weight_signal);
         }
 
         // Update GitHub status

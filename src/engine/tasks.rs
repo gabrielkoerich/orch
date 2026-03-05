@@ -3,6 +3,29 @@ use crate::db::{Db, InternalTask, TaskStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// Returns true if the given task ID refers to an internal (SQLite) task.
+pub fn is_internal_id(id: &str) -> bool {
+    id.starts_with("internal:")
+}
+
+/// Parse an internal task ID string (e.g. "internal:8") to its numeric SQLite id.
+pub fn parse_internal_id(id: &str) -> Option<i64> {
+    id.strip_prefix("internal:")?.parse().ok()
+}
+
+/// Map a backend `Status` to a DB `TaskStatus`.
+pub fn status_to_task_status(status: Status) -> TaskStatus {
+    match status {
+        Status::New => TaskStatus::New,
+        Status::Routed => TaskStatus::Routed,
+        Status::InProgress => TaskStatus::InProgress,
+        Status::Done => TaskStatus::Done,
+        Status::Blocked => TaskStatus::Blocked,
+        Status::InReview => TaskStatus::InReview,
+        Status::NeedsReview => TaskStatus::NeedsReview,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskType {
@@ -34,8 +57,17 @@ pub enum Task {
 }
 
 pub struct TaskManager {
-    db: Arc<Db>,
+    pub(crate) db: Arc<Db>,
     backend: Arc<dyn ExternalBackend>,
+}
+
+impl Clone for TaskManager {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            backend: self.backend.clone(),
+        }
+    }
 }
 
 impl TaskManager {
@@ -148,8 +180,47 @@ impl TaskManager {
     }
 
     /// Get open tasks that are routable (no status:* label or status:new).
+    /// Includes both external (GitHub) tasks and internal (SQLite) tasks in New status.
     pub async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
-        self.backend.list_routable().await
+        let mut tasks = self.backend.list_routable().await?;
+
+        // Include internal tasks with New status so the engine can dispatch them.
+        let internal_new = self.db.list_internal_tasks_by_status(TaskStatus::New).await?;
+        for t in internal_new {
+            tasks.push(ExternalTask {
+                id: ExternalId(format!("internal:{}", t.id)),
+                title: t.title,
+                body: t.body,
+                state: "open".to_string(),
+                labels: vec!["status:new".to_string()],
+                author: t.source,
+                created_at: t.created_at.to_rfc3339(),
+                updated_at: t.updated_at.to_rfc3339(),
+                url: String::new(),
+            });
+        }
+
+        Ok(tasks)
+    }
+
+    /// Update the status of an internal or external task by its string ID.
+    /// For `"internal:{n}"` IDs, updates SQLite. For all others, calls the backend.
+    pub async fn update_task_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+        if let Some(internal_id) = parse_internal_id(&id.0) {
+            return self
+                .db
+                .update_internal_task_status(internal_id, status_to_task_status(status))
+                .await;
+        }
+        self.backend.update_status(id, status).await
+    }
+
+    /// List internal tasks by DB status (used by the dispatch phase).
+    pub async fn db_list_internal_by_status(
+        &self,
+        status: TaskStatus,
+    ) -> anyhow::Result<Vec<InternalTask>> {
+        self.db.list_internal_tasks_by_status(status).await
     }
 
     pub async fn publish_task(&self, id: i64, labels: &[String]) -> anyhow::Result<ExternalId> {
