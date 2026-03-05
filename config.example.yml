@@ -139,6 +139,12 @@ webhook:
   enabled: false
   port: 8080
   secret: "${WEBHOOK_SECRET}"
+  # Deduplication settings (optional)
+  # dedup_window_seconds: 7200
+  # max_seen_deliveries: 50000
+  # dedup_store: "memory" # or "file"
+  # dedup_path: "~/.orch/webhook_dedup.db"
+  # dedup_metrics: true
 
 # Engine settings
 engine:
