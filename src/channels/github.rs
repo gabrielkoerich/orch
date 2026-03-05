@@ -548,12 +548,13 @@ async fn handle_webhook(
 
 /// Health endpoint — returns JSON with dedup store status.
 ///
-/// Response: `{"ok": true, "seen_count": N}`
+/// Response: `{"ok": true, "seen_count": N, "duplicate_count": M}`
 async fn webhook_health(State(state): State<WebhookState>) -> impl IntoResponse {
     let metrics = state.dedup_store.metrics().await;
     axum::Json(serde_json::json!({
         "ok": true,
-        "seen_count": metrics.seen_count
+        "seen_count": metrics.seen_count,
+        "duplicate_count": metrics.duplicate_count
     }))
 }
 
@@ -1528,6 +1529,7 @@ mod tests {
 
         assert_eq!(json["ok"], true);
         assert_eq!(json["seen_count"], 1);
+        assert_eq!(json["duplicate_count"], 1);
     }
 
     /// Verify that `is_transient_bind_error` correctly classifies EADDRINUSE.
