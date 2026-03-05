@@ -4,7 +4,6 @@
 //! Worktrees are stored at `~/.orch/worktrees/<project>/<branch>/`.
 
 use crate::cmd::CommandErrorContext;
-use crate::github::cli_wrapper::Gh;
 use crate::sidecar;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -294,44 +293,6 @@ pub async fn setup_worktree(
             format!("branch={branch_name_str}"),
         ],
     )?;
-
-    // Link branch to GitHub issue (non-fatal).
-    // Guard against empty branch name — calling `gh issue develop --name ""` writes
-    // a corrupt `[branch ""]` entry to .git/config that breaks subsequent git pushes.
-    if !branch_name_str.is_empty() {
-        let repo_slug = crate::config::get_repo_for_project(&main_dir).unwrap_or_default();
-        // Use CLI wrapper for gh issue develop
-        let gh = Gh::new([
-            "issue",
-            "develop",
-            task_id,
-            "--base",
-            &default_branch,
-            "--branch-repo",
-            &repo_slug,
-            "--name",
-            &branch_name_str,
-        ])
-        .current_dir(&main_dir);
-        let link_output = gh.output_async().await;
-        match link_output {
-            Ok(o) if o.status.success() => {
-                tracing::info!(task_id, branch = %branch_name_str, "linked branch to issue");
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                tracing::debug!(task_id, err = %stderr, "gh issue develop failed (non-fatal)");
-            }
-            Err(e) => {
-                tracing::debug!(task_id, err = %e, "gh issue develop failed (non-fatal)");
-            }
-        }
-    } else {
-        tracing::warn!(task_id, "skipping gh issue develop: branch name is empty");
-    }
-
-    // gh issue develop sometimes creates corrupt [branch ""] config entries — clean up
-    super::git_ops::cleanup_empty_branch_config(&main_dir).await;
 
     tracing::info!(
         task_id,

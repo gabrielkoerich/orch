@@ -388,18 +388,6 @@ async fn link_issue_to_branch(repo: &str, task_id: &str, branch: &str) -> anyhow
     }
 }
 
-/// Remove corrupt `[branch ""]` entries from git config.
-///
-/// `gh issue develop` sometimes creates these as a side effect,
-/// which corrupts git config and blocks pushes.
-pub async fn cleanup_empty_branch_config(dir: &Path) {
-    let _ = Command::new("git")
-        .args(["config", "--remove-section", "branch."])
-        .current_dir(dir)
-        .output_with_context()
-        .await;
-}
-
 /// Get the current branch name.
 async fn get_current_branch(dir: &Path) -> String {
     let output = Command::new("git")

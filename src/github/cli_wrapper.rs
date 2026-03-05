@@ -31,6 +31,7 @@ pub enum GhError {
     #[error("gh CLI not found in PATH or known locations")]
     NotFound,
 
+    #[allow(dead_code)]
     #[error("gh command timed out after {0}s: {1}")]
     Timeout(u64, String),
 
@@ -76,6 +77,7 @@ impl Gh {
     }
 
     /// Set the working directory for the command.
+    #[allow(dead_code)]
     pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.current_dir = Some(dir.into());
         self
@@ -141,6 +143,7 @@ impl Gh {
     }
 
     /// Execute the command asynchronously and return the output.
+    #[allow(dead_code)]
     pub async fn output_async(&self) -> GhResult<Output> {
         use tokio::process::Command as TokioCommand;
 
