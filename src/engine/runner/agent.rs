@@ -108,9 +108,7 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
             r#"#!/usr/bin/env bash
 set -euo pipefail
 
-# Environment
-[ -f "$HOME/.path" ] && source "$HOME/.path"
-[ -f "$HOME/.private" ] && source "$HOME/.private"
+# Environment — ~/.path and ~/.private are loaded by orch at startup into the process env
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 export GIT_AUTHOR_NAME="{git_name}"
 export GIT_COMMITTER_NAME="{git_name}"
