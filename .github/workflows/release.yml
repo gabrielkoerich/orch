@@ -185,7 +185,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust"
+          prefix-key: "v1-build"
           key: ${{ matrix.target }}
           cache-all-crates: true
 
