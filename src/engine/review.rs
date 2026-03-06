@@ -1081,9 +1081,10 @@ pub(crate) async fn auto_merge_pr(
             || err_msg.contains("merge conflict");
 
         if is_conflict {
-            // Merge failed due to conflicts — re-trigger review agent to rebase
+            // Merge failed due to conflicts — attempt rebase in the worktree directly.
+            // Do NOT re-trigger the full review cycle; that doesn't fix the conflict.
             let retries = sidecar::get_u64(&task.id.0, "merge_conflict_retries");
-            if retries >= 3 {
+            if retries >= 2 {
                 tracing::error!(
                     task_id = task.id.0,
                     retries,
@@ -1092,10 +1093,7 @@ pub(crate) async fn auto_merge_pr(
                 task_manager
                     .update_task_status(&task.id, Status::Blocked)
                     .await?;
-                let comment = format!(
-                    "Auto-merge failed after {} conflict retries: {}",
-                    retries, e
-                );
+                let comment = format!("Auto-merge failed after {} rebase attempts: {}", retries, e);
                 let footer = format!(
                     "\n\n---\n*Commented by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
                     review_agent, review_model
@@ -1109,21 +1107,96 @@ pub(crate) async fn auto_merge_pr(
                     .await;
                 return Err(e);
             }
-            tracing::warn!(
-                task_id = task.id.0,
-                retries,
-                error = %e,
-                "merge failed due to conflicts — re-triggering review agent to rebase"
-            );
-            let _ = sidecar::set(
-                &task.id.0,
-                &[format!("merge_conflict_retries={}", retries + 1)],
-            );
-            // Set NeedsReview — next tick will re-trigger review agent
+
+            // Try rebase in the worktree
+            let worktree_path = sidecar::get(&task.id.0, "worktree").ok();
+            if let Some(wt) = worktree_path {
+                let wt_path = std::path::PathBuf::from(&wt);
+                if wt_path.exists() {
+                    tracing::info!(
+                        task_id = task.id.0,
+                        worktree = %wt,
+                        "attempting rebase to resolve merge conflict"
+                    );
+                    let rebase_result = tokio::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(format!(
+                            "cd '{}' && git fetch origin && git rebase origin/main && git push --force-with-lease",
+                            wt
+                        ))
+                        .output()
+                        .await;
+
+                    match rebase_result {
+                        Ok(out) if out.status.success() => {
+                            tracing::info!(
+                                task_id = task.id.0,
+                                "rebase succeeded — retrying merge"
+                            );
+                            let _ = sidecar::set(
+                                &task.id.0,
+                                &[format!("merge_conflict_retries={}", retries + 1)],
+                            );
+                            // Retry merge once after successful rebase
+                            if let Err(merge_err) = gh.merge_pr(repo, pr_number, true).await {
+                                tracing::error!(
+                                    task_id = task.id.0,
+                                    error = %merge_err,
+                                    "merge still failed after rebase — blocking"
+                                );
+                                task_manager
+                                    .update_task_status(&task.id, Status::Blocked)
+                                    .await?;
+                                return Err(merge_err);
+                            }
+                            // Merge succeeded after rebase — fall through to done
+                            task_manager
+                                .update_task_status(&task.id, Status::Done)
+                                .await?;
+                            if let Err(ce) = cleanup_task_worktree(&task.id.0, repo).await {
+                                tracing::warn!(task_id = task.id.0, err = %ce, "post-merge cleanup failed");
+                            }
+                            return Ok(());
+                        }
+                        Ok(out) => {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            tracing::error!(
+                                task_id = task.id.0,
+                                stderr = %stderr,
+                                "rebase failed — blocking for human review"
+                            );
+                        }
+                        Err(io_err) => {
+                            tracing::error!(
+                                task_id = task.id.0,
+                                error = %io_err,
+                                "rebase command error — blocking for human review"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Rebase failed or no worktree — block
             task_manager
-                .update_task_status(&task.id, Status::NeedsReview)
+                .update_task_status(&task.id, Status::Blocked)
                 .await?;
-            return Ok(());
+            let comment = format!(
+                "Auto-merge failed (merge conflict, rebase unsuccessful): {}",
+                e
+            );
+            let footer = format!(
+                "\n\n---\n*Commented by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
+                review_agent, review_model
+            );
+            let _ = gh
+                .add_comment(
+                    repo,
+                    &pr_number.to_string(),
+                    &format!("{}{}", comment, footer),
+                )
+                .await;
+            return Err(e);
         }
 
         // Non-conflict merge failure (permissions, branch protection, etc.)
