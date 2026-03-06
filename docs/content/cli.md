@@ -2,50 +2,52 @@
 title = "CLI Reference"
 description = "Commands, namespaces, and background service"
 weight = 6
-++ 
+++
 
 ## Namespaces
 
 ```bash
-orch task list|tree|add|plan|route|run|next|poll|retry|unblock|agent|stream|watch|unlock
-orch service start|stop|restart|status|install|uninstall
-orch gh pull|push|sync
-orch project info|create|list|add
+orch task list|add|get|status|route|run|retry|unblock|attach|live|kill|publish|cost|tree
+orch service start|stop|restart|status
 orch job add|list|remove|enable|disable|tick
-orch skills list|sync
+orch project add|remove|list
+orch stream <task_id>
+orch dashboard
+orch metrics
+orch cost
 ```
 
-Top-level shortcuts: `init`, `chat`, `status`, `dashboard`, `log`, `start`, `stop`, `restart`, `info`, `agents`, `version`.
-
- `orch` is a short alias for `orchestrator`.
+Top-level shortcuts: `serve`, `init`, `log`, `agents`, `version`, `completions`.
 
 ## Task Commands
 
 ```bash
 orch task add "title" --body "body" --labels "comma,separated"  # create a task
 orch task add "title" -p owner/repo   # create a task for a managed project
-orch task plan "title" "body"          # create a plan/decompose task
 orch task list                          # list tasks for current project
 orch task tree                          # show parent-child tree
+orch task get <id>                      # get task details
+orch task status                        # show task status summary
 orch task route <id>                    # route a task to an agent
 orch task run <id>                      # run a specific task
-orch task next                          # route + run next pending task
-orch task poll                          # process all pending tasks (runs routed tasks)
 orch task retry <id>                    # reset task to new
 orch task unblock <id>                  # reset a needs_review/stalled task to new
 orch task unblock all                   # reset all needs_review/blocked tasks
-orch task agent <id> <agent>            # manually set task agent
-orch task watch                         # watch task status changes
-orch task unlock                        # clear stale locks
+orch task attach <id>                   # attach to a running agent's tmux session
+orch task live                          # list active agent tmux sessions
+orch task kill <id>                     # kill a running agent tmux session
+orch task publish <id>                  # publish internal task to GitHub
+orch task cost <id>                     # show token cost breakdown for a task
+orch stream <id>                        # stream live output from a running task
 ```
 
 ## Background Service
 
 ```bash
-orch start                # start background server
-orch stop                 # stop background server
-orch restart              # restart server
-orch info                 # show server status (PID, uptime)
+orch service start      # start background service
+orch service stop       # stop background service
+orch service restart    # restart service
+orch service status     # show service status
 ```
 
 With Homebrew:
@@ -55,49 +57,41 @@ brew services stop orch
 brew services restart orch
 ```
 
-The server runs a background service which ticks every `engine.tick_interval` seconds (default 10s):
-- Polls for new/routed tasks and runs them
-- Checks for stuck tasks and recovers or marks `needs_review`
+The service ticks every `engine.tick_interval` seconds (default 10s):
+- Syncs GitHub issues and PR events (webhook or polling)
+- Routes new tasks to agents via LLM router
+- Dispatches routed tasks into tmux sessions in worktrees
 - Runs due scheduled jobs (per-project)
-- Syncs with GitHub (sync interval configurable; webhook mode preferred)
-
-Install as a launchd service (auto-starts on login):
-```bash
-orch service install      # create launchd plist
-orch service uninstall    # remove launchd plist
-```
-
-## Chat Mode
-
-```bash
-orch chat
-```
-
- Interactive mode with readline support. Talk to the orchestrator, add tasks, check status. Chat tasks run in the current `PROJECT_DIR` without worktrees.
+- Recovers stuck tasks (no tmux session, age >10 min → reset to `new`)
 
 ## Dashboard & Status
 
 ```bash
-orch status                 # show task counts for current project
-orch status --global        # show all projects
-orch status --json          # JSON output
-orch dashboard              # full dashboard view
+orch dashboard              # full dashboard view (tasks, sessions, activity)
+orch task status            # show task counts for current project
+orch metrics                # show task metrics summary
+orch cost                   # show cost tracking and token usage
 orch log                    # tail server logs
 ```
 
-## GitHub Commands
+## Project Commands
 
 ```bash
-orch gh pull                # import issues into tasks
-orch gh push                # push task updates to issues
-orch gh sync                # both directions
-orch project add owner/repo  # bare clone + import issues
-orch project info            # show GitHub Project field IDs
-orch project info --fix      # auto-fill project config
-orch project create "name"   # create or link a GitHub Project v2
-orch project list             # list managed bare-clone projects
-orch project list org=ORG     # list GitHub Projects v2 + managed projects
-orch project list user=USER   # list GitHub Projects v2 + managed projects
+orch project add owner/repo   # bare clone + import issues
+orch project add /path/to/repo # register a local project
+orch project list              # list registered projects
+orch project remove owner/repo # remove a project from registry
+```
+
+## Job Commands
+
+```bash
+orch job list                             # list scheduled jobs
+orch job add "title" --cron "0 9 * * *"  # add a cron job
+orch job remove <id>                      # remove a job
+orch job enable <id>                      # enable a job
+orch job disable <id>                     # disable a job
+orch job tick                             # run one job scheduler tick manually
 ```
 
 ## Agent Management
@@ -112,10 +106,8 @@ orch agents                 # list available agents and their status
 |-----|----------|
 | Server log | `~/.orch/state/orch.log` |
 | Server archive | `~/.orch/state/orch.archive.log` |
-| Jobs log | `~/.orch/state/jobs.log` |
-| Per-task output | `~/.orch/state/output-{id}.json` |
-| Per-task tools | `~/.orch/state/tools-{id}.json` |
-| Per-task prompts | `~/.orch/state/prompt-{id}.md` |
-| Task context | `~/.orch/contexts/task-{id}.md` |
+| Per-task sidecar | `~/.orch/state/<repo>/tasks/<id>/sidecar.json` |
+| Per-task output | `~/.orch/state/<repo>/tasks/<id>/attempts/<n>/output.json` |
+| Per-task prompts | `~/.orch/state/<repo>/tasks/<id>/attempts/<n>/prompt-sys.md` |
 | Brew stdout | `/opt/homebrew/var/log/orch.log` |
 | Brew stderr | `/opt/homebrew/var/log/orch.error.log` |
