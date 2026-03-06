@@ -4,7 +4,7 @@ use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
-use crate::engine::tasks::{CreateTaskRequest, Task, TaskFilter, TaskType};
+use crate::engine::tasks::{parse_internal_id, CreateTaskRequest, Task, TaskFilter, TaskType};
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
@@ -560,6 +560,168 @@ pub async fn tree(id: Option<i64>) -> anyhow::Result<()> {
     let forest = build_forest(tasks);
     let output = render_forest(&forest);
     print!("{}", output);
+
+    Ok(())
+}
+
+/// Show logs / post-mortem for a task (internal or external).
+pub async fn logs(id: &str) -> anyhow::Result<()> {
+    let task_manager = init_task_manager().await?;
+
+    // Resolve sidecar key and print basic metadata where available.
+    let mut sidecar_key = id.to_string();
+
+    // If user passed `internal:N` or the task resolves to an internal task,
+    // prefer the internal sidecar key format `internal:{n}` so we read the
+    // correct file.
+    if let Some(n) = parse_internal_id(id) {
+        sidecar_key = format!("internal:{}", n);
+        // Fetch internal task metadata
+        if let Ok(internal) = task_manager.db.get_internal_task(n).await {
+            println!("ID: {} (internal)", internal.id);
+            println!("Title: {}", internal.title);
+            println!("Status: {}", internal.status.as_str());
+            if let Some(agent) = &internal.agent {
+                println!("Agent: {}", agent);
+            }
+            if let Some(reason) = &internal.block_reason {
+                println!("Block reason: {}", reason);
+            }
+            println!("Created: {}", internal.created_at.to_rfc3339());
+            println!("Updated: {}", internal.updated_at.to_rfc3339());
+        }
+    } else if let Ok(num) = id.parse::<i64>() {
+        // Numeric ID: try DB first (TaskManager::get_task will check both)
+        match task_manager.get_task(num).await {
+            Ok(Task::External(ext)) => {
+                println!("ID: {} (external)", ext.id.0);
+                println!("Title: {}", ext.title);
+                println!("State: {}", ext.state);
+                println!("Labels: {}", ext.labels.join(", "));
+                println!("Author: {}", ext.author);
+                println!("URL: {}", ext.url);
+                println!("Created: {}", ext.created_at);
+                println!("Updated: {}", ext.updated_at);
+                sidecar_key = ext.id.0.clone();
+            }
+            Ok(Task::Internal(int)) => {
+                println!("ID: {} (internal)", int.id);
+                println!("Title: {}", int.title);
+                println!("Status: {}", int.status.as_str());
+                if let Some(agent) = &int.agent {
+                    println!("Agent: {}", agent);
+                }
+                println!("Created: {}", int.created_at.to_rfc3339());
+                println!("Updated: {}", int.updated_at.to_rfc3339());
+                sidecar_key = format!("internal:{}", int.id);
+            }
+            Err(e) => {
+                // Could not resolve task metadata; continue and try sidecar only
+                println!("ID: {}", id);
+                println!("(could not resolve task metadata: {})", e);
+            }
+        }
+    } else {
+        // Non-numeric external id (rare) — use as-is for sidecar lookup
+        println!("ID: {}", id);
+    }
+
+    // Sidecar path and existence
+    match sidecar::sidecar_path(&sidecar_key) {
+        Ok(path) => {
+            if !path.exists() {
+                println!(
+                    "\nNo sidecar found for task {} — looked at: {}",
+                    sidecar_key,
+                    path.display()
+                );
+            } else {
+                println!("\nSidecar: {}", path.display());
+
+                // Agent & model
+                if let Ok(agent) = sidecar::get(&sidecar_key, "agent") {
+                    println!("Agent: {}", agent);
+                }
+                let model = sidecar::get_model(&sidecar_key);
+                if !model.is_empty() {
+                    println!("Model: {}", model);
+                }
+
+                // Attempts
+                if let Ok(attempts) = sidecar::get(&sidecar_key, "attempts") {
+                    println!("Attempts: {}", attempts);
+                }
+
+                // Token & cost summary
+                let usage = sidecar::get_token_usage(&sidecar_key);
+                let cost = sidecar::get_cost_estimate(&sidecar_key);
+                let total_tokens = usage.total_tokens();
+                if total_tokens > 0 || cost.total_cost_usd > 0.0 {
+                    println!("\nCost summary:");
+                    println!("  input tokens:  {}", usage.input_tokens);
+                    println!("  output tokens: {}", usage.output_tokens);
+                    println!("  total tokens:  {}", total_tokens);
+                    println!("  estimated $:   ${:.6}", cost.total_cost_usd);
+                }
+
+                // Memory (recent attempts)
+                if let Ok(mem) = sidecar::get_recent_memory(&sidecar_key, 10) {
+                    if !mem.is_empty() {
+                        println!("\nMemory (recent attempts):");
+                        for m in mem {
+                            println!(
+                                "- Attempt {} @ {}: agent={} model={}",
+                                m.attempt,
+                                m.timestamp,
+                                m.agent,
+                                m.model.clone().unwrap_or_default()
+                            );
+                            if let Some(err) = m.error.as_ref() {
+                                println!("    Error: {}", err);
+                            }
+                            if !m.learnings.is_empty() {
+                                println!("    Learnings:");
+                                for l in &m.learnings {
+                                    println!("      - {}", l);
+                                }
+                            }
+                            if !m.files_modified.is_empty() {
+                                println!("    Files modified:");
+                                for f in &m.files_modified {
+                                    println!("      - {}", f);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            println!(
+                "\nCould not resolve sidecar path for {}: {}",
+                sidecar_key, e
+            );
+        }
+    }
+
+    // If tmux session is live, append recent pane capture
+    let tmux = TmuxManager::new();
+    let repo = config::get_current_repo().unwrap_or_default();
+    let session = tmux.session_name(&repo, &sidecar_key);
+    if tmux.session_exists(&session).await {
+        println!(
+            "\nLive tmux session detected: {} — appending recent output:\n---",
+            session
+        );
+        match tmux.capture_pane(&session, 200).await {
+            Ok(output) => {
+                println!("{}", output);
+            }
+            Err(e) => {
+                println!("(tmux capture failed: {})", e);
+            }
+        }
+    }
 
     Ok(())
 }
