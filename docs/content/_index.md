@@ -3,4 +3,4 @@ title = "Documentation"
 sort_by = "weight"
 +++
 
-Orchestrator documentation — a Rust-based orchestrator for autonomous coding agents.
+Orch documentation — a Rust-based multi-agent task orchestrator for AI coding agents.
