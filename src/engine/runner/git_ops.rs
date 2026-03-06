@@ -367,11 +367,6 @@ async fn append_pr_footer_if_missing(
     agent: &str,
     model: Option<&str>,
 ) {
-    // Only run for numeric task IDs (GitHub issues)
-    if task_id.parse::<u64>().is_err() {
-        return;
-    }
-
     let pr = match gh.get_pr(repo, pr_number).await {
         Ok(pr) => pr,
         Err(e) => {
