@@ -5,6 +5,7 @@ use crate::config;
 use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
 use crate::engine::tasks::{parse_internal_id, CreateTaskRequest, Task, TaskFilter, TaskType};
+use crate::home;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
@@ -800,9 +801,58 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
         }
     }
 
+    // Show agent output from last attempt if available
+    let repo = config::get_current_repo().unwrap_or_default();
+    if let Ok(attempts_str) = sidecar::get(&sidecar_key, "attempts") {
+        if let Ok(attempt_n) = attempts_str.parse::<u32>() {
+            if attempt_n > 0 {
+                match home::task_attempt_dir(&repo, &sidecar_key, attempt_n) {
+                    Ok(attempt_dir) => {
+                        let output_file = attempt_dir.join("output.json");
+                        let exit_file = attempt_dir.join("exit.txt");
+
+                        if output_file.exists() {
+                            if let Ok(content) = std::fs::read_to_string(&output_file) {
+                                let truncated = if content.len() > 2000 {
+                                    format!("...{} chars truncated...", content.len() - 2000)
+                                        .to_string()
+                                        + &content[content.len() - 2000..]
+                                } else {
+                                    content
+                                };
+                                println!("\n--- Last attempt output (attempt {}) ---", attempt_n);
+                                println!("{}", truncated);
+                            }
+                        }
+
+                        if exit_file.exists() {
+                            if let Ok(exit_code) = std::fs::read_to_string(&exit_file) {
+                                println!("Exit code: {}", exit_code.trim());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("(could not resolve attempt dir: {})", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Show review agent output if available
+    let review_task_id = format!("{}-review", sidecar_key);
+    if let Ok(review_attempt_dir) = home::task_attempt_dir(&repo, &review_task_id, 1) {
+        let review_output_file = review_attempt_dir.join("output.json");
+        if review_output_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&review_output_file) {
+                println!("\n--- Review agent output ---");
+                println!("{}", content);
+            }
+        }
+    }
+
     // If tmux session is live, append recent pane capture
     let tmux = TmuxManager::new();
-    let repo = config::get_current_repo().unwrap_or_default();
     let session = tmux.session_name(&repo, &sidecar_key);
     if tmux.session_exists(&session).await {
         println!(
