@@ -58,7 +58,7 @@ pub(crate) async fn sync_tick(
     }
 
     // 4. Review open PRs (parse review comments, create follow-ups)
-    if let Err(e) = review_open_prs(backend, db, repo, config).await {
+    if let Err(e) = review_open_prs(backend, db, repo, config, task_manager).await {
         tracing::warn!(err = %e, "PR review failed");
     }
 
@@ -113,7 +113,7 @@ pub(crate) async fn sync_tick(
             tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                 let tid = task_c.id.0.clone();
                 let needs_reset = match review_and_merge(
-                    &task_c, &backend_c, &tmux_c, &repo_s, &router_c,
+                    &task_c, &backend_c, &tmux_c, &repo_s, &router_c, &task_manager_c,
                 )
                 .await
                 {
