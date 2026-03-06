@@ -184,6 +184,19 @@ in_progress → needs_review → in_review → done
 - Changed max-attempts behavior: repeated failures now move tasks to `needs_review` and forced `agent:*` labels are removed
 - Review agent selection clarifications: review agent excludes the original task agent to avoid self-review
 
+### New CLI: `orch task logs <id>`
+
+- Purpose: print a concise post-mortem (summary + memory + token/costs + recent tmux output) for a completed task.
+- Works with internal tasks (`internal:<n>`) and external GitHub tasks (issue number).
+- Fields shown: ID, title, status, agent, model, attempts, cost summary (tokens + USD), recent memory entries (learnings, errors, files modified), sidecar path. If a live tmux session exists, appends recent pane output.
+- Missing sidecar: prints a clear message with the inspected path instead of failing.
+
+Usage example:
+
+  orch task logs internal:8
+
+This was implemented in `src/cli/task.rs::logs` and wired into the main CLI dispatch in `src/main.rs`.
+
 **Review agent**: triggered by engine when a task is in `needs_review` and has a branch. The engine transitions the task to `in_review` before spawning — the status itself is the duplicate guard (no sidecar flags needed). On failure, the engine resets to `needs_review` for retry.
 
 **Key invariant**: `done` means task is finished (PR merged or no code changes). `needs_review` means PR exists and is queued for review. `in_review` means a review agent is actively running. `blocked` means human intervention is required. The runner decides: if agent said "done" AND a PR exists → `needs_review`; otherwise → agent's reported status.
