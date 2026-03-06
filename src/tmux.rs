@@ -36,14 +36,19 @@ impl TmuxManager {
     ///
     /// The project name is derived from the repo slug (e.g. `owner/repo` → `repo`).
     /// This prevents collisions between projects with the same issue number.
+    ///
+    /// Colons are replaced with underscores because tmux interprets `session:window`
+    /// notation in `-t` target flags. Without sanitization, `has-session -t "orch-orch-internal:13"`
+    /// would look for session `orch-orch-internal` window 13 (not found), making
+    /// `wait_for_completion` return immediately and report exit_code=-1.
     pub fn session_name(&self, project: &str, task_id: &str) -> String {
         let project_name = project
             .rsplit('/')
             .next()
             .unwrap_or(project)
             .trim_end_matches(".git");
-        let safe_task_id = task_id.replace(':', "-");
-        format!("{}{project_name}-{safe_task_id}", self.prefix)
+        let sanitized_task_id = task_id.replace(':', "_");
+        format!("{}{project_name}-{sanitized_task_id}", self.prefix)
     }
 
     /// Create a new tmux session for a task and run a command in it.
@@ -325,13 +330,16 @@ mod tests {
         )
     }
 
+    /// Verify that task IDs with colons are sanitized to avoid tmux `session:window` ambiguity.
     #[test]
-    fn session_name_internal_task_id_is_sanitized() {
+    fn session_name_sanitizes_colons() {
         let tmux = TmuxManager::new();
-        assert_eq!(
-            tmux.session_name("owner/repo", "internal:8"),
-            "orch-repo-internal-8"
+        let name = tmux.session_name("gabrielkoerich/orch", "internal:13");
+        assert!(
+            !name.contains(':'),
+            "session name must not contain colons — tmux interprets them as session:window: {name}"
         );
+        assert_eq!(name, "orch-orch-internal_13");
     }
 
     /// Verify set_env runs the correct tmux set-environment command.
