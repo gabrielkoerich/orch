@@ -1321,7 +1321,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | Crate | Purpose | Status |
 |-------|---------|--------|
 | `tokio` | Async runtime | In use |
-| `portable-pty` | PTY spawning for agent runner | In use |
+| ~~`portable-pty`~~ | PTY spawning for agent runner | **Removed** (PR #420) — tmux IS the PTY; do not reintroduce |
 | `serde` / `serde_json` / `serde_yml` | Serialization | In use |
 | `clap` / `clap_complete` | CLI parsing + shell completions | In use |
 | `chrono` | Timestamps | In use |
@@ -1347,7 +1347,15 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 ## TODO — Remaining Work
 
-*No open items — all planned features implemented.*
+*Core architecture complete. See [open GitHub issues](https://github.com/gabrielkoerich/orch/issues) for active bugs and in-progress features.*
+
+**Currently open:**
+- [#431](https://github.com/gabrielkoerich/orch/issues/431) — Bidirectional channel interaction (wire input to engine actions + fan out session output to channels) — in progress
+- [#446](https://github.com/gabrielkoerich/orch/issues/446) — `orch task status` shows only GitHub tasks; internal SQLite tasks excluded
+- [#441](https://github.com/gabrielkoerich/orch/issues/441) — `orch task unblock` ignores internal tasks
+- [#437](https://github.com/gabrielkoerich/orch/issues/437) / [#436](https://github.com/gabrielkoerich/orch/issues/436) — Internal tasks stuck in InProgress not auto-recovered
+- [#435](https://github.com/gabrielkoerich/orch/issues/435) — `resolve_repo_root` uses wrong path for bare-clone projects
+- [#433](https://github.com/gabrielkoerich/orch/issues/433) — `orch task logs <id>` command (show agent output for completed tasks)
 
 ### Recently Closed
 
