@@ -679,6 +679,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Internal tasks design — implemented (SQLite + engine integration)
 - [x] Weighted round-robin for agent routing — PR #94 merged
 - [x] Worktree cleanup for stuck/failed tasks — implemented in sync_tick
+- [x] Throttle review agent spawns in sync_tick — semaphore guard to avoid API bursts
 
 ### Metrics to Collect Before v1
 

@@ -20,6 +20,7 @@ use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
+use tokio::sync::Semaphore;
 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
 use super::review::{review_and_merge, review_open_prs, ReviewDecision};
@@ -31,12 +32,14 @@ use super::EngineConfig;
 /// - Cleanup finished worktrees
 /// - Check for merged PRs → mark tasks done
 /// - Scan for @mentions
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_tick(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
     repo: &str,
     db: &Arc<Db>,
     config: &EngineConfig,
+    semaphore: &Arc<Semaphore>,
     router: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
@@ -94,6 +97,13 @@ pub(crate) async fn sync_tick(
         for task in needs_review_tasks {
             let task_id = &task.id.0;
             tracing::info!(task_id, "triggering review agent for needs_review task");
+            let permit = match semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::debug!("all parallel slots busy, skipping remaining review tasks");
+                    break;
+                }
+            };
             // Transition to InReview — this IS the atomic guard against duplicates.
             // For internal tasks, task_manager routes to SQLite; for external to GitHub labels.
             if let Err(e) = task_manager
@@ -101,6 +111,7 @@ pub(crate) async fn sync_tick(
                 .await
             {
                 tracing::warn!(task_id, err = %e, "failed to transition to InReview");
+                drop(permit);
                 continue;
             }
             let backend_c = backend.clone();
@@ -150,6 +161,8 @@ pub(crate) async fn sync_tick(
                         reset_to_needs_review_with_retry(&backend_c, &tid).await;
                     }
                 }
+
+                drop(permit);
             }));
         }
 
