@@ -110,6 +110,12 @@ impl LlmRouter {
             let _ = self.prune_old_debug_files(50, "route-response-").await;
         }
 
+        // Prune old debug files — keep only the 50 most recent of each type
+        if let Ok(state_dir) = crate::home::state_dir() {
+            prune_route_debug_files(&state_dir, "route-prompt-", 50).await;
+            prune_route_debug_files(&state_dir, "route-response-", 50).await;
+        }
+
         // Parse the response
         let llm_response: LlmRouteResponse = self.parse_llm_response(&response)?;
 
@@ -542,6 +548,42 @@ impl LlmRouter {
         .await??;
 
         Ok(())
+    }
+}
+
+/// Prune route debug files matching `{state_dir}/{prefix}*.txt`, keeping only the `keep` most
+/// recent (by mtime). Files that cannot be stat'd are treated as oldest and removed first.
+async fn prune_route_debug_files(state_dir: &std::path::Path, prefix: &str, keep: usize) {
+    let suffix = ".txt";
+    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+
+    let mut read_dir = match tokio::fs::read_dir(state_dir).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+
+    while let Ok(Some(entry)) = read_dir.next_entry().await {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(prefix) && name_str.ends_with(suffix) {
+            let mtime = entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            entries.push((mtime, entry.path()));
+        }
+    }
+
+    if entries.len() <= keep {
+        return;
+    }
+
+    // Sort newest-first; truncate to keep, then delete the rest
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in entries.into_iter().skip(keep) {
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }
 
