@@ -575,7 +575,7 @@ pub(crate) async fn tick_dispatch_tasks(
                             .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
                             .await;
                     }
-                
+
                     // Send error notification
                     let duration = dispatch_start.elapsed().as_secs_f64();
                     transport.push_notification(TaskNotification {
