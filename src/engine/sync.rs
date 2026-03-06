@@ -174,6 +174,22 @@ pub(crate) async fn sync_tick(
             }
         }
         for task in in_review_tasks {
+            // Skip tasks that just transitioned to InReview — allow time for the
+            // review agent to start its tmux session before treating it as stale.
+            // A task is only considered stale if it has been in InReview for > 5 minutes.
+            const MIN_STALE_MINUTES: i64 = 5;
+            if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
+                let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
+                if age.num_minutes() < MIN_STALE_MINUTES {
+                    tracing::debug!(
+                        task_id = task.id.0,
+                        age_seconds = age.num_seconds(),
+                        "InReview task is too young to be considered stale, skipping"
+                    );
+                    continue;
+                }
+            }
+
             let review_task_id = format!("{}-review", task.id.0);
             let review_session = tmux.session_name(repo, &review_task_id);
             let has_session = tmux.session_exists(&review_session).await;
