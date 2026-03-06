@@ -22,6 +22,14 @@ pub mod sync;
 pub mod tasks;
 pub mod tick;
 
+/// Standard Orch attribution footer for issue bodies, PR bodies, and comments.
+///
+/// Append to every user-visible string posted to GitHub so activity is
+/// clearly attributed to the orchestrator rather than appearing as a human post.
+pub fn orch_footer() -> &'static str {
+    "\n\n---\n*Posted by [Orch](https://github.com/gabrielkoerich/orch)*"
+}
+
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::channels::capture::CaptureService;
 use crate::channels::discord_ws::DiscordGateway;

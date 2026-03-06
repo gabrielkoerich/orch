@@ -223,7 +223,11 @@ pub async fn scan_commands(
                     command = %command,
                     "executed owner command"
                 );
-                let confirmation = format!("[{now}] {msg} — executed by @{}", mention.author);
+                let confirmation = format!(
+                    "[{now}] {msg} — executed by @{}{}",
+                    mention.author,
+                    crate::engine::orch_footer()
+                );
                 if let Err(e) = backend.post_comment(&task_id, &confirmation).await {
                     tracing::warn!(issue = %issue_number, err = %e, "failed to post confirmation");
                 }
@@ -235,7 +239,10 @@ pub async fn scan_commands(
                     err = %e,
                     "failed to execute owner command"
                 );
-                let error_msg = format!("[{now}] Failed to execute `{command}`: {e}");
+                let error_msg = format!(
+                    "[{now}] Failed to execute `{command}`: {e}{}",
+                    crate::engine::orch_footer()
+                );
                 if let Err(e2) = backend.post_comment(&task_id, &error_msg).await {
                     tracing::warn!(issue = %issue_number, err = %e2, "failed to post error comment");
                 }

@@ -147,9 +147,10 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 .post_comment(
                     &task.id,
                     &format!(
-                        "[{}] recovered: stuck in_progress — {}",
+                        "[{}] recovered: stuck in_progress — {}{}",
                         chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                        reason
+                        reason,
+                        crate::engine::orch_footer()
                     ),
                 )
                 .await
@@ -558,8 +559,9 @@ pub(crate) async fn tick_dispatch_tasks(
                             .post_comment(
                                 &ExternalId(task_id.clone()),
                                 &format!(
-                                    "[{}] error: task runner failed: {e}",
+                                    "[{}] error: task runner failed: {e}{}",
                                     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                                    crate::engine::orch_footer()
                                 ),
                             )
                             .await

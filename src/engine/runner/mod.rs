@@ -561,8 +561,10 @@ impl TaskRunner {
 
             // Build child body with delegation reference
             let child_body = format!(
-                "{}\n\n---\n_Delegated from #{}_",
-                delegation.body, parent_id.0
+                "{}\n\n---\n_Delegated from #{}_{}",
+                delegation.body,
+                parent_id.0,
+                crate::engine::orch_footer()
             );
 
             match backend
@@ -603,9 +605,10 @@ impl TaskRunner {
             .post_comment(
                 parent_id,
                 &format!(
-                    "Delegated {} subtask(s):\n\n{}\n\nParent task is blocked until all subtasks complete.",
+                    "Delegated {} subtask(s):\n\n{}\n\nParent task is blocked until all subtasks complete.{}",
                     delegations.len(),
-                    summary
+                    summary,
+                    crate::engine::orch_footer()
                 ),
             )
             .await?;

@@ -287,8 +287,11 @@ pub(crate) async fn check_merged_prs(backend: &Arc<dyn ExternalBackend>) -> anyh
                 }
 
                 // Post comment
-                let comment = "PR merged, marking task complete";
-                if let Err(e) = backend.post_comment(&id, comment).await {
+                let comment = format!(
+                    "PR merged, marking task complete{}",
+                    crate::engine::orch_footer()
+                );
+                if let Err(e) = backend.post_comment(&id, &comment).await {
                     tracing::warn!(task_id, err = %e, "failed to post comment");
                 }
             }
