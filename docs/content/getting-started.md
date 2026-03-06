@@ -1,6 +1,6 @@
 +++
 title = "Getting Started"
-description = "Install orchestrator and run your first task"
+description = "Install orch and run your first task"
 weight = 1
 +++
 
@@ -22,7 +22,7 @@ brew install --cask codex         # Codex (if available)
 brew install opencode             # OpenCode
 ```
 
-Optional: `gh` for GitHub sync (legacy interactive flows), `bats` for tests.
+Optional: `gh` for GitHub sync, `bats` for tests.
 
 ## Quick Start
 
@@ -32,8 +32,8 @@ Optional: `gh` for GitHub sync (legacy interactive flows), `bats` for tests.
 cd ~/projects/my-app
 orch init               # configure project (optional GitHub setup)
 orch task add "title"   # add a task
-orch task next          # route + run next task
-orch start              # start background server
+orch task run <id>      # run a specific task
+orch service start      # start background service
 ```
 
 ### Option B: Any GitHub repo
@@ -41,12 +41,10 @@ orch start              # start background server
 ```bash
 orch project add owner/repo          # bare clone + import issues
 orch task add "title" -p owner/repo  # add a task to that project
-orch start                           # serve loop picks it up
+orch service start                   # service picks it up automatically
 ```
 
 Bare clones live at `~/.orch/projects/<owner>/<repo>.git`. Agents always work in worktrees — never in the main clone. Worktrees are under `~/.orch/worktrees/<project>/<branch>/`.
-
-`orch` is a short alias for `orchestrator` — use `orch` for the lightweight CLI.
 
 ## GitHub Authentication
 
@@ -114,7 +112,7 @@ echo 'export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"' >> ~/.private
 chmod 600 ~/.private
 ```
 
-Runner scripts automatically source `~/.private` if it exists.
+The service sources `~/.private` if it exists.
 
 **Option B — launchd `EnvironmentVariables`** in the plist (for system-wide installs):
 
@@ -140,15 +138,15 @@ All runtime state lives in `~/.orch/` (`ORCH_HOME`):
 
 | File | Description |
 |------|-------------|
-| `tasks.yml` | Task database |
-| `jobs.yml` | Scheduled job definitions |
-| `config.yml` | Runtime configuration |
+| `config.yml` | Global runtime configuration |
+| `orch.db` | SQLite task database (internal tasks, metrics, KV store) |
 | `skills.yml` | Approved skill repositories and catalog |
-| `skills/` | Cloned skill repositories (via `skills-sync`) |
-| `contexts/` | Persisted context files per task/profile |
-| `projects/` | Bare clones added via `project add` |
+| `skills/` | Cloned skill repositories (via `orch skills sync`) |
+| `projects/` | Bare clones added via `orch project add` |
 | `worktrees/` | Agent worktrees (`<project>/<branch>/`) |
-| `.orch/` | Runtime state (pid, logs, locks, output, tool history, prompts) |
+| `state/` | Runtime state (logs, prompts, sidecar JSON, per-task output) |
+
+Per-project config lives at `{project_path}/.orch.yml` (for GitHub repo and job definitions).
 
 Source files:
 
@@ -156,20 +154,16 @@ Source files:
 |------|-------------|
 | `prompts/agent_system.md` | System prompt (workflow, rules, output format) |
 | `prompts/agent_message.md` | Task message (task details, context, memory) |
-| `prompts/agent_memory_entry.md` | Memory entry template (per-attempt learnings) |
-| `prompts/allowed_tools.md` | Tool permissions (appended to system when configured) |
 | `prompts/route.md` | Routing + profile generation prompt |
 | `prompts/review_system.md` | Review agent system prompt |
 | `prompts/review_task.md` | Review task prompt (diff, commits, criteria) |
-| `scripts/*.sh` | Orchestration commands |
-| `tests/orchestrator.bats` | Tests (bats framework) |
 
 ## How It Works
 
-1. **Add a task** to `tasks.yml` (or via `orchestrator task add`).
-2. **Route the task** with an LLM that chooses executor + builds a specialized profile and selects skills.
-3. **Run the task** with the chosen executor in agentic mode. The agent runs inside the worktree (`PROJECT_DIR`) with controlled tool access.
-4. **Output**: the agent writes results to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json` and the orchestrator also writes a machine-side sidecar (`~/.orch/state/{repo}/tasks/{id}/sidecar.json`).
-5. **Review**: if enabled, a different agent reviews the PR and posts a GitHub review.
-6. **Delegation**: if the agent returns `delegations`, child tasks are created and the parent is blocked until children finish.
-7. **Error handling**: if the agent fails or returns `blocked`, the error is commented on the GitHub issue with a `blocked` label.
+1. **Add a task** via `orch task add` (or via a GitHub issue / scheduled job).
+2. **Route the task** — the LLM router chooses executor + builds a specialized profile and selects skills.
+3. **Run the task** — the chosen executor runs in agentic mode inside a tmux session in the task worktree (`PROJECT_DIR`) with controlled tool access.
+4. **Output** — the agent writes results to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json`; the engine writes a sidecar (`~/.orch/state/{repo}/tasks/{id}/sidecar.json`).
+5. **Review** — if enabled, a different agent reviews the PR and posts a GitHub review comment.
+6. **Delegation** — if the agent returns `delegations`, child tasks are created and the parent is blocked until children finish.
+7. **Error handling** — if the agent fails or returns `blocked`, the error is commented on the GitHub issue with a `needs_review` label.
