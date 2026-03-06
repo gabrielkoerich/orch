@@ -2,8 +2,6 @@
 title = "Morning Review — 2026-03-01"
 date = 2026-03-01
 description = "System health check, empty branch guard fix, task status update"
-[taxonomies]
-tags = ["morning-review", "maintenance"]
 +++
 
 ## Overview

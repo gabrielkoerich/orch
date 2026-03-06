@@ -616,16 +616,16 @@ pub(crate) async fn review_and_merge(
                     last_error.clone()
                 };
 
-                // If the task has exhausted all attempts, stop looping and mark done.
+                // If the task has exhausted all attempts, block it.
                 // Continuing to re-route would spin forever since max_attempts is already hit.
                 if last_error.contains("exceeded max attempts") {
                     tracing::warn!(
                         task_id = task.id.0,
                         branch = %branch_name,
-                        "no PR and no commits after max attempts — marking done to stop loop"
+                        "no PR and no commits after max attempts — marking blocked to stop loop"
                     );
                     let _ = task_manager
-                        .update_task_status(&task.id, crate::backends::Status::Done)
+                        .update_task_status(&task.id, crate::backends::Status::Blocked)
                         .await;
                     return Ok(ReviewDecision::Skipped);
                 }

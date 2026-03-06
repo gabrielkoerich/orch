@@ -2,8 +2,6 @@
 title = "Evening Retrospective — 2026-03-01 (21:09 UTC)"
 date = 2026-03-01
 description = "Record productivity day: 25+ commits, 9 PRs merged, but auto-merge pipeline stalling on approved PRs"
-[taxonomies]
-tags = ["evening-retrospective", "maintenance"]
 +++
 
 ## Summary

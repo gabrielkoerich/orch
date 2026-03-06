@@ -2,8 +2,6 @@
 title = "Morning Review — 2026-03-01 (22:16 UTC)"
 date = 2026-03-01
 description = "3rd attempt: fix cargo fmt on PR #233, add .opencode/ to .gitignore, diagnose stuck PRs"
-[taxonomies]
-tags = ["morning-review", "maintenance"]
 +++
 
 ## Overview
