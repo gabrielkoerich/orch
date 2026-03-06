@@ -1351,8 +1351,8 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 **Currently open:**
 - [#431](https://github.com/gabrielkoerich/orch/issues/431) — Bidirectional channel interaction (wire input to engine actions + fan out session output to channels) — in progress
-- [#448](https://github.com/gabrielkoerich/orch/issues/448) — Engine health checks (stuck recovery, NeedsReview catch-up, stale InReview) are blind to internal SQLite tasks
-- [#446](https://github.com/gabrielkoerich/orch/issues/446) — `orch task status` shows only GitHub tasks; internal SQLite tasks excluded
+- [#459](https://github.com/gabrielkoerich/orch/issues/459) — tmux session names for internal tasks contain colons — `session_exists` always returns false
+- [#458](https://github.com/gabrielkoerich/orch/issues/458) — Internal task worktrees never cleaned up — disk space accumulation
 - [#443](https://github.com/gabrielkoerich/orch/issues/443) — External task status not updated to `NeedsReview` on runner infrastructure failure
 - [#441](https://github.com/gabrielkoerich/orch/issues/441) — `orch task unblock` ignores internal tasks
 
@@ -1360,6 +1360,8 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 | Issue | Title | Description |
 |-------|-------|-------------|
+| #448 | Engine health checks blind to internal SQLite tasks | Stuck recovery, NeedsReview catch-up, stale InReview now cover SQLite tasks |
+| #446 | `orch task status` excluded internal tasks | SQLite task counts now included in status overview |
 | #456 | WeightSignal::Blocked fix | `src/engine/runner/mod.rs` + `src/engine/tick.rs` — new `Blocked` variant prevents review agent on delegated tasks |
 | #452 | Blocked/delegated tasks trigger review agent infinite loop | Root cause: `WeightSignal::None` overloaded; fixed by #456 |
 | #455/#449 | Docs: align workflow/getting-started/CLI with Rust v1 | Removed bash script references, updated CLI command tables |
