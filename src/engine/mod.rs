@@ -1276,12 +1276,17 @@ mod tests {
 
     #[tokio::test]
     async fn integration_channel_to_tmux_to_capture() {
-        use crate::channels::transport::Transport;
         use crate::channels::capture::CaptureService;
+        use crate::channels::transport::Transport;
         use std::sync::Arc;
 
         // Skip test if tmux is not available in the environment (CI may not have tmux)
-        if tokio::process::Command::new("tmux").arg("-V").output().await.is_err() {
+        if tokio::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .await
+            .is_err()
+        {
             tracing::warn!("tmux not found, skipping integration_channel_to_tmux_to_capture test");
             return;
         }
@@ -1311,11 +1316,21 @@ mod tests {
         let capture_handle = tokio::spawn(async move { capture_clone.run().await });
 
         // Subscribe to transport output for this task
-        let mut rx = transport.subscribe(&task_id).await.expect("no subscription");
+        let mut rx = transport
+            .subscribe(&task_id)
+            .await
+            .expect("no subscription");
 
         // Send a message into the tmux session via tmux send-keys (simulate channel input)
         let send = tokio::process::Command::new("tmux")
-            .args(["send-keys", "-t", &session_name, "echo from-channel", "Enter"]).output()
+            .args([
+                "send-keys",
+                "-t",
+                &session_name,
+                "echo from-channel",
+                "Enter",
+            ])
+            .output()
             .await
             .expect("failed to send keys");
         assert!(send.status.success());
@@ -1323,7 +1338,9 @@ mod tests {
         // Wait for an output chunk from capture -> transport
         let mut got = false;
         for _ in 0..20 {
-            if let Ok(Ok(c)) = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+            if let Ok(Ok(c)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+            {
                 if c.content.contains("from-channel") {
                     got = true;
                     break;
