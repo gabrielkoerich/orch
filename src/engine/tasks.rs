@@ -171,6 +171,11 @@ impl TaskManager {
         Ok(tasks)
     }
 
+    /// Get all external tasks across all statuses (for status summary).
+    pub async fn list_all_external_tasks(&self) -> anyhow::Result<Vec<ExternalTask>> {
+        self.backend.list_all_tasks().await
+    }
+
     /// Get external tasks by status (for engine use)
     pub async fn list_external_by_status(
         &self,
