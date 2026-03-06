@@ -1274,6 +1274,7 @@ Last updated: 2026-03-03 (366 tests, ~98% parity)
 | Agent memory across retries | `src/sidecar.rs` | PR #122 |
 | Self-improvement loop | `src/engine/jobs.rs` | PR #120 |
 | Polling fallback for webhooks | `src/channels/github.rs` | PR #131 |
+| Throttle concurrent review agents in sync_tick (`max_concurrent_reviews`) | `src/engine/sync.rs`, `src/engine/mod.rs` | Issue #508 |
 
 ### Remaining Gaps
 

@@ -19,7 +19,7 @@ use crate::sidecar::REPO_CONTEXT;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
 use super::review::{review_and_merge, review_open_prs, ReviewDecision};
@@ -91,6 +91,9 @@ pub(crate) async fn sync_tick(
             }
         }
 
+        // Semaphore to cap concurrent review agents — prevents thundering herd when
+        // the backlog is large (e.g. 79 tasks all firing ~300+ GitHub API calls at once).
+        let review_sem = Arc::new(Semaphore::new(config.max_concurrent_reviews.max(1)));
         for task in needs_review_tasks {
             let task_id = &task.id.0;
             tracing::info!(task_id, "triggering review agent for needs_review task");
@@ -110,7 +113,12 @@ pub(crate) async fn sync_tick(
             let repo_s = repo.to_string();
             let router_c = router.clone();
             let repo_ctx = repo_s.clone();
+            let sem_c = review_sem.clone();
             tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
+                // Acquire permit before running the review agent.
+                // This is held for the duration of the task so only
+                // max_concurrent_reviews agents run simultaneously.
+                let _permit = sem_c.acquire_owned().await;
                 let tid = task_c.id.0.clone();
                 let needs_reset = match review_and_merge(
                     &task_c,

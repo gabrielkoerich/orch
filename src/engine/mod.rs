@@ -75,6 +75,8 @@ pub struct EngineConfig {
     pub webhook_health_check_interval: Option<std::time::Duration>,
     /// Maximum parallel task executions
     pub max_parallel: usize,
+    /// Maximum concurrent review agents per sync batch (default: same as max_parallel)
+    pub max_concurrent_reviews: usize,
     /// Stuck task timeout for tasks with an active tmux session (seconds)
     pub stuck_timeout: u64,
     /// Stuck task timeout for tasks with no active tmux session (seconds).
@@ -96,6 +98,7 @@ impl Default for EngineConfig {
             sync_interval: std::time::Duration::from_secs(45),
             webhook_health_check_interval: Some(std::time::Duration::from_secs(60)),
             max_parallel: 4,
+            max_concurrent_reviews: 4,
             stuck_timeout: 1800,
             no_session_stuck_timeout: 600,
             auto_create_followup_on_changes: true,
@@ -125,6 +128,14 @@ impl EngineConfig {
         if let Ok(val) = crate::config::get("engine.max_parallel") {
             if let Ok(n) = val.parse::<usize>() {
                 config.max_parallel = n;
+                // max_concurrent_reviews defaults to max_parallel unless overridden
+                config.max_concurrent_reviews = n;
+            }
+        }
+
+        if let Ok(val) = crate::config::get("engine.max_concurrent_reviews") {
+            if let Ok(n) = val.parse::<usize>() {
+                config.max_concurrent_reviews = n;
             }
         }
 
