@@ -139,12 +139,22 @@ impl Router {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        // Try to find an agent that isn't the excluded one
+        // Try to find an agent that isn't excluded and isn't in cooldown
         let n = self.available_agents.len();
         let agent = (0..n)
             .map(|offset| &self.available_agents[(idx + offset) % n])
-            .find(|a| exclude != Some(a.as_str()))
+            .find(|a| {
+                exclude != Some(a.as_str())
+                    && !crate::engine::runner::response::is_agent_in_cooldown(a)
+            })
             .cloned()
+            // Fallback: ignore cooldown if all agents are cooled down
+            .or_else(|| {
+                (0..n)
+                    .map(|offset| &self.available_agents[(idx + offset) % n])
+                    .find(|a| exclude != Some(a.as_str()))
+                    .cloned()
+            })
             .or_else(|| self.available_agents.get(idx % n).cloned())?;
 
         let next = (idx + 1) % n;

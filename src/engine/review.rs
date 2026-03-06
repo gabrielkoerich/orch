@@ -748,6 +748,19 @@ pub(crate) async fn review_and_merge(
     // Abort on hard agent errors (non-zero exit, rate limit, auth, etc.)
     if exit_code != 0 || raw_output.is_empty() {
         let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
+        let err_str = err.to_string();
+        // Put rate-limited agents in cooldown so the round-robin skips them next time.
+        if err_str.contains("rate limit")
+            || err_str.contains("usage limit")
+            || err_str.contains("rate_limit")
+        {
+            tracing::warn!(
+                task_id = task.id.0,
+                agent = %review_agent,
+                "review agent hit rate limit — adding to cooldown"
+            );
+            runner::response::record_agent_failure(&review_agent);
+        }
         tracing::error!(task_id = task.id.0, error = %err, "review agent failed");
         return Ok(ReviewDecision::Failed(format!("agent error: {err}")));
     }
