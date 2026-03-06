@@ -113,7 +113,12 @@ pub(crate) async fn sync_tick(
             tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                 let tid = task_c.id.0.clone();
                 let needs_reset = match review_and_merge(
-                    &task_c, &backend_c, &tmux_c, &repo_s, &router_c, &task_manager_c,
+                    &task_c,
+                    &backend_c,
+                    &tmux_c,
+                    &repo_s,
+                    &router_c,
+                    &task_manager_c,
                 )
                 .await
                 {
