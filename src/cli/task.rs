@@ -139,12 +139,9 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
 
 /// Show task status summary.
 pub async fn status(json: bool) -> anyhow::Result<()> {
-    use crate::backends::github::GitHubBackend;
-    use crate::backends::ExternalBackend;
+    use crate::db::TaskStatus;
 
-    let repo =
-        config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+    let task_manager = init_task_manager().await?;
 
     let statuses = [
         Status::New,
@@ -156,42 +153,72 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         Status::NeedsReview,
     ];
 
-    // Fetch all tasks in a single API call, then filter locally
-    let all_tasks = backend.list_all_tasks().await?;
+    // Fetch all tasks from both backends
+    let all_external = task_manager.list_all_external_tasks().await?;
+    let all_internal = task_manager.db.list_all_internal_tasks().await?;
 
-    let mut counts = Vec::new();
-    for s in &statuses {
-        let label = s.as_label();
-        let filtered: Vec<_> = all_tasks
-            .iter()
-            .filter(|t| t.labels.contains(&label.to_string()))
-            .collect();
-        counts.push((s, filtered.len()));
-    }
+    // Count external tasks per status via labels
+    let ext_counts: Vec<usize> = statuses
+        .iter()
+        .map(|s| {
+            let label = s.as_label().to_string();
+            all_external
+                .iter()
+                .filter(|t| t.labels.contains(&label))
+                .count()
+        })
+        .collect();
 
-    // Calculate total cost across all tasks (reuse the fetched data)
+    // Count internal tasks per status
+    let int_counts: Vec<usize> = statuses
+        .iter()
+        .map(|s| {
+            let ts = match s {
+                Status::New => TaskStatus::New,
+                Status::Routed => TaskStatus::Routed,
+                Status::InProgress => TaskStatus::InProgress,
+                Status::Done => TaskStatus::Done,
+                Status::Blocked => TaskStatus::Blocked,
+                Status::InReview => TaskStatus::InReview,
+                Status::NeedsReview => TaskStatus::NeedsReview,
+            };
+            all_internal.iter().filter(|t| t.status == ts).count()
+        })
+        .collect();
+
+    // Calculate total cost across all external tasks
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
     let mut total_cost: f64 = 0.0;
 
-    for task in &all_tasks {
+    for task in &all_external {
         total_input_tokens += sidecar::get_u64(&task.id.0, "input_tokens");
         total_output_tokens += sidecar::get_u64(&task.id.0, "output_tokens");
         total_cost += sidecar::get_f64(&task.id.0, "total_cost_usd");
     }
+    for task in &all_internal {
+        let id = format!("internal:{}", task.id);
+        total_input_tokens += sidecar::get_u64(&id, "input_tokens");
+        total_output_tokens += sidecar::get_u64(&id, "output_tokens");
+        total_cost += sidecar::get_f64(&id, "total_cost_usd");
+    }
 
     if json {
-        let mut map: serde_json::Map<String, serde_json::Value> = counts
-            .iter()
-            .map(|(s, c)| {
-                (
-                    s.as_label().replace("status:", ""),
-                    serde_json::Value::Number((*c).into()),
-                )
-            })
-            .collect();
+        let mut map = serde_json::Map::new();
+        for (i, s) in statuses.iter().enumerate() {
+            let key = s.as_label().replace("status:", "");
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "external".to_string(),
+                serde_json::Value::Number(ext_counts[i].into()),
+            );
+            entry.insert(
+                "internal".to_string(),
+                serde_json::Value::Number(int_counts[i].into()),
+            );
+            map.insert(key, serde_json::Value::Object(entry));
+        }
 
-        // Add cost summary
         map.insert(
             "total_cost_usd".to_string(),
             serde_json::Value::Number(
@@ -213,16 +240,24 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
 
         println!("{}", serde_json::to_string_pretty(&map)?);
     } else {
-        println!("{:<20} COUNT", "STATUS");
-        println!("{}", "-".repeat(30));
-        let total: usize = counts.iter().map(|(_, c)| c).sum();
-        for (s, count) in &counts {
-            if *count > 0 {
-                println!("{:<20} {}", s.as_label().replace("status:", ""), count);
+        println!("{:<20} {:>8}  {:>8}", "STATUS", "EXTERNAL", "INTERNAL");
+        println!("{}", "-".repeat(42));
+        let total_ext: usize = ext_counts.iter().sum();
+        let total_int: usize = int_counts.iter().sum();
+        for (i, s) in statuses.iter().enumerate() {
+            let ext = ext_counts[i];
+            let int = int_counts[i];
+            if ext > 0 || int > 0 {
+                println!(
+                    "{:<20} {:>8}  {:>8}",
+                    s.as_label().replace("status:", ""),
+                    ext,
+                    int
+                );
             }
         }
-        println!("{}", "-".repeat(30));
-        println!("{:<20} {}", "total", total);
+        println!("{}", "-".repeat(42));
+        println!("{:<20} {:>8}  {:>8}", "total", total_ext, total_int);
 
         // Show cost summary if any
         if total_cost > 0.0 {

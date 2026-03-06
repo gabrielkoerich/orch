@@ -1,19 +1,13 @@
 use crate::backends::Status;
-use crate::config;
+use crate::cli::init_task_manager;
+use crate::db::TaskStatus;
 use crate::sidecar;
 use crate::tmux::TmuxManager;
-use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
 
 /// Simple dashboard command combining task status, active sessions, and recent activity.
 pub async fn dashboard() -> anyhow::Result<()> {
-    // Tasks summary (uses external backend)
-    use crate::backends::github::GitHubBackend;
-    use crate::backends::ExternalBackend;
-
-    let repo = config::get_current_repo()
-        .with_context(|| "'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Box<dyn ExternalBackend> = Box::new(GitHubBackend::new(repo.clone()));
+    let task_manager = init_task_manager().await?;
 
     let statuses = [
         Status::New,
@@ -25,34 +19,53 @@ pub async fn dashboard() -> anyhow::Result<()> {
         Status::Blocked,
     ];
 
-    // Fetch all tasks in a single API call, then filter locally
-    let all_tasks = backend.list_all_tasks().await?;
+    // Fetch all tasks from both backends
+    let all_external = task_manager.list_all_external_tasks().await?;
+    let all_internal = task_manager.db.list_all_internal_tasks().await?;
 
-    let mut counts: Vec<(Status, usize)> = Vec::new();
+    let mut counts: Vec<(Status, usize, usize)> = Vec::new(); // (status, external, internal)
     let mut total = 0usize;
     let mut done_tasks = Vec::new();
     for s in &statuses {
         let label = s.as_label();
-        let filtered: Vec<_> = all_tasks
+        let ext_filtered: Vec<_> = all_external
             .iter()
             .filter(|t| t.labels.contains(&label.to_string()))
             .cloned()
             .collect();
-        total += filtered.len();
-        counts.push((*s, filtered.len()));
+        let ts = match s {
+            Status::New => TaskStatus::New,
+            Status::Routed => TaskStatus::Routed,
+            Status::InProgress => TaskStatus::InProgress,
+            Status::Done => TaskStatus::Done,
+            Status::Blocked => TaskStatus::Blocked,
+            Status::InReview => TaskStatus::InReview,
+            Status::NeedsReview => TaskStatus::NeedsReview,
+        };
+        let int_count = all_internal.iter().filter(|t| t.status == ts).count();
+        total += ext_filtered.len() + int_count;
+        counts.push((*s, ext_filtered.len(), int_count));
         if *s == Status::Done {
-            done_tasks = filtered;
+            done_tasks = ext_filtered;
         }
     }
 
     println!("Tasks ({} total)", total);
 
-    for (s, count) in &counts {
-        println!(
-            "  {:<12} {:>3} ",
-            s.as_label().replace("status:", ""),
-            count
-        );
+    for (s, ext, int) in &counts {
+        let count = ext + int;
+        if count > 0 {
+            println!(
+                "  {:<12} {:>3}{}",
+                s.as_label().replace("status:", ""),
+                count,
+                if *int > 0 {
+                    format!(" ({} internal)", int)
+                } else {
+                    String::new()
+                }
+            );
+        }
     }
 
     println!("\nActive Sessions");
