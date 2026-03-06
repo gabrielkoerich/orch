@@ -12,6 +12,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Run Rust formatting, lints, and test suite with code coverage.
+  # Produces an lcov artifact and posts a coverage report on PRs.
+  # Uses cargo-llvm-cov for line/branch coverage — cheaper than tarpaulin.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -59,6 +62,9 @@ jobs:
           lcov-file: lcov.info
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+  # Scan the full git history for accidentally committed secrets (tokens, keys).
+  # Runs gitleaks with the project's .gitleaks.toml allowlist to suppress
+  # known false positives. fetch-depth: 0 is required for full-history scans.
   secrets:
     runs-on: ubuntu-latest
     steps:
