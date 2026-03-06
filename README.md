@@ -272,8 +272,8 @@ agents:
     models: [...]          # Available models
 
 git:
-  name: "orchestrator[bot]"
-  email: "orchestrator@orchestrator.bot"
+  name: "orch[bot]"
+  email: "orch@orch.bot"
 ```
 
 ### Project config (`.orch.yml`)
