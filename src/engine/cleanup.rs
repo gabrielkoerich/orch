@@ -207,9 +207,13 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
     }
 
     // Fallback: try bare clone in ~/.orch/projects/
-    let bare = crate::home::projects_dir()
-        .map(|d| d.join(repo.replace('/', "__")))
-        .unwrap_or_default();
+    // Bare clones are stored as ~/.orch/projects/<owner>/<repo>.git (see cli/mod.rs project_add_github)
+    let bare = match repo.split_once('/') {
+        Some((owner, name)) => crate::home::projects_dir()
+            .map(|d| d.join(owner).join(format!("{name}.git")))
+            .unwrap_or_default(),
+        None => std::path::PathBuf::new(),
+    };
     if bare.exists() {
         return Ok(bare.display().to_string());
     }
