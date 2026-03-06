@@ -225,7 +225,7 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
         }
     }
 
-    // Fallback: try bare clone in ~/.orch/projects/
+    // Fallback: try bare clone in ~/.orch/projects/<owner>/<repo>.git
     let parts: Vec<&str> = repo.split('/').collect();
     let bare = if parts.len() == 2 {
         crate::home::projects_dir()
