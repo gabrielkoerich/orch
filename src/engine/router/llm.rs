@@ -87,9 +87,6 @@ impl LlmRouter {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
         let _ = tokio::fs::write(&prompt_path, &prompt).await;
-        // Prune old debug files so the state dir doesn't grow indefinitely.
-        // This is best-effort and should never fail the routing operation.
-        let _ = self.prune_old_debug_files(50, "route-prompt-").await;
 
         // Call the LLM router
         let response = self.call_router_llm(&prompt, config).await?;
@@ -106,8 +103,12 @@ impl LlmRouter {
             crate::home::state_dir().map(|d| d.join(format!("route-response-{}.txt", task.id.0)));
         if let Ok(path) = response_path {
             let _ = std::fs::write(&path, &response);
-            // Prune old debug files for responses as well.
-            let _ = self.prune_old_debug_files(50, "route-response-").await;
+        }
+
+        // Prune old debug files — keep only the 50 most recent of each type
+        if let Ok(state_dir) = crate::home::state_dir() {
+            prune_route_debug_files(&state_dir, "route-prompt-", 50).await;
+            prune_route_debug_files(&state_dir, "route-response-", 50).await;
         }
 
         // Parse the response
@@ -485,63 +486,41 @@ impl LlmRouter {
             .unwrap_or_else(|_| PathBuf::from("/tmp").join(".orch").join(".orch"))
             .join(format!("route-prompt-{task_id}.txt"))
     }
+}
 
-    /// Prune old route-* debug files from the state dir.
-    /// Keeps the `keep` most-recent files whose file names start with `prefix`.
-    /// Best-effort: any errors are logged and ignored so routing is not impacted.
-    async fn prune_old_debug_files(&self, keep: usize, prefix: &str) -> anyhow::Result<()> {
-        use std::cmp::Reverse;
-        use std::time::SystemTime;
+/// Prune route debug files matching `{state_dir}/{prefix}*.txt`, keeping only the `keep` most
+/// recent (by mtime). Files that cannot be stat'd are treated as oldest and removed first.
+async fn prune_route_debug_files(state_dir: &std::path::Path, prefix: &str, keep: usize) {
+    let suffix = ".txt";
+    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
 
-        // Resolve state dir (fall back to /tmp if home lookup fails to match route_prompt_path behaviour)
-        let state_dir = match crate::home::state_dir() {
-            Ok(d) => d,
-            Err(_) => PathBuf::from("/tmp").join(".orch").join(".orch"),
-        };
+    let mut read_dir = match tokio::fs::read_dir(state_dir).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
 
-        // Do the potentially-blocking directory listing/metadata work in a blocking task
-        let state_dir_clone = state_dir.clone();
-        let prefix = prefix.to_string();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
+    while let Ok(Some(entry)) = read_dir.next_entry().await {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(prefix) && name_str.ends_with(suffix) {
+            let mtime = entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            entries.push((mtime, entry.path()));
+        }
+    }
 
-            if let Ok(read_dir) = std::fs::read_dir(&state_dir_clone) {
-                for entry in read_dir.flatten() {
-                    let path = entry.path();
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with(&prefix) {
-                            let mtime = entry
-                                .metadata()
-                                .and_then(|m| m.modified())
-                                .unwrap_or(SystemTime::UNIX_EPOCH);
-                            entries.push((path, mtime));
-                        }
-                    }
-                }
-            }
+    if entries.len() <= keep {
+        return;
+    }
 
-            // If there are <= keep entries, nothing to do
-            if entries.len() <= keep {
-                return Ok(());
-            }
-
-            // Sort by modified time (newest first)
-            entries.sort_by_key(|(_, t)| Reverse(*t));
-
-            // Delete entries after the first `keep`
-            for (path, _) in entries.into_iter().skip(keep) {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    tracing::warn!(file = %path.display(), error = ?e, "failed to prune debug file");
-                } else {
-                    tracing::info!(file = %path.display(), "pruned old debug file");
-                }
-            }
-
-            Ok(())
-        })
-        .await??;
-
-        Ok(())
+    // Sort newest-first; truncate to keep, then delete the rest
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in entries.into_iter().skip(keep) {
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }
 
