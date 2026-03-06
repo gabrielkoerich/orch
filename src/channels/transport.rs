@@ -134,6 +134,11 @@ impl Transport {
         last.get(task_id).cloned()
     }
 
+    /// Get the session binding for a specific task, if any.
+    pub async fn get_binding(&self, task_id: &str) -> Option<SessionBinding> {
+        self.bindings.read().await.get(task_id).cloned()
+    }
+
     /// Route an incoming message to the appropriate handler.
     /// Returns the task_id if this message maps to an existing session.
     pub async fn route(&self, msg: &IncomingMessage) -> MessageRoute {
