@@ -530,9 +530,10 @@ pub(crate) async fn tick_dispatch_tasks(
                                 .await;
                         }
                     } else {
-                        // done or new (rate-limited): update status directly.
+                        // done, blocked, or new (rate-limited): update status directly.
                         let final_status = match display_status {
                             "done" => Status::Done,
+                            "blocked" => Status::Blocked,
                             _ => Status::New,
                         };
                         if let Err(e) = task_manager_for_spawn
