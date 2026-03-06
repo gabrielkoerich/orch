@@ -163,6 +163,51 @@ pub(crate) async fn tick_recover_stuck_tasks(
             }
         }
     }
+
+    // Recover internal (SQLite) tasks stuck in in_progress.
+    // These have no GitHub labels or comments — just reset the DB status to New.
+    use crate::db::TaskStatus as DbStatus;
+    let internal_in_progress = task_manager
+        .db_list_internal_by_status(DbStatus::InProgress)
+        .await?;
+    for task in &internal_in_progress {
+        let task_id = format!("internal:{}", task.id);
+        let session_name = tmux.session_name(repo, &task_id);
+        let has_session = tmux.session_exists(&session_name).await;
+
+        let threshold = if has_session {
+            config.stuck_timeout
+        } else {
+            config.no_session_stuck_timeout
+        };
+
+        let age = chrono::Utc::now() - task.updated_at;
+
+        if age.num_seconds() > threshold as i64 {
+            if has_session {
+                tracing::warn!(
+                    task_id,
+                    age_mins = age.num_minutes(),
+                    threshold_mins = threshold / 60,
+                    "recovering stuck internal task: timed out with active session → new"
+                );
+            } else {
+                tracing::warn!(
+                    task_id,
+                    age_mins = age.num_minutes(),
+                    threshold_mins = threshold / 60,
+                    "recovering stuck internal task: no session found — reclaiming early → new"
+                );
+            }
+            if let Err(e) = task_manager
+                .update_task_status(&ExternalId(task_id.clone()), Status::New)
+                .await
+            {
+                tracing::warn!(task_id, ?e, "failed to reset stuck internal task status");
+            }
+        }
+    }
+
     Ok(())
 }
 
