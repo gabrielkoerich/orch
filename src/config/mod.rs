@@ -371,6 +371,9 @@ pub fn find_project_root() -> anyhow::Result<std::path::PathBuf> {
 ///
 /// Walks up from CWD to find `.orch.yml`, reads `gh.repo` from it.
 /// Falls back to global `gh.repo` for backward compatibility.
+/// Final fallback: iterates configured `projects:` list and returns the first
+/// repo found — this allows the engine service (CWD = `/`) to resolve the repo
+/// without needing `.orch.yml` in the working directory.
 pub fn get_current_repo() -> anyhow::Result<String> {
     // Try to find project root from CWD
     if let Ok(project_root) = find_project_root() {
@@ -390,6 +393,16 @@ pub fn get_current_repo() -> anyhow::Result<String> {
     if let Ok(repo) = get("repo") {
         if !repo.is_empty() {
             return Ok(repo);
+        }
+    }
+
+    // Final fallback: iterate configured project paths (supports engine service running at CWD `/`)
+    if let Ok(paths) = get_project_paths() {
+        for path_str in &paths {
+            let path = std::path::PathBuf::from(path_str);
+            if let Ok(repo) = get_repo_for_project(&path) {
+                return Ok(repo);
+            }
         }
     }
 
