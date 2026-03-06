@@ -337,6 +337,28 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 pub async fn retry(id: i64) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::db::{Db, TaskStatus};
+    use crate::home;
+
+    // Check if this is an internal task in the DB first.
+    let db_path = home::db_path().context("could not resolve DB path")?;
+    let db = Db::open(&db_path)?;
+    if let Ok(task) = db.get_internal_task(id).await {
+        let internal_id = format!("internal:{}", task.id);
+        // Reset sidecar
+        crate::sidecar::set(
+            &internal_id,
+            &["attempts=0".to_string(), "route_attempts=0".to_string()],
+        )
+        .ok();
+        // Reset DB status to New
+        db.update_internal_task_status(id, TaskStatus::New).await?;
+        println!(
+            "Task #{} reset to new (attempts reset, will be re-routed)",
+            id
+        );
+        return Ok(());
+    }
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
