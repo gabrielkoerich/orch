@@ -9,11 +9,12 @@
 //! - Owner /slash command scanning
 //! - Skill repository syncing
 
-use crate::backends::{ExternalBackend, ExternalId, Status};
+use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::Router;
+use crate::engine::tasks::TaskManager;
 use crate::sidecar::REPO_CONTEXT;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
@@ -37,11 +38,12 @@ pub(crate) async fn sync_tick(
     db: &Arc<Db>,
     config: &EngineConfig,
     router: &Arc<RwLock<Router>>,
+    task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
 
     // 1. Cleanup worktrees for done tasks
-    if let Err(e) = cleanup_done_worktrees(backend, repo).await {
+    if let Err(e) = cleanup_done_worktrees(backend, repo, task_manager).await {
         tracing::warn!(err = %e, "worktree cleanup failed");
     }
 
@@ -65,68 +67,127 @@ pub(crate) async fn sync_tick(
         .map(|v| v != "false")
         .unwrap_or(true);
     if enable_review {
-        if let Ok(needs_review) = backend.list_by_status(Status::NeedsReview).await {
-            for task in needs_review {
-                let task_id = &task.id.0;
-                tracing::info!(task_id, "triggering review agent for needs_review task");
-                // Transition to InReview — this IS the atomic guard against duplicates.
-                // The GitHub label update is idempotent; if another dispatch already claimed
-                // this task it will already be InReview and this update is a no-op.
-                if let Err(e) = backend.update_status(&task.id, Status::InReview).await {
-                    tracing::warn!(task_id, err = %e, "failed to transition to InReview");
-                    continue;
-                }
-                let backend_c = backend.clone();
-                let tmux_c = tmux.clone();
-                let task_c = task.clone();
-                let repo_s = repo.to_string();
-                let router_c = router.clone();
-                let repo_ctx = repo_s.clone();
-                tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
-                    let tid = task_c.id.0.clone();
-                    let needs_reset =
-                        match review_and_merge(&task_c, &backend_c, &tmux_c, &repo_s, &router_c)
-                            .await
-                        {
-                            Ok(ReviewDecision::Failed(reason)) => {
-                                tracing::error!(
-                                    task_id = tid,
-                                    reason,
-                                    "review agent failed — resetting to NeedsReview for retry"
-                                );
-                                true
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    task_id = tid, error = %e,
-                                    "review_and_merge failed — resetting to NeedsReview for retry"
-                                );
-                                true
-                            }
-                            Ok(_) => false,
-                        };
-                    if needs_reset {
-                        reset_to_needs_review_with_retry(&backend_c, &tid).await;
-                    }
-                }));
+        // Collect all NeedsReview tasks: external + internal.
+        let mut needs_review_tasks = backend
+            .list_by_status(Status::NeedsReview)
+            .await
+            .unwrap_or_default();
+        if let Ok(internal_needs_review) = task_manager
+            .db_list_internal_by_status(TaskStatus::NeedsReview)
+            .await
+        {
+            for t in internal_needs_review {
+                needs_review_tasks.push(ExternalTask {
+                    id: ExternalId(format!("internal:{}", t.id)),
+                    title: t.title,
+                    body: t.body,
+                    state: "open".to_string(),
+                    labels: vec!["status:needs_review".to_string()],
+                    author: t.source,
+                    created_at: t.created_at.to_rfc3339(),
+                    updated_at: t.updated_at.to_rfc3339(),
+                    url: String::new(),
+                });
             }
         }
 
-        // Detect stale InReview tasks (review agent crashed, no active tmux session).
-        if let Ok(in_review) = backend.list_by_status(Status::InReview).await {
-            for task in in_review {
-                let review_task_id = format!("{}-review", task.id.0);
-                let review_session = tmux.session_name(repo, &review_task_id);
-                let has_session = tmux.session_exists(&review_session).await;
-                if !has_session {
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        session = %review_session,
-                        "InReview task has no active review session — resetting to NeedsReview"
-                    );
-                    if let Err(e) = backend.update_status(&task.id, Status::NeedsReview).await {
-                        tracing::error!(task_id = %task.id.0, err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
+        for task in needs_review_tasks {
+            let task_id = &task.id.0;
+            tracing::info!(task_id, "triggering review agent for needs_review task");
+            // Transition to InReview — this IS the atomic guard against duplicates.
+            // For internal tasks, task_manager routes to SQLite; for external to GitHub labels.
+            if let Err(e) = task_manager
+                .update_task_status(&task.id, Status::InReview)
+                .await
+            {
+                tracing::warn!(task_id, err = %e, "failed to transition to InReview");
+                continue;
+            }
+            let backend_c = backend.clone();
+            let task_manager_c = task_manager.clone();
+            let tmux_c = tmux.clone();
+            let task_c = task.clone();
+            let repo_s = repo.to_string();
+            let router_c = router.clone();
+            let repo_ctx = repo_s.clone();
+            tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
+                let tid = task_c.id.0.clone();
+                let needs_reset = match review_and_merge(
+                    &task_c, &backend_c, &tmux_c, &repo_s, &router_c,
+                )
+                .await
+                {
+                    Ok(ReviewDecision::Failed(reason)) => {
+                        tracing::error!(
+                            task_id = tid,
+                            reason,
+                            "review agent failed — resetting to NeedsReview for retry"
+                        );
+                        true
                     }
+                    Err(e) => {
+                        tracing::error!(
+                            task_id = tid, error = %e,
+                            "review_and_merge failed — resetting to NeedsReview for retry"
+                        );
+                        true
+                    }
+                    Ok(_) => false,
+                };
+                if needs_reset {
+                    if tid.starts_with("internal:") {
+                        // Internal tasks: update SQLite via task_manager.
+                        let _ = task_manager_c
+                            .update_task_status(&ExternalId(tid.clone()), Status::NeedsReview)
+                            .await;
+                    } else {
+                        // External tasks: retry with backoff.
+                        reset_to_needs_review_with_retry(&backend_c, &tid).await;
+                    }
+                }
+            }));
+        }
+
+        // Detect stale InReview tasks (review agent crashed, no active tmux session).
+        // Check external tasks.
+        let mut in_review_tasks = backend
+            .list_by_status(Status::InReview)
+            .await
+            .unwrap_or_default();
+        // Also include internal InReview tasks.
+        if let Ok(internal_in_review) = task_manager
+            .db_list_internal_by_status(TaskStatus::InReview)
+            .await
+        {
+            for t in internal_in_review {
+                in_review_tasks.push(ExternalTask {
+                    id: ExternalId(format!("internal:{}", t.id)),
+                    title: t.title,
+                    body: t.body,
+                    state: "open".to_string(),
+                    labels: vec!["status:in_review".to_string()],
+                    author: t.source,
+                    created_at: t.created_at.to_rfc3339(),
+                    updated_at: t.updated_at.to_rfc3339(),
+                    url: String::new(),
+                });
+            }
+        }
+        for task in in_review_tasks {
+            let review_task_id = format!("{}-review", task.id.0);
+            let review_session = tmux.session_name(repo, &review_task_id);
+            let has_session = tmux.session_exists(&review_session).await;
+            if !has_session {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    session = %review_session,
+                    "InReview task has no active review session — resetting to NeedsReview"
+                );
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::NeedsReview)
+                    .await
+                {
+                    tracing::error!(task_id = %task.id.0, err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
                 }
             }
         }

@@ -22,7 +22,7 @@ pub mod sync;
 pub mod tasks;
 pub mod tick;
 
-use crate::backends::ExternalBackend;
+use crate::backends::{ExternalBackend, ExternalId};
 use crate::channels::capture::CaptureService;
 use crate::channels::discord_ws::DiscordGateway;
 use crate::channels::github::start_webhook_server;
@@ -675,6 +675,36 @@ pub async fn serve() -> anyhow::Result<()> {
                 );
             }
         }
+
+        // Also reset internal (SQLite) InReview tasks on startup.
+        use crate::db::TaskStatus as DbStatus;
+        if let Ok(internal_in_review) = engine
+            .task_manager
+            .db_list_internal_by_status(DbStatus::InReview)
+            .await
+        {
+            for task in &internal_in_review {
+                let task_id = format!("internal:{}", task.id);
+                if let Err(e) = engine
+                    .task_manager
+                    .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
+                    .await
+                {
+                    tracing::warn!(
+                        task_id,
+                        err = %e,
+                        "failed to reset stale internal InReview task on startup"
+                    );
+                }
+            }
+            if !internal_in_review.is_empty() {
+                tracing::info!(
+                    repo = %engine.repo,
+                    count = internal_in_review.len(),
+                    "reset stale internal InReview tasks to NeedsReview on startup"
+                );
+            }
+        }
     }
 
     // Main loop
@@ -793,7 +823,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         for engine in &project_engines {
                             let repo = engine.repo.clone();
                             REPO_CONTEXT.scope(repo, async {
-                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config, &router).await {
+                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config, &router, &engine.task_manager).await {
                                     tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
                                 }
                             }).await;
