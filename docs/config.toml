@@ -6,6 +6,10 @@ description = "A multi-agent task orchestrator for AI coding agents"
 default_language = "en"
 minify_html = true
 
+taxonomies = [
+    {name = "tags", feed = false},
+]
+
 [markdown]
 [markdown.highlighting]
 style = "class"
