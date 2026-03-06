@@ -405,95 +405,95 @@ pub(crate) async fn tick_dispatch_tasks(
                     // Send weight signal back to the router
                     let _ = weight_tx.send(signal).await;
 
-                    // For internal tasks: update DB status and skip GitHub-specific ops.
-                    if is_internal_id(&task_id) {
+                    // All tasks: if needs_review, trigger the review agent.
+                    // Status updates go through task_manager so internal tasks
+                    // hit SQLite while external tasks hit GitHub labels.
+                    if display_status == "needs_review" {
+                        let enable_review = config::get("workflow.enable_review_agent")
+                            .map(|v| v != "false")
+                            .unwrap_or(true);
+                        tracing::info!(task_id, enable_review, "review gate check");
+                        if enable_review {
+                            // Transition to InReview — atomic guard against duplicate reviews.
+                            match task_manager_for_spawn
+                                .update_task_status(
+                                    &ExternalId(task_id.clone()),
+                                    Status::InReview,
+                                )
+                                .await
+                            {
+                                Err(e) => {
+                                    tracing::warn!(task_id, err = %e, "failed to transition to InReview");
+                                }
+                                Ok(_) => {
+                                    let backend_clone = backend.clone();
+                                    let task_manager_for_review = task_manager_for_spawn.clone();
+                                    let tmux_clone = tmux.clone();
+                                    let task_owned_clone = task_owned.clone();
+                                    let router_for_review = router_clone.clone();
+                                    let task_id_for_review = task_id.clone();
+                                    let repo_ctx = repo_owned.clone();
+                                    tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
+                                        match review_and_merge(
+                                            &task_owned_clone,
+                                            &backend_clone,
+                                            &tmux_clone,
+                                            &repo_owned,
+                                            &router_for_review,
+                                        )
+                                        .await
+                                        {
+                                            Ok(ReviewDecision::Failed(reason)) => {
+                                                tracing::error!(
+                                                    task_id = task_id_for_review,
+                                                    reason,
+                                                    "review agent failed — resetting to NeedsReview for retry"
+                                                );
+                                                let _ = task_manager_for_review
+                                                    .update_task_status(
+                                                        &ExternalId(task_id_for_review.clone()),
+                                                        Status::NeedsReview,
+                                                    )
+                                                    .await;
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    task_id = task_id_for_review,
+                                                    error = %e,
+                                                    "review_and_merge failed — resetting to NeedsReview for retry"
+                                                );
+                                                let _ = task_manager_for_review
+                                                    .update_task_status(
+                                                        &ExternalId(task_id_for_review.clone()),
+                                                        Status::NeedsReview,
+                                                    )
+                                                    .await;
+                                            }
+                                            Ok(_) => {} // Approve or RequestChanges handled inside
+                                        }
+                                    }));
+                                }
+                            }
+                        } else {
+                            // Review disabled: persist needs_review status.
+                            let _ = task_manager_for_spawn
+                                .update_task_status(
+                                    &ExternalId(task_id.clone()),
+                                    Status::NeedsReview,
+                                )
+                                .await;
+                        }
+                    } else {
+                        // done or new (rate-limited): update status directly.
                         let final_status = match display_status {
                             "done" => Status::Done,
-                            "new" => Status::New,
-                            _ => Status::NeedsReview,
+                            _ => Status::New,
                         };
                         if let Err(e) = task_manager_for_spawn
                             .update_task_status(&ExternalId(task_id.clone()), final_status)
                             .await
                         {
-                            tracing::warn!(task_id, ?e, "failed to update internal task status after completion");
-                        }
-                    } else {
-                        // Trigger review agent for needs_review tasks (PR exists, queued for review).
-                        // WeightSignal::None indicates the task needs attention (needs_review or failed);
-                        // the review gate handles the "no PR" case by re-routing the task.
-                        if display_status == "needs_review" {
-                            let enable_review = config::get("workflow.enable_review_agent")
-                                .map(|v| v != "false")
-                                .unwrap_or(true);
-                            tracing::info!(task_id, enable_review, "review gate check");
-                            if enable_review {
-                                // Transition to InReview — this IS the atomic guard against duplicates.
-                                // The GitHub label update is idempotent; if the task is already InReview
-                                // no duplicate review will be spawned.
-                                match backend
-                                    .update_status(
-                                        &ExternalId(task_id.clone()),
-                                        Status::InReview,
-                                    )
-                                    .await
-                                {
-                                    Err(e) => {
-                                        tracing::warn!(task_id, err = %e, "failed to transition to InReview");
-                                    }
-                                    Ok(_) => {
-                                        let backend_clone = backend.clone();
-                                        let tmux_clone = tmux.clone();
-                                        let task_owned_clone = task_owned.clone();
-                                        let router_for_review = router_clone.clone();
-                                        let task_id_for_review = task_id.clone();
-                                        let repo_ctx = repo_owned.clone();
-                                        tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
-                                            match review_and_merge(
-                                                &task_owned_clone,
-                                                &backend_clone,
-                                                &tmux_clone,
-                                                &repo_owned,
-                                                &router_for_review,
-                                            )
-                                            .await
-                                            {
-                                                Ok(ReviewDecision::Failed(reason)) => {
-                                                    tracing::error!(
-                                                        task_id = task_id_for_review,
-                                                        reason,
-                                                        "review agent failed — resetting to NeedsReview for retry"
-                                                    );
-                                                    let _ = backend_clone
-                                                        .update_status(
-                                                            &ExternalId(
-                                                                task_id_for_review.clone(),
-                                                            ),
-                                                            Status::NeedsReview,
-                                                        )
-                                                        .await;
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!(
-                                                        task_id = task_id_for_review,
-                                                        error = %e,
-                                                        "review_and_merge failed — resetting to NeedsReview for retry"
-                                                    );
-                                                    let _ = backend_clone
-                                                        .update_status(
-                                                            &ExternalId(
-                                                                task_id_for_review.clone(),
-                                                            ),
-                                                            Status::NeedsReview,
-                                                        )
-                                                        .await;
-                                                }
-                                                Ok(_) => {} // Approve or RequestChanges handled inside
-                                            }
-                                        }));
-                                    }
-                                }
-                            }
+                            tracing::warn!(task_id, ?e, "failed to update task status after completion");
                         }
                     }
                 }
