@@ -196,7 +196,10 @@ Usage example:
 
   orch task logs internal:8
 
-This was implemented in `src/cli/task.rs::logs` and wired into the main CLI dispatch in `src/main.rs`.
+Implemented in `src/cli/task.rs:664` (`pub async fn logs`) and wired into the main CLI dispatch in `src/main.rs`.
+
+### Review Agent & Status Invariants
+
 **Review agent**: triggered by engine when a task is in `needs_review` and has a branch. The engine transitions the task to `in_review` before spawning — the status itself is the duplicate guard (no sidecar flags needed). On failure, the engine resets to `needs_review` for retry.
 
 **Key invariant**: `done` means task is finished (PR merged or no code changes). `needs_review` means PR exists and is queued for review. `in_review` means a review agent is actively running. `blocked` means human intervention is required. The runner decides: if agent said "done" AND a PR exists → `needs_review`; otherwise → agent's reported status.
@@ -1336,7 +1339,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | Crate | Purpose | Status |
 |-------|---------|--------|
 | `tokio` | Async runtime | In use |
-| `portable-pty` | PTY spawning for agent runner | In use |
+| ~~`portable-pty`~~ | ~~PTY spawning for agent runner~~ | **Removed** — tmux IS the PTY (PR #420); do not reintroduce |
 | `serde` / `serde_json` / `serde_yml` | Serialization | In use |
 | `clap` / `clap_complete` | CLI parsing + shell completions | In use |
 | `chrono` | Timestamps | In use |
@@ -1396,8 +1399,3 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 - [x] Skills sync from config (auto-clone skill repos) — see `src/engine/sync.rs:263` (PR #158)
 - [x] Slack channel integration — `src/channels/slack.rs` implemented and wired into engine
 
-### Recently Closed (continued)
-
-| Issue | Title | Root Cause |
-|-------|-------|-----------|
-| #317 | Webhook deduplication | Fixed: in-memory `x-github-delivery` dedup in `src/channels/github.rs` — 2h eviction window, capped at 10k entries |
