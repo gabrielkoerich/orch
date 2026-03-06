@@ -88,6 +88,7 @@ pub fn write_result_json(
 ///
 /// Returns `Ok((status, budget_exceeded))` where `status` is the final task status
 /// string and `budget_exceeded` is `true` if `run()` should return early.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_success(
     task_id: &str,
     parsed: agents::ParsedResponse,
@@ -96,6 +97,7 @@ pub async fn handle_success(
     agent_name: &str,
     model_name: Option<&str>,
     new_attempts: u32,
+    repo: &str,
 ) -> anyhow::Result<(String, bool)> {
     let resp = parsed.response;
     tracing::info!(
@@ -130,11 +132,15 @@ pub async fn handle_success(
             }
         };
 
-        // Create PR (skip if push failed)
+        // Create PR (skip if push failed or repo is unknown)
         if !push_ok {
             tracing::warn!(task_id, "skipping PR creation due to push failure");
+        } else if repo.is_empty() {
+            tracing::warn!(
+                task_id,
+                "skipping PR creation — repo is empty (internal task?)"
+            );
         } else {
-            let repo = crate::config::get_current_repo().unwrap_or_default();
             match git_ops::create_pr_if_needed(
                 &wt.work_dir,
                 &wt.branch,
@@ -146,7 +152,7 @@ pub async fn handle_success(
                 task_id,
                 agent_name,
                 model_name,
-                &repo,
+                repo,
                 &wt.default_branch,
             )
             .await

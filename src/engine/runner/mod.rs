@@ -216,6 +216,7 @@ impl TaskRunner {
                     &init.agent_name,
                     init.model_name.as_deref(),
                     init.new_attempts,
+                    &self.repo,
                 )
                 .await?;
                 if budget_exceeded {
