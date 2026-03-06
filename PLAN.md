@@ -185,6 +185,7 @@ in_progress → needs_review → in_review → done
 - Review agent selection clarifications: review agent excludes the original task agent to avoid self-review
 - Aligned `workflow.md`, `getting-started.md`, `cli.md`, and `_index.md` with Rust v1: removed bash script references (`serve.sh`, `poll.sh`, `run_task.sh`), replaced with `orch` subcommands, updated engine tick description, removed "orch is alias for orchestrator" copy, and updated file tables to reflect SQLite database
 
+<<<<<<< HEAD
 ### New CLI: `orch task logs <id>`
 
 - Purpose: print a concise post-mortem (summary + memory + token/costs + recent tmux output) for a completed task.
@@ -198,6 +199,8 @@ Usage example:
 
 This was implemented in `src/cli/task.rs::logs` and wired into the main CLI dispatch in `src/main.rs`.
 
+=======
+>>>>>>> ebd2523 (bug: orch task unblock ignores internal tasks — stuck SQLite tasks not reset by unblock all)
 **Review agent**: triggered by engine when a task is in `needs_review` and has a branch. The engine transitions the task to `in_review` before spawning — the status itself is the duplicate guard (no sidecar flags needed). On failure, the engine resets to `needs_review` for retry.
 
 **Key invariant**: `done` means task is finished (PR merged or no code changes). `needs_review` means PR exists and is queued for review. `in_review` means a review agent is actively running. `blocked` means human intervention is required. The runner decides: if agent said "done" AND a PR exists → `needs_review`; otherwise → agent's reported status.

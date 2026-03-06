@@ -337,11 +337,14 @@ enum TaskAction {
         /// Task ID (if omitted, shows all root tasks)
         id: Option<i64>,
     },
+<<<<<<< HEAD
     /// Show logs / post-mortem for a task (internal or external)
     Logs {
         /// Task ID (e.g. "internal:8" or issue number)
         id: String,
     },
+=======
+>>>>>>> ebd2523 (bug: orch task unblock ignores internal tasks — stuck SQLite tasks not reset by unblock all)
 }
 
 #[derive(Subcommand)]
@@ -539,9 +542,12 @@ async fn main() -> anyhow::Result<()> {
             TaskAction::Tree { id } => {
                 cli::task::tree(id).await?;
             }
+<<<<<<< HEAD
             TaskAction::Logs { id } => {
                 cli::task::logs(&id).await?;
             }
+=======
+>>>>>>> ebd2523 (bug: orch task unblock ignores internal tasks — stuck SQLite tasks not reset by unblock all)
         },
         Commands::Job { action } => match action {
             JobAction::List => {

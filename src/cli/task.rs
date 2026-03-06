@@ -426,20 +426,36 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn reset_internal_sidecar(id: i64) {
+    let internal_id = format!("internal:{}", id);
+    crate::sidecar::set(
+        &internal_id,
+        &[
+            "attempts=0".to_string(),
+            "route_attempts=0".to_string(),
+        ],
+    )
+    .ok();
+}
+
 /// Unblock a task or all blocked tasks.
 pub async fn unblock(id: &str) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
+    use crate::db::{Db, TaskStatus};
+    use crate::home;
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+    let db_path = home::db_path().context("could not resolve DB path")?;
+    let db = Db::open(&db_path)?;
 
     if id == "all" {
         let blocked = backend.list_by_status(Status::Blocked).await?;
         let needs_review = backend.list_by_status(Status::NeedsReview).await?;
 
-        let mut count = 0;
+        let mut external_count = 0;
         for task in blocked.iter().chain(needs_review.iter()) {
             crate::sidecar::set(
                 &task.id.0,
@@ -447,19 +463,67 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
             )
             .ok();
             backend.update_status(&task.id, Status::New).await?;
-            count += 1;
+            external_count += 1;
         }
-        println!("Unblocked {} tasks (attempts reset)", count);
-    } else {
-        let ext_id = ExternalId(id.to_string());
-        crate::sidecar::set(
-            &ext_id.0,
-            &["attempts=0".to_string(), "route_attempts=0".to_string()],
-        )
-        .ok();
-        backend.update_status(&ext_id, Status::New).await?;
-        println!("Unblocked task #{} (attempts reset)", id);
+
+        let internal_blocked = db
+            .list_internal_tasks_by_status(TaskStatus::Blocked)
+            .await?;
+        let internal_needs_review = db
+            .list_internal_tasks_by_status(TaskStatus::NeedsReview)
+            .await?;
+        let mut internal_count = 0;
+        for task in internal_blocked.iter().chain(internal_needs_review.iter()) {
+            reset_internal_sidecar(task.id).await;
+            db.update_internal_task_status(task.id, TaskStatus::New)
+                .await?;
+            internal_count += 1;
+        }
+
+        let total = external_count + internal_count;
+        println!(
+            "Unblocked {} tasks ({} external, {} internal) (attempts reset)",
+            total, external_count, internal_count
+        );
+        return Ok(());
     }
+
+    if let Some(stripped) = id.strip_prefix("internal:") {
+        let parsed = stripped
+            .parse::<i64>()
+            .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
+        db.get_internal_task(parsed).await?;
+        reset_internal_sidecar(parsed).await;
+        db.update_internal_task_status(parsed, TaskStatus::New)
+            .await?;
+        println!(
+            "Unblocked internal task #{} (attempts reset, will be re-routed)",
+            parsed
+        );
+        return Ok(());
+    }
+
+    if let Ok(parsed) = id.parse::<i64>() {
+        if db.get_internal_task(parsed).await.is_ok() {
+            reset_internal_sidecar(parsed).await;
+            db.update_internal_task_status(parsed, TaskStatus::New)
+                .await?;
+            println!(
+                "Unblocked internal task #{} (attempts reset, will be re-routed)",
+                parsed
+            );
+            return Ok(());
+        }
+    }
+
+    let ext_id = ExternalId(id.to_string());
+    crate::sidecar::set(
+        &ext_id.0,
+        &["attempts=0".to_string(), "route_attempts=0".to_string()],
+    )
+    .ok();
+    backend.update_status(&ext_id, Status::New).await?;
+    println!("Unblocked task #{} (attempts reset)", id);
 
     Ok(())
 }
