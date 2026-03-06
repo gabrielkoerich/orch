@@ -608,14 +608,28 @@ pub(crate) async fn review_and_merge(
                     }
                 }
             } else {
-                // No PR and no commits — agent failed before doing any work. Re-route for retry.
-                // (A successfully completed read-only task would be marked Done by the runner
-                //  and never reach the review gate.)
+                // No PR and no commits — agent either failed or completed a read-only task.
+                let last_error = sidecar::get(&task.id.0, "last_error").unwrap_or_default();
                 let reason = if !agent_summary.is_empty() {
                     agent_summary.clone()
                 } else {
-                    sidecar::get(&task.id.0, "last_error").unwrap_or_default()
+                    last_error.clone()
                 };
+
+                // If the task has exhausted all attempts, stop looping and mark done.
+                // Continuing to re-route would spin forever since max_attempts is already hit.
+                if last_error.contains("exceeded max attempts") {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        branch = %branch_name,
+                        "no PR and no commits after max attempts — marking done to stop loop"
+                    );
+                    let _ = task_manager
+                        .update_task_status(&task.id, crate::backends::Status::Done)
+                        .await;
+                    return Ok(ReviewDecision::Skipped);
+                }
+
                 tracing::warn!(
                     task_id = task.id.0,
                     branch = %branch_name,
