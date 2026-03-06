@@ -430,10 +430,7 @@ async fn reset_internal_sidecar(id: i64) {
     let internal_id = format!("internal:{}", id);
     crate::sidecar::set(
         &internal_id,
-        &[
-            "attempts=0".to_string(),
-            "route_attempts=0".to_string(),
-        ],
+        &["attempts=0".to_string(), "route_attempts=0".to_string()],
     )
     .ok();
 }
