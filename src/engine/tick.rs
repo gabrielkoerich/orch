@@ -163,6 +163,43 @@ pub(crate) async fn tick_recover_stuck_tasks(
             }
         }
     }
+
+    // Also recover internal tasks stuck in InProgress.
+    // Internal tasks use SQLite as their state store; the dispatching guard is in-memory
+    // and clears on service restart, leaving them permanently stuck.
+    use crate::db::TaskStatus as DbStatus;
+    let internal_in_progress = task_manager
+        .db_list_internal_by_status(DbStatus::InProgress)
+        .await?;
+    for task in &internal_in_progress {
+        let task_id_str = format!("internal:{}", task.id);
+        let session_name = tmux.session_name(repo, &task_id_str);
+        let has_session = tmux.session_exists(&session_name).await;
+        let age = chrono::Utc::now() - task.updated_at;
+        let threshold = if has_session {
+            config.stuck_timeout
+        } else {
+            config.no_session_stuck_timeout
+        };
+        if age.num_seconds() > threshold as i64 {
+            tracing::warn!(
+                task_id = task_id_str,
+                age_mins = age.num_minutes(),
+                threshold_mins = threshold / 60,
+                has_session,
+                "recovering stuck internal task → new"
+            );
+            let eid = ExternalId(task_id_str.clone());
+            if let Err(e) = task_manager.update_task_status(&eid, Status::New).await {
+                tracing::warn!(
+                    task_id = task_id_str,
+                    ?e,
+                    "failed to reset stuck internal task"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
