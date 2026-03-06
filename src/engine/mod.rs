@@ -710,7 +710,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         WeightSignal::Success { ref agent } => {
                             rw.record_success(agent);
                         }
-                        WeightSignal::None => {}
+                        WeightSignal::Blocked | WeightSignal::None => {}
                     }
                 }
 

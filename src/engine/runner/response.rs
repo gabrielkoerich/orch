@@ -21,6 +21,8 @@ pub enum WeightSignal {
     Success { agent: String },
     /// Agent hit a rate limit / usage limit.
     RateLimited { agent: String },
+    /// Task is blocked on child tasks (delegations). Do not trigger review agent.
+    Blocked,
     /// No weight-relevant signal (timeout, auth error, etc.)
     None,
 }

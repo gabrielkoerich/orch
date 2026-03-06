@@ -435,6 +435,7 @@ pub(crate) async fn tick_dispatch_tasks(
                     let display_status = match &signal {
                         WeightSignal::Success { .. } => "done",
                         WeightSignal::RateLimited { .. } => "new",
+                        WeightSignal::Blocked => "blocked",
                         WeightSignal::None => "needs_review",
                     };
 

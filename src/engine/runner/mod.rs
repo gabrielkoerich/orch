@@ -425,6 +425,8 @@ impl TaskRunner {
             WeightSignal::Success {
                 agent: agent_name.clone(),
             }
+        } else if status == "blocked" {
+            WeightSignal::Blocked
         } else {
             WeightSignal::None
         };
