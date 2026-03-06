@@ -1337,6 +1337,8 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 ## Key Dependencies
 
+> **Note on portable-pty:** This crate was removed in PR #420 as part of a settled architecture decision (see AGENTS.md). Agents run inside tmux sessions — tmux IS the PTY. Do not reintroduce external PTY-based runners.
+
 | Crate | Purpose | Status |
 |-------|---------|--------|
 | `tokio` | Async runtime | In use |
