@@ -42,7 +42,8 @@ impl TmuxManager {
             .next()
             .unwrap_or(project)
             .trim_end_matches(".git");
-        format!("{}{project_name}-{task_id}", self.prefix)
+        let safe_task_id = task_id.replace(':', "-");
+        format!("{}{project_name}-{safe_task_id}", self.prefix)
     }
 
     /// Create a new tmux session for a task and run a command in it.
@@ -322,6 +323,15 @@ mod tests {
                 .unwrap()
                 .as_millis()
         )
+    }
+
+    #[test]
+    fn session_name_internal_task_id_is_sanitized() {
+        let tmux = TmuxManager::new();
+        assert_eq!(
+            tmux.session_name("owner/repo", "internal:8"),
+            "orch-repo-internal-8"
+        );
     }
 
     /// Verify set_env runs the correct tmux set-environment command.
