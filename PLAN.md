@@ -1381,6 +1381,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | #143 | PR Review Integration | `src/engine/review.rs` — processes `changes_requested` reviews and re-dispatches tasks |
 | - | Review Agent + Auto-Merge | `review_and_merge()` in `src/engine/review.rs` |
 | - | Merge Detection | `check_merged_prs()` in `src/engine/cleanup.rs` |
+| #479 | Worktree janitor: reliably clean internal task worktrees | `JanitorOptions` (TTL, dry-run) + tmux session guard + fallback path fix in `src/engine/cleanup.rs` — janitor now reads `workflow.worktree_janitor_ttl_hours` / `workflow.worktree_janitor_dry_run` from config, checks filesystem mtime, and skips any worktree referenced by an active tmux pane |
 | - | Dashboard CLI | `orch dashboard` in `src/cli/dashboard.rs` |
 | - | Task Tree CLI | `orch task tree` in `src/cli/tree.rs` |
 | - | Graceful Shutdown | SIGTERM/SIGINT handlers in `src/engine/mod.rs` (serve loop) |
