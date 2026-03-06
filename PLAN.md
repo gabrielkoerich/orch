@@ -745,11 +745,11 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Multi-project support — PR #82 merged
 - [x] Config hot-reload wired into engine — PR #78 merged
 
-### Phase 3: Channels (scaffolding done, not wired)
+### Phase 3: Channels
 
 **Goal:** Multi-channel I/O for task management and live streaming.
 
-- [x] Channel trait + ChannelRegistry — `src/channels/mod.rs` (scaffolding)
+- [x] Channel trait + ChannelRegistry — `src/channels/mod.rs`
 - [x] Transport layer — `src/channels/transport.rs` (session bindings, broadcast)
 - [x] Tmux channel — `src/channels/tmux.rs` (pane monitoring)
 - [x] Capture service — `src/channels/capture.rs` (output diffing + streaming)
@@ -761,6 +761,8 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Mention detection via webhooks (#112) — webhook handler + polling fallback
 - [x] Polling fallback when webhooks not configured — PR #131 merged
 - [x] Wire channels into engine event loop — PR #81 merged
+- [x] **Bidirectional channel wiring** — `src/engine/mod.rs` `handle_channel_message()`: `TaskSession` → tmux send-keys or slash command; `Command` → `/status` + owner commands; `NewTask` → create internal task + bind thread + start fanout
+- [x] **Output fanout streaming** — `src/channels/stream.rs` `fanout_output()`: per-channel rate limiting + message splitting + final-chunk flush
 
 ### Phase 4: CLI & User-Facing Commands
 

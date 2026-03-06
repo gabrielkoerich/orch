@@ -382,24 +382,25 @@ pub async fn serve() -> anyhow::Result<()> {
 
     // Spawn tasks to handle incoming channel messages (if any channels are active)
     let transport_for_messages = transport.clone();
+    let tmux_for_messages = tmux.clone();
+    let capture_for_messages = capture_for_tick.clone();
+    let channels_for_messages = channel_registry.clone();
+    // Lightweight engine references for command execution and task creation
+    let engine_refs: Vec<(String, Arc<dyn ExternalBackend>, Arc<TaskManager>)> = project_engines
+        .iter()
+        .map(|e| (e.repo.clone(), e.backend.clone(), e.task_manager.clone()))
+        .collect();
     for mut rx in channel_receivers {
         let transport = transport_for_messages.clone();
+        let tmux = tmux_for_messages.clone();
+        let capture = capture_for_messages.clone();
+        let channels = channels_for_messages.clone();
+        let engine_refs = engine_refs.clone();
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received message from channel");
-
-                // Route the message through transport
-                match transport.route(&msg).await {
-                    crate::channels::transport::MessageRoute::TaskSession { task_id } => {
-                        tracing::debug!(task_id = %task_id, "message routed to existing session");
-                    }
-                    crate::channels::transport::MessageRoute::Command { raw } => {
-                        tracing::debug!(command = %raw, "message is a command");
-                    }
-                    crate::channels::transport::MessageRoute::NewTask => {
-                        tracing::debug!("message would create new task");
-                    }
-                }
+                handle_channel_message(msg, &transport, &tmux, &capture, &channels, &engine_refs)
+                    .await;
             }
         });
     }
@@ -1008,6 +1009,215 @@ pub async fn serve() -> anyhow::Result<()> {
     let _ = transport;
     tracing::info!("orch engine stopped");
     Ok(())
+}
+
+/// Send a reply message to a specific channel thread.
+///
+/// Iterates the channel registry and finds the channel by name,
+/// then sends the message to the given thread ID.
+async fn send_channel_reply(
+    channels: &Arc<ChannelRegistry>,
+    channel_name: &str,
+    thread_id: &str,
+    body: String,
+) {
+    for ch in channels.iter() {
+        if ch.name() == channel_name {
+            let msg = OutgoingMessage {
+                thread_id: thread_id.to_string(),
+                body,
+                reply_to: None,
+                metadata: serde_json::json!({}),
+            };
+            if let Err(e) = ch.send(&msg).await {
+                tracing::warn!(
+                    channel = channel_name,
+                    thread_id,
+                    ?e,
+                    "failed to send channel reply"
+                );
+            }
+            return;
+        }
+    }
+    tracing::debug!(
+        channel = channel_name,
+        "channel not found in registry for reply"
+    );
+}
+
+/// Forward a text message to an agent's tmux session via send-keys.
+async fn forward_to_tmux(transport: &Arc<Transport>, task_id: &str, text: &str) {
+    if let Some(binding) = transport.get_binding(task_id).await {
+        if let Err(e) = crate::channels::tmux::send_keys(&binding.tmux_session, text).await {
+            tracing::warn!(
+                task_id,
+                session = %binding.tmux_session,
+                ?e,
+                "failed to forward message to tmux session"
+            );
+        } else {
+            tracing::debug!(
+                task_id,
+                session = %binding.tmux_session,
+                "forwarded message to tmux"
+            );
+        }
+    } else {
+        tracing::warn!(task_id, "no tmux binding found, cannot forward message");
+    }
+}
+
+/// Handle an incoming channel message by routing it to the appropriate action.
+///
+/// - `TaskSession`: slash command → execute on task; otherwise → forward to tmux
+/// - `Command`: global commands like `/status`; task-specific commands need a task thread
+/// - `NewTask`: create an internal task, bind thread, start output fanout
+async fn handle_channel_message(
+    msg: IncomingMessage,
+    transport: &Arc<Transport>,
+    _tmux: &Arc<TmuxManager>,
+    capture: &Arc<CaptureService>,
+    channels: &Arc<ChannelRegistry>,
+    engine_refs: &[(String, Arc<dyn ExternalBackend>, Arc<TaskManager>)],
+) {
+    use crate::backends::ExternalId;
+    use crate::channels::stream::fanout_output;
+    use crate::channels::transport::MessageRoute;
+    use crate::engine::commands::{execute_command, parse_command};
+    use crate::engine::tasks::{CreateTaskRequest, TaskType};
+
+    match transport.route(&msg).await {
+        MessageRoute::TaskSession { task_id } => {
+            let body = msg.body.trim().to_string();
+            let channel = msg.channel.clone();
+            let thread_id = msg.thread_id.clone();
+
+            if body.starts_with('/') {
+                // Parse slash command and execute it on the bound task
+                if let Some(cmd) = parse_command(&body) {
+                    if let Some((repo, backend, _)) = engine_refs.first() {
+                        let gh = GhHttp::new();
+                        let ext_id = ExternalId(task_id.clone());
+                        let result = execute_command(backend, &gh, repo, &ext_id, &cmd).await;
+                        let reply = match result {
+                            Ok(r) => r,
+                            Err(e) => format!("Command `{cmd}` failed: {e}"),
+                        };
+                        send_channel_reply(channels, &channel, &thread_id, reply).await;
+                    }
+                } else {
+                    // Unknown command — forward to agent as-is
+                    forward_to_tmux(transport, &task_id, &body).await;
+                }
+            } else {
+                // Regular message — forward to the agent's tmux session
+                forward_to_tmux(transport, &task_id, &body).await;
+            }
+        }
+
+        MessageRoute::Command { raw } => {
+            let cmd_str = raw.trim().to_string();
+            let channel = msg.channel.clone();
+            let thread_id = msg.thread_id.clone();
+
+            // /status is not in OwnerCommand — handle it specially
+            if cmd_str == "/status" || cmd_str.starts_with("/status ") {
+                let mut lines = vec!["**Active tasks:**".to_string()];
+                for (repo, _, task_manager) in engine_refs {
+                    match task_manager
+                        .list_external_by_status(Status::InProgress)
+                        .await
+                    {
+                        Ok(tasks) => {
+                            for t in &tasks {
+                                lines.push(format!("- #{} [{}]: {}", t.id.0, repo, t.title));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(repo, err = %e, "failed to list in-progress tasks");
+                        }
+                    }
+                }
+                if lines.len() == 1 {
+                    lines.push("No tasks currently in progress.".to_string());
+                }
+                send_channel_reply(channels, &channel, &thread_id, lines.join("\n")).await;
+            } else if let Some(cmd) = parse_command(&cmd_str) {
+                let reply = format!(
+                    "Command `{cmd}` requires a task context. \
+                     Send it in a thread that is bound to a running task."
+                );
+                send_channel_reply(channels, &channel, &thread_id, reply).await;
+            } else {
+                let reply = "Available commands: /status (list tasks), /retry, /close, \
+                             /block, /unblock, /review — send task-specific commands in a task thread."
+                    .to_string();
+                send_channel_reply(channels, &channel, &thread_id, reply).await;
+            }
+        }
+
+        MessageRoute::NewTask => {
+            let channel = msg.channel.clone();
+            let thread_id = msg.thread_id.clone();
+
+            // Pick the first configured project for new tasks from channels
+            if let Some((repo, _, task_manager)) = engine_refs.first() {
+                let title = if msg.body.len() > 80 {
+                    format!("{}…", &msg.body[..80])
+                } else {
+                    msg.body.clone()
+                };
+                let req = CreateTaskRequest {
+                    title,
+                    body: msg.body.clone(),
+                    task_type: TaskType::Internal,
+                    labels: vec!["channel-created".to_string()],
+                    source: channel.clone(),
+                    source_id: thread_id.clone(),
+                };
+                match task_manager.create_task(req).await {
+                    Ok(task) => {
+                        use crate::engine::tasks::Task;
+                        let task_id = match &task {
+                            Task::Internal(t) => format!("internal:{}", t.id),
+                            Task::External(t) => t.id.0.clone(),
+                        };
+                        // Bind the thread to the new task
+                        transport
+                            .bind(
+                                &task_id,
+                                &format!("orch-{repo}-{task_id}"),
+                                &channel,
+                                &thread_id,
+                            )
+                            .await;
+                        // Register the session with CaptureService (graceful if no session yet)
+                        capture
+                            .register_session(&task_id, &format!("orch-{repo}-{task_id}"))
+                            .await;
+                        // Spawn output fanout for this task
+                        let transport_clone = transport.clone();
+                        let channels_clone = channels.clone();
+                        let task_id_clone = task_id.clone();
+                        tokio::spawn(async move {
+                            fanout_output(task_id_clone, transport_clone, channels_clone).await;
+                        });
+                        let reply =
+                            format!("Task created: `{task_id}` — I'll start working on it now.");
+                        send_channel_reply(channels, &channel, &thread_id, reply).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(repo, err = %e, "failed to create task from channel message");
+                        let reply = format!("Failed to create task: {e}");
+                        send_channel_reply(channels, &channel, &thread_id, reply).await;
+                    }
+                }
+            } else {
+                tracing::warn!("no project configured, cannot create task from channel message");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

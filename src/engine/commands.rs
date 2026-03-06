@@ -268,7 +268,7 @@ pub async fn scan_commands(
 }
 
 /// Execute a single owner command against a task.
-async fn execute_command(
+pub async fn execute_command(
     backend: &Arc<dyn ExternalBackend>,
     gh: &GhHttp,
     repo: &str,
