@@ -497,23 +497,39 @@ pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> 
 
 /// Extract the concatenated text content from an NDJSON event stream.
 ///
-/// Handles two text event formats emitted by different opencode versions:
-/// - Format 1 (current): `{"type":"text","part":{"type":"text","text":"..."}}`
-/// - Format 2 (newer):   `{"type":"text","text":"..."}`
+/// Handles text event formats from opencode and codex:
+/// - opencode Format 1: `{"type":"text","part":{"type":"text","text":"..."}}`
+/// - opencode Format 2: `{"type":"text","text":"..."}`
+/// - codex Format:      `{"type":"item.completed","item":{"type":"agent_message","text":"..."}}`
 fn ndjson_extract_text(ndjson: &str) -> String {
     ndjson
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("text"))
         .filter_map(|e| {
-            // Format 1: text nested under "part"
-            e.get("part")
-                .and_then(|p| p.get("text"))
-                .and_then(|t| t.as_str())
-                .map(str::to_string)
-                // Format 2: text directly in event
-                .or_else(|| e.get("text").and_then(|t| t.as_str()).map(str::to_string))
+            let event_type = e.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match event_type {
+                // opencode: text event
+                "text" => {
+                    // Format 1: text nested under "part"
+                    e.get("part")
+                        .and_then(|p| p.get("text"))
+                        .and_then(|t| t.as_str())
+                        .map(str::to_string)
+                        // Format 2: text directly in event
+                        .or_else(|| e.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                }
+                // codex: item.completed with agent_message item
+                "item.completed" => e
+                    .get("item")
+                    .filter(|item| {
+                        item.get("type").and_then(|v| v.as_str()) == Some("agent_message")
+                    })
+                    .and_then(|item| item.get("text"))
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string),
+                _ => None,
+            }
         })
         .collect::<Vec<_>>()
         .join("")
@@ -856,5 +872,61 @@ That's all."#;
         );
         let resp = parse_review_from_output(ndjson).unwrap();
         assert_eq!(resp.decision, "approve");
+    }
+
+    /// codex NDJSON stream — agent_message item carries the ReviewResponse JSON.
+    ///
+    /// Real format from codex `exec --json` output (observed 2026-03-06):
+    /// thread.started / turn.started / item.completed(reasoning) / item.completed(agent_message) / turn.completed
+    #[test]
+    fn parse_review_from_output_codex_agent_message() {
+        let ndjson = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"Planning git commands..."}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"git log --oneline -5","output":"abc123 fix: something"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\"decision\":\"approve\",\"notes\":\"All checks pass\",\"test_results\":\"pass\",\"issues\":[]}"}}"#,
+            "\n",
+            r#"{"type":"turn.completed"}"#,
+        );
+        let resp = parse_review_from_output(ndjson).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert_eq!(resp.notes, "All checks pass");
+    }
+
+    /// codex NDJSON with ReviewResponse in a markdown code block inside agent_message.
+    #[test]
+    fn parse_review_from_output_codex_agent_message_markdown() {
+        let ndjson = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"Reviewing..."}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Review complete.\n\n```json\n{\"decision\":\"request_changes\",\"notes\":\"Fix the tests\",\"issues\":[]}\n```\n"}}"#,
+            "\n",
+            r#"{"type":"turn.completed"}"#,
+        );
+        let resp = parse_review_from_output(ndjson).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+        assert_eq!(resp.notes, "Fix the tests");
+    }
+
+    /// reasoning items must NOT be extracted as review text.
+    #[test]
+    fn ndjson_extract_text_codex_skips_reasoning() {
+        let ndjson = concat!(
+            r#"{"type":"item.completed","item":{"type":"reasoning","text":"internal thoughts..."}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"actual output"}}"#,
+        );
+        let extracted = ndjson_extract_text(ndjson);
+        assert_eq!(extracted, "actual output");
+        assert!(!extracted.contains("internal thoughts"));
     }
 }
