@@ -958,7 +958,7 @@ impl GhHttp {
             .post(&url)
             .header(header::AUTHORIZATION, auth)
             .header(header::ACCEPT, "application/vnd.github+json")
-            .header(header::USER_AGENT, "orchestrator")
+            .header(header::USER_AGENT, "orch")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .json(&payload)
             .send()

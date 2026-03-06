@@ -270,7 +270,7 @@ Override the router by adding labels to tasks:
 
 ### RouteResult Struct
 
-Routing results are stored in the sidecar file (`~/.orchestrator/state/{task_id}.json`):
+Routing results are stored in the sidecar file (`~/.orch/state/{task_id}.json`):
 
 ```rust
 pub struct RouteResult {
@@ -419,7 +419,7 @@ Agents run in worktrees, NOT the main project directory. Orch enforces this:
 Codex runs with `--full-auto` + network access enabled by default. Configurable:
 
 ```yaml
-# In config.yml or .orchestrator.yml
+# In config.yml or .orch.yml
 agents:
   codex:
     sandbox: full-auto  # full-auto | workspace-write | danger-full-access | none

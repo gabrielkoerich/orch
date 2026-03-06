@@ -1186,8 +1186,8 @@ agents:
   opencode: { permission: {...}, models: [...] }
 
 git:
-  name: "orchestrator[bot]"
-  email: "orchestrator@orchestrator.bot"
+  name: "orch[bot]"
+  email: "orch@orch.bot"
 ```
 
 **Per-project config: `{project_path}/.orch.yml`** — project-specific settings.

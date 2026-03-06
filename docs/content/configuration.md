@@ -97,7 +97,7 @@ Requires `gh auth login` to be run interactively. Not recommended for service en
 Drop a `.orch.yml` or `.orchestrator.yml` in your project root to override global config (project-level keys take precedence over global).
 
 ```yaml
-# ~/projects/my-app/.orchestrator.yml
+# ~/projects/my-app/.orch.yml
 required_tools: ["bun"]
 gh:
   repo: "myorg/my-app"
@@ -110,7 +110,7 @@ router:
 ```
 
 - Project config is deep-merged with global config (project wins)
-- The server restarts automatically when `.orchestrator.yml` changes
+- The server restarts automatically when `.orch.yml` changes
 - `gh_project_apply.sh` / `orch project info --fix` writes project IDs into the global config overlay when run from the server context
 
 ## Skills
