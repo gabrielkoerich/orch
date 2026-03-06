@@ -4,7 +4,7 @@ use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
-use crate::engine::tasks::{parse_internal_id, CreateTaskRequest, Task, TaskFilter, TaskType};
+use crate::engine::tasks::{CreateTaskRequest, Task, TaskFilter, TaskType, parse_internal_id};
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
@@ -659,7 +659,6 @@ pub async fn tree(id: Option<i64>) -> anyhow::Result<()> {
 
     Ok(())
 }
-
 /// Show logs / post-mortem for a task (internal or external).
 pub async fn logs(id: &str) -> anyhow::Result<()> {
     let task_manager = init_task_manager().await?;
@@ -820,4 +819,3 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
-}

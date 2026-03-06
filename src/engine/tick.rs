@@ -551,23 +551,31 @@ pub(crate) async fn tick_dispatch_tasks(
                         let _ = task_manager_for_spawn
                             .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
                             .await;
-                    } else if let Err(comment_err) = backend
-                        .post_comment(
-                            &ExternalId(task_id.clone()),
-                            &format!(
-                                "[{}] error: task runner failed: {e}",
-                                chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                            ),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            task_id,
-                            ?comment_err,
-                            "failed to post error comment to GitHub"
-                        );
+                    } else {
+                        // Post comment (best-effort)
+                        if let Err(comment_err) = backend
+                            .post_comment(
+                                &ExternalId(task_id.clone()),
+                                &format!(
+                                    "[{}] error: task runner failed: {e}",
+                                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                task_id,
+                                ?comment_err,
+                                "failed to post error comment to GitHub"
+                            );
+                        }
+                        // Update status immediately to NeedsReview so external tasks
+                        // don't remain stuck in InProgress until the no-session timeout.
+                        let _ = task_manager_for_spawn
+                            .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
+                            .await;
                     }
-
+                
                     // Send error notification
                     let duration = dispatch_start.elapsed().as_secs_f64();
                     transport.push_notification(TaskNotification {
