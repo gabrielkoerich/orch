@@ -192,6 +192,21 @@ pub async fn setup_worktree(
         anyhow::bail!("empty branch name for task {task_id}");
     }
 
+    // Abort any in-progress rebase in an existing worktree.
+    //
+    // Agents can leave a worktree stuck mid-rebase (e.g. after running
+    // `git rebase -i` interactively).  The next dispatch attempt would
+    // inherit that broken state, causing all subsequent git operations to
+    // fail.  Aborting here is safe: if no rebase is in progress git exits
+    // with a non-zero code which we silently ignore.
+    if worktree_dir.exists() {
+        let _ = Command::new("git")
+            .args(["rebase", "--abort"])
+            .current_dir(&worktree_dir)
+            .output_with_context()
+            .await;
+    }
+
     // Create worktree if it doesn't exist
     if !worktree_dir.exists() {
         tracing::info!(task_id, worktree = %worktree_dir.display(), "creating worktree");

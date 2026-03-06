@@ -100,6 +100,15 @@ pub async fn auto_commit(
     Ok(true)
 }
 
+/// Maximum number of commits to replay during a rebase.
+///
+/// If a branch has diverged so far from the default branch that it would
+/// require replaying more than this many commits, we skip the rebase entirely.
+/// This prevents degenerate cases (e.g. a branch forked from the very first
+/// commit that now sits 300+ commits behind main) from producing hundreds of
+/// add/add conflicts that block the agent and leave the worktree unusable.
+const MAX_REBASE_COMMITS: usize = 50;
+
 /// Rebase the current branch on the default branch.
 ///
 /// Run before the agent starts to ensure the worktree has the latest code.
@@ -115,6 +124,38 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
         .current_dir(dir)
         .output_with_context()
         .await;
+
+    // Count commits that would be replayed.  If the branch diverged too far
+    // back we skip the rebase: replaying hundreds of historical commits produces
+    // massive add/add conflicts (the branch adds files that main already has)
+    // and leaves the worktree stuck.
+    let commit_count = Command::new("git")
+        .args([
+            "rev-list",
+            "--count",
+            &format!("origin/{default_branch}..HEAD"),
+        ])
+        .current_dir(dir)
+        .output_with_context()
+        .await
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<usize>()
+                .ok()
+        })
+        .unwrap_or(0);
+
+    if commit_count > MAX_REBASE_COMMITS {
+        tracing::warn!(
+            default_branch,
+            commit_count,
+            max = MAX_REBASE_COMMITS,
+            "skipping rebase: branch has too many commits to replay safely"
+        );
+        return;
+    }
 
     let output = Command::new("git")
         .args(["rebase", &format!("origin/{default_branch}")])
