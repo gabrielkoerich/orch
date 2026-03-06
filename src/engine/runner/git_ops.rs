@@ -82,8 +82,6 @@ pub async fn auto_commit(
 
     let commit_msg = format!("{title}\n\nTask #{task_id}\nAgent: {agent}\nAttempt: {attempt}");
 
-    tracing::info!(task_id, "auto-committing uncommitted changes");
-
     // git add -A
     let add = Command::new("git")
         .args(["add", "-A"])
