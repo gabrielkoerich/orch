@@ -226,7 +226,6 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
     }
 
     // Fallback: try bare clone in ~/.orch/projects/
-<<<<<<< HEAD
     let parts: Vec<&str> = repo.split('/').collect();
     let bare = if parts.len() == 2 {
         crate::home::projects_dir()
@@ -235,11 +234,6 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
     } else {
         std::path::PathBuf::new()
     };
-=======
-    let bare = crate::home::projects_dir()
-        .map(|d| d.join(repo.replace('/', "__")))
-        .unwrap_or_default();
->>>>>>> ebd2523 (bug: orch task unblock ignores internal tasks — stuck SQLite tasks not reset by unblock all)
     if bare.exists() {
         return Ok(bare.display().to_string());
     }

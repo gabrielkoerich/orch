@@ -163,7 +163,6 @@ pub(crate) async fn tick_recover_stuck_tasks(
             }
         }
     }
-<<<<<<< HEAD
 
     // Recover internal (SQLite) tasks stuck in in_progress.
     // These have no GitHub labels or comments — just reset the DB status to New.
@@ -209,8 +208,6 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
     }
 
-=======
->>>>>>> ebd2523 (bug: orch task unblock ignores internal tasks — stuck SQLite tasks not reset by unblock all)
     Ok(())
 }
 

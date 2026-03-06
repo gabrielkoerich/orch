@@ -118,11 +118,7 @@ pub fn state_file(name: &str) -> anyhow::Result<PathBuf> {
 ///
 /// Uses the repo from config if available. Falls back to flat state dir
 /// for backward compatibility.
-<<<<<<< HEAD
 pub fn sidecar_path(task_id: &str) -> anyhow::Result<PathBuf> {
-=======
-fn sidecar_path(task_id: &str) -> anyhow::Result<PathBuf> {
->>>>>>> ebd2523 (bug: orch task unblock ignores internal tasks — stuck SQLite tasks not reset by unblock all)
     sidecar_path_for_repo(task_id, None)
 }
 
