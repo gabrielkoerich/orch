@@ -118,6 +118,7 @@ pub async fn fanout_output(
     let mut buffers: HashMap<String, String> = HashMap::new();
 
     loop {
+        // Wait for either a new chunk or the next scheduled flush
         match rx.recv().await {
             Ok(chunk) => {
                 let is_final = chunk.is_final;
@@ -160,20 +161,20 @@ pub async fn fanout_output(
                 }
 
                 if is_final {
-                    // Flush all remaining buffers
-                    if let Some(binding) = transport.get_binding(&task_id).await {
-                        for thread_key in &binding.connected_threads {
-                            if let Some(buffered) = buffers.remove(thread_key) {
-                                if !buffered.is_empty() {
-                                    let (ch_name, thread_id) = match thread_key.split_once(':') {
-                                        Some(p) => p,
-                                        None => continue,
-                                    };
-                                    let parts = split_for_platform(&buffered, ch_name);
-                                    for part in parts {
-                                        send_to_thread(&channels, ch_name, thread_id, part).await;
-                                    }
-                                }
+                    // Flush all remaining buffers immediately regardless of rate limits
+                    if let Some(_binding) = transport.get_binding(&task_id).await {
+                        // Drain buffers map and send everything
+                        for (thread_key, buffered) in buffers.drain() {
+                            if buffered.is_empty() {
+                                continue;
+                            }
+                            let (ch_name, thread_id) = match thread_key.split_once(':') {
+                                Some(p) => p,
+                                None => continue,
+                            };
+                            let parts = split_for_platform(&buffered, ch_name);
+                            for part in parts {
+                                send_to_thread(&channels, ch_name, thread_id, part).await;
                             }
                         }
                     }
@@ -191,6 +192,72 @@ pub async fn fanout_output(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 tracing::debug!(task_id, "fanout: output broadcast closed");
                 break;
+            }
+        }
+
+        // If there are buffered messages pending due to rate limiting, compute
+        // the soonest time we can send and wait (non-busy) so future loop
+        // iterations can flush them even if no new chunks arrive.
+        if !buffers.is_empty() {
+            let now = Instant::now();
+            let mut earliest = None::<Instant>;
+            for thread_key in buffers.keys() {
+                if let Some((ch_name, _)) = thread_key.split_once(':') {
+                    let rate = platform_rate(ch_name);
+                    if let Some(last) = last_send.get(ch_name) {
+                        let when = *last + rate;
+                        if when > now {
+                            earliest = Some(match earliest {
+                                Some(e) if e <= when => e,
+                                _ => when,
+                            });
+                        } else {
+                            earliest = Some(now);
+                        }
+                    } else {
+                        earliest = Some(now);
+                    }
+                }
+            }
+
+            if let Some(wake_at) = earliest {
+                // Sleep until earliest send time or 50ms minimum to avoid busy-looping
+                let sleep_dur = if wake_at > now {
+                    wake_at - now
+                } else {
+                    Duration::from_millis(50)
+                };
+                tokio::time::sleep(sleep_dur).await;
+
+                // After waiting, attempt to flush any buffers whose rate limit expired
+                if let Some(_binding) = transport.get_binding(&task_id).await {
+                    let now = Instant::now();
+                    // Collect keys to flush to avoid borrowing issues
+                    let keys: Vec<String> = buffers.keys().cloned().collect();
+                    for thread_key in keys {
+                        if let Some(buffered) = buffers.remove(&thread_key) {
+                            let (ch_name, thread_id) = match thread_key.split_once(':') {
+                                Some(p) => p,
+                                None => continue,
+                            };
+                            let rate = platform_rate(ch_name);
+                            let can_send = last_send
+                                .get(ch_name)
+                                .map(|t| now.duration_since(*t) >= rate)
+                                .unwrap_or(true);
+                            if can_send {
+                                let parts = split_for_platform(&buffered, ch_name);
+                                for part in parts {
+                                    send_to_thread(&channels, ch_name, thread_id, part).await;
+                                }
+                                last_send.insert(ch_name.to_string(), now);
+                            } else {
+                                // Put it back for next round
+                                buffers.insert(thread_key, buffered);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -235,5 +302,116 @@ mod tests {
         assert_eq!(platform_max_bytes("discord"), 2000);
         assert_eq!(platform_max_bytes("slack"), 4000);
         assert_eq!(platform_max_bytes("unknown"), 4096);
+    }
+
+    // A lightweight test channel implementation used to assert that
+    // fanout_output sends OutgoingMessage bodies to registered channels.
+    struct TestChannel {
+        name: String,
+        tx: tokio::sync::mpsc::Sender<crate::channels::OutgoingMessage>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::channels::Channel for TestChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn start(
+            &self,
+        ) -> anyhow::Result<tokio::sync::mpsc::Receiver<crate::channels::IncomingMessage>> {
+            // Not used in this test — return a dummy receiver.
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+
+        async fn send(&self, msg: &crate::channels::OutgoingMessage) -> anyhow::Result<()> {
+            // Forward the message to the test harness channel so assertions can observe it.
+            let _ = self.tx.send(msg.clone()).await;
+            Ok(())
+        }
+
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_sends_to_registered_channel() {
+        use crate::channels::transport::Transport;
+
+        let transport = std::sync::Arc::new(Transport::new());
+
+        // Prepare a test channel that will collect OutgoingMessage values
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::channels::OutgoingMessage>(16);
+        let test_ch = TestChannel {
+            name: "telegram".to_string(),
+            tx,
+        };
+
+        // Register channel in a ChannelRegistry
+        let mut registry = crate::channels::ChannelRegistry::new();
+        registry.register(Box::new(test_ch));
+        let registry = std::sync::Arc::new(registry);
+
+        // Bind a task to the channel:thread so fanout knows where to send
+        let task_id = "fanout-test-task";
+        transport
+            .bind(task_id, "orch-fanout-test", "telegram", "thread-1")
+            .await;
+
+        // Spawn the fanout_output task
+        let transport_clone = transport.clone();
+        let registry_clone = registry.clone();
+        let task_id_str = task_id.to_string();
+        tokio::spawn(
+            async move { fanout_output(task_id_str, transport_clone, registry_clone).await },
+        );
+
+        // Give fanout time to subscribe to the broadcast
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Push some output into the transport; the fanout should forward it
+        transport
+            .push_output(
+                task_id,
+                crate::channels::OutputChunk {
+                    content: "hello from agent".to_string(),
+                    is_final: false,
+                },
+            )
+            .await;
+
+        // Push a final chunk to force flush
+        transport
+            .push_output(
+                task_id,
+                crate::channels::OutputChunk {
+                    content: "".to_string(),
+                    is_final: true,
+                },
+            )
+            .await;
+
+        // Expect at least one outgoing message to be sent to the test channel
+        let mut got = false;
+        for _ in 0..10 {
+            if let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), async {
+                    rx.recv().await
+                })
+                .await
+            {
+                if msg.body.contains("hello from agent") {
+                    got = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            got,
+            "fanout did not send expected outgoing message to test channel"
+        );
     }
 }

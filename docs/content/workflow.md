@@ -66,6 +66,10 @@ The Rust engine ticks every `engine.tick_interval` seconds (default 10s):
 6. **Jobs** — runs due scheduled jobs (cron, per-project)
 7. **Recovery** — detects stuck `in_progress` tasks (no tmux session, >10 min) and resets to `new`
 
+### Channels & Live Sessions
+
+The engine supports bidirectional channels (Telegram, Discord, Slack, GitHub, tmux). Incoming messages are routed to tmux sessions or turned into internal tasks. The capture service polls tmux panes and broadcasts diffs to all connected channel threads with per-channel rate limiting and message-splitting to satisfy platform limits.
+
 ## Worktrees
 
 The engine creates worktrees before launching agents. Agents do NOT create worktrees themselves.

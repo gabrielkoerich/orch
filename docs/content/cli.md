@@ -74,6 +74,10 @@ orch cost                   # show cost tracking and token usage
 orch log                    # tail server logs
 ```
 
+## Channels
+
+Channels are first-class: use chat platforms to interact with running tasks. Incoming messages in a bound thread are forwarded to the agent's tmux session (via `tmux send-keys`). New conversations can create internal tasks when sent to any configured channel. Live output from sessions is streamed to all bound channel threads with per-channel rate limiting and message splitting.
+
 ## Project Commands
 
 ```bash
