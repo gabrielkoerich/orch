@@ -50,9 +50,12 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
         }
     }
 
+
     Ok(())
+
 }
 
+/// Create a new task.
 /// Create a new task.
 pub async fn add(
     title: String,
@@ -89,6 +92,7 @@ pub async fn add(
     }
 
     Ok(())
+
 }
 
 /// Get task details by ID.
