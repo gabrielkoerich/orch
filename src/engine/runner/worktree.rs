@@ -24,9 +24,7 @@ pub struct WorktreeSetup {
 ///
 /// Format: `gh-task-{issue}-{slug}` where slug is lowercase, non-alphanum→`-`, max 40 chars.
 pub fn branch_name(task_id: &str, title: &str) -> String {
-    // Sanitize task_id for use in branch names (e.g. "internal:8" → "internal-8")
-    let task_id = task_id.replace(':', "-");
-    let task_id = task_id.as_str();
+    let task_id = sanitize_task_id(task_id);
 
     let raw: String = title
         .to_lowercase()
@@ -59,6 +57,11 @@ pub fn branch_name(task_id: &str, title: &str) -> String {
     } else {
         format!("gh-task-{task_id}-{slug}")
     }
+}
+
+/// Replace characters in `task_id` that are not safe for branch/worktree names.
+fn sanitize_task_id(task_id: &str) -> String {
+    task_id.replace(':', "-")
 }
 
 /// Detect the default branch of a repository.
@@ -315,7 +318,8 @@ pub async fn setup_worktree(
 
 /// Find an existing worktree by task ID prefix.
 fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<PathBuf> {
-    let prefix = format!("gh-task-{task_id}-");
+    let sanitized_id = sanitize_task_id(task_id);
+    let prefix = format!("gh-task-{sanitized_id}-");
 
     if let Ok(entries) = std::fs::read_dir(worktrees_base) {
         for entry in entries.flatten() {
@@ -420,6 +424,16 @@ mod tests {
         std::fs::create_dir(&wt_dir).unwrap();
 
         let result = find_existing_worktree(dir.path(), "42");
+        assert_eq!(result, Some(wt_dir));
+    }
+
+    #[test]
+    fn find_existing_worktree_handles_sanitized_task_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt_dir = dir.path().join("gh-task-internal-8-fix");
+        std::fs::create_dir(&wt_dir).unwrap();
+
+        let result = find_existing_worktree(dir.path(), "internal:8");
         assert_eq!(result, Some(wt_dir));
     }
 
