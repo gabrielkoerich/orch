@@ -6,8 +6,6 @@
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cmd::CommandErrorContext;
-use crate::db::TaskStatus;
-use crate::engine::tasks::TaskManager;
 use crate::sidecar;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -23,30 +21,13 @@ use tokio::process::Command;
 pub(crate) async fn cleanup_done_worktrees(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
-    task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
     let done_tasks = backend.list_by_status(Status::Done).await?;
     tracing::debug!(count = done_tasks.len(), "checking done tasks for cleanup");
 
-    // Collect task IDs from external done tasks.
-    let mut task_ids: Vec<String> = done_tasks.iter().map(|t| t.id.0.clone()).collect();
+    for task in done_tasks {
+        let task_id = &task.id.0;
 
-    // Also include internal done tasks.
-    if let Ok(internal_done) = task_manager
-        .db_list_internal_by_status(TaskStatus::Done)
-        .await
-    {
-        for t in internal_done {
-            task_ids.push(format!("internal:{}", t.id));
-        }
-    }
-
-    tracing::debug!(
-        count = task_ids.len(),
-        "checking all done tasks for cleanup"
-    );
-
-    for task_id in &task_ids {
         // Skip if already cleaned
         let worktree_cleaned = sidecar::get(task_id, "worktree_cleaned").ok();
         if worktree_cleaned.as_deref() == Some("true") || worktree_cleaned.as_deref() == Some("1") {
@@ -225,7 +206,7 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
         }
     }
 
-    // Fallback: try bare clone in ~/.orch/projects/
+    // Fallback: try bare clone in ~/.orch/projects/<owner>/<repo>.git
     let parts: Vec<&str> = repo.split('/').collect();
     let bare = if parts.len() == 2 {
         crate::home::projects_dir()
