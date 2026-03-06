@@ -1355,13 +1355,15 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 - [#446](https://github.com/gabrielkoerich/orch/issues/446) — `orch task status` shows only GitHub tasks; internal SQLite tasks excluded
 - [#443](https://github.com/gabrielkoerich/orch/issues/443) — External task status not updated to `NeedsReview` on runner infrastructure failure
 - [#441](https://github.com/gabrielkoerich/orch/issues/441) — `orch task unblock` ignores internal tasks
-- [#449](https://github.com/gabrielkoerich/orch/issues/449) — Docs: align workflow/getting-started/CLI docs with Rust v1 (orch)
-- [#435](https://github.com/gabrielkoerich/orch/issues/435) — `resolve_repo_root` uses wrong path for bare-clone projects
 
 ### Recently Closed
 
 | Issue | Title | Description |
 |-------|-------|-------------|
+| #456 | WeightSignal::Blocked fix | `src/engine/runner/mod.rs` + `src/engine/tick.rs` — new `Blocked` variant prevents review agent on delegated tasks |
+| #452 | Blocked/delegated tasks trigger review agent infinite loop | Root cause: `WeightSignal::None` overloaded; fixed by #456 |
+| #455/#449 | Docs: align workflow/getting-started/CLI with Rust v1 | Removed bash script references, updated CLI command tables |
+| #438/#435 | `resolve_repo_root` wrong path for bare-clone projects | `src/engine/runner/task_init.rs` — owner__repo → owner/repo.git |
 | #433 | `orch task logs <id>` | `src/cli/task.rs::logs` — shows sidecar, cost, memory, and live tmux output for any task |
 | #437/#436 | Internal tasks stuck in InProgress | Auto-recovery on engine restart — age > 10min with no active tmux session resets to `new` |
 | #361 | PR coverage comments | `romeovs/lcov-reporter-action@v0.4.0` comments coverage % on each PR — `.github/workflows/release.yml:52-57` |
