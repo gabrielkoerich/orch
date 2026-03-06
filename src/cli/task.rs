@@ -4,7 +4,7 @@ use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
-use crate::engine::tasks::{CreateTaskRequest, Task, TaskFilter, TaskType, parse_internal_id};
+use crate::engine::tasks::{parse_internal_id, CreateTaskRequest, Task, TaskFilter, TaskType};
 use crate::sidecar;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
@@ -566,8 +566,6 @@ pub async fn tree(id: Option<i64>) -> anyhow::Result<()> {
 
 /// Show logs / post-mortem for a task (internal or external).
 pub async fn logs(id: &str) -> anyhow::Result<()> {
-    use crate::backends::ExternalId;
-
     let task_manager = init_task_manager().await?;
 
     // Resolve sidecar key and print basic metadata where available.
@@ -632,7 +630,11 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     match sidecar::sidecar_path(&sidecar_key) {
         Ok(path) => {
             if !path.exists() {
-                println!("\nNo sidecar found for task {} — looked at: {}", sidecar_key, path.display());
+                println!(
+                    "\nNo sidecar found for task {} — looked at: {}",
+                    sidecar_key,
+                    path.display()
+                );
             } else {
                 println!("\nSidecar: {}", path.display());
 
@@ -667,7 +669,13 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                     if !mem.is_empty() {
                         println!("\nMemory (recent attempts):");
                         for m in mem {
-                            println!("- Attempt {} @ {}: agent={} model={}", m.attempt, m.timestamp, m.agent, m.model.clone().unwrap_or_default());
+                            println!(
+                                "- Attempt {} @ {}: agent={} model={}",
+                                m.attempt,
+                                m.timestamp,
+                                m.agent,
+                                m.model.clone().unwrap_or_default()
+                            );
                             if let Some(err) = m.error.as_ref() {
                                 println!("    Error: {}", err);
                             }
@@ -689,7 +697,10 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
             }
         }
         Err(e) => {
-            println!("\nCould not resolve sidecar path for {}: {}", sidecar_key, e);
+            println!(
+                "\nCould not resolve sidecar path for {}: {}",
+                sidecar_key, e
+            );
         }
     }
 
@@ -698,7 +709,10 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     let repo = config::get_current_repo().unwrap_or_default();
     let session = tmux.session_name(&repo, &sidecar_key);
     if tmux.session_exists(&session).await {
-        println!("\nLive tmux session detected: {} — appending recent output:\n---", session);
+        println!(
+            "\nLive tmux session detected: {} — appending recent output:\n---",
+            session
+        );
         match tmux.capture_pane(&session, 200).await {
             Ok(output) => {
                 println!("{}", output);

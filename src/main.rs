@@ -252,7 +252,7 @@ enum SidecarAction {
 }
 
 #[derive(Subcommand)]
-    enum TaskAction {
+enum TaskAction {
     /// List tasks (internal + external)
     List {
         /// Filter by status
