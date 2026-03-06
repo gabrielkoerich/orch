@@ -1,8 +1,8 @@
-++
++++
 title = "Morning Review — 2026-03-03"
 date = 2026-03-03
 description = "Daily ops check: recent commits, health, prompt alignment, and follow-ups"
-++ 
++++
 
 ## Summary
 
