@@ -622,8 +622,8 @@ pub(crate) async fn review_and_merge(
                     reason = %reason,
                     "no PR and no commits — re-routing for retry"
                 );
-                let _ = backend
-                    .update_status(&task.id, crate::backends::Status::New)
+                let _ = task_manager
+                    .update_task_status(&task.id, crate::backends::Status::New)
                     .await;
                 return Ok(ReviewDecision::Skipped);
             }
