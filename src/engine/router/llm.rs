@@ -304,6 +304,11 @@ impl LlmRouter {
 
     /// Call the router LLM to classify the task.
     async fn call_router_llm(&self, prompt: &str, config: &RouterConfig) -> anyhow::Result<String> {
+        // Skip immediately if router agent is on cooldown
+        if crate::engine::runner::response::is_agent_in_cooldown(&config.router_agent) {
+            anyhow::bail!("router LLM agent '{}' is on cooldown", config.router_agent);
+        }
+
         let timeout_secs = config.timeout_seconds;
         let timeout_duration = Duration::from_secs(timeout_secs);
 
@@ -327,6 +332,17 @@ impl LlmRouter {
                     "router LLM command completed"
                 );
                 if !output.status.success() {
+                    // Detect rate limit from stdout (agent exits non-zero on API errors)
+                    use crate::engine::runner::agents::AgentError;
+                    let runner = crate::engine::runner::agents::get_runner(&config.router_agent);
+                    if let Err(AgentError::RateLimit { .. }) = runner.parse_response(&stdout) {
+                        tracing::warn!(
+                            agent = %config.router_agent,
+                            "router LLM rate limited — adding to cooldown"
+                        );
+                        crate::engine::runner::response::record_agent_failure(&config.router_agent);
+                        anyhow::bail!("router LLM rate limited: {}", config.router_agent);
+                    }
                     tracing::warn!(
                         stderr = %stderr,
                         stdout = %stdout,
