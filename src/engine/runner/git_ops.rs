@@ -12,6 +12,19 @@ use crate::github::http::GhHttp;
 use std::path::Path;
 use tokio::process::Command;
 
+/// Format a task ID for display in PR/issue footers.
+///
+/// GitHub task IDs are displayed as `#123` (creates a GH issue hyperlink).
+/// Internal task IDs (`internal:13`) are displayed as `internal-13` (no `#`
+/// to avoid creating a false issue link).
+fn format_task_ref(task_id: &str) -> String {
+    if task_id.starts_with("internal:") {
+        task_id.replace(':', "-")
+    } else {
+        format!("#{task_id}")
+    }
+}
+
 /// Errors that can occur during PR creation.
 #[derive(Debug, thiserror::Error)]
 pub enum PrCreateError {
@@ -372,8 +385,9 @@ pub async fn create_pr_if_needed(
     }
 
     let model_str = model.map(|m| format!(" using `{m}`")).unwrap_or_default();
+    let task_ref = format_task_ref(task_id);
     body.push_str(&format!(
-        "\n\n---\n*Task #{task_id} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
+        "\n\n---\n*Task {task_ref} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
     ));
 
     // Always use the short task title for the PR title (summary goes in body)
@@ -422,8 +436,9 @@ async fn append_pr_footer_if_missing(
     }
 
     let model_str = model.map(|m| format!(" using `{m}`")).unwrap_or_default();
+    let task_ref = format_task_ref(task_id);
     let footer = format!(
-        "\n\n---\n*Task #{task_id} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
+        "\n\n---\n*Task {task_ref} · Created by {agent}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
     );
     let new_body = format!("{body}{footer}");
 
