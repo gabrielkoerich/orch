@@ -183,6 +183,7 @@ in_progress → needs_review → in_review → done
 - Clarified that jobs are per-project in `.orch.yml` (preferred) and scheduler runs from engine tick
 - Changed max-attempts behavior: repeated failures now move tasks to `needs_review` and forced `agent:*` labels are removed
 - Review agent selection clarifications: review agent excludes the original task agent to avoid self-review
+- Aligned `workflow.md`, `getting-started.md`, `cli.md`, and `_index.md` with Rust v1: removed bash script references (`serve.sh`, `poll.sh`, `run_task.sh`), replaced with `orch` subcommands, updated engine tick description, removed "orch is alias for orchestrator" copy, and updated file tables to reflect SQLite database
 
 ### New CLI: `orch task logs <id>`
 

@@ -12,16 +12,16 @@ How the orchestrator runs tasks end-to-end.
 Issue → Branch + Worktree → Agent works → Push → PR → Review Agent → Merge → Cleanup
 ```
 
-1. **Issue** — created via `orchestrator task add` or `jobs_tick`
-2. **Branch + Worktree** — orchestrator creates via `gh issue develop` + `git worktree add`
+1. **Issue** — created via `orch task add` or a scheduled job (`orch job tick`)
+2. **Branch + Worktree** — engine creates via `gh issue develop` + `git worktree add`
 3. **Agent works** — runs inside worktree, edits files, commits changes
-4. **Push** — orchestrator pushes the branch after agent finishes
+4. **Push** — engine pushes the branch after agent finishes
 5. **PR** — agent creates with `gh pr create --base main` and `Closes #N`
 6. **Review** — opposite agent reviews the PR via `gh pr review` (approve / request changes / reject)
 7. **Fix + Reply** — fix review findings, reply to each comment, resolve threads
 8. **Merge** — squash merge with conventional commit prefix (`feat:` / `fix:`)
 9. **Release** — CI auto-tags, generates changelog, creates GitHub release, updates Homebrew
-10. **Cleanup** — (TODO) orchestrator detects merged PR, removes worktree + local branch
+10. **Cleanup** — engine detects merged PR, removes worktree + local branch
 
 ## Mention-Driven Tasks
 
@@ -46,28 +46,29 @@ new → routed → in_progress → needs_review → in_review → done (merged)
                             → blocked
 ```
 
-- **new**: task created (via `add` or `jobs_tick`)
+- **new**: task created (via `orch task add` or a scheduled job)
 - **routed**: LLM router assigned agent, model, profile, skills
 - **in_progress**: agent is running
-- **done**: PR merged (or agent completed with no code changes)
-- **in_review**: review agent is actively running on the PR
-- **blocked**: agent hit a blocker or crashed (rare; human intervention needed)
 - **needs_review**: PR exists and is queued for review, or max attempts exceeded
+- **in_review**: review agent is actively running on the PR
+- **done**: PR merged (or agent completed with no code changes)
+- **blocked**: waiting on child tasks to complete
 
-## Poll Loop
+## Engine Tick
 
-`serve.sh` ticks every 10s:
+The Rust engine ticks every `engine.tick_interval` seconds (default 10s):
 
-1. `poll.sh` — finds `new`/`routed` tasks, runs them in parallel (up to `POLL_JOBS=4`)
-2. `poll.sh` — detects stuck `in_progress` tasks (no lock held, stale >30min), resets to `new`
-3. `poll.sh` — checks blocked parents: if all children are `done`, unblocks parent
-4. `jobs_tick.sh` — checks cron schedules, creates tasks for due jobs
-5. `review_prs.sh` — auto-reviews open PRs (if review agent enabled)
-6. `cleanup_worktrees.sh` — removes worktrees for merged PRs
+1. **Sync** — imports new GitHub issues, syncs labels, detects PR events (webhook or polling)
+2. **Route** — assigns agent, model, and profile to `new` tasks via LLM router
+3. **Dispatch** — launches routed tasks in tmux sessions inside worktrees
+4. **Unblock** — if all children of a blocked parent are `done`, resets parent to `new`
+5. **Review** — when a task transitions `needs_review → in_review`, launches review agent
+6. **Jobs** — runs due scheduled jobs (cron, per-project)
+7. **Recovery** — detects stuck `in_progress` tasks (no tmux session, >10 min) and resets to `new`
 
 ## Worktrees
 
-The orchestrator creates worktrees before launching agents. Agents do NOT create worktrees themselves.
+The engine creates worktrees before launching agents. Agents do NOT create worktrees themselves.
 
 **Worktree path:** `~/.orch/worktrees/<project>/<branch>/`
 
@@ -78,12 +79,12 @@ The orchestrator creates worktrees before launching agents. Agents do NOT create
 4. Agent runs inside the worktree directory (`PROJECT_DIR` is set to worktree)
 
 **After agent finishes:**
-- Orchestrator pushes the branch (`git push -u origin <branch>`) if there are unpushed commits. The runner injects `GH_TOKEN` into the spawned runner environment so agents do not need to authenticate with `gh` themselves and agents should avoid calling GitHub directly.
+- Engine pushes the branch (`git push -u origin <branch>`) if there are unpushed commits. The runner injects `GH_TOKEN` into the spawned runner environment so agents do not need to authenticate with `gh` themselves and agents should avoid calling GitHub directly.
 - Agent should NOT run `git push` itself
 
 ## Agent Invocation
 
-`run_task.sh` runs the agent:
+The Rust runner spawns the agent inside a tmux session:
 
 ```bash
 claude -p \
@@ -116,20 +117,20 @@ claude -p \
 
 After agent completion, if a PR is open and `enable_review_agent` is true:
 
-1. Status overridden to `in_review`
+1. Status transitions to `needs_review`, then `in_review` (this transition is the atomic guard)
 2. Opposite agent selected (codex wrote → claude reviews)
 3. PR diff fetched via `gh pr diff`
-4. Review agent evaluates and returns `approve`, `request_changes`, or `reject`
-5. Real GitHub PR review posted via `gh pr review`
+4. Review agent evaluates and posts a comment with `## Automated Review — Approve/Changes Requested` header
+5. CI workflow reads the review comment to determine approval
 
 See the [Review Agent](@/review-agent.md) page for full details.
 
 ## Stuck Task Recovery
 
-`poll.sh` detects stuck tasks:
+The engine detects stuck tasks:
 
-1. **No agent assigned** — task stuck `in_progress` without an agent → set to `needs_review`
-2. **Dead agent** — task has agent but no lock file and `updated_at` older than `stuck_timeout` (default 30min) → reset to `new`
+1. **No tmux session found** — task `in_progress` with no live session and age >10 min → reset to `new`
+2. **Max attempts exceeded** — task goes to `needs_review` (not `blocked`) and the forced `agent:*` label is removed so an owner can reassign or inspect the task
 
 Note: `stuck_timeout` is separate from the task execution timeout. Task execution is limited by `workflow.timeout_seconds` (or `workflow.timeout_by_complexity`), which controls how long an agent run is allowed to execute before being killed (exit 124 / TIMEOUT).
 
