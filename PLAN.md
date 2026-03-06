@@ -1351,16 +1351,19 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 **Currently open:**
 - [#431](https://github.com/gabrielkoerich/orch/issues/431) — Bidirectional channel interaction (wire input to engine actions + fan out session output to channels) — in progress
+- [#448](https://github.com/gabrielkoerich/orch/issues/448) — Engine health checks (stuck recovery, NeedsReview catch-up, stale InReview) are blind to internal SQLite tasks
 - [#446](https://github.com/gabrielkoerich/orch/issues/446) — `orch task status` shows only GitHub tasks; internal SQLite tasks excluded
+- [#443](https://github.com/gabrielkoerich/orch/issues/443) — External task status not updated to `NeedsReview` on runner infrastructure failure
 - [#441](https://github.com/gabrielkoerich/orch/issues/441) — `orch task unblock` ignores internal tasks
-- [#437](https://github.com/gabrielkoerich/orch/issues/437) / [#436](https://github.com/gabrielkoerich/orch/issues/436) — Internal tasks stuck in InProgress not auto-recovered
+- [#449](https://github.com/gabrielkoerich/orch/issues/449) — Docs: align workflow/getting-started/CLI docs with Rust v1 (orch)
 - [#435](https://github.com/gabrielkoerich/orch/issues/435) — `resolve_repo_root` uses wrong path for bare-clone projects
-- [#433](https://github.com/gabrielkoerich/orch/issues/433) — `orch task logs <id>` command (show agent output for completed tasks)
 
 ### Recently Closed
 
 | Issue | Title | Description |
 |-------|-------|-------------|
+| #433 | `orch task logs <id>` | `src/cli/task.rs::logs` — shows sidecar, cost, memory, and live tmux output for any task |
+| #437/#436 | Internal tasks stuck in InProgress | Auto-recovery on engine restart — age > 10min with no active tmux session resets to `new` |
 | #361 | PR coverage comments | `romeovs/lcov-reporter-action@v0.4.0` comments coverage % on each PR — `.github/workflows/release.yml:52-57` |
 | #230 | Break `tick()` into named phases | Extracted 4-5 phases of the `tick()` function into independent methods. |
 | #144 | Cost Tracking CLI and Budget Enforcement | `orch cost` command in `src/cli/cost.rs` — per-task and aggregate cost reporting |
