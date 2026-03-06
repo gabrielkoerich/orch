@@ -148,7 +148,9 @@ mod tests {
         // Use a temporary HOME so we don't touch the developer's real home dir.
         let temp = TempDir::new().unwrap();
         let home = temp.path();
-        std::env::set_var("HOME", home);
+        // Set HOME using a string to avoid platform-dependent AsRef conversions
+        // which can be sensitive during parallel test runs.
+        std::env::set_var("HOME", home.to_str().unwrap());
 
         let dir = task_dir("test-owner/test-repo", "42").unwrap();
         assert!(dir.exists());
@@ -161,7 +163,9 @@ mod tests {
         // Use a temporary HOME so we don't touch the developer's real home dir.
         let temp = TempDir::new().unwrap();
         let home = temp.path();
-        std::env::set_var("HOME", home);
+        // Use a UTF-8 string representation for HOME to avoid intermittent
+        // failures when multiple tests manipulate the environment concurrently.
+        std::env::set_var("HOME", home.to_str().unwrap());
 
         let dir = task_attempt_dir("test-owner/test-repo", "42", 1).unwrap();
         assert!(dir.exists());
@@ -173,7 +177,7 @@ mod tests {
     fn test_repo_state_dir_separates_repos() {
         let temp = TempDir::new().unwrap();
         let home = temp.path();
-        std::env::set_var("HOME", home);
+        std::env::set_var("HOME", home.to_str().unwrap());
 
         let dir_a = repo_state_dir("owner/repo-a").unwrap();
         let dir_b = repo_state_dir("owner/repo-b").unwrap();
