@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 
 use super::cleanup::cleanup_task_worktree;
 use super::router::Router;
+use super::tasks::TaskManager;
 use super::EngineConfig;
 
 /// Review agent decision result.
@@ -44,6 +45,7 @@ pub(crate) async fn review_open_prs(
     _db: &Arc<crate::db::Db>,
     repo: &str,
     config: &EngineConfig,
+    task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
     // Get tasks that are in review (have open PRs)
     let in_review_tasks = backend.list_by_status(Status::InReview).await?;
@@ -75,7 +77,10 @@ pub(crate) async fn review_open_prs(
                     task_id,
                     "in_review task has no branch info — setting needs_review"
                 );
-                if let Err(e) = backend.update_status(&task.id, Status::NeedsReview).await {
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::NeedsReview)
+                    .await
+                {
                     tracing::warn!(task_id, err = %e, "failed to update status");
                 }
                 continue;
@@ -90,12 +95,18 @@ pub(crate) async fn review_open_prs(
                 let merged = gh.is_pr_merged(repo, &branch).await.unwrap_or(false);
                 if merged {
                     tracing::info!(task_id, branch = %branch, "PR already merged, marking done");
-                    if let Err(e) = backend.update_status(&task.id, Status::Done).await {
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::Done)
+                        .await
+                    {
                         tracing::warn!(task_id, err = %e, "failed to update status to done");
                     }
                 } else {
                     tracing::warn!(task_id, branch = %branch, "in_review but no open PR — re-dispatching");
-                    if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::Routed)
+                        .await
+                    {
                         tracing::warn!(task_id, err = %e, "failed to update status to routed");
                     }
                 }
@@ -189,7 +200,10 @@ pub(crate) async fn review_open_prs(
                     pr_number,
                     "PR already merged, marking task as done"
                 );
-                if let Err(e) = backend.update_status(&task.id, Status::Done).await {
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::Done)
+                    .await
+                {
                     tracing::warn!(task_id, err = %e, "failed to update task status to done");
                 }
             } else {
@@ -209,7 +223,10 @@ pub(crate) async fn review_open_prs(
                             retries,
                             "PR approved but merge conflict retry limit reached — blocking for human review"
                         );
-                        if let Err(e) = backend.update_status(&task.id, Status::Blocked).await {
+                        if let Err(e) = task_manager
+                            .update_task_status(&task.id, Status::Blocked)
+                            .await
+                        {
                             tracing::warn!(task_id, err = %e, "failed to set Blocked");
                         }
                         continue;
@@ -227,7 +244,10 @@ pub(crate) async fn review_open_prs(
                         tracing::warn!(task_id, err = %e, "failed to update merge_conflict_retries");
                     }
                     // Set NeedsReview — next tick re-triggers review agent
-                    if let Err(e) = backend.update_status(&task.id, Status::NeedsReview).await {
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::NeedsReview)
+                        .await
+                    {
                         tracing::warn!(task_id, err = %e, "failed to set NeedsReview for conflict retry");
                     }
                     continue;
@@ -244,8 +264,16 @@ pub(crate) async fn review_open_prs(
                     sidecar::get(&task.id.0, "agent").unwrap_or_else(|_| "orch".to_string());
                 let task_model =
                     sidecar::get(&task.id.0, "model").unwrap_or_else(|_| "unknown".to_string());
-                if let Err(e) =
-                    auto_merge_pr(&task, &branch, backend, repo, &task_agent, &task_model).await
+                if let Err(e) = auto_merge_pr(
+                    &task,
+                    &branch,
+                    backend,
+                    repo,
+                    &task_agent,
+                    &task_model,
+                    task_manager,
+                )
+                .await
                 {
                     tracing::warn!(
                         task_id,
@@ -394,7 +422,10 @@ pub(crate) async fn review_open_prs(
                 tracing::warn!(task_id, err = %e, "failed to update last_review_ts");
             }
 
-            if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
+            if let Err(e) = task_manager
+                .update_task_status(&task.id, Status::Routed)
+                .await
+            {
                 tracing::warn!(task_id, err = %e, "failed to set status to routed for re-dispatch");
             } else {
                 tracing::info!(task_id, "re-dispatching task to address review feedback");
@@ -416,6 +447,7 @@ pub(crate) async fn review_and_merge(
     tmux: &Arc<TmuxManager>,
     repo: &str,
     router: &Arc<RwLock<Router>>,
+    task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<ReviewDecision> {
     // 2. Load sidecar for worktree path, branch, agent
     let worktree = sidecar::get(&task.id.0, "worktree").ok();
@@ -864,6 +896,7 @@ pub(crate) async fn review_and_merge(
                     repo,
                     &review_agent,
                     &review_model,
+                    task_manager,
                 )
                 .await
                 {
@@ -892,6 +925,7 @@ pub(crate) async fn review_and_merge(
                 pr_number_early,
                 &review_agent,
                 &review_model,
+                task_manager,
             )
             .await?;
             Ok(decision)
@@ -908,10 +942,11 @@ pub(crate) async fn review_and_merge(
 pub(crate) async fn auto_merge_pr(
     task: &ExternalTask,
     branch: &str,
-    backend: &Arc<dyn ExternalBackend>,
+    _backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     review_agent: &str,
     review_model: &str,
+    task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
     // 1. Get PR number from branch
     let gh = GhHttp::new();
@@ -984,14 +1019,18 @@ pub(crate) async fn auto_merge_pr(
                     failing,
                     "CI failed — re-routing to agent to fix"
                 );
-                backend.update_status(&task.id, Status::NeedsReview).await?;
+                task_manager
+                    .update_task_status(&task.id, Status::NeedsReview)
+                    .await?;
                 return Ok(());
             }
             _ => {
                 // pending — wait up to max_wait
                 if start.elapsed() >= max_wait {
                     tracing::warn!(task_id = task.id.0, "CI checks still pending after timeout");
-                    backend.update_status(&task.id, Status::NeedsReview).await?;
+                    task_manager
+                        .update_task_status(&task.id, Status::NeedsReview)
+                        .await?;
                     return Ok(());
                 }
             }
@@ -1023,7 +1062,9 @@ pub(crate) async fn auto_merge_pr(
                     retries,
                     "merge conflict retry limit reached"
                 );
-                backend.update_status(&task.id, Status::Blocked).await?;
+                task_manager
+                    .update_task_status(&task.id, Status::Blocked)
+                    .await?;
                 let comment = format!(
                     "Auto-merge failed after {} conflict retries: {}",
                     retries, e
@@ -1052,13 +1093,17 @@ pub(crate) async fn auto_merge_pr(
                 &[format!("merge_conflict_retries={}", retries + 1)],
             );
             // Set NeedsReview — next tick will re-trigger review agent
-            backend.update_status(&task.id, Status::NeedsReview).await?;
+            task_manager
+                .update_task_status(&task.id, Status::NeedsReview)
+                .await?;
             return Ok(());
         }
 
         // Non-conflict merge failure (permissions, branch protection, etc.)
         tracing::error!(task_id = task.id.0, error = %e, "merge failed — blocking for human review");
-        backend.update_status(&task.id, Status::Blocked).await?;
+        task_manager
+            .update_task_status(&task.id, Status::Blocked)
+            .await?;
         let comment = format!("Auto-merge failed: {}", e);
         let footer = format!(
             "\n\n---\n*Commented by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
@@ -1075,7 +1120,9 @@ pub(crate) async fn auto_merge_pr(
     }
 
     // 6. Update status to done (auto-closes the issue via backend)
-    backend.update_status(&task.id, Status::Done).await?;
+    task_manager
+        .update_task_status(&task.id, Status::Done)
+        .await?;
 
     // 7. Cleanup worktree + branches + pull main immediately
     // (can't rely on sync_tick because auto-close makes list_by_status(Done) miss it)
@@ -1108,11 +1155,12 @@ pub(crate) async fn handle_review_changes(
     task: &ExternalTask,
     notes: &str,
     issues: &[crate::engine::runner::response::ReviewIssue],
-    backend: &Arc<dyn ExternalBackend>,
+    _backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     pr_number: u64,
     review_agent: &str,
     review_model: &str,
+    task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
     // 1. Check review cycle count (max 2 review rounds)
     let review_cycles: u32 = sidecar::get(&task.id.0, "review_cycles")
@@ -1136,7 +1184,9 @@ pub(crate) async fn handle_review_changes(
             max_cycles,
             "max review cycles exceeded, blocking for human review"
         );
-        backend.update_status(&task.id, Status::Blocked).await?;
+        task_manager
+            .update_task_status(&task.id, Status::Blocked)
+            .await?;
         let escalation = format!(
             "🔍 Review agent requested changes after {} cycles. Escalating to human.\n\n**Review Notes:**\n{}",
             review_cycles, notes
@@ -1206,7 +1256,9 @@ pub(crate) async fn handle_review_changes(
     );
 
     // 4. Re-dispatch — set status back to routed (keeps same agent/branch/worktree)
-    backend.update_status(&task.id, Status::Routed).await?;
+    task_manager
+        .update_task_status(&task.id, Status::Routed)
+        .await?;
 
     tracing::info!(
         task_id = task.id.0,

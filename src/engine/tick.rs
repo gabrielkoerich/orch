@@ -486,6 +486,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                             &tmux_clone,
                                             &repo_owned,
                                             &router_for_review,
+                                            &task_manager_for_review,
                                         )
                                         .await
                                         {
