@@ -207,9 +207,14 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
     }
 
     // Fallback: try bare clone in ~/.orch/projects/
-    let bare = crate::home::projects_dir()
-        .map(|d| d.join(repo.replace('/', "__")))
-        .unwrap_or_default();
+    let parts: Vec<&str> = repo.split('/').collect();
+    let bare = if parts.len() == 2 {
+        crate::home::projects_dir()
+            .map(|d| d.join(parts[0]).join(format!("{}.git", parts[1])))
+            .unwrap_or_default()
+    } else {
+        std::path::PathBuf::new()
+    };
     if bare.exists() {
         return Ok(bare.display().to_string());
     }
