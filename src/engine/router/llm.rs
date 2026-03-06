@@ -89,9 +89,7 @@ impl LlmRouter {
         let _ = tokio::fs::write(&prompt_path, &prompt).await;
         // Prune old debug files so the state dir doesn't grow indefinitely.
         // This is best-effort and should never fail the routing operation.
-        let _ = self
-            .prune_old_debug_files(50, "route-prompt-")
-            .await;
+        let _ = self.prune_old_debug_files(50, "route-prompt-").await;
 
         // Call the LLM router
         let response = self.call_router_llm(&prompt, config).await?;
@@ -109,9 +107,7 @@ impl LlmRouter {
         if let Ok(path) = response_path {
             let _ = std::fs::write(&path, &response);
             // Prune old debug files for responses as well.
-            let _ = self
-                .prune_old_debug_files(50, "route-response-")
-                .await;
+            let _ = self.prune_old_debug_files(50, "route-response-").await;
         }
 
         // Parse the response
