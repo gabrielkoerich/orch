@@ -1118,10 +1118,12 @@ pub(crate) async fn auto_merge_pr(
                         worktree = %wt,
                         "attempting rebase to resolve merge conflict"
                     );
+                    let default_branch =
+                        config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
                     let rebase_result = tokio::process::Command::new("sh")
                         .arg("-c")
                         .arg(format!(
-                            "cd '{}' && git fetch origin && git rebase origin/main && git push --force-with-lease",
+                            "cd '{}' && git fetch origin && git rebase origin/{default_branch} && git push --force-with-lease",
                             wt
                         ))
                         .output()
