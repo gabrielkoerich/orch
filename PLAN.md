@@ -184,6 +184,7 @@ in_progress → needs_review → in_review → done
 - Changed max-attempts behavior: repeated failures now move tasks to `needs_review` and forced `agent:*` labels are removed
 - Review agent selection clarifications: review agent excludes the original task agent to avoid self-review
 - Aligned `workflow.md`, `getting-started.md`, `cli.md`, and `_index.md` with Rust v1: removed bash script references (`serve.sh`, `poll.sh`, `run_task.sh`), replaced with `orch` subcommands, updated engine tick description, removed "orch is alias for orchestrator" copy, and file tables reflect SQLite database
+ - Completed bidirectional channel wiring and live output fanout: `handle_channel_message()` routes incoming messages to tmux or commands, `fanout_output()` enforces per-channel rate limits, splits long messages, and flushes final chunks; added integration tests for tmux capture -> transport and a test channel for fanout
 
 ### New CLI: `orch task logs <id>`
 

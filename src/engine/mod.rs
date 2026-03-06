@@ -1273,4 +1273,74 @@ mod tests {
             config.no_session_stuck_timeout
         );
     }
+
+    #[tokio::test]
+    async fn integration_channel_to_tmux_to_capture() {
+        use crate::channels::transport::Transport;
+        use crate::channels::capture::CaptureService;
+        use std::sync::Arc;
+
+        // Skip test if tmux is not available in the environment (CI may not have tmux)
+        if tokio::process::Command::new("tmux").arg("-V").output().await.is_err() {
+            tracing::warn!("tmux not found, skipping integration_channel_to_tmux_to_capture test");
+            return;
+        }
+
+        // Create transport and capture service
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport.clone()));
+
+        let task_id = "testtask1".to_string();
+        let session_name = format!("orch-test-{}", task_id);
+
+        // Start a detached tmux session
+        let _ = tokio::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session_name])
+            .output()
+            .await
+            .expect("failed to start tmux session");
+
+        // Register session with capture service and transport binding
+        capture.register_session(&task_id, &session_name).await;
+        transport
+            .bind(&task_id, &session_name, "telegram", "12345")
+            .await;
+
+        // Spawn capture.run() which exits when session is unregistered
+        let capture_clone = capture.clone();
+        let capture_handle = tokio::spawn(async move { capture_clone.run().await });
+
+        // Subscribe to transport output for this task
+        let mut rx = transport.subscribe(&task_id).await.expect("no subscription");
+
+        // Send a message into the tmux session via tmux send-keys (simulate channel input)
+        let send = tokio::process::Command::new("tmux")
+            .args(["send-keys", "-t", &session_name, "echo from-channel", "Enter"]).output()
+            .await
+            .expect("failed to send keys");
+        assert!(send.status.success());
+
+        // Wait for an output chunk from capture -> transport
+        let mut got = false;
+        for _ in 0..20 {
+            if let Ok(Ok(c)) = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+                if c.content.contains("from-channel") {
+                    got = true;
+                    break;
+                }
+            }
+        }
+
+        // Clean up: unregister and kill tmux session
+        capture.unregister_session(&task_id).await;
+        let _ = tokio::process::Command::new("tmux")
+            .args(["kill-session", "-t", &session_name])
+            .output()
+            .await;
+
+        // Wait for capture.run to finish
+        let _ = capture_handle.await;
+
+        assert!(got, "did not observe tmux output via capture/transport");
+    }
 }
