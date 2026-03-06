@@ -337,6 +337,11 @@ enum TaskAction {
         /// Task ID (if omitted, shows all root tasks)
         id: Option<i64>,
     },
+    /// Show logs / post-mortem for a task (internal or external)
+    Logs {
+        /// Task ID (e.g. "internal:8" or issue number)
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -533,6 +538,9 @@ async fn main() -> anyhow::Result<()> {
             }
             TaskAction::Tree { id } => {
                 cli::task::tree(id).await?;
+            }
+            TaskAction::Logs { id } => {
+                cli::task::logs(&id).await?;
             }
         },
         Commands::Job { action } => match action {
