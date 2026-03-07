@@ -630,6 +630,22 @@ pub(crate) async fn review_and_merge(
                 }
             } else {
                 // No PR and no commits — agent either failed or completed a read-only task.
+                let merged = gh_check
+                    .is_pr_merged(repo, &branch_name)
+                    .await
+                    .unwrap_or(false);
+                if merged {
+                    tracing::info!(
+                        task_id = task.id.0,
+                        branch = %branch_name,
+                        "PR already merged, marking done"
+                    );
+                    let _ = task_manager
+                        .update_task_status(&task.id, crate::backends::Status::Done)
+                        .await;
+                    return Ok(ReviewDecision::Skipped);
+                }
+
                 let last_error = sidecar::get(&task.id.0, "last_error").unwrap_or_default();
                 let reason = if !agent_summary.is_empty() {
                     agent_summary.clone()
