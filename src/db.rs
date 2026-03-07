@@ -144,6 +144,11 @@ impl Db {
             conn.pragma_update(None, "user_version", 3)?;
         }
 
+        if version < 4 {
+            conn.execute_batch(SCHEMA_V4)?;
+            conn.pragma_update(None, "user_version", 4)?;
+        }
+
         Ok(())
     }
 
@@ -809,6 +814,31 @@ ALTER TABLE task_metrics ADD COLUMN output_tokens INTEGER DEFAULT NULL;
 ALTER TABLE task_metrics ADD COLUMN input_cost_usd REAL DEFAULT NULL;
 ALTER TABLE task_metrics ADD COLUMN output_cost_usd REAL DEFAULT NULL;
 ALTER TABLE task_metrics ADD COLUMN total_cost_usd REAL DEFAULT NULL;
+"#;
+
+/// Schema v4 — fix corrupt/non-RFC3339 timestamps in internal_tasks.
+///
+/// Some rows were inserted with NULL, empty, or SQLite-default format
+/// ("YYYY-MM-DD HH:MM:SS" without T/Z) that fails chrono::parse_from_rfc3339.
+/// Backfill order matters: convert space-formatted timestamps first, then
+/// backfill created_at (so it is non-NULL), then set updated_at = created_at
+/// for rows where updated_at is still NULL/empty.
+const SCHEMA_V4: &str = r#"
+UPDATE internal_tasks
+SET updated_at = substr(updated_at, 1, 10) || 'T' || substr(updated_at, 12, 8) || 'Z'
+WHERE updated_at IS NOT NULL AND updated_at != '' AND updated_at NOT LIKE '%T%';
+
+UPDATE internal_tasks
+SET created_at = substr(created_at, 1, 10) || 'T' || substr(created_at, 12, 8) || 'Z'
+WHERE created_at IS NOT NULL AND created_at != '' AND created_at NOT LIKE '%T%';
+
+UPDATE internal_tasks
+SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE created_at IS NULL OR created_at = '';
+
+UPDATE internal_tasks
+SET updated_at = created_at
+WHERE updated_at IS NULL OR updated_at = '';
 "#;
 
 #[cfg(test)]
