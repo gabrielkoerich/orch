@@ -1375,6 +1375,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 | Issue | Title | Description |
 |-------|-------|-------------|
+| #509 | Show agent output in `orch task logs` | `orch task logs <id>` now displays agent output from `output.json` (last 2000 chars via `safe_utf8_tail`), exit code from `exit.txt`, and review agent output from `{task_id}-review/attempts/1/output.json` — `src/cli/task.rs:803-860` |
 | #361 | PR coverage comments | `romeovs/lcov-reporter-action@v0.4.0` comments coverage % on each PR — `.github/workflows/release.yml:52-57` |
 | #230 | Break `tick()` into named phases | Extracted 4-5 phases of the `tick()` function into independent methods. |
 | #144 | Cost Tracking CLI and Budget Enforcement | `orch cost` command in `src/cli/cost.rs` — per-task and aggregate cost reporting |
