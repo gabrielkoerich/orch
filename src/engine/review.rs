@@ -4,7 +4,7 @@
 //! tasks, parsing its decision, posting automated review comments, merging
 //! approved PRs, and re-dispatching agents when changes are requested.
 
-use crate::backends::{ExternalBackend, ExternalTask, Status};
+use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::config;
 use crate::engine::runner;
 use crate::github::http::GhHttp;
@@ -48,7 +48,28 @@ pub(crate) async fn review_open_prs(
     task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
     // Get tasks that are in review (have open PRs)
-    let in_review_tasks = backend.list_by_status(Status::InReview).await?;
+    let mut in_review_tasks = backend.list_by_status(Status::InReview).await?;
+
+    // Also include internal tasks in InReview — they create real PRs
+    // and can receive human review comments just like external tasks.
+    if let Ok(internal_in_review) = task_manager
+        .db_list_internal_by_status(crate::db::TaskStatus::InReview)
+        .await
+    {
+        for t in internal_in_review {
+            in_review_tasks.push(ExternalTask {
+                id: ExternalId(format!("internal:{}", t.id)),
+                title: t.title,
+                body: t.body,
+                state: "open".to_string(),
+                labels: vec!["status:in_review".to_string()],
+                author: t.source,
+                created_at: t.created_at.to_rfc3339(),
+                updated_at: t.updated_at.to_rfc3339(),
+                url: String::new(),
+            });
+        }
+    }
 
     if in_review_tasks.is_empty() {
         return Ok(());
