@@ -168,6 +168,21 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
         return;
     }
 
+    // Stash any uncommitted changes so the rebase can proceed cleanly.
+    // Worktrees killed mid-run (e.g. service restart) may have leftover
+    // unstaged changes from a previous attempt that block `git rebase`.
+    let stashed = if has_changes(dir).await {
+        Command::new("git")
+            .args(["stash", "--include-untracked"])
+            .current_dir(dir)
+            .output_with_context()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     let output = Command::new("git")
         .args(["rebase", &format!("origin/{default_branch}")])
         .current_dir(dir)
@@ -195,6 +210,15 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
         Err(e) => {
             tracing::warn!(err = %e, "failed to run rebase");
         }
+    }
+
+    // Restore stashed changes after rebase (success or aborted).
+    if stashed {
+        let _ = Command::new("git")
+            .args(["stash", "pop"])
+            .current_dir(dir)
+            .output_with_context()
+            .await;
     }
 }
 
