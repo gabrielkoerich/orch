@@ -275,7 +275,10 @@ impl TaskRunner {
             "new" => "rerouted",
             "needs_review" => {
                 let last_error = error_type.unwrap_or("");
-                if last_error.contains("timeout") {
+                if last_error.is_empty() {
+                    // No error: agent completed successfully and created a PR waiting for review
+                    "success"
+                } else if last_error.contains("timeout") {
                     "timeout"
                 } else if last_error.contains("rate limit") || last_error.contains("usage") {
                     "rate_limit"
