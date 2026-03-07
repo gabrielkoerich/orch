@@ -530,9 +530,9 @@ pub(crate) async fn review_and_merge(
                 // Try to create PR using GhHttp API first
                 let default_branch =
                     config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+                let task_ref = runner::git_ops::format_task_ref(&task.id.0);
                 let pr_body = format!(
-                    "Resolves #{}\n\nAuto-created by orch review gate (agent forgot to open PR)",
-                    task.id.0
+                    "Resolves {task_ref}\n\nAuto-created by orch review gate (agent forgot to open PR)"
                 );
                 let gh = GhHttp::new();
                 match gh
