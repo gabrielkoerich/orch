@@ -302,23 +302,13 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
     // Get existing mention tasks across ALL statuses to avoid duplicates.
     // Only checking New status would miss tasks that progressed to InProgress/Done,
     // causing duplicate tasks on the next sync tick within the 24h window.
-    let mut existing_mentions = std::collections::HashSet::new();
-    for status in &[
-        TaskStatus::New,
-        TaskStatus::InProgress,
-        TaskStatus::Done,
-        TaskStatus::Blocked,
-        TaskStatus::Routed,
-        TaskStatus::InReview,
-        TaskStatus::NeedsReview,
-    ] {
-        let tasks = db.list_internal_tasks_by_status(*status).await?;
-        for t in tasks {
-            if t.source == "mention" {
-                existing_mentions.insert(t.source_id.clone());
-            }
-        }
-    }
+    let existing_mentions: std::collections::HashSet<String> = db
+        .list_all_internal_tasks()
+        .await?
+        .into_iter()
+        .filter(|t| t.source == "mention")
+        .map(|t| t.source_id.clone())
+        .collect();
 
     for mention in mentions {
         // Skip if already processed
