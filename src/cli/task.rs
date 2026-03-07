@@ -22,8 +22,11 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
         return Ok(());
     }
 
-    println!("{:<10} {:<12} {:<20} TITLE", "ID", "TYPE", "STATUS");
-    println!("{}", "-".repeat(80));
+    println!(
+        "{:<15} {:<12} {:<20} {:<10} TITLE",
+        "ID", "TYPE", "STATUS", "AGENT"
+    );
+    println!("{}", "-".repeat(90));
 
     for task in tasks {
         match task {
@@ -34,18 +37,30 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
                     .find(|l| l.starts_with("status:"))
                     .map(|s| s.replace("status:", ""))
                     .unwrap_or_else(|| "unknown".to_string());
+                let agent = sidecar::get(&ext.id.0, "agent").unwrap_or_default();
                 println!(
-                    "{:<10} {:<12} {:<20} {}",
-                    ext.id.0, "external", status, ext.title
+                    "{:<15} {:<12} {:<20} {:<10} {}",
+                    ext.id.0, "external", status, agent, ext.title
                 );
             }
             Task::Internal(int) => {
+                let agent = int.agent.as_deref().unwrap_or("-");
+                let title = if int.status == crate::db::TaskStatus::Blocked {
+                    if let Some(ref reason) = int.block_reason {
+                        format!("{} [blocked: {}]", int.title, reason)
+                    } else {
+                        int.title.clone()
+                    }
+                } else {
+                    int.title.clone()
+                };
                 println!(
-                    "{:<10} {:<12} {:<20} {}",
-                    int.id,
+                    "{:<15} {:<12} {:<20} {:<10} {}",
+                    format!("internal:{}", int.id),
                     "internal",
                     int.status.as_str(),
-                    int.title
+                    agent,
+                    title
                 );
             }
         }
@@ -551,15 +566,17 @@ pub async fn live() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<12} {:<10} CREATED", "SESSION", "TASK", "ACTIVE");
-    println!("{}", "-".repeat(60));
+    println!("{:<30} {:<15} {:<10} ACTIVE", "SESSION", "TASK", "AGENT");
+    println!("{}", "-".repeat(70));
 
     for session in &sessions {
         let active = tmux.is_session_active(&session.name).await;
+        let agent = sidecar::get(&session.task_id, "agent").unwrap_or_default();
         println!(
-            "{:<20} {:<12} {}",
+            "{:<30} {:<15} {:<10} {}",
             session.name,
             session.task_id,
+            agent,
             if active { "yes" } else { "no" },
         );
     }
