@@ -169,6 +169,43 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
         return;
     }
 
+    // Stash any uncommitted changes so the rebase can proceed cleanly.
+    // Worktrees killed mid-run (e.g. service restart) may have leftover
+    // unstaged changes from a previous attempt that block `git rebase`.
+    //
+    // Safety: git stashes are repo-global. With multiple worktrees running
+    // concurrently we must capture the exact stash ref created here and apply
+    // it by that ref — NOT with `stash pop`, which would apply stash@{0}
+    // (the most-recent stash) and could restore a stash from a different
+    // worktree running in parallel.
+    let stash_ref: Option<String> = if has_changes(dir).await {
+        let stash_out = Command::new("git")
+            .args(["stash", "--include-untracked"])
+            .current_dir(dir)
+            .output_with_context()
+            .await;
+        match stash_out {
+            Ok(o) if o.status.success() => {
+                // Capture the OID of the stash object just created so we can
+                // apply it back by its exact ref, regardless of any stashes
+                // that other worktrees may push between now and then.
+                let ref_out = Command::new("git")
+                    .args(["rev-parse", "refs/stash"])
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await;
+                ref_out
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|s| !s.is_empty())
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let output = Command::new("git")
         .args(["rebase", &format!("origin/{default_branch}")])
         .current_dir(dir)
@@ -195,6 +232,25 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
         }
         Err(e) => {
             tracing::warn!(err = %e, "failed to run rebase");
+        }
+    }
+
+    // Restore stashed changes using the captured ref so we never accidentally
+    // pop a stash that belongs to a different concurrently-running worktree.
+    if let Some(ref stash_hash) = stash_ref {
+        let apply = Command::new("git")
+            .args(["stash", "apply", stash_hash])
+            .current_dir(dir)
+            .output_with_context()
+            .await;
+        if apply.map(|o| o.status.success()).unwrap_or(false) {
+            let _ = Command::new("git")
+                .args(["stash", "drop", stash_hash])
+                .current_dir(dir)
+                .output_with_context()
+                .await;
+        } else {
+            tracing::warn!(stash = %stash_hash, "stash apply failed after rebase — stash preserved for manual recovery");
         }
     }
 }
