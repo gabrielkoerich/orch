@@ -17,7 +17,7 @@ use tokio::process::Command;
 /// GitHub task IDs are displayed as `#123` (creates a GH issue hyperlink).
 /// Internal task IDs (`internal:13`) are displayed as `internal-13` (no `#`
 /// to avoid creating a false issue link).
-fn format_task_ref(task_id: &str) -> String {
+pub(crate) fn format_task_ref(task_id: &str) -> String {
     if task_id.starts_with("internal:") {
         task_id.replace(':', "-")
     } else {
@@ -80,7 +80,8 @@ pub async fn auto_commit(
 
     tracing::info!(task_id, "auto-committing uncommitted changes");
 
-    let commit_msg = format!("{title}\n\nTask #{task_id}\nAgent: {agent}\nAttempt: {attempt}");
+    let task_ref = format_task_ref(task_id);
+    let commit_msg = format!("{title}\n\nTask {task_ref}\nAgent: {agent}\nAttempt: {attempt}");
 
     // git add -A
     let add = Command::new("git")
