@@ -144,6 +144,11 @@ impl Db {
             conn.pragma_update(None, "user_version", 3)?;
         }
 
+        if version < 4 {
+            conn.execute_batch(SCHEMA_V4)?;
+            conn.pragma_update(None, "user_version", 4)?;
+        }
+
         Ok(())
     }
 
@@ -809,6 +814,20 @@ ALTER TABLE task_metrics ADD COLUMN output_tokens INTEGER DEFAULT NULL;
 ALTER TABLE task_metrics ADD COLUMN input_cost_usd REAL DEFAULT NULL;
 ALTER TABLE task_metrics ADD COLUMN output_cost_usd REAL DEFAULT NULL;
 ALTER TABLE task_metrics ADD COLUMN total_cost_usd REAL DEFAULT NULL;
+"#;
+
+/// Schema v4 — fix empty/corrupt timestamps in internal_tasks.
+///
+/// Some early rows were inserted with an empty string for `updated_at`
+/// (e.g. from DB migration or schema mismatch). Backfill them with `created_at`.
+const SCHEMA_V4: &str = r#"
+UPDATE internal_tasks
+SET updated_at = created_at
+WHERE updated_at IS NULL OR updated_at = '';
+
+UPDATE internal_tasks
+SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE created_at IS NULL OR created_at = '';
 "#;
 
 #[cfg(test)]
