@@ -125,7 +125,10 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 /// Removes the git worktree, deletes local + remote branches,
 /// pulls main to stay up-to-date, and marks sidecar as cleaned.
 pub(crate) async fn cleanup_task_worktree(task_id: &str, repo: &str) -> anyhow::Result<()> {
-    let opts = JanitorOptions::default();
+    let opts = JanitorOptions {
+        ttl_hours: 0,
+        ..Default::default()
+    };
     cleanup_task_worktree_with_opts(task_id, repo, &opts).await
 }
 
