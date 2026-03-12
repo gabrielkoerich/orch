@@ -211,7 +211,7 @@ impl OutputBuffer {
         }
 
         let new_content = if self.last_len >= current_len {
-            current_content.to_string()
+            cap_content(current_content)
         } else {
             let mut offset = self.last_len.min(current_len);
             while offset < current_len && !current_content.is_char_boundary(offset) {
