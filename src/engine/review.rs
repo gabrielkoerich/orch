@@ -119,7 +119,13 @@ pub(crate) async fn review_open_prs(
             Ok(Some(n)) => n,
             Ok(None) => {
                 // No open PR for this branch. Check if it was already merged.
-                let merged = gh.is_pr_merged(repo, &branch).await.unwrap_or(false);
+                let merged = match gh.is_pr_merged(repo, &branch).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
+                        continue;
+                    }
+                };
                 if merged {
                     tracing::info!(task_id, branch = %branch, "PR already merged, marking done");
                     if let Err(e) = task_manager
