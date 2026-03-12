@@ -4,6 +4,12 @@
 //! tasks, parsing its decision, posting automated review comments, merging
 //! approved PRs, and re-dispatching agents when changes are requested.
 
+/// Maximum number of times we will attempt to rebase and retry a conflicting PR
+/// before giving up and blocking the task for human intervention.
+/// Both `review_open_prs` and `auto_merge_pr` use this constant so the limit is
+/// always consistent regardless of which code path increments the counter first.
+const MAX_MERGE_CONFLICT_RETRIES: u64 = 3;
+
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::config;
 use crate::engine::runner;
@@ -237,7 +243,7 @@ pub(crate) async fn review_open_prs(
 
                 if is_conflicting {
                     let retries = sidecar::get_u64(task_id, "merge_conflict_retries");
-                    if retries >= 3 {
+                    if retries >= MAX_MERGE_CONFLICT_RETRIES {
                         tracing::error!(
                             task_id,
                             pr_number,
@@ -1121,7 +1127,7 @@ pub(crate) async fn auto_merge_pr(
             // Merge failed due to conflicts — attempt rebase in the worktree directly.
             // Do NOT re-trigger the full review cycle; that doesn't fix the conflict.
             let retries = sidecar::get_u64(&task.id.0, "merge_conflict_retries");
-            if retries >= 2 {
+            if retries >= MAX_MERGE_CONFLICT_RETRIES {
                 tracing::error!(
                     task_id = task.id.0,
                     retries,
