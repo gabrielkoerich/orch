@@ -230,7 +230,13 @@ pub(crate) async fn review_open_prs(
         if (all_approved || comment_approved) && auto_close_task && !comment_changes_requested {
             // Check if the PR is already merged before marking done.
             // If not merged, attempt auto-merge so the PR doesn't get orphaned.
-            let already_merged = gh.is_pr_merged(repo, &branch).await.unwrap_or(false);
+            let already_merged = match gh.is_pr_merged(repo, &branch).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
+                    continue;
+                }
+            };
 
             if already_merged {
                 tracing::info!(
@@ -669,10 +675,13 @@ pub(crate) async fn review_and_merge(
                 }
             } else {
                 // No PR and no commits — agent either failed or completed a read-only task.
-                let merged = gh_check
-                    .is_pr_merged(repo, &branch_name)
-                    .await
-                    .unwrap_or(false);
+                let merged = match gh_check.is_pr_merged(repo, &branch_name).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(task_id = task.id.0, branch = %branch_name, err = %e, "merge check failed, skipping task this tick");
+                        return Ok(ReviewDecision::Failed(format!("merge check failed: {e}")));
+                    }
+                };
                 if merged {
                     tracing::info!(
                         task_id = task.id.0,
