@@ -263,6 +263,27 @@ pub fn set(task_id: &str, fields: &[String]) -> anyhow::Result<()> {
     })
 }
 
+/// Reset all task failure counters when a task is retried or unblocked by a human.
+///
+/// Resets both execution counters (`attempts`, `route_attempts`) and review-cycle
+/// counters (`review_agent_failures`, `merge_conflict_retries`, `pr_create_failures`,
+/// `ci_merge_failures`, `review_cycles`) so that stale failures from a previous cycle
+/// do not prematurely block the new cycle.
+pub fn reset_task_counters(task_id: &str) {
+    let _ = set(
+        task_id,
+        &[
+            "attempts=0".to_string(),
+            "route_attempts=0".to_string(),
+            "review_agent_failures=0".to_string(),
+            "merge_conflict_retries=0".to_string(),
+            "pr_create_failures=0".to_string(),
+            "ci_merge_failures=0".to_string(),
+            "review_cycles=0".to_string(),
+        ],
+    );
+}
+
 /// Read a numeric sidecar field as u64. Missing or invalid values return 0.
 pub fn get_u64(task_id: &str, field: &str) -> u64 {
     get(task_id, field)
@@ -676,6 +697,49 @@ mod tests {
             compare_and_swap(&task_id, "review_started", "false", "true").unwrap(),
             "CAS should succeed when expected matches actual value"
         );
+
+        // Cleanup
+        let _ = state_dir().map(|d| std::fs::remove_file(d.join(format!("{task_id}.json"))));
+    }
+
+    #[test]
+    fn reset_task_counters_zeros_all_failure_fields() {
+        let task_id = format!(
+            "test-reset-counters-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        );
+        let _ = state_dir().map(|d| std::fs::remove_file(d.join(format!("{task_id}.json"))));
+
+        // Seed with non-zero failure counters
+        set(
+            &task_id,
+            &[
+                "attempts=5".to_string(),
+                "route_attempts=2".to_string(),
+                "review_agent_failures=3".to_string(),
+                "merge_conflict_retries=3".to_string(),
+                "pr_create_failures=3".to_string(),
+                "ci_merge_failures=3".to_string(),
+                "review_cycles=2".to_string(),
+                "agent=claude".to_string(), // non-counter field should be preserved
+            ],
+        )
+        .unwrap();
+
+        reset_task_counters(&task_id);
+
+        assert_eq!(get_u64(&task_id, "attempts"), 0);
+        assert_eq!(get_u64(&task_id, "route_attempts"), 0);
+        assert_eq!(get_u64(&task_id, "review_agent_failures"), 0);
+        assert_eq!(get_u64(&task_id, "merge_conflict_retries"), 0);
+        assert_eq!(get_u64(&task_id, "pr_create_failures"), 0);
+        assert_eq!(get_u64(&task_id, "ci_merge_failures"), 0);
+        assert_eq!(get_u64(&task_id, "review_cycles"), 0);
+        // Non-counter field should be untouched
+        assert_eq!(get(&task_id, "agent").unwrap(), "claude");
 
         // Cleanup
         let _ = state_dir().map(|d| std::fs::remove_file(d.join(format!("{task_id}.json"))));
