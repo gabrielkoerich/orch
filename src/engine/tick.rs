@@ -27,6 +27,8 @@ use tokio::sync::{mpsc, RwLock, Semaphore};
 use super::review::{review_and_merge, ReviewDecision};
 use super::EngineConfig;
 
+const MAX_REVIEW_AGENT_FAILURES: u64 = 3;
+
 /// Phase 1 of tick: poll tmux for finished sessions and clean them up.
 pub(crate) async fn tick_check_session_completions(
     tmux: &Arc<TmuxManager>,
@@ -505,32 +507,99 @@ pub(crate) async fn tick_dispatch_tasks(
                                                     .await;
                                             }
                                             Ok(ReviewDecision::Failed(reason)) => {
-                                                tracing::error!(
-                                                    task_id = task_id_for_review,
-                                                    reason,
-                                                    "review agent failed — resetting to NeedsReview for retry"
+                                                let failures = sidecar::get_u64(
+                                                    &task_id_for_review,
+                                                    "review_agent_failures",
+                                                )
+                                                .saturating_add(1);
+                                                let _ = sidecar::set(
+                                                    &task_id_for_review,
+                                                    &[format!(
+                                                        "review_agent_failures={failures}"
+                                                    )],
                                                 );
-                                                let _ = task_manager_for_review
-                                                    .update_task_status(
-                                                        &ExternalId(task_id_for_review.clone()),
-                                                        Status::NeedsReview,
-                                                    )
-                                                    .await;
+                                                if failures >= MAX_REVIEW_AGENT_FAILURES {
+                                                    tracing::error!(
+                                                        task_id = task_id_for_review,
+                                                        reason,
+                                                        failures,
+                                                        "review agent failed too many times — blocking task"
+                                                    );
+                                                    let _ = task_manager_for_review
+                                                        .update_task_status(
+                                                            &ExternalId(
+                                                                task_id_for_review.clone(),
+                                                            ),
+                                                            Status::Blocked,
+                                                        )
+                                                        .await;
+                                                } else {
+                                                    tracing::error!(
+                                                        task_id = task_id_for_review,
+                                                        reason,
+                                                        failures,
+                                                        "review agent failed — resetting to NeedsReview for retry"
+                                                    );
+                                                    let _ = task_manager_for_review
+                                                        .update_task_status(
+                                                            &ExternalId(
+                                                                task_id_for_review.clone(),
+                                                            ),
+                                                            Status::NeedsReview,
+                                                        )
+                                                        .await;
+                                                }
                                             }
                                             Err(e) => {
-                                                tracing::error!(
-                                                    task_id = task_id_for_review,
-                                                    error = %e,
-                                                    "review_and_merge failed — resetting to NeedsReview for retry"
+                                                let failures = sidecar::get_u64(
+                                                    &task_id_for_review,
+                                                    "review_agent_failures",
+                                                )
+                                                .saturating_add(1);
+                                                let _ = sidecar::set(
+                                                    &task_id_for_review,
+                                                    &[format!(
+                                                        "review_agent_failures={failures}"
+                                                    )],
                                                 );
-                                                let _ = task_manager_for_review
-                                                    .update_task_status(
-                                                        &ExternalId(task_id_for_review.clone()),
-                                                        Status::NeedsReview,
-                                                    )
-                                                    .await;
+                                                if failures >= MAX_REVIEW_AGENT_FAILURES {
+                                                    tracing::error!(
+                                                        task_id = task_id_for_review,
+                                                        error = %e,
+                                                        failures,
+                                                        "review_and_merge failed too many times — blocking task"
+                                                    );
+                                                    let _ = task_manager_for_review
+                                                        .update_task_status(
+                                                            &ExternalId(
+                                                                task_id_for_review.clone(),
+                                                            ),
+                                                            Status::Blocked,
+                                                        )
+                                                        .await;
+                                                } else {
+                                                    tracing::error!(
+                                                        task_id = task_id_for_review,
+                                                        error = %e,
+                                                        failures,
+                                                        "review_and_merge failed — resetting to NeedsReview for retry"
+                                                    );
+                                                    let _ = task_manager_for_review
+                                                        .update_task_status(
+                                                            &ExternalId(
+                                                                task_id_for_review.clone(),
+                                                            ),
+                                                            Status::NeedsReview,
+                                                        )
+                                                        .await;
+                                                }
                                             }
-                                            Ok(_) => {} // Approve or RequestChanges handled inside
+                                            Ok(_) => {
+                                                let _ = sidecar::set(
+                                                    &task_id_for_review,
+                                                    &["review_agent_failures=0".to_string()],
+                                                );
+                                            } // Approve or RequestChanges handled inside
                                         }
                                     }));
                                 }

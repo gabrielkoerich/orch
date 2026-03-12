@@ -15,7 +15,7 @@ use crate::config;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
-use crate::sidecar::REPO_CONTEXT;
+use crate::sidecar::{self, REPO_CONTEXT};
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -25,6 +25,8 @@ use tokio::sync::Semaphore;
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
 use super::review::{review_and_merge, review_open_prs, ReviewDecision};
 use super::EngineConfig;
+
+const MAX_REVIEW_AGENT_FAILURES: u64 = 3;
 
 /// Sync tick — runs every 45s.
 ///
@@ -147,21 +149,53 @@ pub(crate) async fn sync_tick(
                         ReviewOutcome::Block
                     }
                     Ok(ReviewDecision::Failed(reason)) => {
-                        tracing::error!(
-                            task_id = tid,
-                            reason,
-                            "review agent failed — resetting to NeedsReview for retry"
-                        );
-                        ReviewOutcome::Reset
+                        let failures =
+                            sidecar::get_u64(&tid, "review_agent_failures").saturating_add(1);
+                        let _ = sidecar::set(&tid, &[format!("review_agent_failures={failures}")]);
+                        if failures >= MAX_REVIEW_AGENT_FAILURES {
+                            tracing::error!(
+                                task_id = tid,
+                                reason,
+                                failures,
+                                "review agent failed too many times — blocking task"
+                            );
+                            ReviewOutcome::Block
+                        } else {
+                            tracing::error!(
+                                task_id = tid,
+                                reason,
+                                failures,
+                                "review agent failed — resetting to NeedsReview for retry"
+                            );
+                            ReviewOutcome::Reset
+                        }
                     }
                     Err(e) => {
-                        tracing::error!(
-                            task_id = tid, error = %e,
-                            "review_and_merge failed — resetting to NeedsReview for retry"
-                        );
-                        ReviewOutcome::Reset
+                        let failures =
+                            sidecar::get_u64(&tid, "review_agent_failures").saturating_add(1);
+                        let _ = sidecar::set(&tid, &[format!("review_agent_failures={failures}")]);
+                        if failures >= MAX_REVIEW_AGENT_FAILURES {
+                            tracing::error!(
+                                task_id = tid,
+                                error = %e,
+                                failures,
+                                "review_and_merge failed too many times — blocking task"
+                            );
+                            ReviewOutcome::Block
+                        } else {
+                            tracing::error!(
+                                task_id = tid,
+                                error = %e,
+                                failures,
+                                "review_and_merge failed — resetting to NeedsReview for retry"
+                            );
+                            ReviewOutcome::Reset
+                        }
                     }
-                    Ok(_) => ReviewOutcome::Ok,
+                    Ok(_) => {
+                        let _ = sidecar::set(&tid, &["review_agent_failures=0".to_string()]);
+                        ReviewOutcome::Ok
+                    }
                 };
                 match outcome {
                     ReviewOutcome::Reset => {
