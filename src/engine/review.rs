@@ -612,10 +612,16 @@ pub(crate) async fn review_and_merge(
                     .create_pr(repo, &task.title, &pr_body, &branch_name, &default_branch)
                     .await
                 {
-                    Ok(_url) => {
+                    Ok(url) => {
+                        // Extract PR number from URL and update sidecar so subsequent
+                        // review cycles check the correct PR (not a stale pr_number).
+                        if let Some(pr_num) = url.rsplit('/').next() {
+                            let _ = sidecar::set(&task.id.0, &[format!("pr_number={pr_num}")]);
+                        }
                         tracing::info!(
                             task_id = task.id.0,
                             branch = %branch_name,
+                            pr_url = %url,
                             "created missing PR via GhHttp — retrying review"
                         );
                         return Ok(ReviewDecision::Failed(
@@ -648,6 +654,12 @@ pub(crate) async fn review_and_merge(
                             .await;
                         match pr_result {
                             Ok(o) if o.status.success() => {
+                                // gh pr create prints the PR URL to stdout
+                                let stdout = String::from_utf8_lossy(&o.stdout);
+                                if let Some(pr_num) = stdout.trim().rsplit('/').next() {
+                                    let _ =
+                                        sidecar::set(&task.id.0, &[format!("pr_number={pr_num}")]);
+                                }
                                 tracing::info!(
                                     task_id = task.id.0,
                                     branch = %branch_name,
