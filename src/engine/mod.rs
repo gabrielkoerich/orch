@@ -236,8 +236,13 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         // Initialize unified task store (sqlx)
         let store = Arc::new(TaskStore::open(&crate::db::default_path()?).await?);
 
-        // Initialize task manager
-        let task_manager = Arc::new(TaskManager::new(db.clone(), backend.clone()));
+        // Initialize task manager (with unified store for dual-write)
+        let task_manager = Arc::new(TaskManager::with_store(
+            db.clone(),
+            backend.clone(),
+            store.clone(),
+            repo.clone(),
+        ));
 
         // Task runner (with db for metrics)
         let runner = Arc::new(runner::TaskRunner::new(repo.clone()).with_db(db.clone()));
@@ -301,9 +306,14 @@ pub async fn serve() -> anyhow::Result<()> {
         "initialized project engines"
     );
 
-    // Re-create task managers with shared db
+    // Re-create task managers with shared db and store
     for engine in &mut project_engines {
-        engine.task_manager = Arc::new(TaskManager::new(db.clone(), engine.backend.clone()));
+        engine.task_manager = Arc::new(TaskManager::with_store(
+            db.clone(),
+            engine.backend.clone(),
+            engine.store.clone(),
+            engine.repo.clone(),
+        ));
     }
 
     // Initialize tmux manager (shared across all projects)

@@ -1,5 +1,6 @@
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::db::{Db, InternalTask, TaskStatus};
+use crate::store::TaskStore;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -59,6 +60,10 @@ pub enum Task {
 pub struct TaskManager {
     pub(crate) db: Arc<Db>,
     backend: Arc<dyn ExternalBackend>,
+    /// Unified task store (Phase 2+). Optional for backward compat with tests.
+    store: Option<Arc<TaskStore>>,
+    /// Repo identifier for store operations (e.g. "owner/repo").
+    repo: String,
 }
 
 impl Clone for TaskManager {
@@ -66,13 +71,35 @@ impl Clone for TaskManager {
         Self {
             db: self.db.clone(),
             backend: self.backend.clone(),
+            store: self.store.clone(),
+            repo: self.repo.clone(),
         }
     }
 }
 
 impl TaskManager {
     pub fn new(db: Arc<Db>, backend: Arc<dyn ExternalBackend>) -> Self {
-        Self { db, backend }
+        Self {
+            db,
+            backend,
+            store: None,
+            repo: String::new(),
+        }
+    }
+
+    /// Create a TaskManager with the unified store for dual-write support.
+    pub fn with_store(
+        db: Arc<Db>,
+        backend: Arc<dyn ExternalBackend>,
+        store: Arc<TaskStore>,
+        repo: String,
+    ) -> Self {
+        Self {
+            db,
+            backend,
+            store: Some(store),
+            repo,
+        }
     }
 
     pub async fn create_task(&self, req: CreateTaskRequest) -> anyhow::Result<Task> {
@@ -213,14 +240,28 @@ impl TaskManager {
 
     /// Update the status of an internal or external task by its string ID.
     /// For `"internal:{n}"` IDs, updates SQLite. For all others, calls the backend.
+    /// Also dual-writes to the unified store if available.
     pub async fn update_task_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
-        if let Some(internal_id) = parse_internal_id(&id.0) {
-            return self
-                .db
+        let result = if let Some(internal_id) = parse_internal_id(&id.0) {
+            self.db
                 .update_internal_task_status(internal_id, status_to_task_status(status))
-                .await;
+                .await
+        } else {
+            self.backend.update_status(id, status).await
+        };
+
+        // Dual-write: mirror status to unified store (best-effort)
+        if result.is_ok() {
+            if let Some(ref store) = self.store {
+                if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &id.0).await {
+                    let _ = store
+                        .update_status(store_id, status_to_task_status(status))
+                        .await;
+                }
+            }
         }
-        self.backend.update_status(id, status).await
+
+        result
     }
 
     /// List internal tasks by DB status (used by the dispatch phase).

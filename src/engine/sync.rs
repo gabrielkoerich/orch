@@ -42,9 +42,15 @@ pub(crate) async fn sync_tick(
     semaphore: &Arc<Semaphore>,
     router: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
-    _store: &Arc<crate::store::TaskStore>,
+    store: &Arc<crate::store::TaskStore>,
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
+
+    // 0. Ingest all active external tasks into the unified store.
+    //    This ensures the store has data for tasks created before dual-write was added.
+    if let Err(e) = ingest_external_tasks(backend, repo, store).await {
+        tracing::debug!(err = %e, "external task ingest failed");
+    }
 
     // 1. Cleanup worktrees for done tasks
     if let Err(e) = cleanup_done_worktrees(backend, repo, task_manager).await {
@@ -501,6 +507,57 @@ async fn skills_sync() -> anyhow::Result<()> {
                 Err(_) => {
                     tracing::warn!(repo = %skill.repo, "git clone timed out after 60s");
                     let _ = std::fs::remove_dir_all(&repo_dir);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Ingest all active external tasks into the unified SQLite store.
+///
+/// Upserts each task so the store stays in sync with the backend.
+/// Also syncs sidecar fields for each task so the store has the latest
+/// routing, execution, and cost data. This is best-effort — individual
+/// task failures are logged and skipped.
+async fn ingest_external_tasks(
+    backend: &Arc<dyn ExternalBackend>,
+    repo: &str,
+    store: &Arc<crate::store::TaskStore>,
+) -> anyhow::Result<()> {
+    // Ingest tasks across all active statuses.
+    let active_statuses = [
+        Status::New,
+        Status::Routed,
+        Status::InProgress,
+        Status::NeedsReview,
+        Status::InReview,
+        Status::Blocked,
+    ];
+
+    for status in &active_statuses {
+        let tasks = match backend.list_by_status(*status).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(?status, ?e, "ingest: failed to list tasks");
+                continue;
+            }
+        };
+
+        for task in &tasks {
+            match store.ensure_external_task(repo, task).await {
+                Ok(store_id) => {
+                    // Sync sidecar fields to store (best-effort)
+                    store.sync_sidecar_to_store(store_id, &task.id.0).await;
+                    // Sync status from backend label to store
+                    let db_status = crate::engine::tasks::status_to_task_status(*status);
+                    if let Err(e) = store.update_status(store_id, db_status).await {
+                        tracing::debug!(task_id = task.id.0, ?e, "ingest: status sync failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(task_id = task.id.0, ?e, "ingest: upsert failed");
                 }
             }
         }
