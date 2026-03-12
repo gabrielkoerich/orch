@@ -124,6 +124,11 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 ///
 /// Removes the git worktree, deletes local + remote branches,
 /// pulls main to stay up-to-date, and marks sidecar as cleaned.
+///
+/// This function is used for inline post-merge cleanup (called from
+/// auto-merge flows) and must attempt immediate removal — it constructs
+/// janitor options with `ttl_hours = 0` so the janitor age guard does not
+/// postpone removing freshly-created worktrees.
 pub(crate) async fn cleanup_task_worktree(task_id: &str, repo: &str) -> anyhow::Result<()> {
     let opts = JanitorOptions {
         ttl_hours: 0,
