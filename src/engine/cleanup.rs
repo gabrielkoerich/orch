@@ -56,14 +56,14 @@ impl JanitorOptions {
     }
 }
 
-/// Cleanup worktrees for done tasks.
+/// Cleanup worktrees for completed tasks.
 ///
-/// Queries status:done tasks, checks if worktree exists, removes it,
-/// deletes the local branch, and marks the worktree as cleaned.
+/// Targets tasks that are finished: status:done OR closed on GitHub
+/// (e.g. when a PR merge auto-closes the issue via "Fixes #N").
 ///
 /// Note: This is a fallback. Primary cleanup happens inline in
 /// `auto_merge_pr` via `cleanup_task_worktree`. This catches edge cases
-/// where the inline cleanup missed (e.g., manual merges).
+/// where the inline cleanup missed (e.g., manual merges, auto-closed issues).
 pub(crate) async fn cleanup_done_worktrees(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
@@ -73,7 +73,7 @@ pub(crate) async fn cleanup_done_worktrees(
     cleanup_done_worktrees_with_opts(backend, repo, task_manager, &opts).await
 }
 
-/// Cleanup worktrees for done tasks with explicit options.
+/// Cleanup worktrees for completed tasks with explicit options.
 ///
 /// Separated from `cleanup_done_worktrees` so that integration tests can
 /// inject specific options (e.g. `ttl_hours: 0`, `dry_run: true`) without
@@ -90,6 +90,39 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     // Collect task IDs from external done tasks.
     let mut task_ids: Vec<String> = done_tasks.iter().map(|t| t.id.0.clone()).collect();
 
+    // Also include closed-but-not-done external tasks.
+    // When a PR merge auto-closes a GitHub issue (via "Fixes #N"), the issue
+    // state becomes "closed" but orch never updates the status label to "done".
+    // These orphaned worktrees accumulate unless we catch them here.
+    match backend.list_all_tasks().await {
+        Ok(all_tasks) => {
+            let done_set: std::collections::HashSet<String> = task_ids.iter().cloned().collect();
+            let closed_stale: Vec<_> = all_tasks
+                .iter()
+                .filter(|t| t.state == "closed" && !done_set.contains(&t.id.0))
+                .collect();
+            for task in &closed_stale {
+                tracing::info!(
+                    task_id = task.id.0,
+                    labels = ?task.labels,
+                    "closed issue with stale status label — reconciling to done and cleaning up"
+                );
+                // Reconcile: update the status label so other flows stay consistent.
+                if let Err(e) = backend.update_status(&task.id, Status::Done).await {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        err = %e,
+                        "failed to reconcile closed issue status to done"
+                    );
+                }
+            }
+            task_ids.extend(closed_stale.iter().map(|t| t.id.0.clone()));
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to list all tasks for closed-issue reconciliation");
+        }
+    }
+
     // Also include internal done tasks.
     if let Ok(internal_done) = task_manager
         .db_list_internal_by_status(TaskStatus::Done)
@@ -100,9 +133,19 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         }
     }
 
+    // Also include internal blocked tasks (terminal state, worktree is useless).
+    if let Ok(internal_blocked) = task_manager
+        .db_list_internal_by_status(TaskStatus::Blocked)
+        .await
+    {
+        for t in internal_blocked {
+            task_ids.push(format!("internal:{}", t.id));
+        }
+    }
+
     tracing::debug!(
         count = task_ids.len(),
-        "checking all done tasks for cleanup"
+        "checking all terminal tasks for cleanup"
     );
 
     for task_id in &task_ids {
