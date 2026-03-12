@@ -1248,4 +1248,873 @@ mod tests {
         let cleanable = store.list_cleanable("owner/repo").await.unwrap();
         assert_eq!(cleanable.len(), 0);
     }
+
+    // ---------------------------------------------------------------
+    // Additional coverage
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_nonexistent_task_returns_error() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let result = store.get(999).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("not found"),
+            "error should mention 'not found'"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_by_external_id_returns_none_for_missing() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let result = store.get_by_external_id("owner/repo", "999").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_by_external_id_finds_existing() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .upsert_external(&UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "55",
+                title: "Find me",
+                body: "",
+                author: "user",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        let task = store
+            .get_by_external_id("owner/repo", "55")
+            .await
+            .unwrap()
+            .expect("should find the task");
+        assert_eq!(task.title, "Find me");
+        assert_eq!(task.external_id, Some("55".to_string()));
+    }
+
+    #[tokio::test]
+    async fn unique_constraint_on_repo_external_id() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        // Two tasks with same external_id but different repos should both succeed
+        let id1 = store
+            .upsert_external(&UpsertExternal {
+                repo: "owner/repo-a",
+                ext_id: "1",
+                title: "Task A",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        let id2 = store
+            .upsert_external(&UpsertExternal {
+                repo: "owner/repo-b",
+                ext_id: "1",
+                title: "Task B",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        assert_ne!(id1, id2, "different repos should produce different IDs");
+    }
+
+    #[tokio::test]
+    async fn list_by_status_scopes_to_repo() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo-a".to_string(),
+                origin: "internal".to_string(),
+                title: "Task A".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo-b".to_string(),
+                origin: "internal".to_string(),
+                title: "Task B".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        let a_tasks = store
+            .list_by_status("owner/repo-a", TaskStatus::New)
+            .await
+            .unwrap();
+        assert_eq!(a_tasks.len(), 1);
+        assert_eq!(a_tasks[0].title, "Task A");
+
+        let b_tasks = store
+            .list_by_status("owner/repo-b", TaskStatus::New)
+            .await
+            .unwrap();
+        assert_eq!(b_tasks.len(), 1);
+        assert_eq!(b_tasks[0].title, "Task B");
+    }
+
+    #[tokio::test]
+    async fn set_fields_empty_is_noop() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Empty updates should succeed without error
+        store.set_fields(id, &[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_fields_with_null_value() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Set agent, then clear it with null
+        store
+            .set_fields(
+                id,
+                &[
+                    ("agent", serde_json::json!("claude")),
+                    ("summary", serde_json::json!(null)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.agent, Some("claude".to_string()));
+    }
+
+    #[tokio::test]
+    async fn increment_rejects_disallowed_field() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        let result = store.increment(id, "input_tokens").await;
+        assert!(result.is_err(), "input_tokens should not be incrementable");
+    }
+
+    #[tokio::test]
+    async fn store_route_updates_routing_fields() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Route me".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        store
+            .store_route(&StoreRoute {
+                id,
+                agent: "codex",
+                model: Some("gpt-5.2"),
+                complexity: "complex",
+                reason: "needs deep analysis",
+                profile: r#"{"role":"backend"}"#,
+                skills: "git,rust",
+            })
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.agent, Some("codex".to_string()));
+        assert_eq!(task.model, Some("gpt-5.2".to_string()));
+        assert_eq!(task.complexity, "complex");
+        assert_eq!(task.route_reason, "needs deep analysis");
+        assert_eq!(task.selected_skills, "git,rust");
+    }
+
+    #[tokio::test]
+    async fn memory_empty_by_default() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        let memory = store.recent_memory(id, 10).await.unwrap();
+        assert!(memory.is_empty());
+    }
+
+    #[tokio::test]
+    async fn labels_roundtrip_as_json() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let labels = vec![
+            "status:new".to_string(),
+            "agent:claude".to_string(),
+            "priority:high".to_string(),
+        ];
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("10".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Labeled task".to_string(),
+                body: "".to_string(),
+                source: "webhook".to_string(),
+                source_id: "".to_string(),
+                author: "user".to_string(),
+                url: "".to_string(),
+                labels: labels.clone(),
+            })
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.labels, labels);
+    }
+
+    #[tokio::test]
+    async fn task_with_parent_id() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let parent_id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Parent".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        let child_id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Child".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        store
+            .set_fields(child_id, &[("parent_id", serde_json::json!(parent_id))])
+            .await
+            .unwrap();
+
+        let child = store.get(child_id).await.unwrap();
+        assert_eq!(child.parent_id, Some(parent_id));
+    }
+
+    #[tokio::test]
+    async fn multiple_runs_per_task() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let task_id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Multi-run".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Attempt 1: agent run fails
+        let r1 = store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "sonnet",
+                command: "claude -p ...",
+                prompt: "prompt v1",
+            })
+            .await
+            .unwrap();
+        store
+            .complete_run(&CompleteRun {
+                run_id: r1,
+                exit_code: Some(1),
+                stdout: "error output",
+                stderr: "compile failed",
+                parsed: "",
+                outcome: "failed",
+                error: "compilation error",
+                tokens: RunTokenUsage {
+                    input_tokens: 30000,
+                    output_tokens: 5000,
+                    total_cost_usd: 0.10,
+                    duration_secs: 20.0,
+                },
+            })
+            .await
+            .unwrap();
+
+        // Attempt 2: agent run succeeds
+        let r2 = store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 2,
+                run_type: "agent",
+                agent: "claude",
+                model: "opus",
+                command: "claude -p ...",
+                prompt: "prompt v2",
+            })
+            .await
+            .unwrap();
+        store
+            .complete_run(&CompleteRun {
+                run_id: r2,
+                exit_code: Some(0),
+                stdout: "success output",
+                stderr: "",
+                parsed: r#"{"summary":"done"}"#,
+                outcome: "success",
+                error: "",
+                tokens: RunTokenUsage {
+                    input_tokens: 40000,
+                    output_tokens: 8000,
+                    total_cost_usd: 0.80,
+                    duration_secs: 60.0,
+                },
+            })
+            .await
+            .unwrap();
+
+        // Attempt 2: review run
+        let r3 = store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 2,
+                run_type: "review",
+                agent: "claude",
+                model: "sonnet",
+                command: "claude -p review ...",
+                prompt: "review prompt",
+            })
+            .await
+            .unwrap();
+        store
+            .complete_run(&CompleteRun {
+                run_id: r3,
+                exit_code: Some(0),
+                stdout: "LGTM",
+                stderr: "",
+                parsed: r#"{"verdict":"approve"}"#,
+                outcome: "success",
+                error: "",
+                tokens: RunTokenUsage::default(),
+            })
+            .await
+            .unwrap();
+
+        // All 3 runs
+        let runs = store.get_runs(task_id).await.unwrap();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].attempt, 1);
+        assert_eq!(runs[0].outcome, "failed");
+        assert_eq!(runs[1].attempt, 2);
+        assert_eq!(runs[1].run_type, "agent");
+        assert_eq!(runs[2].attempt, 2);
+        assert_eq!(runs[2].run_type, "review");
+
+        // Last agent run is attempt 2
+        let last_agent = store.get_last_run(task_id, "agent").await.unwrap().unwrap();
+        assert_eq!(last_agent.attempt, 2);
+        assert_eq!(last_agent.model, "opus");
+
+        // Last review run
+        let last_review = store
+            .get_last_run(task_id, "review")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last_review.outcome, "success");
+    }
+
+    #[tokio::test]
+    async fn start_run_upserts_on_conflict() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let task_id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Start same run twice (same task_id, attempt, run_type)
+        let id1 = store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "sonnet",
+                command: "cmd1",
+                prompt: "prompt1",
+            })
+            .await
+            .unwrap();
+
+        let id2 = store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "codex",
+                model: "gpt-5.2",
+                command: "cmd2",
+                prompt: "prompt2",
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(id1, id2, "upsert should return same ID");
+
+        // Should have updated agent/model
+        let runs = store.get_runs(task_id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].agent, "codex");
+        assert_eq!(runs[0].model, "gpt-5.2");
+    }
+
+    #[tokio::test]
+    async fn reset_counters_preserves_other_fields() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Set some counters and non-counter fields
+        store
+            .set_fields(
+                id,
+                &[
+                    ("agent", serde_json::json!("claude")),
+                    ("branch", serde_json::json!("fix-123")),
+                    ("summary", serde_json::json!("did something")),
+                ],
+            )
+            .await
+            .unwrap();
+        store.increment(id, "attempts").await.unwrap();
+        store.increment(id, "attempts").await.unwrap();
+        store.increment(id, "review_cycles").await.unwrap();
+
+        // Reset
+        store.reset_counters(id).await.unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.attempts, 0);
+        assert_eq!(task.review_cycles, 0);
+        // Non-counter fields preserved
+        assert_eq!(task.agent, Some("claude".to_string()));
+        assert_eq!(task.branch, "fix-123");
+        assert_eq!(task.summary, "did something");
+    }
+
+    #[tokio::test]
+    async fn status_lifecycle_full_flow() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("42".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Full lifecycle".to_string(),
+                body: "".to_string(),
+                source: "webhook".to_string(),
+                source_id: "".to_string(),
+                author: "user".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Walk through the full lifecycle
+        let transitions = [
+            TaskStatus::Routed,
+            TaskStatus::InProgress,
+            TaskStatus::NeedsReview,
+            TaskStatus::InReview,
+            TaskStatus::Done,
+        ];
+
+        for status in transitions {
+            store.update_status(id, status).await.unwrap();
+            let task = store.get(id).await.unwrap();
+            assert_eq!(task.status, status);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_routable_returns_only_new() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id1 = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "New task".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        let _id2 = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Done task".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+        store.update_status(_id2, TaskStatus::Done).await.unwrap();
+
+        let routable = store.list_routable("owner/repo").await.unwrap();
+        assert_eq!(routable.len(), 1);
+        assert_eq!(routable[0].id, id1);
+    }
+
+    #[tokio::test]
+    async fn cleanable_excludes_in_progress_tasks() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "In progress".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        store
+            .set_fields(id, &[("worktree", serde_json::json!("/tmp/wt"))])
+            .await
+            .unwrap();
+        store
+            .update_status(id, TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        // In-progress task with worktree should NOT be cleanable
+        let cleanable = store.list_cleanable("owner/repo").await.unwrap();
+        assert_eq!(cleanable.len(), 0);
+
+        // But blocked task with worktree SHOULD be cleanable
+        store.update_status(id, TaskStatus::Blocked).await.unwrap();
+        let cleanable = store.list_cleanable("owner/repo").await.unwrap();
+        assert_eq!(cleanable.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delegations_stored_as_json() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        let delegations = serde_json::json!([
+            {"task_id": 2, "reason": "sub-task"},
+            {"task_id": 3, "reason": "follow-up"}
+        ]);
+
+        store
+            .set_fields(id, &[("delegations", delegations.clone())])
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.delegations.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn created_at_and_updated_at_are_set() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert!(!task.created_at.is_empty());
+        assert!(!task.updated_at.is_empty());
+        assert!(task.created_at.ends_with('Z'), "should be UTC");
+        assert!(task.created_at.contains('T'), "should be RFC3339");
+    }
+
+    #[tokio::test]
+    async fn concurrent_increments() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Sequential increments should produce correct values
+        for expected in 1..=10 {
+            let val = store.increment(id, "attempts").await.unwrap();
+            assert_eq!(val, expected);
+        }
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.attempts, 10);
+    }
+
+    #[tokio::test]
+    async fn internal_task_has_no_external_id() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Internal".to_string(),
+                body: "".to_string(),
+                source: "cron".to_string(),
+                source_id: "daily".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert!(task.external_id.is_none());
+        assert_eq!(task.origin, "internal");
+    }
+
+    #[tokio::test]
+    async fn default_values_are_correct() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Defaults".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::New);
+        assert_eq!(task.complexity, "medium");
+        assert_eq!(task.attempts, 0);
+        assert_eq!(task.route_attempts, 0);
+        assert_eq!(task.merge_conflict_retries, 0);
+        assert_eq!(task.ci_merge_failures, 0);
+        assert_eq!(task.pr_create_failures, 0);
+        assert_eq!(task.review_agent_failures, 0);
+        assert_eq!(task.review_cycles, 0);
+        assert_eq!(task.input_tokens, 0);
+        assert_eq!(task.output_tokens, 0);
+        assert!((task.total_cost_usd - 0.0).abs() < f64::EPSILON);
+        assert!(!task.worktree_cleaned);
+        assert!(!task.budget_exceeded);
+        assert!(task.memory.is_empty());
+        assert!(task.delegations.is_empty());
+        assert!(task.pr_number.is_none());
+        assert!(task.parent_id.is_none());
+        assert!(task.agent.is_none());
+        assert!(task.model.is_none());
+        assert!(task.block_reason.is_none());
+    }
 }
