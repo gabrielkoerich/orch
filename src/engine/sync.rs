@@ -193,7 +193,14 @@ pub(crate) async fn sync_tick(
                         }
                     }
                     Ok(_) => {
-                        let _ = sidecar::set(&tid, &["review_agent_failures=0".to_string()]);
+                        let _ = sidecar::set(
+                            &tid,
+                            &[
+                                "review_agent_failures=0".to_string(),
+                                "merge_conflict_retries=0".to_string(),
+                                "pr_create_failures=0".to_string(),
+                            ],
+                        );
                         ReviewOutcome::Ok
                     }
                 };
