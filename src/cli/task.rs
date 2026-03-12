@@ -586,11 +586,66 @@ pub async fn live() -> anyhow::Result<()> {
 
 /// Kill a running agent tmux session.
 pub async fn kill(id: &str) -> anyhow::Result<()> {
+    use crate::backends::github::GitHubBackend;
+    use crate::backends::ExternalBackend;
+    use crate::db::{Db, TaskStatus};
+
     let tmux = TmuxManager::new();
     let repo = crate::config::get_current_repo().unwrap_or_default();
     let session = tmux.session_name(&repo, id);
     tmux.kill_session(&session).await?;
     println!("Killed session for task #{}", id);
+
+    // Immediately reset the task status to New so the engine can re-dispatch it
+    // without waiting for the no_session_stuck_timeout (default 10 min).
+    if let Some(n) = parse_internal_id(id) {
+        let db_path = home::db_path().context("could not resolve DB path")?;
+        let db = Db::open(&db_path)?;
+        let internal_id = format!("internal:{}", n);
+        sidecar::set(
+            &internal_id,
+            &["attempts=0".to_string(), "route_attempts=0".to_string()],
+        )
+        .ok();
+        db.update_internal_task_status(n, TaskStatus::New).await?;
+        println!("Task #{} reset to new (will be re-dispatched)", n);
+    } else if let Ok(num) = id.parse::<i64>() {
+        // Try internal DB first, then fall back to external
+        let db_path = home::db_path().context("could not resolve DB path")?;
+        let db = Db::open(&db_path)?;
+        if db.get_internal_task(num).await.is_ok() {
+            let internal_id = format!("internal:{}", num);
+            sidecar::set(
+                &internal_id,
+                &["attempts=0".to_string(), "route_attempts=0".to_string()],
+            )
+            .ok();
+            db.update_internal_task_status(num, TaskStatus::New).await?;
+            println!("Task #{} reset to new (will be re-dispatched)", num);
+        } else {
+            let ext_id = ExternalId(id.to_string());
+            let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+            sidecar::set(
+                &ext_id.0,
+                &["attempts=0".to_string(), "route_attempts=0".to_string()],
+            )
+            .ok();
+            backend.update_status(&ext_id, Status::New).await?;
+            println!("Task #{} reset to new (will be re-dispatched)", id);
+        }
+    } else {
+        // Non-numeric external id
+        let ext_id = ExternalId(id.to_string());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+        sidecar::set(
+            &ext_id.0,
+            &["attempts=0".to_string(), "route_attempts=0".to_string()],
+        )
+        .ok();
+        backend.update_status(&ext_id, Status::New).await?;
+        println!("Task #{} reset to new (will be re-dispatched)", id);
+    }
+
     Ok(())
 }
 
