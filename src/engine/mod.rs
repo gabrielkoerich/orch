@@ -46,6 +46,7 @@ use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{rate_limit_metrics, GhHttp};
 use crate::sidecar::REPO_CONTEXT;
+use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use runner::WeightSignal;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +64,7 @@ pub struct ProjectEngine {
     pub backend: Arc<dyn ExternalBackend>,
     pub task_manager: Arc<TaskManager>,
     pub runner: Arc<runner::TaskRunner>,
+    pub store: Arc<TaskStore>,
 }
 
 /// Engine configuration.
@@ -231,6 +233,9 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         let db = Arc::new(Db::open(&crate::db::default_path()?)?);
         db.migrate().await?;
 
+        // Initialize unified task store (sqlx)
+        let store = Arc::new(TaskStore::open(&crate::db::default_path()?).await?);
+
         // Initialize task manager
         let task_manager = Arc::new(TaskManager::new(db.clone(), backend.clone()));
 
@@ -242,6 +247,7 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
             backend,
             task_manager,
             runner,
+            store,
         });
     }
 
@@ -820,6 +826,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &weight_tx,
                                 &transport,
                                 &dispatching,
+                                &engine.store,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
                             }
@@ -832,7 +839,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         for engine in &project_engines {
                             let repo = engine.repo.clone();
                             REPO_CONTEXT.scope(repo, async {
-                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config, &semaphore, &router, &engine.task_manager).await {
+                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config, &semaphore, &router, &engine.task_manager, &engine.store).await {
                                     tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
                                 }
                             }).await;
@@ -910,6 +917,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &weight_tx,
                                 &transport,
                                 &dispatching,
+                                &engine.store,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
                             }

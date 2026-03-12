@@ -811,6 +811,149 @@ impl TaskStore {
         })
     }
 
+    // ---------------------------------------------------------------
+    // Dual-write helpers (Phase 2: sidecar → SQLite sync)
+    // ---------------------------------------------------------------
+
+    /// Ensure an external task exists in the store, upserting from its ExternalTask representation.
+    /// Returns the store's internal ID for the task.
+    pub async fn ensure_external_task(
+        &self,
+        repo: &str,
+        ext: &crate::backends::ExternalTask,
+    ) -> anyhow::Result<i64> {
+        self.upsert_external(&UpsertExternal {
+            repo,
+            ext_id: &ext.id.0,
+            title: &ext.title,
+            body: &ext.body,
+            author: &ext.author,
+            url: &ext.url,
+            labels: &ext.labels,
+            origin: "github",
+        })
+        .await
+    }
+
+    /// Sync sidecar fields to the store for a given task.
+    /// Reads key fields from sidecar and writes them to the tasks table.
+    /// Silently ignores errors (best-effort dual-write).
+    pub async fn sync_sidecar_to_store(&self, store_id: i64, sidecar_task_id: &str) {
+        let mut updates: Vec<(&str, serde_json::Value)> = Vec::new();
+
+        // Routing fields
+        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "agent") {
+            if !v.is_empty() {
+                updates.push(("agent", serde_json::json!(v)));
+            }
+        }
+        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "model") {
+            if !v.is_empty() {
+                updates.push(("model", serde_json::json!(v)));
+            }
+        }
+        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "complexity") {
+            if !v.is_empty() {
+                updates.push(("complexity", serde_json::json!(v)));
+            }
+        }
+        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "route_reason") {
+            if !v.is_empty() {
+                updates.push(("route_reason", serde_json::json!(v)));
+            }
+        }
+
+        // Execution fields
+        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "branch") {
+            if !v.is_empty() {
+                updates.push(("branch", serde_json::json!(v)));
+            }
+        }
+        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "worktree") {
+            if !v.is_empty() {
+                updates.push(("worktree", serde_json::json!(v)));
+            }
+        }
+        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "summary") {
+            if !v.is_empty() {
+                updates.push(("summary", serde_json::json!(v)));
+            }
+        }
+        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "last_error") {
+            if !v.is_empty() {
+                updates.push(("last_error", serde_json::json!(v)));
+            }
+        }
+
+        // Counters
+        let attempts = crate::sidecar::get_u64(sidecar_task_id, "attempts");
+        if attempts > 0 {
+            updates.push(("attempts", serde_json::json!(attempts)));
+        }
+        let route_attempts = crate::sidecar::get_u64(sidecar_task_id, "route_attempts");
+        if route_attempts > 0 {
+            updates.push(("route_attempts", serde_json::json!(route_attempts)));
+        }
+
+        // PR fields
+        let pr_number = crate::sidecar::get_u64(sidecar_task_id, "pr_number");
+        if pr_number > 0 {
+            updates.push(("pr_number", serde_json::json!(pr_number)));
+        }
+
+        // Tokens & cost
+        let input_tokens = crate::sidecar::get_u64(sidecar_task_id, "input_tokens");
+        let output_tokens = crate::sidecar::get_u64(sidecar_task_id, "output_tokens");
+        if input_tokens > 0 || output_tokens > 0 {
+            updates.push(("input_tokens", serde_json::json!(input_tokens)));
+            updates.push(("output_tokens", serde_json::json!(output_tokens)));
+            let cost = crate::sidecar::get_cost_estimate(sidecar_task_id);
+            updates.push(("input_cost_usd", serde_json::json!(cost.input_cost_usd)));
+            updates.push(("output_cost_usd", serde_json::json!(cost.output_cost_usd)));
+            updates.push(("total_cost_usd", serde_json::json!(cost.total_cost_usd)));
+        }
+
+        // Review counters
+        let review_cycles = crate::sidecar::get_u64(sidecar_task_id, "review_cycles");
+        if review_cycles > 0 {
+            updates.push(("review_cycles", serde_json::json!(review_cycles)));
+        }
+        let review_failures = crate::sidecar::get_u64(sidecar_task_id, "review_agent_failures");
+        if review_failures > 0 {
+            updates.push(("review_agent_failures", serde_json::json!(review_failures)));
+        }
+        let merge_retries = crate::sidecar::get_u64(sidecar_task_id, "merge_conflict_retries");
+        if merge_retries > 0 {
+            updates.push(("merge_conflict_retries", serde_json::json!(merge_retries)));
+        }
+
+        if !updates.is_empty() {
+            if let Err(e) = self.set_fields(store_id, &updates).await {
+                tracing::debug!(store_id, error = %e, "dual-write: failed to sync sidecar → store");
+            }
+        }
+    }
+
+    /// Resolve a sidecar task_id (e.g. "42" or "internal:3") to a store internal ID.
+    /// Returns None if the task is not in the store yet.
+    pub async fn resolve_task_id(
+        &self,
+        repo: &str,
+        sidecar_task_id: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        // Internal tasks use "internal:{n}" format
+        if sidecar_task_id.starts_with("internal:") {
+            // Internal tasks aren't in the store yet (will be migrated in Phase 4)
+            // For now, return None
+            return Ok(None);
+        }
+        // External tasks: look up by external_id
+        match self.get_by_external_id(repo, sidecar_task_id).await? {
+            Some(task) => Ok(Some(task.id)),
+            None => Ok(None),
+        }
+    }
+
     fn row_to_run(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskRun> {
         Ok(TaskRun {
             id: row.get("id"),

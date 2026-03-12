@@ -42,6 +42,7 @@ pub(crate) async fn sync_tick(
     semaphore: &Arc<Semaphore>,
     router: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
+    _store: &Arc<crate::store::TaskStore>,
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
 
