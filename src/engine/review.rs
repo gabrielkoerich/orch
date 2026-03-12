@@ -10,6 +10,10 @@
 /// always consistent regardless of which code path increments the counter first.
 const MAX_MERGE_CONFLICT_RETRIES: u64 = 3;
 
+/// Maximum number of CI failure or CI timeout events in `auto_merge_pr` before
+/// the task is blocked for human intervention instead of re-entering NeedsReview.
+const MAX_CI_MERGE_FAILURES: u64 = 3;
+
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::config;
 use crate::engine::runner;
@@ -1129,25 +1133,59 @@ pub(crate) async fn auto_merge_pr(
         match state.as_str() {
             "success" => break,
             "failure" => {
-                // CI already in terminal failure — re-route immediately, don't wait
-                tracing::warn!(
-                    task_id = task.id.0,
-                    pr_number,
-                    failing,
-                    "CI failed — re-routing to agent to fix"
-                );
-                task_manager
-                    .update_task_status(&task.id, Status::NeedsReview)
-                    .await?;
+                // CI already in terminal failure — increment counter and re-route or block
+                let ci_failures =
+                    sidecar::get_u64(&task.id.0, "ci_merge_failures").saturating_add(1);
+                let _ = sidecar::set(&task.id.0, &[format!("ci_merge_failures={ci_failures}")]);
+                if ci_failures >= MAX_CI_MERGE_FAILURES {
+                    tracing::error!(
+                        task_id = task.id.0,
+                        pr_number,
+                        ci_failures,
+                        "CI failure limit reached — blocking for human intervention"
+                    );
+                    task_manager
+                        .update_task_status(&task.id, Status::Blocked)
+                        .await?;
+                } else {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        pr_number,
+                        failing,
+                        ci_failures,
+                        "CI failed — re-routing to agent to fix"
+                    );
+                    task_manager
+                        .update_task_status(&task.id, Status::NeedsReview)
+                        .await?;
+                }
                 return Ok(());
             }
             _ => {
                 // pending — wait up to max_wait
                 if start.elapsed() >= max_wait {
-                    tracing::warn!(task_id = task.id.0, "CI checks still pending after timeout");
-                    task_manager
-                        .update_task_status(&task.id, Status::NeedsReview)
-                        .await?;
+                    let ci_failures =
+                        sidecar::get_u64(&task.id.0, "ci_merge_failures").saturating_add(1);
+                    let _ = sidecar::set(&task.id.0, &[format!("ci_merge_failures={ci_failures}")]);
+                    if ci_failures >= MAX_CI_MERGE_FAILURES {
+                        tracing::error!(
+                            task_id = task.id.0,
+                            ci_failures,
+                            "CI timeout limit reached — blocking for human intervention"
+                        );
+                        task_manager
+                            .update_task_status(&task.id, Status::Blocked)
+                            .await?;
+                    } else {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            ci_failures,
+                            "CI checks still pending after timeout — re-routing to agent"
+                        );
+                        task_manager
+                            .update_task_status(&task.id, Status::NeedsReview)
+                            .await?;
+                    }
                     return Ok(());
                 }
             }
@@ -1314,6 +1352,8 @@ pub(crate) async fn auto_merge_pr(
     }
 
     // 6. Update status to done (auto-closes the issue via backend)
+    // Reset CI failure counter on successful merge.
+    let _ = sidecar::set(&task.id.0, &["ci_merge_failures=0".to_string()]);
     task_manager
         .update_task_status(&task.id, Status::Done)
         .await?;
