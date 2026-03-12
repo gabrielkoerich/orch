@@ -150,6 +150,18 @@ pub(crate) async fn review_open_prs(
                         .await
                     {
                         tracing::warn!(task_id, err = %e, "failed to update status to routed");
+                    } else {
+                        // Reset merge conflict and PR creation counters on re-dispatch so failures
+                        // from the previous review cycle don't prematurely block the next cycle.
+                        if let Err(e) = sidecar::set(
+                            task_id,
+                            &[
+                                "merge_conflict_retries=0".to_string(),
+                                "pr_create_failures=0".to_string(),
+                            ],
+                        ) {
+                            tracing::warn!(task_id, err = %e, "failed to reset merge conflict counters");
+                        }
                     }
                 }
                 continue;
@@ -477,10 +489,17 @@ pub(crate) async fn review_open_prs(
                 tracing::warn!(task_id, err = %e, "failed to set status to routed for re-dispatch");
             } else {
                 tracing::info!(task_id, "re-dispatching task to address review feedback");
-                // Reset the review_agent_failures counter so transient failures from the
-                // previous review cycle don't count against the budget for the next cycle.
-                if let Err(e) = sidecar::set(task_id, &["review_agent_failures=0".to_string()]) {
-                    tracing::warn!(task_id, err = %e, "failed to reset review_agent_failures on re-dispatch");
+                // Reset counters so transient failures from the previous review cycle don't
+                // count against the budget for the next cycle.
+                if let Err(e) = sidecar::set(
+                    task_id,
+                    &[
+                        "review_agent_failures=0".to_string(),
+                        "merge_conflict_retries=0".to_string(),
+                        "pr_create_failures=0".to_string(),
+                    ],
+                ) {
+                    tracing::warn!(task_id, err = %e, "failed to reset review failure counters on re-dispatch");
                 }
             }
         }
