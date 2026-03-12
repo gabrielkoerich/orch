@@ -1175,7 +1175,8 @@ pub(crate) async fn auto_merge_pr(
                         &format!("{}{}", comment, footer),
                     )
                     .await;
-                return Err(e);
+                // Task is already Blocked — return Ok so the caller does not reset to NeedsReview.
+                return Ok(());
             }
 
             // Try rebase in the worktree
@@ -1219,7 +1220,8 @@ pub(crate) async fn auto_merge_pr(
                                 task_manager
                                     .update_task_status(&task.id, Status::Blocked)
                                     .await?;
-                                return Err(merge_err);
+                                // Task is already Blocked — return Ok so the caller does not reset to NeedsReview.
+                                return Ok(());
                             }
                             // Merge succeeded after rebase — fall through to done
                             task_manager
