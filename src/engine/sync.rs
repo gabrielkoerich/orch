@@ -270,6 +270,12 @@ pub(crate) async fn sync_tick(
                     session = %review_session,
                     "InReview task has no active review session — resetting to NeedsReview"
                 );
+                // Reset the failure counter: stale-session recovery is an infrastructure
+                // event (tmux crash, service restart) not a genuine agent parse failure.
+                // Keeping the counter would unfairly consume the budget for the next cycle.
+                if let Err(e) = sidecar::set(&task.id.0, &["review_agent_failures=0".to_string()]) {
+                    tracing::warn!(task_id = %task.id.0, err = %e, "failed to reset review_agent_failures on stale-session recovery");
+                }
                 if let Err(e) = task_manager
                     .update_task_status(&task.id, Status::NeedsReview)
                     .await
