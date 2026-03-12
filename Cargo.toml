@@ -59,8 +59,11 @@ dirs = "6"
 # File watching for config hot reload
 notify = "7"
 
-# SQLite for internal tasks
+# SQLite for internal tasks (legacy — being replaced by sqlx)
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+# SQLite via sqlx — unified task store (async, compile-time checked queries)
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 
 # Command discovery for agents
 which = "7"

@@ -12,6 +12,8 @@ mod home;
 mod parser;
 pub mod security;
 mod sidecar;
+#[allow(dead_code)]
+mod store;
 mod template;
 mod tmux;
 mod webhook_status;
