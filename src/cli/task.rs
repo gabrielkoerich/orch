@@ -396,12 +396,8 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
     let db = Db::open(&db_path)?;
     if let Ok(task) = db.get_internal_task(id).await {
         let internal_id = format!("internal:{}", task.id);
-        // Reset sidecar
-        crate::sidecar::set(
-            &internal_id,
-            &["attempts=0".to_string(), "route_attempts=0".to_string()],
-        )
-        .ok();
+        // Reset sidecar (attempts + all failure counters)
+        crate::sidecar::reset_task_counters(&internal_id);
         // Reset DB status to New
         db.update_internal_task_status(id, TaskStatus::New).await?;
         println!(
@@ -425,12 +421,8 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
         }
     }
 
-    // Reset sidecar state so the task starts fresh
-    crate::sidecar::set(
-        &ext_id.0,
-        &["attempts=0".to_string(), "route_attempts=0".to_string()],
-    )
-    .ok();
+    // Reset sidecar state (attempts + all failure counters) so the task starts fresh
+    crate::sidecar::reset_task_counters(&ext_id.0);
 
     // Reset to new
     backend.update_status(&ext_id, Status::New).await?;
@@ -444,11 +436,7 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
 
 async fn reset_internal_sidecar(id: i64) {
     let internal_id = format!("internal:{}", id);
-    crate::sidecar::set(
-        &internal_id,
-        &["attempts=0".to_string(), "route_attempts=0".to_string()],
-    )
-    .ok();
+    crate::sidecar::reset_task_counters(&internal_id);
 }
 
 /// Unblock a task or all blocked tasks.
@@ -470,11 +458,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
         let mut external_count = 0;
         for task in blocked.iter().chain(needs_review.iter()) {
-            crate::sidecar::set(
-                &task.id.0,
-                &["attempts=0".to_string(), "route_attempts=0".to_string()],
-            )
-            .ok();
+            crate::sidecar::reset_task_counters(&task.id.0);
             backend.update_status(&task.id, Status::New).await?;
             external_count += 1;
         }
@@ -530,11 +514,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     }
 
     let ext_id = ExternalId(id.to_string());
-    crate::sidecar::set(
-        &ext_id.0,
-        &["attempts=0".to_string(), "route_attempts=0".to_string()],
-    )
-    .ok();
+    crate::sidecar::reset_task_counters(&ext_id.0);
     backend.update_status(&ext_id, Status::New).await?;
     println!("Unblocked task #{} (attempts reset)", id);
 

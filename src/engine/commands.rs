@@ -284,37 +284,29 @@ pub async fn execute_command(
 ) -> anyhow::Result<String> {
     match command {
         OwnerCommand::Retry => {
-            // Remove agent labels, reset attempts, reset to new
+            // Remove agent labels, reset attempts and all failure counters, reset to new
             let task = backend.get_task(task_id).await?;
             for label in &task.labels {
                 if label.starts_with("agent:") {
                     backend.remove_label(task_id, label).await.ok();
                 }
             }
-            // Reset sidecar state so the task starts fresh
-            crate::sidecar::set(
-                &task_id.0,
-                &["attempts=0".to_string(), "route_attempts=0".to_string()],
-            )
-            .ok();
+            // Reset sidecar state (attempts + all failure counters) so the task starts fresh
+            crate::sidecar::reset_task_counters(&task_id.0);
             backend.update_status(task_id, Status::New).await?;
             Ok("`/retry` — reset attempts, cleared agent, reset to `status:new`".to_string())
         }
 
         OwnerCommand::Reroute(agent) => {
-            // Remove existing agent labels and reset attempts
+            // Remove existing agent labels and reset attempts and all failure counters
             let task = backend.get_task(task_id).await?;
             for label in &task.labels {
                 if label.starts_with("agent:") {
                     backend.remove_label(task_id, label).await.ok();
                 }
             }
-            // Reset sidecar state so the task starts fresh
-            crate::sidecar::set(
-                &task_id.0,
-                &["attempts=0".to_string(), "route_attempts=0".to_string()],
-            )
-            .ok();
+            // Reset sidecar state (attempts + all failure counters) so the task starts fresh
+            crate::sidecar::reset_task_counters(&task_id.0);
             // Optionally set new agent
             if let Some(agent_name) = agent {
                 let label = format!("agent:{agent_name}");
