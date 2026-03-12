@@ -25,6 +25,9 @@ use super::router::Router;
 use super::tasks::TaskManager;
 use super::EngineConfig;
 
+/// Maximum consecutive PR-creation failures before blocking the task.
+const MAX_PR_CREATE_FAILURES: u64 = 3;
+
 /// Review agent decision result.
 #[derive(Debug, Clone)]
 pub(crate) enum ReviewDecision {
@@ -37,6 +40,8 @@ pub(crate) enum ReviewDecision {
     },
     /// Review agent failed or crashed (reason stored for logging).
     Failed(String),
+    /// Unrecoverable failure — task should be blocked for human intervention.
+    Blocked(String),
     /// No PR exists — nothing to review, task marked done directly.
     Skipped,
 }
@@ -619,6 +624,17 @@ pub(crate) async fn review_and_merge(
                                     stderr = %stderr,
                                     "failed to create missing PR — work may be stuck"
                                 );
+                                let failures = sidecar::get_u64(&task.id.0, "pr_create_failures")
+                                    .saturating_add(1);
+                                let _ = sidecar::set(
+                                    &task.id.0,
+                                    &[format!("pr_create_failures={failures}")],
+                                );
+                                if failures >= MAX_PR_CREATE_FAILURES {
+                                    return Ok(ReviewDecision::Blocked(format!(
+                                        "no PR, create failed {failures} times: {stderr}"
+                                    )));
+                                }
                                 return Ok(ReviewDecision::Failed(format!(
                                     "no PR, create failed: {stderr}"
                                 )));
@@ -629,6 +645,17 @@ pub(crate) async fn review_and_merge(
                                     error = %e,
                                     "failed to run gh pr create"
                                 );
+                                let failures = sidecar::get_u64(&task.id.0, "pr_create_failures")
+                                    .saturating_add(1);
+                                let _ = sidecar::set(
+                                    &task.id.0,
+                                    &[format!("pr_create_failures={failures}")],
+                                );
+                                if failures >= MAX_PR_CREATE_FAILURES {
+                                    return Ok(ReviewDecision::Blocked(format!(
+                                        "no PR, gh error {failures} times: {e}"
+                                    )));
+                                }
                                 return Ok(ReviewDecision::Failed(format!("no PR, gh error: {e}")));
                             }
                         }

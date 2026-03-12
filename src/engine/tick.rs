@@ -491,6 +491,19 @@ pub(crate) async fn tick_dispatch_tasks(
                                         )
                                         .await
                                         {
+                                            Ok(ReviewDecision::Blocked(reason)) => {
+                                                tracing::error!(
+                                                    task_id = task_id_for_review,
+                                                    reason,
+                                                    "review gate blocked after repeated failures — marking task blocked"
+                                                );
+                                                let _ = task_manager_for_review
+                                                    .update_task_status(
+                                                        &ExternalId(task_id_for_review.clone()),
+                                                        Status::Blocked,
+                                                    )
+                                                    .await;
+                                            }
                                             Ok(ReviewDecision::Failed(reason)) => {
                                                 tracing::error!(
                                                     task_id = task_id_for_review,

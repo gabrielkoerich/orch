@@ -123,7 +123,12 @@ pub(crate) async fn sync_tick(
             let repo_ctx = repo_s.clone();
             tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                 let tid = task_c.id.0.clone();
-                let needs_reset = match review_and_merge(
+                enum ReviewOutcome {
+                    Reset,
+                    Block,
+                    Ok,
+                }
+                let outcome = match review_and_merge(
                     &task_c,
                     &backend_c,
                     &tmux_c,
@@ -133,33 +138,47 @@ pub(crate) async fn sync_tick(
                 )
                 .await
                 {
+                    Ok(ReviewDecision::Blocked(reason)) => {
+                        tracing::error!(
+                            task_id = tid,
+                            reason,
+                            "review gate blocked after repeated failures — marking task blocked"
+                        );
+                        ReviewOutcome::Block
+                    }
                     Ok(ReviewDecision::Failed(reason)) => {
                         tracing::error!(
                             task_id = tid,
                             reason,
                             "review agent failed — resetting to NeedsReview for retry"
                         );
-                        true
+                        ReviewOutcome::Reset
                     }
                     Err(e) => {
                         tracing::error!(
                             task_id = tid, error = %e,
                             "review_and_merge failed — resetting to NeedsReview for retry"
                         );
-                        true
+                        ReviewOutcome::Reset
                     }
-                    Ok(_) => false,
+                    Ok(_) => ReviewOutcome::Ok,
                 };
-                if needs_reset {
-                    if tid.starts_with("internal:") {
-                        // Internal tasks: update SQLite via task_manager.
-                        let _ = task_manager_c
-                            .update_task_status(&ExternalId(tid.clone()), Status::NeedsReview)
-                            .await;
-                    } else {
-                        // External tasks: retry with backoff.
-                        reset_to_needs_review_with_retry(&backend_c, &tid).await;
+                match outcome {
+                    ReviewOutcome::Reset => {
+                        if tid.starts_with("internal:") {
+                            let _ = task_manager_c
+                                .update_task_status(&ExternalId(tid.clone()), Status::NeedsReview)
+                                .await;
+                        } else {
+                            reset_to_needs_review_with_retry(&backend_c, &tid).await;
+                        }
                     }
+                    ReviewOutcome::Block => {
+                        let _ = task_manager_c
+                            .update_task_status(&ExternalId(tid.clone()), Status::Blocked)
+                            .await;
+                    }
+                    ReviewOutcome::Ok => {}
                 }
 
                 drop(permit);
