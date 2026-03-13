@@ -78,6 +78,7 @@ impl Clone for TaskManager {
 }
 
 impl TaskManager {
+    #[allow(dead_code)] // Used in tests
     pub fn new(db: Arc<Db>, backend: Arc<dyn ExternalBackend>) -> Self {
         Self {
             db,

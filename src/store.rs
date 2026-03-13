@@ -87,7 +87,7 @@ pub struct Task {
 }
 
 /// Parameters for creating a new task.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NewTask {
     pub external_id: Option<String>,
     pub repo: String,
@@ -362,6 +362,59 @@ impl TaskStore {
     /// List routable tasks (status = 'new') within a repo.
     pub async fn list_routable(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         self.list_by_status(repo, TaskStatus::New).await
+    }
+
+    /// List all tasks for a repo, ordered by creation time descending.
+    pub async fn list_all(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query("SELECT * FROM tasks WHERE repo = ? ORDER BY created_at DESC")
+            .bind(repo)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
+    /// Aggregate cost and token data for a repo.
+    /// Returns (total_input_tokens, total_output_tokens, total_cost_usd).
+    pub async fn cost_summary(&self, repo: &str) -> anyhow::Result<(i64, i64, f64)> {
+        let row = sqlx::query(
+            "SELECT
+                COALESCE(SUM(input_tokens), 0) as total_input,
+                COALESCE(SUM(output_tokens), 0) as total_output,
+                COALESCE(SUM(total_cost_usd), 0.0) as total_cost
+             FROM tasks WHERE repo = ?",
+        )
+        .bind(repo)
+        .fetch_one(&self.pool)
+        .await?;
+
+        use sqlx::Row;
+        Ok((
+            row.get::<i64, _>("total_input"),
+            row.get::<i64, _>("total_output"),
+            row.get::<f64, _>("total_cost"),
+        ))
+    }
+
+    /// Count tasks by status for a repo.
+    /// Returns a map of status string → count.
+    pub async fn status_counts(
+        &self,
+        repo: &str,
+    ) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+        let rows =
+            sqlx::query("SELECT status, COUNT(*) as cnt FROM tasks WHERE repo = ? GROUP BY status")
+                .bind(repo)
+                .fetch_all(&self.pool)
+                .await?;
+
+        use sqlx::Row;
+        let mut map = std::collections::HashMap::new();
+        for row in &rows {
+            let status: String = row.get("status");
+            let count: i64 = row.get("cnt");
+            map.insert(status, count);
+        }
+        Ok(map)
     }
 
     // ---------------------------------------------------------------
@@ -2259,5 +2312,176 @@ mod tests {
         assert!(task.agent.is_none());
         assert!(task.model.is_none());
         assert!(task.block_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_all_returns_all_tasks_in_repo() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        // Create tasks in two repos
+        store
+            .create(&NewTask {
+                external_id: Some("1".to_string()),
+                repo: "owner/repo-a".to_string(),
+                origin: "github".to_string(),
+                title: "Task A1".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .create(&NewTask {
+                external_id: Some("2".to_string()),
+                repo: "owner/repo-a".to_string(),
+                origin: "github".to_string(),
+                title: "Task A2".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .create(&NewTask {
+                external_id: Some("3".to_string()),
+                repo: "owner/repo-b".to_string(),
+                origin: "github".to_string(),
+                title: "Task B1".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let all_a = store.list_all("owner/repo-a").await.unwrap();
+        assert_eq!(all_a.len(), 2);
+
+        let all_b = store.list_all("owner/repo-b").await.unwrap();
+        assert_eq!(all_b.len(), 1);
+        assert_eq!(all_b[0].title, "Task B1");
+    }
+
+    #[tokio::test]
+    async fn cost_summary_aggregates_correctly() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id1 = store
+            .create(&NewTask {
+                external_id: Some("1".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Task 1".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id2 = store
+            .create(&NewTask {
+                external_id: Some("2".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Task 2".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store.store_tokens(id1, 1000, 500, "sonnet").await.unwrap();
+        store.store_tokens(id2, 2000, 1000, "opus").await.unwrap();
+
+        let (input, output, cost) = store.cost_summary("owner/repo").await.unwrap();
+        assert_eq!(input, 3000);
+        assert_eq!(output, 1500);
+        assert!(cost > 0.0);
+    }
+
+    #[tokio::test]
+    async fn status_counts_groups_correctly() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        for i in 0..3 {
+            store
+                .create(&NewTask {
+                    external_id: Some(format!("{}", i)),
+                    repo: "owner/repo".to_string(),
+                    origin: "github".to_string(),
+                    title: format!("Task {}", i),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        // Move task 1 to routed, task 2 to done
+        store.update_status(2, TaskStatus::Routed).await.unwrap();
+        store.update_status(3, TaskStatus::Done).await.unwrap();
+
+        let counts = store.status_counts("owner/repo").await.unwrap();
+        assert_eq!(counts.get("new"), Some(&1));
+        assert_eq!(counts.get("routed"), Some(&1));
+        assert_eq!(counts.get("done"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn ensure_external_task_upserts() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let ext = crate::backends::ExternalTask {
+            id: crate::backends::ExternalId("42".to_string()),
+            title: "Test issue".to_string(),
+            body: "Body text".to_string(),
+            state: "open".to_string(),
+            labels: vec!["bug".to_string()],
+            author: "user".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://github.com/owner/repo/issues/42".to_string(),
+        };
+
+        let id1 = store
+            .ensure_external_task("owner/repo", &ext)
+            .await
+            .unwrap();
+        let id2 = store
+            .ensure_external_task("owner/repo", &ext)
+            .await
+            .unwrap();
+        assert_eq!(id1, id2, "should upsert, not create duplicate");
+
+        let task = store.get(id1).await.unwrap();
+        assert_eq!(task.external_id, Some("42".to_string()));
+        assert_eq!(task.title, "Test issue");
+    }
+
+    #[tokio::test]
+    async fn resolve_task_id_external() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        store
+            .create(&NewTask {
+                external_id: Some("42".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Issue 42".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resolved = store.resolve_task_id("owner/repo", "42").await.unwrap();
+        assert_eq!(resolved, Some(1));
+
+        let missing = store.resolve_task_id("owner/repo", "999").await.unwrap();
+        assert_eq!(missing, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_task_id_internal_returns_none() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let resolved = store
+            .resolve_task_id("owner/repo", "internal:5")
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved, None,
+            "internal tasks not yet supported in resolve_task_id"
+        );
     }
 }

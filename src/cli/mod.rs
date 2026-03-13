@@ -728,13 +728,21 @@ pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
     use crate::db::Db;
+    use crate::store::TaskStore;
 
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
     let db = Arc::new(Db::open(&crate::db::default_path()?)?);
     db.migrate().await?;
-    Ok(TaskManager::new(db, backend))
+    let store = Arc::new(TaskStore::open(&crate::db::default_path()?).await?);
+    Ok(TaskManager::with_store(db, backend, store, repo))
+}
+
+/// Initialize the unified task store for CLI commands.
+#[allow(dead_code)]
+pub async fn init_store() -> anyhow::Result<crate::store::TaskStore> {
+    crate::store::TaskStore::open(&crate::db::default_path()?).await
 }
 
 #[cfg(test)]
