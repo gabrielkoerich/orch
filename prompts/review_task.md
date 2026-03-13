@@ -6,7 +6,7 @@ You are reviewing a PR created by an AI agent. Complete ALL steps in order.
 
 Keep the branch up to date — other PRs may have merged since this was created:
 1. Ensure the service has pre-fetched remote refs, then rebase onto the default branch:
-   - `git rebase origin/main`  # service pre-fetches refs for agent worktrees
+   - `git rebase origin/{{DEFAULT_BRANCH}}`  # service pre-fetches refs for agent worktrees
 3. If there are conflicts:
    - Resolve each conflict by understanding both sides of the change
    - `git add <resolved files>` then `git rebase --continue`
