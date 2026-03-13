@@ -98,7 +98,7 @@ pub(crate) async fn sync_tick(
     }
 
     // 4. Review open PRs (parse review comments, create follow-ups)
-    if let Err(e) = review_open_prs(backend, db, repo, config, task_manager, store).await {
+    if let Err(e) = review_open_prs(backend, repo, config, task_manager, store).await {
         tracing::warn!(err = %e, "PR review failed");
     }
 
@@ -905,5 +905,56 @@ mod tests {
         assert_eq!(counts.get("needs_review"), Some(&1));
         assert_eq!(counts.get("in_review"), Some(&1));
         assert_eq!(counts.get("blocked"), Some(&1));
+    }
+
+    // ── kv_get_prefer_store / kv_set_prefer_store ────────────────────
+
+    #[tokio::test]
+    async fn kv_get_prefer_store_reads_from_store() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+
+        store.kv_set("k1", "store_val").await.unwrap();
+        db.kv_set("k1", "db_val").await.unwrap();
+
+        let opt = Some(&store);
+        let val = kv_get_prefer_store(&opt, &db, "k1").await;
+        assert_eq!(val.as_deref(), Some("store_val"));
+    }
+
+    #[tokio::test]
+    async fn kv_get_prefer_store_falls_back_to_db() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+        db.kv_set("k2", "db_val").await.unwrap();
+
+        let opt: Option<&Arc<crate::store::TaskStore>> = None;
+        let val = kv_get_prefer_store(&opt, &db, "k2").await;
+        assert_eq!(val.as_deref(), Some("db_val"));
+    }
+
+    #[tokio::test]
+    async fn kv_set_prefer_store_writes_to_store() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+
+        let opt = Some(&store);
+        kv_set_prefer_store(&opt, &db, "k3", "val3").await;
+
+        assert_eq!(store.kv_get("k3").await.unwrap().as_deref(), Some("val3"));
+        assert_eq!(db.kv_get("k3").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn kv_set_prefer_store_falls_back_to_db() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+
+        let opt: Option<&Arc<crate::store::TaskStore>> = None;
+        kv_set_prefer_store(&opt, &db, "k4", "val4").await;
+
+        assert_eq!(db.kv_get("k4").await.unwrap().as_deref(), Some("val4"));
     }
 }

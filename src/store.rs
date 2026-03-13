@@ -1025,12 +1025,22 @@ impl TaskStore {
             origin: row.get("origin"),
             title: row.get("title"),
             body: row.get("body"),
-            status: TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::New),
+            status: TaskStatus::from_str(&status_str).unwrap_or_else(|| {
+                tracing::warn!(
+                    status = status_str,
+                    "unknown task status, defaulting to New"
+                );
+                TaskStatus::New
+            }),
             source: row.get("source"),
             source_id: row.get("source_id"),
             author: row.get("author"),
             url: row.get("url"),
-            labels: serde_json::from_str(&labels_str).unwrap_or_default(),
+            labels: serde_json::from_str(&labels_str)
+                .inspect_err(
+                    |e| tracing::warn!(error = %e, "corrupt labels JSON, defaulting to empty"),
+                )
+                .unwrap_or_default(),
             agent: row.get("agent"),
             model: row.get("model"),
             complexity: row.get("complexity"),
@@ -1064,8 +1074,16 @@ impl TaskStore {
             limit_reroute_chain: row.get("limit_reroute_chain"),
             budget_warning: row.get("budget_warning"),
             budget_exceeded: row.get::<i32, _>("budget_exceeded") != 0,
-            memory: serde_json::from_str(&memory_str).unwrap_or_default(),
-            delegations: serde_json::from_str(&delegations_str).unwrap_or_default(),
+            memory: serde_json::from_str(&memory_str)
+                .inspect_err(
+                    |e| tracing::warn!(error = %e, "corrupt memory JSON, defaulting to empty"),
+                )
+                .unwrap_or_default(),
+            delegations: serde_json::from_str(&delegations_str)
+                .inspect_err(
+                    |e| tracing::warn!(error = %e, "corrupt delegations JSON, defaulting to empty"),
+                )
+                .unwrap_or_default(),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })
@@ -1641,6 +1659,8 @@ impl TaskStore {
                     }
                 }
             }
+        } else {
+            tracing::warn!("failed to read internal tasks from old db, skipping phase");
         }
 
         // 2. Migrate KV store entries
@@ -1653,6 +1673,8 @@ impl TaskStore {
                     result.migrated += 1;
                 }
             }
+        } else {
+            tracing::warn!("failed to read kv entries from old db, skipping phase");
         }
 
         // 3. Migrate task_metrics
@@ -1690,6 +1712,8 @@ impl TaskStore {
                     result.migrated += 1;
                 }
             }
+        } else {
+            tracing::warn!("failed to read task metrics from old db, skipping phase");
         }
 
         // 4. Migrate rate_limits
@@ -1714,6 +1738,8 @@ impl TaskStore {
                     }
                 }
             }
+        } else {
+            tracing::warn!("failed to read rate limits from old db, skipping phase");
         }
 
         // 5. Walk sidecar files for external tasks

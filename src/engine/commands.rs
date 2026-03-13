@@ -514,4 +514,72 @@ mod tests {
         assert_eq!(OwnerCommand::Unblock.to_string(), "/unblock");
         assert_eq!(OwnerCommand::Review.to_string(), "/review");
     }
+
+    // ── kv_get / kv_set store-first helpers ──────────────────────────
+
+    #[tokio::test]
+    async fn kv_get_prefers_store_over_db() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+
+        // Write different values to store and db
+        store.kv_set("key1", "from_store").await.unwrap();
+        db.kv_set("key1", "from_db").await.unwrap();
+
+        let opt_store = Some(store);
+        let val = kv_get(&opt_store, &db, "key1").await;
+        assert_eq!(val.as_deref(), Some("from_store"));
+    }
+
+    #[tokio::test]
+    async fn kv_get_falls_back_to_db_when_no_store() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+        db.kv_set("key2", "from_db").await.unwrap();
+
+        let opt_store: Option<Arc<crate::store::TaskStore>> = None;
+        let val = kv_get(&opt_store, &db, "key2").await;
+        assert_eq!(val.as_deref(), Some("from_db"));
+    }
+
+    #[tokio::test]
+    async fn kv_get_returns_none_for_missing_key() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+
+        let opt_store = Some(store);
+        let val = kv_get(&opt_store, &db, "nonexistent").await;
+        assert_eq!(val, None);
+    }
+
+    #[tokio::test]
+    async fn kv_set_writes_to_store_when_present() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+
+        let opt_store = Some(Arc::clone(&store));
+        kv_set(&opt_store, &db, "key3", "value3").await;
+
+        // Should be in store
+        assert_eq!(
+            store.kv_get("key3").await.unwrap().as_deref(),
+            Some("value3")
+        );
+        // Should NOT be in db (store succeeded, so db write was skipped)
+        assert_eq!(db.kv_get("key3").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn kv_set_falls_back_to_db_when_no_store() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+
+        let opt_store: Option<Arc<crate::store::TaskStore>> = None;
+        kv_set(&opt_store, &db, "key4", "value4").await;
+
+        assert_eq!(db.kv_get("key4").await.unwrap().as_deref(), Some("value4"));
+    }
 }

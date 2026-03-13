@@ -62,7 +62,6 @@ pub(crate) enum ReviewDecision {
 /// store and injected into the agent prompt.
 pub(crate) async fn review_open_prs(
     backend: &Arc<dyn ExternalBackend>,
-    _db: &Arc<crate::db::Db>,
     repo: &str,
     config: &EngineConfig,
     task_manager: &Arc<TaskManager>,
