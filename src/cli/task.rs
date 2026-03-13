@@ -743,14 +743,12 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
 
-    // Resolve sidecar key and print basic metadata where available.
-    let mut sidecar_key = id.to_string();
+    // Resolve task key for store lookups.
+    let mut task_key = id.to_string();
 
-    // If user passed `internal:N` or the task resolves to an internal task,
-    // prefer the internal sidecar key format `internal:{n}` so we read the
-    // correct file.
+    // If user passed `internal:N`, use `internal:{n}` format for store lookups.
     if let Some(n) = parse_internal_id(id) {
-        sidecar_key = format!("internal:{}", n);
+        task_key = format!("internal:{}", n);
         // Fetch internal task metadata from store
         if let Some(ref s) = store {
             if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
@@ -781,7 +779,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                 println!("URL: {}", ext.url);
                 println!("Created: {}", ext.created_at);
                 println!("Updated: {}", ext.updated_at);
-                sidecar_key = ext.id.0.clone();
+                task_key = ext.id.0.clone();
             }
             Ok(Task::Internal(int)) => {
                 println!("ID: {} (internal)", int.id);
@@ -792,7 +790,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                 }
                 println!("Created: {}", int.created_at);
                 println!("Updated: {}", int.updated_at);
-                sidecar_key = int
+                task_key = int
                     .external_id
                     .clone()
                     .unwrap_or_else(|| format!("internal:{}", int.id));
@@ -813,26 +811,26 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
         {
             // Agent & model from store
             if let Some(agent) =
-                store_helpers::opt_store_get_field(&store, &repo, &sidecar_key, "agent").await
+                store_helpers::opt_store_get_field(&store, &repo, &task_key, "agent").await
             {
                 println!("Agent: {}", agent);
             }
             if let Some(model) =
-                store_helpers::opt_store_get_field(&store, &repo, &sidecar_key, "model").await
+                store_helpers::opt_store_get_field(&store, &repo, &task_key, "model").await
             {
                 println!("Model: {}", model);
             }
 
             // Attempts
             if let Some(attempts) =
-                store_helpers::opt_store_get_field(&store, &repo, &sidecar_key, "attempts").await
+                store_helpers::opt_store_get_field(&store, &repo, &task_key, "attempts").await
             {
                 println!("Attempts: {}", attempts);
             }
 
             // Token & cost summary
-            let usage = store_helpers::get_token_usage(&store, &repo, &sidecar_key).await;
-            let cost = store_helpers::get_cost_estimate(&store, &repo, &sidecar_key).await;
+            let usage = store_helpers::get_token_usage(&store, &repo, &task_key).await;
+            let cost = store_helpers::get_cost_estimate(&store, &repo, &task_key).await;
             let total_tokens = usage.total_tokens();
             if total_tokens > 0 || cost.total_cost_usd > 0.0 {
                 println!("\nCost summary:");
@@ -844,7 +842,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
 
             // Memory (recent attempts)
             {
-                let mem = store_helpers::get_recent_memory(&store, &repo, &sidecar_key, 10).await;
+                let mem = store_helpers::get_recent_memory(&store, &repo, &task_key, 10).await;
                 if !mem.is_empty() {
                     println!("\nMemory (recent attempts):");
                     for m in mem {
@@ -878,11 +876,11 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
 
     // Show agent output from last attempt if available
     if let Some(attempts_str) =
-        store_helpers::opt_store_get_field(&store, &repo, &sidecar_key, "attempts").await
+        store_helpers::opt_store_get_field(&store, &repo, &task_key, "attempts").await
     {
         if let Ok(attempt_n) = attempts_str.parse::<u32>() {
             if attempt_n > 0 {
-                match home::task_attempt_dir(&repo, &sidecar_key, attempt_n) {
+                match home::task_attempt_dir(&repo, &task_key, attempt_n) {
                     Ok(attempt_dir) => {
                         let output_file = attempt_dir.join("output.json");
                         let exit_file = attempt_dir.join("exit.txt");
@@ -921,7 +919,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     }
 
     // Show review agent output if available
-    let review_task_id = format!("{}-review", sidecar_key);
+    let review_task_id = format!("{}-review", task_key);
     if let Ok(review_attempt_dir) = home::task_attempt_dir(&repo, &review_task_id, 1) {
         let review_output_file = review_attempt_dir.join("output.json");
         if review_output_file.exists() {
@@ -934,7 +932,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
 
     // Show audit trail from task_runs table (if available in store)
     if let Ok(store) = crate::cli::init_store().await {
-        if let Ok(Some(store_id)) = store.resolve_task_id(&repo, &sidecar_key).await {
+        if let Ok(Some(store_id)) = store.resolve_task_id(&repo, &task_key).await {
             if let Ok(runs) = store.get_runs(store_id).await {
                 if !runs.is_empty() {
                     println!("\n--- Run audit trail ({} runs) ---", runs.len());
@@ -970,7 +968,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
 
     // If tmux session is live, append recent pane capture
     let tmux = TmuxManager::new();
-    let session = tmux.session_name(&repo, &sidecar_key);
+    let session = tmux.session_name(&repo, &task_key);
     if tmux.session_exists(&session).await {
         println!(
             "\nLive tmux session detected: {} — appending recent output:\n---",

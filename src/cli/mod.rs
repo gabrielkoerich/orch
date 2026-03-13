@@ -734,7 +734,6 @@ pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
 }
 
 /// Initialize the unified task store for CLI commands.
-#[allow(dead_code)]
 pub async fn init_store() -> anyhow::Result<crate::store::TaskStore> {
     crate::store::TaskStore::open(&crate::store::default_db_path()?).await
 }

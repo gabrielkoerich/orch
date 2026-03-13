@@ -6,7 +6,7 @@
 //!
 //! Uses sqlx for async SQLite access with file-based migrations.
 //!
-//! Phase 1: schema + CRUD only, no behavior change. Dead code expected until wired in.
+//! All task state, metrics, KV, and rate limits flow through this module.
 
 use anyhow::Context;
 use chrono::{Datelike, Utc};
@@ -20,7 +20,7 @@ pub fn default_db_path() -> anyhow::Result<std::path::PathBuf> {
     crate::home::db_path()
 }
 
-// ── Types formerly in db.rs ─────────────────────────────────────────
+// ── Core types ──────────────────────────────────────────────────────
 
 /// Parameters for inserting a new task metric record.
 #[derive(Debug, Clone)]
