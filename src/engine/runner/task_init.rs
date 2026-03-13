@@ -6,7 +6,6 @@
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::config;
 use crate::engine::router::get_route_result;
-use crate::sidecar;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::path::{Path, PathBuf};
@@ -43,10 +42,11 @@ pub async fn check_guards(
     repo: &str,
     store: &Option<Arc<TaskStore>>,
 ) -> anyhow::Result<GuardOutcome> {
-    let attempts: u32 = sidecar::get(task_id, "attempts")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let attempts: u32 =
+        crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "attempts")
+            .await
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
     // Guard: check if tmux session already exists (prevents duplicate dispatch)
     let tmux = TmuxManager::new();
@@ -84,10 +84,18 @@ pub async fn check_guards(
     Ok(GuardOutcome::Proceed(attempts))
 }
 
-/// Build a minimal `ExternalTask` from sidecar state for prompt building.
-pub fn build_pseudo_task(task_id: &str) -> ExternalTask {
-    let task_title = sidecar::get(task_id, "title").unwrap_or_else(|_| format!("Task #{task_id}"));
-    let task_body = sidecar::get(task_id, "body").unwrap_or_default();
+/// Build a minimal `ExternalTask` from store/sidecar state for prompt building.
+pub async fn build_pseudo_task(
+    task_id: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> ExternalTask {
+    let task_title = crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "title")
+        .await
+        .unwrap_or_else(|| format!("Task #{task_id}"));
+    let task_body = crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "body")
+        .await
+        .unwrap_or_default();
     ExternalTask {
         id: ExternalId(task_id.to_string()),
         title: task_title,
@@ -113,8 +121,11 @@ pub async fn prepare_task(
     attempts: u32,
     store: &Option<Arc<TaskStore>>,
 ) -> anyhow::Result<TaskInitResult> {
-    // Load title from sidecar for branch naming (set by run_with_context before run())
-    let title_for_branch = sidecar::get(task_id, "title").unwrap_or_default();
+    // Load title from store/sidecar for branch naming (set by run_with_context before run())
+    let title_for_branch =
+        crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "title")
+            .await
+            .unwrap_or_default();
 
     // Set up worktree
     let wt = worktree::setup_worktree(task_id, &title_for_branch, project_dir, store, repo).await?;
@@ -136,7 +147,7 @@ pub async fn prepare_task(
         .or_else(|| route_result.as_ref().and_then(|r| r.model.clone()));
 
     // Build a minimal ExternalTask for prompt building
-    let pseudo_task = build_pseudo_task(task_id);
+    let pseudo_task = build_pseudo_task(task_id, store, repo).await;
     let task_title = pseudo_task.title.clone();
 
     let selected_skills = route_result
@@ -152,6 +163,8 @@ pub async fn prepare_task(
         &wt.default_branch,
         attempts,
         &selected_skills,
+        store,
+        repo,
     )
     .await;
 

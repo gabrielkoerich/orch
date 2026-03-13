@@ -11,8 +11,9 @@
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::cmd::CommandErrorContext;
-use crate::sidecar;
+use crate::store::TaskStore;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::process::Command;
 
 /// All assembled context for a task execution.
@@ -46,12 +47,20 @@ pub fn load_task_context(task_id: &str) -> String {
 }
 
 /// Build parent task context for subtasks.
-pub async fn build_parent_context(task: &ExternalTask, backend: &dyn ExternalBackend) -> String {
-    // Check if task has a parent via sidecar
-    let parent_id = match sidecar::get(&task.id.0, "parent_id") {
-        Ok(id) if !id.is_empty() => id,
-        _ => return String::new(),
-    };
+pub async fn build_parent_context(
+    task: &ExternalTask,
+    backend: &dyn ExternalBackend,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> String {
+    // Check if task has a parent via store or sidecar
+    let parent_id =
+        match crate::engine::cleanup::opt_store_or_sidecar(store, repo, &task.id.0, "parent_id")
+            .await
+        {
+            Some(id) if !id.is_empty() => id,
+            _ => return String::new(),
+        };
 
     let mut ctx = String::new();
 
@@ -83,8 +92,12 @@ pub async fn build_parent_context(task: &ExternalTask, backend: &dyn ExternalBac
                         .unwrap_or_else(|| "unknown".to_string());
                     ctx.push_str(&format!("- #{} [{}]: {}\n", sib.id.0, status, sib.title));
 
-                    // Include sidecar summary if available
-                    if let Ok(summary) = sidecar::get(&sib.id.0, "summary") {
+                    // Include summary if available (store-first, sidecar fallback)
+                    if let Some(summary) = crate::engine::cleanup::opt_store_or_sidecar(
+                        store, repo, &sib.id.0, "summary",
+                    )
+                    .await
+                    {
                         if !summary.is_empty() {
                             ctx.push_str(&format!("  Summary: {}\n", summary));
                         }
@@ -260,13 +273,15 @@ pub async fn fetch_issue_comments(
 
 /// Build memory context from previous attempts.
 /// Returns formatted memory context string and the raw memory entries.
-pub fn build_memory_context(task_id: &str) -> (String, Vec<crate::sidecar::MemoryEntry>) {
+pub async fn build_memory_context(
+    task_id: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> (String, Vec<crate::sidecar::MemoryEntry>) {
     const MAX_MEMORY_ENTRIES: usize = 3;
 
-    let memory = match crate::sidecar::get_recent_memory(task_id, MAX_MEMORY_ENTRIES) {
-        Ok(m) => m,
-        Err(_) => return (String::new(), vec![]),
-    };
+    let memory =
+        crate::engine::cleanup::get_recent_memory(store, repo, task_id, MAX_MEMORY_ENTRIES).await;
 
     if memory.is_empty() {
         return (String::new(), vec![]);
@@ -315,12 +330,19 @@ pub fn build_memory_context(task_id: &str) -> (String, Vec<crate::sidecar::Memor
     (context, memory)
 }
 
-/// Load PR review context from sidecar (for re-dispatching after review changes requested).
-pub fn load_pr_review_context(task_id: &str) -> String {
-    sidecar::get(task_id, "pr_review_context").unwrap_or_default()
+/// Load PR review context (store-first, sidecar fallback).
+pub async fn load_pr_review_context(
+    task_id: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> String {
+    crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "pr_review_context")
+        .await
+        .unwrap_or_default()
 }
 
 /// Build the full task context.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_full_context(
     task: &ExternalTask,
     backend: Option<&dyn ExternalBackend>,
@@ -328,11 +350,13 @@ pub async fn build_full_context(
     default_branch: &str,
     attempts: u32,
     selected_skills: &[String],
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
 ) -> TaskContext {
     let task_context = load_task_context(&task.id.0);
 
     let parent_context = if let Some(b) = backend {
-        build_parent_context(task, b).await
+        build_parent_context(task, b, store, repo).await
     } else {
         String::new()
     };
@@ -353,11 +377,11 @@ pub async fn build_full_context(
         String::new()
     };
 
-    // Load PR review context from sidecar (for re-dispatch after review changes requested)
-    let pr_review_context = load_pr_review_context(&task.id.0);
+    // Load PR review context (store-first, sidecar fallback)
+    let pr_review_context = load_pr_review_context(&task.id.0, store, repo).await;
 
     // Always load memory from previous attempts (empty on first run, populated on retries)
-    let (_, memory) = build_memory_context(&task.id.0);
+    let (_, memory) = build_memory_context(&task.id.0, store, repo).await;
 
     TaskContext {
         task_context,
@@ -376,9 +400,9 @@ pub async fn build_full_context(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_build_memory_context_empty() {
-        let (context, memory) = build_memory_context("nonexistent-task-12345");
+    #[tokio::test]
+    async fn test_build_memory_context_empty() {
+        let (context, memory) = build_memory_context("nonexistent-task-12345", &None, "").await;
         assert!(context.is_empty());
         assert!(memory.is_empty());
     }

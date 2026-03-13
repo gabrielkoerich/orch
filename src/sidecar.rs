@@ -353,6 +353,7 @@ pub fn get_model(task_id: &str) -> String {
 }
 
 /// Get total tokens used for a task.
+#[allow(dead_code)]
 pub fn get_total_tokens(task_id: &str) -> u64 {
     let usage = get_token_usage(task_id);
     usage.total_tokens()

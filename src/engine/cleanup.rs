@@ -15,6 +15,23 @@ use tokio::process::Command;
 
 /// Try to read a task field from the store first, falling back to sidecar.
 ///
+/// Convenience wrapper that handles `Option<Arc<TaskStore>>`:
+/// if store is `None`, falls back to sidecar directly.
+pub(crate) async fn opt_store_or_sidecar(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    field: &str,
+) -> Option<String> {
+    if let Some(ref s) = store {
+        store_or_sidecar(s, repo, task_id, field).await
+    } else {
+        sidecar::get(task_id, field).ok()
+    }
+}
+
+/// Try to read a task field from the store first, falling back to sidecar.
+///
 /// Supports common fields: worktree, branch, summary, agent, model, last_error,
 /// worktree_cleaned, last_review_ts, last_comment_review_ts, review_cycles,
 /// merge_conflict_retries, ci_merge_failures, pr_create_failures, attempts,
@@ -63,6 +80,29 @@ pub(crate) async fn store_or_sidecar(
                     Some(task.budget_warning.clone())
                 }
                 "budget_exceeded" if task.budget_exceeded => Some("true".to_string()),
+                "title" if !task.title.is_empty() => Some(task.title.clone()),
+                "body" if !task.body.is_empty() => Some(task.body.clone()),
+                "parent_id" => task.parent_id.map(|id| id.to_string()),
+                "pr_review_context" if !task.pr_review_context.is_empty() => {
+                    Some(task.pr_review_context.clone())
+                }
+                "limit_reroute_chain" if !task.limit_reroute_chain.is_empty() => {
+                    Some(task.limit_reroute_chain.clone())
+                }
+                "model_reroute_chain" if !task.model_reroute_chain.is_empty() => {
+                    Some(task.model_reroute_chain.clone())
+                }
+                "input_tokens" if task.input_tokens > 0 => Some(task.input_tokens.to_string()),
+                "output_tokens" if task.output_tokens > 0 => Some(task.output_tokens.to_string()),
+                "input_cost_usd" if task.input_cost_usd > 0.0 => {
+                    Some(task.input_cost_usd.to_string())
+                }
+                "output_cost_usd" if task.output_cost_usd > 0.0 => {
+                    Some(task.output_cost_usd.to_string())
+                }
+                "total_cost_usd" if task.total_cost_usd > 0.0 => {
+                    Some(task.total_cost_usd.to_string())
+                }
                 "delegations" => {
                     let json = serde_json::to_string(&task.delegations).unwrap_or_default();
                     if json != "[]" && !json.is_empty() {
@@ -147,6 +187,78 @@ pub(crate) async fn store_and_sidecar_reset_counters(
             let _ = store.reset_counters(store_id).await;
         }
     }
+}
+
+/// Get token usage from store first, falling back to sidecar.
+pub(crate) async fn get_token_usage(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> sidecar::TokenUsage {
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
+            if let Ok(task) = s.get(store_id).await {
+                if task.input_tokens > 0 || task.output_tokens > 0 {
+                    return sidecar::TokenUsage {
+                        input_tokens: task.input_tokens as u64,
+                        output_tokens: task.output_tokens as u64,
+                    };
+                }
+            }
+        }
+    }
+    sidecar::get_token_usage(task_id)
+}
+
+/// Get cost estimate from store first, falling back to sidecar.
+pub(crate) async fn get_cost_estimate(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> sidecar::CostEstimate {
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
+            if let Ok(task) = s.get(store_id).await {
+                if task.total_cost_usd > 0.0 {
+                    return sidecar::CostEstimate {
+                        input_cost_usd: task.input_cost_usd,
+                        output_cost_usd: task.output_cost_usd,
+                        total_cost_usd: task.total_cost_usd,
+                    };
+                }
+            }
+        }
+    }
+    sidecar::get_cost_estimate(task_id)
+}
+
+/// Get total tokens from store first, falling back to sidecar.
+pub(crate) async fn get_total_tokens(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> u64 {
+    let usage = get_token_usage(store, repo, task_id).await;
+    usage.total_tokens()
+}
+
+/// Get recent memory from store first, falling back to sidecar.
+pub(crate) async fn get_recent_memory(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    max_entries: usize,
+) -> Vec<sidecar::MemoryEntry> {
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
+            if let Ok(memory) = s.recent_memory(store_id, max_entries).await {
+                if !memory.is_empty() {
+                    return memory;
+                }
+            }
+        }
+    }
+    sidecar::get_recent_memory(task_id, max_entries).unwrap_or_default()
 }
 
 /// Options controlling the worktree janitor.

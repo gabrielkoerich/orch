@@ -288,8 +288,8 @@ pub async fn handle_success(
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000);
 
-    let total_tokens = sidecar::get_total_tokens(task_id);
-    let cost = sidecar::get_cost_estimate(task_id);
+    let total_tokens = crate::engine::cleanup::get_total_tokens(store, repo, task_id).await;
+    let cost = crate::engine::cleanup::get_cost_estimate(store, repo, task_id).await;
     let warning_threshold = (max_tokens as f64 * 0.8) as u64;
 
     if total_tokens > max_tokens {

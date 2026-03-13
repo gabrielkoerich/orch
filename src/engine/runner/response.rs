@@ -343,7 +343,7 @@ pub async fn handle_failover(
     repo: &str,
 ) -> String {
     // Get the reroute chain
-    let chain = get_reroute_chain(task_id);
+    let chain = get_reroute_chain(task_id, store, repo).await;
     let chain = update_reroute_chain(task_id, agent_name, &chain, store, repo).await;
 
     // Get all available agents
@@ -443,9 +443,14 @@ pub async fn handle_failover(
     "needs_review".to_string()
 }
 
-/// Get the reroute chain from sidecar.
-pub fn get_reroute_chain(task_id: &str) -> String {
-    sidecar::get(task_id, "limit_reroute_chain")
+/// Get the reroute chain from store/sidecar.
+pub async fn get_reroute_chain(
+    task_id: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> String {
+    crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "limit_reroute_chain")
+        .await
         .unwrap_or_default()
         .trim()
         .to_string()

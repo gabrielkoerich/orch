@@ -5,7 +5,6 @@
 //! and agent rerouting.
 
 use crate::db::Db;
-use crate::sidecar;
 use crate::store::TaskStore;
 use std::sync::Arc;
 
@@ -158,7 +157,7 @@ pub async fn handle_error(
     }
 
     // Try free models as last resort before giving up
-    let chain = response::get_reroute_chain(task_id);
+    let chain = response::get_reroute_chain(task_id, store, repo).await;
     let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
         .iter()
         .filter(|a| crate::cmd_cache::command_exists(a))
@@ -180,8 +179,14 @@ pub async fn handle_error(
         // All agents exhausted — try free models via opencode
         let free = agent_runner.free_models();
         if !free.is_empty() {
-            let tried_models: String =
-                sidecar::get(task_id, "model_reroute_chain").unwrap_or_default();
+            let tried_models: String = crate::engine::cleanup::opt_store_or_sidecar(
+                store,
+                repo,
+                task_id,
+                "model_reroute_chain",
+            )
+            .await
+            .unwrap_or_default();
             let tried_set: std::collections::HashSet<&str> =
                 tried_models.split(',').filter(|s| !s.is_empty()).collect();
 

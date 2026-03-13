@@ -32,7 +32,6 @@ use crate::db::{Db, InsertTaskMetric};
 use crate::engine::router::RouteResult;
 use crate::engine::tasks::is_internal_id;
 use crate::security;
-use crate::sidecar;
 use crate::tmux::TmuxManager;
 use chrono::Utc;
 pub use response::WeightSignal;
@@ -78,11 +77,7 @@ impl TaskRunner {
 
     /// Read a field from the store first, falling back to sidecar.
     async fn get_field(&self, task_id: &str, field: &str) -> Option<String> {
-        if let Some(ref store) = self.store {
-            let store = Arc::clone(store);
-            return super::cleanup::store_or_sidecar(&store, &self.repo, task_id, field).await;
-        }
-        sidecar::get(task_id, field).ok()
+        crate::engine::cleanup::opt_store_or_sidecar(&self.store, &self.repo, task_id, field).await
     }
 
     /// Run a task through the full execution pipeline.
@@ -333,9 +328,11 @@ impl TaskRunner {
                 Some(outcome.to_string())
             };
 
-            // Read cost data from sidecar
-            let usage = sidecar::get_token_usage(task_id);
-            let cost = sidecar::get_cost_estimate(task_id);
+            // Read cost data from store/sidecar
+            let usage =
+                crate::engine::cleanup::get_token_usage(&self.store, &self.repo, task_id).await;
+            let cost =
+                crate::engine::cleanup::get_cost_estimate(&self.store, &self.repo, task_id).await;
             let input_tokens = if usage.input_tokens > 0 {
                 Some(usage.input_tokens as i64)
             } else {
@@ -535,7 +532,8 @@ impl TaskRunner {
         if let Some(run_id) = run_audit_id {
             if let Some(ref store) = self.store {
                 let duration = (Utc::now() - started_at).num_milliseconds() as f64 / 1000.0;
-                let usage = sidecar::get_token_usage(task_id);
+                let usage =
+                    crate::engine::cleanup::get_token_usage(&self.store, &self.repo, task_id).await;
                 let outcome = if status == "done" || status == "in_progress" {
                     "success"
                 } else if is_rate_limited {
@@ -621,8 +619,10 @@ impl TaskRunner {
 
         // Append budget warnings to the GitHub comment
         if budget_exceeded == "true" {
-            let cost = sidecar::get_cost_estimate(task_id);
-            let total_tokens = sidecar::get_total_tokens(task_id);
+            let cost =
+                crate::engine::cleanup::get_cost_estimate(&self.store, &self.repo, task_id).await;
+            let total_tokens =
+                crate::engine::cleanup::get_total_tokens(&self.store, &self.repo, task_id).await;
             raw_comment.push_str(&format!(
                 "\n\n> **Budget exceeded**: {} tokens used (${:.4}). Task paused for review.",
                 total_tokens, cost.total_cost_usd
