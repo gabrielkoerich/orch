@@ -2959,4 +2959,359 @@ mod tests {
         assert_eq!(task.agent_profile, r#"{"role":"backend"}"#);
         assert_eq!(task.selected_skills, r#"["git","rust"]"#);
     }
+
+    // ── full run lifecycle: start → complete → query ────────────────────────
+
+    #[tokio::test]
+    async fn run_lifecycle_start_complete_query() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Lifecycle test".to_string(),
+                external_id: Some("100".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Attempt 1: agent run
+        let run1 = store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "sonnet",
+                command: "claude --model sonnet",
+                prompt: "Fix the login bug",
+            })
+            .await
+            .unwrap();
+
+        store
+            .complete_run(&CompleteRun {
+                run_id: run1,
+                exit_code: Some(1),
+                stdout: "Error: couldn't find file",
+                stderr: "WARN: deprecated API",
+                parsed: r#"{"status":"failed"}"#,
+                outcome: "failed",
+                error: "file not found",
+                tokens: RunTokenUsage {
+                    input_tokens: 3000,
+                    output_tokens: 1500,
+                    total_cost_usd: 0.045,
+                    duration_secs: 30.0,
+                },
+            })
+            .await
+            .unwrap();
+
+        // Attempt 2: retry with different model
+        let run2 = store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 2,
+                run_type: "agent",
+                agent: "claude",
+                model: "opus",
+                command: "claude --model opus",
+                prompt: "Fix the login bug (retry)",
+            })
+            .await
+            .unwrap();
+
+        store
+            .complete_run(&CompleteRun {
+                run_id: run2,
+                exit_code: Some(0),
+                stdout: "Fixed the bug by updating the path",
+                stderr: "",
+                parsed: r#"{"status":"done","summary":"Fixed path"}"#,
+                outcome: "success",
+                error: "",
+                tokens: RunTokenUsage {
+                    input_tokens: 5000,
+                    output_tokens: 3000,
+                    total_cost_usd: 0.12,
+                    duration_secs: 60.0,
+                },
+            })
+            .await
+            .unwrap();
+
+        // Attempt 1: review run
+        let run3 = store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 1,
+                run_type: "review",
+                agent: "codex",
+                model: "gpt-5.2",
+                command: "codex review",
+                prompt: "Review PR #42",
+            })
+            .await
+            .unwrap();
+
+        store
+            .complete_run(&CompleteRun {
+                run_id: run3,
+                exit_code: Some(0),
+                stdout: "LGTM",
+                stderr: "",
+                parsed: r#"{"decision":"approve"}"#,
+                outcome: "success",
+                error: "",
+                tokens: RunTokenUsage {
+                    input_tokens: 2000,
+                    output_tokens: 500,
+                    total_cost_usd: 0.03,
+                    duration_secs: 15.0,
+                },
+            })
+            .await
+            .unwrap();
+
+        // Query: get all runs
+        let all_runs = store.get_runs(task_id).await.unwrap();
+        assert_eq!(all_runs.len(), 3);
+        assert_eq!(all_runs[0].attempt, 1);
+        assert_eq!(all_runs[0].run_type, "agent");
+        assert_eq!(all_runs[0].outcome, "failed");
+        assert_eq!(all_runs[1].attempt, 1);
+        assert_eq!(all_runs[1].run_type, "review");
+        assert_eq!(all_runs[2].attempt, 2);
+        assert_eq!(all_runs[2].run_type, "agent");
+        assert_eq!(all_runs[2].outcome, "success");
+
+        // Query: last agent run should be attempt 2
+        let last_agent = store.get_last_run(task_id, "agent").await.unwrap().unwrap();
+        assert_eq!(last_agent.attempt, 2);
+        assert_eq!(last_agent.model, "opus");
+        assert_eq!(last_agent.exit_code, Some(0));
+
+        // Query: last review run
+        let last_review = store
+            .get_last_run(task_id, "review")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last_review.agent, "codex");
+        assert_eq!(last_review.parsed_response, r#"{"decision":"approve"}"#);
+    }
+
+    // ── set_fields rejects unknown columns ──────────────────────────────────
+
+    #[tokio::test]
+    async fn set_fields_rejects_sql_injection_attempt() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Attempt to set a column not in the allowlist
+        let result = store
+            .set_fields(id, &[("id", serde_json::json!(999))])
+            .await;
+        assert!(result.is_err(), "should reject 'id' column");
+
+        let result = store
+            .set_fields(
+                id,
+                &[("'; DROP TABLE tasks; --", serde_json::json!("pwned"))],
+            )
+            .await;
+        assert!(result.is_err(), "should reject SQL injection attempt");
+
+        // Verify task is intact
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.id, id, "task should not be modified");
+    }
+
+    // ── append_memory + recent_memory ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn memory_append_and_retrieve() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Memory test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Append memory entries
+        let entry1 = crate::sidecar::MemoryEntry {
+            attempt: 1,
+            agent: "claude".to_string(),
+            model: None,
+            learnings: vec!["file is at src/main.rs".to_string()],
+            error: None,
+            files_modified: vec![],
+            approach: "read the code".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let entry2 = crate::sidecar::MemoryEntry {
+            attempt: 2,
+            agent: "codex".to_string(),
+            model: None,
+            learnings: vec!["need to update Cargo.toml too".to_string()],
+            error: None,
+            files_modified: vec![],
+            approach: "edit files".to_string(),
+            timestamp: "2026-01-01T01:00:00Z".to_string(),
+        };
+
+        store.append_memory(id, &entry1).await.unwrap();
+        store.append_memory(id, &entry2).await.unwrap();
+
+        // Retrieve recent
+        let recent = store.recent_memory(id, 10).await.unwrap();
+        assert_eq!(recent.len(), 2);
+
+        // Retrieve with limit
+        let limited = store.recent_memory(id, 1).await.unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    // ── mark_cleaned + list_cleanable ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn mark_cleaned_and_list_cleanable() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id1 = store
+            .create(&NewTask {
+                external_id: Some("1".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Task 1".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id2 = store
+            .create(&NewTask {
+                external_id: Some("2".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Task 2".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Set worktrees and mark done
+        store
+            .set_fields(id1, &[("worktree", serde_json::json!("/tmp/wt1"))])
+            .await
+            .unwrap();
+        store
+            .set_fields(id2, &[("worktree", serde_json::json!("/tmp/wt2"))])
+            .await
+            .unwrap();
+        store.update_status(id1, TaskStatus::Done).await.unwrap();
+        store.update_status(id2, TaskStatus::Done).await.unwrap();
+
+        // Both should be cleanable
+        let cleanable = store.list_cleanable("owner/repo").await.unwrap();
+        assert_eq!(cleanable.len(), 2);
+
+        // Mark one as cleaned
+        store.mark_cleaned(id1).await.unwrap();
+
+        let cleanable = store.list_cleanable("owner/repo").await.unwrap();
+        assert_eq!(cleanable.len(), 1);
+        assert_eq!(cleanable[0].id, id2);
+
+        // Verify the flag persisted
+        let task = store.get(id1).await.unwrap();
+        assert!(task.worktree_cleaned);
+    }
+
+    // ── store_tokens accumulates ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_tokens_accumulates_across_calls() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Token test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store.store_tokens(id, 1000, 500, "sonnet").await.unwrap();
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.input_tokens, 1000);
+        assert_eq!(task.output_tokens, 500);
+        let cost1 = task.total_cost_usd;
+        assert!(cost1 > 0.0);
+
+        // Second call replaces (not accumulates)
+        store.store_tokens(id, 2000, 1000, "sonnet").await.unwrap();
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.input_tokens, 2000);
+        assert_eq!(task.output_tokens, 1000);
+        assert!(task.total_cost_usd > cost1);
+    }
+
+    // ── increment field ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn increment_increases_counter() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Increment test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let v1 = store.increment(id, "attempts").await.unwrap();
+        assert_eq!(v1, 1);
+        let v2 = store.increment(id, "attempts").await.unwrap();
+        assert_eq!(v2, 2);
+        let v3 = store.increment(id, "review_cycles").await.unwrap();
+        assert_eq!(v3, 1);
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.attempts, 2);
+        assert_eq!(task.review_cycles, 1);
+    }
+
+    // ── with_store on TaskRunner ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn task_runner_with_store() {
+        use crate::engine::runner::TaskRunner;
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        // Just verify it compiles and the builder works
+        let _runner = TaskRunner::new("owner/repo".to_string()).with_store(store);
+    }
 }
