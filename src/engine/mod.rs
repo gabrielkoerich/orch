@@ -245,7 +245,11 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         ));
 
         // Task runner (with db for metrics)
-        let runner = Arc::new(runner::TaskRunner::new(repo.clone()).with_db(db.clone()));
+        let runner = Arc::new(
+            runner::TaskRunner::new(repo.clone())
+                .with_db(db.clone())
+                .with_store(store.clone()),
+        );
 
         engines.push(ProjectEngine {
             repo,

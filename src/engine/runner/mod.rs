@@ -47,6 +47,8 @@ pub struct TaskRunner {
     orch_home: PathBuf,
     /// Database for storing metrics
     db: Option<Arc<Db>>,
+    /// Unified task store for run audit trail
+    store: Option<Arc<crate::store::TaskStore>>,
 }
 
 impl TaskRunner {
@@ -58,12 +60,19 @@ impl TaskRunner {
             repo,
             orch_home,
             db: None,
+            store: None,
         }
     }
 
     /// Set the database reference for metrics recording.
     pub fn with_db(mut self, db: Arc<Db>) -> Self {
         self.db = Some(db);
+        self
+    }
+
+    /// Set the unified task store for run audit trail.
+    pub fn with_store(mut self, store: Arc<crate::store::TaskStore>) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -388,6 +397,33 @@ impl TaskRunner {
             ],
         )?;
 
+        // Record run start in task_runs audit trail
+        let run_audit_id = if let Some(ref store) = self.store {
+            let attempt: i32 = sidecar::get(task_id, "attempts")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+                + 1;
+            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, task_id).await {
+                store
+                    .start_run(&crate::store::StartRun {
+                        task_id: store_id,
+                        attempt,
+                        run_type: "agent",
+                        agent: &agent_name,
+                        model: model.unwrap_or(""),
+                        command: &format!("{} --model {}", agent_name, model.unwrap_or("default")),
+                        prompt: &task.body,
+                    })
+                    .await
+                    .ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Run the task
         let run_status = self.run(task_id, agent, model, Some(&**backend)).await?;
 
@@ -456,6 +492,38 @@ impl TaskRunner {
                 },
             )
             .await;
+        }
+
+        // Complete run in task_runs audit trail
+        if let Some(run_id) = run_audit_id {
+            if let Some(ref store) = self.store {
+                let duration = (Utc::now() - started_at).num_milliseconds() as f64 / 1000.0;
+                let usage = sidecar::get_token_usage(task_id);
+                let outcome = if status == "done" || status == "in_progress" {
+                    "success"
+                } else if is_rate_limited {
+                    "rate_limit"
+                } else {
+                    "failed"
+                };
+                let _ = store
+                    .complete_run(&crate::store::CompleteRun {
+                        run_id,
+                        exit_code: None, // TODO: capture from runner
+                        stdout: &summary,
+                        stderr: "",
+                        parsed: "",
+                        outcome,
+                        error: &last_error,
+                        tokens: crate::store::RunTokenUsage {
+                            input_tokens: usage.input_tokens as i64,
+                            output_tokens: usage.output_tokens as i64,
+                            total_cost_usd: 0.0, // computed by store
+                            duration_secs: duration,
+                        },
+                    })
+                    .await;
+            }
         }
 
         // If task was rerouted (status=new after run), update GitHub agent label
