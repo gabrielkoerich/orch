@@ -7,8 +7,6 @@
 //! 4. Determines next action (success, reroute, needs_review)
 
 use crate::store::TaskStore;
-use fs2::FileExt; // for try_lock_exclusive / unlock
-use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -96,14 +94,22 @@ const AGENT_COOLDOWN_SECS: i64 = 30 * 60;
 /// model-specific rate limit), we ban that combo for longer.
 const MODEL_COOLDOWN_SECS: i64 = 60 * 60;
 
-/// Path to the agent cooldowns file.
-fn cooldowns_path() -> std::path::PathBuf {
-    crate::home::state_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-        .join("agent_cooldowns.json")
+/// In-memory cooldown entry. The orchestrator is a single process, so
+/// cross-process file locking (fs2) is unnecessary. Cooldowns are short-lived
+/// (30-60 min) so losing them on restart is acceptable.
+struct CooldownEntry {
+    failed_at: i64,
+    #[allow(dead_code)]
+    reason: String,
 }
 
-// Expose lockable file operations to tests or other modules if needed
+/// Global in-memory cooldown map, protected by a Mutex.
+fn cooldowns() -> &'static std::sync::Mutex<std::collections::HashMap<String, CooldownEntry>> {
+    use std::sync::Mutex;
+    static COOLDOWNS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, CooldownEntry>>> =
+        std::sync::OnceLock::new();
+    COOLDOWNS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
 
 /// Record that an agent has failed and should be temporarily avoided.
 pub fn record_agent_failure(agent_name: &str) {
@@ -132,145 +138,37 @@ pub fn is_agent_in_cooldown(agent_name: &str) -> bool {
 
 /// Shared helper: check if a given key is in cooldown within `max_age_secs`.
 fn is_key_in_cooldown(key: &str, max_age_secs: i64) -> bool {
-    let cooldowns = read_cooldowns_file();
-    if let Some(entry) = cooldowns.get(key) {
-        if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
-            let now = chrono::Utc::now().timestamp();
-            return (now - failed_at) < max_age_secs;
-        }
+    let map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = map.get(key) {
+        let now = chrono::Utc::now().timestamp();
+        return (now - entry.failed_at) < max_age_secs;
     }
     false
 }
 
-/// Read and parse the cooldowns JSON file. Returns empty map on any error.
-fn read_cooldowns_file() -> serde_json::Map<String, serde_json::Value> {
-    let path = cooldowns_path();
-    if !path.exists() {
-        return serde_json::Map::new();
-    }
-    // Read without locking; callers use locking where needed
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    serde_json::from_str(&content).unwrap_or_default()
-}
-
 fn record_failure_with_reason(key: &str, reason: &str) {
-    let path = cooldowns_path();
-    // Ensure the directory exists
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    // Use an advisory file lock to guard read-modify-write across processes.
-    // fs2 provides a simple cross-platform lock via File::try_lock_exclusive().
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-    {
-        // Use blocking lock to avoid race conditions (try_lock + fallback is unsafe)
-        if f.lock_exclusive().is_ok() {
-            let mut cooldowns = serde_json::Map::new();
-            // Read existing content
-            let mut content = String::new();
-            if f.read_to_string(&mut content).is_ok() && !content.is_empty() {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(map) = v.as_object() {
-                        cooldowns = map.clone();
-                    }
-                }
-            }
-
-            // Record failure with current timestamp
-            let timestamp = chrono::Utc::now().timestamp();
-            cooldowns.insert(
-                key.to_string(),
-                serde_json::json!({ "failed_at": timestamp, "reason": reason }),
-            );
-
-            if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns))
-            {
-                // Truncate then write
-                let _ = f.set_len(0);
-                let _ = f.rewind();
-                let _ = f.write_all(content.as_bytes());
-            }
-
-            let _ = f.unlock();
-        } else {
-            tracing::warn!("could not acquire lock on cooldowns file, skipping write");
-        }
-    } else {
-        // Can't open file — write directly
-        let mut cooldowns = read_cooldowns_file();
-        let timestamp = chrono::Utc::now().timestamp();
-        cooldowns.insert(
-            key.to_string(),
-            serde_json::json!({ "failed_at": timestamp, "reason": reason }),
-        );
-        if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns)) {
-            std::fs::write(&path, content).ok();
-        }
-    }
+    let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(
+        key.to_string(),
+        CooldownEntry {
+            failed_at: chrono::Utc::now().timestamp(),
+            reason: reason.to_string(),
+        },
+    );
 }
 
-/// Clear expired cooldowns from the file.
+/// Clear expired cooldowns from the in-memory map.
 pub fn clear_expired_cooldowns() {
-    let path = cooldowns_path();
-    if !path.exists() {
-        return;
-    }
-
-    // Use same file-locking strategy as record_failure_with_reason
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-    {
-        // Use blocking lock to avoid race conditions
-        if f.lock_exclusive().is_ok() {
-            let mut content = String::new();
-            if f.read_to_string(&mut content).is_ok() {
-                let mut cooldowns = if !content.is_empty() {
-                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&content)
-                        .unwrap_or_default()
-                } else {
-                    serde_json::Map::new()
-                };
-
-                let now = chrono::Utc::now().timestamp();
-                let mut to_remove = Vec::new();
-                for (agent, entry) in &cooldowns {
-                    if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
-                        let timeout = if agent.contains(':') {
-                            MODEL_COOLDOWN_SECS
-                        } else {
-                            AGENT_COOLDOWN_SECS
-                        };
-                        if (now - failed_at) >= timeout {
-                            to_remove.push(agent.clone());
-                        }
-                    }
-                }
-                for agent in to_remove {
-                    cooldowns.remove(&agent);
-                }
-
-                if let Ok(content) =
-                    serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns))
-                {
-                    let _ = f.set_len(0);
-                    let _ = f.rewind();
-                    let _ = f.write_all(content.as_bytes());
-                }
-            }
-
-            let _ = f.unlock();
+    let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    let now = chrono::Utc::now().timestamp();
+    map.retain(|key, entry| {
+        let timeout = if key.contains(':') {
+            MODEL_COOLDOWN_SECS
         } else {
-            tracing::warn!("could not acquire lock on cooldowns file, skipping cleanup");
-        }
-    }
+            AGENT_COOLDOWN_SECS
+        };
+        (now - entry.failed_at) < timeout
+    });
 }
 
 /// Pick a fallback agent, avoiding agents already in the reroute chain and agents in cooldown.
@@ -740,7 +638,38 @@ mod tests {
         assert!(patterns::detect_missing_tool("").is_none());
     }
 
-    // Use fake agent names so real cooldowns on disk don't affect tests.
+    // ── Cooldown tests ────────────────────────────────────────────
+
+    #[test]
+    fn record_and_check_agent_cooldown() {
+        // Use unique names to avoid interference from other tests
+        let agent = "test_cooldown_agent_1";
+        assert!(!is_agent_in_cooldown(agent));
+        record_agent_failure(agent);
+        assert!(is_agent_in_cooldown(agent));
+    }
+
+    #[test]
+    fn record_and_check_model_cooldown() {
+        let agent = "test_cooldown_agent_2";
+        let model = "test_model_x";
+        assert!(!is_model_in_cooldown(agent, model));
+        record_model_failure(agent, model);
+        assert!(is_model_in_cooldown(agent, model));
+        // Different model should not be in cooldown
+        assert!(!is_model_in_cooldown(agent, "other_model"));
+    }
+
+    #[test]
+    fn clear_expired_does_not_remove_fresh_entries() {
+        let agent = "test_cooldown_agent_3";
+        record_agent_failure(agent);
+        clear_expired_cooldowns();
+        // Should still be in cooldown (just recorded)
+        assert!(is_agent_in_cooldown(agent));
+    }
+
+    // Use fake agent names so other tests don't interfere.
     #[test]
     fn pick_fallback_skips_current_agent() {
         let available = vec!["test_agent_a".to_string(), "test_agent_b".to_string()];
