@@ -426,8 +426,8 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
     )
     .await?;
 
-    // Run via TaskRunner
-    let runner = TaskRunner::new(repo);
+    // Run via TaskRunner (with store for audit trail + token tracking)
+    let runner = TaskRunner::new(repo).with_store(store);
     runner
         .run(
             &task_id,

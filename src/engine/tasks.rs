@@ -976,12 +976,8 @@ mod tests {
         let db = Arc::new(crate::db::Db::open_memory().unwrap());
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
-        let tm = TaskManager::with_store(
-            db,
-            backend.clone(),
-            store.clone(),
-            "owner/repo".to_string(),
-        );
+        let tm =
+            TaskManager::with_store(db, backend.clone(), store.clone(), "owner/repo".to_string());
 
         // Upsert an external task
         let store_id = store
@@ -1015,12 +1011,8 @@ mod tests {
         let db = Arc::new(crate::db::Db::open_memory().unwrap());
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
-        let tm = TaskManager::with_store(
-            db,
-            backend.clone(),
-            store.clone(),
-            "owner/repo".to_string(),
-        );
+        let tm =
+            TaskManager::with_store(db, backend.clone(), store.clone(), "owner/repo".to_string());
 
         // Create an internal task
         let store_id = store

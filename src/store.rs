@@ -5062,6 +5062,46 @@ mod tests {
         assert!((groups[0].total_cost_usd - 0.30).abs() < 0.001);
     }
 
+    #[tokio::test]
+    async fn cost_by_model_groups_correctly() {
+        use chrono::Utc;
+        let store = TaskStore::open_memory().await.unwrap();
+        let now = Utc::now();
+
+        for (model, cost) in &[("sonnet", 0.05), ("opus", 0.15), ("sonnet", 0.10)] {
+            store
+                .insert_task_metric(&crate::db::InsertTaskMetric {
+                    task_id: "1",
+                    agent: "claude",
+                    model: Some(model),
+                    complexity: None,
+                    outcome: "success",
+                    duration_seconds: 10.0,
+                    started_at: &now,
+                    completed_at: &now,
+                    attempts: 1,
+                    files_changed: 0,
+                    error_type: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    input_cost_usd: None,
+                    output_cost_usd: None,
+                    total_cost_usd: Some(*cost),
+                })
+                .await
+                .unwrap();
+        }
+
+        let groups = store.get_cost_by_model().await.unwrap();
+        assert_eq!(groups.len(), 2);
+        // sonnet should be first (higher total cost: 0.15)
+        assert_eq!(groups[0].name, "sonnet");
+        assert_eq!(groups[0].task_count, 2);
+        assert!((groups[0].total_cost_usd - 0.15).abs() < 0.001);
+        assert_eq!(groups[1].name, "opus");
+        assert_eq!(groups[1].task_count, 1);
+    }
+
     // ── Rate Limits ─────────────────────────────────────────────────
 
     #[tokio::test]
