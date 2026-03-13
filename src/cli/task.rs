@@ -302,7 +302,7 @@ pub async fn route(id: i64) -> anyhow::Result<()> {
     let ext_id = ExternalId(id.to_string());
     let task = backend.get_task(&ext_id).await?;
 
-    let router = Router::from_config();
+    let mut router = Router::from_config();
     let result = router.route(&task).await?;
 
     // Store in sidecar

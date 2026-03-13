@@ -859,7 +859,7 @@ pub(crate) async fn review_and_merge(
         .await
         .unwrap_or_default();
     let review_agent = {
-        let r = router.read().await;
+        let mut r = router.write().await;
         let exclude = if task_agent.is_empty() {
             None
         } else {

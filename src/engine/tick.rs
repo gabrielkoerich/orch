@@ -219,7 +219,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
 pub(crate) async fn tick_route_tasks(
     backend: &Arc<dyn ExternalBackend>,
     task_manager: &Arc<TaskManager>,
-    router: &Router,
+    router: &mut Router,
     store: &Arc<TaskStore>,
     repo: &str,
 ) -> anyhow::Result<()> {
@@ -835,7 +835,7 @@ pub(crate) async fn tick(
     config: &EngineConfig,
     jobs_path: &std::path::PathBuf,
     db: &Arc<Db>,
-    router: &Router,
+    router: &mut Router,
     router_arc: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,

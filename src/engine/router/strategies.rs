@@ -91,19 +91,14 @@ pub(super) fn route_via_round_robin_stateful(
     agents: &[String],
     config: &RouterConfig,
     task: &ExternalTask,
+    rr_index: &mut usize,
+    last_agent: &mut Option<String>,
 ) -> anyhow::Result<RouteResult> {
     if agents.is_empty() {
         anyhow::bail!("no agent CLIs found in PATH");
     }
 
-    let current_idx: usize = crate::sidecar::get("_router", "rr_index")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    let last_agent = crate::sidecar::get("_router", "last_agent").ok();
-
-    let mut agent_idx = current_idx % agents.len();
+    let mut agent_idx = *rr_index % agents.len();
     if agents.len() > 1 {
         if let Some(ref last) = last_agent {
             if agents.get(agent_idx).map(|a| a.as_str()) == Some(last.as_str()) {
@@ -114,16 +109,8 @@ pub(super) fn route_via_round_robin_stateful(
 
     let agent = agents[agent_idx].clone();
 
-    let next_idx = (agent_idx + 1) % agents.len();
-    if let Err(e) = crate::sidecar::set(
-        "_router",
-        &[
-            format!("rr_index={}", next_idx),
-            format!("last_agent={}", agent),
-        ],
-    ) {
-        tracing::warn!(error = ?e, "failed to persist round-robin state");
-    }
+    *rr_index = (agent_idx + 1) % agents.len();
+    *last_agent = Some(agent.clone());
 
     let complexity = extract_complexity_from_labels(&task.labels);
     let model = config.model_for_complexity(&agent, &complexity);
@@ -159,6 +146,7 @@ pub(super) fn route_via_weighted_round_robin(
     weights: &AgentWeights,
     config: &RouterConfig,
     task: &ExternalTask,
+    last_agent: &mut Option<String>,
 ) -> anyhow::Result<RouteResult> {
     if agents.is_empty() {
         anyhow::bail!("no agent CLIs found in PATH");
@@ -186,7 +174,7 @@ pub(super) fn route_via_weighted_round_robin(
         constraints: vec![],
     };
 
-    let _ = crate::sidecar::set("_router", &[format!("last_agent={}", agent)]);
+    *last_agent = Some(agent.clone());
 
     let reason = format!(
         "weighted_round_robin (weight={weight:.2}, weights=[{}])",

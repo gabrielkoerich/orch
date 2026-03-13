@@ -68,6 +68,12 @@ pub struct Router {
     pub weights: AgentWeights,
     /// LLM routing subsystem
     llm_router: LlmRouter,
+    /// Round-robin index for task routing
+    pub(crate) rr_index: usize,
+    /// Last agent routed to (for distribution tracking)
+    pub(crate) last_agent: Option<String>,
+    /// Round-robin index for review agent selection
+    pub(crate) review_rr_index: usize,
 }
 
 impl Router {
@@ -81,6 +87,9 @@ impl Router {
             available_agents,
             weights,
             llm_router: LlmRouter::new(),
+            rr_index: 0,
+            last_agent: None,
+            review_rr_index: 0,
         }
     }
 
@@ -130,14 +139,11 @@ impl Router {
     /// Pick next agent via round-robin (for review or other non-task routing).
     /// Pick the next review agent, optionally excluding one (e.g. the task's original agent).
     /// Falls back to the excluded agent only if it's the only one available.
-    pub fn next_round_robin_agent(&self, exclude: Option<&str>) -> Option<String> {
+    pub fn next_round_robin_agent(&mut self, exclude: Option<&str>) -> Option<String> {
         if self.available_agents.is_empty() {
             return None;
         }
-        let idx: usize = crate::sidecar::get("_review_rr", "index")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let idx = self.review_rr_index;
 
         // Try to find an agent that isn't excluded and isn't in cooldown
         let n = self.available_agents.len();
@@ -157,8 +163,7 @@ impl Router {
             })
             .or_else(|| self.available_agents.get(idx % n).cloned())?;
 
-        let next = (idx + 1) % n;
-        let _ = crate::sidecar::set("_review_rr", &[format!("index={next}")]);
+        self.review_rr_index = (idx + 1) % n;
         Some(agent)
     }
 
@@ -170,7 +175,7 @@ impl Router {
     /// 3. If round_robin mode, cycle through agents (stateful)
     /// 4. Call LLM classifier for intelligent routing
     /// 5. After max_route_attempts LLM failures, fall back to round-robin
-    pub async fn route(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
+    pub async fn route(&mut self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         // 1. Check for explicit agent label
         if let Some(agent) =
             strategies::extract_agent_from_labels(&self.config.agents, &task.labels)
@@ -205,6 +210,7 @@ impl Router {
                 &self.weights,
                 &self.config,
                 task,
+                &mut self.last_agent,
             );
         }
 
@@ -215,6 +221,8 @@ impl Router {
                 &self.available_agents,
                 &self.config,
                 task,
+                &mut self.rr_index,
+                &mut self.last_agent,
             );
         }
 
@@ -232,6 +240,8 @@ impl Router {
                 &self.available_agents,
                 &self.config,
                 task,
+                &mut self.rr_index,
+                &mut self.last_agent,
             );
         }
 
@@ -267,6 +277,8 @@ impl Router {
                         &self.available_agents,
                         &self.config,
                         task,
+                        &mut self.rr_index,
+                        &mut self.last_agent,
                     )
                 } else {
                     strategies::route_via_fallback(&self.available_agents, &self.config, task)
@@ -289,9 +301,14 @@ impl Router {
     }
 
     /// Route using LLM classification. Delegates to `self.llm_router`.
-    async fn route_with_llm(&self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
+    async fn route_with_llm(&mut self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
         self.llm_router
-            .route_with_llm(task, &self.available_agents, &self.config)
+            .route_with_llm(
+                task,
+                &self.available_agents,
+                &self.config,
+                &mut self.last_agent,
+            )
             .await
     }
 
@@ -800,6 +817,9 @@ Hope that helps!"#;
             available_agents: agents,
             weights,
             llm_router: LlmRouter::new(),
+            rr_index: 0,
+            last_agent: None,
+            review_rr_index: 0,
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -818,11 +838,14 @@ Hope that helps!"#;
         let agents = vec!["claude".to_string(), "codex".to_string()];
         let mut weights = AgentWeights::default();
         weights.ensure_agents(&agents);
-        let router = Router {
+        let mut router = Router {
             config,
             available_agents: agents,
             weights,
             llm_router: LlmRouter::new(),
+            rr_index: 0,
+            last_agent: None,
+            review_rr_index: 0,
         };
 
         let task = create_test_task("1", "Test", vec!["agent:claude".to_string()]);
@@ -873,6 +896,9 @@ Hope that helps!"#;
             available_agents: agents,
             weights,
             llm_router: LlmRouter::new(),
+            rr_index: 0,
+            last_agent: None,
+            review_rr_index: 0,
         };
 
         // Reload — should re-read config and remain valid
@@ -1147,11 +1173,14 @@ Hope that helps!"#;
         let agents = vec!["claude".to_string(), "codex".to_string()];
         let mut weights = AgentWeights::default();
         weights.ensure_agents(&agents);
-        let router = Router {
+        let mut router = Router {
             config,
             available_agents: agents,
             weights,
             llm_router: LlmRouter::new(),
+            rr_index: 0,
+            last_agent: None,
+            review_rr_index: 0,
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -1176,11 +1205,14 @@ Hope that helps!"#;
         let agents = vec!["claude".to_string(), "codex".to_string()];
         let mut weights = AgentWeights::default();
         weights.ensure_agents(&agents);
-        let router = Router {
+        let mut router = Router {
             config,
             available_agents: agents,
             weights,
             llm_router: LlmRouter::new(),
+            rr_index: 0,
+            last_agent: None,
+            review_rr_index: 0,
         };
 
         // Label override should take precedence over weighted routing

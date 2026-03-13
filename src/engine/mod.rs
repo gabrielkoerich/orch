@@ -835,7 +835,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     );
                 } else {
                     // Core tick: poll tasks for all projects
-                    let router_guard = router.read().await;
+                    let mut router_guard = router.write().await;
                     for engine in &project_engines {
                         let repo = engine.repo.clone();
                         REPO_CONTEXT.scope(repo, async {
@@ -849,7 +849,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &config,
                                 &jobs_path,
                                 &db,
-                                &router_guard,
+                                &mut router_guard,
                                 &router,
                                 &engine.task_manager,
                                 &weight_tx,
@@ -926,7 +926,7 @@ pub async fn serve() -> anyhow::Result<()> {
                 } else {
                     tracing::info!("webhook event triggered immediate tick");
 
-                    let router_guard = router.read().await;
+                    let mut router_guard = router.write().await;
                     for engine in &project_engines {
                         let repo = engine.repo.clone();
                         REPO_CONTEXT.scope(repo, async {
@@ -940,7 +940,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &config,
                                 &jobs_path,
                                 &db,
-                                &router_guard,
+                                &mut router_guard,
                                 &router,
                                 &engine.task_manager,
                                 &weight_tx,
