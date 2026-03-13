@@ -24,10 +24,8 @@ use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
-use super::review::{review_and_merge, ReviewDecision};
+use super::review::{review_and_merge, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
 use super::EngineConfig;
-
-const MAX_REVIEW_AGENT_FAILURES: u64 = 3;
 
 /// Phase 1 of tick: poll tmux for finished sessions and clean them up.
 pub(crate) async fn tick_check_session_completions(
@@ -595,9 +593,15 @@ pub(crate) async fn tick_dispatch_tasks(
                                                 }
                                             }
                                             Ok(_) => {
+                                                // Reset all review-cycle failure counters on success
+                                                // so a subsequent retry doesn't inherit stale values.
                                                 let _ = sidecar::set(
                                                     &task_id_for_review,
-                                                    &["review_agent_failures=0".to_string()],
+                                                    &[
+                                                        "review_agent_failures=0".to_string(),
+                                                        "merge_conflict_retries=0".to_string(),
+                                                        "pr_create_failures=0".to_string(),
+                                                    ],
                                                 );
                                             } // Approve or RequestChanges handled inside
                                         }

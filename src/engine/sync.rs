@@ -23,10 +23,8 @@ use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
-use super::review::{review_and_merge, review_open_prs, ReviewDecision};
+use super::review::{review_and_merge, review_open_prs, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
 use super::EngineConfig;
-
-const MAX_REVIEW_AGENT_FAILURES: u64 = 3;
 
 /// Sync tick — runs every 45s.
 ///

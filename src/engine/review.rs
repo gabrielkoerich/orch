@@ -14,6 +14,11 @@ const MAX_MERGE_CONFLICT_RETRIES: u64 = 3;
 /// the task is blocked for human intervention instead of re-entering NeedsReview.
 const MAX_CI_MERGE_FAILURES: u64 = 3;
 
+/// Maximum number of consecutive review agent failures before the task is blocked
+/// for human intervention. Exported so `tick` and `sync` use the same threshold
+/// without duplicating the constant.
+pub(crate) const MAX_REVIEW_AGENT_FAILURES: u64 = 3;
+
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::config;
 use crate::engine::runner;
