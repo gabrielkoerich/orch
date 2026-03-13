@@ -1113,9 +1113,7 @@ impl GhHttp {
 
         let result = self.graphql(&query).await?;
 
-        // Repository ID fetched but not directly needed for createLinkedBranch mutation
-        // when using branchName with the issue context
-        let _repo_id = result
+        let repo_id = result
             .pointer("/data/repository/id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("failed to get repository node ID"))?;
@@ -1125,13 +1123,14 @@ impl GhHttp {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("failed to get issue node ID"))?;
 
-        // Check if a branch with this name already exists
+        // Fetch branch ref to get the commit OID required by createLinkedBranch
         let branch_query = format!(
             r#"{{
                 repository(owner: "{}", name: "{}") {{
                     ref(qualifiedName: "refs/heads/{}") {{
-                        id
-                        name
+                        target {{
+                            oid
+                        }}
                     }}
                 }}
             }}"#,
@@ -1139,30 +1138,35 @@ impl GhHttp {
         );
 
         let branch_result = self.graphql(&branch_query).await?;
-        let branch_id = branch_result
-            .pointer("/data/repository/ref/id")
+        let branch_oid = branch_result
+            .pointer("/data/repository/ref/target/oid")
             .and_then(|v| v.as_str());
 
         // If branch doesn't exist yet, we can't link it - this is fine for new PRs
         // where the branch was just pushed
-        if branch_id.is_none() {
-            tracing::debug!(
-                repo,
-                issue_number,
-                branch,
-                "branch not found for linking, may not be pushed yet"
-            );
-            // Return a placeholder - the link will be created when the PR is opened
-            return Ok(format!("unlinked:{}", branch));
-        }
+        let branch_oid = match branch_oid {
+            Some(oid) => oid.to_string(),
+            None => {
+                tracing::debug!(
+                    repo,
+                    issue_number,
+                    branch,
+                    "branch not found for linking, may not be pushed yet"
+                );
+                // Return a placeholder - the link will be created when the PR is opened
+                return Ok(format!("unlinked:{}", branch));
+            }
+        };
 
-        // Use createLinkedBranch mutation to link the issue to the branch
-        let branch_name_arg = format!(r#"branchName: "{}""#, branch);
+        // Use createLinkedBranch mutation to link the issue to the existing branch.
+        // Required fields: issueId, repositoryId, name (branch name), oid (commit SHA).
         let mutation = format!(
             r#"mutation {{
                 createLinkedBranch(input: {{
-                    issueId: "{}"
-                    {}
+                    issueId: "{issue_id}"
+                    repositoryId: "{repo_id}"
+                    name: "{branch}"
+                    oid: "{branch_oid}"
                 }}) {{
                     linkedBranch {{
                         id
@@ -1172,7 +1176,10 @@ impl GhHttp {
                     }}
                 }}
             }}"#,
-            issue_id, branch_name_arg
+            issue_id = issue_id,
+            repo_id = repo_id,
+            branch = branch,
+            branch_oid = branch_oid,
         );
 
         let link_result = self.graphql(&mutation).await;
