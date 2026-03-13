@@ -7,7 +7,28 @@
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::db::Db;
 use crate::github::http::GhHttp;
+use crate::store::TaskStore;
 use std::sync::Arc;
+
+/// Read a KV value, preferring the store (sqlx) over the old db (rusqlite).
+async fn kv_get(store: &Option<Arc<TaskStore>>, db: &Arc<Db>, key: &str) -> Option<String> {
+    if let Some(ref s) = store {
+        if let Ok(v) = s.kv_get(key).await {
+            return v;
+        }
+    }
+    db.kv_get(key).await.ok().flatten()
+}
+
+/// Write a KV value, preferring the store (sqlx) over the old db (rusqlite).
+async fn kv_set(store: &Option<Arc<TaskStore>>, db: &Arc<Db>, key: &str, value: &str) {
+    if let Some(ref s) = store {
+        if s.kv_set(key, value).await.is_ok() {
+            return;
+        }
+    }
+    db.kv_set(key, value).await.ok();
+}
 
 /// Parsed owner command from an issue comment.
 #[derive(Debug, Clone, PartialEq)]
@@ -108,9 +129,9 @@ pub async fn scan_commands(
 
     // Use persisted cursor, fall back to 24h ago
     let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-    let since_str = match db.kv_get("owner_commands_last_checked").await {
-        Ok(Some(ts)) => ts,
-        _ => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    let since_str = match kv_get(store, db, "owner_commands_last_checked").await {
+        Some(ts) => ts,
+        None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
 
     // Fetch recent comments (same endpoint as mentions)
@@ -125,15 +146,15 @@ pub async fn scan_commands(
     if comments.is_empty() {
         // Still advance cursor even if no comments
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        db.kv_set("owner_commands_last_checked", &now).await.ok();
+        kv_set(store, db, "owner_commands_last_checked", &now).await;
         return Ok(());
     }
 
     // Build dedup set from already-processed command comment IDs.
     // We store processed IDs in KV to survive restarts within the cursor window.
     let processed_ids: std::collections::HashSet<String> =
-        match db.kv_get("owner_commands_processed_ids").await {
-            Ok(Some(ids)) if !ids.is_empty() => ids.split(',').map(String::from).collect(),
+        match kv_get(store, db, "owner_commands_processed_ids").await {
+            Some(ids) if !ids.is_empty() => ids.split(',').map(String::from).collect(),
             _ => std::collections::HashSet::new(),
         };
 
@@ -261,16 +282,12 @@ pub async fn scan_commands(
         if all.len() > 500 {
             all = all.split_off(all.len() - 500);
         }
-        db.kv_set("owner_commands_processed_ids", &all.join(","))
-            .await
-            .ok();
+        kv_set(store, db, "owner_commands_processed_ids", &all.join(",")).await;
     }
 
     // Advance cursor
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    if let Err(e) = db.kv_set("owner_commands_last_checked", &now).await {
-        tracing::warn!(err = %e, "failed to persist owner commands cursor");
-    }
+    kv_set(store, db, "owner_commands_last_checked", &now).await;
 
     Ok(())
 }
@@ -293,7 +310,7 @@ pub async fn execute_command(
                     backend.remove_label(task_id, label).await.ok();
                 }
             }
-            // Reset sidecar + store state (attempts + all failure counters) so the task starts fresh
+            // Reset store state (attempts + all failure counters) so the task starts fresh
             crate::engine::cleanup::store_reset_counters(store, repo, &task_id.0).await;
             backend.update_status(task_id, Status::New).await?;
             Ok("`/retry` — reset attempts, cleared agent, reset to `status:new`".to_string())
@@ -307,7 +324,7 @@ pub async fn execute_command(
                     backend.remove_label(task_id, label).await.ok();
                 }
             }
-            // Reset sidecar + store state (attempts + all failure counters) so the task starts fresh
+            // Reset store state (attempts + all failure counters) so the task starts fresh
             crate::engine::cleanup::store_reset_counters(store, repo, &task_id.0).await;
             // Optionally set new agent
             if let Some(agent_name) = agent {

@@ -75,7 +75,7 @@ impl TaskRunner {
         self
     }
 
-    /// Read a field from the store first, falling back to sidecar.
+    /// Read a field from the task store.
     async fn get_field(&self, task_id: &str, field: &str) -> Option<String> {
         crate::engine::cleanup::opt_store_get_field(&self.store, &self.repo, task_id, field).await
     }
@@ -238,7 +238,7 @@ impl TaskRunner {
                 )
                 .await?;
                 if budget_exceeded {
-                    // Token budget exceeded — sidecar already updated, return without
+                    // Token budget exceeded — store already updated, return without
                     // tmux cleanup or metrics (preserves original behavior)
                     return Ok(Some(status));
                 }
@@ -328,7 +328,7 @@ impl TaskRunner {
                 Some(outcome.to_string())
             };
 
-            // Read cost data from store/sidecar
+            // Read cost data from store
             let usage =
                 crate::engine::cleanup::get_token_usage(&self.store, &self.repo, task_id).await;
             let cost =
@@ -378,7 +378,12 @@ impl TaskRunner {
                 total_cost_usd: total_cost,
             };
 
-            if let Err(e) = db.insert_task_metric(metric).await {
+            // Write to store (sqlx) if available, otherwise fall back to rusqlite db
+            if let Some(ref store) = self.store {
+                if let Err(e) = store.insert_task_metric(&metric).await {
+                    tracing::error!(task_id, ?e, "failed to record task metrics (store)");
+                }
+            } else if let Err(e) = db.insert_task_metric(metric).await {
                 tracing::error!(task_id, ?e, "failed to record task metrics");
             }
         }
@@ -403,7 +408,7 @@ impl TaskRunner {
         // Record start time for metrics (before any work begins)
         let started_at = Utc::now();
 
-        // Store task info in sidecar for prompt building
+        // Store task info for prompt building
         crate::engine::cleanup::store_set(
             &self.store,
             &self.repo,

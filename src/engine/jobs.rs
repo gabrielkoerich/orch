@@ -401,7 +401,7 @@ pub async fn tick(
             }
             "self-review" => {
                 // Analyze metrics and create self-improvement issues
-                match run_self_review(db, backend).await {
+                match run_self_review(db, backend, store).await {
                     Ok(issues_created) => {
                         tracing::info!(job_id = job.id, issues_created, "self-review completed");
                         job.last_task_status = Some(if issues_created > 0 {
@@ -430,11 +430,19 @@ pub async fn tick(
 }
 
 /// Run the self-review job: analyze metrics and create improvement issues.
-async fn run_self_review(db: &Arc<Db>, backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<i64> {
+async fn run_self_review(
+    db: &Arc<Db>,
+    backend: &Arc<dyn ExternalBackend>,
+    store: Option<&Arc<crate::store::TaskStore>>,
+) -> anyhow::Result<i64> {
     let mut issues_created: i64 = 0;
 
-    // Check rate limit
-    let current_count = db.count_self_improvement_issues_7d().await?;
+    // Check rate limit — prefer store over old db
+    let current_count = if let Some(s) = store {
+        s.count_self_improvement_issues_7d().await?
+    } else {
+        db.count_self_improvement_issues_7d().await?
+    };
     if current_count >= MAX_SELF_IMPROVEMENT_ISSUES_PER_WEEK {
         tracing::info!(
             current_count,
@@ -444,10 +452,20 @@ async fn run_self_review(db: &Arc<Db>, backend: &Arc<dyn ExternalBackend>) -> an
         return Ok(0);
     }
 
-    // Gather metrics data
-    let summary = db.get_metrics_summary_24h().await?;
-    let slow_tasks = db.get_slow_tasks_7d().await?;
-    let error_distribution = db.get_error_distribution_7d().await?;
+    // Gather metrics data — prefer store over old db
+    let (summary, slow_tasks, error_distribution) = if let Some(s) = store {
+        (
+            s.get_metrics_summary_24h().await?,
+            s.get_slow_tasks_7d().await?,
+            s.get_error_distribution_7d().await?,
+        )
+    } else {
+        (
+            db.get_metrics_summary_24h().await?,
+            db.get_slow_tasks_7d().await?,
+            db.get_error_distribution_7d().await?,
+        )
+    };
 
     // Analyze and create issues for each pattern
     let remaining_slots = MAX_SELF_IMPROVEMENT_ISSUES_PER_WEEK - current_count;
@@ -459,7 +477,11 @@ async fn run_self_review(db: &Arc<Db>, backend: &Arc<dyn ExternalBackend>) -> an
                 .await
                 .is_ok()
             {
-                db.increment_self_improvement_counter().await?;
+                if let Some(s) = store {
+                    s.increment_self_improvement_counter().await?;
+                } else {
+                    db.increment_self_improvement_counter().await?;
+                }
                 issues_created += 1;
             }
         }
@@ -472,7 +494,11 @@ async fn run_self_review(db: &Arc<Db>, backend: &Arc<dyn ExternalBackend>) -> an
                 .await
                 .is_ok()
             {
-                db.increment_self_improvement_counter().await?;
+                if let Some(s) = store {
+                    s.increment_self_improvement_counter().await?;
+                } else {
+                    db.increment_self_improvement_counter().await?;
+                }
                 issues_created += 1;
             }
         }
@@ -485,7 +511,11 @@ async fn run_self_review(db: &Arc<Db>, backend: &Arc<dyn ExternalBackend>) -> an
                 .await
                 .is_ok()
             {
-                db.increment_self_improvement_counter().await?;
+                if let Some(s) = store {
+                    s.increment_self_improvement_counter().await?;
+                } else {
+                    db.increment_self_improvement_counter().await?;
+                }
                 issues_created += 1;
             }
         }

@@ -574,6 +574,7 @@ impl Db {
     }
 
     /// Get cost summary over multiple time windows (24h, 7d, 30d).
+    #[allow(dead_code)]
     pub async fn get_cost_summary(&self) -> anyhow::Result<CostSummary> {
         let conn = self.conn.lock().await;
 
@@ -606,6 +607,7 @@ impl Db {
     }
 
     /// Get cost breakdown by agent.
+    #[allow(dead_code)]
     pub async fn get_cost_by_agent(&self) -> anyhow::Result<Vec<CostByGroup>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(
@@ -634,6 +636,7 @@ impl Db {
     }
 
     /// Get cost breakdown by model.
+    #[allow(dead_code)]
     pub async fn get_cost_by_model(&self) -> anyhow::Result<Vec<CostByGroup>> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(

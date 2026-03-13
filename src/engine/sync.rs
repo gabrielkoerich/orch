@@ -16,11 +16,41 @@ use crate::db::{Db, TaskStatus};
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::repo_context::REPO_CONTEXT;
+use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
+
+/// Read a KV value, preferring the store (sqlx) over the old db (rusqlite).
+async fn kv_get_prefer_store(
+    store: &Option<&Arc<TaskStore>>,
+    db: &Arc<Db>,
+    key: &str,
+) -> Option<String> {
+    if let Some(s) = store {
+        if let Ok(v) = s.kv_get(key).await {
+            return v;
+        }
+    }
+    db.kv_get(key).await.ok().flatten()
+}
+
+/// Write a KV value, preferring the store (sqlx) over the old db (rusqlite).
+async fn kv_set_prefer_store(
+    store: &Option<&Arc<TaskStore>>,
+    db: &Arc<Db>,
+    key: &str,
+    value: &str,
+) {
+    if let Some(s) = store {
+        if s.kv_set(key, value).await.is_ok() {
+            return;
+        }
+    }
+    db.kv_set(key, value).await.ok();
+}
 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
 use super::review::{review_and_merge, review_open_prs, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
@@ -348,9 +378,9 @@ async fn scan_mentions(
 
     // Use persisted cursor if available, otherwise fall back to 24h ago
     let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-    let since_str = match db.kv_get("mentions_last_checked").await {
-        Ok(Some(ts)) => ts,
-        _ => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    let since_str = match kv_get_prefer_store(&store, db, "mentions_last_checked").await {
+        Some(ts) => ts,
+        None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
 
     let mentions = match backend.get_mentions(&since_str).await {
@@ -398,9 +428,7 @@ async fn scan_mentions(
 
     // Persist cursor so the next sync tick only fetches newer comments
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    if let Err(e) = db.kv_set("mentions_last_checked", &now).await {
-        tracing::warn!(err = %e, "failed to persist mentions cursor");
-    }
+    kv_set_prefer_store(&store, db, "mentions_last_checked", &now).await;
 
     Ok(())
 }
@@ -511,7 +539,7 @@ async fn skills_sync() -> anyhow::Result<()> {
 /// Ingest all active external tasks into the unified SQLite store.
 ///
 /// Upserts each task so the store stays in sync with the backend.
-/// Also syncs sidecar fields for each task so the store has the latest
+/// Also syncs fields for each task so the store has the latest
 /// routing, execution, and cost data. This is best-effort — individual
 /// task failures are logged and skipped.
 pub(crate) async fn ingest_external_tasks(

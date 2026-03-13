@@ -9,12 +9,23 @@
 //! Phase 1: schema + CRUD only, no behavior change. Dead code expected until wired in.
 
 use anyhow::Context;
+use chrono::{Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use std::path::Path;
 
 use crate::db::TaskStatus;
+
+/// Build the week-scoped KV key for the self-improvement counter.
+fn self_improvement_key() -> String {
+    let now = Utc::now();
+    format!(
+        "self_improvement_issues_{}_w{}",
+        now.iso_week().year(),
+        now.iso_week().week()
+    )
+}
 
 /// Token usage for an agent run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1058,6 +1069,321 @@ impl TaskStore {
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })
+    }
+
+    // ---------------------------------------------------------------
+    // KV Store
+    // ---------------------------------------------------------------
+
+    /// Get a value from the KV store.
+    pub async fn kv_get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let result: Option<(String,)> = sqlx::query_as("SELECT value FROM kv WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(result.map(|r| r.0))
+    }
+
+    /// Set a value in the KV store (upsert).
+    pub async fn kv_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO kv (key, value, updated_at) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Task Metrics
+    // ---------------------------------------------------------------
+
+    /// Insert a new task metric record. Prunes records older than 90 days.
+    pub async fn insert_task_metric(
+        &self,
+        metric: &crate::db::InsertTaskMetric<'_>,
+    ) -> anyhow::Result<i64> {
+        sqlx::query("DELETE FROM task_metrics WHERE completed_at < datetime('now', '-90 days')")
+            .execute(&self.pool)
+            .await?;
+
+        let row = sqlx::query(
+            "INSERT INTO task_metrics (task_id, agent, model, complexity, outcome, duration_seconds,
+             started_at, completed_at, attempts, files_changed, error_type,
+             input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             RETURNING id",
+        )
+        .bind(metric.task_id)
+        .bind(metric.agent)
+        .bind(metric.model)
+        .bind(metric.complexity)
+        .bind(metric.outcome)
+        .bind(metric.duration_seconds)
+        .bind(metric.started_at.to_rfc3339())
+        .bind(metric.completed_at.to_rfc3339())
+        .bind(metric.attempts)
+        .bind(metric.files_changed)
+        .bind(metric.error_type)
+        .bind(metric.input_tokens)
+        .bind(metric.output_tokens)
+        .bind(metric.input_cost_usd)
+        .bind(metric.output_cost_usd)
+        .bind(metric.total_cost_usd)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get("id"))
+    }
+
+    /// Get aggregated metrics for the last 24 hours.
+    pub async fn get_metrics_summary_24h(&self) -> anyhow::Result<crate::db::MetricsSummary> {
+        let completed: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND outcome = 'success'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let failed: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND outcome != 'success'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let avg_simple: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND complexity = 'simple'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let avg_medium: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND complexity = 'medium'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let avg_complex: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND complexity = 'complex'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let agent_rows = sqlx::query(
+            "SELECT agent, COUNT(*) as total,
+                    SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as success_count
+             FROM task_metrics
+             WHERE completed_at >= datetime('now', '-24 hours')
+             GROUP BY agent",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let agent_stats: Vec<crate::db::AgentStat> = agent_rows
+            .iter()
+            .map(|row| {
+                let total: i64 = row.get("total");
+                let success: i64 = row.get("success_count");
+                crate::db::AgentStat {
+                    agent: row.get("agent"),
+                    total_runs: total,
+                    success_count: success,
+                    success_rate: if total > 0 {
+                        (success as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                }
+            })
+            .collect();
+
+        let rate_limit_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM rate_limits WHERE occurred_at >= datetime('now', '-24 hours')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(crate::db::MetricsSummary {
+            tasks_completed_24h: completed.0,
+            tasks_failed_24h: failed.0,
+            avg_duration_simple: avg_simple.map(|r| r.0),
+            avg_duration_medium: avg_medium.map(|r| r.0),
+            avg_duration_complex: avg_complex.map(|r| r.0),
+            agent_stats,
+            rate_limits_24h: rate_limit_count.0,
+        })
+    }
+
+    /// Record a rate limit event. Prunes records older than 30 days.
+    pub async fn record_rate_limit(
+        &self,
+        agent: &str,
+        limit_type: &str,
+        task_id: Option<&str>,
+    ) -> anyhow::Result<i64> {
+        sqlx::query("DELETE FROM rate_limits WHERE occurred_at < datetime('now', '-30 days')")
+            .execute(&self.pool)
+            .await?;
+
+        let row = sqlx::query(
+            "INSERT INTO rate_limits (agent, limit_type, occurred_at, task_id)
+             VALUES (?, ?, datetime('now'), ?)
+             RETURNING id",
+        )
+        .bind(agent)
+        .bind(limit_type)
+        .bind(task_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get("id"))
+    }
+
+    /// Get slow tasks (top 10 longest running) from the last 7 days.
+    pub async fn get_slow_tasks_7d(&self) -> anyhow::Result<Vec<crate::db::SlowTaskInfo>> {
+        let rows = sqlx::query(
+            "SELECT task_id, agent, complexity, duration_seconds
+             FROM task_metrics
+             WHERE completed_at >= datetime('now', '-7 days') AND outcome = 'success'
+             ORDER BY duration_seconds DESC
+             LIMIT 10",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| crate::db::SlowTaskInfo {
+                task_id: row.get("task_id"),
+                agent: row.get("agent"),
+                complexity: row.get("complexity"),
+                duration_seconds: row.get("duration_seconds"),
+            })
+            .collect())
+    }
+
+    /// Get error type distribution from the last 7 days.
+    pub async fn get_error_distribution_7d(&self) -> anyhow::Result<Vec<crate::db::ErrorStat>> {
+        let rows = sqlx::query(
+            "SELECT error_type, COUNT(*) as count
+             FROM task_metrics
+             WHERE completed_at >= datetime('now', '-7 days')
+               AND outcome != 'success'
+               AND error_type IS NOT NULL
+             GROUP BY error_type
+             ORDER BY count DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| crate::db::ErrorStat {
+                error_type: row.get("error_type"),
+                count: row.get("count"),
+            })
+            .collect())
+    }
+
+    /// Get cost summary over multiple time windows (24h, 7d, 30d).
+    pub async fn get_cost_summary(&self) -> anyhow::Result<crate::db::CostSummary> {
+        let windows = [("24 hours", "24h"), ("7 days", "7d"), ("30 days", "30d")];
+        let mut periods = Vec::new();
+
+        for (interval, label) in &windows {
+            let query = format!(
+                "SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
+                        COALESCE(SUM(output_tokens), 0) as output_tokens,
+                        COALESCE(SUM(input_cost_usd), 0.0) as input_cost_usd,
+                        COALESCE(SUM(output_cost_usd), 0.0) as output_cost_usd,
+                        COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
+                        COUNT(*) as task_count
+                 FROM task_metrics
+                 WHERE completed_at >= datetime('now', '-{interval}')"
+            );
+            let row = sqlx::query(&query).fetch_one(&self.pool).await?;
+            periods.push(crate::db::CostPeriod {
+                label: label.to_string(),
+                input_tokens: row.get("input_tokens"),
+                output_tokens: row.get("output_tokens"),
+                input_cost_usd: row.get("input_cost_usd"),
+                output_cost_usd: row.get("output_cost_usd"),
+                total_cost_usd: row.get("total_cost_usd"),
+                task_count: row.get("task_count"),
+            });
+        }
+
+        Ok(crate::db::CostSummary { periods })
+    }
+
+    /// Get cost breakdown by agent.
+    pub async fn get_cost_by_agent(&self) -> anyhow::Result<Vec<crate::db::CostByGroup>> {
+        let rows = sqlx::query(
+            "SELECT agent as name,
+                    COALESCE(SUM(input_tokens), 0) as input_tokens,
+                    COALESCE(SUM(output_tokens), 0) as output_tokens,
+                    COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
+                    COUNT(*) as task_count
+             FROM task_metrics
+             GROUP BY agent
+             ORDER BY SUM(total_cost_usd) DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| crate::db::CostByGroup {
+                name: row.get("name"),
+                input_tokens: row.get("input_tokens"),
+                output_tokens: row.get("output_tokens"),
+                total_cost_usd: row.get("total_cost_usd"),
+                task_count: row.get("task_count"),
+            })
+            .collect())
+    }
+
+    /// Get cost breakdown by model.
+    pub async fn get_cost_by_model(&self) -> anyhow::Result<Vec<crate::db::CostByGroup>> {
+        let rows = sqlx::query(
+            "SELECT COALESCE(model, 'unknown') as name,
+                    COALESCE(SUM(input_tokens), 0) as input_tokens,
+                    COALESCE(SUM(output_tokens), 0) as output_tokens,
+                    COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
+                    COUNT(*) as task_count
+             FROM task_metrics
+             GROUP BY model
+             ORDER BY SUM(total_cost_usd) DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| crate::db::CostByGroup {
+                name: row.get("name"),
+                input_tokens: row.get("input_tokens"),
+                output_tokens: row.get("output_tokens"),
+                total_cost_usd: row.get("total_cost_usd"),
+                task_count: row.get("task_count"),
+            })
+            .collect())
+    }
+
+    /// Get count of self-improvement issues created this week.
+    pub async fn count_self_improvement_issues_7d(&self) -> anyhow::Result<i64> {
+        let key = self_improvement_key();
+        let count = self.kv_get(&key).await?;
+        Ok(count.and_then(|c| c.parse().ok()).unwrap_or(0))
+    }
+
+    /// Increment the self-improvement issue counter for the current week.
+    pub async fn increment_self_improvement_counter(&self) -> anyhow::Result<()> {
+        let key = self_improvement_key();
+        let current = self.kv_get(&key).await?;
+        let new_count = current.and_then(|c| c.parse::<i64>().ok()).unwrap_or(0) + 1;
+        self.kv_set(&key, &new_count.to_string()).await?;
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -4407,5 +4733,296 @@ mod tests {
         let all = store.list_all_internal("owner/repo").await.unwrap();
         assert_eq!(all.len(), 2);
         assert!(all.iter().all(|t| t.origin == "internal"));
+    }
+
+    // ── KV Store ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn kv_get_missing_returns_none() {
+        let store = TaskStore::open_memory().await.unwrap();
+        assert_eq!(store.kv_get("missing").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn kv_set_and_get() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store.kv_set("foo", "bar").await.unwrap();
+        assert_eq!(store.kv_get("foo").await.unwrap(), Some("bar".to_string()));
+    }
+
+    #[tokio::test]
+    async fn kv_set_upserts() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store.kv_set("key", "v1").await.unwrap();
+        store.kv_set("key", "v2").await.unwrap();
+        assert_eq!(store.kv_get("key").await.unwrap(), Some("v2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn kv_multiple_keys() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store.kv_set("a", "1").await.unwrap();
+        store.kv_set("b", "2").await.unwrap();
+        assert_eq!(store.kv_get("a").await.unwrap(), Some("1".to_string()));
+        assert_eq!(store.kv_get("b").await.unwrap(), Some("2".to_string()));
+    }
+
+    // ── Task Metrics ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn insert_and_query_task_metric() {
+        use chrono::Utc;
+        let store = TaskStore::open_memory().await.unwrap();
+        let now = Utc::now();
+
+        let metric = crate::db::InsertTaskMetric {
+            task_id: "42",
+            agent: "claude",
+            model: Some("opus"),
+            complexity: Some("complex"),
+            outcome: "success",
+            duration_seconds: 120.5,
+            started_at: &now,
+            completed_at: &now,
+            attempts: 1,
+            files_changed: 3,
+            error_type: None,
+            input_tokens: Some(5000),
+            output_tokens: Some(2000),
+            input_cost_usd: Some(0.05),
+            output_cost_usd: Some(0.10),
+            total_cost_usd: Some(0.15),
+        };
+
+        let id = store.insert_task_metric(&metric).await.unwrap();
+        assert!(id > 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_summary_empty() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let summary = store.get_metrics_summary_24h().await.unwrap();
+        assert_eq!(summary.tasks_completed_24h, 0);
+        assert_eq!(summary.tasks_failed_24h, 0);
+        assert!(summary.agent_stats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_summary_counts_success_and_failure() {
+        use chrono::Utc;
+        let store = TaskStore::open_memory().await.unwrap();
+        let now = Utc::now();
+
+        // Insert a success
+        store
+            .insert_task_metric(&crate::db::InsertTaskMetric {
+                task_id: "1",
+                agent: "claude",
+                model: None,
+                complexity: Some("simple"),
+                outcome: "success",
+                duration_seconds: 60.0,
+                started_at: &now,
+                completed_at: &now,
+                attempts: 1,
+                files_changed: 1,
+                error_type: None,
+                input_tokens: None,
+                output_tokens: None,
+                input_cost_usd: None,
+                output_cost_usd: None,
+                total_cost_usd: None,
+            })
+            .await
+            .unwrap();
+
+        // Insert a failure
+        store
+            .insert_task_metric(&crate::db::InsertTaskMetric {
+                task_id: "2",
+                agent: "codex",
+                model: None,
+                complexity: Some("medium"),
+                outcome: "failed",
+                duration_seconds: 30.0,
+                started_at: &now,
+                completed_at: &now,
+                attempts: 2,
+                files_changed: 0,
+                error_type: Some("timeout"),
+                input_tokens: None,
+                output_tokens: None,
+                input_cost_usd: None,
+                output_cost_usd: None,
+                total_cost_usd: None,
+            })
+            .await
+            .unwrap();
+
+        let summary = store.get_metrics_summary_24h().await.unwrap();
+        assert_eq!(summary.tasks_completed_24h, 1);
+        assert_eq!(summary.tasks_failed_24h, 1);
+        assert_eq!(summary.agent_stats.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cost_summary_returns_correct_periods() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let summary = store.get_cost_summary().await.unwrap();
+        assert_eq!(summary.periods.len(), 3);
+        assert_eq!(summary.periods[0].label, "24h");
+        assert_eq!(summary.periods[1].label, "7d");
+        assert_eq!(summary.periods[2].label, "30d");
+    }
+
+    #[tokio::test]
+    async fn cost_by_agent_empty() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let groups = store.get_cost_by_agent().await.unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cost_by_model_empty() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let groups = store.get_cost_by_model().await.unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cost_by_agent_groups_correctly() {
+        use chrono::Utc;
+        let store = TaskStore::open_memory().await.unwrap();
+        let now = Utc::now();
+
+        for (agent, cost) in &[("claude", 0.10), ("codex", 0.05), ("claude", 0.20)] {
+            store
+                .insert_task_metric(&crate::db::InsertTaskMetric {
+                    task_id: "1",
+                    agent,
+                    model: None,
+                    complexity: None,
+                    outcome: "success",
+                    duration_seconds: 10.0,
+                    started_at: &now,
+                    completed_at: &now,
+                    attempts: 1,
+                    files_changed: 0,
+                    error_type: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    input_cost_usd: None,
+                    output_cost_usd: None,
+                    total_cost_usd: Some(*cost),
+                })
+                .await
+                .unwrap();
+        }
+
+        let groups = store.get_cost_by_agent().await.unwrap();
+        assert_eq!(groups.len(), 2);
+        // claude should be first (higher total cost)
+        assert_eq!(groups[0].name, "claude");
+        assert_eq!(groups[0].task_count, 2);
+        assert!((groups[0].total_cost_usd - 0.30).abs() < 0.001);
+    }
+
+    // ── Rate Limits ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn record_rate_limit_returns_id() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .record_rate_limit("claude", "rate", Some("42"))
+            .await
+            .unwrap();
+        assert!(id > 0);
+    }
+
+    #[tokio::test]
+    async fn rate_limits_counted_in_metrics_summary() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .record_rate_limit("claude", "rate", None)
+            .await
+            .unwrap();
+        store
+            .record_rate_limit("codex", "budget", Some("5"))
+            .await
+            .unwrap();
+
+        let summary = store.get_metrics_summary_24h().await.unwrap();
+        assert_eq!(summary.rate_limits_24h, 2);
+    }
+
+    // ── Self-improvement counter ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn self_improvement_counter_starts_at_zero() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let count = store.count_self_improvement_issues_7d().await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn self_improvement_counter_increments() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store.increment_self_improvement_counter().await.unwrap();
+        store.increment_self_improvement_counter().await.unwrap();
+        let count = store.count_self_improvement_issues_7d().await.unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // ── Slow tasks & error distribution ─────────────────────────────
+
+    #[tokio::test]
+    async fn slow_tasks_empty() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let slow = store.get_slow_tasks_7d().await.unwrap();
+        assert!(slow.is_empty());
+    }
+
+    #[tokio::test]
+    async fn error_distribution_empty() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let errors = store.get_error_distribution_7d().await.unwrap();
+        assert!(errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn error_distribution_groups_by_type() {
+        use chrono::Utc;
+        let store = TaskStore::open_memory().await.unwrap();
+        let now = Utc::now();
+
+        for error_type in &["timeout", "timeout", "rate_limit"] {
+            store
+                .insert_task_metric(&crate::db::InsertTaskMetric {
+                    task_id: "1",
+                    agent: "claude",
+                    model: None,
+                    complexity: None,
+                    outcome: "failed",
+                    duration_seconds: 10.0,
+                    started_at: &now,
+                    completed_at: &now,
+                    attempts: 1,
+                    files_changed: 0,
+                    error_type: Some(error_type),
+                    input_tokens: None,
+                    output_tokens: None,
+                    input_cost_usd: None,
+                    output_cost_usd: None,
+                    total_cost_usd: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let errors = store.get_error_distribution_7d().await.unwrap();
+        assert_eq!(errors.len(), 2);
+        // timeout should be first (count=2)
+        assert_eq!(errors[0].error_type.as_deref(), Some("timeout"));
+        assert_eq!(errors[0].count, 2);
     }
 }

@@ -18,7 +18,7 @@ pub enum ErrorHandleResult {
     Continue { status: String },
 }
 
-/// Handle an agent error: classify it, attempt recovery strategies, and update sidecar.
+/// Handle an agent error: classify it, attempt recovery strategies, and update store.
 ///
 /// Returns `Ok(ErrorHandleResult::EarlyReturn)` when the task was rerouted and
 /// `run()` should record metrics and return immediately (skipping tmux cleanup).
@@ -134,16 +134,22 @@ pub async fn handle_error(
         ),
     };
 
-    // Record rate limit in DB for rate-limit and auth errors
-    if let Some(db) = db {
+    // Record rate limit in store (sqlx) if available, otherwise rusqlite
+    {
         let error_type_str = match retryable {
             response::RetryableError::UsageLimit => "rate",
             response::RetryableError::AuthError => "budget",
             _ => "error",
         };
-        let _ = db
-            .record_rate_limit(agent_name, error_type_str, Some(task_id))
-            .await;
+        if let Some(ref s) = store {
+            let _ = s
+                .record_rate_limit(agent_name, error_type_str, Some(task_id))
+                .await;
+        } else if let Some(db) = db {
+            let _ = db
+                .record_rate_limit(agent_name, error_type_str, Some(task_id))
+                .await;
+        }
     }
 
     // Try free models as last resort before giving up

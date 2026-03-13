@@ -234,12 +234,9 @@ pub fn agents() {
 
 /// Show task metrics summary.
 pub async fn metrics() -> anyhow::Result<()> {
-    use crate::db::Db;
+    let store = init_store().await?;
 
-    let db = Db::open(&crate::db::default_path()?)?;
-    db.migrate().await?;
-
-    let summary = db.get_metrics_summary_24h().await?;
+    let summary = store.get_metrics_summary_24h().await?;
 
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");

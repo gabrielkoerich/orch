@@ -1,10 +1,9 @@
 use crate::config;
-use crate::db::Db;
 use crate::engine::cleanup as store_helpers;
 use crate::store::{self, TaskStore};
 use std::sync::Arc;
 
-/// Show cost breakdown for a specific task (store-first, sidecar fallback).
+/// Show cost breakdown for a specific task.
 pub async fn show_task(id: &str) -> anyhow::Result<()> {
     let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
@@ -59,10 +58,9 @@ pub async fn show_task(id: &str) -> anyhow::Result<()> {
 
 /// Show aggregate cost summary over time periods (24h, 7d, 30d).
 pub async fn show_summary() -> anyhow::Result<()> {
-    let db = Db::open(&crate::db::default_path()?)?;
-    db.migrate().await?;
+    let store = crate::cli::init_store().await?;
 
-    let summary = db.get_cost_summary().await?;
+    let summary = store.get_cost_summary().await?;
 
     println!();
     println!("Cost Summary");
@@ -91,10 +89,9 @@ pub async fn show_summary() -> anyhow::Result<()> {
 
 /// Show cost breakdown by agent.
 pub async fn show_by_agent() -> anyhow::Result<()> {
-    let db = Db::open(&crate::db::default_path()?)?;
-    db.migrate().await?;
+    let store = crate::cli::init_store().await?;
 
-    let groups = db.get_cost_by_agent().await?;
+    let groups = store.get_cost_by_agent().await?;
 
     if groups.is_empty() {
         println!("No cost data available yet.");
@@ -138,10 +135,9 @@ pub async fn show_by_agent() -> anyhow::Result<()> {
 
 /// Show cost breakdown by model.
 pub async fn show_by_model() -> anyhow::Result<()> {
-    let db = Db::open(&crate::db::default_path()?)?;
-    db.migrate().await?;
+    let store = crate::cli::init_store().await?;
 
-    let groups = db.get_cost_by_model().await?;
+    let groups = store.get_cost_by_model().await?;
 
     if groups.is_empty() {
         println!("No cost data available yet.");
