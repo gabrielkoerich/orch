@@ -376,10 +376,7 @@ pub async fn handle_failover(
                 format!("last_error={msg}"),
                 format!("error_type={}", error_type.type_str()),
             ],
-            &[
-                ("last_error", serde_json::json!(msg)),
-                ("error_type", serde_json::json!(error_type.type_str())),
-            ],
+            &[("last_error", serde_json::json!(msg))],
         )
         .await;
         return "needs_review".to_string();
@@ -416,7 +413,6 @@ pub async fn handle_failover(
                 ("agent", serde_json::json!(next)),
                 ("model", serde_json::json!("")),
                 ("last_error", serde_json::json!(msg)),
-                ("error_type", serde_json::json!(error_type.type_str())),
             ],
         )
         .await;
@@ -434,10 +430,7 @@ pub async fn handle_failover(
             format!("last_error={msg}"),
             format!("error_type={}", error_type.type_str()),
         ],
-        &[
-            ("last_error", serde_json::json!(msg)),
-            ("error_type", serde_json::json!(error_type.type_str())),
-        ],
+        &[("last_error", serde_json::json!(msg))],
     )
     .await;
     "needs_review".to_string()

@@ -87,7 +87,6 @@ pub async fn handle_error(
                     &[
                         ("model", serde_json::json!(next.to_string())),
                         ("last_error", serde_json::json!(msg)),
-                        ("error_type", serde_json::json!("failed")),
                     ],
                 )
                 .await;
@@ -116,10 +115,7 @@ pub async fn handle_error(
                 repo,
                 task_id,
                 &[format!("last_error={msg}"), "error_type=failed".to_string()],
-                &[
-                    ("last_error", serde_json::json!(msg)),
-                    ("error_type", serde_json::json!("failed")),
-                ],
+                &[("last_error", serde_json::json!(msg))],
             )
             .await;
             return Ok(ErrorHandleResult::EarlyReturn {
@@ -213,7 +209,6 @@ pub async fn handle_error(
                         ("agent", serde_json::json!("opencode")),
                         ("model", serde_json::json!(free_model.to_string())),
                         ("last_error", serde_json::json!(msg)),
-                        ("error_type", serde_json::json!(retryable.type_str())),
                     ],
                 )
                 .await;

@@ -147,30 +147,32 @@ pub(crate) async fn store_and_sidecar_set(
 }
 
 /// Dual-write: increment a counter in both store and sidecar.
+///
+/// Uses the store as the authoritative source: `store.increment()` does an
+/// atomic SQL `field + 1` and returns the new value, which is then mirrored
+/// to the sidecar.  This avoids a TOCTOU race where two concurrent increments
+/// could read the same value and diverge between store and sidecar.
 pub(crate) async fn store_and_sidecar_increment(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
     field: &str,
 ) -> u64 {
-    let current = if let Some(ref s) = store {
-        store_or_sidecar(s, repo, task_id, field)
-            .await
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0)
-    } else {
-        sidecar::get_u64(task_id, field)
-    };
-    let new_val = current.saturating_add(1);
-
-    let _ = sidecar::set(task_id, &[format!("{field}={new_val}")]);
-
-    if let Some(ref store) = store {
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-            let _ = store.increment(store_id, field).await;
+    // Try store-authoritative increment first
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
+            if let Ok(new_val) = s.increment(store_id, field).await {
+                // Mirror the store's authoritative value to sidecar
+                let _ = sidecar::set(task_id, &[format!("{field}={new_val}")]);
+                return new_val as u64;
+            }
         }
     }
 
+    // Fallback: sidecar-only increment (no store available)
+    let current = sidecar::get_u64(task_id, field);
+    let new_val = current.saturating_add(1);
+    let _ = sidecar::set(task_id, &[format!("{field}={new_val}")]);
     new_val
 }
 
@@ -1106,5 +1108,190 @@ mod tests {
             .unwrap();
         let agent = store_or_sidecar(&store, "owner/repo", "55", "agent").await;
         assert_eq!(agent.as_deref(), Some("claude"));
+    }
+
+    // ── opt_store_or_sidecar with None store ────────────────────────────
+
+    #[tokio::test]
+    async fn opt_store_or_sidecar_with_none_store() {
+        // When store is None, should return None without panicking
+        // (sidecar fallback also returns None for unknown tasks in test env)
+        let store: Option<Arc<TaskStore>> = None;
+        let result = opt_store_or_sidecar(&store, "owner/repo", "nonexistent-999", "branch").await;
+        // Should not panic; value is None because sidecar won't have this task either
+        assert!(result.is_none());
+    }
+
+    // ── get_token_usage from store ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_token_usage_from_store() {
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("70".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Token test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Set token fields
+        store
+            .set_fields(
+                id,
+                &[
+                    ("input_tokens", serde_json::json!(1500)),
+                    ("output_tokens", serde_json::json!(800)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let opt_store = Some(store);
+        let usage = get_token_usage(&opt_store, "owner/repo", "70").await;
+        assert_eq!(usage.input_tokens, 1500);
+        assert_eq!(usage.output_tokens, 800);
+        assert_eq!(usage.total_tokens(), 2300);
+    }
+
+    // ── get_cost_estimate from store ────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_cost_estimate_from_store() {
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("71".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Cost test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .set_fields(
+                id,
+                &[
+                    ("input_cost_usd", serde_json::json!(0.05)),
+                    ("output_cost_usd", serde_json::json!(0.10)),
+                    ("total_cost_usd", serde_json::json!(0.15)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let opt_store = Some(store);
+        let cost = get_cost_estimate(&opt_store, "owner/repo", "71").await;
+        assert!((cost.input_cost_usd - 0.05).abs() < f64::EPSILON);
+        assert!((cost.output_cost_usd - 0.10).abs() < f64::EPSILON);
+        assert!((cost.total_cost_usd - 0.15).abs() < f64::EPSILON);
+    }
+
+    // ── get_recent_memory from store ────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_recent_memory_from_store() {
+        use crate::sidecar::MemoryEntry;
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("72".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Memory test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let entry1 = MemoryEntry {
+            attempt: 1,
+            agent: "claude".to_string(),
+            model: Some("opus".to_string()),
+            learnings: vec!["learned A".to_string()],
+            error: None,
+            files_modified: vec!["src/main.rs".to_string()],
+            approach: "first try".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let entry2 = MemoryEntry {
+            attempt: 2,
+            agent: "codex".to_string(),
+            model: Some("gpt-5".to_string()),
+            learnings: vec!["learned B".to_string()],
+            error: Some("timeout".to_string()),
+            files_modified: vec![],
+            approach: "second try".to_string(),
+            timestamp: "2026-01-01T01:00:00Z".to_string(),
+        };
+
+        store.append_memory(id, &entry1).await.unwrap();
+        store.append_memory(id, &entry2).await.unwrap();
+
+        let opt_store = Some(store);
+        let memory = get_recent_memory(&opt_store, "owner/repo", "72", 10).await;
+        assert_eq!(memory.len(), 2);
+        assert_eq!(memory[0].attempt, 1);
+        assert_eq!(memory[1].attempt, 2);
+        assert_eq!(memory[0].agent, "claude");
+        assert_eq!(memory[1].agent, "codex");
+    }
+
+    // ── increment returns new value ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn increment_returns_new_value() {
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("73".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Increment test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let opt_store = Some(store);
+        let v1 = store_and_sidecar_increment(&opt_store, "owner/repo", "73", "attempts").await;
+        assert_eq!(v1, 1);
+
+        let v2 = store_and_sidecar_increment(&opt_store, "owner/repo", "73", "attempts").await;
+        assert_eq!(v2, 2);
+
+        let v3 = store_and_sidecar_increment(&opt_store, "owner/repo", "73", "attempts").await;
+        assert_eq!(v3, 3);
+
+        // Verify store has the correct value
+        let task = opt_store.as_ref().unwrap().get(id).await.unwrap();
+        assert_eq!(task.attempts, 3);
+    }
+
+    // ── increment without store falls back ──────────────────────────────
+
+    #[tokio::test]
+    async fn increment_without_store_falls_back() {
+        let store: Option<Arc<TaskStore>> = None;
+        // Use a unique task ID to avoid sidecar state from previous runs
+        let unique_id = format!("no-store-test-{}", std::process::id());
+        // Read current sidecar value (may be non-zero from previous runs)
+        let before = sidecar::get_u64(&unique_id, "attempts");
+        let v = store_and_sidecar_increment(&store, "owner/repo", &unique_id, "attempts").await;
+        // Should increment by exactly 1 from whatever the sidecar had
+        assert_eq!(v, before + 1);
     }
 }

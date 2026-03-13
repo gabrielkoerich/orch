@@ -1249,4 +1249,62 @@ Hope that helps!"#;
         let after_success = router.weights.get_weight("claude");
         assert!(after_success > MIN_WEIGHT);
     }
+
+    #[test]
+    fn review_rr_index_advances() {
+        let config = RouterConfig::default();
+        let agents = vec![
+            "test_a".to_string(),
+            "test_b".to_string(),
+            "test_c".to_string(),
+        ];
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&agents);
+        let mut router = Router {
+            config,
+            available_agents: agents,
+            weights,
+            llm_router: LlmRouter::new(),
+            rr_index: 0,
+            last_agent: None,
+            review_rr_index: 0,
+        };
+
+        let a1 = router.next_round_robin_agent(None).unwrap();
+        let a2 = router.next_round_robin_agent(None).unwrap();
+        let a3 = router.next_round_robin_agent(None).unwrap();
+
+        // All three agents should appear (order depends on start index)
+        let mut seen = vec![a1, a2, a3];
+        seen.sort();
+        assert_eq!(seen, vec!["test_a", "test_b", "test_c"]);
+    }
+
+    #[tokio::test]
+    async fn last_agent_tracks_routing() {
+        let config = RouterConfig {
+            mode: "round_robin".to_string(),
+            ..Default::default()
+        };
+        let agents = vec!["test_x".to_string(), "test_y".to_string()];
+        let mut weights = AgentWeights::default();
+        weights.ensure_agents(&agents);
+        let mut router = Router {
+            config,
+            available_agents: agents,
+            weights,
+            llm_router: LlmRouter::new(),
+            rr_index: 0,
+            last_agent: None,
+            review_rr_index: 0,
+        };
+
+        assert!(router.last_agent.is_none());
+
+        let task = create_test_task("1", "Test routing", vec![]);
+        let result = router.route(&task).await.unwrap();
+
+        assert!(router.last_agent.is_some());
+        assert_eq!(router.last_agent.as_deref(), Some(result.agent.as_str()));
+    }
 }
