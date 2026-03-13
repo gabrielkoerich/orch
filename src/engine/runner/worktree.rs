@@ -159,7 +159,7 @@ pub async fn setup_worktree(
         .join(&project_name);
     std::fs::create_dir_all(&worktrees_base)?;
 
-    // Check if we have a saved branch/worktree in store/sidecar
+    // Check if we have a saved branch/worktree in store
     let saved_branch =
         crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "branch").await;
     let saved_worktree =
@@ -312,7 +312,7 @@ pub async fn setup_worktree(
         }
     }
 
-    // Save worktree info to sidecar + store
+    // Save worktree info to store
     crate::engine::cleanup::store_set(
         store,
         repo,

@@ -204,7 +204,7 @@ pub async fn handle_success(
         .await;
     }
 
-    // Store result in sidecar
+    // Store result in task store
     // If agent said "done" and a PR exists, send to review before merge.
     // If agent said "done", pushed commits, but PR creation failed — review gate creates PR.
     // If agent said "done", no PR, and no delegations — work is complete

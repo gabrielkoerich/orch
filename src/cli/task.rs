@@ -132,7 +132,7 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             println!("Created: {}", ext.created_at);
             println!("Updated: {}", ext.updated_at);
 
-            // Show agent/branch info if available (store-first, sidecar fallback)
+            // Show agent/branch info if available
             if let Some(agent) =
                 store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "agent").await
             {
@@ -215,7 +215,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         })
         .collect();
 
-    // Calculate total cost across all external tasks (store-first, sidecar fallback)
+    // Calculate total cost across all external tasks
     let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
     let mut total_input_tokens: u64 = 0;
@@ -448,7 +448,7 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
         }
     }
 
-    // Reset sidecar + store state (attempts + all failure counters)
+    // Reset store state (attempts + all failure counters)
     crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id.0).await;
 
     // Reset to new

@@ -53,7 +53,7 @@ pub async fn build_parent_context(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> String {
-    // Check if task has a parent via store or sidecar
+    // Check if task has a parent via store
     let parent_id =
         match crate::engine::cleanup::opt_store_get_field(store, repo, &task.id.0, "parent_id")
             .await
@@ -92,7 +92,7 @@ pub async fn build_parent_context(
                         .unwrap_or_else(|| "unknown".to_string());
                     ctx.push_str(&format!("- #{} [{}]: {}\n", sib.id.0, status, sib.title));
 
-                    // Include summary if available (store-first, sidecar fallback)
+                    // Include summary if available
                     if let Some(summary) = crate::engine::cleanup::opt_store_get_field(
                         store, repo, &sib.id.0, "summary",
                     )
@@ -330,7 +330,7 @@ pub async fn build_memory_context(
     (context, memory)
 }
 
-/// Load PR review context (store-first, sidecar fallback).
+/// Load PR review context from store.
 pub async fn load_pr_review_context(
     task_id: &str,
     store: &Option<Arc<TaskStore>>,
@@ -377,7 +377,7 @@ pub async fn build_full_context(
         String::new()
     };
 
-    // Load PR review context (store-first, sidecar fallback)
+    // Load PR review context from store
     let pr_review_context = load_pr_review_context(&task.id.0, store, repo).await;
 
     // Always load memory from previous attempts (empty on first run, populated on retries)

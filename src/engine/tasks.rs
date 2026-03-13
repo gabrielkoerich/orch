@@ -605,4 +605,187 @@ mod tests {
         assert_eq!(parse_internal_id("42"), None);
         assert_eq!(parse_internal_id(""), None);
     }
+
+    #[tokio::test]
+    async fn create_internal_task_via_task_manager() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        let task = tm
+            .create_task(CreateTaskRequest {
+                title: "Internal task".to_string(),
+                body: "Do something".to_string(),
+                task_type: TaskType::Internal,
+                labels: vec![],
+                source: "cron".to_string(),
+                source_id: "job:daily".to_string(),
+            })
+            .await
+            .unwrap();
+
+        match task {
+            Task::Internal(t) => {
+                assert_eq!(t.title, "Internal task");
+                assert_eq!(t.origin, "internal");
+                assert!(t.external_id.as_deref().unwrap().starts_with("internal:"));
+            }
+            Task::External(_) => panic!("expected Internal variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_internal_task_fails_without_store() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let tm = TaskManager::new(db, backend);
+
+        let result = tm
+            .create_task(CreateTaskRequest {
+                title: "No store".to_string(),
+                body: "".to_string(),
+                task_type: TaskType::Internal,
+                labels: vec![],
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+            })
+            .await;
+
+        assert!(result.is_err(), "should fail without store");
+    }
+
+    #[tokio::test]
+    async fn get_task_returns_internal_from_store() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        let id = store
+            .create_internal("owner/repo", "Fetch me", "body", "cron", "job:1")
+            .await
+            .unwrap();
+
+        let task = tm.get_task(id).await.unwrap();
+        match task {
+            Task::Internal(t) => assert_eq!(t.title, "Fetch me"),
+            Task::External(_) => panic!("expected Internal variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_routable_includes_internal_new_tasks() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        // Create internal task (starts as New)
+        store
+            .create_internal("owner/repo", "Route me", "", "cron", "job:2")
+            .await
+            .unwrap();
+
+        let routable = tm.list_routable().await.unwrap();
+        assert_eq!(routable.len(), 1);
+        assert!(routable[0].id.0.starts_with("internal:"));
+        assert_eq!(routable[0].title, "Route me");
+    }
+
+    #[tokio::test]
+    async fn list_routable_excludes_non_new_internal_tasks() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        let id = store
+            .create_internal("owner/repo", "Already routed", "", "cron", "job:3")
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::db::TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        let routable = tm.list_routable().await.unwrap();
+        assert!(
+            routable.is_empty(),
+            "in_progress tasks should not be routable"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_internal_by_status_returns_external_tasks() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        store
+            .create_internal("owner/repo", "Task A", "", "cron", "a")
+            .await
+            .unwrap();
+        let id_b = store
+            .create_internal("owner/repo", "Task B", "", "cron", "b")
+            .await
+            .unwrap();
+        store
+            .update_status(id_b, crate::db::TaskStatus::Done)
+            .await
+            .unwrap();
+
+        let new_tasks = tm
+            .list_internal_by_status(crate::db::TaskStatus::New)
+            .await
+            .unwrap();
+        assert_eq!(new_tasks.len(), 1);
+        assert_eq!(new_tasks[0].title, "Task A");
+        // Verify it's wrapped as ExternalTask with status label
+        assert!(new_tasks[0].labels.contains(&"status:new".to_string()));
+    }
+
+    #[tokio::test]
+    async fn store_task_to_external_maps_fields_correctly() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create_internal("owner/repo", "Convert me", "body text", "manual", "m:1")
+            .await
+            .unwrap();
+        let task = store.get(id).await.unwrap();
+        let ext = store_task_to_external(&task);
+
+        assert!(ext.id.0.starts_with("internal:"));
+        assert_eq!(ext.title, "Convert me");
+        assert_eq!(ext.body, "body text");
+        assert_eq!(ext.state, "open");
+        assert!(ext.labels.contains(&"status:new".to_string()));
+        assert_eq!(ext.author, "manual"); // source maps to author
+    }
+
+    #[tokio::test]
+    async fn list_all_internal_returns_store_tasks() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        store
+            .create_internal("owner/repo", "T1", "", "cron", "1")
+            .await
+            .unwrap();
+        store
+            .create_internal("owner/repo", "T2", "", "cron", "2")
+            .await
+            .unwrap();
+        // Different repo — should not appear
+        store
+            .create_internal("other/repo", "T3", "", "cron", "3")
+            .await
+            .unwrap();
+
+        let tasks = tm.list_all_internal().await.unwrap();
+        assert_eq!(tasks.len(), 2);
+    }
 }

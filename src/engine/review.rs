@@ -59,7 +59,7 @@ pub(crate) enum ReviewDecision {
 ///
 /// Lists tasks in review, fetches PR reviews, and re-dispatches the agent
 /// when a reviewer requests changes. The review context is stored in the
-/// sidecar and injected into the agent prompt.
+/// store and injected into the agent prompt.
 pub(crate) async fn review_open_prs(
     backend: &Arc<dyn ExternalBackend>,
     _db: &Arc<crate::db::Db>,
@@ -97,7 +97,7 @@ pub(crate) async fn review_open_prs(
     for task in in_review_tasks {
         let task_id = &task.id.0;
 
-        // Get branch (store-first, sidecar fallback)
+        // Get branch from store
         let branch = match super::cleanup::store_get_field(store, repo, task_id, "branch").await {
             Some(b) if !b.is_empty() => b,
             _ => {
@@ -158,7 +158,7 @@ pub(crate) async fn review_open_prs(
             }
         };
 
-        // Store PR number in sidecar + store for follow-up tasks
+        // Store PR number for follow-up tasks
         store_set(
             &Some(Arc::clone(store)),
             repo,
@@ -325,7 +325,7 @@ pub(crate) async fn review_open_prs(
                     comment_approved,
                     "PR approved but not yet merged — attempting auto-merge"
                 );
-                // Get the task agent and model (store-first, sidecar fallback)
+                // Get the task agent and model from store
                 let task_agent = super::cleanup::store_get_field(store, repo, &task.id.0, "agent")
                     .await
                     .unwrap_or_else(|| "orch".to_string());
@@ -468,7 +468,7 @@ pub(crate) async fn review_open_prs(
             }
         }
 
-        // Cap review context to avoid oversized sidecar values
+        // Cap review context to avoid oversized values
         const MAX_REVIEW_CONTEXT_BYTES: usize = 16 * 1024;
         if review_context.len() > MAX_REVIEW_CONTEXT_BYTES {
             // Find safe UTF-8 char boundary
@@ -486,7 +486,7 @@ pub(crate) async fn review_open_prs(
 
         // If we have new review feedback, store it and re-dispatch the task
         if !review_context.is_empty() {
-            // Store the review context in sidecar + store
+            // Store the review context
             store_set(
                 &Some(Arc::clone(store)),
                 repo,
@@ -541,7 +541,7 @@ pub(crate) async fn review_and_merge(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<ReviewDecision> {
-    // 2. Load worktree path, branch, agent (store-first, sidecar fallback)
+    // 2. Load worktree path, branch, agent from store
     let worktree = super::cleanup::store_get_field(store, repo, &task.id.0, "worktree").await;
     let branch = super::cleanup::store_get_field(store, repo, &task.id.0, "branch").await;
     let agent_summary = super::cleanup::store_get_field(store, repo, &task.id.0, "summary")
@@ -634,7 +634,7 @@ pub(crate) async fn review_and_merge(
                     .await
                 {
                     Ok(url) => {
-                        // Extract PR number from URL and update sidecar so subsequent
+                        // Extract PR number from URL and update store so subsequent
                         // review cycles check the correct PR (not a stale pr_number).
                         if let Some(pr_num) = url.rsplit('/').next() {
                             let pr_num_i64 = pr_num.parse::<i64>().unwrap_or(0);

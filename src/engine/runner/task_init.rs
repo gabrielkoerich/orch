@@ -83,7 +83,7 @@ pub async fn check_guards(
     Ok(GuardOutcome::Proceed(attempts))
 }
 
-/// Build a minimal `ExternalTask` from store/sidecar state for prompt building.
+/// Build a minimal `ExternalTask` from store state for prompt building.
 pub async fn build_pseudo_task(
     task_id: &str,
     store: &Option<Arc<TaskStore>>,
@@ -120,7 +120,7 @@ pub async fn prepare_task(
     attempts: u32,
     store: &Option<Arc<TaskStore>>,
 ) -> anyhow::Result<TaskInitResult> {
-    // Load title from store/sidecar for branch naming (set by run_with_context before run())
+    // Load title from store for branch naming (set by run_with_context before run())
     let title_for_branch =
         crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "title")
             .await

@@ -1,6 +1,6 @@
 //! Repo context propagated into spawned async tasks.
 //!
-//! The `REPO_CONTEXT` task-local allows sidecar path resolution and other
+//! The `REPO_CONTEXT` task-local allows store task resolution and other
 //! per-repo operations to access the repo slug without requiring every
 //! call-site to pass it explicitly.
 

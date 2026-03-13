@@ -333,7 +333,7 @@ impl RetryableError {
 /// Returns the resulting status string: "new" if rerouted, "needs_review" otherwise.
 ///
 /// Note: DB recording of rate limit events is handled by the caller (mod.rs)
-/// which has async context. This function only handles sidecar state + cooldowns.
+/// which has async context. This function only handles store state + cooldowns.
 pub async fn handle_failover(
     task_id: &str,
     agent_name: &str,
@@ -422,7 +422,7 @@ pub async fn handle_failover(
     "needs_review".to_string()
 }
 
-/// Get the reroute chain from store/sidecar.
+/// Get the reroute chain from store.
 pub async fn get_reroute_chain(
     task_id: &str,
     store: &Option<Arc<TaskStore>>,
@@ -435,7 +435,7 @@ pub async fn get_reroute_chain(
         .to_string()
 }
 
-/// Update the reroute chain in sidecar + store.
+/// Update the reroute chain in store.
 pub async fn update_reroute_chain(
     task_id: &str,
     current_agent: &str,
