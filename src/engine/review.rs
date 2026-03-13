@@ -249,7 +249,11 @@ pub(crate) async fn review_open_prs(
         let comment_changes_requested = automated_review.as_deref() == Some("changes_requested");
 
         // Handle fully-approved PRs (either via PR review API or comment-based review)
-        if (all_approved || comment_approved) && auto_close_task && !comment_changes_requested {
+        if (all_approved || comment_approved)
+            && auto_close_task
+            && !comment_changes_requested
+            && !any_changes_requested
+        {
             // Check if the PR is already merged before marking done.
             // If not merged, attempt auto-merge so the PR doesn't get orphaned.
             let already_merged = match gh.is_pr_merged(repo, &branch).await {
