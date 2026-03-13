@@ -538,7 +538,7 @@ async fn main() -> anyhow::Result<()> {
                 cli::task::publish(id, labels).await?;
             }
             TaskAction::Cost { id } => {
-                cli::task::cost(&id)?;
+                cli::task::cost(&id).await?;
             }
             TaskAction::Tree { id } => {
                 cli::task::tree(id).await?;
@@ -632,7 +632,7 @@ async fn main() -> anyhow::Result<()> {
             model,
         } => {
             if let Some(id) = task_id {
-                cli::cost::show_task(&id)?;
+                cli::cost::show_task(&id).await?;
             } else if agent {
                 cli::cost::show_by_agent().await?;
             } else if model {

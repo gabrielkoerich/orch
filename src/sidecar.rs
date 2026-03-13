@@ -348,6 +348,7 @@ pub fn get_cost_estimate(task_id: &str) -> CostEstimate {
 }
 
 /// Get the model used for a task.
+#[allow(dead_code)]
 pub fn get_model(task_id: &str) -> String {
     get(task_id, "model").unwrap_or_default()
 }

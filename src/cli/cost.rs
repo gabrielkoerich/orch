@@ -1,11 +1,20 @@
+use crate::config;
 use crate::db::Db;
+use crate::engine::cleanup as store_helpers;
 use crate::sidecar;
+use crate::store::TaskStore;
+use std::sync::Arc;
 
-/// Show cost breakdown for a specific task (from sidecar data).
-pub fn show_task(id: &str) -> anyhow::Result<()> {
-    let usage = sidecar::get_token_usage(id);
-    let cost_estimate = sidecar::get_cost_estimate(id);
-    let model = sidecar::get_model(id);
+/// Show cost breakdown for a specific task (store-first, sidecar fallback).
+pub async fn show_task(id: &str) -> anyhow::Result<()> {
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
+
+    let usage = store_helpers::get_token_usage(&store, &repo, id).await;
+    let cost_estimate = store_helpers::get_cost_estimate(&store, &repo, id).await;
+    let model = store_helpers::opt_store_or_sidecar(&store, &repo, id, "model")
+        .await
+        .unwrap_or_default();
 
     if usage.total_tokens() == 0 {
         println!("No token data available for task #{}", id);

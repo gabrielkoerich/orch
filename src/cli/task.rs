@@ -2,11 +2,13 @@ use crate::backends::{ExternalId, Status};
 use crate::cli::init_task_manager;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
+use crate::engine::cleanup as store_helpers;
 use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
 use crate::engine::tasks::{parse_internal_id, CreateTaskRequest, Task, TaskFilter, TaskType};
 use crate::home;
 use crate::sidecar;
+use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use std::sync::Arc;
@@ -21,6 +23,9 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
         println!("No tasks found.");
         return Ok(());
     }
+
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
 
     println!(
         "{:<15} {:<12} {:<20} {:<10} TITLE",
@@ -37,7 +42,9 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
                     .find(|l| l.starts_with("status:"))
                     .map(|s| s.replace("status:", ""))
                     .unwrap_or_else(|| "unknown".to_string());
-                let agent = sidecar::get(&ext.id.0, "agent").unwrap_or_default();
+                let agent = store_helpers::opt_store_or_sidecar(&store, &repo, &ext.id.0, "agent")
+                    .await
+                    .unwrap_or_default();
                 println!(
                     "{:<15} {:<12} {:<20} {:<10} {}",
                     ext.id.0, "external", status, agent, ext.title
@@ -112,6 +119,9 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
     let task_manager = init_task_manager().await?;
     let task = task_manager.get_task(id).await?;
 
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
+
     match task {
         Task::External(ext) => {
             println!("ID: {} (external)", ext.id.0);
@@ -123,11 +133,15 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             println!("Created: {}", ext.created_at);
             println!("Updated: {}", ext.updated_at);
 
-            // Show sidecar info if available
-            if let Ok(agent) = sidecar::get(&ext.id.0, "agent") {
+            // Show agent/branch info if available (store-first, sidecar fallback)
+            if let Some(agent) =
+                store_helpers::opt_store_or_sidecar(&store, &repo, &ext.id.0, "agent").await
+            {
                 println!("Agent: {}", agent);
             }
-            if let Ok(branch) = sidecar::get(&ext.id.0, "branch") {
+            if let Some(branch) =
+                store_helpers::opt_store_or_sidecar(&store, &repo, &ext.id.0, "branch").await
+            {
                 println!("Branch: {}", branch);
             }
 
@@ -202,21 +216,27 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         })
         .collect();
 
-    // Calculate total cost across all external tasks
+    // Calculate total cost across all external tasks (store-first, sidecar fallback)
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
     let mut total_cost: f64 = 0.0;
 
     for task in &all_external {
-        total_input_tokens += sidecar::get_u64(&task.id.0, "input_tokens");
-        total_output_tokens += sidecar::get_u64(&task.id.0, "output_tokens");
-        total_cost += sidecar::get_f64(&task.id.0, "total_cost_usd");
+        let usage = store_helpers::get_token_usage(&store, &repo, &task.id.0).await;
+        let cost = store_helpers::get_cost_estimate(&store, &repo, &task.id.0).await;
+        total_input_tokens += usage.input_tokens;
+        total_output_tokens += usage.output_tokens;
+        total_cost += cost.total_cost_usd;
     }
     for task in &all_internal {
         let id = format!("internal:{}", task.id);
-        total_input_tokens += sidecar::get_u64(&id, "input_tokens");
-        total_output_tokens += sidecar::get_u64(&id, "output_tokens");
-        total_cost += sidecar::get_f64(&id, "total_cost_usd");
+        let usage = store_helpers::get_token_usage(&store, &repo, &id).await;
+        let cost = store_helpers::get_cost_estimate(&store, &repo, &id).await;
+        total_input_tokens += usage.input_tokens;
+        total_output_tokens += usage.output_tokens;
+        total_cost += cost.total_cost_usd;
     }
 
     if json {
@@ -552,12 +572,17 @@ pub async fn live() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
+
     println!("{:<30} {:<15} {:<10} ACTIVE", "SESSION", "TASK", "AGENT");
     println!("{}", "-".repeat(70));
 
     for session in &sessions {
         let active = tmux.is_session_active(&session.name).await;
-        let agent = sidecar::get(&session.task_id, "agent").unwrap_or_default();
+        let agent = store_helpers::opt_store_or_sidecar(&store, &repo, &session.task_id, "agent")
+            .await
+            .unwrap_or_default();
         println!(
             "{:<30} {:<15} {:<10} {}",
             session.name,
@@ -589,9 +614,9 @@ pub async fn publish(id: i64, labels: Vec<String>) -> anyhow::Result<()> {
 }
 
 /// Show token cost breakdown for a task.
-pub fn cost(id: &str) -> anyhow::Result<()> {
+pub async fn cost(id: &str) -> anyhow::Result<()> {
     // Delegate to cli::cost::show_task for consistent formatting
-    super::cost::show_task(id)
+    super::cost::show_task(id).await
 }
 
 /// Show task tree view (parent-child relationships).
@@ -667,6 +692,8 @@ pub async fn tree(id: Option<i64>) -> anyhow::Result<()> {
 /// Show logs / post-mortem for a task (internal or external).
 pub async fn logs(id: &str) -> anyhow::Result<()> {
     let task_manager = init_task_manager().await?;
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
 
     // Resolve sidecar key and print basic metadata where available.
     let mut sidecar_key = id.to_string();
@@ -737,59 +764,65 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                 );
             } else {
                 println!("\nSidecar: {}", path.display());
+            }
 
-                // Agent & model
-                if let Ok(agent) = sidecar::get(&sidecar_key, "agent") {
-                    println!("Agent: {}", agent);
-                }
-                let model = sidecar::get_model(&sidecar_key);
-                if !model.is_empty() {
-                    println!("Model: {}", model);
-                }
+            // Agent & model (store-first, sidecar fallback — works even without sidecar file)
+            if let Some(agent) =
+                store_helpers::opt_store_or_sidecar(&store, &repo, &sidecar_key, "agent").await
+            {
+                println!("Agent: {}", agent);
+            }
+            if let Some(model) =
+                store_helpers::opt_store_or_sidecar(&store, &repo, &sidecar_key, "model").await
+            {
+                println!("Model: {}", model);
+            }
 
-                // Attempts
-                if let Ok(attempts) = sidecar::get(&sidecar_key, "attempts") {
-                    println!("Attempts: {}", attempts);
-                }
+            // Attempts
+            if let Some(attempts) =
+                store_helpers::opt_store_or_sidecar(&store, &repo, &sidecar_key, "attempts").await
+            {
+                println!("Attempts: {}", attempts);
+            }
 
-                // Token & cost summary
-                let usage = sidecar::get_token_usage(&sidecar_key);
-                let cost = sidecar::get_cost_estimate(&sidecar_key);
-                let total_tokens = usage.total_tokens();
-                if total_tokens > 0 || cost.total_cost_usd > 0.0 {
-                    println!("\nCost summary:");
-                    println!("  input tokens:  {}", usage.input_tokens);
-                    println!("  output tokens: {}", usage.output_tokens);
-                    println!("  total tokens:  {}", total_tokens);
-                    println!("  estimated $:   ${:.6}", cost.total_cost_usd);
-                }
+            // Token & cost summary
+            let usage = store_helpers::get_token_usage(&store, &repo, &sidecar_key).await;
+            let cost = store_helpers::get_cost_estimate(&store, &repo, &sidecar_key).await;
+            let total_tokens = usage.total_tokens();
+            if total_tokens > 0 || cost.total_cost_usd > 0.0 {
+                println!("\nCost summary:");
+                println!("  input tokens:  {}", usage.input_tokens);
+                println!("  output tokens: {}", usage.output_tokens);
+                println!("  total tokens:  {}", total_tokens);
+                println!("  estimated $:   ${:.6}", cost.total_cost_usd);
+            }
 
-                // Memory (recent attempts)
-                if let Ok(mem) = sidecar::get_recent_memory(&sidecar_key, 10) {
-                    if !mem.is_empty() {
-                        println!("\nMemory (recent attempts):");
-                        for m in mem {
-                            println!(
-                                "- Attempt {} @ {}: agent={} model={}",
-                                m.attempt,
-                                m.timestamp,
-                                m.agent,
-                                m.model.clone().unwrap_or_default()
-                            );
-                            if let Some(err) = m.error.as_ref() {
-                                println!("    Error: {}", err);
+            // Memory (recent attempts)
+            {
+                let mem = store_helpers::get_recent_memory(&store, &repo, &sidecar_key, 10).await;
+                if !mem.is_empty() {
+                    println!("\nMemory (recent attempts):");
+                    for m in mem {
+                        println!(
+                            "- Attempt {} @ {}: agent={} model={}",
+                            m.attempt,
+                            m.timestamp,
+                            m.agent,
+                            m.model.clone().unwrap_or_default()
+                        );
+                        if let Some(err) = m.error.as_ref() {
+                            println!("    Error: {}", err);
+                        }
+                        if !m.learnings.is_empty() {
+                            println!("    Learnings:");
+                            for l in &m.learnings {
+                                println!("      - {}", l);
                             }
-                            if !m.learnings.is_empty() {
-                                println!("    Learnings:");
-                                for l in &m.learnings {
-                                    println!("      - {}", l);
-                                }
-                            }
-                            if !m.files_modified.is_empty() {
-                                println!("    Files modified:");
-                                for f in &m.files_modified {
-                                    println!("      - {}", f);
-                                }
+                        }
+                        if !m.files_modified.is_empty() {
+                            println!("    Files modified:");
+                            for f in &m.files_modified {
+                                println!("      - {}", f);
                             }
                         }
                     }
@@ -805,8 +838,9 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     }
 
     // Show agent output from last attempt if available
-    let repo = config::get_current_repo().unwrap_or_default();
-    if let Ok(attempts_str) = sidecar::get(&sidecar_key, "attempts") {
+    if let Some(attempts_str) =
+        store_helpers::opt_store_or_sidecar(&store, &repo, &sidecar_key, "attempts").await
+    {
         if let Ok(attempt_n) = attempts_str.parse::<u32>() {
             if attempt_n > 0 {
                 match home::task_attempt_dir(&repo, &sidecar_key, attempt_n) {
