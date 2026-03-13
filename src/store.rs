@@ -1286,12 +1286,13 @@ impl TaskStore {
     }
 
     /// Get cost summary over multiple time windows (24h, 7d, 30d).
+    ///
+    /// Uses separate static queries per window because SQLite's `datetime()`
+    /// modifier argument cannot be parameterised via `?` bind.
     pub async fn get_cost_summary(&self) -> anyhow::Result<crate::db::CostSummary> {
-        let windows = [("24 hours", "24h"), ("7 days", "7d"), ("30 days", "30d")];
-        let mut periods = Vec::new();
-
-        for (interval, label) in &windows {
-            let query = format!(
+        // Each entry: (static SQL with the interval baked in, label)
+        let windows: &[(&str, &str)] = &[
+            (
                 "SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
                         COALESCE(SUM(output_tokens), 0) as output_tokens,
                         COALESCE(SUM(input_cost_usd), 0.0) as input_cost_usd,
@@ -1299,9 +1300,36 @@ impl TaskStore {
                         COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
                         COUNT(*) as task_count
                  FROM task_metrics
-                 WHERE completed_at >= datetime('now', '-{interval}')"
-            );
-            let row = sqlx::query(&query).fetch_one(&self.pool).await?;
+                 WHERE completed_at >= datetime('now', '-24 hours')",
+                "24h",
+            ),
+            (
+                "SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
+                        COALESCE(SUM(output_tokens), 0) as output_tokens,
+                        COALESCE(SUM(input_cost_usd), 0.0) as input_cost_usd,
+                        COALESCE(SUM(output_cost_usd), 0.0) as output_cost_usd,
+                        COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
+                        COUNT(*) as task_count
+                 FROM task_metrics
+                 WHERE completed_at >= datetime('now', '-7 days')",
+                "7d",
+            ),
+            (
+                "SELECT COALESCE(SUM(input_tokens), 0) as input_tokens,
+                        COALESCE(SUM(output_tokens), 0) as output_tokens,
+                        COALESCE(SUM(input_cost_usd), 0.0) as input_cost_usd,
+                        COALESCE(SUM(output_cost_usd), 0.0) as output_cost_usd,
+                        COALESCE(SUM(total_cost_usd), 0.0) as total_cost_usd,
+                        COUNT(*) as task_count
+                 FROM task_metrics
+                 WHERE completed_at >= datetime('now', '-30 days')",
+                "30d",
+            ),
+        ];
+
+        let mut periods = Vec::new();
+        for (query, label) in windows {
+            let row = sqlx::query(query).fetch_one(&self.pool).await?;
             periods.push(crate::db::CostPeriod {
                 label: label.to_string(),
                 input_tokens: row.get("input_tokens"),
@@ -1615,7 +1643,80 @@ impl TaskStore {
             }
         }
 
-        // 2. Walk sidecar files for external tasks
+        // 2. Migrate KV store entries
+        if let Ok(entries) = db.dump_kv().await {
+            for (key, value) in entries {
+                if let Err(e) = self.kv_set(&key, &value).await {
+                    tracing::warn!(key, err = %e, "failed to migrate kv entry");
+                    result.errors += 1;
+                } else {
+                    result.migrated += 1;
+                }
+            }
+        }
+
+        // 3. Migrate task_metrics
+        if let Ok(rows) = db.dump_task_metrics().await {
+            for row in rows {
+                let started_at = chrono::DateTime::parse_from_rfc3339(&row.6)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let completed_at = chrono::DateTime::parse_from_rfc3339(&row.7)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+
+                let metric = crate::db::InsertTaskMetric {
+                    task_id: &row.0,
+                    agent: &row.1,
+                    model: row.2.as_deref(),
+                    complexity: row.3.as_deref(),
+                    outcome: &row.4,
+                    duration_seconds: row.5,
+                    started_at: &started_at,
+                    completed_at: &completed_at,
+                    attempts: row.8,
+                    files_changed: row.9,
+                    error_type: row.10.as_deref(),
+                    input_tokens: row.11,
+                    output_tokens: row.12,
+                    input_cost_usd: row.13,
+                    output_cost_usd: row.14,
+                    total_cost_usd: row.15,
+                };
+                if let Err(e) = self.insert_task_metric(&metric).await {
+                    tracing::warn!(task_id = row.0, err = %e, "failed to migrate task metric");
+                    result.errors += 1;
+                } else {
+                    result.migrated += 1;
+                }
+            }
+        }
+
+        // 4. Migrate rate_limits
+        if let Ok(rows) = db.dump_rate_limits().await {
+            for row in rows {
+                // Insert directly to preserve original occurred_at timestamps
+                let res = sqlx::query(
+                    "INSERT INTO rate_limits (agent, limit_type, occurred_at, task_id) VALUES (?, ?, ?, ?)",
+                )
+                .bind(&row.0)
+                .bind(&row.1)
+                .bind(&row.2)
+                .bind(&row.3)
+                .execute(&self.pool)
+                .await;
+
+                match res {
+                    Ok(_) => result.migrated += 1,
+                    Err(e) => {
+                        tracing::warn!(agent = row.0, err = %e, "failed to migrate rate limit");
+                        result.errors += 1;
+                    }
+                }
+            }
+        }
+
+        // 5. Walk sidecar files for external tasks
         let state_dir = match crate::home::orch_home() {
             Ok(h) => h.join("state"),
             Err(_) => return Ok(result),
@@ -5024,5 +5125,121 @@ mod tests {
         // timeout should be first (count=2)
         assert_eq!(errors[0].error_type.as_deref(), Some("timeout"));
         assert_eq!(errors[0].count, 2);
+    }
+
+    #[tokio::test]
+    async fn slow_tasks_returns_sorted_by_duration() {
+        use chrono::Utc;
+        let store = TaskStore::open_memory().await.unwrap();
+        let now = Utc::now();
+
+        // Insert three metrics with different durations
+        for (task_id, duration) in &[("t1", 120.0), ("t2", 300.0), ("t3", 60.0)] {
+            store
+                .insert_task_metric(&crate::db::InsertTaskMetric {
+                    task_id,
+                    agent: "claude",
+                    model: Some("sonnet"),
+                    complexity: Some("medium"),
+                    outcome: "success",
+                    duration_seconds: *duration,
+                    started_at: &now,
+                    completed_at: &now,
+                    attempts: 1,
+                    files_changed: 1,
+                    error_type: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    input_cost_usd: None,
+                    output_cost_usd: None,
+                    total_cost_usd: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let slow = store.get_slow_tasks_7d().await.unwrap();
+        assert_eq!(slow.len(), 3);
+        // Should be sorted descending by duration
+        assert_eq!(slow[0].task_id, "t2");
+        assert!((slow[0].duration_seconds - 300.0).abs() < 0.01);
+        assert_eq!(slow[1].task_id, "t1");
+        assert_eq!(slow[2].task_id, "t3");
+    }
+
+    // ── pricing_for_model ──────────────────────────────────────────────
+
+    #[test]
+    fn pricing_known_models() {
+        use super::pricing_for_model;
+
+        let opus = pricing_for_model("claude-opus-4-6");
+        assert!((opus.input_per_million_usd - 15.0).abs() < 0.01);
+        assert!((opus.output_per_million_usd - 75.0).abs() < 0.01);
+
+        let sonnet = pricing_for_model("claude-sonnet-4-6");
+        assert!((sonnet.input_per_million_usd - 3.0).abs() < 0.01);
+
+        let haiku = pricing_for_model("Haiku");
+        assert!((haiku.input_per_million_usd - 0.8).abs() < 0.01);
+
+        let o3 = pricing_for_model("o3");
+        assert!((o3.input_per_million_usd - 2.0).abs() < 0.01);
+
+        let gpt_mini = pricing_for_model("o4-mini");
+        assert!((gpt_mini.input_per_million_usd - 0.15).abs() < 0.01);
+
+        let gpt41 = pricing_for_model("gpt-4.1");
+        assert!((gpt41.input_per_million_usd - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn pricing_unknown_model_returns_fallback() {
+        use super::pricing_for_model;
+        let unknown = pricing_for_model("totally-unknown-model");
+        assert!((unknown.input_per_million_usd - 1.0).abs() < 0.01);
+        assert!((unknown.output_per_million_usd - 4.0).abs() < 0.01);
+    }
+
+    // ── cost_summary static queries ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn cost_summary_returns_three_periods() {
+        use chrono::Utc;
+        let store = TaskStore::open_memory().await.unwrap();
+        let now = Utc::now();
+
+        store
+            .insert_task_metric(&crate::db::InsertTaskMetric {
+                task_id: "cost1",
+                agent: "claude",
+                model: Some("sonnet"),
+                complexity: None,
+                outcome: "success",
+                duration_seconds: 10.0,
+                started_at: &now,
+                completed_at: &now,
+                attempts: 1,
+                files_changed: 1,
+                error_type: None,
+                input_tokens: Some(1000),
+                output_tokens: Some(500),
+                input_cost_usd: Some(0.003),
+                output_cost_usd: Some(0.0075),
+                total_cost_usd: Some(0.0105),
+            })
+            .await
+            .unwrap();
+
+        let summary = store.get_cost_summary().await.unwrap();
+        assert_eq!(summary.periods.len(), 3);
+        assert_eq!(summary.periods[0].label, "24h");
+        assert_eq!(summary.periods[1].label, "7d");
+        assert_eq!(summary.periods[2].label, "30d");
+        // All three windows should include our recent metric
+        for period in &summary.periods {
+            assert_eq!(period.task_count, 1);
+            assert!(period.total_cost_usd > 0.0);
+        }
     }
 }

@@ -624,7 +624,8 @@ async fn main() -> anyhow::Result<()> {
             let store = cli::init_store().await?;
             let db = db::Db::open(&db::default_path()?)?;
             let default_repo = config::get_current_repo().unwrap_or_default();
-            println!("Migrating sidecar files and internal tasks to SQLite store...");
+            db.migrate().await?;
+            println!("Migrating sidecars, internal tasks, KV, metrics, and rate limits to SQLite store...");
             let result = store.migrate_sidecars(&db, &default_repo).await?;
             println!(
                 "Migration complete: {} migrated, {} skipped, {} errors",

@@ -176,107 +176,6 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
-    #[allow(dead_code)]
-    pub async fn get_internal_task(&self, id: i64) -> anyhow::Result<InternalTask> {
-        let conn = self.conn.lock().await;
-        let task = conn.query_row(
-            "SELECT id, title, body, status, source, source_id, agent, block_reason, created_at, updated_at
-             FROM internal_tasks WHERE id = ?1",
-            [id],
-            |row| {
-                let status_str: String = row.get(3)?;
-                let created_str: String = row.get(8)?;
-                let updated_str: String = row.get(9)?;
-                Ok(InternalTask {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    body: row.get(2)?,
-                    status: TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::New),
-                    source: row.get(4)?,
-                    source_id: row.get(5)?,
-                    agent: row.get(6)?,
-                    block_reason: row.get(7)?,
-                    created_at: DateTime::parse_from_rfc3339(&created_str)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(id, error = %e, "corrupt created_at timestamp in internal_task");
-                            Utc::now()
-                        }),
-                    updated_at: DateTime::parse_from_rfc3339(&updated_str)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(id, error = %e, "corrupt updated_at timestamp in internal_task");
-                            Utc::now()
-                        }),
-                })
-            },
-        )?;
-        Ok(task)
-    }
-
-    #[allow(dead_code)]
-    pub async fn list_internal_tasks_by_status(
-        &self,
-        status: TaskStatus,
-    ) -> anyhow::Result<Vec<InternalTask>> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT id, title, body, status, source, source_id, agent, block_reason, created_at, updated_at
-             FROM internal_tasks WHERE status = ?1 ORDER BY created_at DESC",
-        )?;
-        let tasks = stmt.query_map([status.as_str()], |row| {
-            let status_str: String = row.get(3)?;
-            let created_str: String = row.get(8)?;
-            let updated_str: String = row.get(9)?;
-            Ok(InternalTask {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                body: row.get(2)?,
-                status: TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::New),
-                source: row.get(4)?,
-                source_id: row.get(5)?,
-                agent: row.get(6)?,
-                block_reason: row.get(7)?,
-                created_at: DateTime::parse_from_rfc3339(&created_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "corrupt created_at timestamp in internal_task");
-                        Utc::now()
-                    }),
-                updated_at: DateTime::parse_from_rfc3339(&updated_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "corrupt updated_at timestamp in internal_task");
-                        Utc::now()
-                    }),
-            })
-        })?;
-        let result: Vec<InternalTask> = tasks
-            .filter_map(|r| match r {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!(?e, "failed to parse row");
-                    None
-                }
-            })
-            .collect();
-        Ok(result)
-    }
-
-    #[allow(dead_code)]
-    pub async fn update_internal_task_status(
-        &self,
-        id: i64,
-        status: TaskStatus,
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "UPDATE internal_tasks SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?2",
-            rusqlite::params![status.as_str(), id],
-        )?;
-        Ok(())
-    }
-
     /// Get a value from the kv store.
     pub async fn kv_get(&self, key: &str) -> anyhow::Result<Option<String>> {
         let conn = self.conn.lock().await;
@@ -345,6 +244,81 @@ impl Db {
             })
             .collect();
         Ok(result)
+    }
+
+    /// Dump all KV entries for migration. Returns (key, value) pairs.
+    pub async fn dump_kv(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare("SELECT key, value FROM kv")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Dump all task_metrics rows for migration.
+    #[allow(clippy::type_complexity)]
+    pub async fn dump_task_metrics(
+        &self,
+    ) -> anyhow::Result<
+        Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            f64,
+            String,
+            String,
+            i32,
+            i32,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        )>,
+    > {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, agent, model, complexity, outcome, duration_seconds,
+                    started_at, completed_at, attempts, files_changed, error_type,
+                    input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd
+             FROM task_metrics",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+                row.get(12)?,
+                row.get(13)?,
+                row.get(14)?,
+                row.get(15)?,
+            ))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Dump all rate_limits rows for migration. Returns (agent, limit_type, occurred_at, task_id).
+    pub async fn dump_rate_limits(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String, String, Option<String>)>> {
+        let conn = self.conn.lock().await;
+        let mut stmt =
+            conn.prepare("SELECT agent, limit_type, occurred_at, task_id FROM rate_limits")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// Insert a new task metric record.
@@ -926,63 +900,6 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.migrate().await.unwrap();
         db.migrate().await.unwrap(); // should not error
-    }
-
-    #[tokio::test]
-    async fn create_internal_task_crud() {
-        let db = Db::open_memory().unwrap();
-        db.migrate().await.unwrap();
-
-        let id = db
-            .create_internal_task("Test task", "Test body", "cron", "daily-sync")
-            .await
-            .unwrap();
-        assert_eq!(id, 1);
-
-        let task = db.get_internal_task(id).await.unwrap();
-        assert_eq!(task.title, "Test task");
-        assert_eq!(task.body, "Test body");
-        assert_eq!(task.source, "cron");
-        assert_eq!(task.source_id, "daily-sync");
-        assert_eq!(task.status, TaskStatus::New);
-
-        db.update_internal_task_status(id, TaskStatus::Done)
-            .await
-            .unwrap();
-        let task = db.get_internal_task(id).await.unwrap();
-        assert_eq!(task.status, TaskStatus::Done);
-    }
-
-    #[tokio::test]
-    async fn list_internal_tasks_by_status() {
-        let db = Db::open_memory().unwrap();
-        db.migrate().await.unwrap();
-
-        db.create_internal_task("Task 1", "", "cron", "job1")
-            .await
-            .unwrap();
-        db.create_internal_task("Task 2", "", "cron", "job2")
-            .await
-            .unwrap();
-        db.create_internal_task("Task 3", "", "manual", "manual1")
-            .await
-            .unwrap();
-
-        let new_tasks = db
-            .list_internal_tasks_by_status(TaskStatus::New)
-            .await
-            .unwrap();
-        assert_eq!(new_tasks.len(), 3);
-
-        db.update_internal_task_status(1, TaskStatus::Done)
-            .await
-            .unwrap();
-        let done_tasks = db
-            .list_internal_tasks_by_status(TaskStatus::Done)
-            .await
-            .unwrap();
-        assert_eq!(done_tasks.len(), 1);
-        assert_eq!(done_tasks[0].title, "Task 1");
     }
 
     #[tokio::test]
