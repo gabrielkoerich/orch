@@ -201,7 +201,8 @@ impl TaskStore {
             .filename(db_path)
             .journal_mode(SqliteJournalMode::Wal)
             .create_if_missing(true)
-            .busy_timeout(std::time::Duration::from_secs(5));
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .pragma("foreign_keys", "ON");
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -217,9 +218,12 @@ impl TaskStore {
     /// Open an in-memory store (for testing).
     #[cfg(test)]
     pub async fn open_memory() -> anyhow::Result<Self> {
+        let options = SqliteConnectOptions::new()
+            .filename(":memory:")
+            .pragma("foreign_keys", "ON");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect_with(options)
             .await?;
 
         let store = Self { pool };
@@ -587,15 +591,23 @@ impl TaskStore {
     // ---------------------------------------------------------------
 
     /// Append a memory entry to the task's memory JSON array.
+    ///
+    /// Uses a transaction to prevent lost-update races when concurrent
+    /// callers append simultaneously.
     pub async fn append_memory(&self, id: i64, entry: &MemoryEntry) -> anyhow::Result<()> {
-        // Read current, append, write back — all in one query
+        let mut tx = self.pool.begin().await?;
+
         let row = sqlx::query("SELECT memory FROM tasks WHERE id = ?")
             .bind(id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
 
         let memory_str: String = row.get("memory");
-        let mut memory: Vec<MemoryEntry> = serde_json::from_str(&memory_str).unwrap_or_default();
+        let mut memory: Vec<MemoryEntry> = serde_json::from_str(&memory_str)
+            .inspect_err(
+                |e| tracing::warn!(task_id = id, error = %e, "corrupt memory JSON, resetting"),
+            )
+            .unwrap_or_default();
         memory.push(entry.clone());
         let new_json = serde_json::to_string(&memory)?;
 
@@ -604,9 +616,10 @@ impl TaskStore {
         )
         .bind(&new_json)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -618,7 +631,9 @@ impl TaskStore {
             .await?;
 
         let memory_str: String = row.get("memory");
-        let mut memory: Vec<MemoryEntry> = serde_json::from_str(&memory_str).unwrap_or_default();
+        let mut memory: Vec<MemoryEntry> = serde_json::from_str(&memory_str)
+            .inspect_err(|e| tracing::warn!(task_id = id, error = %e, "corrupt memory JSON"))
+            .unwrap_or_default();
 
         memory.sort_by_key(|m| m.attempt);
         if memory.len() > max {
@@ -982,7 +997,7 @@ impl TaskStore {
 
         if !updates.is_empty() {
             if let Err(e) = self.set_fields(store_id, &updates).await {
-                tracing::debug!(store_id, error = %e, "dual-write: failed to sync sidecar → store");
+                tracing::warn!(store_id, error = %e, "dual-write: failed to sync sidecar → store");
             }
         }
     }
@@ -994,10 +1009,10 @@ impl TaskStore {
         repo: &str,
         sidecar_task_id: &str,
     ) -> anyhow::Result<Option<i64>> {
-        // Internal tasks use "internal:{n}" format
+        // Internal tasks use "internal:{n}" format — these use the old rusqlite
+        // ID space and don't have external_id entries in the unified store yet.
+        // After `orch migrate` they'll be in the store with origin='internal'.
         if sidecar_task_id.starts_with("internal:") {
-            // Internal tasks aren't in the store yet (will be migrated in Phase 4)
-            // For now, return None
             return Ok(None);
         }
         // External tasks: look up by external_id
@@ -3541,5 +3556,529 @@ mod tests {
             internal.is_empty(),
             "no tasks should exist under empty repo"
         );
+    }
+
+    #[tokio::test]
+    async fn append_memory_within_transaction() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Memory tx test".to_string(),
+                body: "".to_string(),
+                source: "".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Append two entries sequentially — both should be preserved
+        store
+            .append_memory(
+                id,
+                &MemoryEntry {
+                    attempt: 1,
+                    agent: "claude".to_string(),
+                    model: Some("opus".to_string()),
+                    learnings: vec!["first learning".to_string()],
+                    error: None,
+                    files_modified: vec![],
+                    approach: "first approach".to_string(),
+                    timestamp: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .append_memory(
+                id,
+                &MemoryEntry {
+                    attempt: 2,
+                    agent: "codex".to_string(),
+                    model: Some("gpt-5".to_string()),
+                    learnings: vec!["second learning".to_string()],
+                    error: None,
+                    files_modified: vec![],
+                    approach: "second approach".to_string(),
+                    timestamp: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mem = store.recent_memory(id, 10).await.unwrap();
+        assert_eq!(mem.len(), 2);
+        assert_eq!(mem[0].approach, "first approach");
+        assert_eq!(mem[1].approach, "second approach");
+    }
+
+    #[tokio::test]
+    async fn set_fields_with_numeric_bool_null_types() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: Some("99".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Type test".to_string(),
+                body: "".to_string(),
+                source: "".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Set a numeric field
+        store
+            .set_fields(id, &[("pr_number", serde_json::json!(42))])
+            .await
+            .unwrap();
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.pr_number, Some(42));
+
+        // Set a boolean field
+        store
+            .set_fields(id, &[("budget_exceeded", serde_json::json!(true))])
+            .await
+            .unwrap();
+        let task = store.get(id).await.unwrap();
+        assert!(task.budget_exceeded);
+
+        // Set a field to null (empty string)
+        store
+            .set_fields(id, &[("summary", serde_json::Value::Null)])
+            .await
+            .unwrap();
+        let task = store.get(id).await.unwrap();
+        assert!(task.summary.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_task_id_for_external_and_internal() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: Some("123".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Resolve test".to_string(),
+                body: "".to_string(),
+                source: "".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // External task resolves
+        let resolved = store.resolve_task_id("owner/repo", "123").await.unwrap();
+        assert_eq!(resolved, Some(id));
+
+        // Wrong repo returns None
+        let resolved = store.resolve_task_id("other/repo", "123").await.unwrap();
+        assert_eq!(resolved, None);
+
+        // Internal task ID format returns None (not migrated yet)
+        let resolved = store
+            .resolve_task_id("owner/repo", "internal:5")
+            .await
+            .unwrap();
+        assert_eq!(resolved, None);
+
+        // Non-existent external ID returns None
+        let resolved = store.resolve_task_id("owner/repo", "999").await.unwrap();
+        assert_eq!(resolved, None);
+    }
+
+    #[tokio::test]
+    async fn list_cleanable_excludes_active_and_already_cleaned() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        // Create tasks in various states
+        let done_id = store
+            .create(&NewTask {
+                external_id: Some("1".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Done task".to_string(),
+                body: "".to_string(),
+                source: "".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(done_id, TaskStatus::Done)
+            .await
+            .unwrap();
+        store
+            .set_fields(done_id, &[("worktree", serde_json::json!("/tmp/wt1"))])
+            .await
+            .unwrap();
+
+        let active_id = store
+            .create(&NewTask {
+                external_id: Some("2".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Active task".to_string(),
+                body: "".to_string(),
+                source: "".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(active_id, TaskStatus::InProgress)
+            .await
+            .unwrap();
+        store
+            .set_fields(active_id, &[("worktree", serde_json::json!("/tmp/wt2"))])
+            .await
+            .unwrap();
+
+        let cleaned_id = store
+            .create(&NewTask {
+                external_id: Some("3".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Already cleaned".to_string(),
+                body: "".to_string(),
+                source: "".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(cleaned_id, TaskStatus::Done)
+            .await
+            .unwrap();
+        store
+            .set_fields(cleaned_id, &[("worktree", serde_json::json!("/tmp/wt3"))])
+            .await
+            .unwrap();
+        store.mark_cleaned(cleaned_id).await.unwrap();
+
+        let cleanable = store.list_cleanable("owner/repo").await.unwrap();
+        assert_eq!(cleanable.len(), 1);
+        assert_eq!(cleanable[0].id, done_id);
+    }
+
+    #[tokio::test]
+    async fn prune_old_runs_only_removes_old_terminal_tasks() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        // Create a done task
+        let done_id = store
+            .create(&NewTask {
+                external_id: Some("1".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Old done".to_string(),
+                body: "".to_string(),
+                source: "".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(done_id, TaskStatus::Done)
+            .await
+            .unwrap();
+
+        // Backdate the updated_at to 60 days ago
+        sqlx::query("UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-60 days') WHERE id = ?")
+            .bind(done_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        // Add a run to the old done task
+        store
+            .start_run(&StartRun {
+                task_id: done_id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "opus",
+                command: "cmd",
+                prompt: "prompt",
+            })
+            .await
+            .unwrap();
+
+        // Create an active task with a run
+        let active_id = store
+            .create(&NewTask {
+                external_id: Some("2".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Active".to_string(),
+                body: "".to_string(),
+                source: "".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .start_run(&StartRun {
+                task_id: active_id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "opus",
+                command: "cmd",
+                prompt: "prompt",
+            })
+            .await
+            .unwrap();
+
+        // Prune runs older than 30 days
+        let pruned = store.prune_old_runs(30).await.unwrap();
+        assert_eq!(pruned, 1);
+
+        // Old done task's runs are gone
+        let old_runs = store.get_runs(done_id).await.unwrap();
+        assert!(old_runs.is_empty());
+
+        // Active task's runs are preserved
+        let active_runs = store.get_runs(active_id).await.unwrap();
+        assert_eq!(active_runs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn foreign_key_constraint_on_task_runs() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        // Try to create a run for a non-existent task — should fail with FK constraint
+        let result = store
+            .start_run(&StartRun {
+                task_id: 99999,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "opus",
+                command: "cmd",
+                prompt: "prompt",
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "FK constraint should prevent orphaned runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_fields_multiple_fields_at_once() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: Some("1".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Multi-field".to_string(),
+                body: "".to_string(),
+                source: "".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Set multiple fields atomically
+        store
+            .set_fields(
+                id,
+                &[
+                    ("agent", serde_json::json!("claude")),
+                    ("model", serde_json::json!("opus")),
+                    ("complexity", serde_json::json!("complex")),
+                    ("branch", serde_json::json!("feat/test")),
+                    ("pr_number", serde_json::json!(42)),
+                    ("attempts", serde_json::json!(3)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.agent, Some("claude".to_string()));
+        assert_eq!(task.model, Some("opus".to_string()));
+        assert_eq!(task.complexity, "complex");
+        assert_eq!(task.branch, "feat/test");
+        assert_eq!(task.pr_number, Some(42));
+        assert_eq!(task.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn store_tokens_overwrites_previous_values() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Token test".to_string(),
+                body: "".to_string(),
+                source: "".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // First token store
+        store.store_tokens(id, 1000, 500, "haiku").await.unwrap();
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.input_tokens, 1000);
+        assert_eq!(task.output_tokens, 500);
+
+        // Second store overwrites (not accumulates)
+        store.store_tokens(id, 2000, 1000, "sonnet").await.unwrap();
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.input_tokens, 2000);
+        assert_eq!(task.output_tokens, 1000);
+        assert_eq!(task.model, Some("sonnet".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cost_summary_across_multiple_tasks() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        for i in 1..=3 {
+            let id = store
+                .create(&NewTask {
+                    external_id: Some(i.to_string()),
+                    repo: "owner/repo".to_string(),
+                    origin: "github".to_string(),
+                    title: format!("Task {i}"),
+                    body: "".to_string(),
+                    source: "".to_string(),
+                    source_id: "".to_string(),
+                    author: "".to_string(),
+                    url: "".to_string(),
+                    labels: vec![],
+                })
+                .await
+                .unwrap();
+            store
+                .store_tokens(id, 1000 * i, 500 * i, "haiku")
+                .await
+                .unwrap();
+        }
+
+        let (input, output, _cost) = store.cost_summary("owner/repo").await.unwrap();
+        assert_eq!(input, 6000); // 1000 + 2000 + 3000
+        assert_eq!(output, 3000); // 500 + 1000 + 1500
+    }
+
+    #[tokio::test]
+    async fn status_counts_with_mixed_statuses() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        for i in 1..=5 {
+            let id = store
+                .create(&NewTask {
+                    external_id: Some(i.to_string()),
+                    repo: "owner/repo".to_string(),
+                    origin: "github".to_string(),
+                    title: format!("Task {i}"),
+                    body: "".to_string(),
+                    source: "".to_string(),
+                    source_id: "".to_string(),
+                    author: "".to_string(),
+                    url: "".to_string(),
+                    labels: vec![],
+                })
+                .await
+                .unwrap();
+            if i <= 2 {
+                store
+                    .update_status(id, TaskStatus::InProgress)
+                    .await
+                    .unwrap();
+            } else if i == 3 {
+                store.update_status(id, TaskStatus::Done).await.unwrap();
+            }
+            // Tasks 4-5 stay New
+        }
+
+        let counts = store.status_counts("owner/repo").await.unwrap();
+        assert_eq!(counts.get("new").copied().unwrap_or(0), 2);
+        assert_eq!(counts.get("in_progress").copied().unwrap_or(0), 2);
+        assert_eq!(counts.get("done").copied().unwrap_or(0), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_external_task_creates_then_updates() {
+        use crate::backends::{ExternalId, ExternalTask};
+
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let ext1 = ExternalTask {
+            id: ExternalId("55".to_string()),
+            title: "Original title".to_string(),
+            body: "Original body".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "user".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://github.com/owner/repo/issues/55".to_string(),
+        };
+        let id1 = store
+            .ensure_external_task("owner/repo", &ext1)
+            .await
+            .unwrap();
+
+        let ext2 = ExternalTask {
+            id: ExternalId("55".to_string()),
+            title: "Updated title".to_string(),
+            body: "Updated body".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "user".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            url: "https://github.com/owner/repo/issues/55".to_string(),
+        };
+        let id2 = store
+            .ensure_external_task("owner/repo", &ext2)
+            .await
+            .unwrap();
+
+        assert_eq!(id1, id2);
+        let task = store.get(id1).await.unwrap();
+        assert_eq!(task.title, "Updated title");
+        assert_eq!(task.body, "Updated body");
     }
 }
