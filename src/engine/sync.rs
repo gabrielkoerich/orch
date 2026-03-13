@@ -9,7 +9,7 @@
 //! - Owner /slash command scanning
 //! - Skill repository syncing
 
-use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
+use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::db::{Db, TaskStatus};
@@ -63,7 +63,7 @@ pub(crate) async fn sync_tick(
     }
 
     // 3. Scan for @mentions
-    if let Err(e) = scan_mentions(backend, db).await {
+    if let Err(e) = scan_mentions(backend, db, Some(store), repo).await {
         tracing::warn!(err = %e, "mention scan failed");
     }
 
@@ -83,22 +83,10 @@ pub(crate) async fn sync_tick(
             .await
             .unwrap_or_default();
         if let Ok(internal_needs_review) = task_manager
-            .db_list_internal_by_status(TaskStatus::NeedsReview)
+            .list_internal_by_status(TaskStatus::NeedsReview)
             .await
         {
-            for t in internal_needs_review {
-                needs_review_tasks.push(ExternalTask {
-                    id: ExternalId(format!("internal:{}", t.id)),
-                    title: t.title,
-                    body: t.body,
-                    state: "open".to_string(),
-                    labels: vec!["status:needs_review".to_string()],
-                    author: t.source,
-                    created_at: t.created_at.to_rfc3339(),
-                    updated_at: t.updated_at.to_rfc3339(),
-                    url: String::new(),
-                });
-            }
+            needs_review_tasks.extend(internal_needs_review);
         }
 
         for task in needs_review_tasks {
@@ -247,22 +235,10 @@ pub(crate) async fn sync_tick(
             .unwrap_or_default();
         // Also include internal InReview tasks.
         if let Ok(internal_in_review) = task_manager
-            .db_list_internal_by_status(TaskStatus::InReview)
+            .list_internal_by_status(TaskStatus::InReview)
             .await
         {
-            for t in internal_in_review {
-                in_review_tasks.push(ExternalTask {
-                    id: ExternalId(format!("internal:{}", t.id)),
-                    title: t.title,
-                    body: t.body,
-                    state: "open".to_string(),
-                    labels: vec!["status:in_review".to_string()],
-                    author: t.source,
-                    created_at: t.created_at.to_rfc3339(),
-                    updated_at: t.updated_at.to_rfc3339(),
-                    url: String::new(),
-                });
-            }
+            in_review_tasks.extend(internal_in_review);
         }
         for task in in_review_tasks {
             // Skip tasks that just transitioned to InReview — allow time for the
@@ -356,7 +332,12 @@ async fn reset_to_needs_review_with_retry(backend: &Arc<dyn ExternalBackend>, ta
 ///
 /// Checks recent issue comments for @orchestrator mentions,
 /// creates internal tasks, and acknowledges them.
-async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyhow::Result<()> {
+async fn scan_mentions(
+    backend: &Arc<dyn ExternalBackend>,
+    db: &Arc<Db>,
+    store: Option<&Arc<crate::store::TaskStore>>,
+    repo: &str,
+) -> anyhow::Result<()> {
     // Get the current user (for mention detection)
     let current_user = match backend.get_authenticated_user().await {
         Ok(Some(u)) => format!("@{}", u),
@@ -386,15 +367,17 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
     };
 
     // Get existing mention tasks across ALL statuses to avoid duplicates.
-    // Only checking New status would miss tasks that progressed to InProgress/Done,
-    // causing duplicate tasks on the next sync tick within the 24h window.
-    let existing_mentions: std::collections::HashSet<String> = db
-        .list_all_internal_tasks()
-        .await?
-        .into_iter()
-        .filter(|t| t.source == "mention")
-        .map(|t| t.source_id.clone())
-        .collect();
+    let existing_mentions: std::collections::HashSet<String> = if let Some(s) = store {
+        s.list_all_internal(repo)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.source == "mention")
+            .map(|t| t.source_id.clone())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
 
     for mention in mentions {
         // Skip if already processed
@@ -410,11 +393,12 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
         let title = format!("Respond to mention by @{}", mention.author);
         let task_body = format!("Mention by @{}:\n\n{}", mention.author, mention.body);
 
-        let task_id = db
-            .create_internal_task(&title, &task_body, "mention", &mention.id)
-            .await?;
-
-        tracing::info!(task_id, mention_id = %mention.id, "created mention task");
+        if let Some(s) = store {
+            let task_id = s
+                .create_internal(repo, &title, &task_body, "mention", &mention.id)
+                .await?;
+            tracing::info!(task_id, mention_id = %mention.id, "created mention task");
+        }
     }
 
     // Persist cursor so the next sync tick only fetches newer comments

@@ -172,10 +172,10 @@ pub(crate) async fn tick_recover_stuck_tasks(
     // These have no GitHub labels or comments — just reset the DB status to New.
     use crate::db::TaskStatus as DbStatus;
     let internal_in_progress = task_manager
-        .db_list_internal_by_status(DbStatus::InProgress)
+        .list_internal_by_status(DbStatus::InProgress)
         .await?;
     for task in &internal_in_progress {
-        let task_id = format!("internal:{}", task.id);
+        let task_id = task.id.0.clone();
         let session_name = tmux.session_name(repo, &task_id);
         let has_session = tmux.session_exists(&session_name).await;
 
@@ -185,7 +185,11 @@ pub(crate) async fn tick_recover_stuck_tasks(
             config.no_session_stuck_timeout
         };
 
-        let age = chrono::Utc::now() - task.updated_at;
+        let age = if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
+            chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc)
+        } else {
+            continue;
+        };
 
         if age.num_seconds() > threshold as i64 {
             if has_session {
@@ -359,21 +363,9 @@ pub(crate) async fn tick_dispatch_tasks(
     // Also include internal tasks in Routed status.
     use crate::db::TaskStatus as DbStatus;
     let internal_routed = task_manager
-        .db_list_internal_by_status(DbStatus::Routed)
+        .list_internal_by_status(DbStatus::Routed)
         .await?;
-    for t in internal_routed {
-        routed_tasks.push(ExternalTask {
-            id: ExternalId(format!("internal:{}", t.id)),
-            title: t.title,
-            body: t.body,
-            state: "open".to_string(),
-            labels: vec!["status:routed".to_string()],
-            author: t.source,
-            created_at: t.created_at.to_rfc3339(),
-            updated_at: t.updated_at.to_rfc3339(),
-            url: String::new(),
-        });
-    }
+    routed_tasks.extend(internal_routed);
 
     let dispatchable: Vec<&ExternalTask> = routed_tasks
         .iter()
@@ -809,8 +801,10 @@ pub(crate) async fn tick_job_scheduler(
     jobs_path: &std::path::PathBuf,
     backend: &Arc<dyn ExternalBackend>,
     db: &Arc<Db>,
+    store: Option<&Arc<crate::store::TaskStore>>,
+    repo: &str,
 ) -> anyhow::Result<()> {
-    jobs::tick(jobs_path, backend, db).await
+    jobs::tick(jobs_path, backend, db, store, repo).await
 }
 
 /// Core tick — runs every 10s.
@@ -861,7 +855,7 @@ pub(crate) async fn tick(
     )
     .await?;
     tick_unblock_parents(backend, task_manager).await?;
-    if let Err(e) = tick_job_scheduler(jobs_path, backend, db).await {
+    if let Err(e) = tick_job_scheduler(jobs_path, backend, db, Some(store), repo).await {
         tracing::error!(?e, "job scheduler tick failed");
     }
     Ok(())

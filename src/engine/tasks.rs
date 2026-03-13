@@ -1,6 +1,6 @@
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
-use crate::db::{Db, InternalTask, TaskStatus};
-use crate::store::TaskStore;
+use crate::db::{Db, TaskStatus};
+use crate::store::{self, TaskStore};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -52,9 +52,10 @@ pub struct TaskFilter {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum Task {
     External(ExternalTask),
-    Internal(InternalTask),
+    Internal(store::Task),
 }
 
 pub struct TaskManager {
@@ -106,11 +107,20 @@ impl TaskManager {
     pub async fn create_task(&self, req: CreateTaskRequest) -> anyhow::Result<Task> {
         match req.task_type {
             TaskType::Internal => {
-                let id = self
-                    .db
-                    .create_internal_task(&req.title, &req.body, &req.source, &req.source_id)
+                let store = self
+                    .store
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("store required for internal tasks"))?;
+                let id = store
+                    .create_internal(
+                        &self.repo,
+                        &req.title,
+                        &req.body,
+                        &req.source,
+                        &req.source_id,
+                    )
                     .await?;
-                let task = self.db.get_internal_task(id).await?;
+                let task = store.get(id).await?;
                 Ok(Task::Internal(task))
             }
             TaskType::External => {
@@ -125,27 +135,32 @@ impl TaskManager {
     }
 
     pub async fn get_task(&self, id: i64) -> anyhow::Result<Task> {
-        match self.db.get_internal_task(id).await {
-            Ok(internal) => Ok(Task::Internal(internal)),
-            Err(internal_err) => {
-                let ext_id = ExternalId(id.to_string());
-                match self.backend.get_task(&ext_id).await {
-                    Ok(external) => Ok(Task::External(external)),
-                    Err(external_err) => Err(internal_err.context(format!(
-                        "task {id} not found internally or externally (external: {external_err})"
-                    ))),
+        // Try store first (covers both internal and external tasks)
+        if let Some(ref store) = self.store {
+            if let Ok(task) = store.get(id).await {
+                if task.origin == "internal" {
+                    return Ok(Task::Internal(task));
                 }
+                // External task found in store — still return as External from backend
+                // for compatibility with callers that expect ExternalTask fields
             }
+        }
+        // Fall back to backend for external tasks
+        let ext_id = ExternalId(id.to_string());
+        match self.backend.get_task(&ext_id).await {
+            Ok(external) => Ok(Task::External(external)),
+            Err(external_err) => Err(anyhow::anyhow!(
+                "task {id} not found in store or externally (external: {external_err})"
+            )),
         }
     }
 
     /// List tasks by status, source, or both.
-    /// Returns both internal (SQLite) and external (GitHub) tasks.
+    /// Returns both internal (store) and external (GitHub) tasks.
     pub async fn list_tasks(&self, filter: TaskFilter) -> anyhow::Result<Vec<Task>> {
         let mut tasks = Vec::new();
 
         if let Some(status_str) = &filter.status {
-            // Map string status to TaskStatus and Status
             let task_status = TaskStatus::from_str(status_str).unwrap_or(TaskStatus::New);
             let backend_status = match status_str.as_str() {
                 "new" => Status::New,
@@ -158,17 +173,19 @@ impl TaskManager {
                 _ => Status::New,
             };
 
-            // Get internal tasks with this status
-            let internal_tasks = self.db.list_internal_tasks_by_status(task_status).await?;
-
-            // Apply source filter if specified
-            for t in internal_tasks {
-                if let Some(ref source) = filter.source {
-                    if t.source != *source {
-                        continue;
+            // Get internal tasks from store
+            if let Some(ref store) = self.store {
+                let internal_tasks = store
+                    .list_internal_by_status(&self.repo, task_status)
+                    .await?;
+                for t in internal_tasks {
+                    if let Some(ref source) = filter.source {
+                        if t.source != *source {
+                            continue;
+                        }
                     }
+                    tasks.push(Task::Internal(t));
                 }
-                tasks.push(Task::Internal(t));
             }
 
             // Get external tasks with this status
@@ -177,18 +194,22 @@ impl TaskManager {
                 tasks.push(Task::External(t));
             }
         } else if let Some(source) = &filter.source {
-            // Only source filter — query all internal tasks across all statuses
-            let all_internal = self.db.list_all_internal_tasks().await?;
-            for t in all_internal {
-                if t.source == *source {
-                    tasks.push(Task::Internal(t));
+            // Only source filter — query all internal tasks from store
+            if let Some(ref store) = self.store {
+                let all_internal = store.list_all_internal(&self.repo).await?;
+                for t in all_internal {
+                    if t.source == *source {
+                        tasks.push(Task::Internal(t));
+                    }
                 }
             }
         } else {
             // No filters — return all internal tasks + new external tasks
-            let internal_tasks = self.db.list_all_internal_tasks().await?;
-            for t in internal_tasks {
-                tasks.push(Task::Internal(t));
+            if let Some(ref store) = self.store {
+                let internal_tasks = store.list_all_internal(&self.repo).await?;
+                for t in internal_tasks {
+                    tasks.push(Task::Internal(t));
+                }
             }
             let external_tasks = self.backend.list_by_status(Status::New).await?;
             for t in external_tasks {
@@ -213,51 +234,62 @@ impl TaskManager {
     }
 
     /// Get open tasks that are routable (no status:* label or status:new).
-    /// Includes both external (GitHub) tasks and internal (SQLite) tasks in New status.
+    /// Includes both external (GitHub) tasks and internal (store) tasks in New status.
     pub async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
         let mut tasks = self.backend.list_routable().await?;
 
-        // Include internal tasks with New status so the engine can dispatch them.
-        let internal_new = self
-            .db
-            .list_internal_tasks_by_status(TaskStatus::New)
-            .await?;
-        for t in internal_new {
-            tasks.push(ExternalTask {
-                id: ExternalId(format!("internal:{}", t.id)),
-                title: t.title,
-                body: t.body,
-                state: "open".to_string(),
-                labels: vec!["status:new".to_string()],
-                author: t.source,
-                created_at: t.created_at.to_rfc3339(),
-                updated_at: t.updated_at.to_rfc3339(),
-                url: String::new(),
-            });
+        // Include internal tasks with New status from the store.
+        if let Some(ref store) = self.store {
+            let internal_new = store
+                .list_internal_by_status(&self.repo, TaskStatus::New)
+                .await?;
+            for t in internal_new {
+                let ext_id = t
+                    .external_id
+                    .clone()
+                    .unwrap_or_else(|| format!("internal:{}", t.id));
+                tasks.push(ExternalTask {
+                    id: ExternalId(ext_id),
+                    title: t.title,
+                    body: t.body,
+                    state: "open".to_string(),
+                    labels: vec!["status:new".to_string()],
+                    author: t.source,
+                    created_at: t.created_at.clone(),
+                    updated_at: t.updated_at.clone(),
+                    url: String::new(),
+                });
+            }
         }
 
         Ok(tasks)
     }
 
     /// Update the status of an internal or external task by its string ID.
-    /// For `"internal:{n}"` IDs, updates SQLite. For all others, calls the backend.
-    /// Also dual-writes to the unified store if available.
+    /// For `"internal:{n}"` IDs, updates the store. For all others, calls the backend.
+    /// Store is always updated when available.
     pub async fn update_task_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
-        let result = if let Some(internal_id) = parse_internal_id(&id.0) {
-            self.db
-                .update_internal_task_status(internal_id, status_to_task_status(status))
-                .await
-        } else {
-            self.backend.update_status(id, status).await
-        };
+        let task_status = status_to_task_status(status);
 
-        // Dual-write: mirror status to unified store (best-effort)
+        if is_internal_id(&id.0) {
+            // Internal tasks: store is the single source of truth
+            let store = self
+                .store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("store required for internal task status update"))?;
+            if let Some(store_id) = store.resolve_task_id(&self.repo, &id.0).await? {
+                store.update_status(store_id, task_status).await?;
+            }
+            return Ok(());
+        }
+
+        // External tasks: update backend + mirror to store
+        let result = self.backend.update_status(id, status).await;
+
         if result.is_ok() {
             if let Some(ref store) = self.store {
                 if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &id.0).await {
-                    let _ = store
-                        .update_status(store_id, status_to_task_status(status))
-                        .await;
+                    let _ = store.update_status(store_id, task_status).await;
                 }
             }
         }
@@ -265,24 +297,68 @@ impl TaskManager {
         result
     }
 
-    /// List internal tasks by DB status (used by the dispatch phase).
-    pub async fn db_list_internal_by_status(
+    /// List internal tasks by status from the store.
+    /// Returns store::Task items converted to ExternalTask for backward compatibility.
+    pub async fn list_internal_by_status(
         &self,
         status: TaskStatus,
-    ) -> anyhow::Result<Vec<InternalTask>> {
-        self.db.list_internal_tasks_by_status(status).await
+    ) -> anyhow::Result<Vec<ExternalTask>> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("store required"))?;
+        let tasks = store.list_internal_by_status(&self.repo, status).await?;
+        Ok(tasks
+            .into_iter()
+            .map(|t| store_task_to_external(&t))
+            .collect())
+    }
+
+    /// List all internal tasks from the store.
+    pub async fn list_all_internal(&self) -> anyhow::Result<Vec<store::Task>> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("store required"))?;
+        store.list_all_internal(&self.repo).await
     }
 
     pub async fn publish_task(&self, id: i64, labels: &[String]) -> anyhow::Result<ExternalId> {
-        let internal = self.db.get_internal_task(id).await?;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("store required for publish_task"))?;
+        let task = store.get(id).await?;
         let ext_id = self
             .backend
-            .create_task(&internal.title, &internal.body, labels)
+            .create_task(&task.title, &task.body, labels)
             .await?;
-        self.db
-            .update_internal_task_status(id, TaskStatus::Done)
-            .await?;
+        store.update_status(id, TaskStatus::Done).await?;
         Ok(ext_id)
+    }
+}
+
+/// Convert a store::Task to an ExternalTask for backward compatibility with
+/// code that expects ExternalTask (engine dispatch, review, etc.).
+pub fn store_task_to_external(t: &store::Task) -> ExternalTask {
+    let ext_id = t
+        .external_id
+        .clone()
+        .unwrap_or_else(|| format!("internal:{}", t.id));
+    ExternalTask {
+        id: ExternalId(ext_id),
+        title: t.title.clone(),
+        body: t.body.clone(),
+        state: "open".to_string(),
+        labels: {
+            let mut labels = t.labels.clone();
+            labels.push(format!("status:{}", t.status.as_str()));
+            labels
+        },
+        author: t.source.clone(),
+        created_at: t.created_at.clone(),
+        updated_at: t.updated_at.clone(),
+        url: t.url.clone(),
     }
 }
 
@@ -468,33 +544,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_status_dual_writes_for_internal_task() {
+    async fn update_status_writes_to_store_for_internal_task() {
         let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        db.migrate().await.unwrap();
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
-        // Create an internal task in the DB
-        let internal_id = db
-            .create_internal_task("Internal task", "body", "cron", "job:1")
+        // Create an internal task in the store
+        let internal_id = store
+            .create_internal("owner/repo", "Internal task", "body", "cron", "job:1")
             .await
             .unwrap();
 
-        let tm =
-            TaskManager::with_store(db.clone(), backend, store.clone(), "owner/repo".to_string());
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
 
-        // Update the internal task status
+        // Update the internal task status via TaskManager
         let id_str = format!("internal:{}", internal_id);
         tm.update_task_status(&ExternalId(id_str), Status::Routed)
             .await
             .unwrap();
 
-        // Verify DB was updated
-        let task = db.get_internal_task(internal_id).await.unwrap();
+        // Verify the store was updated
+        let task = store.get(internal_id).await.unwrap();
         assert_eq!(task.status, TaskStatus::Routed);
-
-        // Store dual-write: internal tasks return None from resolve_task_id,
-        // so store should NOT be updated (by design — internal tasks not yet in store)
     }
 
     #[tokio::test]

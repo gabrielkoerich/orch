@@ -162,6 +162,8 @@ pub async fn tick(
     jobs_path: &PathBuf,
     backend: &Arc<dyn ExternalBackend>,
     db: &Arc<Db>,
+    store: Option<&Arc<crate::store::TaskStore>>,
+    repo: &str,
 ) -> anyhow::Result<()> {
     let mut jobs = load_jobs(jobs_path)?;
     let mut changed = false;
@@ -234,45 +236,38 @@ pub async fn tick(
                     }
                 }
             } else {
-                // Check internal (SQLite) task
-                // Parse "internal:{id}" format
-                if let Some(internal_id_str) = task_id_clone.strip_prefix("internal:") {
-                    if let Ok(internal_id) = internal_id_str.parse::<i64>() {
-                        match db.get_internal_task(internal_id).await {
+                // Check internal task via store
+                if let Some(s) = store {
+                    if let Ok(Some(store_id)) = s.resolve_task_id(repo, &task_id_clone).await {
+                        match s.get(store_id).await {
                             Ok(task) => match task.status {
                                 TaskStatus::New | TaskStatus::Routed | TaskStatus::InProgress => {
                                     true
                                 }
-                                _ => false, // Terminal state (done, blocked, needs_review, etc.)
+                                _ => false, // Terminal state
                             },
                             Err(e) => {
-                                if let Some(rusqlite::Error::QueryReturnedNoRows) =
-                                    e.downcast_ref::<rusqlite::Error>()
-                                {
-                                    tracing::warn!(
-                                        job_id = job.id,
-                                        task_id = task_id_clone,
-                                        "internal task not found, clearing active_task_id"
-                                    );
-                                } else {
-                                    tracing::warn!(
-                                        job_id = job.id,
-                                        task_id = task_id_clone,
-                                        ?e,
-                                        "cannot fetch internal task, clearing active_task_id"
-                                    );
-                                }
+                                tracing::warn!(
+                                    job_id = job.id,
+                                    task_id = task_id_clone,
+                                    ?e,
+                                    "cannot fetch internal task from store, clearing active_task_id"
+                                );
                                 should_clear_task_id = true;
                                 false
                             }
                         }
                     } else {
-                        // Invalid format — clear it
+                        tracing::warn!(
+                            job_id = job.id,
+                            task_id = task_id_clone,
+                            "internal task not found in store, clearing active_task_id"
+                        );
                         should_clear_task_id = true;
                         false
                     }
                 } else {
-                    // Legacy format without prefix — clear it
+                    // No store — clear stale task id
                     should_clear_task_id = true;
                     false
                 }
@@ -341,10 +336,10 @@ pub async fn tick(
                                 job.last_task_status = Some("failed".to_string());
                             }
                         }
-                    } else {
-                        // Create internal (SQLite) task
-                        match db
-                            .create_internal_task(&template.title, &template.body, "cron", &job.id)
+                    } else if let Some(s) = store {
+                        // Create internal task via store
+                        match s
+                            .create_internal(repo, &template.title, &template.body, "cron", &job.id)
                             .await
                         {
                             Ok(internal_id) => {
@@ -362,6 +357,12 @@ pub async fn tick(
                                 job.last_task_status = Some("failed".to_string());
                             }
                         }
+                    } else {
+                        tracing::error!(
+                            job_id = job.id,
+                            "no store available for internal task creation"
+                        );
+                        job.last_task_status = Some("failed".to_string());
                     }
                 }
             }
@@ -751,9 +752,15 @@ mod tests {
             created_ids: Arc::new(Mutex::new(vec![])),
         });
         let db = Arc::new(Db::open_memory().unwrap());
-        tick(&path, &(backend.clone() as Arc<dyn ExternalBackend>), &db)
-            .await
-            .unwrap();
+        tick(
+            &path,
+            &(backend.clone() as Arc<dyn ExternalBackend>),
+            &db,
+            None,
+            "test/repo",
+        )
+        .await
+        .unwrap();
 
         let jobs = load_jobs(&path).unwrap();
         // active_task_id should point to the newly created task, not the old deleted one
@@ -792,9 +799,15 @@ mod tests {
             created_ids: Arc::new(Mutex::new(vec![])),
         });
         let db = Arc::new(Db::open_memory().unwrap());
-        tick(&path, &(backend.clone() as Arc<dyn ExternalBackend>), &db)
-            .await
-            .unwrap();
+        tick(
+            &path,
+            &(backend.clone() as Arc<dyn ExternalBackend>),
+            &db,
+            None,
+            "test/repo",
+        )
+        .await
+        .unwrap();
 
         let jobs = load_jobs(&path).unwrap();
         // active_task_id must be preserved — transient error, don't lose the reference

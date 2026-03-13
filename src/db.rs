@@ -158,6 +158,9 @@ impl Db {
         self.conn.lock().await
     }
 
+    /// Used by `orch migrate` to read old internal_tasks for migration to the store.
+    /// Will be removed when the old `internal_tasks` table is dropped.
+    #[allow(dead_code)]
     pub async fn create_internal_task(
         &self,
         title: &str,
@@ -173,6 +176,7 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
+    #[allow(dead_code)]
     pub async fn get_internal_task(&self, id: i64) -> anyhow::Result<InternalTask> {
         let conn = self.conn.lock().await;
         let task = conn.query_row(
@@ -210,6 +214,7 @@ impl Db {
         Ok(task)
     }
 
+    #[allow(dead_code)]
     pub async fn list_internal_tasks_by_status(
         &self,
         status: TaskStatus,
@@ -258,6 +263,7 @@ impl Db {
         Ok(result)
     }
 
+    #[allow(dead_code)]
     pub async fn update_internal_task_status(
         &self,
         id: i64,

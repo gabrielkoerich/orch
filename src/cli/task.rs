@@ -157,8 +157,8 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             if let Some(reason) = &int.block_reason {
                 println!("Block reason: {}", reason);
             }
-            println!("Created: {}", int.created_at.to_rfc3339());
-            println!("Updated: {}", int.updated_at.to_rfc3339());
+            println!("Created: {}", int.created_at);
+            println!("Updated: {}", int.updated_at);
             println!("\n{}", int.body);
         }
     }
@@ -184,7 +184,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
 
     // Fetch all tasks from both backends
     let all_external = task_manager.list_all_external_tasks().await?;
-    let all_internal = task_manager.db.list_all_internal_tasks().await?;
+    let all_internal = task_manager.list_all_internal().await.unwrap_or_default();
 
     // Count external tasks per status via labels
     let ext_counts: Vec<usize> = statuses
@@ -411,25 +411,34 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 pub async fn retry(id: i64) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
-    use crate::db::{Db, TaskStatus};
-    use crate::home;
+    use crate::db::TaskStatus;
 
-    // Check if this is an internal task in the DB first.
-    let db_path = home::db_path().context("could not resolve DB path")?;
-    let db = Db::open(&db_path)?;
     let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
-    if let Ok(task) = db.get_internal_task(id).await {
-        let internal_id = format!("internal:{}", task.id);
-        // Reset sidecar + store (attempts + all failure counters)
-        crate::engine::cleanup::store_and_sidecar_reset_counters(&store, &repo, &internal_id).await;
-        // Reset DB status to New
-        db.update_internal_task_status(id, TaskStatus::New).await?;
-        println!(
-            "Task #{} reset to new (attempts reset, will be re-routed)",
-            id
-        );
-        return Ok(());
+
+    // Check if this is an internal task in the store.
+    if let Some(ref s) = store {
+        if let Ok(task) = s.get(id).await {
+            if task.origin == "internal" {
+                let internal_id = task
+                    .external_id
+                    .unwrap_or_else(|| format!("internal:{}", task.id));
+                // Reset store counters
+                crate::engine::cleanup::store_and_sidecar_reset_counters(
+                    &store,
+                    &repo,
+                    &internal_id,
+                )
+                .await;
+                // Reset status to New
+                s.update_status(id, TaskStatus::New).await?;
+                println!(
+                    "Task #{} reset to new (attempts reset, will be re-routed)",
+                    id
+                );
+                return Ok(());
+            }
+        }
     }
 
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
@@ -470,14 +479,11 @@ async fn reset_counters(
 pub async fn unblock(id: &str) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
-    use crate::db::{Db, TaskStatus};
-    use crate::home;
+    use crate::db::TaskStatus;
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
-    let db_path = home::db_path().context("could not resolve DB path")?;
-    let db = Db::open(&db_path)?;
     let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
 
     if id == "all" {
@@ -492,18 +498,26 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
             external_count += 1;
         }
 
-        let internal_blocked = db
-            .list_internal_tasks_by_status(TaskStatus::Blocked)
-            .await?;
-        let internal_needs_review = db
-            .list_internal_tasks_by_status(TaskStatus::NeedsReview)
-            .await?;
         let mut internal_count = 0;
-        for task in internal_blocked.iter().chain(internal_needs_review.iter()) {
-            reset_counters(task.id, &store, &repo).await;
-            db.update_internal_task_status(task.id, TaskStatus::New)
-                .await?;
-            internal_count += 1;
+        if let Some(ref s) = store {
+            let internal_blocked = s
+                .list_internal_by_status(&repo, TaskStatus::Blocked)
+                .await
+                .unwrap_or_default();
+            let internal_needs_review = s
+                .list_internal_by_status(&repo, TaskStatus::NeedsReview)
+                .await
+                .unwrap_or_default();
+            for task in internal_blocked.iter().chain(internal_needs_review.iter()) {
+                let ext_id = task
+                    .external_id
+                    .clone()
+                    .unwrap_or_else(|| format!("internal:{}", task.id));
+                crate::engine::cleanup::store_and_sidecar_reset_counters(&store, &repo, &ext_id)
+                    .await;
+                s.update_status(task.id, TaskStatus::New).await?;
+                internal_count += 1;
+            }
         }
 
         let total = external_count + internal_count;
@@ -514,31 +528,35 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if let Some(stripped) = id.strip_prefix("internal:") {
-        let parsed = stripped
-            .parse::<i64>()
-            .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
-        db.get_internal_task(parsed).await?;
-        reset_counters(parsed, &store, &repo).await;
-        db.update_internal_task_status(parsed, TaskStatus::New)
-            .await?;
-        println!(
-            "Unblocked internal task #{} (attempts reset, will be re-routed)",
-            parsed
-        );
-        return Ok(());
-    }
+    // Try to resolve as a store task (internal or external)
+    if let Some(ref s) = store {
+        if let Some(stripped) = id.strip_prefix("internal:") {
+            let parsed = stripped
+                .parse::<i64>()
+                .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
+            if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
+                reset_counters(store_id, &store, &repo).await;
+                s.update_status(store_id, TaskStatus::New).await?;
+                println!(
+                    "Unblocked internal task #{} (attempts reset, will be re-routed)",
+                    parsed
+                );
+                return Ok(());
+            }
+        }
 
-    if let Ok(parsed) = id.parse::<i64>() {
-        if db.get_internal_task(parsed).await.is_ok() {
-            reset_counters(parsed, &store, &repo).await;
-            db.update_internal_task_status(parsed, TaskStatus::New)
-                .await?;
-            println!(
-                "Unblocked internal task #{} (attempts reset, will be re-routed)",
-                parsed
-            );
-            return Ok(());
+        if let Ok(parsed) = id.parse::<i64>() {
+            if let Ok(task) = s.get(parsed).await {
+                if task.origin == "internal" {
+                    reset_counters(parsed, &store, &repo).await;
+                    s.update_status(parsed, TaskStatus::New).await?;
+                    println!(
+                        "Unblocked internal task #{} (attempts reset, will be re-routed)",
+                        parsed
+                    );
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -706,19 +724,23 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     // correct file.
     if let Some(n) = parse_internal_id(id) {
         sidecar_key = format!("internal:{}", n);
-        // Fetch internal task metadata
-        if let Ok(internal) = task_manager.db.get_internal_task(n).await {
-            println!("ID: {} (internal)", internal.id);
-            println!("Title: {}", internal.title);
-            println!("Status: {}", internal.status.as_str());
-            if let Some(agent) = &internal.agent {
-                println!("Agent: {}", agent);
+        // Fetch internal task metadata from store
+        if let Some(ref s) = store {
+            if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
+                if let Ok(internal) = s.get(store_id).await {
+                    println!("ID: {} (internal)", internal.id);
+                    println!("Title: {}", internal.title);
+                    println!("Status: {}", internal.status.as_str());
+                    if let Some(agent) = &internal.agent {
+                        println!("Agent: {}", agent);
+                    }
+                    if let Some(reason) = &internal.block_reason {
+                        println!("Block reason: {}", reason);
+                    }
+                    println!("Created: {}", internal.created_at);
+                    println!("Updated: {}", internal.updated_at);
+                }
             }
-            if let Some(reason) = &internal.block_reason {
-                println!("Block reason: {}", reason);
-            }
-            println!("Created: {}", internal.created_at.to_rfc3339());
-            println!("Updated: {}", internal.updated_at.to_rfc3339());
         }
     } else if let Ok(num) = id.parse::<i64>() {
         // Numeric ID: try DB first (TaskManager::get_task will check both)
@@ -741,9 +763,12 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                 if let Some(agent) = &int.agent {
                     println!("Agent: {}", agent);
                 }
-                println!("Created: {}", int.created_at.to_rfc3339());
-                println!("Updated: {}", int.updated_at.to_rfc3339());
-                sidecar_key = format!("internal:{}", int.id);
+                println!("Created: {}", int.created_at);
+                println!("Updated: {}", int.updated_at);
+                sidecar_key = int
+                    .external_id
+                    .clone()
+                    .unwrap_or_else(|| format!("internal:{}", int.id));
             }
             Err(e) => {
                 // Could not resolve task metadata; continue and try sidecar only

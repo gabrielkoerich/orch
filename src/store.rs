@@ -382,6 +382,41 @@ impl TaskStore {
         Ok(row.get("id"))
     }
 
+    /// Create an internal task, returning its auto-generated ID.
+    ///
+    /// Convenience wrapper around `create()` that sets origin = "internal"
+    /// and generates `external_id = "internal:{id}"` after creation.
+    pub async fn create_internal(
+        &self,
+        repo: &str,
+        title: &str,
+        body: &str,
+        source: &str,
+        source_id: &str,
+    ) -> anyhow::Result<i64> {
+        let id = self
+            .create(&NewTask {
+                external_id: None,
+                repo: repo.to_string(),
+                origin: "internal".to_string(),
+                title: title.to_string(),
+                body: body.to_string(),
+                source: source.to_string(),
+                source_id: source_id.to_string(),
+                author: String::new(),
+                url: String::new(),
+                labels: vec![],
+            })
+            .await?;
+        // Set external_id to "internal:{id}" so resolve_task_id can find it
+        sqlx::query("UPDATE tasks SET external_id = ? WHERE id = ?")
+            .bind(format!("internal:{id}"))
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(id)
+    }
+
     /// Get a task by its internal ID.
     pub async fn get(&self, id: i64) -> anyhow::Result<Task> {
         let row = sqlx::query("SELECT * FROM tasks WHERE id = ?")
@@ -477,6 +512,35 @@ impl TaskStore {
     #[allow(dead_code)]
     pub async fn list_routable(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         self.list_by_status(repo, TaskStatus::New).await
+    }
+
+    /// List internal tasks by status within a repo (origin = 'internal').
+    pub async fn list_internal_by_status(
+        &self,
+        repo: &str,
+        status: TaskStatus,
+    ) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(
+            "SELECT * FROM tasks WHERE repo = ? AND origin = 'internal' AND status = ? ORDER BY created_at DESC",
+        )
+        .bind(repo)
+        .bind(status.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
+    /// List all internal tasks for a repo (origin = 'internal').
+    pub async fn list_all_internal(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(
+            "SELECT * FROM tasks WHERE repo = ? AND origin = 'internal' ORDER BY created_at DESC",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_task).collect()
     }
 
     /// List all tasks for a repo, ordered by creation time descending.
@@ -4255,5 +4319,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved, None);
+    }
+
+    #[tokio::test]
+    async fn create_internal_sets_external_id() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create_internal("owner/repo", "Test task", "body", "cron", "job:1")
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.origin, "internal");
+        assert_eq!(task.external_id, Some(format!("internal:{}", id)));
+        assert_eq!(task.title, "Test task");
+        assert_eq!(task.source, "cron");
+        assert_eq!(task.source_id, "job:1");
+    }
+
+    #[tokio::test]
+    async fn create_internal_resolvable_by_task_id() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create_internal("owner/repo", "Resolvable", "body", "cron", "job:2")
+            .await
+            .unwrap();
+
+        let resolved = store
+            .resolve_task_id("owner/repo", &format!("internal:{id}"))
+            .await
+            .unwrap();
+        assert_eq!(resolved, Some(id));
+    }
+
+    #[tokio::test]
+    async fn list_internal_by_status_filters_origin() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        // Create one internal and one external task, both with status New
+        store
+            .create_internal("owner/repo", "Internal task", "", "cron", "j1")
+            .await
+            .unwrap();
+        store
+            .create(&NewTask {
+                external_id: Some("42".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "External task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let internal = store
+            .list_internal_by_status("owner/repo", TaskStatus::New)
+            .await
+            .unwrap();
+        assert_eq!(internal.len(), 1);
+        assert_eq!(internal[0].title, "Internal task");
+        assert_eq!(internal[0].origin, "internal");
+    }
+
+    #[tokio::test]
+    async fn list_all_internal_returns_only_internal() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        store
+            .create_internal("owner/repo", "Int 1", "", "cron", "j1")
+            .await
+            .unwrap();
+        store
+            .create_internal("owner/repo", "Int 2", "", "manual", "")
+            .await
+            .unwrap();
+        store
+            .create(&NewTask {
+                external_id: Some("99".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "External".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let all = store.list_all_internal("owner/repo").await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|t| t.origin == "internal"));
     }
 }

@@ -724,11 +724,11 @@ pub async fn serve() -> anyhow::Result<()> {
         use crate::db::TaskStatus as DbStatus;
         if let Ok(internal_in_review) = engine
             .task_manager
-            .db_list_internal_by_status(DbStatus::InReview)
+            .list_internal_by_status(DbStatus::InReview)
             .await
         {
             for task in &internal_in_review {
-                let task_id = format!("internal:{}", task.id);
+                let task_id = task.id.0.clone();
                 if let Err(e) = engine
                     .task_manager
                     .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)

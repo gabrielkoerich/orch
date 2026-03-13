@@ -157,12 +157,13 @@ pub async fn tick() -> anyhow::Result<()> {
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
     let db = Arc::new(Db::open(&crate::db::default_path()?)?);
     db.migrate().await?;
+    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
 
     let path = jobs::resolve_jobs_path();
-    jobs::tick(&path, &backend, &db).await?;
+    jobs::tick(&path, &backend, &db, store.as_ref(), &repo).await?;
 
     println!("Job tick completed");
     Ok(())

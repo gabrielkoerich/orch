@@ -372,23 +372,16 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     }
 
     // Also include internal done tasks.
-    if let Ok(internal_done) = task_manager
-        .db_list_internal_by_status(TaskStatus::Done)
-        .await
-    {
-        for t in internal_done {
-            task_ids.push(format!("internal:{}", t.id));
-        }
+    if let Ok(internal_done) = task_manager.list_internal_by_status(TaskStatus::Done).await {
+        task_ids.extend(internal_done.iter().map(|t| t.id.0.clone()));
     }
 
     // Also include internal blocked tasks (terminal state, worktree is useless).
     if let Ok(internal_blocked) = task_manager
-        .db_list_internal_by_status(TaskStatus::Blocked)
+        .list_internal_by_status(TaskStatus::Blocked)
         .await
     {
-        for t in internal_blocked {
-            task_ids.push(format!("internal:{}", t.id));
-        }
+        task_ids.extend(internal_blocked.iter().map(|t| t.id.0.clone()));
     }
 
     tracing::debug!(

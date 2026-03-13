@@ -24,7 +24,7 @@ pub async fn dashboard() -> anyhow::Result<()> {
 
     // Fetch all tasks from both backends
     let all_external = task_manager.list_all_external_tasks().await?;
-    let all_internal = task_manager.db.list_all_internal_tasks().await?;
+    let all_internal = task_manager.list_all_internal().await.unwrap_or_default();
 
     let mut counts: Vec<(Status, usize, usize)> = Vec::new(); // (status, external, internal)
     let mut total = 0usize;
