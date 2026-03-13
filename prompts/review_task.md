@@ -17,7 +17,7 @@ Keep the branch up to date — other PRs may have merged since this was created:
 
 Look at `.github/workflows/` to see what CI runs, then execute those exact commands:
 - `cargo fmt -- --check` (formatting)
-- `cargo clippy --all-targets` (lints)
+- `cargo clippy --all-targets -- -D warnings` (lints)
 - `cargo test` (tests)
 
 If ANY check fails, try to fix it yourself:
