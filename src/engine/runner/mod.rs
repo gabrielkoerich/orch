@@ -33,6 +33,7 @@ use crate::engine::tasks::is_internal_id;
 use crate::security;
 use crate::store::InsertTaskMetric;
 use crate::tmux::TmuxManager;
+use anyhow::Context;
 use chrono::Utc;
 pub use response::WeightSignal;
 use std::path::PathBuf;
@@ -580,15 +581,16 @@ impl TaskRunner {
             "new" => Status::New, // Rerouted
             _ => Status::NeedsReview,
         };
-        // Store-first: update SQLite, then mirror to backend.
+        // Store-first: update SQLite (must succeed), then mirror to backend.
         if let Some(ref store) = self.store {
             if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &task.id.0).await {
-                let _ = store
+                store
                     .update_status(
                         store_id,
                         crate::engine::tasks::status_to_task_status(new_status),
                     )
-                    .await;
+                    .await
+                    .context("store-first status update failed in runner")?;
             }
         }
         if let Err(e) = backend.update_status(&task.id, new_status).await {
@@ -708,8 +710,22 @@ impl TaskRunner {
             }
         }
 
-        // Mark parent as blocked
-        backend.update_status(parent_id, Status::Blocked).await?;
+        // Mark parent as blocked — store-first, then mirror to backend.
+        if let Some(ref store) = self.store {
+            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &parent_id.0).await {
+                store
+                    .update_status(store_id, crate::store::TaskStatus::Blocked)
+                    .await
+                    .context("store-first: failed to block parent in store")?;
+            }
+        }
+        if let Err(e) = backend.update_status(parent_id, Status::Blocked).await {
+            tracing::warn!(
+                parent = parent_id.0,
+                err = %e,
+                "failed to mirror blocked status to backend — store is authoritative"
+            );
+        }
 
         // Post summary comment on parent
         let summary = delegations
