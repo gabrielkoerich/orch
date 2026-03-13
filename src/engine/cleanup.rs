@@ -63,6 +63,18 @@ pub(crate) async fn store_or_sidecar(
                     Some(task.route_reason.clone())
                 }
                 "complexity" if !task.complexity.is_empty() => Some(task.complexity.clone()),
+                "budget_warning" if !task.budget_warning.is_empty() => {
+                    Some(task.budget_warning.clone())
+                }
+                "budget_exceeded" if task.budget_exceeded => Some("true".to_string()),
+                "delegations" => {
+                    let json = serde_json::to_string(&task.delegations).unwrap_or_default();
+                    if json != "[]" && !json.is_empty() {
+                        Some(json)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             };
             if val.is_some() {

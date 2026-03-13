@@ -76,6 +76,15 @@ impl TaskRunner {
         self
     }
 
+    /// Read a field from the store first, falling back to sidecar.
+    async fn get_field(&self, task_id: &str, field: &str) -> Option<String> {
+        if let Some(ref store) = self.store {
+            let store = Arc::clone(store);
+            return super::cleanup::store_or_sidecar(&store, &self.repo, task_id, field).await;
+        }
+        sidecar::get(task_id, field).ok()
+    }
+
     /// Run a task through the full execution pipeline.
     ///
     /// Returns `Ok(None)` if the runner guard skipped the task (caller should not
@@ -110,7 +119,7 @@ impl TaskRunner {
 
                     // If this was label-forced to a specific agent, remove the agent label
                     // so that /retry can route to a different agent instead of looping.
-                    let route_reason = sidecar::get(task_id, "route_reason").unwrap_or_default();
+                    let route_reason = self.get_field(task_id, "route_reason").await.unwrap_or_default();
                     if route_reason.starts_with("label agent:") {
                         let agent_label = route_reason.trim_start_matches("label ");
                         let gh = crate::github::http::GhHttp::new();
@@ -302,7 +311,7 @@ impl TaskRunner {
 
         let complexity = route_result.as_ref().map(|r| r.complexity.clone());
         let files_changed = git_ops::count_changed_files(&PathBuf::from(
-            sidecar::get(task_id, "worktree").unwrap_or_default(),
+            self.get_field(task_id, "worktree").await.unwrap_or_default(),
         ))
         .await
         .unwrap_or(0);
@@ -399,8 +408,8 @@ impl TaskRunner {
 
         // Record run start in task_runs audit trail
         let run_audit_id = if let Some(ref store) = self.store {
-            let attempt: i32 = sidecar::get(task_id, "attempts")
-                .ok()
+            let attempt: i32 = self.get_field(task_id, "attempts")
+                .await
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0)
                 + 1;
@@ -435,7 +444,7 @@ impl TaskRunner {
         let status = run_status.unwrap();
 
         // Process delegations if the agent requested subtasks
-        let delegations_raw = sidecar::get(task_id, "delegations").unwrap_or_default();
+        let delegations_raw = self.get_field(task_id, "delegations").await.unwrap_or_default();
         if !delegations_raw.is_empty() {
             if let Ok(delegations) =
                 serde_json::from_str::<Vec<crate::parser::Delegation>>(&delegations_raw)
@@ -450,8 +459,8 @@ impl TaskRunner {
         }
 
         // Post result to GitHub
-        let summary = sidecar::get(task_id, "summary").unwrap_or_default();
-        let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
+        let summary = self.get_field(task_id, "summary").await.unwrap_or_default();
+        let last_error = self.get_field(task_id, "last_error").await.unwrap_or_default();
 
         // Determine weight signal based on outcome
         let is_rate_limited = last_error.contains("usage")
@@ -473,8 +482,8 @@ impl TaskRunner {
 
         // Record metrics
         {
-            let attempts: u32 = sidecar::get(task_id, "attempts")
-                .ok()
+            let attempts: u32 = self.get_field(task_id, "attempts")
+                .await
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             self.record_metrics(
@@ -529,7 +538,7 @@ impl TaskRunner {
         // If task was rerouted (status=new after run), update GitHub agent label
         // so the router doesn't re-route back to the same failed agent.
         if status == "new" {
-            let new_agent = sidecar::get(task_id, "agent").unwrap_or_default();
+            let new_agent = self.get_field(task_id, "agent").await.unwrap_or_default();
             if !new_agent.is_empty() && new_agent != agent_name {
                 // Remove old agent label, add new one
                 let old_label = format!("agent:{agent_name}");
@@ -563,8 +572,8 @@ impl TaskRunner {
         backend.update_status(&task.id, new_status).await?;
 
         // Check for budget warnings and append to comment
-        let budget_warning = sidecar::get(task_id, "budget_warning").unwrap_or_default();
-        let budget_exceeded = sidecar::get(task_id, "budget_exceeded").unwrap_or_default();
+        let budget_warning = self.get_field(task_id, "budget_warning").await.unwrap_or_default();
+        let budget_exceeded = self.get_field(task_id, "budget_exceeded").await.unwrap_or_default();
 
         // Post comment (scan for secrets before posting to GitHub)
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
