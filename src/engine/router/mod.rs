@@ -300,7 +300,7 @@ impl Router {
         store: &std::sync::Arc<crate::store::TaskStore>,
         repo: &str,
     ) -> u32 {
-        crate::engine::cleanup::store_or_sidecar(store, repo, task_id, "route_attempts")
+        crate::engine::cleanup::store_get_field(store, repo, task_id, "route_attempts")
             .await
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
@@ -395,7 +395,7 @@ pub async fn get_route_result(
         let task_id = task_id.to_string();
         let field = field.to_string();
         async move {
-            crate::engine::cleanup::store_or_sidecar(&store, &repo, &task_id, &field)
+            crate::engine::cleanup::store_get_field(&store, &repo, &task_id, &field)
                 .await
                 .unwrap_or_default()
         }

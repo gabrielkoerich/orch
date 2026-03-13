@@ -316,8 +316,9 @@ pub enum RetryableError {
 }
 
 impl RetryableError {
-    /// Return a short classified string for this error type, stored in sidecar
-    /// and used for DB metrics rather than parsing `last_error` strings.
+    /// Return a short classified string for this error type.
+    /// Used in DB rate-limit metrics and test assertions.
+    #[allow(dead_code)]
     pub fn type_str(self) -> &'static str {
         match self {
             RetryableError::Timeout => "timeout",
@@ -367,14 +368,10 @@ pub async fn handle_failover(
             "all agents exhausted, marking needs_review"
         );
         let msg = format!("{error_message} (all agents exhausted)");
-        crate::engine::cleanup::store_and_sidecar_set(
+        crate::engine::cleanup::store_set(
             store,
             repo,
             task_id,
-            &[
-                format!("last_error={msg}"),
-                format!("error_type={}", error_type.type_str()),
-            ],
             &[("last_error", serde_json::json!(msg))],
         )
         .await;
@@ -398,16 +395,10 @@ pub async fn handle_failover(
         }
 
         let msg = format!("{error_message}, rerouted to {next}");
-        crate::engine::cleanup::store_and_sidecar_set(
+        crate::engine::cleanup::store_set(
             store,
             repo,
             task_id,
-            &[
-                format!("agent={next}"),
-                "model=".to_string(),
-                format!("last_error={msg}"),
-                format!("error_type={}", error_type.type_str()),
-            ],
             &[
                 ("agent", serde_json::json!(next)),
                 ("model", serde_json::json!("")),
@@ -421,14 +412,10 @@ pub async fn handle_failover(
     // No fallback available
     tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
     let msg = format!("{error_message}, no fallback agents");
-    crate::engine::cleanup::store_and_sidecar_set(
+    crate::engine::cleanup::store_set(
         store,
         repo,
         task_id,
-        &[
-            format!("last_error={msg}"),
-            format!("error_type={}", error_type.type_str()),
-        ],
         &[("last_error", serde_json::json!(msg))],
     )
     .await;
@@ -441,7 +428,7 @@ pub async fn get_reroute_chain(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> String {
-    crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "limit_reroute_chain")
+    crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "limit_reroute_chain")
         .await
         .unwrap_or_default()
         .trim()
@@ -463,11 +450,10 @@ pub async fn update_reroute_chain(
         chain = format!("{chain},{current_agent}");
     }
 
-    crate::engine::cleanup::store_and_sidecar_set(
+    crate::engine::cleanup::store_set(
         store,
         repo,
         task_id,
-        &[format!("limit_reroute_chain={chain}")],
         &[("limit_reroute_chain", serde_json::json!(chain))],
     )
     .await;

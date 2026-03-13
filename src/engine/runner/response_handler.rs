@@ -118,11 +118,10 @@ pub async fn handle_success(
         {
             tracing::error!(task_id, error = ?e, "auto commit failed");
             let msg = format!("auto commit failed: {e}");
-            crate::engine::cleanup::store_and_sidecar_set(
+            crate::engine::cleanup::store_set(
                 store,
                 repo,
                 task_id,
-                &[format!("last_error={msg}")],
                 &[("last_error", serde_json::json!(msg))],
             )
             .await;
@@ -138,11 +137,10 @@ pub async fn handle_success(
             Err(e) => {
                 tracing::error!(task_id, error = ?e, "push failed");
                 let msg = format!("push failed: {e}");
-                crate::engine::cleanup::store_and_sidecar_set(
+                crate::engine::cleanup::store_set(
                     store,
                     repo,
                     task_id,
-                    &[format!("last_error={msg}")],
                     &[("last_error", serde_json::json!(msg))],
                 )
                 .await;
@@ -183,11 +181,10 @@ pub async fn handle_success(
                 Err(e) => {
                     tracing::error!(task_id, error = ?e, "create PR failed");
                     let msg = format!("create PR failed: {e}");
-                    crate::engine::cleanup::store_and_sidecar_set(
+                    crate::engine::cleanup::store_set(
                         store,
                         repo,
                         task_id,
-                        &[format!("last_error={msg}")],
                         &[("last_error", serde_json::json!(msg))],
                     )
                     .await;
@@ -196,18 +193,15 @@ pub async fn handle_success(
         }
     }
 
-    // Store delegations in sidecar + store if present (processed by run_with_context)
+    // Store delegations in store if present (processed by run_with_context)
     if !resp.delegations.is_empty() {
-        if let Ok(delegations_json) = serde_json::to_string(&resp.delegations) {
-            crate::engine::cleanup::store_and_sidecar_set(
-                store,
-                repo,
-                task_id,
-                &[format!("delegations={delegations_json}")],
-                &[("delegations", serde_json::json!(resp.delegations))],
-            )
-            .await;
-        }
+        crate::engine::cleanup::store_set(
+            store,
+            repo,
+            task_id,
+            &[("delegations", serde_json::json!(resp.delegations))],
+        )
+        .await;
     }
 
     // Store result in sidecar
@@ -241,11 +235,10 @@ pub async fn handle_success(
     } else {
         &resp.status
     };
-    crate::engine::cleanup::store_and_sidecar_set(
+    crate::engine::cleanup::store_set(
         store,
         repo,
         task_id,
-        &[format!("summary={}", resp.summary)],
         &[("summary", serde_json::json!(resp.summary))],
     )
     .await;
@@ -300,14 +293,10 @@ pub async fn handle_success(
             "token budget exceeded: {}/{} tokens (${:.4})",
             total_tokens, max_tokens, cost.total_cost_usd
         );
-        crate::engine::cleanup::store_and_sidecar_set(
+        crate::engine::cleanup::store_set(
             store,
             repo,
             task_id,
-            &[
-                format!("last_error={budget_msg}"),
-                "budget_exceeded=true".to_string(),
-            ],
             &[
                 ("last_error", serde_json::json!(budget_msg)),
                 ("budget_exceeded", serde_json::json!(true)),
@@ -328,11 +317,10 @@ pub async fn handle_success(
             "{}% of budget used ({}/{} tokens, ${:.4})",
             pct, total_tokens, max_tokens, cost.total_cost_usd
         );
-        crate::engine::cleanup::store_and_sidecar_set(
+        crate::engine::cleanup::store_set(
             store,
             repo,
             task_id,
-            &[format!("budget_warning={warning_msg}")],
             &[("budget_warning", serde_json::json!(warning_msg))],
         )
         .await;

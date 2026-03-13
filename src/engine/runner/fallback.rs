@@ -75,15 +75,10 @@ pub async fn handle_error(
             if let Some(next) = next_model {
                 tracing::info!(task_id, model = %next, "retrying with different model");
                 let msg = format!("model {model} unavailable, trying {next}");
-                crate::engine::cleanup::store_and_sidecar_set(
+                crate::engine::cleanup::store_set(
                     store,
                     repo,
                     task_id,
-                    &[
-                        format!("model={next}"),
-                        format!("last_error={msg}"),
-                        "error_type=failed".to_string(),
-                    ],
                     &[
                         ("model", serde_json::json!(next.to_string())),
                         ("last_error", serde_json::json!(msg)),
@@ -110,11 +105,10 @@ pub async fn handle_error(
         agents::AgentError::WaitingForInput { message } => {
             // Requires human — skip failover, go straight to needs_review
             let msg = format!("waiting for input: {message}");
-            crate::engine::cleanup::store_and_sidecar_set(
+            crate::engine::cleanup::store_set(
                 store,
                 repo,
                 task_id,
-                &[format!("last_error={msg}"), "error_type=failed".to_string()],
                 &[("last_error", serde_json::json!(msg))],
             )
             .await;
@@ -175,7 +169,7 @@ pub async fn handle_error(
         // All agents exhausted — try free models via opencode
         let free = agent_runner.free_models();
         if !free.is_empty() {
-            let tried_models: String = crate::engine::cleanup::opt_store_or_sidecar(
+            let tried_models: String = crate::engine::cleanup::opt_store_get_field(
                 store,
                 repo,
                 task_id,
@@ -194,17 +188,10 @@ pub async fn handle_error(
                     format!("{tried_models},{free_model}")
                 };
                 let msg = format!("all agents exhausted, trying free model {free_model}");
-                crate::engine::cleanup::store_and_sidecar_set(
+                crate::engine::cleanup::store_set(
                     store,
                     repo,
                     task_id,
-                    &[
-                        "agent=opencode".to_string(),
-                        format!("model={free_model}"),
-                        format!("model_reroute_chain={new_tried}"),
-                        format!("last_error={msg}"),
-                        format!("error_type={}", retryable.type_str()),
-                    ],
                     &[
                         ("agent", serde_json::json!("opencode")),
                         ("model", serde_json::json!(free_model.to_string())),

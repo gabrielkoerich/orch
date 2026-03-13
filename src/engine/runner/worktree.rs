@@ -161,9 +161,9 @@ pub async fn setup_worktree(
 
     // Check if we have a saved branch/worktree in store/sidecar
     let saved_branch =
-        crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "branch").await;
+        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "branch").await;
     let saved_worktree =
-        crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "worktree").await;
+        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "worktree").await;
 
     let (branch_name_str, worktree_dir) = if let Some(ref saved) = saved_branch {
         if !saved.is_empty() {
@@ -313,14 +313,10 @@ pub async fn setup_worktree(
     }
 
     // Save worktree info to sidecar + store
-    crate::engine::cleanup::store_and_sidecar_set(
+    crate::engine::cleanup::store_set(
         store,
         repo,
         task_id,
-        &[
-            format!("worktree={}", worktree_dir.display()),
-            format!("branch={branch_name_str}"),
-        ],
         &[
             (
                 "worktree",

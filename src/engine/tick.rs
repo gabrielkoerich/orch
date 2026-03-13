@@ -115,15 +115,10 @@ pub(crate) async fn tick_recover_stuck_tasks(
                     backend.remove_label(&task.id, label).await.ok();
                 }
             }
-            super::cleanup::store_and_sidecar_set(
+            super::cleanup::store_set(
                 &Some(Arc::clone(store)),
                 repo,
                 &task.id.0,
-                &[
-                    "agent=".to_string(),
-                    "model=".to_string(),
-                    "route_attempts=0".to_string(),
-                ],
                 &[
                     ("agent", serde_json::Value::Null),
                     ("model", serde_json::Value::Null),
@@ -476,7 +471,7 @@ pub(crate) async fn tick_dispatch_tasks(
                     tracing::info!(task_id, "task runner completed");
 
                     // Send task completion notification
-                    let summary = super::cleanup::store_or_sidecar(&store_for_spawn, &repo_owned, &task_id, "summary")
+                    let summary = super::cleanup::store_get_field(&store_for_spawn, &repo_owned, &task_id, "summary")
                         .await
                         .unwrap_or_default();
                     let duration = dispatch_start.elapsed().as_secs_f64();
@@ -557,7 +552,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                             }
                                             Ok(ReviewDecision::Failed(reason)) => {
                                                 let failures =
-                                                    super::cleanup::store_and_sidecar_increment(
+                                                    super::cleanup::store_increment(
                                                         &Some(store_for_review.clone()),
                                                         &repo_owned,
                                                         &task_id_for_review,
@@ -598,7 +593,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                             }
                                             Err(e) => {
                                                 let failures =
-                                                    super::cleanup::store_and_sidecar_increment(
+                                                    super::cleanup::store_increment(
                                                         &Some(store_for_review.clone()),
                                                         &repo_owned,
                                                         &task_id_for_review,
@@ -640,7 +635,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                             Ok(_) => {
                                                 // Reset all review-cycle failure counters on success
                                                 // so a subsequent retry doesn't inherit stale values.
-                                                super::cleanup::store_and_sidecar_reset_counters(
+                                                super::cleanup::store_reset_counters(
                                                     &Some(store_for_review.clone()),
                                                     &repo_owned,
                                                     &task_id_for_review,

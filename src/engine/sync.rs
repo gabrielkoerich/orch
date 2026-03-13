@@ -144,7 +144,7 @@ pub(crate) async fn sync_tick(
                         ReviewOutcome::Block
                     }
                     Ok(ReviewDecision::Failed(reason)) => {
-                        let failures = super::cleanup::store_and_sidecar_increment(
+                        let failures = super::cleanup::store_increment(
                             &Some(store_c.clone()),
                             &repo_s,
                             &tid,
@@ -170,7 +170,7 @@ pub(crate) async fn sync_tick(
                         }
                     }
                     Err(e) => {
-                        let failures = super::cleanup::store_and_sidecar_increment(
+                        let failures = super::cleanup::store_increment(
                             &Some(store_c.clone()),
                             &repo_s,
                             &tid,
@@ -196,12 +196,8 @@ pub(crate) async fn sync_tick(
                         }
                     }
                     Ok(_) => {
-                        super::cleanup::store_and_sidecar_reset_counters(
-                            &Some(store_c.clone()),
-                            &repo_s,
-                            &tid,
-                        )
-                        .await;
+                        super::cleanup::store_reset_counters(&Some(store_c.clone()), &repo_s, &tid)
+                            .await;
                         ReviewOutcome::Ok
                     }
                 };
@@ -269,11 +265,10 @@ pub(crate) async fn sync_tick(
                 // Reset the failure counter: stale-session recovery is an infrastructure
                 // event (tmux crash, service restart) not a genuine agent parse failure.
                 // Keeping the counter would unfairly consume the budget for the next cycle.
-                super::cleanup::store_and_sidecar_set(
+                super::cleanup::store_set(
                     &Some(Arc::clone(store)),
                     repo,
                     &task.id.0,
-                    &["review_agent_failures=0".to_string()],
                     &[("review_agent_failures", serde_json::json!(0))],
                 )
                 .await;

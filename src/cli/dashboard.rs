@@ -78,7 +78,7 @@ pub async fn dashboard() -> anyhow::Result<()> {
     let tmux = TmuxManager::new();
     let sessions = tmux.list_sessions().await.unwrap_or_default();
     for s in sessions.iter() {
-        let agent = store_helpers::opt_store_or_sidecar(&store, &repo, &s.task_id, "agent")
+        let agent = store_helpers::opt_store_get_field(&store, &repo, &s.task_id, "agent")
             .await
             .unwrap_or_default();
         println!("  {:<25} {:<8} #{}", s.name, agent, s.task_id);
@@ -90,7 +90,7 @@ pub async fn dashboard() -> anyhow::Result<()> {
         if let Ok(dt) = DateTime::parse_from_rfc3339(&r.updated_at) {
             let dt_utc = dt.with_timezone(&Utc);
             if dt_utc >= cutoff {
-                let agent = store_helpers::opt_store_or_sidecar(&store, &repo, &r.id.0, "agent")
+                let agent = store_helpers::opt_store_get_field(&store, &repo, &r.id.0, "agent")
                     .await
                     .unwrap_or_default();
                 let elapsed = Utc::now() - dt_utc;

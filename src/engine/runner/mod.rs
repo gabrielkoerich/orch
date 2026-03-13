@@ -77,7 +77,7 @@ impl TaskRunner {
 
     /// Read a field from the store first, falling back to sidecar.
     async fn get_field(&self, task_id: &str, field: &str) -> Option<String> {
-        crate::engine::cleanup::opt_store_or_sidecar(&self.store, &self.repo, task_id, field).await
+        crate::engine::cleanup::opt_store_get_field(&self.store, &self.repo, task_id, field).await
     }
 
     /// Run a task through the full execution pipeline.
@@ -404,14 +404,10 @@ impl TaskRunner {
         let started_at = Utc::now();
 
         // Store task info in sidecar for prompt building
-        crate::engine::cleanup::store_and_sidecar_set(
+        crate::engine::cleanup::store_set(
             &self.store,
             &self.repo,
             task_id,
-            &[
-                format!("title={}", task.title),
-                format!("body={}", task.body),
-            ],
             &[], // title/body already in store tasks table
         )
         .await;
@@ -467,11 +463,10 @@ impl TaskRunner {
                     self.process_delegations(task, &delegations, backend)
                         .await?;
                     // Clear delegations after processing
-                    crate::engine::cleanup::store_and_sidecar_set(
+                    crate::engine::cleanup::store_set(
                         &self.store,
                         &self.repo,
                         task_id,
-                        &["delegations=".to_string()],
                         &[("delegations", serde_json::json!([]))],
                     )
                     .await;

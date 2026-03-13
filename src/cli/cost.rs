@@ -11,7 +11,7 @@ pub async fn show_task(id: &str) -> anyhow::Result<()> {
 
     let usage = store_helpers::get_token_usage(&store, &repo, id).await;
     let cost_estimate = store_helpers::get_cost_estimate(&store, &repo, id).await;
-    let model = store_helpers::opt_store_or_sidecar(&store, &repo, id, "model")
+    let model = store_helpers::opt_store_get_field(&store, &repo, id, "model")
         .await
         .unwrap_or_default();
 

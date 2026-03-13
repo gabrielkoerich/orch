@@ -41,7 +41,7 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
                     .find(|l| l.starts_with("status:"))
                     .map(|s| s.replace("status:", ""))
                     .unwrap_or_else(|| "unknown".to_string());
-                let agent = store_helpers::opt_store_or_sidecar(&store, &repo, &ext.id.0, "agent")
+                let agent = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "agent")
                     .await
                     .unwrap_or_default();
                 println!(
@@ -134,12 +134,12 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
 
             // Show agent/branch info if available (store-first, sidecar fallback)
             if let Some(agent) =
-                store_helpers::opt_store_or_sidecar(&store, &repo, &ext.id.0, "agent").await
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "agent").await
             {
                 println!("Agent: {}", agent);
             }
             if let Some(branch) =
-                store_helpers::opt_store_or_sidecar(&store, &repo, &ext.id.0, "branch").await
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "branch").await
             {
                 println!("Branch: {}", branch);
             }
@@ -424,12 +424,7 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
                     .external_id
                     .unwrap_or_else(|| format!("internal:{}", task.id));
                 // Reset store counters
-                crate::engine::cleanup::store_and_sidecar_reset_counters(
-                    &store,
-                    &repo,
-                    &internal_id,
-                )
-                .await;
+                crate::engine::cleanup::store_reset_counters(&store, &repo, &internal_id).await;
                 // Reset status to New
                 s.update_status(id, TaskStatus::New).await?;
                 println!(
@@ -454,7 +449,7 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
     }
 
     // Reset sidecar + store state (attempts + all failure counters)
-    crate::engine::cleanup::store_and_sidecar_reset_counters(&store, &repo, &ext_id.0).await;
+    crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id.0).await;
 
     // Reset to new
     backend.update_status(&ext_id, Status::New).await?;
@@ -472,7 +467,7 @@ async fn reset_counters(
     repo: &str,
 ) {
     let internal_id = format!("internal:{}", id);
-    crate::engine::cleanup::store_and_sidecar_reset_counters(store, repo, &internal_id).await;
+    crate::engine::cleanup::store_reset_counters(store, repo, &internal_id).await;
 }
 
 /// Unblock a task or all blocked tasks.
@@ -492,8 +487,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
         let mut external_count = 0;
         for task in blocked.iter().chain(needs_review.iter()) {
-            crate::engine::cleanup::store_and_sidecar_reset_counters(&store, &repo, &task.id.0)
-                .await;
+            crate::engine::cleanup::store_reset_counters(&store, &repo, &task.id.0).await;
             backend.update_status(&task.id, Status::New).await?;
             external_count += 1;
         }
@@ -513,8 +507,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
                     .external_id
                     .clone()
                     .unwrap_or_else(|| format!("internal:{}", task.id));
-                crate::engine::cleanup::store_and_sidecar_reset_counters(&store, &repo, &ext_id)
-                    .await;
+                crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id).await;
                 s.update_status(task.id, TaskStatus::New).await?;
                 internal_count += 1;
             }
@@ -561,7 +554,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     }
 
     let ext_id = ExternalId(id.to_string());
-    crate::engine::cleanup::store_and_sidecar_reset_counters(&store, &repo, &ext_id.0).await;
+    crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id.0).await;
     backend.update_status(&ext_id, Status::New).await?;
     println!("Unblocked task #{} (attempts reset)", id);
 
@@ -601,7 +594,7 @@ pub async fn live() -> anyhow::Result<()> {
 
     for session in &sessions {
         let active = tmux.is_session_active(&session.name).await;
-        let agent = store_helpers::opt_store_or_sidecar(&store, &repo, &session.task_id, "agent")
+        let agent = store_helpers::opt_store_get_field(&store, &repo, &session.task_id, "agent")
             .await
             .unwrap_or_default();
         println!(
@@ -786,19 +779,19 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
         {
             // Agent & model from store
             if let Some(agent) =
-                store_helpers::opt_store_or_sidecar(&store, &repo, &sidecar_key, "agent").await
+                store_helpers::opt_store_get_field(&store, &repo, &sidecar_key, "agent").await
             {
                 println!("Agent: {}", agent);
             }
             if let Some(model) =
-                store_helpers::opt_store_or_sidecar(&store, &repo, &sidecar_key, "model").await
+                store_helpers::opt_store_get_field(&store, &repo, &sidecar_key, "model").await
             {
                 println!("Model: {}", model);
             }
 
             // Attempts
             if let Some(attempts) =
-                store_helpers::opt_store_or_sidecar(&store, &repo, &sidecar_key, "attempts").await
+                store_helpers::opt_store_get_field(&store, &repo, &sidecar_key, "attempts").await
             {
                 println!("Attempts: {}", attempts);
             }
@@ -851,7 +844,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
 
     // Show agent output from last attempt if available
     if let Some(attempts_str) =
-        store_helpers::opt_store_or_sidecar(&store, &repo, &sidecar_key, "attempts").await
+        store_helpers::opt_store_get_field(&store, &repo, &sidecar_key, "attempts").await
     {
         if let Ok(attempt_n) = attempts_str.parse::<u32>() {
             if attempt_n > 0 {

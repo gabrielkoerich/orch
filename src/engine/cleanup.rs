@@ -16,14 +16,14 @@ use tokio::process::Command;
 ///
 /// Convenience wrapper that handles `Option<Arc<TaskStore>>`:
 /// if store is `None`, returns `None`.
-pub(crate) async fn opt_store_or_sidecar(
+pub(crate) async fn opt_store_get_field(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
     field: &str,
 ) -> Option<String> {
     if let Some(ref s) = store {
-        store_or_sidecar(s, repo, task_id, field).await
+        store_get_field(s, repo, task_id, field).await
     } else {
         None
     }
@@ -35,7 +35,7 @@ pub(crate) async fn opt_store_or_sidecar(
 /// worktree_cleaned, last_review_ts, last_comment_review_ts, review_cycles,
 /// merge_conflict_retries, ci_merge_failures, pr_create_failures, attempts,
 /// pr_number, route_reason, complexity.
-pub(crate) async fn store_or_sidecar(
+pub(crate) async fn store_get_field(
     store: &Arc<TaskStore>,
     repo: &str,
     task_id: &str,
@@ -145,25 +145,11 @@ pub(crate) async fn store_set(
     }
 }
 
-/// Backward-compatible alias: `store_and_sidecar_set` → `store_set`.
-///
-/// Accepts (but ignores) `sidecar_fields` for callers not yet migrated.
-#[allow(unused_variables)]
-pub(crate) async fn store_and_sidecar_set(
-    store: &Option<Arc<TaskStore>>,
-    repo: &str,
-    task_id: &str,
-    sidecar_fields: &[String],
-    store_fields: &[(&str, serde_json::Value)],
-) {
-    store_set(store, repo, task_id, store_fields).await;
-}
-
 /// Increment a counter in the task store.
 ///
 /// Uses `store.increment()` for an atomic SQL `field + 1`.
 /// Returns the new value, or 0 if the store is unavailable.
-pub(crate) async fn store_and_sidecar_increment(
+pub(crate) async fn store_increment(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
@@ -180,7 +166,7 @@ pub(crate) async fn store_and_sidecar_increment(
 }
 
 /// Reset all task counters in the task store.
-pub(crate) async fn store_and_sidecar_reset_counters(
+pub(crate) async fn store_reset_counters(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
@@ -391,7 +377,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 
     for task_id in &task_ids {
         // Skip if already cleaned
-        let worktree_cleaned = store_or_sidecar(store, repo, task_id, "worktree_cleaned").await;
+        let worktree_cleaned = store_get_field(store, repo, task_id, "worktree_cleaned").await;
         if worktree_cleaned.as_deref() == Some("true") || worktree_cleaned.as_deref() == Some("1") {
             continue;
         }
@@ -432,8 +418,8 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<()> {
-    let worktree = store_or_sidecar(store, repo, task_id, "worktree").await;
-    let branch = store_or_sidecar(store, repo, task_id, "branch").await;
+    let worktree = store_get_field(store, repo, task_id, "worktree").await;
+    let branch = store_get_field(store, repo, task_id, "branch").await;
 
     let worktree_path = worktree.as_ref().map(std::path::PathBuf::from);
 
@@ -740,7 +726,7 @@ pub(crate) async fn check_merged_prs(
         let task_id = &task.id.0;
 
         // Get branch from store (fallback to sidecar)
-        let branch = match store_or_sidecar(store, repo, task_id, "branch").await {
+        let branch = match store_get_field(store, repo, task_id, "branch").await {
             Some(b) if !b.is_empty() => b,
             _ => {
                 tracing::debug!(task_id, "no branch info, skipping PR check");
@@ -1010,10 +996,10 @@ mod tests {
         );
     }
 
-    // ── store_or_sidecar ──────────────────────────────────────────────────
+    // ── store_get_field ──────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn store_or_sidecar_reads_from_store() {
+    async fn store_get_field_reads_from_store() {
         use crate::store::{NewTask, TaskStore};
         use std::sync::Arc;
 
@@ -1040,27 +1026,27 @@ mod tests {
             .unwrap();
 
         // Should read from store
-        let branch = store_or_sidecar(&store, "owner/repo", "42", "branch").await;
+        let branch = store_get_field(&store, "owner/repo", "42", "branch").await;
         assert_eq!(branch.as_deref(), Some("gh-42-fix"));
 
-        let wt = store_or_sidecar(&store, "owner/repo", "42", "worktree").await;
+        let wt = store_get_field(&store, "owner/repo", "42", "worktree").await;
         assert_eq!(wt.as_deref(), Some("/tmp/wt42"));
     }
 
     #[tokio::test]
-    async fn store_or_sidecar_falls_back_for_unknown_task() {
+    async fn store_get_field_falls_back_for_unknown_task() {
         use crate::store::TaskStore;
         use std::sync::Arc;
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         // Task doesn't exist in store — should return None (sidecar fallback would also fail in test)
-        let result = store_or_sidecar(&store, "owner/repo", "unknown-999", "branch").await;
+        let result = store_get_field(&store, "owner/repo", "unknown-999", "branch").await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
-    async fn store_or_sidecar_counter_fields() {
+    async fn store_get_field_counter_fields() {
         use crate::store::{NewTask, TaskStore};
         use std::sync::Arc;
 
@@ -1078,12 +1064,12 @@ mod tests {
             .unwrap();
 
         // Zero counters should return None (falls through to sidecar)
-        let retries = store_or_sidecar(&store, "owner/repo", "55", "merge_conflict_retries").await;
+        let retries = store_get_field(&store, "owner/repo", "55", "merge_conflict_retries").await;
         assert!(retries.is_none());
 
         // Set counter
         store.increment(id, "merge_conflict_retries").await.unwrap();
-        let retries = store_or_sidecar(&store, "owner/repo", "55", "merge_conflict_retries").await;
+        let retries = store_get_field(&store, "owner/repo", "55", "merge_conflict_retries").await;
         assert_eq!(retries.as_deref(), Some("1"));
 
         // Agent (Option field)
@@ -1091,18 +1077,18 @@ mod tests {
             .set_fields(id, &[("agent", serde_json::json!("claude"))])
             .await
             .unwrap();
-        let agent = store_or_sidecar(&store, "owner/repo", "55", "agent").await;
+        let agent = store_get_field(&store, "owner/repo", "55", "agent").await;
         assert_eq!(agent.as_deref(), Some("claude"));
     }
 
-    // ── opt_store_or_sidecar with None store ────────────────────────────
+    // ── opt_store_get_field with None store ────────────────────────────
 
     #[tokio::test]
-    async fn opt_store_or_sidecar_with_none_store() {
+    async fn opt_store_get_field_with_none_store() {
         // When store is None, should return None without panicking
         // (sidecar fallback also returns None for unknown tasks in test env)
         let store: Option<Arc<TaskStore>> = None;
-        let result = opt_store_or_sidecar(&store, "owner/repo", "nonexistent-999", "branch").await;
+        let result = opt_store_get_field(&store, "owner/repo", "nonexistent-999", "branch").await;
         // Should not panic; value is None because sidecar won't have this task either
         assert!(result.is_none());
     }
@@ -1252,13 +1238,13 @@ mod tests {
             .unwrap();
 
         let opt_store = Some(store);
-        let v1 = store_and_sidecar_increment(&opt_store, "owner/repo", "73", "attempts").await;
+        let v1 = store_increment(&opt_store, "owner/repo", "73", "attempts").await;
         assert_eq!(v1, 1);
 
-        let v2 = store_and_sidecar_increment(&opt_store, "owner/repo", "73", "attempts").await;
+        let v2 = store_increment(&opt_store, "owner/repo", "73", "attempts").await;
         assert_eq!(v2, 2);
 
-        let v3 = store_and_sidecar_increment(&opt_store, "owner/repo", "73", "attempts").await;
+        let v3 = store_increment(&opt_store, "owner/repo", "73", "attempts").await;
         assert_eq!(v3, 3);
 
         // Verify store has the correct value
@@ -1271,16 +1257,15 @@ mod tests {
     #[tokio::test]
     async fn increment_without_store_returns_zero() {
         let store: Option<Arc<TaskStore>> = None;
-        let v =
-            store_and_sidecar_increment(&store, "owner/repo", "no-store-task", "attempts").await;
+        let v = store_increment(&store, "owner/repo", "no-store-task", "attempts").await;
         // No store available — returns 0
         assert_eq!(v, 0);
     }
 
-    // ── store_or_sidecar: route_attempts and agent_profile ─────────────────
+    // ── store_get_field: route_attempts and agent_profile ─────────────────
 
     #[tokio::test]
-    async fn store_or_sidecar_reads_route_attempts() {
+    async fn store_get_field_reads_route_attempts() {
         use crate::store::{NewTask, TaskStore};
         use std::sync::Arc;
 
@@ -1302,12 +1287,12 @@ mod tests {
             .await
             .unwrap();
 
-        let val = store_or_sidecar(&store, "owner/repo", "80", "route_attempts").await;
+        let val = store_get_field(&store, "owner/repo", "80", "route_attempts").await;
         assert_eq!(val.as_deref(), Some("3"));
     }
 
     #[tokio::test]
-    async fn store_or_sidecar_reads_agent_profile() {
+    async fn store_get_field_reads_agent_profile() {
         use crate::store::{NewTask, TaskStore};
         use std::sync::Arc;
 
@@ -1338,10 +1323,10 @@ mod tests {
             .await
             .unwrap();
 
-        let profile = store_or_sidecar(&store, "owner/repo", "81", "agent_profile").await;
+        let profile = store_get_field(&store, "owner/repo", "81", "agent_profile").await;
         assert_eq!(profile.as_deref(), Some(r#"{"role":"backend specialist"}"#));
 
-        let skills = store_or_sidecar(&store, "owner/repo", "81", "selected_skills").await;
+        let skills = store_get_field(&store, "owner/repo", "81", "selected_skills").await;
         assert_eq!(skills.as_deref(), Some("git,rust,gh"));
     }
 
@@ -1359,51 +1344,5 @@ mod tests {
             &[("branch", serde_json::json!("main"))],
         )
         .await;
-    }
-
-    // ── store_and_sidecar_set ignores sidecar_fields ───────────────────────
-
-    #[tokio::test]
-    async fn store_and_sidecar_set_ignores_sidecar_fields() {
-        use crate::store::{NewTask, TaskStore};
-        use std::sync::Arc;
-
-        let store = Arc::new(TaskStore::open_memory().await.unwrap());
-
-        let id = store
-            .create(&NewTask {
-                external_id: Some("82".to_string()),
-                repo: "owner/repo".to_string(),
-                origin: "github".to_string(),
-                title: "Sidecar fields test".to_string(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        // Set initial branch value
-        store
-            .set_fields(id, &[("branch", serde_json::json!("initial-branch"))])
-            .await
-            .unwrap();
-
-        // Call store_and_sidecar_set with sidecar_fields populated but store_fields empty.
-        // Sidecar fields should be ignored; store task's fields must be unchanged.
-        let opt_store = Some(store.clone());
-        store_and_sidecar_set(
-            &opt_store,
-            "owner/repo",
-            "82",
-            &[
-                "some_sidecar_field=value".to_string(),
-                "another_sidecar_field=other".to_string(),
-            ],
-            &[], // empty store_fields
-        )
-        .await;
-
-        // Branch should be unchanged since store_fields was empty
-        let task = store.get(id).await.unwrap();
-        assert_eq!(task.branch, "initial-branch");
     }
 }

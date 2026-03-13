@@ -43,7 +43,7 @@ pub async fn check_guards(
     store: &Option<Arc<TaskStore>>,
 ) -> anyhow::Result<GuardOutcome> {
     let attempts: u32 =
-        crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "attempts")
+        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "attempts")
             .await
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
@@ -70,11 +70,10 @@ pub async fn check_guards(
         tracing::warn!(task_id, attempts, max_attempts, "exceeded max attempts");
         let msg =
             format!("exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset.");
-        crate::engine::cleanup::store_and_sidecar_set(
+        crate::engine::cleanup::store_set(
             store,
             repo,
             task_id,
-            &[format!("last_error={msg}")],
             &[("last_error", serde_json::json!(msg))],
         )
         .await;
@@ -90,10 +89,10 @@ pub async fn build_pseudo_task(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> ExternalTask {
-    let task_title = crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "title")
+    let task_title = crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "title")
         .await
         .unwrap_or_else(|| format!("Task #{task_id}"));
-    let task_body = crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "body")
+    let task_body = crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "body")
         .await
         .unwrap_or_default();
     ExternalTask {
@@ -123,7 +122,7 @@ pub async fn prepare_task(
 ) -> anyhow::Result<TaskInitResult> {
     // Load title from store/sidecar for branch naming (set by run_with_context before run())
     let title_for_branch =
-        crate::engine::cleanup::opt_store_or_sidecar(store, repo, task_id, "title")
+        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "title")
             .await
             .unwrap_or_default();
 
@@ -229,11 +228,10 @@ pub async fn prepare_task(
     };
 
     // Increment attempts counter
-    crate::engine::cleanup::store_and_sidecar_set(
+    crate::engine::cleanup::store_set(
         store,
         repo,
         task_id,
-        &[format!("attempts={next_attempt}")],
         &[("attempts", serde_json::json!(next_attempt))],
     )
     .await;

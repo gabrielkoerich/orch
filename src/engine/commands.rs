@@ -294,7 +294,7 @@ pub async fn execute_command(
                 }
             }
             // Reset sidecar + store state (attempts + all failure counters) so the task starts fresh
-            crate::engine::cleanup::store_and_sidecar_reset_counters(store, repo, &task_id.0).await;
+            crate::engine::cleanup::store_reset_counters(store, repo, &task_id.0).await;
             backend.update_status(task_id, Status::New).await?;
             Ok("`/retry` — reset attempts, cleared agent, reset to `status:new`".to_string())
         }
@@ -308,7 +308,7 @@ pub async fn execute_command(
                 }
             }
             // Reset sidecar + store state (attempts + all failure counters) so the task starts fresh
-            crate::engine::cleanup::store_and_sidecar_reset_counters(store, repo, &task_id.0).await;
+            crate::engine::cleanup::store_reset_counters(store, repo, &task_id.0).await;
             // Optionally set new agent
             if let Some(agent_name) = agent {
                 let label = format!("agent:{agent_name}");
