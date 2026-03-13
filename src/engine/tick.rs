@@ -19,7 +19,7 @@ use crate::engine::jobs;
 use crate::engine::router::{get_route_result, Router};
 use crate::engine::runner::{TaskRunner, WeightSignal};
 use crate::engine::tasks::{is_internal_id, TaskManager};
-use crate::sidecar::REPO_CONTEXT;
+use crate::repo_context::REPO_CONTEXT;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
@@ -232,10 +232,13 @@ pub(crate) async fn tick_route_tasks(
 
     for task in routable {
         let _task_span = tracing::info_span!("engine.route", task_id = %task.id.0).entered();
-        match router.route(task).await {
+        match router.route(task, store, repo).await {
             Ok(result) => {
-                // Store route result in sidecar
-                if let Err(e) = router.store_route_result(&task.id.0, &result) {
+                // Store route result in store
+                if let Err(e) = router
+                    .store_route_result(&task.id.0, &result, store, repo)
+                    .await
+                {
                     tracing::warn!(task_id = task.id.0, ?e, "failed to store route result");
                 }
 
@@ -458,8 +461,8 @@ pub(crate) async fn tick_dispatch_tasks(
         let task_manager_for_spawn = task_manager.clone();
         let store_for_spawn = store.clone();
 
-        // Load routing result from sidecar (stored during Phase 3a)
-        let route_result = get_route_result(&task_id).ok();
+        // Load routing result from store (stored during Phase 3a)
+        let route_result = get_route_result(store, repo, &task_id).await.ok();
         let agent_name = route_result
             .as_ref()
             .map(|r| r.agent.clone())
@@ -479,11 +482,6 @@ pub(crate) async fn tick_dispatch_tasks(
             {
                 Ok(signal) => {
                     tracing::info!(task_id, "task runner completed");
-
-                    // Dual-write: sync sidecar fields to SQLite store
-                    if let Ok(Some(store_id)) = store_for_spawn.resolve_task_id(&repo_owned, &task_id).await {
-                        store_for_spawn.sync_sidecar_to_store(store_id, &task_id).await;
-                    }
 
                     // Send task completion notification
                     let summary = super::cleanup::store_or_sidecar(&store_for_spawn, &repo_owned, &task_id, "summary")

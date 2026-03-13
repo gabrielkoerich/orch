@@ -135,7 +135,11 @@ pub async fn prepare_task(
     git_ops::rebase_on_default(&wt.work_dir, &wt.default_branch).await;
 
     // Get routing result
-    let route_result = get_route_result(task_id).ok();
+    let route_result = if let Some(ref s) = store {
+        get_route_result(s, repo, task_id).await.ok()
+    } else {
+        None
+    };
 
     let agent_name = agent
         .map(String::from)

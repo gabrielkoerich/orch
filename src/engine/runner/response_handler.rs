@@ -5,7 +5,6 @@
 //! Also owns `write_result_json` and the `safe_utf8_tail` utility.
 
 use crate::config;
-use crate::sidecar;
 use crate::store::TaskStore;
 use std::path::Path;
 use std::sync::Arc;
@@ -256,15 +255,14 @@ pub async fn handle_success(
     let output_tokens = parsed.output_tokens.or(resp.output_tokens);
     if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
         let model = model_name.unwrap_or("haiku");
-        if let Err(e) = sidecar::store_token_usage(task_id, input, output, model) {
-            tracing::warn!(task_id, ?e, "failed to store token usage");
-        }
-        // Dual-write tokens to store
         if let Some(ref st) = store {
             if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
-                let _ = st
+                if let Err(e) = st
                     .store_tokens(store_id, input as i64, output as i64, model)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(task_id, ?e, "failed to store token usage");
+                }
             }
         }
     }

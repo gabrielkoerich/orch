@@ -22,12 +22,49 @@ pub fn orch_home() -> anyhow::Result<PathBuf> {
 /// Get the orch state directory path (~/.orch/state/).
 ///
 /// This is where runtime state like logs, prompts, and PID files are stored.
-/// Note: This unifies with sidecar::state_dir() to avoid scattering files.
+/// Used across the codebase for runtime state file resolution.
 pub fn state_dir() -> anyhow::Result<PathBuf> {
     let home = orch_home()?;
     let state = home.join("state");
     std::fs::create_dir_all(&state)?;
     Ok(state)
+}
+
+/// Legacy state directories for backward-compatible reads.
+///
+/// Checks `~/.orchestrator/state/` first, then `~/.orchestrator/.orchestrator/`.
+/// Never writes to these locations.
+fn legacy_state_dir() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    // Check ~/.orchestrator/state/ (intermediate migration path)
+    let mid = home.join(".orchestrator").join("state");
+    if mid.is_dir() {
+        return Some(mid);
+    }
+    // Check ~/.orchestrator/.orchestrator/ (original nested path)
+    let old = home.join(".orchestrator").join(".orchestrator");
+    if old.is_dir() {
+        return Some(old);
+    }
+    None
+}
+
+/// Resolve a file inside the state directory, falling back to the legacy
+/// location when the file doesn't exist at the new path yet.
+pub fn state_file(name: &str) -> anyhow::Result<PathBuf> {
+    let new_path = state_dir()?.join(name);
+    if new_path.exists() {
+        return Ok(new_path);
+    }
+    // Check legacy location
+    if let Some(legacy) = legacy_state_dir() {
+        let old_path = legacy.join(name);
+        if old_path.exists() {
+            return Ok(old_path);
+        }
+    }
+    // Return new path even if it doesn't exist yet (for writes)
+    Ok(new_path)
 }
 
 /// Get the path to the global config file (~/.orch/config.yml).

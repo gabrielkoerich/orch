@@ -175,7 +175,12 @@ impl Router {
     /// 3. If round_robin mode, cycle through agents (stateful)
     /// 4. Call LLM classifier for intelligent routing
     /// 5. After max_route_attempts LLM failures, fall back to round-robin
-    pub async fn route(&mut self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
+    pub async fn route(
+        &mut self,
+        task: &ExternalTask,
+        store: &std::sync::Arc<crate::store::TaskStore>,
+        repo: &str,
+    ) -> anyhow::Result<RouteResult> {
         // 1. Check for explicit agent label
         if let Some(agent) =
             strategies::extract_agent_from_labels(&self.config.agents, &task.labels)
@@ -227,7 +232,7 @@ impl Router {
         }
 
         // 3. LLM-based routing with retry tracking
-        let route_attempts = self.get_route_attempts(&task.id.0);
+        let route_attempts = self.get_route_attempts(&task.id.0, store, repo).await;
 
         if route_attempts >= self.config.max_route_attempts {
             tracing::warn!(
@@ -251,13 +256,14 @@ impl Router {
         match self.route_with_llm(task).await {
             Ok(result) => {
                 // Reset attempts on success
-                let _ = self.set_route_attempts(&task.id.0, 0);
+                self.set_route_attempts(&task.id.0, 0, store, repo).await;
                 tracing::info!(task_id = %task.id.0, agent = %result.agent, complexity = %result.complexity, "routed via LLM");
                 Ok(result)
             }
             Err(e) => {
                 let new_attempts = route_attempts + 1;
-                let _ = self.set_route_attempts(&task.id.0, new_attempts);
+                self.set_route_attempts(&task.id.0, new_attempts, store, repo)
+                    .await;
                 tracing::warn!(
                     task_id = %task.id.0,
                     error = %e,
@@ -287,17 +293,34 @@ impl Router {
         }
     }
 
-    /// Get the number of LLM routing attempts for a task from sidecar.
-    fn get_route_attempts(&self, task_id: &str) -> u32 {
-        crate::sidecar::get(task_id, "route_attempts")
-            .ok()
+    /// Get the number of LLM routing attempts for a task from the store.
+    async fn get_route_attempts(
+        &self,
+        task_id: &str,
+        store: &std::sync::Arc<crate::store::TaskStore>,
+        repo: &str,
+    ) -> u32 {
+        crate::engine::cleanup::store_or_sidecar(store, repo, task_id, "route_attempts")
+            .await
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
     }
 
-    /// Set the number of LLM routing attempts for a task in sidecar.
-    fn set_route_attempts(&self, task_id: &str, attempts: u32) -> anyhow::Result<()> {
-        crate::sidecar::set(task_id, &[format!("route_attempts={}", attempts)])
+    /// Set the number of LLM routing attempts for a task in the store.
+    async fn set_route_attempts(
+        &self,
+        task_id: &str,
+        attempts: u32,
+        store: &std::sync::Arc<crate::store::TaskStore>,
+        repo: &str,
+    ) {
+        crate::engine::cleanup::store_set(
+            &Some(std::sync::Arc::clone(store)),
+            repo,
+            task_id,
+            &[("route_attempts", serde_json::json!(attempts))],
+        )
+        .await;
     }
 
     /// Route using LLM classification. Delegates to `self.llm_router`.
@@ -332,47 +355,72 @@ impl Router {
         self.weights.tick_recovery();
     }
 
-    /// Store routing result in sidecar file.
-    pub fn store_route_result(&self, task_id: &str, result: &RouteResult) -> anyhow::Result<()> {
-        let fields = vec![
-            format!("agent={}", result.agent),
-            format!("complexity={}", result.complexity),
-            format!("route_reason={}", result.reason),
-            format!("agent_profile={}", serde_json::to_string(&result.profile)?),
-            format!("model={}", result.model.as_deref().unwrap_or("")),
-            format!("selected_skills={}", result.selected_skills.join(",")),
-        ];
-
-        crate::sidecar::set(task_id, &fields)
+    /// Store routing result in the task store.
+    pub async fn store_route_result(
+        &self,
+        task_id: &str,
+        result: &RouteResult,
+        store: &std::sync::Arc<crate::store::TaskStore>,
+        repo: &str,
+    ) -> anyhow::Result<()> {
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            store
+                .set_fields(
+                    store_id,
+                    &[
+                        ("agent", serde_json::json!(result.agent)),
+                        ("complexity", serde_json::json!(result.complexity)),
+                        ("route_reason", serde_json::json!(result.reason)),
+                        (
+                            "model",
+                            serde_json::json!(result.model.as_deref().unwrap_or("")),
+                        ),
+                    ],
+                )
+                .await?;
+        }
+        Ok(())
     }
 }
 
-/// Retrieve routing result from sidecar file.
-pub fn get_route_result(task_id: &str) -> anyhow::Result<RouteResult> {
-    let agent = crate::sidecar::get(task_id, "agent")?;
-    let complexity =
-        crate::sidecar::get(task_id, "complexity").unwrap_or_else(|_| "medium".to_string());
-    let reason = crate::sidecar::get(task_id, "route_reason").unwrap_or_default();
-    let model = crate::sidecar::get(task_id, "model")
-        .ok()
-        .filter(|m| !m.is_empty());
-
-    let profile_json = crate::sidecar::get(task_id, "agent_profile").unwrap_or_default();
-    let profile: AgentProfile = if !profile_json.is_empty() {
-        serde_json::from_str(&profile_json).unwrap_or_default()
-    } else {
-        AgentProfile::default()
+/// Retrieve routing result from the task store.
+pub async fn get_route_result(
+    store: &std::sync::Arc<crate::store::TaskStore>,
+    repo: &str,
+    task_id: &str,
+) -> anyhow::Result<RouteResult> {
+    let read = |field: &str| {
+        let store = store.clone();
+        let repo = repo.to_string();
+        let task_id = task_id.to_string();
+        let field = field.to_string();
+        async move {
+            crate::engine::cleanup::store_or_sidecar(&store, &repo, &task_id, &field)
+                .await
+                .unwrap_or_default()
+        }
     };
 
-    let selected_skills_str = crate::sidecar::get(task_id, "selected_skills").unwrap_or_default();
-    let selected_skills: Vec<String> = if !selected_skills_str.is_empty() {
-        selected_skills_str
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        vec![]
+    let agent = read("agent").await;
+    if agent.is_empty() {
+        anyhow::bail!("no agent field found for task {task_id}");
+    }
+    let complexity = {
+        let v = read("complexity").await;
+        if v.is_empty() {
+            "medium".to_string()
+        } else {
+            v
+        }
+    };
+    let reason = read("route_reason").await;
+    let model = {
+        let v = read("model").await;
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
     };
 
     Ok(RouteResult {
@@ -380,8 +428,8 @@ pub fn get_route_result(task_id: &str) -> anyhow::Result<RouteResult> {
         model,
         complexity,
         reason,
-        profile,
-        selected_skills,
+        profile: AgentProfile::default(),
+        selected_skills: vec![],
         warning: None,
     })
 }
@@ -413,6 +461,10 @@ mod tests {
         ) -> Option<String> {
             self.llm_router.check_routing_sanity(task, agent, profile)
         }
+    }
+
+    async fn test_store() -> std::sync::Arc<crate::store::TaskStore> {
+        std::sync::Arc::new(crate::store::TaskStore::open_memory().await.unwrap())
     }
 
     fn create_test_task(id: &str, title: &str, labels: Vec<String>) -> ExternalTask {
@@ -849,9 +901,10 @@ Hope that helps!"#;
         };
 
         let task = create_test_task("1", "Test", vec!["agent:claude".to_string()]);
+        let store = test_store().await;
 
         // Should use label override, not LLM
-        let result = router.route(&task).await.unwrap();
+        let result = router.route(&task, &store, "test/repo").await.unwrap();
         assert_eq!(result.agent, "claude");
         assert!(result.reason.contains("label"));
     }
@@ -1184,7 +1237,8 @@ Hope that helps!"#;
         };
 
         let task = create_test_task("1", "Test task", vec![]);
-        let result = router.route(&task).await.unwrap();
+        let store = test_store().await;
+        let result = router.route(&task, &store, "test/repo").await.unwrap();
 
         // Should use weighted_round_robin
         assert!(result.reason.contains("weighted_round_robin"));
@@ -1217,7 +1271,8 @@ Hope that helps!"#;
 
         // Label override should take precedence over weighted routing
         let task = create_test_task("1", "Test task", vec!["agent:codex".to_string()]);
-        let result = router.route(&task).await.unwrap();
+        let store = test_store().await;
+        let result = router.route(&task, &store, "test/repo").await.unwrap();
         assert_eq!(result.agent, "codex");
         assert!(result.reason.contains("label"));
     }
@@ -1302,7 +1357,8 @@ Hope that helps!"#;
         assert!(router.last_agent.is_none());
 
         let task = create_test_task("1", "Test routing", vec![]);
-        let result = router.route(&task).await.unwrap();
+        let store = test_store().await;
+        let result = router.route(&task, &store, "test/repo").await.unwrap();
 
         assert!(router.last_agent.is_some());
         assert_eq!(router.last_agent.as_deref(), Some(result.agent.as_str()));

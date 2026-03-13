@@ -1,8 +1,7 @@
 use crate::config;
 use crate::db::Db;
 use crate::engine::cleanup as store_helpers;
-use crate::sidecar;
-use crate::store::TaskStore;
+use crate::store::{self, TaskStore};
 use std::sync::Arc;
 
 /// Show cost breakdown for a specific task (store-first, sidecar fallback).
@@ -22,7 +21,7 @@ pub async fn show_task(id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let pricing = sidecar::pricing_for_model(&model);
+    let pricing = store::pricing_for_model(&model);
 
     println!("Task #{}: cost breakdown", id);
     println!(

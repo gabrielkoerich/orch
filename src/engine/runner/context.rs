@@ -35,7 +35,7 @@ pub struct TaskContext {
     /// PR review context (for re-dispatching after review changes requested)
     pub pr_review_context: String,
     /// Memory from previous attempts (capped at last 3)
-    pub memory: Vec<crate::sidecar::MemoryEntry>,
+    pub memory: Vec<crate::store::MemoryEntry>,
 }
 
 /// Load task-specific context from context file.
@@ -277,7 +277,7 @@ pub async fn build_memory_context(
     task_id: &str,
     store: &Option<Arc<TaskStore>>,
     repo: &str,
-) -> (String, Vec<crate::sidecar::MemoryEntry>) {
+) -> (String, Vec<crate::store::MemoryEntry>) {
     const MAX_MEMORY_ENTRIES: usize = 3;
 
     let memory =

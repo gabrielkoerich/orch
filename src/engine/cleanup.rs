@@ -8,15 +8,14 @@ use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cmd::CommandErrorContext;
 use crate::db::TaskStatus;
 use crate::engine::tasks::TaskManager;
-use crate::sidecar;
 use crate::store::TaskStore;
 use std::sync::Arc;
 use tokio::process::Command;
 
-/// Try to read a task field from the store first, falling back to sidecar.
+/// Try to read a task field from the store.
 ///
 /// Convenience wrapper that handles `Option<Arc<TaskStore>>`:
-/// if store is `None`, falls back to sidecar directly.
+/// if store is `None`, returns `None`.
 pub(crate) async fn opt_store_or_sidecar(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
@@ -26,7 +25,7 @@ pub(crate) async fn opt_store_or_sidecar(
     if let Some(ref s) = store {
         store_or_sidecar(s, repo, task_id, field).await
     } else {
-        sidecar::get(task_id, field).ok()
+        None
     }
 }
 
@@ -113,19 +112,34 @@ pub(crate) async fn store_or_sidecar(
                 }
                 _ => None,
             };
-            if val.is_some() {
-                return val;
+            return val;
+        }
+    }
+    None
+}
+
+/// Write fields to the task store.
+///
+/// `store` may be None if the store isn't initialized yet.
+pub(crate) async fn store_set(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    store_fields: &[(&str, serde_json::Value)],
+) {
+    if let Some(ref store) = store {
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            if let Err(e) = store.set_fields(store_id, store_fields).await {
+                tracing::warn!(task_id, error = %e, "store set_fields failed");
             }
         }
     }
-    // Fallback to sidecar
-    sidecar::get(task_id, field).ok()
 }
 
-/// Dual-write: set fields in both store and sidecar.
+/// Backward-compatible alias: `store_and_sidecar_set` → `store_set`.
 ///
-/// Writes to sidecar first (always works), then best-effort to store.
-/// `store` may be None if the store isn't initialized yet.
+/// Accepts (but ignores) `sidecar_fields` for callers not yet migrated.
+#[allow(unused_variables)]
 pub(crate) async fn store_and_sidecar_set(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
@@ -133,57 +147,35 @@ pub(crate) async fn store_and_sidecar_set(
     sidecar_fields: &[String],
     store_fields: &[(&str, serde_json::Value)],
 ) {
-    // Sidecar write (always)
-    let _ = sidecar::set(task_id, sidecar_fields);
-
-    // Store write (best-effort)
-    if let Some(ref store) = store {
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-            if let Err(e) = store.set_fields(store_id, store_fields).await {
-                tracing::warn!(task_id, error = %e, "dual-write set_fields failed");
-            }
-        }
-    }
+    store_set(store, repo, task_id, store_fields).await;
 }
 
-/// Dual-write: increment a counter in both store and sidecar.
+/// Increment a counter in the task store.
 ///
-/// Uses the store as the authoritative source: `store.increment()` does an
-/// atomic SQL `field + 1` and returns the new value, which is then mirrored
-/// to the sidecar.  This avoids a TOCTOU race where two concurrent increments
-/// could read the same value and diverge between store and sidecar.
+/// Uses `store.increment()` for an atomic SQL `field + 1`.
+/// Returns the new value, or 0 if the store is unavailable.
 pub(crate) async fn store_and_sidecar_increment(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
     field: &str,
 ) -> u64 {
-    // Try store-authoritative increment first
     if let Some(ref s) = store {
         if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
             if let Ok(new_val) = s.increment(store_id, field).await {
-                // Mirror the store's authoritative value to sidecar
-                let _ = sidecar::set(task_id, &[format!("{field}={new_val}")]);
                 return new_val as u64;
             }
         }
     }
-
-    // Fallback: sidecar-only increment (no store available)
-    let current = sidecar::get_u64(task_id, field);
-    let new_val = current.saturating_add(1);
-    let _ = sidecar::set(task_id, &[format!("{field}={new_val}")]);
-    new_val
+    0
 }
 
-/// Dual-write: reset all task counters in both store and sidecar.
+/// Reset all task counters in the task store.
 pub(crate) async fn store_and_sidecar_reset_counters(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
 ) {
-    sidecar::reset_task_counters(task_id);
-
     if let Some(ref store) = store {
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
             let _ = store.reset_counters(store_id).await;
@@ -191,50 +183,46 @@ pub(crate) async fn store_and_sidecar_reset_counters(
     }
 }
 
-/// Get token usage from store first, falling back to sidecar.
+/// Get token usage from the store.
 pub(crate) async fn get_token_usage(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
-) -> sidecar::TokenUsage {
+) -> crate::store::TokenUsage {
     if let Some(ref s) = store {
         if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
             if let Ok(task) = s.get(store_id).await {
-                if task.input_tokens > 0 || task.output_tokens > 0 {
-                    return sidecar::TokenUsage {
-                        input_tokens: task.input_tokens as u64,
-                        output_tokens: task.output_tokens as u64,
-                    };
-                }
+                return crate::store::TokenUsage {
+                    input_tokens: task.input_tokens as u64,
+                    output_tokens: task.output_tokens as u64,
+                };
             }
         }
     }
-    sidecar::get_token_usage(task_id)
+    crate::store::TokenUsage::default()
 }
 
-/// Get cost estimate from store first, falling back to sidecar.
+/// Get cost estimate from the store.
 pub(crate) async fn get_cost_estimate(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
-) -> sidecar::CostEstimate {
+) -> crate::store::CostEstimate {
     if let Some(ref s) = store {
         if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
             if let Ok(task) = s.get(store_id).await {
-                if task.total_cost_usd > 0.0 {
-                    return sidecar::CostEstimate {
-                        input_cost_usd: task.input_cost_usd,
-                        output_cost_usd: task.output_cost_usd,
-                        total_cost_usd: task.total_cost_usd,
-                    };
-                }
+                return crate::store::CostEstimate {
+                    input_cost_usd: task.input_cost_usd,
+                    output_cost_usd: task.output_cost_usd,
+                    total_cost_usd: task.total_cost_usd,
+                };
             }
         }
     }
-    sidecar::get_cost_estimate(task_id)
+    crate::store::CostEstimate::default()
 }
 
-/// Get total tokens from store first, falling back to sidecar.
+/// Get total tokens from the store.
 pub(crate) async fn get_total_tokens(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
@@ -244,23 +232,21 @@ pub(crate) async fn get_total_tokens(
     usage.total_tokens()
 }
 
-/// Get recent memory from store first, falling back to sidecar.
+/// Get recent memory from the store.
 pub(crate) async fn get_recent_memory(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
     max_entries: usize,
-) -> Vec<sidecar::MemoryEntry> {
+) -> Vec<crate::store::MemoryEntry> {
     if let Some(ref s) = store {
         if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
             if let Ok(memory) = s.recent_memory(store_id, max_entries).await {
-                if !memory.is_empty() {
-                    return memory;
-                }
+                return memory;
             }
         }
     }
-    sidecar::get_recent_memory(task_id, max_entries).unwrap_or_default()
+    vec![]
 }
 
 /// Options controlling the worktree janitor.
@@ -555,12 +541,9 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             }
         }
 
-        // Mark as cleaned in store + sidecar
+        // Mark as cleaned in store
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
             let _ = store.mark_cleaned(store_id).await;
-        }
-        if let Err(e) = sidecar::set(task_id, &["worktree_cleaned=true".to_string()]) {
-            tracing::warn!(task_id, err = %e, "failed to mark worktree_cleaned in sidecar");
         }
     }
 
@@ -1200,7 +1183,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_recent_memory_from_store() {
-        use crate::sidecar::MemoryEntry;
+        use crate::store::MemoryEntry;
         use crate::store::{NewTask, TaskStore};
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
@@ -1281,17 +1264,14 @@ mod tests {
         assert_eq!(task.attempts, 3);
     }
 
-    // ── increment without store falls back ──────────────────────────────
+    // ── increment without store returns zero ──────────────────────────
 
     #[tokio::test]
-    async fn increment_without_store_falls_back() {
+    async fn increment_without_store_returns_zero() {
         let store: Option<Arc<TaskStore>> = None;
-        // Use a unique task ID to avoid sidecar state from previous runs
-        let unique_id = format!("no-store-test-{}", std::process::id());
-        // Read current sidecar value (may be non-zero from previous runs)
-        let before = sidecar::get_u64(&unique_id, "attempts");
-        let v = store_and_sidecar_increment(&store, "owner/repo", &unique_id, "attempts").await;
-        // Should increment by exactly 1 from whatever the sidecar had
-        assert_eq!(v, before + 1);
+        let v =
+            store_and_sidecar_increment(&store, "owner/repo", "no-store-task", "attempts").await;
+        // No store available — returns 0
+        assert_eq!(v, 0);
     }
 }

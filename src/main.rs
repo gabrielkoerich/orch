@@ -10,8 +10,8 @@ mod engine;
 mod github;
 mod home;
 mod parser;
+mod repo_context;
 pub mod security;
-mod sidecar;
 #[allow(dead_code)]
 mod store;
 mod template;
@@ -152,11 +152,6 @@ enum Commands {
         #[arg(long)]
         since: Option<String>,
     },
-    /// Read/write sidecar JSON files
-    Sidecar {
-        #[command(subcommand)]
-        action: SidecarAction,
-    },
     /// Read config values
     Config {
         /// Config key (dot-separated path)
@@ -235,24 +230,6 @@ enum Commands {
 enum WebhookAction {
     /// Show webhook server health status
     Status,
-}
-
-#[derive(Subcommand)]
-enum SidecarAction {
-    /// Get a field from a sidecar file
-    Get {
-        /// Task ID
-        task_id: String,
-        /// Field name
-        field: String,
-    },
-    /// Set a field in a sidecar file
-    Set {
-        /// Task ID
-        task_id: String,
-        /// Field=value pairs
-        fields: Vec<String>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -476,15 +453,6 @@ async fn main() -> anyhow::Result<()> {
             let matches = cron::check(&expression, since.as_deref())?;
             std::process::exit(if matches { 0 } else { 1 });
         }
-        Commands::Sidecar { action } => match action {
-            SidecarAction::Get { task_id, field } => {
-                let val = sidecar::get(&task_id, &field)?;
-                println!("{val}");
-            }
-            SidecarAction::Set { task_id, fields } => {
-                sidecar::set(&task_id, &fields)?;
-            }
-        },
         Commands::Config { key } => {
             let val = config::get(&key)?;
             println!("{val}");

@@ -6,7 +6,6 @@
 //! 3. Classifies errors (timeout, usage limit, auth, tooling)
 //! 4. Determines next action (success, reroute, needs_review)
 
-use crate::sidecar;
 use crate::store::TaskStore;
 use fs2::FileExt; // for try_lock_exclusive / unlock
 use std::io::{Read, Seek, Write};
@@ -64,14 +63,14 @@ pub fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> Strin
     }
 
     // Legacy fallback locations
-    let state_dir = sidecar::state_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let state_dir = crate::home::state_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
 
     let mut fallbacks = vec![
         PathBuf::from(format!("/tmp/output-{task_id}.json")),
         state_dir.join(format!("output-{task_id}.json")),
     ];
 
-    if let Ok(legacy_path) = sidecar::state_file(&format!("output-{task_id}.json")) {
+    if let Ok(legacy_path) = crate::home::state_file(&format!("output-{task_id}.json")) {
         if !fallbacks.contains(&legacy_path) {
             fallbacks.push(legacy_path);
         }
@@ -99,7 +98,7 @@ const MODEL_COOLDOWN_SECS: i64 = 60 * 60;
 
 /// Path to the agent cooldowns file.
 fn cooldowns_path() -> std::path::PathBuf {
-    crate::sidecar::state_dir()
+    crate::home::state_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
         .join("agent_cooldowns.json")
 }
@@ -625,7 +624,7 @@ pub async fn store_learnings_from_response(
     repo: &str,
 ) {
     // Build the memory entry
-    let entry = crate::sidecar::MemoryEntry {
+    let entry = crate::store::MemoryEntry {
         attempt,
         agent: agent.to_string(),
         model: model.map(String::from),
@@ -636,15 +635,13 @@ pub async fn store_learnings_from_response(
         timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
 
-    if let Err(e) = crate::sidecar::store_memory(task_id, &entry) {
-        tracing::warn!(task_id, error = ?e, "failed to store memory");
-    } else {
-        tracing::debug!(task_id, attempt, "stored memory for attempt");
-    }
-    // Dual-write memory to store
     if let Some(ref st) = store {
         if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
-            let _ = st.append_memory(store_id, &entry).await;
+            if let Err(e) = st.append_memory(store_id, &entry).await {
+                tracing::warn!(task_id, error = ?e, "failed to store memory");
+            } else {
+                tracing::debug!(task_id, attempt, "stored memory for attempt");
+            }
         }
     }
 }
@@ -659,7 +656,7 @@ pub async fn store_failure_memory(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) {
-    let entry = crate::sidecar::MemoryEntry {
+    let entry = crate::store::MemoryEntry {
         attempt,
         agent: agent.to_string(),
         model: model.map(String::from),
@@ -670,15 +667,13 @@ pub async fn store_failure_memory(
         timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
 
-    if let Err(e) = crate::sidecar::store_memory(task_id, &entry) {
-        tracing::warn!(task_id, error = ?e, "failed to store failure memory");
-    } else {
-        tracing::debug!(task_id, attempt, "stored failure memory");
-    }
-    // Dual-write memory to store
     if let Some(ref st) = store {
         if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
-            let _ = st.append_memory(store_id, &entry).await;
+            if let Err(e) = st.append_memory(store_id, &entry).await {
+                tracing::warn!(task_id, error = ?e, "failed to store failure memory");
+            } else {
+                tracing::debug!(task_id, attempt, "stored failure memory");
+            }
         }
     }
 }

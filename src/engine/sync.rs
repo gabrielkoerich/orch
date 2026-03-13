@@ -15,7 +15,7 @@ use crate::config;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
-use crate::sidecar::REPO_CONTEXT;
+use crate::repo_context::REPO_CONTEXT;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -562,8 +562,6 @@ pub(crate) async fn ingest_external_tasks(
         for task in &tasks {
             match store.ensure_external_task(repo, task).await {
                 Ok(store_id) => {
-                    // Sync sidecar fields to store (best-effort)
-                    store.sync_sidecar_to_store(store_id, &task.id.0).await;
                     // Sync status from backend label to store
                     let db_status = crate::engine::tasks::status_to_task_status(*status);
                     if let Err(e) = store.update_status(store_id, db_status).await {

@@ -45,7 +45,7 @@ use crate::db::Db;
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{rate_limit_metrics, GhHttp};
-use crate::sidecar::REPO_CONTEXT;
+use crate::repo_context::REPO_CONTEXT;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use runner::WeightSignal;

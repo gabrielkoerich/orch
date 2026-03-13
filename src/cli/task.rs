@@ -7,7 +7,6 @@ use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
 use crate::engine::tasks::{parse_internal_id, CreateTaskRequest, Task, TaskFilter, TaskType};
 use crate::home;
-use crate::sidecar;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
@@ -317,16 +316,19 @@ pub async fn route(id: i64) -> anyhow::Result<()> {
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let store: Arc<TaskStore> = Arc::new(crate::cli::init_store().await?);
 
     let ext_id = ExternalId(id.to_string());
     let task = backend.get_task(&ext_id).await?;
 
     let mut router = Router::from_config();
-    let result = router.route(&task).await?;
+    let result = router.route(&task, &store, &repo).await?;
 
-    // Store in sidecar
-    router.store_route_result(&ext_id.0, &result)?;
+    // Store route result
+    router
+        .store_route_result(&ext_id.0, &result, &store, &repo)
+        .await?;
 
     // Set labels
     let labels = vec![
@@ -353,6 +355,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let store: Arc<TaskStore> = Arc::new(crate::cli::init_store().await?);
 
     // Resolve task ID
     let task_id = match id {
@@ -374,7 +377,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
     };
 
     // Get routing info
-    let route_result = get_route_result(&task_id).ok();
+    let route_result = get_route_result(&store, &repo, &task_id).await.ok();
     let agent = route_result.as_ref().map(|r| r.agent.clone());
     let model = route_result.as_ref().and_then(|r| r.model.clone());
 
@@ -753,20 +756,10 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
         println!("ID: {}", id);
     }
 
-    // Sidecar path and existence
-    match sidecar::sidecar_path(&sidecar_key) {
-        Ok(path) => {
-            if !path.exists() {
-                println!(
-                    "\nNo sidecar found for task {} — looked at: {}",
-                    sidecar_key,
-                    path.display()
-                );
-            } else {
-                println!("\nSidecar: {}", path.display());
-            }
-
-            // Agent & model (store-first, sidecar fallback — works even without sidecar file)
+    // Task store fields
+    {
+        {
+            // Agent & model from store
             if let Some(agent) =
                 store_helpers::opt_store_or_sidecar(&store, &repo, &sidecar_key, "agent").await
             {
@@ -828,12 +821,6 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                     }
                 }
             }
-        }
-        Err(e) => {
-            println!(
-                "\nCould not resolve sidecar path for {}: {}",
-                sidecar_key, e
-            );
         }
     }
 

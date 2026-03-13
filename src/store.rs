@@ -15,7 +15,115 @@ use sqlx::Row;
 use std::path::Path;
 
 use crate::db::TaskStatus;
-use crate::sidecar::MemoryEntry;
+
+/// Token usage for an agent run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
+/// Per-1M token pricing in USD.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelPricing {
+    pub input_per_million_usd: f64,
+    pub output_per_million_usd: f64,
+}
+
+impl ModelPricing {
+    pub fn estimate_cost_usd(self, usage: TokenUsage) -> CostEstimate {
+        let input_cost = (usage.input_tokens as f64 / 1_000_000.0) * self.input_per_million_usd;
+        let output_cost = (usage.output_tokens as f64 / 1_000_000.0) * self.output_per_million_usd;
+        CostEstimate {
+            input_cost_usd: input_cost,
+            output_cost_usd: output_cost,
+            total_cost_usd: input_cost + output_cost,
+        }
+    }
+}
+
+/// Cost estimate in USD.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CostEstimate {
+    pub input_cost_usd: f64,
+    pub output_cost_usd: f64,
+    pub total_cost_usd: f64,
+}
+
+/// A single memory entry from a task attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryEntry {
+    /// Attempt number (1-indexed)
+    pub attempt: u32,
+    /// Agent that made this attempt
+    pub agent: String,
+    /// Model used for this attempt
+    pub model: Option<String>,
+    /// Key learnings from this attempt
+    pub learnings: Vec<String>,
+    /// Error message if the attempt failed
+    pub error: Option<String>,
+    /// Files modified in this attempt
+    pub files_modified: Vec<String>,
+    /// Approach taken (from summary)
+    pub approach: String,
+    /// Timestamp of the attempt
+    pub timestamp: String,
+}
+
+/// Resolve model pricing using a built-in table and normalized model aliases.
+pub fn pricing_for_model(model: &str) -> ModelPricing {
+    let normalized = model.trim().to_lowercase();
+    // OpenAI models
+    if normalized == "o3" {
+        return ModelPricing {
+            input_per_million_usd: 2.0,
+            output_per_million_usd: 8.0,
+        };
+    }
+    if normalized == "o4-mini" || normalized.contains("gpt-4.1-mini") {
+        return ModelPricing {
+            input_per_million_usd: 0.15,
+            output_per_million_usd: 0.6,
+        };
+    }
+    if normalized.contains("gpt-4.1") && !normalized.contains("mini") {
+        return ModelPricing {
+            input_per_million_usd: 2.0,
+            output_per_million_usd: 8.0,
+        };
+    }
+    if normalized.contains("opus") {
+        return ModelPricing {
+            input_per_million_usd: 15.0,
+            output_per_million_usd: 75.0,
+        };
+    }
+    if normalized.contains("sonnet") {
+        return ModelPricing {
+            input_per_million_usd: 3.0,
+            output_per_million_usd: 15.0,
+        };
+    }
+    if normalized.contains("haiku") {
+        return ModelPricing {
+            input_per_million_usd: 0.8,
+            output_per_million_usd: 4.0,
+        };
+    }
+
+    // Fallback baseline when model is unknown.
+    ModelPricing {
+        input_per_million_usd: 1.0,
+        output_per_million_usd: 4.0,
+    }
+}
 
 /// Unified task record — single row in the `tasks` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -654,8 +762,8 @@ impl TaskStore {
         output: i64,
         model: &str,
     ) -> anyhow::Result<()> {
-        let pricing = crate::sidecar::pricing_for_model(model);
-        let usage = crate::sidecar::TokenUsage {
+        let pricing = pricing_for_model(model);
+        let usage = TokenUsage {
             input_tokens: input as u64,
             output_tokens: output as u64,
         };
@@ -903,101 +1011,96 @@ impl TaskStore {
         .await
     }
 
-    /// Sync sidecar fields to the store for a given task.
-    /// Reads key fields from sidecar and writes them to the tasks table.
-    /// Silently ignores errors (best-effort dual-write).
-    pub async fn sync_sidecar_to_store(&self, store_id: i64, sidecar_task_id: &str) {
+    /// Sync fields from a sidecar JSON object to the store.
+    ///
+    /// Used by migration: reads key fields from the parsed JSON and writes them
+    /// to the tasks table. Silently ignores errors (best-effort).
+    async fn sync_sidecar_json_to_store(&self, store_id: i64, json: &serde_json::Value) {
         let mut updates: Vec<(&str, serde_json::Value)> = Vec::new();
 
+        // Helper: extract string field
+        let get_str = |field: &str| -> Option<String> {
+            json.get(field).and_then(|v| match v {
+                serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                serde_json::Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            })
+        };
+        let get_u64 = |field: &str| -> u64 {
+            get_str(field)
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let get_f64 = |field: &str| -> f64 {
+            get_str(field)
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+
         // Routing fields
-        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "agent") {
-            if !v.is_empty() {
-                updates.push(("agent", serde_json::json!(v)));
-            }
-        }
-        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "model") {
-            if !v.is_empty() {
-                updates.push(("model", serde_json::json!(v)));
-            }
-        }
-        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "complexity") {
-            if !v.is_empty() {
-                updates.push(("complexity", serde_json::json!(v)));
-            }
-        }
-        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "route_reason") {
-            if !v.is_empty() {
-                updates.push(("route_reason", serde_json::json!(v)));
+        for field in ["agent", "model", "complexity", "route_reason"] {
+            if let Some(v) = get_str(field) {
+                updates.push((field, serde_json::json!(v)));
             }
         }
 
         // Execution fields
-        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "branch") {
-            if !v.is_empty() {
-                updates.push(("branch", serde_json::json!(v)));
-            }
-        }
-        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "worktree") {
-            if !v.is_empty() {
-                updates.push(("worktree", serde_json::json!(v)));
-            }
-        }
-        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "summary") {
-            if !v.is_empty() {
-                updates.push(("summary", serde_json::json!(v)));
-            }
-        }
-        if let Ok(v) = crate::sidecar::get(sidecar_task_id, "last_error") {
-            if !v.is_empty() {
-                updates.push(("last_error", serde_json::json!(v)));
+        for field in ["branch", "worktree", "summary", "last_error"] {
+            if let Some(v) = get_str(field) {
+                updates.push((field, serde_json::json!(v)));
             }
         }
 
         // Counters
-        let attempts = crate::sidecar::get_u64(sidecar_task_id, "attempts");
-        if attempts > 0 {
-            updates.push(("attempts", serde_json::json!(attempts)));
-        }
-        let route_attempts = crate::sidecar::get_u64(sidecar_task_id, "route_attempts");
-        if route_attempts > 0 {
-            updates.push(("route_attempts", serde_json::json!(route_attempts)));
+        for field in ["attempts", "route_attempts"] {
+            let val = get_u64(field);
+            if val > 0 {
+                updates.push((field, serde_json::json!(val)));
+            }
         }
 
         // PR fields
-        let pr_number = crate::sidecar::get_u64(sidecar_task_id, "pr_number");
+        let pr_number = get_u64("pr_number");
         if pr_number > 0 {
             updates.push(("pr_number", serde_json::json!(pr_number)));
         }
 
         // Tokens & cost
-        let input_tokens = crate::sidecar::get_u64(sidecar_task_id, "input_tokens");
-        let output_tokens = crate::sidecar::get_u64(sidecar_task_id, "output_tokens");
+        let input_tokens = get_u64("input_tokens");
+        let output_tokens = get_u64("output_tokens");
         if input_tokens > 0 || output_tokens > 0 {
             updates.push(("input_tokens", serde_json::json!(input_tokens)));
             updates.push(("output_tokens", serde_json::json!(output_tokens)));
-            let cost = crate::sidecar::get_cost_estimate(sidecar_task_id);
-            updates.push(("input_cost_usd", serde_json::json!(cost.input_cost_usd)));
-            updates.push(("output_cost_usd", serde_json::json!(cost.output_cost_usd)));
-            updates.push(("total_cost_usd", serde_json::json!(cost.total_cost_usd)));
+            updates.push((
+                "input_cost_usd",
+                serde_json::json!(get_f64("input_cost_usd")),
+            ));
+            updates.push((
+                "output_cost_usd",
+                serde_json::json!(get_f64("output_cost_usd")),
+            ));
+            updates.push((
+                "total_cost_usd",
+                serde_json::json!(get_f64("total_cost_usd")),
+            ));
         }
 
         // Review counters
-        let review_cycles = crate::sidecar::get_u64(sidecar_task_id, "review_cycles");
-        if review_cycles > 0 {
-            updates.push(("review_cycles", serde_json::json!(review_cycles)));
-        }
-        let review_failures = crate::sidecar::get_u64(sidecar_task_id, "review_agent_failures");
-        if review_failures > 0 {
-            updates.push(("review_agent_failures", serde_json::json!(review_failures)));
-        }
-        let merge_retries = crate::sidecar::get_u64(sidecar_task_id, "merge_conflict_retries");
-        if merge_retries > 0 {
-            updates.push(("merge_conflict_retries", serde_json::json!(merge_retries)));
+        for field in [
+            "review_cycles",
+            "review_agent_failures",
+            "merge_conflict_retries",
+        ] {
+            let val = get_u64(field);
+            if val > 0 {
+                updates.push((field, serde_json::json!(val)));
+            }
         }
 
         if !updates.is_empty() {
             if let Err(e) = self.set_fields(store_id, &updates).await {
-                tracing::warn!(store_id, error = %e, "dual-write: failed to sync sidecar → store");
+                tracing::warn!(store_id, error = %e, "migration: failed to sync sidecar → store");
             }
         }
     }
@@ -1084,9 +1187,18 @@ impl TaskStore {
                 {
                     Ok(id) => {
                         let _ = self.update_status(id, task.status).await;
-                        // Sync sidecar fields
+                        // Try to read sidecar file and sync fields
                         let sidecar_key = format!("internal:{}", task.id);
-                        self.sync_sidecar_to_store(id, &sidecar_key).await;
+                        if let Ok(task_dir) = crate::home::task_dir(default_repo, &sidecar_key) {
+                            let sidecar_file = task_dir.join("sidecar.json");
+                            if let Ok(content) = std::fs::read_to_string(&sidecar_file) {
+                                if let Ok(json) =
+                                    serde_json::from_str::<serde_json::Value>(&content)
+                                {
+                                    self.sync_sidecar_json_to_store(id, &json).await;
+                                }
+                            }
+                        }
                         result.migrated += 1;
                     }
                     Err(e) => {
@@ -1190,7 +1302,7 @@ impl TaskStore {
                         .await
                     {
                         Ok(id) => {
-                            self.sync_sidecar_to_store(id, &task_id).await;
+                            self.sync_sidecar_json_to_store(id, &json).await;
                             result.migrated += 1;
                         }
                         Err(e) => {
@@ -3336,7 +3448,7 @@ mod tests {
             .unwrap();
 
         // Append memory entries
-        let entry1 = crate::sidecar::MemoryEntry {
+        let entry1 = MemoryEntry {
             attempt: 1,
             agent: "claude".to_string(),
             model: None,
@@ -3346,7 +3458,7 @@ mod tests {
             approach: "read the code".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
         };
-        let entry2 = crate::sidecar::MemoryEntry {
+        let entry2 = MemoryEntry {
             attempt: 2,
             agent: "codex".to_string(),
             model: None,
