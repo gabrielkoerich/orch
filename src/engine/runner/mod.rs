@@ -104,7 +104,7 @@ impl TaskRunner {
         );
 
         // Check task guards; returns outcome indicating whether to proceed.
-        let attempts = match task_init::check_guards(task_id, &self.repo).await {
+        let attempts = match task_init::check_guards(task_id, &self.repo, &self.store).await {
             Ok(task_init::GuardOutcome::Proceed(a)) => a,
             Ok(task_init::GuardOutcome::Skip) => {
                 return Ok(None);
@@ -150,6 +150,7 @@ impl TaskRunner {
             &self.repo,
             &project_dir,
             attempts,
+            &self.store,
         )
         .await?;
 
@@ -238,6 +239,7 @@ impl TaskRunner {
                     init.model_name.as_deref(),
                     init.new_attempts,
                     &self.repo,
+                    &self.store,
                 )
                 .await?;
                 if budget_exceeded {
@@ -256,6 +258,8 @@ impl TaskRunner {
                     init.model_name.as_deref(),
                     init.new_attempts,
                     self.db.as_ref(),
+                    &self.store,
+                    &self.repo,
                 )
                 .await?
                 {

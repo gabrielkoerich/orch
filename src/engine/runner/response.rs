@@ -7,9 +7,11 @@
 //! 4. Determines next action (success, reroute, needs_review)
 
 use crate::sidecar;
+use crate::store::TaskStore;
 use fs2::FileExt; // for try_lock_exclusive / unlock
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Outcome signal for the engine to update router weights.
 ///
@@ -332,15 +334,17 @@ impl RetryableError {
 ///
 /// Note: DB recording of rate limit events is handled by the caller (mod.rs)
 /// which has async context. This function only handles sidecar state + cooldowns.
-pub fn handle_failover(
+pub async fn handle_failover(
     task_id: &str,
     agent_name: &str,
     error_type: RetryableError,
     error_message: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
 ) -> String {
     // Get the reroute chain
     let chain = get_reroute_chain(task_id);
-    let chain = update_reroute_chain(task_id, agent_name, &chain);
+    let chain = update_reroute_chain(task_id, agent_name, &chain, store, repo).await;
 
     // Get all available agents
     let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
@@ -363,15 +367,21 @@ pub fn handle_failover(
             agent = agent_name,
             "all agents exhausted, marking needs_review"
         );
-        if let Err(e) = sidecar::set(
+        let msg = format!("{error_message} (all agents exhausted)");
+        crate::engine::cleanup::store_and_sidecar_set(
+            store,
+            repo,
             task_id,
             &[
-                format!("last_error={error_message} (all agents exhausted)"),
+                format!("last_error={msg}"),
                 format!("error_type={}", error_type.type_str()),
             ],
-        ) {
-            tracing::error!(task_id, ?e, "failed to update task status during failover");
-        }
+            &[
+                ("last_error", serde_json::json!(msg)),
+                ("error_type", serde_json::json!(error_type.type_str())),
+            ],
+        )
+        .await;
         return "needs_review".to_string();
     }
 
@@ -391,31 +401,45 @@ pub fn handle_failover(
             record_agent_failure(agent_name);
         }
 
-        if let Err(e) = sidecar::set(
+        let msg = format!("{error_message}, rerouted to {next}");
+        crate::engine::cleanup::store_and_sidecar_set(
+            store,
+            repo,
             task_id,
             &[
                 format!("agent={next}"),
                 "model=".to_string(),
-                format!("last_error={error_message}, rerouted to {next}"),
+                format!("last_error={msg}"),
                 format!("error_type={}", error_type.type_str()),
             ],
-        ) {
-            tracing::error!(task_id, ?e, "failed to update task status during failover");
-        }
+            &[
+                ("agent", serde_json::json!(next)),
+                ("model", serde_json::json!("")),
+                ("last_error", serde_json::json!(msg)),
+                ("error_type", serde_json::json!(error_type.type_str())),
+            ],
+        )
+        .await;
         return "new".to_string();
     }
 
     // No fallback available
     tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
-    if let Err(e) = sidecar::set(
+    let msg = format!("{error_message}, no fallback agents");
+    crate::engine::cleanup::store_and_sidecar_set(
+        store,
+        repo,
         task_id,
         &[
-            format!("last_error={error_message}, no fallback agents"),
+            format!("last_error={msg}"),
             format!("error_type={}", error_type.type_str()),
         ],
-    ) {
-        tracing::error!(task_id, ?e, "failed to update task status during failover");
-    }
+        &[
+            ("last_error", serde_json::json!(msg)),
+            ("error_type", serde_json::json!(error_type.type_str())),
+        ],
+    )
+    .await;
     "needs_review".to_string()
 }
 
@@ -427,8 +451,14 @@ pub fn get_reroute_chain(task_id: &str) -> String {
         .to_string()
 }
 
-/// Update the reroute chain in sidecar.
-pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: &str) -> String {
+/// Update the reroute chain in sidecar + store.
+pub async fn update_reroute_chain(
+    task_id: &str,
+    current_agent: &str,
+    existing_chain: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> String {
     let mut chain = existing_chain.to_string();
     if chain.is_empty() {
         chain = current_agent.to_string();
@@ -436,9 +466,14 @@ pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: 
         chain = format!("{chain},{current_agent}");
     }
 
-    if let Err(e) = sidecar::set(task_id, &[format!("limit_reroute_chain={chain}")]) {
-        tracing::warn!(task_id, error = ?e, "failed to update reroute chain");
-    }
+    crate::engine::cleanup::store_and_sidecar_set(
+        store,
+        repo,
+        task_id,
+        &[format!("limit_reroute_chain={chain}")],
+        &[("limit_reroute_chain", serde_json::json!(chain))],
+    )
+    .await;
     chain
 }
 
@@ -580,13 +615,16 @@ fn extract_json_block(text: &str) -> Option<String> {
 }
 
 /// Extract learnings and store as memory for future attempts.
-pub fn store_learnings_from_response(
+#[allow(clippy::too_many_arguments)]
+pub async fn store_learnings_from_response(
     task_id: &str,
     attempt: u32,
     agent: &str,
     model: Option<&str>,
     response: &crate::parser::AgentResponse,
     error: Option<&str>,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
 ) {
     // Build the memory entry
     let entry = crate::sidecar::MemoryEntry {
@@ -605,15 +643,23 @@ pub fn store_learnings_from_response(
     } else {
         tracing::debug!(task_id, attempt, "stored memory for attempt");
     }
+    // Dual-write memory to store
+    if let Some(ref st) = store {
+        if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
+            let _ = st.append_memory(store_id, &entry).await;
+        }
+    }
 }
 
 /// Store a memory entry for a failed attempt (without a full AgentResponse).
-pub fn store_failure_memory(
+pub async fn store_failure_memory(
     task_id: &str,
     attempt: u32,
     agent: &str,
     model: Option<&str>,
     error: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
 ) {
     let entry = crate::sidecar::MemoryEntry {
         attempt,
@@ -630,6 +676,12 @@ pub fn store_failure_memory(
         tracing::warn!(task_id, error = ?e, "failed to store failure memory");
     } else {
         tracing::debug!(task_id, attempt, "stored failure memory");
+    }
+    // Dual-write memory to store
+    if let Some(ref st) = store {
+        if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
+            let _ = st.append_memory(store_id, &entry).await;
+        }
     }
 }
 

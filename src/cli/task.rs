@@ -394,10 +394,12 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
     // Check if this is an internal task in the DB first.
     let db_path = home::db_path().context("could not resolve DB path")?;
     let db = Db::open(&db_path)?;
+    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
     if let Ok(task) = db.get_internal_task(id).await {
         let internal_id = format!("internal:{}", task.id);
-        // Reset sidecar (attempts + all failure counters)
-        crate::sidecar::reset_task_counters(&internal_id);
+        // Reset sidecar + store (attempts + all failure counters)
+        crate::engine::cleanup::store_and_sidecar_reset_counters(&store, &repo, &internal_id).await;
         // Reset DB status to New
         db.update_internal_task_status(id, TaskStatus::New).await?;
         println!(
@@ -407,9 +409,7 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let repo =
-        config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
 
     let ext_id = ExternalId(id.to_string());
 
@@ -421,8 +421,8 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
         }
     }
 
-    // Reset sidecar state (attempts + all failure counters) so the task starts fresh
-    crate::sidecar::reset_task_counters(&ext_id.0);
+    // Reset sidecar + store state (attempts + all failure counters)
+    crate::engine::cleanup::store_and_sidecar_reset_counters(&store, &repo, &ext_id.0).await;
 
     // Reset to new
     backend.update_status(&ext_id, Status::New).await?;
@@ -434,9 +434,13 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn reset_internal_sidecar(id: i64) {
+async fn reset_counters(
+    id: i64,
+    store: &Option<std::sync::Arc<crate::store::TaskStore>>,
+    repo: &str,
+) {
     let internal_id = format!("internal:{}", id);
-    crate::sidecar::reset_task_counters(&internal_id);
+    crate::engine::cleanup::store_and_sidecar_reset_counters(store, repo, &internal_id).await;
 }
 
 /// Unblock a task or all blocked tasks.
@@ -448,9 +452,10 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
     let db_path = home::db_path().context("could not resolve DB path")?;
     let db = Db::open(&db_path)?;
+    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
 
     if id == "all" {
         let blocked = backend.list_by_status(Status::Blocked).await?;
@@ -458,7 +463,8 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
         let mut external_count = 0;
         for task in blocked.iter().chain(needs_review.iter()) {
-            crate::sidecar::reset_task_counters(&task.id.0);
+            crate::engine::cleanup::store_and_sidecar_reset_counters(&store, &repo, &task.id.0)
+                .await;
             backend.update_status(&task.id, Status::New).await?;
             external_count += 1;
         }
@@ -471,7 +477,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
             .await?;
         let mut internal_count = 0;
         for task in internal_blocked.iter().chain(internal_needs_review.iter()) {
-            reset_internal_sidecar(task.id).await;
+            reset_counters(task.id, &store, &repo).await;
             db.update_internal_task_status(task.id, TaskStatus::New)
                 .await?;
             internal_count += 1;
@@ -490,7 +496,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
             .parse::<i64>()
             .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
         db.get_internal_task(parsed).await?;
-        reset_internal_sidecar(parsed).await;
+        reset_counters(parsed, &store, &repo).await;
         db.update_internal_task_status(parsed, TaskStatus::New)
             .await?;
         println!(
@@ -502,7 +508,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
     if let Ok(parsed) = id.parse::<i64>() {
         if db.get_internal_task(parsed).await.is_ok() {
-            reset_internal_sidecar(parsed).await;
+            reset_counters(parsed, &store, &repo).await;
             db.update_internal_task_status(parsed, TaskStatus::New)
                 .await?;
             println!(
@@ -514,7 +520,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     }
 
     let ext_id = ExternalId(id.to_string());
-    crate::sidecar::reset_task_counters(&ext_id.0);
+    crate::engine::cleanup::store_and_sidecar_reset_counters(&store, &repo, &ext_id.0).await;
     backend.update_status(&ext_id, Status::New).await?;
     println!("Unblocked task #{} (attempts reset)", id);
 

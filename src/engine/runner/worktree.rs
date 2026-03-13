@@ -5,7 +5,9 @@
 
 use crate::cmd::CommandErrorContext;
 use crate::sidecar;
+use crate::store::TaskStore;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::process::Command;
 
 /// Result of worktree setup.
@@ -139,6 +141,8 @@ pub async fn setup_worktree(
     task_id: &str,
     title: &str,
     project_dir: &Path,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
 ) -> anyhow::Result<WorktreeSetup> {
     // Resolve to main repo (avoid nested worktrees)
     let main_dir = resolve_main_repo(project_dir).await;
@@ -307,14 +311,24 @@ pub async fn setup_worktree(
         }
     }
 
-    // Save worktree info to sidecar
-    sidecar::set(
+    // Save worktree info to sidecar + store
+    crate::engine::cleanup::store_and_sidecar_set(
+        store,
+        repo,
         task_id,
         &[
             format!("worktree={}", worktree_dir.display()),
             format!("branch={branch_name_str}"),
         ],
-    )?;
+        &[
+            (
+                "worktree",
+                serde_json::json!(worktree_dir.display().to_string()),
+            ),
+            ("branch", serde_json::json!(branch_name_str)),
+        ],
+    )
+    .await;
 
     tracing::info!(
         task_id,

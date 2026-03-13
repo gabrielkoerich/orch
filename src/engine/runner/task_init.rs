@@ -7,8 +7,10 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::config;
 use crate::engine::router::get_route_result;
 use crate::sidecar;
+use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::{agent, context, git_ops, worktree};
 
@@ -36,7 +38,11 @@ pub enum GuardOutcome {
 /// Check task guards and return the outcome.
 ///
 /// Also checks for existing tmux sessions to prevent duplicate dispatch.
-pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<GuardOutcome> {
+pub async fn check_guards(
+    task_id: &str,
+    repo: &str,
+    store: &Option<Arc<TaskStore>>,
+) -> anyhow::Result<GuardOutcome> {
     let attempts: u32 = sidecar::get(task_id, "attempts")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -62,12 +68,16 @@ pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<GuardOutc
 
     if attempts >= max_attempts {
         tracing::warn!(task_id, attempts, max_attempts, "exceeded max attempts");
-        sidecar::set(
+        let msg =
+            format!("exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset.");
+        crate::engine::cleanup::store_and_sidecar_set(
+            store,
+            repo,
             task_id,
-            &[format!(
-                "last_error=exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset."
-            )],
-        )?;
+            &[format!("last_error={msg}")],
+            &[("last_error", serde_json::json!(msg))],
+        )
+        .await;
         return Ok(GuardOutcome::MaxAttempts);
     }
 
@@ -92,6 +102,7 @@ pub fn build_pseudo_task(task_id: &str) -> ExternalTask {
 }
 
 /// Prepare the full task: set up worktree, build context and prompts, create invocation.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_task(
     task_id: &str,
     agent: Option<&str>,
@@ -100,12 +111,13 @@ pub async fn prepare_task(
     repo: &str,
     project_dir: &Path,
     attempts: u32,
+    store: &Option<Arc<TaskStore>>,
 ) -> anyhow::Result<TaskInitResult> {
     // Load title from sidecar for branch naming (set by run_with_context before run())
     let title_for_branch = sidecar::get(task_id, "title").unwrap_or_default();
 
     // Set up worktree
-    let wt = worktree::setup_worktree(task_id, &title_for_branch, project_dir).await?;
+    let wt = worktree::setup_worktree(task_id, &title_for_branch, project_dir, store, repo).await?;
 
     // Rebase worktree on default branch to pick up latest changes.
     // This prevents non-fast-forward push failures when the task is re-dispatched.
@@ -200,7 +212,14 @@ pub async fn prepare_task(
     };
 
     // Increment attempts counter
-    sidecar::set(task_id, &[format!("attempts={next_attempt}")])?;
+    crate::engine::cleanup::store_and_sidecar_set(
+        store,
+        repo,
+        task_id,
+        &[format!("attempts={next_attempt}")],
+        &[("attempts", serde_json::json!(next_attempt))],
+    )
+    .await;
 
     Ok(TaskInitResult {
         agent_name,

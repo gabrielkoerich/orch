@@ -6,6 +6,7 @@
 
 use crate::db::Db;
 use crate::sidecar;
+use crate::store::TaskStore;
 use std::sync::Arc;
 
 use super::{agents, response};
@@ -23,6 +24,7 @@ pub enum ErrorHandleResult {
 /// Returns `Ok(ErrorHandleResult::EarlyReturn)` when the task was rerouted and
 /// `run()` should record metrics and return immediately (skipping tmux cleanup).
 /// Returns `Ok(ErrorHandleResult::Continue)` when `run()` should proceed to cleanup.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_error(
     task_id: &str,
     agent_err: &agents::AgentError,
@@ -31,6 +33,8 @@ pub async fn handle_error(
     model_name: Option<&str>,
     new_attempts: u32,
     db: Option<&Arc<Db>>,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
 ) -> anyhow::Result<ErrorHandleResult> {
     tracing::warn!(
         task_id,
@@ -71,14 +75,23 @@ pub async fn handle_error(
             });
             if let Some(next) = next_model {
                 tracing::info!(task_id, model = %next, "retrying with different model");
-                sidecar::set(
+                let msg = format!("model {model} unavailable, trying {next}");
+                crate::engine::cleanup::store_and_sidecar_set(
+                    store,
+                    repo,
                     task_id,
                     &[
                         format!("model={next}"),
-                        format!("last_error=model {model} unavailable, trying {next}"),
+                        format!("last_error={msg}"),
                         "error_type=failed".to_string(),
                     ],
-                )?;
+                    &[
+                        ("model", serde_json::json!(next.to_string())),
+                        ("last_error", serde_json::json!(msg)),
+                        ("error_type", serde_json::json!("failed")),
+                    ],
+                )
+                .await;
                 // Skip normal failover — we're retrying same agent with different model
                 return Ok(ErrorHandleResult::EarlyReturn {
                     status: "new".to_string(),
@@ -98,13 +111,18 @@ pub async fn handle_error(
         }
         agents::AgentError::WaitingForInput { message } => {
             // Requires human — skip failover, go straight to needs_review
-            sidecar::set(
+            let msg = format!("waiting for input: {message}");
+            crate::engine::cleanup::store_and_sidecar_set(
+                store,
+                repo,
                 task_id,
+                &[format!("last_error={msg}"), "error_type=failed".to_string()],
                 &[
-                    format!("last_error=waiting for input: {message}"),
-                    "error_type=failed".to_string(),
+                    ("last_error", serde_json::json!(msg)),
+                    ("error_type", serde_json::json!("failed")),
                 ],
-            )?;
+            )
+            .await;
             return Ok(ErrorHandleResult::EarlyReturn {
                 status: "needs_review".to_string(),
             });
@@ -174,16 +192,26 @@ pub async fn handle_error(
                 } else {
                     format!("{tried_models},{free_model}")
                 };
-                sidecar::set(
+                let msg = format!("all agents exhausted, trying free model {free_model}");
+                crate::engine::cleanup::store_and_sidecar_set(
+                    store,
+                    repo,
                     task_id,
                     &[
                         "agent=opencode".to_string(),
                         format!("model={free_model}"),
                         format!("model_reroute_chain={new_tried}"),
-                        format!("last_error=all agents exhausted, trying free model {free_model}"),
+                        format!("last_error={msg}"),
                         format!("error_type={}", retryable.type_str()),
                     ],
-                )?;
+                    &[
+                        ("agent", serde_json::json!("opencode")),
+                        ("model", serde_json::json!(free_model.to_string())),
+                        ("last_error", serde_json::json!(msg)),
+                        ("error_type", serde_json::json!(retryable.type_str())),
+                    ],
+                )
+                .await;
                 return Ok(ErrorHandleResult::EarlyReturn {
                     status: "new".to_string(),
                 });
@@ -191,13 +219,23 @@ pub async fn handle_error(
         }
     }
 
-    let status = response::handle_failover(task_id, agent_name, retryable, &error_msg);
+    let status =
+        response::handle_failover(task_id, agent_name, retryable, &error_msg, store, repo).await;
     if status == "needs_review" {
         tracing::warn!(task_id, "failover exhausted, task marked needs_review");
     }
 
     // Store failure memory for retry learning
-    response::store_failure_memory(task_id, new_attempts, agent_name, model_name, &error_msg);
+    response::store_failure_memory(
+        task_id,
+        new_attempts,
+        agent_name,
+        model_name,
+        &error_msg,
+        store,
+        repo,
+    )
+    .await;
 
     Ok(ErrorHandleResult::Continue { status })
 }
