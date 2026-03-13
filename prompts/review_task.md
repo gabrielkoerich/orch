@@ -15,15 +15,13 @@ Keep the branch up to date — other PRs may have merged since this was created:
 
 ### Step 2: Run CI checks locally
 
-Look at `.github/workflows/` to see what CI runs, then execute those exact commands:
-- `cargo fmt -- --check` (formatting)
-- `cargo clippy --all-targets -- -D warnings` (lints)
-- `cargo test` (tests)
+1. Read `.github/workflows/` to identify what the CI pipeline runs (lint, format, test, build, etc.)
+2. Execute those exact commands locally — do not guess or hardcode language-specific commands
+3. Run only the checks that apply to the changed code (skip deploy/publish steps)
 
 If ANY check fails, try to fix it yourself:
-- Run `cargo fmt` for formatting issues
-- Fix clippy warnings directly
-- Fix compilation errors if straightforward
+- Apply auto-fixers if available (e.g. formatter --fix, linter --fix)
+- Fix errors directly if straightforward
 
 Commit your fixes, push, and re-run checks. If you cannot fix a failure, decision = `request_changes`.
 
