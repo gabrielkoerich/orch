@@ -853,6 +853,44 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
         }
     }
 
+    // Show audit trail from task_runs table (if available in store)
+    if let Ok(store) = crate::cli::init_store().await {
+        if let Ok(Some(store_id)) = store.resolve_task_id(&repo, &sidecar_key).await {
+            if let Ok(runs) = store.get_runs(store_id).await {
+                if !runs.is_empty() {
+                    println!("\n--- Run audit trail ({} runs) ---", runs.len());
+                    for run in &runs {
+                        println!(
+                            "\n  Run #{} [{}] agent={} model={} outcome={}",
+                            run.attempt,
+                            run.run_type,
+                            run.agent,
+                            run.model,
+                            run.outcome,
+                        );
+                        if let Some(code) = run.exit_code {
+                            println!("    exit_code: {}", code);
+                        }
+                        if !run.error.is_empty() {
+                            println!("    error: {}", run.error);
+                        }
+                        if run.total_cost_usd > 0.0 {
+                            println!(
+                                "    tokens: {}in/{}out  cost: ${:.6}  duration: {:.1}s",
+                                run.input_tokens, run.output_tokens,
+                                run.total_cost_usd, run.duration_secs,
+                            );
+                        }
+                        println!("    started: {}", run.started_at);
+                        if let Some(ref completed) = run.completed_at {
+                            println!("    completed: {}", completed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // If tmux session is live, append recent pane capture
     let tmux = TmuxManager::new();
     let session = tmux.session_name(&repo, &sidecar_key);
