@@ -208,6 +208,7 @@ pub async fn handle_error(
                     &[
                         ("agent", serde_json::json!("opencode")),
                         ("model", serde_json::json!(free_model.to_string())),
+                        ("model_reroute_chain", serde_json::json!(new_tried)),
                         ("last_error", serde_json::json!(msg)),
                     ],
                 )

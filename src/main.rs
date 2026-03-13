@@ -12,7 +12,6 @@ mod home;
 mod parser;
 mod repo_context;
 pub mod security;
-#[allow(dead_code)]
 mod store;
 mod template;
 mod tmux;

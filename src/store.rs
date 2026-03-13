@@ -349,6 +349,7 @@ impl TaskStore {
     }
 
     /// Get a reference to the underlying pool (for advanced queries).
+    #[allow(dead_code)]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
@@ -455,6 +456,7 @@ impl TaskStore {
     }
 
     /// List tasks by status within a repo.
+    #[allow(dead_code)]
     pub async fn list_by_status(
         &self,
         repo: &str,
@@ -472,11 +474,13 @@ impl TaskStore {
     }
 
     /// List routable tasks (status = 'new') within a repo.
+    #[allow(dead_code)]
     pub async fn list_routable(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         self.list_by_status(repo, TaskStatus::New).await
     }
 
     /// List all tasks for a repo, ordered by creation time descending.
+    #[allow(dead_code)]
     pub async fn list_all(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query("SELECT * FROM tasks WHERE repo = ? ORDER BY created_at DESC")
             .bind(repo)
@@ -487,6 +491,7 @@ impl TaskStore {
 
     /// Aggregate cost and token data for a repo.
     /// Returns (total_input_tokens, total_output_tokens, total_cost_usd).
+    #[allow(dead_code)]
     pub async fn cost_summary(&self, repo: &str) -> anyhow::Result<(i64, i64, f64)> {
         let row = sqlx::query(
             "SELECT
@@ -509,6 +514,7 @@ impl TaskStore {
 
     /// Count tasks by status for a repo.
     /// Returns a map of status string → count.
+    #[allow(dead_code)]
     pub async fn status_counts(
         &self,
         repo: &str,
@@ -805,6 +811,7 @@ impl TaskStore {
     }
 
     /// List tasks that are done/blocked with worktrees that haven't been cleaned.
+    #[allow(dead_code)]
     pub async fn list_cleanable(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
             "SELECT * FROM tasks
@@ -889,6 +896,7 @@ impl TaskStore {
     }
 
     /// Get the last run of a specific type for a task.
+    #[allow(dead_code)]
     pub async fn get_last_run(
         &self,
         task_id: i64,
@@ -909,6 +917,7 @@ impl TaskStore {
     }
 
     /// Prune old runs for done/blocked tasks older than `days` days.
+    #[allow(dead_code)]
     pub async fn prune_old_runs(&self, days: i32) -> anyhow::Result<u64> {
         let result = sqlx::query(
             "DELETE FROM task_runs WHERE task_id IN (
@@ -1105,21 +1114,28 @@ impl TaskStore {
         }
     }
 
-    /// Resolve a sidecar task_id (e.g. "42" or "internal:3") to a store internal ID.
+    /// Resolve a task_id (e.g. "42" or "internal:3") to a store internal ID.
     /// Returns None if the task is not in the store yet.
-    pub async fn resolve_task_id(
-        &self,
-        repo: &str,
-        sidecar_task_id: &str,
-    ) -> anyhow::Result<Option<i64>> {
-        // Internal tasks use "internal:{n}" format — these use the old rusqlite
-        // ID space and don't have external_id entries in the unified store yet.
-        // After `orch migrate` they'll be in the store with origin='internal'.
-        if sidecar_task_id.starts_with("internal:") {
+    pub async fn resolve_task_id(&self, repo: &str, task_id: &str) -> anyhow::Result<Option<i64>> {
+        if let Some(suffix) = task_id.strip_prefix("internal:") {
+            // Internal tasks: look up by external_id="internal:{n}" with origin='internal'
+            if let Some(task) = self.get_by_external_id(repo, task_id).await? {
+                return Ok(Some(task.id));
+            }
+            // Fallback: try the numeric suffix as a direct store ID
+            if let Ok(id) = suffix.parse::<i64>() {
+                let exists = sqlx::query("SELECT id FROM tasks WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                if exists.is_some() {
+                    return Ok(Some(id));
+                }
+            }
             return Ok(None);
         }
         // External tasks: look up by external_id
-        match self.get_by_external_id(repo, sidecar_task_id).await? {
+        match self.get_by_external_id(repo, task_id).await? {
             Some(task) => Ok(Some(task.id)),
             None => Ok(None),
         }
@@ -4192,5 +4208,52 @@ mod tests {
         let task = store.get(id1).await.unwrap();
         assert_eq!(task.title, "Updated title");
         assert_eq!(task.body, "Updated body");
+    }
+
+    // ── resolve_task_id: internal tasks ────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_task_id_finds_internal_task() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("internal:5".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Internal task 5".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resolved = store
+            .resolve_task_id("owner/repo", "internal:5")
+            .await
+            .unwrap();
+        assert_eq!(resolved, Some(id));
+    }
+
+    #[tokio::test]
+    async fn resolve_task_id_returns_none_for_unknown_internal() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        // Create a different internal task to make sure the store isn't empty
+        store
+            .create(&NewTask {
+                external_id: Some("internal:1".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Internal task 1".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let resolved = store
+            .resolve_task_id("owner/repo", "internal:999")
+            .await
+            .unwrap();
+        assert_eq!(resolved, None);
     }
 }

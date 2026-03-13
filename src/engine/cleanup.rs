@@ -102,6 +102,15 @@ pub(crate) async fn store_or_sidecar(
                 "total_cost_usd" if task.total_cost_usd > 0.0 => {
                     Some(task.total_cost_usd.to_string())
                 }
+                "route_attempts" if task.route_attempts > 0 => {
+                    Some(task.route_attempts.to_string())
+                }
+                "agent_profile" if !task.agent_profile.is_empty() => {
+                    Some(task.agent_profile.clone())
+                }
+                "selected_skills" if !task.selected_skills.is_empty() => {
+                    Some(task.selected_skills.clone())
+                }
                 "delegations" => {
                     let json = serde_json::to_string(&task.delegations).unwrap_or_default();
                     if json != "[]" && !json.is_empty() {
@@ -1273,5 +1282,135 @@ mod tests {
             store_and_sidecar_increment(&store, "owner/repo", "no-store-task", "attempts").await;
         // No store available — returns 0
         assert_eq!(v, 0);
+    }
+
+    // ── store_or_sidecar: route_attempts and agent_profile ─────────────────
+
+    #[tokio::test]
+    async fn store_or_sidecar_reads_route_attempts() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("80".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Route attempts test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .set_fields(id, &[("route_attempts", serde_json::json!(3))])
+            .await
+            .unwrap();
+
+        let val = store_or_sidecar(&store, "owner/repo", "80", "route_attempts").await;
+        assert_eq!(val.as_deref(), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn store_or_sidecar_reads_agent_profile() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("81".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Agent profile test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .set_fields(
+                id,
+                &[
+                    (
+                        "agent_profile",
+                        serde_json::json!(r#"{"role":"backend specialist"}"#),
+                    ),
+                    ("selected_skills", serde_json::json!("git,rust,gh")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let profile = store_or_sidecar(&store, "owner/repo", "81", "agent_profile").await;
+        assert_eq!(profile.as_deref(), Some(r#"{"role":"backend specialist"}"#));
+
+        let skills = store_or_sidecar(&store, "owner/repo", "81", "selected_skills").await;
+        assert_eq!(skills.as_deref(), Some("git,rust,gh"));
+    }
+
+    // ── store_set with None store ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_set_with_none_store() {
+        // When store is None, store_set should not panic and return normally.
+        let store: Option<Arc<TaskStore>> = None;
+        // Should complete without panicking
+        store_set(
+            &store,
+            "owner/repo",
+            "42",
+            &[("branch", serde_json::json!("main"))],
+        )
+        .await;
+    }
+
+    // ── store_and_sidecar_set ignores sidecar_fields ───────────────────────
+
+    #[tokio::test]
+    async fn store_and_sidecar_set_ignores_sidecar_fields() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("82".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Sidecar fields test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Set initial branch value
+        store
+            .set_fields(id, &[("branch", serde_json::json!("initial-branch"))])
+            .await
+            .unwrap();
+
+        // Call store_and_sidecar_set with sidecar_fields populated but store_fields empty.
+        // Sidecar fields should be ignored; store task's fields must be unchanged.
+        let opt_store = Some(store.clone());
+        store_and_sidecar_set(
+            &opt_store,
+            "owner/repo",
+            "82",
+            &[
+                "some_sidecar_field=value".to_string(),
+                "another_sidecar_field=other".to_string(),
+            ],
+            &[], // empty store_fields
+        )
+        .await;
+
+        // Branch should be unchanged since store_fields was empty
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.branch, "initial-branch");
     }
 }
