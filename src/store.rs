@@ -502,7 +502,6 @@ impl TaskStore {
     }
 
     /// List tasks by status within a repo.
-    #[allow(dead_code)]
     pub async fn list_by_status(
         &self,
         repo: &str,
@@ -520,7 +519,6 @@ impl TaskStore {
     }
 
     /// List routable tasks (status = 'new') within a repo.
-    #[allow(dead_code)]
     pub async fn list_routable(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         self.list_by_status(repo, TaskStatus::New).await
     }

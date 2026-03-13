@@ -318,7 +318,21 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<()> {
-    let done_tasks = backend.list_by_status(Status::Done).await?;
+    // Read done tasks from the store first; fall back to backend before first sync.
+    let done_tasks = {
+        let store_populated = store.list_all(repo).await.map_or(0, |t| t.len()) > 0;
+        if store_populated {
+            store
+                .list_by_status(repo, crate::db::TaskStatus::Done)
+                .await?
+                .iter()
+                .filter(|t| t.origin != "internal")
+                .map(crate::engine::tasks::store_task_to_external)
+                .collect()
+        } else {
+            backend.list_by_status(Status::Done).await?
+        }
+    };
     tracing::debug!(count = done_tasks.len(), "checking done tasks for cleanup");
 
     // Collect task IDs from external done tasks.
@@ -328,6 +342,8 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     // When a PR merge auto-closes a GitHub issue (via "Fixes #N"), the issue
     // state becomes "closed" but orch never updates the status label to "done".
     // These orphaned worktrees accumulate unless we catch them here.
+    // Note: This still queries the backend because GitHub `state` (open/closed)
+    // is backend-specific and not tracked in the store.
     match backend.list_all_tasks().await {
         Ok(all_tasks) => {
             let done_set: std::collections::HashSet<String> = task_ids.iter().cloned().collect();
@@ -711,8 +727,30 @@ pub(crate) async fn check_merged_prs(
     repo: &str,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
-    let in_review_tasks = backend.list_by_status(Status::InReview).await?;
-    let needs_review_tasks = backend.list_by_status(Status::NeedsReview).await?;
+    // Read from the store first; fall back to backend if the store has no data.
+    let store_populated = store.list_all(repo).await.map_or(0, |t| t.len()) > 0;
+    let in_review_tasks = if store_populated {
+        store
+            .list_by_status(repo, crate::db::TaskStatus::InReview)
+            .await?
+            .iter()
+            .filter(|t| t.origin != "internal")
+            .map(crate::engine::tasks::store_task_to_external)
+            .collect()
+    } else {
+        backend.list_by_status(Status::InReview).await?
+    };
+    let needs_review_tasks = if store_populated {
+        store
+            .list_by_status(repo, crate::db::TaskStatus::NeedsReview)
+            .await?
+            .iter()
+            .filter(|t| t.origin != "internal")
+            .map(crate::engine::tasks::store_task_to_external)
+            .collect()
+    } else {
+        backend.list_by_status(Status::NeedsReview).await?
+    };
     let all_review_tasks: Vec<_> = in_review_tasks
         .into_iter()
         .chain(needs_review_tasks)

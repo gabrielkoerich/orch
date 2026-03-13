@@ -107,17 +107,32 @@ pub(crate) async fn sync_tick(
         .map(|v| v != "false")
         .unwrap_or(true);
     if enable_review {
-        // Collect all NeedsReview tasks: external + internal.
-        let mut needs_review_tasks = backend
-            .list_by_status(Status::NeedsReview)
-            .await
-            .unwrap_or_default();
-        if let Ok(internal_needs_review) = task_manager
-            .list_internal_by_status(TaskStatus::NeedsReview)
-            .await
-        {
-            needs_review_tasks.extend(internal_needs_review);
-        }
+        // Collect all NeedsReview tasks (external + internal) from the store.
+        // Falls back to backend if the store has no data yet.
+        let needs_review_tasks = {
+            let store_populated = store.list_all(repo).await.map_or(0, |t| t.len()) > 0;
+            if store_populated {
+                store
+                    .list_by_status(repo, TaskStatus::NeedsReview)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .map(crate::engine::tasks::store_task_to_external)
+                    .collect::<Vec<_>>()
+            } else {
+                let mut tasks = backend
+                    .list_by_status(Status::NeedsReview)
+                    .await
+                    .unwrap_or_default();
+                if let Ok(internal_needs_review) = task_manager
+                    .list_internal_by_status(TaskStatus::NeedsReview)
+                    .await
+                {
+                    tasks.extend(internal_needs_review);
+                }
+                tasks
+            }
+        };
 
         for task in needs_review_tasks {
             let task_id = &task.id.0;
@@ -254,18 +269,31 @@ pub(crate) async fn sync_tick(
         }
 
         // Detect stale InReview tasks (review agent crashed, no active tmux session).
-        // Check external tasks.
-        let mut in_review_tasks = backend
-            .list_by_status(Status::InReview)
-            .await
-            .unwrap_or_default();
-        // Also include internal InReview tasks.
-        if let Ok(internal_in_review) = task_manager
-            .list_internal_by_status(TaskStatus::InReview)
-            .await
-        {
-            in_review_tasks.extend(internal_in_review);
-        }
+        // Read from the store (includes both external and internal tasks).
+        let in_review_tasks = {
+            let store_populated = store.list_all(repo).await.map_or(0, |t| t.len()) > 0;
+            if store_populated {
+                store
+                    .list_by_status(repo, TaskStatus::InReview)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .map(crate::engine::tasks::store_task_to_external)
+                    .collect::<Vec<_>>()
+            } else {
+                let mut tasks = backend
+                    .list_by_status(Status::InReview)
+                    .await
+                    .unwrap_or_default();
+                if let Ok(internal_in_review) = task_manager
+                    .list_internal_by_status(TaskStatus::InReview)
+                    .await
+                {
+                    tasks.extend(internal_in_review);
+                }
+                tasks
+            }
+        };
         for task in in_review_tasks {
             // Skip tasks that just transitioned to InReview — allow time for the
             // review agent to start its tmux session before treating it as stale.

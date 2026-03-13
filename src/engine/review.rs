@@ -67,8 +67,23 @@ pub(crate) async fn review_open_prs(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
-    // Get tasks that are in review (have open PRs)
-    let mut in_review_tasks = backend.list_by_status(Status::InReview).await?;
+    // Get tasks that are in review (have open PRs).
+    // Read from the store first; fall back to backend if the store is empty.
+    let mut in_review_tasks = {
+        let store_tasks = store
+            .list_by_status(repo, crate::db::TaskStatus::InReview)
+            .await?;
+        let external: Vec<_> = store_tasks
+            .iter()
+            .filter(|t| t.origin != "internal")
+            .map(crate::engine::tasks::store_task_to_external)
+            .collect();
+        if store.list_all(repo).await.map_or(0, |t| t.len()) > 0 {
+            external
+        } else {
+            backend.list_by_status(Status::InReview).await?
+        }
+    };
 
     // Also include internal tasks in InReview — they create real PRs
     // and can receive human review comments just like external tasks.

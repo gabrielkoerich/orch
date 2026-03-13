@@ -221,47 +221,71 @@ impl TaskManager {
     }
 
     /// Get all external tasks across all statuses (for status summary).
+    /// Reads from the store when available, falling back to the backend.
     pub async fn list_all_external_tasks(&self) -> anyhow::Result<Vec<ExternalTask>> {
+        if let Some(ref store) = self.store {
+            let tasks = store.list_all(&self.repo).await?;
+            if !tasks.is_empty() {
+                return Ok(tasks
+                    .iter()
+                    .filter(|t| t.origin != "internal")
+                    .map(store_task_to_external)
+                    .collect());
+            }
+        }
         self.backend.list_all_tasks().await
     }
 
-    /// Get external tasks by status (for engine use)
+    /// Get external tasks by status (for engine use).
+    /// Store-first: reads from the store when available, falls back to backend
+    /// if the store has no tasks (e.g. before first sync).
     pub async fn list_external_by_status(
         &self,
         status: Status,
     ) -> anyhow::Result<Vec<ExternalTask>> {
+        if let Some(ref store) = self.store {
+            let db_status = status_to_task_status(status);
+            let tasks = store.list_by_status(&self.repo, db_status).await?;
+            // Filter to external only (exclude internal tasks)
+            let external: Vec<ExternalTask> = tasks
+                .iter()
+                .filter(|t| t.origin != "internal")
+                .map(store_task_to_external)
+                .collect();
+            // If the store has data for this repo, trust it even if empty for this status.
+            // Only fall back to the backend if the store has no data at all (pre-first-sync).
+            let any_tasks_in_store = store.list_all(&self.repo).await.map_or(0, |t| t.len());
+            if any_tasks_in_store > 0 {
+                return Ok(external);
+            }
+        }
         self.backend.list_by_status(status).await
     }
 
-    /// Get open tasks that are routable (no status:* label or status:new).
-    /// Includes both external (GitHub) tasks and internal (store) tasks in New status.
+    /// Get open tasks that are routable (status = new).
+    /// Store-first: reads all New tasks (external + internal) from the store,
+    /// falling back to the backend for external tasks before first sync.
     pub async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
-        let mut tasks = self.backend.list_routable().await?;
+        if let Some(ref store) = self.store {
+            let all_new = store.list_routable(&self.repo).await?;
+            let tasks: Vec<ExternalTask> = all_new.iter().map(store_task_to_external).collect();
+            // If store has any data, trust it (even empty = nothing routable)
+            let any_tasks_in_store = store.list_all(&self.repo).await.map_or(0, |t| t.len());
+            if any_tasks_in_store > 0 {
+                return Ok(tasks);
+            }
+        }
 
-        // Include internal tasks with New status from the store.
+        // Fallback: backend for external + store for internal
+        let mut tasks = self.backend.list_routable().await?;
         if let Some(ref store) = self.store {
             let internal_new = store
                 .list_internal_by_status(&self.repo, TaskStatus::New)
                 .await?;
             for t in internal_new {
-                let ext_id = t
-                    .external_id
-                    .clone()
-                    .unwrap_or_else(|| format!("internal:{}", t.id));
-                tasks.push(ExternalTask {
-                    id: ExternalId(ext_id),
-                    title: t.title,
-                    body: t.body,
-                    state: "open".to_string(),
-                    labels: vec!["status:new".to_string()],
-                    author: t.source,
-                    created_at: t.created_at.clone(),
-                    updated_at: t.updated_at.clone(),
-                    url: String::new(),
-                });
+                tasks.push(store_task_to_external(&t));
             }
         }
-
         Ok(tasks)
     }
 
@@ -787,5 +811,156 @@ mod tests {
 
         let tasks = tm.list_all_internal().await.unwrap();
         assert_eq!(tasks.len(), 2);
+    }
+
+    // ── Phase 4: store-first reads ───────────────────────────────────
+
+    #[tokio::test]
+    async fn list_external_by_status_reads_from_store() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend = Arc::new(MockBackend::new());
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        // Create an external task in the store with status Routed
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "42",
+                title: "Store task",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Routed).await.unwrap();
+
+        let routed = tm.list_external_by_status(Status::Routed).await.unwrap();
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].id.0, "42");
+        assert_eq!(routed[0].title, "Store task");
+    }
+
+    #[tokio::test]
+    async fn list_external_by_status_excludes_internal_tasks() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend = Arc::new(MockBackend::new());
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        // Create an internal task with Routed status
+        let id = store
+            .create_internal("owner/repo", "Internal task", "", "cron", "1")
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Routed).await.unwrap();
+
+        // Also create an external task to populate the store
+        store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "99",
+                title: "External",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        let routed = tm.list_external_by_status(Status::Routed).await.unwrap();
+        // Should only include the internal task since it's status Routed, but filtered to external only
+        assert_eq!(routed.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_routable_reads_from_store_when_populated() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend = Arc::new(MockBackend::new());
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        // Create a new external task
+        store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "10",
+                title: "New external",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        // Also a new internal task
+        store
+            .create_internal("owner/repo", "New internal", "", "cron", "1")
+            .await
+            .unwrap();
+
+        let routable = tm.list_routable().await.unwrap();
+        // Both should appear (both are status=new)
+        assert_eq!(routable.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_all_external_tasks_reads_from_store() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend = Arc::new(MockBackend::new());
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        // Create tasks with different statuses
+        let id1 = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "1",
+                title: "Task 1",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        let id2 = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "2",
+                title: "Task 2",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store.update_status(id1, TaskStatus::Done).await.unwrap();
+        store
+            .update_status(id2, TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        // Internal tasks should be excluded
+        store
+            .create_internal("owner/repo", "Internal", "", "cron", "1")
+            .await
+            .unwrap();
+
+        let all = tm.list_all_external_tasks().await.unwrap();
+        assert_eq!(all.len(), 2);
     }
 }
