@@ -1561,11 +1561,16 @@ impl TaskStore {
     }
 
     /// Increment the self-improvement issue counter for the current week.
+    /// Uses a single atomic SQL statement to avoid TOCTOU race conditions.
     pub async fn increment_self_improvement_counter(&self) -> anyhow::Result<()> {
         let key = self_improvement_key();
-        let current = self.kv_get(&key).await?;
-        let new_count = current.and_then(|c| c.parse::<i64>().ok()).unwrap_or(0) + 1;
-        self.kv_set(&key, &new_count.to_string()).await?;
+        sqlx::query(
+            "INSERT INTO kv (key, value, updated_at) VALUES (?, '1', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+        )
+        .bind(&key)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1747,6 +1752,13 @@ impl TaskStore {
     /// All reads use sqlx raw queries — no rusqlite dependency needed.
     pub async fn migrate_sidecars(&self, default_repo: &str) -> anyhow::Result<MigrateResult> {
         let mut result = MigrateResult::default();
+
+        // Idempotency guard: skip if migration was already completed.
+        // Prevents duplicate task_metrics and rate_limits rows on repeated runs.
+        if let Ok(Some(_)) = self.kv_get("migration_completed").await {
+            tracing::info!("migration already completed, skipping");
+            return Ok(result);
+        }
 
         // 1. Migrate internal tasks from old SQLite table (if it exists)
         let old_tasks: Vec<_> = sqlx::query(
@@ -2013,6 +2025,9 @@ impl TaskStore {
                 }
             }
         }
+
+        // Mark migration as completed to prevent duplicate runs
+        let _ = self.kv_set("migration_completed", "1").await;
 
         Ok(result)
     }

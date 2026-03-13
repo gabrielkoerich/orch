@@ -551,10 +551,23 @@ pub(crate) async fn ingest_external_tasks(
         for task in &tasks {
             match store.ensure_external_task(repo, task).await {
                 Ok(store_id) => {
-                    // Sync status from backend label to store
-                    let db_status = crate::engine::tasks::status_to_task_status(*status);
-                    if let Err(e) = store.update_status(store_id, db_status).await {
-                        tracing::debug!(task_id = task.id.0, ?e, "ingest: status sync failed");
+                    // Only sync status from backend → store for NEW tasks (first ingest).
+                    // Once a task exists in the store, its status is authoritative —
+                    // re-ingestion must not overwrite store-first status changes
+                    // (e.g., store has Routed but GitHub still shows New labels).
+                    if let Ok(existing) = store.get(store_id).await {
+                        if existing.status == crate::store::TaskStatus::New {
+                            let db_status = crate::engine::tasks::status_to_task_status(*status);
+                            if db_status != crate::store::TaskStatus::New {
+                                if let Err(e) = store.update_status(store_id, db_status).await {
+                                    tracing::debug!(
+                                        task_id = task.id.0,
+                                        ?e,
+                                        "ingest: status sync failed"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -768,6 +781,44 @@ mod tests {
         assert_eq!(counts.get("needs_review"), Some(&1));
         assert_eq!(counts.get("in_review"), Some(&1));
         assert_eq!(counts.get("blocked"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn ingest_does_not_overwrite_store_authoritative_status() {
+        use crate::store::TaskStore;
+
+        // Backend reports task as New (GitHub labels haven't caught up yet)
+        let backend: Arc<dyn ExternalBackend> =
+            IngestMockBackend::with_tasks(vec![(Status::New, make_ext_task("99", "My task"))]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Pre-create the task and advance it to Routed in the store
+        let id = store
+            .create(&crate::store::NewTask {
+                external_id: Some("99".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "My task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Routed)
+            .await
+            .unwrap();
+
+        // Ingest should NOT overwrite Routed back to New
+        ingest_external_tasks(&backend, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::Routed,
+            "ingest must not overwrite store-authoritative status"
+        );
     }
 
     // ── kv_get_prefer_store / kv_set_prefer_store ────────────────────
