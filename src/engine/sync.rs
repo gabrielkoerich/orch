@@ -12,10 +12,10 @@
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
-use crate::db::{Db, TaskStatus};
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::repo_context::REPO_CONTEXT;
+use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
@@ -23,33 +23,21 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 
-/// Read a KV value, preferring the store (sqlx) over the old db (rusqlite).
-async fn kv_get_prefer_store(
-    store: &Option<&Arc<TaskStore>>,
-    db: &Arc<Db>,
-    key: &str,
-) -> Option<String> {
+/// Read a KV value from the store.
+async fn kv_get_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str) -> Option<String> {
     if let Some(s) = store {
         if let Ok(v) = s.kv_get(key).await {
             return v;
         }
     }
-    db.kv_get(key).await.ok().flatten()
+    None
 }
 
-/// Write a KV value, preferring the store (sqlx) over the old db (rusqlite).
-async fn kv_set_prefer_store(
-    store: &Option<&Arc<TaskStore>>,
-    db: &Arc<Db>,
-    key: &str,
-    value: &str,
-) {
+/// Write a KV value to the store.
+async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: &str) {
     if let Some(s) = store {
-        if s.kv_set(key, value).await.is_ok() {
-            return;
-        }
+        let _ = s.kv_set(key, value).await;
     }
-    db.kv_set(key, value).await.ok();
 }
 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
@@ -67,7 +55,6 @@ pub(crate) async fn sync_tick(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
     repo: &str,
-    db: &Arc<Db>,
     config: &EngineConfig,
     semaphore: &Arc<Semaphore>,
     router: &Arc<RwLock<Router>>,
@@ -93,7 +80,7 @@ pub(crate) async fn sync_tick(
     }
 
     // 3. Scan for @mentions
-    if let Err(e) = scan_mentions(backend, db, Some(store), repo).await {
+    if let Err(e) = scan_mentions(backend, Some(store), repo).await {
         tracing::warn!(err = %e, "mention scan failed");
     }
 
@@ -336,8 +323,7 @@ pub(crate) async fn sync_tick(
 
     // 6. Scan for owner /slash commands in issue comments
     if let Err(e) =
-        super::commands::scan_commands(backend, db, repo, &Some(Arc::clone(store)), task_manager)
-            .await
+        super::commands::scan_commands(backend, repo, &Some(Arc::clone(store)), task_manager).await
     {
         tracing::warn!(err = %e, "owner command scan failed");
     }
@@ -356,7 +342,6 @@ pub(crate) async fn sync_tick(
 /// creates internal tasks, and acknowledges them.
 async fn scan_mentions(
     backend: &Arc<dyn ExternalBackend>,
-    db: &Arc<Db>,
     store: Option<&Arc<crate::store::TaskStore>>,
     repo: &str,
 ) -> anyhow::Result<()> {
@@ -375,7 +360,7 @@ async fn scan_mentions(
 
     // Use persisted cursor if available, otherwise fall back to 24h ago
     let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-    let since_str = match kv_get_prefer_store(&store, db, "mentions_last_checked").await {
+    let since_str = match kv_get_prefer_store(&store, "mentions_last_checked").await {
         Some(ts) => ts,
         None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
@@ -425,7 +410,7 @@ async fn scan_mentions(
 
     // Persist cursor so the next sync tick only fetches newer comments
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    kv_set_prefer_store(&store, db, "mentions_last_checked", &now).await;
+    kv_set_prefer_store(&store, "mentions_last_checked", &now).await;
 
     Ok(())
 }
@@ -696,7 +681,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(task1.title, "First issue");
-        assert_eq!(task1.status, crate::db::TaskStatus::New);
+        assert_eq!(task1.status, crate::store::TaskStatus::New);
 
         let task2 = store
             .get_by_external_id("owner/repo", "2")
@@ -704,7 +689,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(task2.title, "Second issue");
-        assert_eq!(task2.status, crate::db::TaskStatus::InProgress);
+        assert_eq!(task2.status, crate::store::TaskStatus::InProgress);
     }
 
     #[tokio::test]
@@ -740,7 +725,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(task.title, "Updated title");
-        assert_eq!(task.status, crate::db::TaskStatus::Routed);
+        assert_eq!(task.status, crate::store::TaskStatus::Routed);
     }
 
     #[tokio::test]
@@ -790,49 +775,35 @@ mod tests {
     #[tokio::test]
     async fn kv_get_prefer_store_reads_from_store() {
         let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
-        let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        db.migrate().await.unwrap();
 
         store.kv_set("k1", "store_val").await.unwrap();
-        db.kv_set("k1", "db_val").await.unwrap();
 
         let opt = Some(&store);
-        let val = kv_get_prefer_store(&opt, &db, "k1").await;
+        let val = kv_get_prefer_store(&opt, "k1").await;
         assert_eq!(val.as_deref(), Some("store_val"));
     }
 
     #[tokio::test]
-    async fn kv_get_prefer_store_falls_back_to_db() {
-        let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        db.migrate().await.unwrap();
-        db.kv_set("k2", "db_val").await.unwrap();
-
+    async fn kv_get_prefer_store_returns_none_without_store() {
         let opt: Option<&Arc<crate::store::TaskStore>> = None;
-        let val = kv_get_prefer_store(&opt, &db, "k2").await;
-        assert_eq!(val.as_deref(), Some("db_val"));
+        let val = kv_get_prefer_store(&opt, "k2").await;
+        assert_eq!(val, None);
     }
 
     #[tokio::test]
     async fn kv_set_prefer_store_writes_to_store() {
         let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
-        let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        db.migrate().await.unwrap();
 
         let opt = Some(&store);
-        kv_set_prefer_store(&opt, &db, "k3", "val3").await;
+        kv_set_prefer_store(&opt, "k3", "val3").await;
 
         assert_eq!(store.kv_get("k3").await.unwrap().as_deref(), Some("val3"));
-        assert_eq!(db.kv_get("k3").await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn kv_set_prefer_store_falls_back_to_db() {
-        let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        db.migrate().await.unwrap();
-
+    async fn kv_set_prefer_store_noop_without_store() {
         let opt: Option<&Arc<crate::store::TaskStore>> = None;
-        kv_set_prefer_store(&opt, &db, "k4", "val4").await;
-
-        assert_eq!(db.kv_get("k4").await.unwrap().as_deref(), Some("val4"));
+        // Should not panic
+        kv_set_prefer_store(&opt, "k4", "val4").await;
     }
 }

@@ -71,7 +71,7 @@ pub(crate) async fn review_open_prs(
     // Read from the store first; fall back to backend if the store is empty.
     let mut in_review_tasks = {
         let store_tasks = store
-            .list_by_status(repo, crate::db::TaskStatus::InReview)
+            .list_by_status(repo, crate::store::TaskStatus::InReview)
             .await?;
         let external: Vec<_> = store_tasks
             .iter()
@@ -88,7 +88,7 @@ pub(crate) async fn review_open_prs(
     // Also include internal tasks in InReview — they create real PRs
     // and can receive human review comments just like external tasks.
     if let Ok(internal_in_review) = task_manager
-        .list_internal_by_status(crate::db::TaskStatus::InReview)
+        .list_internal_by_status(crate::store::TaskStatus::InReview)
         .await
     {
         in_review_tasks.extend(internal_in_review);

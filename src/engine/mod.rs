@@ -41,7 +41,6 @@ use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
 use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use crate::config;
-use crate::db::Db;
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{rate_limit_metrics, GhHttp};
@@ -237,27 +236,18 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         }
         tracing::info!(repo = %repo, backend = backend.name(), "backend connected");
 
-        // Initialize database (shared between task manager and runner for metrics)
-        let db = Arc::new(Db::open(&crate::db::default_path()?)?);
-        db.migrate().await?;
-
         // Initialize unified task store (sqlx)
-        let store = Arc::new(TaskStore::open(&crate::db::default_path()?).await?);
+        let store = Arc::new(TaskStore::open(&crate::store::default_db_path()?).await?);
 
-        // Initialize task manager (with unified store for dual-write)
+        // Initialize task manager (with unified store)
         let task_manager = Arc::new(TaskManager::with_store(
-            db.clone(),
             backend.clone(),
             store.clone(),
             repo.clone(),
         ));
 
-        // Task runner (with db for metrics)
-        let runner = Arc::new(
-            runner::TaskRunner::new(repo.clone())
-                .with_db(db.clone())
-                .with_store(store.clone()),
-        );
+        // Task runner (with store for metrics)
+        let runner = Arc::new(runner::TaskRunner::new(repo.clone()).with_store(store.clone()));
 
         engines.push(ProjectEngine {
             repo,
@@ -291,9 +281,6 @@ pub async fn serve() -> anyhow::Result<()> {
 
     let mut config = EngineConfig::from_config();
 
-    // Initialize internal database (shared across all projects)
-    let db = Arc::new(Db::open(&crate::db::default_path()?)?);
-    db.migrate().await?;
     tracing::info!("internal database ready");
 
     // Initialize project engines — retry with backoff so a network outage at
@@ -318,10 +305,9 @@ pub async fn serve() -> anyhow::Result<()> {
         "initialized project engines"
     );
 
-    // Re-create task managers with shared db and store
+    // Re-create task managers with shared store
     for engine in &mut project_engines {
         engine.task_manager = Arc::new(TaskManager::with_store(
-            db.clone(),
             engine.backend.clone(),
             engine.store.clone(),
             engine.repo.clone(),
@@ -721,7 +707,7 @@ pub async fn serve() -> anyhow::Result<()> {
         }
 
         // Also reset internal (SQLite) InReview tasks on startup.
-        use crate::db::TaskStatus as DbStatus;
+        use crate::store::TaskStatus as DbStatus;
         if let Ok(internal_in_review) = engine
             .task_manager
             .list_internal_by_status(DbStatus::InReview)
@@ -848,7 +834,6 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &semaphore,
                                 &config,
                                 &jobs_path,
-                                &db,
                                 &mut router_guard,
                                 &router,
                                 &engine.task_manager,
@@ -868,7 +853,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         for engine in &project_engines {
                             let repo = engine.repo.clone();
                             REPO_CONTEXT.scope(repo, async {
-                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config, &semaphore, &router, &engine.task_manager, &engine.store).await {
+                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &config, &semaphore, &router, &engine.task_manager, &engine.store).await {
                                     tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
                                 }
                             }).await;
@@ -939,7 +924,6 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &semaphore,
                                 &config,
                                 &jobs_path,
-                                &db,
                                 &mut router_guard,
                                 &router,
                                 &engine.task_manager,

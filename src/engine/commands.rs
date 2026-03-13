@@ -5,29 +5,25 @@
 //! executed against the issue's task and a confirmation comment is posted.
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
-use crate::db::Db;
 use crate::github::http::GhHttp;
 use crate::store::TaskStore;
 use std::sync::Arc;
 
-/// Read a KV value, preferring the store (sqlx) over the old db (rusqlite).
-async fn kv_get(store: &Option<Arc<TaskStore>>, db: &Arc<Db>, key: &str) -> Option<String> {
+/// Read a KV value from the store.
+async fn kv_get(store: &Option<Arc<TaskStore>>, key: &str) -> Option<String> {
     if let Some(ref s) = store {
         if let Ok(v) = s.kv_get(key).await {
             return v;
         }
     }
-    db.kv_get(key).await.ok().flatten()
+    None
 }
 
-/// Write a KV value, preferring the store (sqlx) over the old db (rusqlite).
-async fn kv_set(store: &Option<Arc<TaskStore>>, db: &Arc<Db>, key: &str, value: &str) {
+/// Write a KV value to the store.
+async fn kv_set(store: &Option<Arc<TaskStore>>, key: &str, value: &str) {
     if let Some(ref s) = store {
-        if s.kv_set(key, value).await.is_ok() {
-            return;
-        }
+        let _ = s.kv_set(key, value).await;
     }
-    db.kv_set(key, value).await.ok();
 }
 
 /// Parsed owner command from an issue comment.
@@ -121,7 +117,6 @@ fn extract_issue_number(issue_url: &str) -> Option<String> {
 /// Reuses the same comment endpoint as `scan_mentions`.
 pub async fn scan_commands(
     backend: &Arc<dyn ExternalBackend>,
-    db: &Arc<Db>,
     repo: &str,
     store: &Option<Arc<crate::store::TaskStore>>,
     task_manager: &Arc<crate::engine::tasks::TaskManager>,
@@ -130,7 +125,7 @@ pub async fn scan_commands(
 
     // Use persisted cursor, fall back to 24h ago
     let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-    let since_str = match kv_get(store, db, "owner_commands_last_checked").await {
+    let since_str = match kv_get(store, "owner_commands_last_checked").await {
         Some(ts) => ts,
         None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
@@ -147,14 +142,14 @@ pub async fn scan_commands(
     if comments.is_empty() {
         // Still advance cursor even if no comments
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        kv_set(store, db, "owner_commands_last_checked", &now).await;
+        kv_set(store, "owner_commands_last_checked", &now).await;
         return Ok(());
     }
 
     // Build dedup set from already-processed command comment IDs.
     // We store processed IDs in KV to survive restarts within the cursor window.
     let processed_ids: std::collections::HashSet<String> =
-        match kv_get(store, db, "owner_commands_processed_ids").await {
+        match kv_get(store, "owner_commands_processed_ids").await {
             Some(ids) if !ids.is_empty() => ids.split(',').map(String::from).collect(),
             _ => std::collections::HashSet::new(),
         };
@@ -284,12 +279,12 @@ pub async fn scan_commands(
         if all.len() > 500 {
             all = all.split_off(all.len() - 500);
         }
-        kv_set(store, db, "owner_commands_processed_ids", &all.join(",")).await;
+        kv_set(store, "owner_commands_processed_ids", &all.join(",")).await;
     }
 
     // Advance cursor
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    kv_set(store, db, "owner_commands_last_checked", &now).await;
+    kv_set(store, "owner_commands_last_checked", &now).await;
 
     Ok(())
 }
@@ -533,68 +528,49 @@ mod tests {
     // ── kv_get / kv_set store-first helpers ──────────────────────────
 
     #[tokio::test]
-    async fn kv_get_prefers_store_over_db() {
+    async fn kv_get_reads_from_store() {
         let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
-        let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        db.migrate().await.unwrap();
 
-        // Write different values to store and db
         store.kv_set("key1", "from_store").await.unwrap();
-        db.kv_set("key1", "from_db").await.unwrap();
 
         let opt_store = Some(store);
-        let val = kv_get(&opt_store, &db, "key1").await;
+        let val = kv_get(&opt_store, "key1").await;
         assert_eq!(val.as_deref(), Some("from_store"));
     }
 
     #[tokio::test]
-    async fn kv_get_falls_back_to_db_when_no_store() {
-        let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        db.migrate().await.unwrap();
-        db.kv_set("key2", "from_db").await.unwrap();
-
+    async fn kv_get_returns_none_without_store() {
         let opt_store: Option<Arc<crate::store::TaskStore>> = None;
-        let val = kv_get(&opt_store, &db, "key2").await;
-        assert_eq!(val.as_deref(), Some("from_db"));
+        let val = kv_get(&opt_store, "key2").await;
+        assert_eq!(val, None);
     }
 
     #[tokio::test]
     async fn kv_get_returns_none_for_missing_key() {
         let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
-        let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        db.migrate().await.unwrap();
 
         let opt_store = Some(store);
-        let val = kv_get(&opt_store, &db, "nonexistent").await;
+        let val = kv_get(&opt_store, "nonexistent").await;
         assert_eq!(val, None);
     }
 
     #[tokio::test]
     async fn kv_set_writes_to_store_when_present() {
         let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
-        let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        db.migrate().await.unwrap();
 
         let opt_store = Some(Arc::clone(&store));
-        kv_set(&opt_store, &db, "key3", "value3").await;
+        kv_set(&opt_store, "key3", "value3").await;
 
-        // Should be in store
         assert_eq!(
             store.kv_get("key3").await.unwrap().as_deref(),
             Some("value3")
         );
-        // Should NOT be in db (store succeeded, so db write was skipped)
-        assert_eq!(db.kv_get("key3").await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn kv_set_falls_back_to_db_when_no_store() {
-        let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        db.migrate().await.unwrap();
-
+    async fn kv_set_noop_without_store() {
         let opt_store: Option<Arc<crate::store::TaskStore>> = None;
-        kv_set(&opt_store, &db, "key4", "value4").await;
-
-        assert_eq!(db.kv_get("key4").await.unwrap().as_deref(), Some("value4"));
+        // Should not panic
+        kv_set(&opt_store, "key4", "value4").await;
     }
 }

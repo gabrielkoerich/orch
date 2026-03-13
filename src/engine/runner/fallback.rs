@@ -4,7 +4,6 @@
 //! parse result: error classification, model failover, free-model fallback,
 //! and agent rerouting.
 
-use crate::db::Db;
 use crate::store::TaskStore;
 use std::sync::Arc;
 
@@ -31,7 +30,6 @@ pub async fn handle_error(
     agent_runner: &dyn agents::AgentRunner,
     model_name: Option<&str>,
     new_attempts: u32,
-    db: Option<&Arc<Db>>,
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> anyhow::Result<ErrorHandleResult> {
@@ -134,7 +132,7 @@ pub async fn handle_error(
         ),
     };
 
-    // Record rate limit in store (sqlx) if available, otherwise rusqlite
+    // Record rate limit in store (sqlx)
     {
         let error_type_str = match retryable {
             response::RetryableError::UsageLimit => "rate",
@@ -143,10 +141,6 @@ pub async fn handle_error(
         };
         if let Some(ref s) = store {
             let _ = s
-                .record_rate_limit(agent_name, error_type_str, Some(task_id))
-                .await;
-        } else if let Some(db) = db {
-            let _ = db
                 .record_rate_limit(agent_name, error_type_str, Some(task_id))
                 .await;
         }

@@ -14,7 +14,6 @@ use crate::channels::capture::CaptureService;
 use crate::channels::notification::TaskNotification;
 use crate::channels::transport::Transport;
 use crate::config;
-use crate::db::Db;
 use crate::engine::jobs;
 use crate::engine::router::{get_route_result, Router};
 use crate::engine::runner::{TaskRunner, WeightSignal};
@@ -165,7 +164,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
 
     // Recover internal (SQLite) tasks stuck in in_progress.
     // These have no GitHub labels or comments — just reset the DB status to New.
-    use crate::db::TaskStatus as DbStatus;
+    use crate::store::TaskStatus as DbStatus;
     let internal_in_progress = task_manager
         .list_internal_by_status(DbStatus::InProgress)
         .await?;
@@ -298,7 +297,7 @@ pub(crate) async fn tick_route_tasks(
                             );
                         }
                         if let Err(e) = store
-                            .update_status(store_id, crate::db::TaskStatus::Routed)
+                            .update_status(store_id, crate::store::TaskStatus::Routed)
                             .await
                         {
                             tracing::debug!(
@@ -359,7 +358,7 @@ pub(crate) async fn tick_dispatch_tasks(
     let mut routed_tasks = task_manager.list_external_by_status(Status::Routed).await?;
 
     // Also include internal tasks in Routed status.
-    use crate::db::TaskStatus as DbStatus;
+    use crate::store::TaskStatus as DbStatus;
     let internal_routed = task_manager
         .list_internal_by_status(DbStatus::Routed)
         .await?;
@@ -794,11 +793,10 @@ pub(crate) async fn tick_unblock_parents(
 pub(crate) async fn tick_job_scheduler(
     jobs_path: &std::path::PathBuf,
     backend: &Arc<dyn ExternalBackend>,
-    db: &Arc<Db>,
     store: Option<&Arc<crate::store::TaskStore>>,
     repo: &str,
 ) -> anyhow::Result<()> {
-    jobs::tick(jobs_path, backend, db, store, repo).await
+    jobs::tick(jobs_path, backend, store, repo).await
 }
 
 /// Core tick — runs every 10s.
@@ -820,7 +818,6 @@ pub(crate) async fn tick(
     semaphore: &Arc<Semaphore>,
     config: &EngineConfig,
     jobs_path: &std::path::PathBuf,
-    db: &Arc<Db>,
     router: &mut Router,
     router_arc: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
@@ -849,7 +846,7 @@ pub(crate) async fn tick(
     )
     .await?;
     tick_unblock_parents(backend, task_manager).await?;
-    if let Err(e) = tick_job_scheduler(jobs_path, backend, db, Some(store), repo).await {
+    if let Err(e) = tick_job_scheduler(jobs_path, backend, Some(store), repo).await {
         tracing::error!(?e, "job scheduler tick failed");
     }
     Ok(())
@@ -983,8 +980,7 @@ mod tests {
     }
 
     fn make_task_manager(backend: Arc<dyn ExternalBackend>) -> Arc<TaskManager> {
-        let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        Arc::new(TaskManager::new(db, backend))
+        Arc::new(TaskManager::new(backend))
     }
 
     // ── tick_unblock_parents ─────────────────────────────────────────────────

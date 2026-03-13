@@ -78,7 +78,7 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
             }
             Task::Internal(int) => {
                 let agent = int.agent.as_deref().unwrap_or("-");
-                let title = if int.status == crate::db::TaskStatus::Blocked {
+                let title = if int.status == crate::store::TaskStatus::Blocked {
                     if let Some(ref reason) = int.block_reason {
                         format!("{} [blocked: {}]", int.title, reason)
                     } else {
@@ -195,7 +195,7 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
 
 /// Show task status summary.
 pub async fn status(json: bool) -> anyhow::Result<()> {
-    use crate::db::TaskStatus;
+    use crate::store::TaskStatus;
 
     let task_manager = init_task_manager().await?;
 
@@ -445,7 +445,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 pub async fn retry(id: i64) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
-    use crate::db::TaskStatus;
+    use crate::store::TaskStatus;
 
     let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
@@ -508,7 +508,7 @@ async fn reset_counters(
 pub async fn unblock(id: &str) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
-    use crate::db::TaskStatus;
+    use crate::store::TaskStatus;
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;

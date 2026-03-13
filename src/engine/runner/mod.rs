@@ -28,10 +28,10 @@ pub mod worktree;
 
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
-use crate::db::{Db, InsertTaskMetric};
 use crate::engine::router::RouteResult;
 use crate::engine::tasks::is_internal_id;
 use crate::security;
+use crate::store::InsertTaskMetric;
 use crate::tmux::TmuxManager;
 use chrono::Utc;
 pub use response::WeightSignal;
@@ -44,8 +44,6 @@ pub struct TaskRunner {
     repo: String,
     /// Path to the orchestrator home directory
     orch_home: PathBuf,
-    /// Database for storing metrics
-    db: Option<Arc<Db>>,
     /// Unified task store for run audit trail
     store: Option<Arc<crate::store::TaskStore>>,
 }
@@ -58,15 +56,8 @@ impl TaskRunner {
         Self {
             repo,
             orch_home,
-            db: None,
             store: None,
         }
-    }
-
-    /// Set the database reference for metrics recording.
-    pub fn with_db(mut self, db: Arc<Db>) -> Self {
-        self.db = Some(db);
-        self
     }
 
     /// Set the unified task store for run audit trail.
@@ -252,7 +243,6 @@ impl TaskRunner {
                     &*agent_runner,
                     init.model_name.as_deref(),
                     init.new_attempts,
-                    self.db.as_ref(),
                     &self.store,
                     &self.repo,
                 )
@@ -320,7 +310,7 @@ impl TaskRunner {
         .await
         .unwrap_or(0);
 
-        if let Some(ref db) = self.db {
+        if let Some(ref store) = self.store {
             // Only set error_type for non-success outcomes
             let db_error_type: Option<String> = if outcome == "success" {
                 None
@@ -378,12 +368,7 @@ impl TaskRunner {
                 total_cost_usd: total_cost,
             };
 
-            // Write to store (sqlx) if available, otherwise fall back to rusqlite db
-            if let Some(ref store) = self.store {
-                if let Err(e) = store.insert_task_metric(&metric).await {
-                    tracing::error!(task_id, ?e, "failed to record task metrics (store)");
-                }
-            } else if let Err(e) = db.insert_task_metric(metric).await {
+            if let Err(e) = store.insert_task_metric(&metric).await {
                 tracing::error!(task_id, ?e, "failed to record task metrics");
             }
         }

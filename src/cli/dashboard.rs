@@ -1,8 +1,8 @@
 use crate::backends::Status;
 use crate::cli::init_task_manager;
 use crate::config;
-use crate::db::TaskStatus;
 use crate::engine::cleanup as store_helpers;
+use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use chrono::{DateTime, Duration, Utc};

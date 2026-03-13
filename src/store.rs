@@ -15,7 +15,139 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 use sqlx::Row;
 use std::path::Path;
 
-use crate::db::TaskStatus;
+/// Default database path: `~/.orch/orch.db`
+pub fn default_db_path() -> anyhow::Result<std::path::PathBuf> {
+    crate::home::db_path()
+}
+
+// ── Types formerly in db.rs ─────────────────────────────────────────
+
+/// Parameters for inserting a new task metric record.
+#[derive(Debug, Clone)]
+pub struct InsertTaskMetric<'a> {
+    pub task_id: &'a str,
+    pub agent: &'a str,
+    pub model: Option<&'a str>,
+    pub complexity: Option<&'a str>,
+    pub outcome: &'a str,
+    pub duration_seconds: f64,
+    pub started_at: &'a chrono::DateTime<Utc>,
+    pub completed_at: &'a chrono::DateTime<Utc>,
+    pub attempts: i32,
+    pub files_changed: i32,
+    pub error_type: Option<&'a str>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub input_cost_usd: Option<f64>,
+    pub output_cost_usd: Option<f64>,
+    pub total_cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    New,
+    Routed,
+    InProgress,
+    Done,
+    Blocked,
+    InReview,
+    NeedsReview,
+}
+
+impl TaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Routed => "routed",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+            Self::InReview => "in_review",
+            Self::NeedsReview => "needs_review",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "new" => Some(Self::New),
+            "routed" => Some(Self::Routed),
+            "in_progress" => Some(Self::InProgress),
+            "done" => Some(Self::Done),
+            "blocked" => Some(Self::Blocked),
+            "in_review" => Some(Self::InReview),
+            "needs_review" => Some(Self::NeedsReview),
+            _ => None,
+        }
+    }
+}
+
+/// Metrics summary for the CLI output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsSummary {
+    pub tasks_completed_24h: i64,
+    pub tasks_failed_24h: i64,
+    pub avg_duration_simple: Option<f64>,
+    pub avg_duration_medium: Option<f64>,
+    pub avg_duration_complex: Option<f64>,
+    pub agent_stats: Vec<AgentStat>,
+    pub rate_limits_24h: i64,
+}
+
+/// Agent statistics from metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStat {
+    pub agent: String,
+    pub total_runs: i64,
+    pub success_count: i64,
+    pub success_rate: f64,
+}
+
+/// Slow task info for pattern detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlowTaskInfo {
+    pub task_id: String,
+    pub agent: String,
+    pub complexity: Option<String>,
+    pub duration_seconds: f64,
+}
+
+/// Error type distribution for pattern detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorStat {
+    pub error_type: Option<String>,
+    pub count: i64,
+}
+
+/// Cost summary across multiple time periods.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostSummary {
+    pub periods: Vec<CostPeriod>,
+}
+
+/// Cost data for a single time period.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostPeriod {
+    pub label: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub input_cost_usd: f64,
+    pub output_cost_usd: f64,
+    pub total_cost_usd: f64,
+    pub task_count: i64,
+}
+
+/// Cost breakdown by a grouping dimension (agent, model, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostByGroup {
+    pub name: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_cost_usd: f64,
+    pub task_count: i64,
+}
+
+// ── End types ───────────────────────────────────────────────────────
 
 /// Build the week-scoped KV key for the self-improvement counter.
 fn self_improvement_key() -> String {
@@ -1128,10 +1260,7 @@ impl TaskStore {
     // ---------------------------------------------------------------
 
     /// Insert a new task metric record. Prunes records older than 90 days.
-    pub async fn insert_task_metric(
-        &self,
-        metric: &crate::db::InsertTaskMetric<'_>,
-    ) -> anyhow::Result<i64> {
+    pub async fn insert_task_metric(&self, metric: &InsertTaskMetric<'_>) -> anyhow::Result<i64> {
         sqlx::query("DELETE FROM task_metrics WHERE completed_at < datetime('now', '-90 days')")
             .execute(&self.pool)
             .await?;
@@ -1165,7 +1294,7 @@ impl TaskStore {
     }
 
     /// Get aggregated metrics for the last 24 hours.
-    pub async fn get_metrics_summary_24h(&self) -> anyhow::Result<crate::db::MetricsSummary> {
+    pub async fn get_metrics_summary_24h(&self) -> anyhow::Result<MetricsSummary> {
         let completed: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND outcome = 'success'",
         )
@@ -1206,12 +1335,12 @@ impl TaskStore {
         .fetch_all(&self.pool)
         .await?;
 
-        let agent_stats: Vec<crate::db::AgentStat> = agent_rows
+        let agent_stats: Vec<AgentStat> = agent_rows
             .iter()
             .map(|row| {
                 let total: i64 = row.get("total");
                 let success: i64 = row.get("success_count");
-                crate::db::AgentStat {
+                AgentStat {
                     agent: row.get("agent"),
                     total_runs: total,
                     success_count: success,
@@ -1230,7 +1359,7 @@ impl TaskStore {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(crate::db::MetricsSummary {
+        Ok(MetricsSummary {
             tasks_completed_24h: completed.0,
             tasks_failed_24h: failed.0,
             avg_duration_simple: avg_simple.map(|r| r.0),
@@ -1266,7 +1395,7 @@ impl TaskStore {
     }
 
     /// Get slow tasks (top 10 longest running) from the last 7 days.
-    pub async fn get_slow_tasks_7d(&self) -> anyhow::Result<Vec<crate::db::SlowTaskInfo>> {
+    pub async fn get_slow_tasks_7d(&self) -> anyhow::Result<Vec<SlowTaskInfo>> {
         let rows = sqlx::query(
             "SELECT task_id, agent, complexity, duration_seconds
              FROM task_metrics
@@ -1279,7 +1408,7 @@ impl TaskStore {
 
         Ok(rows
             .iter()
-            .map(|row| crate::db::SlowTaskInfo {
+            .map(|row| SlowTaskInfo {
                 task_id: row.get("task_id"),
                 agent: row.get("agent"),
                 complexity: row.get("complexity"),
@@ -1289,7 +1418,7 @@ impl TaskStore {
     }
 
     /// Get error type distribution from the last 7 days.
-    pub async fn get_error_distribution_7d(&self) -> anyhow::Result<Vec<crate::db::ErrorStat>> {
+    pub async fn get_error_distribution_7d(&self) -> anyhow::Result<Vec<ErrorStat>> {
         let rows = sqlx::query(
             "SELECT error_type, COUNT(*) as count
              FROM task_metrics
@@ -1304,7 +1433,7 @@ impl TaskStore {
 
         Ok(rows
             .iter()
-            .map(|row| crate::db::ErrorStat {
+            .map(|row| ErrorStat {
                 error_type: row.get("error_type"),
                 count: row.get("count"),
             })
@@ -1315,7 +1444,7 @@ impl TaskStore {
     ///
     /// Uses separate static queries per window because SQLite's `datetime()`
     /// modifier argument cannot be parameterised via `?` bind.
-    pub async fn get_cost_summary(&self) -> anyhow::Result<crate::db::CostSummary> {
+    pub async fn get_cost_summary(&self) -> anyhow::Result<CostSummary> {
         // Each entry: (static SQL with the interval baked in, label)
         let windows: &[(&str, &str)] = &[
             (
@@ -1356,7 +1485,7 @@ impl TaskStore {
         let mut periods = Vec::new();
         for (query, label) in windows {
             let row = sqlx::query(query).fetch_one(&self.pool).await?;
-            periods.push(crate::db::CostPeriod {
+            periods.push(CostPeriod {
                 label: label.to_string(),
                 input_tokens: row.get("input_tokens"),
                 output_tokens: row.get("output_tokens"),
@@ -1367,11 +1496,11 @@ impl TaskStore {
             });
         }
 
-        Ok(crate::db::CostSummary { periods })
+        Ok(CostSummary { periods })
     }
 
     /// Get cost breakdown by agent.
-    pub async fn get_cost_by_agent(&self) -> anyhow::Result<Vec<crate::db::CostByGroup>> {
+    pub async fn get_cost_by_agent(&self) -> anyhow::Result<Vec<CostByGroup>> {
         let rows = sqlx::query(
             "SELECT agent as name,
                     COALESCE(SUM(input_tokens), 0) as input_tokens,
@@ -1387,7 +1516,7 @@ impl TaskStore {
 
         Ok(rows
             .iter()
-            .map(|row| crate::db::CostByGroup {
+            .map(|row| CostByGroup {
                 name: row.get("name"),
                 input_tokens: row.get("input_tokens"),
                 output_tokens: row.get("output_tokens"),
@@ -1398,7 +1527,7 @@ impl TaskStore {
     }
 
     /// Get cost breakdown by model.
-    pub async fn get_cost_by_model(&self) -> anyhow::Result<Vec<crate::db::CostByGroup>> {
+    pub async fn get_cost_by_model(&self) -> anyhow::Result<Vec<CostByGroup>> {
         let rows = sqlx::query(
             "SELECT COALESCE(model, 'unknown') as name,
                     COALESCE(SUM(input_tokens), 0) as input_tokens,
@@ -1414,7 +1543,7 @@ impl TaskStore {
 
         Ok(rows
             .iter()
-            .map(|row| crate::db::CostByGroup {
+            .map(|row| CostByGroup {
                 name: row.get("name"),
                 input_tokens: row.get("input_tokens"),
                 output_tokens: row.get("output_tokens"),
@@ -1611,143 +1740,173 @@ impl TaskStore {
         })
     }
 
-    /// Migrate sidecar JSON files into the unified tasks table.
+    /// Migrate old data into the unified tasks table.
     ///
-    /// Walks `~/.orch/state/{owner}/{repo}/tasks/*/sidecar.json` and upserts
-    /// each into the store. Also migrates internal_tasks from the old SQLite table.
-    pub async fn migrate_sidecars(
-        &self,
-        db: &crate::db::Db,
-        default_repo: &str,
-    ) -> anyhow::Result<MigrateResult> {
+    /// Reads from the legacy rusqlite tables (internal_tasks, kv, task_metrics,
+    /// rate_limits) which share the same DB file, plus walks sidecar JSON files.
+    /// All reads use sqlx raw queries — no rusqlite dependency needed.
+    pub async fn migrate_sidecars(&self, default_repo: &str) -> anyhow::Result<MigrateResult> {
         let mut result = MigrateResult::default();
 
-        // 1. Migrate internal tasks from old SQLite table
-        // InternalTask has no repo field, so we use the provided default_repo
-        if let Ok(tasks) = db.list_all_internal_tasks().await {
-            for task in tasks {
-                if default_repo.is_empty() {
-                    result.skipped += 1;
-                    continue;
-                }
-                match self
-                    .create(&NewTask {
-                        external_id: None,
-                        repo: default_repo.to_string(),
-                        origin: "internal".to_string(),
-                        title: task.title.clone(),
-                        body: task.body.clone(),
-                        source: task.source.clone(),
-                        source_id: task.source_id.clone(),
-                        author: "".to_string(),
-                        url: "".to_string(),
-                        labels: vec![],
-                    })
-                    .await
-                {
-                    Ok(id) => {
-                        let _ = self.update_status(id, task.status).await;
-                        // Try to read sidecar file and sync fields
-                        let sidecar_key = format!("internal:{}", task.id);
-                        if let Ok(task_dir) = crate::home::task_dir(default_repo, &sidecar_key) {
-                            let sidecar_file = task_dir.join("sidecar.json");
-                            if let Ok(content) = std::fs::read_to_string(&sidecar_file) {
-                                if let Ok(json) =
-                                    serde_json::from_str::<serde_json::Value>(&content)
-                                {
-                                    self.sync_sidecar_json_to_store(id, &json).await;
-                                }
+        // 1. Migrate internal tasks from old SQLite table (if it exists)
+        let old_tasks: Vec<_> = sqlx::query(
+            "SELECT id, title, body, status, source, source_id FROM internal_tasks ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        for row in &old_tasks {
+            if default_repo.is_empty() {
+                result.skipped += 1;
+                continue;
+            }
+            let old_id: i64 = row.get("id");
+            let title: String = row.get("title");
+            let body: String = row.get("body");
+            let status_str: String = row.get("status");
+            let source: String = row.get("source");
+            let source_id: String = row.get("source_id");
+            let status = TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::New);
+
+            match self
+                .create(&NewTask {
+                    external_id: None,
+                    repo: default_repo.to_string(),
+                    origin: "internal".to_string(),
+                    title: title.clone(),
+                    body: body.clone(),
+                    source: source.clone(),
+                    source_id: source_id.clone(),
+                    author: "".to_string(),
+                    url: "".to_string(),
+                    labels: vec![],
+                })
+                .await
+            {
+                Ok(id) => {
+                    let _ = self.update_status(id, status).await;
+                    let sidecar_key = format!("internal:{}", old_id);
+                    if let Ok(task_dir) = crate::home::task_dir(default_repo, &sidecar_key) {
+                        let sidecar_file = task_dir.join("sidecar.json");
+                        if let Ok(content) = std::fs::read_to_string(&sidecar_file) {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                                self.sync_sidecar_json_to_store(id, &json).await;
                             }
                         }
-                        result.migrated += 1;
                     }
-                    Err(e) => {
-                        tracing::warn!(task_id = task.id, err = %e, "failed to migrate internal task");
-                        result.errors += 1;
-                    }
-                }
-            }
-        } else {
-            tracing::warn!("failed to read internal tasks from old db, skipping phase");
-        }
-
-        // 2. Migrate KV store entries
-        if let Ok(entries) = db.dump_kv().await {
-            for (key, value) in entries {
-                if let Err(e) = self.kv_set(&key, &value).await {
-                    tracing::warn!(key, err = %e, "failed to migrate kv entry");
-                    result.errors += 1;
-                } else {
                     result.migrated += 1;
                 }
-            }
-        } else {
-            tracing::warn!("failed to read kv entries from old db, skipping phase");
-        }
-
-        // 3. Migrate task_metrics
-        if let Ok(rows) = db.dump_task_metrics().await {
-            for row in rows {
-                let started_at = chrono::DateTime::parse_from_rfc3339(&row.6)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-                let completed_at = chrono::DateTime::parse_from_rfc3339(&row.7)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
-
-                let metric = crate::db::InsertTaskMetric {
-                    task_id: &row.0,
-                    agent: &row.1,
-                    model: row.2.as_deref(),
-                    complexity: row.3.as_deref(),
-                    outcome: &row.4,
-                    duration_seconds: row.5,
-                    started_at: &started_at,
-                    completed_at: &completed_at,
-                    attempts: row.8,
-                    files_changed: row.9,
-                    error_type: row.10.as_deref(),
-                    input_tokens: row.11,
-                    output_tokens: row.12,
-                    input_cost_usd: row.13,
-                    output_cost_usd: row.14,
-                    total_cost_usd: row.15,
-                };
-                if let Err(e) = self.insert_task_metric(&metric).await {
-                    tracing::warn!(task_id = row.0, err = %e, "failed to migrate task metric");
+                Err(e) => {
+                    tracing::warn!(task_id = old_id, err = %e, "failed to migrate internal task");
                     result.errors += 1;
-                } else {
-                    result.migrated += 1;
                 }
             }
-        } else {
-            tracing::warn!("failed to read task metrics from old db, skipping phase");
         }
 
-        // 4. Migrate rate_limits
-        if let Ok(rows) = db.dump_rate_limits().await {
-            for row in rows {
-                // Insert directly to preserve original occurred_at timestamps
-                let res = sqlx::query(
-                    "INSERT INTO rate_limits (agent, limit_type, occurred_at, task_id) VALUES (?, ?, ?, ?)",
-                )
-                .bind(&row.0)
-                .bind(&row.1)
-                .bind(&row.2)
-                .bind(&row.3)
-                .execute(&self.pool)
-                .await;
+        // 2. Migrate KV store entries from old kv table
+        // The old table uses (key, value) columns — same schema as our sqlx kv table,
+        // but we read from the old table and write via our kv_set() which upserts.
+        let old_kv: Vec<_> = sqlx::query("SELECT key, value FROM kv")
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
 
-                match res {
-                    Ok(_) => result.migrated += 1,
-                    Err(e) => {
-                        tracing::warn!(agent = row.0, err = %e, "failed to migrate rate limit");
-                        result.errors += 1;
-                    }
+        for row in &old_kv {
+            let key: String = row.get("key");
+            let value: String = row.get("value");
+            if let Err(e) = self.kv_set(&key, &value).await {
+                tracing::warn!(key, err = %e, "failed to migrate kv entry");
+                result.errors += 1;
+            } else {
+                result.migrated += 1;
+            }
+        }
+
+        // 3. Migrate task_metrics from old table
+        let old_metrics: Vec<_> = sqlx::query(
+            "SELECT task_id, agent, model, complexity, outcome, duration_seconds,
+                    started_at, completed_at, attempts, files_changed, error_type,
+                    input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd
+             FROM task_metrics",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        for row in &old_metrics {
+            let started_str: String = row.get("started_at");
+            let completed_str: String = row.get("completed_at");
+            let task_id: String = row.get("task_id");
+            let agent: String = row.get("agent");
+            let model: Option<String> = row.get("model");
+            let complexity: Option<String> = row.get("complexity");
+            let outcome: String = row.get("outcome");
+            let error_type: Option<String> = row.get("error_type");
+
+            let started_at = chrono::DateTime::parse_from_rfc3339(&started_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let completed_at = chrono::DateTime::parse_from_rfc3339(&completed_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+            let metric = InsertTaskMetric {
+                task_id: &task_id,
+                agent: &agent,
+                model: model.as_deref(),
+                complexity: complexity.as_deref(),
+                outcome: &outcome,
+                duration_seconds: row.get("duration_seconds"),
+                started_at: &started_at,
+                completed_at: &completed_at,
+                attempts: row.get("attempts"),
+                files_changed: row.get("files_changed"),
+                error_type: error_type.as_deref(),
+                input_tokens: row.get("input_tokens"),
+                output_tokens: row.get("output_tokens"),
+                input_cost_usd: row.get("input_cost_usd"),
+                output_cost_usd: row.get("output_cost_usd"),
+                total_cost_usd: row.get("total_cost_usd"),
+            };
+            if let Err(e) = self.insert_task_metric(&metric).await {
+                tracing::warn!(task_id, err = %e, "failed to migrate task metric");
+                result.errors += 1;
+            } else {
+                result.migrated += 1;
+            }
+        }
+
+        // 4. Migrate rate_limits from old table
+        let old_rates: Vec<_> =
+            sqlx::query("SELECT agent, limit_type, occurred_at, task_id FROM rate_limits")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default();
+
+        for row in &old_rates {
+            let agent: String = row.get("agent");
+            let limit_type: String = row.get("limit_type");
+            let occurred_at: String = row.get("occurred_at");
+            let task_id: Option<String> = row.get("task_id");
+
+            let res = sqlx::query(
+                "INSERT INTO rate_limits (agent, limit_type, occurred_at, task_id) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&agent)
+            .bind(&limit_type)
+            .bind(&occurred_at)
+            .bind(&task_id)
+            .execute(&self.pool)
+            .await;
+
+            match res {
+                Ok(_) => result.migrated += 1,
+                Err(e) => {
+                    tracing::warn!(agent, err = %e, "failed to migrate rate limit");
+                    result.errors += 1;
                 }
             }
-        } else {
-            tracing::warn!("failed to read rate limits from old db, skipping phase");
         }
 
         // 5. Walk sidecar files for external tasks
@@ -4149,25 +4308,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrate_internal_tasks_from_old_db() {
-        // Set up old rusqlite DB with internal tasks
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let db = crate::db::Db::open(&db_path).unwrap();
-        db.migrate().await.unwrap();
-
-        // Create two internal tasks
-        db.create_internal_task("Task A", "Body A", "cron", "daily-a")
-            .await
-            .unwrap();
-        db.create_internal_task("Task B", "Body B", "manual", "")
-            .await
-            .unwrap();
-
+    async fn migrate_internal_tasks_from_old_tables() {
         let store = TaskStore::open_memory().await.unwrap();
-        let result = store.migrate_sidecars(&db, "owner/repo").await.unwrap();
 
-        // At least our 2 internal tasks migrated (real ~/.orch sidecars may add more)
+        // Create the legacy internal_tasks table in the same DB
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS internal_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL, body TEXT DEFAULT '', status TEXT DEFAULT 'new',
+                source TEXT NOT NULL, source_id TEXT DEFAULT '',
+                created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            )",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        // Insert two legacy internal tasks
+        sqlx::query(
+            "INSERT INTO internal_tasks (title, body, source, source_id) VALUES (?, ?, ?, ?)",
+        )
+        .bind("Task A")
+        .bind("Body A")
+        .bind("cron")
+        .bind("daily-a")
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO internal_tasks (title, body, source, source_id) VALUES (?, ?, ?, ?)",
+        )
+        .bind("Task B")
+        .bind("Body B")
+        .bind("manual")
+        .bind("")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let result = store.migrate_sidecars("owner/repo").await.unwrap();
+
         assert!(
             result.migrated >= 2,
             "expected at least 2, got {}",
@@ -4175,7 +4356,6 @@ mod tests {
         );
         assert_eq!(result.skipped, 0);
 
-        // Verify the internal tasks landed in the store with correct repo scope
         let tasks = store
             .list_by_status("owner/repo", TaskStatus::New)
             .await
@@ -4188,22 +4368,35 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_skips_when_no_repo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let db = crate::db::Db::open(&db_path).unwrap();
-        db.migrate().await.unwrap();
-
-        db.create_internal_task("Task X", "Body X", "cron", "x")
-            .await
-            .unwrap();
-
         let store = TaskStore::open_memory().await.unwrap();
-        // Empty repo should cause internal task skips (sidecar walk may still find real files)
-        let result = store.migrate_sidecars(&db, "").await.unwrap();
+
+        // Create legacy table with one task
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS internal_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL, body TEXT DEFAULT '', status TEXT DEFAULT 'new',
+                source TEXT NOT NULL, source_id TEXT DEFAULT '',
+                created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            )",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO internal_tasks (title, body, source, source_id) VALUES (?, ?, ?, ?)",
+        )
+        .bind("Task X")
+        .bind("Body X")
+        .bind("cron")
+        .bind("x")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let result = store.migrate_sidecars("").await.unwrap();
 
         assert_eq!(result.skipped, 1);
-        // Verify no internal-origin tasks were created (the skip worked)
-        // External sidecars from real ~/.orch may still have been migrated
         let internal = store.list_by_status("", TaskStatus::New).await.unwrap();
         assert!(
             internal.is_empty(),
@@ -4910,7 +5103,7 @@ mod tests {
         let store = TaskStore::open_memory().await.unwrap();
         let now = Utc::now();
 
-        let metric = crate::db::InsertTaskMetric {
+        let metric = InsertTaskMetric {
             task_id: "42",
             agent: "claude",
             model: Some("opus"),
@@ -4950,7 +5143,7 @@ mod tests {
 
         // Insert a success
         store
-            .insert_task_metric(&crate::db::InsertTaskMetric {
+            .insert_task_metric(&InsertTaskMetric {
                 task_id: "1",
                 agent: "claude",
                 model: None,
@@ -4973,7 +5166,7 @@ mod tests {
 
         // Insert a failure
         store
-            .insert_task_metric(&crate::db::InsertTaskMetric {
+            .insert_task_metric(&InsertTaskMetric {
                 task_id: "2",
                 agent: "codex",
                 model: None,
@@ -5032,7 +5225,7 @@ mod tests {
 
         for (agent, cost) in &[("claude", 0.10), ("codex", 0.05), ("claude", 0.20)] {
             store
-                .insert_task_metric(&crate::db::InsertTaskMetric {
+                .insert_task_metric(&InsertTaskMetric {
                     task_id: "1",
                     agent,
                     model: None,
@@ -5070,7 +5263,7 @@ mod tests {
 
         for (model, cost) in &[("sonnet", 0.05), ("opus", 0.15), ("sonnet", 0.10)] {
             store
-                .insert_task_metric(&crate::db::InsertTaskMetric {
+                .insert_task_metric(&InsertTaskMetric {
                     task_id: "1",
                     agent: "claude",
                     model: Some(model),
@@ -5172,7 +5365,7 @@ mod tests {
 
         for error_type in &["timeout", "timeout", "rate_limit"] {
             store
-                .insert_task_metric(&crate::db::InsertTaskMetric {
+                .insert_task_metric(&InsertTaskMetric {
                     task_id: "1",
                     agent: "claude",
                     model: None,
@@ -5210,7 +5403,7 @@ mod tests {
         // Insert three metrics with different durations
         for (task_id, duration) in &[("t1", 120.0), ("t2", 300.0), ("t3", 60.0)] {
             store
-                .insert_task_metric(&crate::db::InsertTaskMetric {
+                .insert_task_metric(&InsertTaskMetric {
                     task_id,
                     agent: "claude",
                     model: Some("sonnet"),
@@ -5284,7 +5477,7 @@ mod tests {
         let now = Utc::now();
 
         store
-            .insert_task_metric(&crate::db::InsertTaskMetric {
+            .insert_task_metric(&InsertTaskMetric {
                 task_id: "cost1",
                 agent: "claude",
                 model: Some("sonnet"),

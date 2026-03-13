@@ -6,8 +6,8 @@
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cmd::CommandErrorContext;
-use crate::db::TaskStatus;
 use crate::engine::tasks::TaskManager;
+use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -322,7 +322,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     let done_tasks = {
         if store.has_tasks(repo).await {
             store
-                .list_by_status(repo, crate::db::TaskStatus::Done)
+                .list_by_status(repo, crate::store::TaskStatus::Done)
                 .await?
                 .iter()
                 .filter(|t| t.origin != "internal")
@@ -733,7 +733,7 @@ pub(crate) async fn check_merged_prs(
     // Read from the store first; fall back to backend if the store has no data.
     let in_review_tasks = if store.has_tasks(repo).await {
         store
-            .list_by_status(repo, crate::db::TaskStatus::InReview)
+            .list_by_status(repo, crate::store::TaskStatus::InReview)
             .await?
             .iter()
             .filter(|t| t.origin != "internal")
@@ -744,7 +744,7 @@ pub(crate) async fn check_merged_prs(
     };
     let needs_review_tasks = if store.has_tasks(repo).await {
         store
-            .list_by_status(repo, crate::db::TaskStatus::NeedsReview)
+            .list_by_status(repo, crate::store::TaskStatus::NeedsReview)
             .await?
             .iter()
             .filter(|t| t.origin != "internal")
