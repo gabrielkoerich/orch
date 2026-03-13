@@ -2484,4 +2484,479 @@ mod tests {
             "internal tasks not yet supported in resolve_task_id"
         );
     }
+
+    // ── prune_old_runs ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn prune_old_runs_deletes_runs_for_old_done_tasks() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Old task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Add a run
+        let run_id = store
+            .start_run(&StartRun {
+                task_id: id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "sonnet",
+                command: "echo test",
+                prompt: "do stuff",
+            })
+            .await
+            .unwrap();
+        store
+            .complete_run(&CompleteRun {
+                run_id,
+                exit_code: Some(0),
+                stdout: "ok",
+                stderr: "",
+                parsed: "{}",
+                outcome: "success",
+                error: "",
+                tokens: RunTokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    total_cost_usd: 0.001,
+                    duration_secs: 5.0,
+                },
+            })
+            .await
+            .unwrap();
+
+        // Mark done and backdate updated_at
+        store.update_status(id, TaskStatus::Done).await.unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        // Prune runs older than 30 days
+        let pruned = store.prune_old_runs(30).await.unwrap();
+        assert_eq!(pruned, 1, "should prune 1 run for old done task");
+
+        // Verify runs are gone
+        let runs = store.get_runs(id).await.unwrap();
+        assert!(runs.is_empty(), "runs should be deleted after prune");
+    }
+
+    #[tokio::test]
+    async fn prune_old_runs_keeps_runs_for_active_tasks() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Active task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .start_run(&StartRun {
+                task_id: id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "sonnet",
+                command: "",
+                prompt: "",
+            })
+            .await
+            .unwrap();
+
+        // Task stays in 'new' status — not done/blocked
+        // Backdate it too
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let pruned = store.prune_old_runs(30).await.unwrap();
+        assert_eq!(
+            pruned, 0,
+            "should not prune runs for active (non-done/blocked) tasks"
+        );
+
+        let runs = store.get_runs(id).await.unwrap();
+        assert_eq!(runs.len(), 1, "run should still exist");
+    }
+
+    #[tokio::test]
+    async fn prune_old_runs_keeps_recent_done_tasks() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Recent done task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .start_run(&StartRun {
+                task_id: id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "sonnet",
+                command: "",
+                prompt: "",
+            })
+            .await
+            .unwrap();
+
+        // Mark done but keep updated_at recent (default is now)
+        store.update_status(id, TaskStatus::Done).await.unwrap();
+
+        let pruned = store.prune_old_runs(30).await.unwrap();
+        assert_eq!(
+            pruned, 0,
+            "should not prune runs for recently completed tasks"
+        );
+    }
+
+    // ── complete_run with full lifecycle ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn complete_run_records_all_fields() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let run_id = store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "opus",
+                command: "claude --model opus",
+                prompt: "Fix the bug",
+            })
+            .await
+            .unwrap();
+
+        store
+            .complete_run(&CompleteRun {
+                run_id,
+                exit_code: Some(0),
+                stdout: "Fixed it!",
+                stderr: "warning: unused var",
+                parsed: r#"{"summary":"Fixed bug"}"#,
+                outcome: "success",
+                error: "",
+                tokens: RunTokenUsage {
+                    input_tokens: 5000,
+                    output_tokens: 2000,
+                    total_cost_usd: 0.105,
+                    duration_secs: 45.3,
+                },
+            })
+            .await
+            .unwrap();
+
+        let run = store.get_last_run(task_id, "agent").await.unwrap().unwrap();
+        assert_eq!(run.agent, "claude");
+        assert_eq!(run.model, "opus");
+        assert_eq!(run.command, "claude --model opus");
+        assert_eq!(run.prompt, "Fix the bug");
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(run.stdout, "Fixed it!");
+        assert_eq!(run.stderr, "warning: unused var");
+        assert_eq!(run.parsed_response, r#"{"summary":"Fixed bug"}"#);
+        assert_eq!(run.outcome, "success");
+        assert!(run.error.is_empty());
+        assert_eq!(run.input_tokens, 5000);
+        assert_eq!(run.output_tokens, 2000);
+        assert!((run.total_cost_usd - 0.105).abs() < 0.001);
+        assert!((run.duration_secs - 45.3).abs() < 0.1);
+        assert!(run.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_last_run_filters_by_run_type() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Create runs of different types
+        store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 1,
+                run_type: "route",
+                agent: "claude",
+                model: "haiku",
+                command: "",
+                prompt: "route this",
+            })
+            .await
+            .unwrap();
+        store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "codex",
+                model: "gpt-5.2",
+                command: "codex run",
+                prompt: "fix bug",
+            })
+            .await
+            .unwrap();
+        store
+            .start_run(&StartRun {
+                task_id,
+                attempt: 1,
+                run_type: "review",
+                agent: "claude",
+                model: "sonnet",
+                command: "",
+                prompt: "review PR",
+            })
+            .await
+            .unwrap();
+
+        let route_run = store.get_last_run(task_id, "route").await.unwrap().unwrap();
+        assert_eq!(route_run.agent, "claude");
+        assert_eq!(route_run.model, "haiku");
+
+        let agent_run = store.get_last_run(task_id, "agent").await.unwrap().unwrap();
+        assert_eq!(agent_run.agent, "codex");
+
+        let review_run = store
+            .get_last_run(task_id, "review")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(review_run.prompt, "review PR");
+
+        let missing = store.get_last_run(task_id, "nonexistent").await.unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_runs_returns_all_attempts_ordered() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Multi-attempt".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        for attempt in 1..=3 {
+            store
+                .start_run(&StartRun {
+                    task_id,
+                    attempt,
+                    run_type: "agent",
+                    agent: "claude",
+                    model: "sonnet",
+                    command: "",
+                    prompt: &format!("attempt {attempt}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let runs = store.get_runs(task_id).await.unwrap();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].attempt, 1);
+        assert_eq!(runs[1].attempt, 2);
+        assert_eq!(runs[2].attempt, 3);
+        assert_eq!(runs[0].prompt, "attempt 1");
+        assert_eq!(runs[2].prompt, "attempt 3");
+    }
+
+    // ── cost_summary edge cases ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cost_summary_returns_zeros_for_empty_repo() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let (input, output, cost) = store.cost_summary("empty/repo").await.unwrap();
+        assert_eq!(input, 0);
+        assert_eq!(output, 0);
+        assert!((cost - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ── status_counts edge cases ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn status_counts_returns_empty_map_for_empty_repo() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let counts = store.status_counts("empty/repo").await.unwrap();
+        assert!(counts.is_empty());
+    }
+
+    // ── list_all with mixed statuses ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_all_includes_all_statuses() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let _id1 = store
+            .create(&NewTask {
+                external_id: Some("1".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "New task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id2 = store
+            .create(&NewTask {
+                external_id: Some("2".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Done task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id3 = store
+            .create(&NewTask {
+                external_id: Some("3".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Blocked task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store.update_status(id2, TaskStatus::Done).await.unwrap();
+        store.update_status(id3, TaskStatus::Blocked).await.unwrap();
+
+        let all = store.list_all("owner/repo").await.unwrap();
+        assert_eq!(
+            all.len(),
+            3,
+            "list_all should include new, done, and blocked"
+        );
+
+        // Verify statuses
+        let statuses: Vec<_> = all.iter().map(|t| t.status).collect();
+        assert!(statuses.contains(&TaskStatus::New));
+        assert!(statuses.contains(&TaskStatus::Done));
+        assert!(statuses.contains(&TaskStatus::Blocked));
+    }
+
+    // ── ensure_external_task updates title on re-upsert ─────────────────────
+
+    #[tokio::test]
+    async fn ensure_external_task_updates_on_reupsert() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let ext1 = crate::backends::ExternalTask {
+            id: crate::backends::ExternalId("42".to_string()),
+            title: "Original title".to_string(),
+            body: "Original body".to_string(),
+            state: "open".to_string(),
+            labels: vec!["bug".to_string()],
+            author: "user".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://github.com/owner/repo/issues/42".to_string(),
+        };
+
+        let id1 = store
+            .ensure_external_task("owner/repo", &ext1)
+            .await
+            .unwrap();
+
+        // Update the title
+        let ext2 = crate::backends::ExternalTask {
+            title: "Updated title".to_string(),
+            body: "Updated body".to_string(),
+            ..ext1
+        };
+
+        let id2 = store
+            .ensure_external_task("owner/repo", &ext2)
+            .await
+            .unwrap();
+        assert_eq!(id1, id2);
+
+        let task = store.get(id1).await.unwrap();
+        assert_eq!(task.title, "Updated title");
+        assert_eq!(task.body, "Updated body");
+    }
+
+    // ── store_route + list verifies routing data persists ───────────────────
+
+    #[tokio::test]
+    async fn store_route_persists_all_routing_fields() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("99".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Route me".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .store_route(&StoreRoute {
+                id,
+                agent: "codex",
+                model: Some("gpt-5.2"),
+                complexity: "complex",
+                reason: "needs deep refactoring",
+                profile: r#"{"role":"backend"}"#,
+                skills: r#"["git","rust"]"#,
+            })
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.agent.as_deref(), Some("codex"));
+        assert_eq!(task.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(task.complexity, "complex");
+        assert_eq!(task.route_reason, "needs deep refactoring");
+        assert_eq!(task.agent_profile, r#"{"role":"backend"}"#);
+        assert_eq!(task.selected_skills, r#"["git","rust"]"#);
+    }
 }

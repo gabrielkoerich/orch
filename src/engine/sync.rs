@@ -521,7 +521,7 @@ async fn skills_sync() -> anyhow::Result<()> {
 /// Also syncs sidecar fields for each task so the store has the latest
 /// routing, execution, and cost data. This is best-effort — individual
 /// task failures are logged and skipped.
-async fn ingest_external_tasks(
+pub(crate) async fn ingest_external_tasks(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     store: &Arc<crate::store::TaskStore>,
@@ -690,5 +690,201 @@ mod tests {
             3,
             "should attempt exactly 3 times then give up"
         );
+    }
+
+    // ── ingest_external_tasks tests ─────────────────────────────────────────
+
+    /// Mock backend that returns configurable tasks per status.
+    struct IngestMockBackend {
+        /// Stored as (status_label, tasks) pairs since Status doesn't impl Hash.
+        tasks: Vec<(String, Vec<ExternalTask>)>,
+    }
+
+    impl IngestMockBackend {
+        fn with_tasks(tasks: Vec<(Status, ExternalTask)>) -> Arc<Self> {
+            let mut grouped: Vec<(String, Vec<ExternalTask>)> = Vec::new();
+            for (status, task) in tasks {
+                let label = status.as_label().to_string();
+                if let Some(entry) = grouped.iter_mut().find(|(l, _)| l == &label) {
+                    entry.1.push(task);
+                } else {
+                    grouped.push((label, vec![task]));
+                }
+            }
+            Arc::new(Self { tasks: grouped })
+        }
+    }
+
+    #[async_trait]
+    impl ExternalBackend for IngestMockBackend {
+        fn name(&self) -> &str {
+            "ingest-mock"
+        }
+        async fn create_task(&self, _: &str, _: &str, _: &[String]) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("new".into()))
+        }
+        async fn get_task(&self, _: &ExternalId) -> anyhow::Result<ExternalTask> {
+            anyhow::bail!("not implemented")
+        }
+        async fn list_by_status(&self, status: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            let label = status.as_label().to_string();
+            Ok(self
+                .tasks
+                .iter()
+                .find(|(l, _)| l == &label)
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default())
+        }
+        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+        async fn post_comment(&self, _: &ExternalId, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_labels(&self, _: &ExternalId, _: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_label(&self, _: &ExternalId, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_sub_issues(&self, _: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_mentions(&self, _: &str) -> anyhow::Result<Vec<Mention>> {
+            Ok(vec![])
+        }
+        async fn update_status(&self, _: &ExternalId, _: Status) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_ext_task(id: &str, title: &str) -> ExternalTask {
+        ExternalTask {
+            id: ExternalId(id.to_string()),
+            title: title.to_string(),
+            body: "".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "user".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: format!("https://github.com/owner/repo/issues/{id}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_upserts_tasks_into_store() {
+        use crate::store::TaskStore;
+
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![
+            (Status::New, make_ext_task("1", "First issue")),
+            (Status::InProgress, make_ext_task("2", "Second issue")),
+        ]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        ingest_external_tasks(&backend, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        // Both tasks should be in the store
+        let all = store.list_all("owner/repo").await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        let task1 = store
+            .get_by_external_id("owner/repo", "1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task1.title, "First issue");
+        assert_eq!(task1.status, crate::db::TaskStatus::New);
+
+        let task2 = store
+            .get_by_external_id("owner/repo", "2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task2.title, "Second issue");
+        assert_eq!(task2.status, crate::db::TaskStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn ingest_updates_existing_tasks() {
+        use crate::store::TaskStore;
+
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![(
+            Status::Routed,
+            make_ext_task("42", "Updated title"),
+        )]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Pre-create the task
+        store
+            .create(&crate::store::NewTask {
+                external_id: Some("42".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Original title".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ingest_external_tasks(&backend, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        // Should have updated the title
+        let task = store
+            .get_by_external_id("owner/repo", "42")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.title, "Updated title");
+        assert_eq!(task.status, crate::db::TaskStatus::Routed);
+    }
+
+    #[tokio::test]
+    async fn ingest_handles_empty_backend() {
+        use crate::store::TaskStore;
+
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Should not error on empty backend
+        let result = ingest_external_tasks(&backend, "owner/repo", &store).await;
+        assert!(result.is_ok());
+
+        let all = store.list_all("owner/repo").await.unwrap();
+        assert!(all.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_syncs_status_correctly_across_statuses() {
+        use crate::store::TaskStore;
+
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![
+            (Status::New, make_ext_task("1", "New")),
+            (Status::Routed, make_ext_task("2", "Routed")),
+            (Status::InProgress, make_ext_task("3", "InProgress")),
+            (Status::NeedsReview, make_ext_task("4", "NeedsReview")),
+            (Status::InReview, make_ext_task("5", "InReview")),
+            (Status::Blocked, make_ext_task("6", "Blocked")),
+        ]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        ingest_external_tasks(&backend, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let counts = store.status_counts("owner/repo").await.unwrap();
+        assert_eq!(counts.get("new"), Some(&1));
+        assert_eq!(counts.get("routed"), Some(&1));
+        assert_eq!(counts.get("in_progress"), Some(&1));
+        assert_eq!(counts.get("needs_review"), Some(&1));
+        assert_eq!(counts.get("in_review"), Some(&1));
+        assert_eq!(counts.get("blocked"), Some(&1));
     }
 }

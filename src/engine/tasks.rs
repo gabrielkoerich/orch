@@ -285,3 +285,253 @@ impl TaskManager {
         Ok(ext_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::{ExternalId, ExternalTask, Mention};
+    use crate::store::{NewTask, TaskStore};
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    /// Mock backend that records update_status calls.
+    struct MockBackend {
+        status_updates: Arc<Mutex<Vec<(String, Status)>>>,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                status_updates: Arc::new(Mutex::new(vec![])),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExternalBackend for MockBackend {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn create_task(
+            &self,
+            _t: &str,
+            _b: &str,
+            _l: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("new".to_string()))
+        }
+        async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask> {
+            Ok(ExternalTask {
+                id: id.clone(),
+                title: "Mock".to_string(),
+                body: "".to_string(),
+                state: "open".to_string(),
+                labels: vec![],
+                author: "bot".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                url: "".to_string(),
+            })
+        }
+        async fn list_by_status(&self, _s: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+        async fn post_comment(&self, _id: &ExternalId, _b: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_labels(&self, _id: &ExternalId, _l: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_label(&self, _id: &ExternalId, _l: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+        async fn create_sub_task(
+            &self,
+            _p: &ExternalId,
+            _t: &str,
+            _b: &str,
+            _l: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("child".to_string()))
+        }
+        async fn ensure_status_label(&self, _l: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn has_open_issue_with_title(&self, _t: &str, _l: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn is_pr_merged(&self, _b: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+            Ok(Some("testbot".to_string()))
+        }
+        async fn get_mentions(&self, _s: &str) -> anyhow::Result<Vec<Mention>> {
+            Ok(vec![])
+        }
+        async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+            self.status_updates
+                .lock()
+                .unwrap()
+                .push((id.0.clone(), status));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn with_store_constructor_enables_dual_write() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        assert!(tm.store.is_some(), "store should be set via with_store");
+        assert_eq!(tm.repo, "owner/repo");
+    }
+
+    #[tokio::test]
+    async fn update_status_dual_writes_to_store_for_external_task() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let mock = MockBackend::new();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Pre-create the task in the store so resolve_task_id finds it
+        store
+            .create(&NewTask {
+                external_id: Some("42".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let tm =
+            TaskManager::with_store(db, backend.clone(), store.clone(), "owner/repo".to_string());
+
+        // Update status — should write to both backend and store
+        tm.update_task_status(&ExternalId("42".to_string()), Status::InProgress)
+            .await
+            .unwrap();
+
+        // Verify the store side was updated
+        let task = store.get(1).await.unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::InProgress,
+            "store should have updated status"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_status_skips_store_when_task_not_in_store() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let tm = TaskManager::with_store(db, backend, store.clone(), "owner/repo".to_string());
+
+        // Update for a task not in the store — should not error
+        let result = tm
+            .update_task_status(&ExternalId("999".to_string()), Status::Done)
+            .await;
+        assert!(result.is_ok(), "should succeed even when task not in store");
+    }
+
+    #[tokio::test]
+    async fn update_status_works_without_store() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+
+        // Use old constructor (no store)
+        let tm = TaskManager::new(db, backend);
+
+        let result = tm
+            .update_task_status(&ExternalId("42".to_string()), Status::Routed)
+            .await;
+        assert!(
+            result.is_ok(),
+            "should work without store (backward compat)"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_status_dual_writes_for_internal_task() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        db.migrate().await.unwrap();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Create an internal task in the DB
+        let internal_id = db
+            .create_internal_task("Internal task", "body", "cron", "job:1")
+            .await
+            .unwrap();
+
+        let tm =
+            TaskManager::with_store(db.clone(), backend, store.clone(), "owner/repo".to_string());
+
+        // Update the internal task status
+        let id_str = format!("internal:{}", internal_id);
+        tm.update_task_status(&ExternalId(id_str), Status::Routed)
+            .await
+            .unwrap();
+
+        // Verify DB was updated
+        let task = db.get_internal_task(internal_id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::Routed);
+
+        // Store dual-write: internal tasks return None from resolve_task_id,
+        // so store should NOT be updated (by design — internal tasks not yet in store)
+    }
+
+    #[tokio::test]
+    async fn status_to_task_status_maps_all_variants() {
+        assert_eq!(status_to_task_status(Status::New), TaskStatus::New);
+        assert_eq!(status_to_task_status(Status::Routed), TaskStatus::Routed);
+        assert_eq!(
+            status_to_task_status(Status::InProgress),
+            TaskStatus::InProgress
+        );
+        assert_eq!(status_to_task_status(Status::Done), TaskStatus::Done);
+        assert_eq!(status_to_task_status(Status::Blocked), TaskStatus::Blocked);
+        assert_eq!(
+            status_to_task_status(Status::InReview),
+            TaskStatus::InReview
+        );
+        assert_eq!(
+            status_to_task_status(Status::NeedsReview),
+            TaskStatus::NeedsReview
+        );
+    }
+
+    #[test]
+    fn is_internal_id_detects_prefix() {
+        assert!(is_internal_id("internal:5"));
+        assert!(is_internal_id("internal:0"));
+        assert!(!is_internal_id("42"));
+        assert!(!is_internal_id(""));
+        assert!(!is_internal_id("internal"));
+    }
+
+    #[test]
+    fn parse_internal_id_extracts_number() {
+        assert_eq!(parse_internal_id("internal:5"), Some(5));
+        assert_eq!(parse_internal_id("internal:0"), Some(0));
+        assert_eq!(parse_internal_id("internal:abc"), None);
+        assert_eq!(parse_internal_id("42"), None);
+        assert_eq!(parse_internal_id(""), None);
+    }
+}
