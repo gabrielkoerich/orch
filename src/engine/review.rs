@@ -164,6 +164,7 @@ pub(crate) async fn review_open_prs(
                                 "review_agent_failures=0".to_string(),
                                 "merge_conflict_retries=0".to_string(),
                                 "pr_create_failures=0".to_string(),
+                                "ci_merge_failures=0".to_string(),
                             ],
                         ) {
                             tracing::warn!(task_id, err = %e, "failed to reset per-cycle counters on no-PR re-dispatch");
@@ -507,6 +508,7 @@ pub(crate) async fn review_open_prs(
                         "review_agent_failures=0".to_string(),
                         "merge_conflict_retries=0".to_string(),
                         "pr_create_failures=0".to_string(),
+                        "ci_merge_failures=0".to_string(),
                     ],
                 ) {
                     tracing::warn!(task_id, err = %e, "failed to reset per-cycle counters on re-dispatch");

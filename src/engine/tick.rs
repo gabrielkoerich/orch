@@ -601,6 +601,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                                         "review_agent_failures=0".to_string(),
                                                         "merge_conflict_retries=0".to_string(),
                                                         "pr_create_failures=0".to_string(),
+                                                        "ci_merge_failures=0".to_string(),
                                                     ],
                                                 );
                                             } // Approve or RequestChanges handled inside
