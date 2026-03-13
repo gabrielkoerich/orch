@@ -407,13 +407,17 @@ impl TaskRunner {
         let started_at = Utc::now();
 
         // Store task info in sidecar for prompt building
-        sidecar::set(
+        crate::engine::cleanup::store_and_sidecar_set(
+            &self.store,
+            &self.repo,
             task_id,
             &[
                 format!("title={}", task.title),
                 format!("body={}", task.body),
             ],
-        )?;
+            &[], // title/body already in store tasks table
+        )
+        .await;
 
         // Record run start in task_runs audit trail
         let run_audit_id = if let Some(ref store) = self.store {
@@ -465,8 +469,15 @@ impl TaskRunner {
                 if !delegations.is_empty() {
                     self.process_delegations(task, &delegations, backend)
                         .await?;
-                    // Clear delegations from sidecar after processing
-                    sidecar::set(task_id, &["delegations=".to_string()])?;
+                    // Clear delegations after processing
+                    crate::engine::cleanup::store_and_sidecar_set(
+                        &self.store,
+                        &self.repo,
+                        task_id,
+                        &["delegations=".to_string()],
+                        &[("delegations", serde_json::json!([]))],
+                    )
+                    .await;
                 }
             }
         }
