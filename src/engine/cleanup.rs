@@ -847,4 +847,89 @@ mod tests {
             "fallback path should point to existing dir"
         );
     }
+
+    // ── store_or_sidecar ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_or_sidecar_reads_from_store() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("42".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Test task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .set_fields(id, &[("branch", serde_json::json!("gh-42-fix"))])
+            .await
+            .unwrap();
+        store
+            .set_fields(id, &[("worktree", serde_json::json!("/tmp/wt42"))])
+            .await
+            .unwrap();
+
+        // Should read from store
+        let branch = store_or_sidecar(&store, "owner/repo", "42", "branch").await;
+        assert_eq!(branch.as_deref(), Some("gh-42-fix"));
+
+        let wt = store_or_sidecar(&store, "owner/repo", "42", "worktree").await;
+        assert_eq!(wt.as_deref(), Some("/tmp/wt42"));
+    }
+
+    #[tokio::test]
+    async fn store_or_sidecar_falls_back_for_unknown_task() {
+        use crate::store::TaskStore;
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Task doesn't exist in store — should return None (sidecar fallback would also fail in test)
+        let result = store_or_sidecar(&store, "owner/repo", "unknown-999", "branch").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_or_sidecar_counter_fields() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("55".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Counter test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Zero counters should return None (falls through to sidecar)
+        let retries = store_or_sidecar(&store, "owner/repo", "55", "merge_conflict_retries").await;
+        assert!(retries.is_none());
+
+        // Set counter
+        store.increment(id, "merge_conflict_retries").await.unwrap();
+        let retries = store_or_sidecar(&store, "owner/repo", "55", "merge_conflict_retries").await;
+        assert_eq!(retries.as_deref(), Some("1"));
+
+        // Agent (Option field)
+        store
+            .set_fields(id, &[("agent", serde_json::json!("claude"))])
+            .await
+            .unwrap();
+        let agent = store_or_sidecar(&store, "owner/repo", "55", "agent").await;
+        assert_eq!(agent.as_deref(), Some("claude"));
+    }
 }
