@@ -1,11 +1,18 @@
-use crate::db::Db;
-use crate::sidecar;
+use crate::config;
+use crate::engine::cleanup as store_helpers;
+use crate::store::{self, TaskStore};
+use std::sync::Arc;
 
-/// Show cost breakdown for a specific task (from sidecar data).
-pub fn show_task(id: &str) -> anyhow::Result<()> {
-    let usage = sidecar::get_token_usage(id);
-    let cost_estimate = sidecar::get_cost_estimate(id);
-    let model = sidecar::get_model(id);
+/// Show cost breakdown for a specific task.
+pub async fn show_task(id: &str) -> anyhow::Result<()> {
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
+
+    let usage = store_helpers::get_token_usage(&store, &repo, id).await;
+    let cost_estimate = store_helpers::get_cost_estimate(&store, &repo, id).await;
+    let model = store_helpers::opt_store_get_field(&store, &repo, id, "model")
+        .await
+        .unwrap_or_default();
 
     if usage.total_tokens() == 0 {
         println!("No token data available for task #{}", id);
@@ -13,7 +20,7 @@ pub fn show_task(id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let pricing = sidecar::pricing_for_model(&model);
+    let pricing = store::pricing_for_model(&model);
 
     println!("Task #{}: cost breakdown", id);
     println!(
@@ -51,10 +58,9 @@ pub fn show_task(id: &str) -> anyhow::Result<()> {
 
 /// Show aggregate cost summary over time periods (24h, 7d, 30d).
 pub async fn show_summary() -> anyhow::Result<()> {
-    let db = Db::open(&crate::db::default_path()?)?;
-    db.migrate().await?;
+    let store = crate::cli::init_store().await?;
 
-    let summary = db.get_cost_summary().await?;
+    let summary = store.get_cost_summary().await?;
 
     println!();
     println!("Cost Summary");
@@ -83,10 +89,9 @@ pub async fn show_summary() -> anyhow::Result<()> {
 
 /// Show cost breakdown by agent.
 pub async fn show_by_agent() -> anyhow::Result<()> {
-    let db = Db::open(&crate::db::default_path()?)?;
-    db.migrate().await?;
+    let store = crate::cli::init_store().await?;
 
-    let groups = db.get_cost_by_agent().await?;
+    let groups = store.get_cost_by_agent().await?;
 
     if groups.is_empty() {
         println!("No cost data available yet.");
@@ -130,10 +135,9 @@ pub async fn show_by_agent() -> anyhow::Result<()> {
 
 /// Show cost breakdown by model.
 pub async fn show_by_model() -> anyhow::Result<()> {
-    let db = Db::open(&crate::db::default_path()?)?;
-    db.migrate().await?;
+    let store = crate::cli::init_store().await?;
 
-    let groups = db.get_cost_by_model().await?;
+    let groups = store.get_cost_by_model().await?;
 
     if groups.is_empty() {
         println!("No cost data available yet.");

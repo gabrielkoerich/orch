@@ -5,8 +5,9 @@
 //! Also owns `write_result_json` and the `safe_utf8_tail` utility.
 
 use crate::config;
-use crate::sidecar;
+use crate::store::TaskStore;
 use std::path::Path;
+use std::sync::Arc;
 
 use super::{agents, git_ops, response, worktree};
 
@@ -98,6 +99,7 @@ pub async fn handle_success(
     model_name: Option<&str>,
     new_attempts: u32,
     repo: &str,
+    store: &Option<Arc<TaskStore>>,
 ) -> anyhow::Result<(String, bool)> {
     let resp = parsed.response;
     tracing::info!(
@@ -115,7 +117,14 @@ pub async fn handle_success(
             git_ops::auto_commit(&wt.work_dir, task_id, task_title, agent_name, new_attempts).await
         {
             tracing::error!(task_id, error = ?e, "auto commit failed");
-            sidecar::set(task_id, &[format!("last_error=auto commit failed: {e}")])?;
+            let msg = format!("auto commit failed: {e}");
+            crate::engine::cleanup::store_set(
+                store,
+                repo,
+                task_id,
+                &[("last_error", serde_json::json!(msg))],
+            )
+            .await;
         }
 
         // Push
@@ -127,7 +136,14 @@ pub async fn handle_success(
             }
             Err(e) => {
                 tracing::error!(task_id, error = ?e, "push failed");
-                sidecar::set(task_id, &[format!("last_error=push failed: {e}")])?;
+                let msg = format!("push failed: {e}");
+                crate::engine::cleanup::store_set(
+                    store,
+                    repo,
+                    task_id,
+                    &[("last_error", serde_json::json!(msg))],
+                )
+                .await;
                 false
             }
         };
@@ -164,20 +180,31 @@ pub async fn handle_success(
                 }
                 Err(e) => {
                     tracing::error!(task_id, error = ?e, "create PR failed");
-                    sidecar::set(task_id, &[format!("last_error=create PR failed: {e}")])?;
+                    let msg = format!("create PR failed: {e}");
+                    crate::engine::cleanup::store_set(
+                        store,
+                        repo,
+                        task_id,
+                        &[("last_error", serde_json::json!(msg))],
+                    )
+                    .await;
                 }
             }
         }
     }
 
-    // Store delegations in sidecar if present (processed by run_with_context)
+    // Store delegations in store if present (processed by run_with_context)
     if !resp.delegations.is_empty() {
-        if let Ok(delegations_json) = serde_json::to_string(&resp.delegations) {
-            sidecar::set(task_id, &[format!("delegations={delegations_json}")])?;
-        }
+        crate::engine::cleanup::store_set(
+            store,
+            repo,
+            task_id,
+            &[("delegations", serde_json::json!(resp.delegations))],
+        )
+        .await;
     }
 
-    // Store result in sidecar
+    // Store result in task store
     // If agent said "done" and a PR exists, send to review before merge.
     // If agent said "done", pushed commits, but PR creation failed — review gate creates PR.
     // If agent said "done", no PR, and no delegations — work is complete
@@ -208,15 +235,28 @@ pub async fn handle_success(
     } else {
         &resp.status
     };
-    sidecar::set(task_id, &[format!("summary={}", resp.summary)])?;
+    crate::engine::cleanup::store_set(
+        store,
+        repo,
+        task_id,
+        &[("summary", serde_json::json!(resp.summary))],
+    )
+    .await;
 
     // Store token usage — prefer agent-parsed tokens, fall back to response
     let input_tokens = parsed.input_tokens.or(resp.input_tokens);
     let output_tokens = parsed.output_tokens.or(resp.output_tokens);
     if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
         let model = model_name.unwrap_or("haiku");
-        if let Err(e) = sidecar::store_token_usage(task_id, input, output, model) {
-            tracing::warn!(task_id, ?e, "failed to store token usage");
+        if let Some(ref st) = store {
+            if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
+                if let Err(e) = st
+                    .store_tokens(store_id, input as i64, output as i64, model)
+                    .await
+                {
+                    tracing::warn!(task_id, ?e, "failed to store token usage");
+                }
+            }
         }
     }
 
@@ -228,7 +268,10 @@ pub async fn handle_success(
         model_name,
         &resp,
         resp.error.as_deref(),
-    );
+        store,
+        repo,
+    )
+    .await;
 
     // Check token budget with warning thresholds
     let max_tokens: u64 = config::get("max_tokens_per_task")
@@ -236,8 +279,8 @@ pub async fn handle_success(
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000);
 
-    let total_tokens = sidecar::get_total_tokens(task_id);
-    let cost = sidecar::get_cost_estimate(task_id);
+    let total_tokens = crate::engine::cleanup::get_total_tokens(store, repo, task_id).await;
+    let cost = crate::engine::cleanup::get_cost_estimate(store, repo, task_id).await;
     let warning_threshold = (max_tokens as f64 * 0.8) as u64;
 
     if total_tokens > max_tokens {
@@ -246,16 +289,20 @@ pub async fn handle_success(
         // otherwise keep the already-computed final_status (e.g. "done" for
         // read-only tasks with no code changes).
         let budget_status = if has_pr { "needs_review" } else { final_status };
-        sidecar::set(
+        let budget_msg = format!(
+            "token budget exceeded: {}/{} tokens (${:.4})",
+            total_tokens, max_tokens, cost.total_cost_usd
+        );
+        crate::engine::cleanup::store_set(
+            store,
+            repo,
             task_id,
             &[
-                format!(
-                    "last_error=token budget exceeded: {}/{} tokens (${:.4})",
-                    total_tokens, max_tokens, cost.total_cost_usd
-                ),
-                "budget_exceeded=true".to_string(),
+                ("last_error", serde_json::json!(budget_msg)),
+                ("budget_exceeded", serde_json::json!(true)),
             ],
-        )?;
+        )
+        .await;
         return Ok((budget_status.to_string(), true)); // signal early return to caller
     } else if total_tokens > warning_threshold {
         let pct = (total_tokens as f64 / max_tokens as f64 * 100.0) as u32;
@@ -266,13 +313,17 @@ pub async fn handle_success(
             pct,
             "approaching token budget"
         );
-        sidecar::set(
+        let warning_msg = format!(
+            "{}% of budget used ({}/{} tokens, ${:.4})",
+            pct, total_tokens, max_tokens, cost.total_cost_usd
+        );
+        crate::engine::cleanup::store_set(
+            store,
+            repo,
             task_id,
-            &[format!(
-                "budget_warning={}% of budget used ({}/{} tokens, ${:.4})",
-                pct, total_tokens, max_tokens, cost.total_cost_usd
-            )],
-        )?;
+            &[("budget_warning", serde_json::json!(warning_msg))],
+        )
+        .await;
     }
 
     // Note: done → in_review transition is handled by the engine

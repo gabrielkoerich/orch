@@ -3,7 +3,6 @@
 //! Extracted from `runner/mod.rs`. Handles the tmux session lifecycle:
 //! spawning the agent, waiting for completion, reading output files, and cleanup.
 
-use crate::sidecar;
 use crate::tmux::TmuxManager;
 use std::path::{Path, PathBuf};
 use tokio::time::{timeout, Duration};
@@ -81,7 +80,7 @@ fn collect_output(
     // Read exit code — check per-task attempt dir first, fall back to legacy
     let exit_code: i32 = {
         let attempt_exit = attempt_dir.join("exit.txt");
-        let legacy_exit = sidecar::state_file(&format!("exit-{task_id}.txt"))
+        let legacy_exit = crate::home::state_file(&format!("exit-{task_id}.txt"))
             .unwrap_or_else(|_| orch_home.join("state").join(format!("exit-{task_id}.txt")));
 
         std::fs::read_to_string(&attempt_exit)
@@ -95,7 +94,7 @@ fn collect_output(
     let raw_stdout = response::read_output_file(task_id, &invocation.output_file, &invocation.repo);
 
     let stderr_path_attempt = attempt_dir.join("stderr.txt");
-    let stderr_path_legacy = sidecar::state_file(&format!("stderr-{task_id}.txt"))
+    let stderr_path_legacy = crate::home::state_file(&format!("stderr-{task_id}.txt"))
         .unwrap_or_else(|_| PathBuf::from(format!("/tmp/stderr-{task_id}.txt")));
     let raw_stderr = std::fs::read_to_string(&stderr_path_attempt)
         .or_else(|_| std::fs::read_to_string(&stderr_path_legacy))

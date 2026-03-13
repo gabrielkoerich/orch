@@ -9,18 +9,36 @@
 //! - Owner /slash command scanning
 //! - Skill repository syncing
 
-use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
+use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
-use crate::db::{Db, TaskStatus};
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
-use crate::sidecar::{self, REPO_CONTEXT};
+use crate::repo_context::REPO_CONTEXT;
+use crate::store::TaskStatus;
+use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
+
+/// Read a KV value from the store.
+async fn kv_get_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str) -> Option<String> {
+    if let Some(s) = store {
+        if let Ok(v) = s.kv_get(key).await {
+            return v;
+        }
+    }
+    None
+}
+
+/// Write a KV value to the store.
+async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: &str) {
+    if let Some(s) = store {
+        let _ = s.kv_set(key, value).await;
+    }
+}
 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
 use super::review::{review_and_merge, review_open_prs, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
@@ -37,31 +55,37 @@ pub(crate) async fn sync_tick(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
     repo: &str,
-    db: &Arc<Db>,
     config: &EngineConfig,
     semaphore: &Arc<Semaphore>,
     router: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
+    store: &Arc<crate::store::TaskStore>,
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
 
+    // 0. Ingest all active external tasks into the unified store.
+    //    This ensures the store has data for tasks created before dual-write was added.
+    if let Err(e) = ingest_external_tasks(backend, repo, store).await {
+        tracing::debug!(err = %e, "external task ingest failed");
+    }
+
     // 1. Cleanup worktrees for done tasks
-    if let Err(e) = cleanup_done_worktrees(backend, repo, task_manager).await {
+    if let Err(e) = cleanup_done_worktrees(backend, repo, task_manager, store).await {
         tracing::warn!(err = %e, "worktree cleanup failed");
     }
 
     // 2. Check for merged PRs (in_review → done)
-    if let Err(e) = check_merged_prs(backend).await {
+    if let Err(e) = check_merged_prs(backend, repo, store, task_manager).await {
         tracing::warn!(err = %e, "PR merge check failed");
     }
 
     // 3. Scan for @mentions
-    if let Err(e) = scan_mentions(backend, db).await {
+    if let Err(e) = scan_mentions(backend, Some(store), repo).await {
         tracing::warn!(err = %e, "mention scan failed");
     }
 
     // 4. Review open PRs (parse review comments, create follow-ups)
-    if let Err(e) = review_open_prs(backend, db, repo, config, task_manager).await {
+    if let Err(e) = review_open_prs(backend, repo, config, task_manager, store).await {
         tracing::warn!(err = %e, "PR review failed");
     }
 
@@ -70,29 +94,31 @@ pub(crate) async fn sync_tick(
         .map(|v| v != "false")
         .unwrap_or(true);
     if enable_review {
-        // Collect all NeedsReview tasks: external + internal.
-        let mut needs_review_tasks = backend
-            .list_by_status(Status::NeedsReview)
-            .await
-            .unwrap_or_default();
-        if let Ok(internal_needs_review) = task_manager
-            .db_list_internal_by_status(TaskStatus::NeedsReview)
-            .await
-        {
-            for t in internal_needs_review {
-                needs_review_tasks.push(ExternalTask {
-                    id: ExternalId(format!("internal:{}", t.id)),
-                    title: t.title,
-                    body: t.body,
-                    state: "open".to_string(),
-                    labels: vec!["status:needs_review".to_string()],
-                    author: t.source,
-                    created_at: t.created_at.to_rfc3339(),
-                    updated_at: t.updated_at.to_rfc3339(),
-                    url: String::new(),
-                });
+        // Collect all NeedsReview tasks (external + internal) from the store.
+        // Falls back to backend if the store has no data yet.
+        let needs_review_tasks = {
+            if store.has_tasks(repo).await {
+                store
+                    .list_by_status(repo, TaskStatus::NeedsReview)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .map(crate::engine::tasks::store_task_to_external)
+                    .collect::<Vec<_>>()
+            } else {
+                let mut tasks = backend
+                    .list_by_status(Status::NeedsReview)
+                    .await
+                    .unwrap_or_default();
+                if let Ok(internal_needs_review) = task_manager
+                    .list_internal_by_status(TaskStatus::NeedsReview)
+                    .await
+                {
+                    tasks.extend(internal_needs_review);
+                }
+                tasks
             }
-        }
+        };
 
         for task in needs_review_tasks {
             let task_id = &task.id.0;
@@ -120,6 +146,7 @@ pub(crate) async fn sync_tick(
             let task_c = task.clone();
             let repo_s = repo.to_string();
             let router_c = router.clone();
+            let store_c = store.clone();
             let repo_ctx = repo_s.clone();
             tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                 let tid = task_c.id.0.clone();
@@ -135,6 +162,7 @@ pub(crate) async fn sync_tick(
                     &repo_s,
                     &router_c,
                     &task_manager_c,
+                    &store_c,
                 )
                 .await
                 {
@@ -147,9 +175,13 @@ pub(crate) async fn sync_tick(
                         ReviewOutcome::Block
                     }
                     Ok(ReviewDecision::Failed(reason)) => {
-                        let failures =
-                            sidecar::get_u64(&tid, "review_agent_failures").saturating_add(1);
-                        let _ = sidecar::set(&tid, &[format!("review_agent_failures={failures}")]);
+                        let failures = super::cleanup::store_increment(
+                            &Some(store_c.clone()),
+                            &repo_s,
+                            &tid,
+                            "review_agent_failures",
+                        )
+                        .await;
                         if failures >= MAX_REVIEW_AGENT_FAILURES {
                             tracing::error!(
                                 task_id = tid,
@@ -169,9 +201,13 @@ pub(crate) async fn sync_tick(
                         }
                     }
                     Err(e) => {
-                        let failures =
-                            sidecar::get_u64(&tid, "review_agent_failures").saturating_add(1);
-                        let _ = sidecar::set(&tid, &[format!("review_agent_failures={failures}")]);
+                        let failures = super::cleanup::store_increment(
+                            &Some(store_c.clone()),
+                            &repo_s,
+                            &tid,
+                            "review_agent_failures",
+                        )
+                        .await;
                         if failures >= MAX_REVIEW_AGENT_FAILURES {
                             tracing::error!(
                                 task_id = tid,
@@ -191,27 +227,16 @@ pub(crate) async fn sync_tick(
                         }
                     }
                     Ok(_) => {
-                        let _ = sidecar::set(
-                            &tid,
-                            &[
-                                "review_agent_failures=0".to_string(),
-                                "merge_conflict_retries=0".to_string(),
-                                "pr_create_failures=0".to_string(),
-                                "ci_merge_failures=0".to_string(),
-                            ],
-                        );
+                        super::cleanup::store_reset_counters(&Some(store_c.clone()), &repo_s, &tid)
+                            .await;
                         ReviewOutcome::Ok
                     }
                 };
                 match outcome {
                     ReviewOutcome::Reset => {
-                        if tid.starts_with("internal:") {
-                            let _ = task_manager_c
-                                .update_task_status(&ExternalId(tid.clone()), Status::NeedsReview)
-                                .await;
-                        } else {
-                            reset_to_needs_review_with_retry(&backend_c, &tid).await;
-                        }
+                        let _ = task_manager_c
+                            .update_task_status(&ExternalId(tid.clone()), Status::NeedsReview)
+                            .await;
                     }
                     ReviewOutcome::Block => {
                         let _ = task_manager_c
@@ -226,30 +251,30 @@ pub(crate) async fn sync_tick(
         }
 
         // Detect stale InReview tasks (review agent crashed, no active tmux session).
-        // Check external tasks.
-        let mut in_review_tasks = backend
-            .list_by_status(Status::InReview)
-            .await
-            .unwrap_or_default();
-        // Also include internal InReview tasks.
-        if let Ok(internal_in_review) = task_manager
-            .db_list_internal_by_status(TaskStatus::InReview)
-            .await
-        {
-            for t in internal_in_review {
-                in_review_tasks.push(ExternalTask {
-                    id: ExternalId(format!("internal:{}", t.id)),
-                    title: t.title,
-                    body: t.body,
-                    state: "open".to_string(),
-                    labels: vec!["status:in_review".to_string()],
-                    author: t.source,
-                    created_at: t.created_at.to_rfc3339(),
-                    updated_at: t.updated_at.to_rfc3339(),
-                    url: String::new(),
-                });
+        // Read from the store (includes both external and internal tasks).
+        let in_review_tasks = {
+            if store.has_tasks(repo).await {
+                store
+                    .list_by_status(repo, TaskStatus::InReview)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .map(crate::engine::tasks::store_task_to_external)
+                    .collect::<Vec<_>>()
+            } else {
+                let mut tasks = backend
+                    .list_by_status(Status::InReview)
+                    .await
+                    .unwrap_or_default();
+                if let Ok(internal_in_review) = task_manager
+                    .list_internal_by_status(TaskStatus::InReview)
+                    .await
+                {
+                    tasks.extend(internal_in_review);
+                }
+                tasks
             }
-        }
+        };
         for task in in_review_tasks {
             // Skip tasks that just transitioned to InReview — allow time for the
             // review agent to start its tmux session before treating it as stale.
@@ -279,9 +304,13 @@ pub(crate) async fn sync_tick(
                 // Reset the failure counter: stale-session recovery is an infrastructure
                 // event (tmux crash, service restart) not a genuine agent parse failure.
                 // Keeping the counter would unfairly consume the budget for the next cycle.
-                if let Err(e) = sidecar::set(&task.id.0, &["review_agent_failures=0".to_string()]) {
-                    tracing::warn!(task_id = %task.id.0, err = %e, "failed to reset review_agent_failures on stale-session recovery");
-                }
+                super::cleanup::store_set(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    &[("review_agent_failures", serde_json::json!(0))],
+                )
+                .await;
                 if let Err(e) = task_manager
                     .update_task_status(&task.id, Status::NeedsReview)
                     .await
@@ -293,7 +322,9 @@ pub(crate) async fn sync_tick(
     }
 
     // 6. Scan for owner /slash commands in issue comments
-    if let Err(e) = super::commands::scan_commands(backend, db, repo).await {
+    if let Err(e) =
+        super::commands::scan_commands(backend, repo, &Some(Arc::clone(store)), task_manager).await
+    {
         tracing::warn!(err = %e, "owner command scan failed");
     }
 
@@ -305,37 +336,15 @@ pub(crate) async fn sync_tick(
     Ok(())
 }
 
-/// Reset a task to NeedsReview, retrying up to 3 times with exponential backoff.
-///
-/// If the reset fails on every attempt, an error is logged and the task will
-/// remain stuck in InReview until the stale-detection sweep rescues it (≤45s).
-async fn reset_to_needs_review_with_retry(backend: &Arc<dyn ExternalBackend>, task_id: &str) {
-    let eid = ExternalId(task_id.to_string());
-    for attempt in 1u32..=3 {
-        match backend.update_status(&eid, Status::NeedsReview).await {
-            Ok(_) => return,
-            Err(e) if attempt < 3 => {
-                tracing::warn!(
-                    task_id, attempt, err = %e,
-                    "failed to reset review task to NeedsReview, retrying"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(attempt as u64 * 2)).await;
-            }
-            Err(e) => {
-                tracing::error!(
-                    task_id, err = %e,
-                    "all retries exhausted resetting to NeedsReview — task stuck in InReview until stale sweep"
-                );
-            }
-        }
-    }
-}
-
 /// Scan for @mentions and create internal tasks.
 ///
 /// Checks recent issue comments for @orchestrator mentions,
 /// creates internal tasks, and acknowledges them.
-async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyhow::Result<()> {
+async fn scan_mentions(
+    backend: &Arc<dyn ExternalBackend>,
+    store: Option<&Arc<crate::store::TaskStore>>,
+    repo: &str,
+) -> anyhow::Result<()> {
     // Get the current user (for mention detection)
     let current_user = match backend.get_authenticated_user().await {
         Ok(Some(u)) => format!("@{}", u),
@@ -351,9 +360,9 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
 
     // Use persisted cursor if available, otherwise fall back to 24h ago
     let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-    let since_str = match db.kv_get("mentions_last_checked").await {
-        Ok(Some(ts)) => ts,
-        _ => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    let since_str = match kv_get_prefer_store(&store, "mentions_last_checked").await {
+        Some(ts) => ts,
+        None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
 
     let mentions = match backend.get_mentions(&since_str).await {
@@ -365,15 +374,17 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
     };
 
     // Get existing mention tasks across ALL statuses to avoid duplicates.
-    // Only checking New status would miss tasks that progressed to InProgress/Done,
-    // causing duplicate tasks on the next sync tick within the 24h window.
-    let existing_mentions: std::collections::HashSet<String> = db
-        .list_all_internal_tasks()
-        .await?
-        .into_iter()
-        .filter(|t| t.source == "mention")
-        .map(|t| t.source_id.clone())
-        .collect();
+    let existing_mentions: std::collections::HashSet<String> = if let Some(s) = store {
+        s.list_all_internal(repo)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.source == "mention")
+            .map(|t| t.source_id.clone())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
 
     for mention in mentions {
         // Skip if already processed
@@ -389,18 +400,17 @@ async fn scan_mentions(backend: &Arc<dyn ExternalBackend>, db: &Arc<Db>) -> anyh
         let title = format!("Respond to mention by @{}", mention.author);
         let task_body = format!("Mention by @{}:\n\n{}", mention.author, mention.body);
 
-        let task_id = db
-            .create_internal_task(&title, &task_body, "mention", &mention.id)
-            .await?;
-
-        tracing::info!(task_id, mention_id = %mention.id, "created mention task");
+        if let Some(s) = store {
+            let task_id = s
+                .create_internal(repo, &title, &task_body, "mention", &mention.id)
+                .await?;
+            tracing::info!(task_id, mention_id = %mention.id, "created mention task");
+        }
     }
 
     // Persist cursor so the next sync tick only fetches newer comments
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    if let Err(e) = db.kv_set("mentions_last_checked", &now).await {
-        tracing::warn!(err = %e, "failed to persist mentions cursor");
-    }
+    kv_set_prefer_store(&store, "mentions_last_checked", &now).await;
 
     Ok(())
 }
@@ -508,129 +518,343 @@ async fn skills_sync() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ingest all active external tasks into the unified SQLite store.
+///
+/// Upserts each task so the store stays in sync with the backend.
+/// Also syncs fields for each task so the store has the latest
+/// routing, execution, and cost data. This is best-effort — individual
+/// task failures are logged and skipped.
+pub(crate) async fn ingest_external_tasks(
+    backend: &Arc<dyn ExternalBackend>,
+    repo: &str,
+    store: &Arc<crate::store::TaskStore>,
+) -> anyhow::Result<()> {
+    // Ingest tasks across all active statuses.
+    let active_statuses = [
+        Status::New,
+        Status::Routed,
+        Status::InProgress,
+        Status::NeedsReview,
+        Status::InReview,
+        Status::Blocked,
+    ];
+
+    for status in &active_statuses {
+        let tasks = match backend.list_by_status(*status).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(?status, ?e, "ingest: failed to list tasks");
+                continue;
+            }
+        };
+
+        for task in &tasks {
+            match store.ensure_external_task(repo, task).await {
+                Ok(store_id) => {
+                    // Only sync status from backend → store for NEW tasks (first ingest).
+                    // Once a task exists in the store, its status is authoritative —
+                    // re-ingestion must not overwrite store-first status changes
+                    // (e.g., store has Routed but GitHub still shows New labels).
+                    if let Ok(existing) = store.get(store_id).await {
+                        if existing.status == crate::store::TaskStatus::New {
+                            let db_status = crate::engine::tasks::status_to_task_status(*status);
+                            if db_status != crate::store::TaskStatus::New {
+                                if let Err(e) = store.update_status(store_id, db_status).await {
+                                    tracing::debug!(
+                                        task_id = task.id.0,
+                                        ?e,
+                                        "ingest: status sync failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(task_id = task.id.0, ?e, "ingest: upsert failed");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
     use async_trait::async_trait;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    /// Mock backend where `update_status` fails for the first `fail_first_n` calls,
-    /// then succeeds. All other methods are stubs.
-    struct CountingBackend {
-        calls: Arc<Mutex<u32>>,
-        fail_first_n: u32,
+    // ── ingest_external_tasks tests ─────────────────────────────────────────
+
+    /// Mock backend that returns configurable tasks per status.
+    struct IngestMockBackend {
+        /// Stored as (status_label, tasks) pairs since Status doesn't impl Hash.
+        tasks: Vec<(String, Vec<ExternalTask>)>,
     }
 
-    impl CountingBackend {
-        fn new(fail_first_n: u32) -> Arc<Self> {
-            Arc::new(Self {
-                calls: Arc::new(Mutex::new(0)),
-                fail_first_n,
-            })
-        }
-
-        fn call_count(&self) -> u32 {
-            *self.calls.lock().unwrap()
+    impl IngestMockBackend {
+        fn with_tasks(tasks: Vec<(Status, ExternalTask)>) -> Arc<Self> {
+            let mut grouped: Vec<(String, Vec<ExternalTask>)> = Vec::new();
+            for (status, task) in tasks {
+                let label = status.as_label().to_string();
+                if let Some(entry) = grouped.iter_mut().find(|(l, _)| l == &label) {
+                    entry.1.push(task);
+                } else {
+                    grouped.push((label, vec![task]));
+                }
+            }
+            Arc::new(Self { tasks: grouped })
         }
     }
 
     #[async_trait]
-    impl ExternalBackend for CountingBackend {
+    impl ExternalBackend for IngestMockBackend {
         fn name(&self) -> &str {
-            "counting-mock"
+            "ingest-mock"
         }
-
         async fn create_task(&self, _: &str, _: &str, _: &[String]) -> anyhow::Result<ExternalId> {
-            Ok(ExternalId("1".into()))
+            Ok(ExternalId("new".into()))
         }
-
         async fn get_task(&self, _: &ExternalId) -> anyhow::Result<ExternalTask> {
-            Ok(ExternalTask {
-                id: ExternalId("1".into()),
-                title: "test".into(),
-                body: "".into(),
-                state: "open".into(),
-                labels: vec![],
-                author: "user".into(),
-                created_at: "2024-01-01T00:00:00Z".into(),
-                updated_at: "2024-01-01T00:00:00Z".into(),
-                url: "https://github.com/owner/repo/issues/1".into(),
-            })
+            anyhow::bail!("not implemented")
         }
-
-        /// Override update_status so we control success/failure directly, bypassing
-        /// the default get_task/remove_label/set_labels orchestration.
-        async fn update_status(&self, _: &ExternalId, _: Status) -> anyhow::Result<()> {
-            let mut calls = self.calls.lock().unwrap();
-            *calls += 1;
-            if *calls <= self.fail_first_n {
-                anyhow::bail!("simulated failure on call {}", *calls)
-            } else {
-                Ok(())
-            }
+        async fn list_by_status(&self, status: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            let label = status.as_label().to_string();
+            Ok(self
+                .tasks
+                .iter()
+                .find(|(l, _)| l == &label)
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default())
         }
-
-        async fn list_by_status(&self, _: Status) -> anyhow::Result<Vec<ExternalTask>> {
+        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
             Ok(vec![])
         }
-
         async fn post_comment(&self, _: &ExternalId, _: &str) -> anyhow::Result<()> {
             Ok(())
         }
-
         async fn set_labels(&self, _: &ExternalId, _: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
-
         async fn remove_label(&self, _: &ExternalId, _: &str) -> anyhow::Result<()> {
             Ok(())
         }
-
         async fn get_sub_issues(&self, _: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
             Ok(vec![])
         }
-
         async fn health_check(&self) -> anyhow::Result<()> {
             Ok(())
         }
-
         async fn get_mentions(&self, _: &str) -> anyhow::Result<Vec<Mention>> {
             Ok(vec![])
         }
+        async fn update_status(&self, _: &ExternalId, _: Status) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn reset_succeeds_on_first_try() {
-        let backend = CountingBackend::new(0);
-        let backend_arc: Arc<dyn ExternalBackend> = backend.clone();
-        reset_to_needs_review_with_retry(&backend_arc, "task-1").await;
+    fn make_ext_task(id: &str, title: &str) -> ExternalTask {
+        ExternalTask {
+            id: ExternalId(id.to_string()),
+            title: title.to_string(),
+            body: "".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "user".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: format!("https://github.com/owner/repo/issues/{id}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_upserts_tasks_into_store() {
+        use crate::store::TaskStore;
+
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![
+            (Status::New, make_ext_task("1", "First issue")),
+            (Status::InProgress, make_ext_task("2", "Second issue")),
+        ]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        ingest_external_tasks(&backend, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        // Both tasks should be in the store
+        let all = store.list_all("owner/repo").await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        let task1 = store
+            .get_by_external_id("owner/repo", "1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task1.title, "First issue");
+        assert_eq!(task1.status, crate::store::TaskStatus::New);
+
+        let task2 = store
+            .get_by_external_id("owner/repo", "2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task2.title, "Second issue");
+        assert_eq!(task2.status, crate::store::TaskStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn ingest_updates_existing_tasks() {
+        use crate::store::TaskStore;
+
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![(
+            Status::Routed,
+            make_ext_task("42", "Updated title"),
+        )]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Pre-create the task
+        store
+            .create(&crate::store::NewTask {
+                external_id: Some("42".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Original title".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ingest_external_tasks(&backend, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        // Should have updated the title
+        let task = store
+            .get_by_external_id("owner/repo", "42")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.title, "Updated title");
+        assert_eq!(task.status, crate::store::TaskStatus::Routed);
+    }
+
+    #[tokio::test]
+    async fn ingest_handles_empty_backend() {
+        use crate::store::TaskStore;
+
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Should not error on empty backend
+        let result = ingest_external_tasks(&backend, "owner/repo", &store).await;
+        assert!(result.is_ok());
+
+        let all = store.list_all("owner/repo").await.unwrap();
+        assert!(all.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_syncs_status_correctly_across_statuses() {
+        use crate::store::TaskStore;
+
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![
+            (Status::New, make_ext_task("1", "New")),
+            (Status::Routed, make_ext_task("2", "Routed")),
+            (Status::InProgress, make_ext_task("3", "InProgress")),
+            (Status::NeedsReview, make_ext_task("4", "NeedsReview")),
+            (Status::InReview, make_ext_task("5", "InReview")),
+            (Status::Blocked, make_ext_task("6", "Blocked")),
+        ]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        ingest_external_tasks(&backend, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let counts = store.status_counts("owner/repo").await.unwrap();
+        assert_eq!(counts.get("new"), Some(&1));
+        assert_eq!(counts.get("routed"), Some(&1));
+        assert_eq!(counts.get("in_progress"), Some(&1));
+        assert_eq!(counts.get("needs_review"), Some(&1));
+        assert_eq!(counts.get("in_review"), Some(&1));
+        assert_eq!(counts.get("blocked"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn ingest_does_not_overwrite_store_authoritative_status() {
+        use crate::store::TaskStore;
+
+        // Backend reports task as New (GitHub labels haven't caught up yet)
+        let backend: Arc<dyn ExternalBackend> =
+            IngestMockBackend::with_tasks(vec![(Status::New, make_ext_task("99", "My task"))]);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Pre-create the task and advance it to Routed in the store
+        let id = store
+            .create(&crate::store::NewTask {
+                external_id: Some("99".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "My task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Routed)
+            .await
+            .unwrap();
+
+        // Ingest should NOT overwrite Routed back to New
+        ingest_external_tasks(&backend, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
         assert_eq!(
-            backend.call_count(),
-            1,
-            "should call update_status exactly once"
+            task.status,
+            crate::store::TaskStatus::Routed,
+            "ingest must not overwrite store-authoritative status"
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn reset_retries_on_transient_failures_and_succeeds() {
-        // Fail first 2 calls, succeed on the 3rd
-        let backend = CountingBackend::new(2);
-        let backend_arc: Arc<dyn ExternalBackend> = backend.clone();
-        reset_to_needs_review_with_retry(&backend_arc, "task-1").await;
-        assert_eq!(backend.call_count(), 3, "should retry twice then succeed");
+    // ── kv_get_prefer_store / kv_set_prefer_store ────────────────────
+
+    #[tokio::test]
+    async fn kv_get_prefer_store_reads_from_store() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+
+        store.kv_set("k1", "store_val").await.unwrap();
+
+        let opt = Some(&store);
+        let val = kv_get_prefer_store(&opt, "k1").await;
+        assert_eq!(val.as_deref(), Some("store_val"));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn reset_stops_after_three_attempts_when_exhausted() {
-        // Always fail — function must not panic, just log error and stop
-        let backend = CountingBackend::new(10);
-        let backend_arc: Arc<dyn ExternalBackend> = backend.clone();
-        reset_to_needs_review_with_retry(&backend_arc, "task-1").await;
-        assert_eq!(
-            backend.call_count(),
-            3,
-            "should attempt exactly 3 times then give up"
-        );
+    #[tokio::test]
+    async fn kv_get_prefer_store_returns_none_without_store() {
+        let opt: Option<&Arc<crate::store::TaskStore>> = None;
+        let val = kv_get_prefer_store(&opt, "k2").await;
+        assert_eq!(val, None);
+    }
+
+    #[tokio::test]
+    async fn kv_set_prefer_store_writes_to_store() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+
+        let opt = Some(&store);
+        kv_set_prefer_store(&opt, "k3", "val3").await;
+
+        assert_eq!(store.kv_get("k3").await.unwrap().as_deref(), Some("val3"));
+    }
+
+    #[tokio::test]
+    async fn kv_set_prefer_store_noop_without_store() {
+        let opt: Option<&Arc<crate::store::TaskStore>> = None;
+        // Should not panic
+        kv_set_prefer_store(&opt, "k4", "val4").await;
     }
 }

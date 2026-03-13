@@ -6,9 +6,10 @@
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::config;
 use crate::engine::router::get_route_result;
-use crate::sidecar;
+use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::{agent, context, git_ops, worktree};
 
@@ -36,11 +37,16 @@ pub enum GuardOutcome {
 /// Check task guards and return the outcome.
 ///
 /// Also checks for existing tmux sessions to prevent duplicate dispatch.
-pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<GuardOutcome> {
-    let attempts: u32 = sidecar::get(task_id, "attempts")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+pub async fn check_guards(
+    task_id: &str,
+    repo: &str,
+    store: &Option<Arc<TaskStore>>,
+) -> anyhow::Result<GuardOutcome> {
+    let attempts: u32 =
+        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "attempts")
+            .await
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
     // Guard: check if tmux session already exists (prevents duplicate dispatch)
     let tmux = TmuxManager::new();
@@ -62,22 +68,33 @@ pub async fn check_guards(task_id: &str, repo: &str) -> anyhow::Result<GuardOutc
 
     if attempts >= max_attempts {
         tracing::warn!(task_id, attempts, max_attempts, "exceeded max attempts");
-        sidecar::set(
+        let msg =
+            format!("exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset.");
+        crate::engine::cleanup::store_set(
+            store,
+            repo,
             task_id,
-            &[format!(
-                "last_error=exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset."
-            )],
-        )?;
+            &[("last_error", serde_json::json!(msg))],
+        )
+        .await;
         return Ok(GuardOutcome::MaxAttempts);
     }
 
     Ok(GuardOutcome::Proceed(attempts))
 }
 
-/// Build a minimal `ExternalTask` from sidecar state for prompt building.
-pub fn build_pseudo_task(task_id: &str) -> ExternalTask {
-    let task_title = sidecar::get(task_id, "title").unwrap_or_else(|_| format!("Task #{task_id}"));
-    let task_body = sidecar::get(task_id, "body").unwrap_or_default();
+/// Build a minimal `ExternalTask` from store state for prompt building.
+pub async fn build_pseudo_task(
+    task_id: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> ExternalTask {
+    let task_title = crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "title")
+        .await
+        .unwrap_or_else(|| format!("Task #{task_id}"));
+    let task_body = crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "body")
+        .await
+        .unwrap_or_default();
     ExternalTask {
         id: ExternalId(task_id.to_string()),
         title: task_title,
@@ -92,6 +109,7 @@ pub fn build_pseudo_task(task_id: &str) -> ExternalTask {
 }
 
 /// Prepare the full task: set up worktree, build context and prompts, create invocation.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_task(
     task_id: &str,
     agent: Option<&str>,
@@ -100,19 +118,27 @@ pub async fn prepare_task(
     repo: &str,
     project_dir: &Path,
     attempts: u32,
+    store: &Option<Arc<TaskStore>>,
 ) -> anyhow::Result<TaskInitResult> {
-    // Load title from sidecar for branch naming (set by run_with_context before run())
-    let title_for_branch = sidecar::get(task_id, "title").unwrap_or_default();
+    // Load title from store for branch naming (set by run_with_context before run())
+    let title_for_branch =
+        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "title")
+            .await
+            .unwrap_or_default();
 
     // Set up worktree
-    let wt = worktree::setup_worktree(task_id, &title_for_branch, project_dir).await?;
+    let wt = worktree::setup_worktree(task_id, &title_for_branch, project_dir, store, repo).await?;
 
     // Rebase worktree on default branch to pick up latest changes.
     // This prevents non-fast-forward push failures when the task is re-dispatched.
     git_ops::rebase_on_default(&wt.work_dir, &wt.default_branch).await;
 
     // Get routing result
-    let route_result = get_route_result(task_id).ok();
+    let route_result = if let Some(ref s) = store {
+        get_route_result(s, repo, task_id).await.ok()
+    } else {
+        None
+    };
 
     let agent_name = agent
         .map(String::from)
@@ -124,7 +150,7 @@ pub async fn prepare_task(
         .or_else(|| route_result.as_ref().and_then(|r| r.model.clone()));
 
     // Build a minimal ExternalTask for prompt building
-    let pseudo_task = build_pseudo_task(task_id);
+    let pseudo_task = build_pseudo_task(task_id, store, repo).await;
     let task_title = pseudo_task.title.clone();
 
     let selected_skills = route_result
@@ -140,6 +166,8 @@ pub async fn prepare_task(
         &wt.default_branch,
         attempts,
         &selected_skills,
+        store,
+        repo,
     )
     .await;
 
@@ -200,7 +228,13 @@ pub async fn prepare_task(
     };
 
     // Increment attempts counter
-    sidecar::set(task_id, &[format!("attempts={next_attempt}")])?;
+    crate::engine::cleanup::store_set(
+        store,
+        repo,
+        task_id,
+        &[("attempts", serde_json::json!(next_attempt))],
+    )
+    .await;
 
     Ok(TaskInitResult {
         agent_name,

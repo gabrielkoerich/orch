@@ -4,8 +4,7 @@
 //! parse result: error classification, model failover, free-model fallback,
 //! and agent rerouting.
 
-use crate::db::Db;
-use crate::sidecar;
+use crate::store::TaskStore;
 use std::sync::Arc;
 
 use super::{agents, response};
@@ -18,11 +17,12 @@ pub enum ErrorHandleResult {
     Continue { status: String },
 }
 
-/// Handle an agent error: classify it, attempt recovery strategies, and update sidecar.
+/// Handle an agent error: classify it, attempt recovery strategies, and update store.
 ///
 /// Returns `Ok(ErrorHandleResult::EarlyReturn)` when the task was rerouted and
 /// `run()` should record metrics and return immediately (skipping tmux cleanup).
 /// Returns `Ok(ErrorHandleResult::Continue)` when `run()` should proceed to cleanup.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_error(
     task_id: &str,
     agent_err: &agents::AgentError,
@@ -30,7 +30,8 @@ pub async fn handle_error(
     agent_runner: &dyn agents::AgentRunner,
     model_name: Option<&str>,
     new_attempts: u32,
-    db: Option<&Arc<Db>>,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
 ) -> anyhow::Result<ErrorHandleResult> {
     tracing::warn!(
         task_id,
@@ -71,14 +72,17 @@ pub async fn handle_error(
             });
             if let Some(next) = next_model {
                 tracing::info!(task_id, model = %next, "retrying with different model");
-                sidecar::set(
+                let msg = format!("model {model} unavailable, trying {next}");
+                crate::engine::cleanup::store_set(
+                    store,
+                    repo,
                     task_id,
                     &[
-                        format!("model={next}"),
-                        format!("last_error=model {model} unavailable, trying {next}"),
-                        "error_type=failed".to_string(),
+                        ("model", serde_json::json!(next.to_string())),
+                        ("last_error", serde_json::json!(msg)),
                     ],
-                )?;
+                )
+                .await;
                 // Skip normal failover — we're retrying same agent with different model
                 return Ok(ErrorHandleResult::EarlyReturn {
                     status: "new".to_string(),
@@ -98,13 +102,14 @@ pub async fn handle_error(
         }
         agents::AgentError::WaitingForInput { message } => {
             // Requires human — skip failover, go straight to needs_review
-            sidecar::set(
+            let msg = format!("waiting for input: {message}");
+            crate::engine::cleanup::store_set(
+                store,
+                repo,
                 task_id,
-                &[
-                    format!("last_error=waiting for input: {message}"),
-                    "error_type=failed".to_string(),
-                ],
-            )?;
+                &[("last_error", serde_json::json!(msg))],
+            )
+            .await;
             return Ok(ErrorHandleResult::EarlyReturn {
                 status: "needs_review".to_string(),
             });
@@ -127,20 +132,22 @@ pub async fn handle_error(
         ),
     };
 
-    // Record rate limit in DB for rate-limit and auth errors
-    if let Some(db) = db {
+    // Record rate limit in store (sqlx)
+    {
         let error_type_str = match retryable {
             response::RetryableError::UsageLimit => "rate",
             response::RetryableError::AuthError => "budget",
             _ => "error",
         };
-        let _ = db
-            .record_rate_limit(agent_name, error_type_str, Some(task_id))
-            .await;
+        if let Some(ref s) = store {
+            let _ = s
+                .record_rate_limit(agent_name, error_type_str, Some(task_id))
+                .await;
+        }
     }
 
     // Try free models as last resort before giving up
-    let chain = response::get_reroute_chain(task_id);
+    let chain = response::get_reroute_chain(task_id, store, repo).await;
     let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
         .iter()
         .filter(|a| crate::cmd_cache::command_exists(a))
@@ -162,8 +169,14 @@ pub async fn handle_error(
         // All agents exhausted — try free models via opencode
         let free = agent_runner.free_models();
         if !free.is_empty() {
-            let tried_models: String =
-                sidecar::get(task_id, "model_reroute_chain").unwrap_or_default();
+            let tried_models: String = crate::engine::cleanup::opt_store_get_field(
+                store,
+                repo,
+                task_id,
+                "model_reroute_chain",
+            )
+            .await
+            .unwrap_or_default();
             let tried_set: std::collections::HashSet<&str> =
                 tried_models.split(',').filter(|s| !s.is_empty()).collect();
 
@@ -174,16 +187,19 @@ pub async fn handle_error(
                 } else {
                     format!("{tried_models},{free_model}")
                 };
-                sidecar::set(
+                let msg = format!("all agents exhausted, trying free model {free_model}");
+                crate::engine::cleanup::store_set(
+                    store,
+                    repo,
                     task_id,
                     &[
-                        "agent=opencode".to_string(),
-                        format!("model={free_model}"),
-                        format!("model_reroute_chain={new_tried}"),
-                        format!("last_error=all agents exhausted, trying free model {free_model}"),
-                        format!("error_type={}", retryable.type_str()),
+                        ("agent", serde_json::json!("opencode")),
+                        ("model", serde_json::json!(free_model.to_string())),
+                        ("model_reroute_chain", serde_json::json!(new_tried)),
+                        ("last_error", serde_json::json!(msg)),
                     ],
-                )?;
+                )
+                .await;
                 return Ok(ErrorHandleResult::EarlyReturn {
                     status: "new".to_string(),
                 });
@@ -191,13 +207,23 @@ pub async fn handle_error(
         }
     }
 
-    let status = response::handle_failover(task_id, agent_name, retryable, &error_msg);
+    let status =
+        response::handle_failover(task_id, agent_name, retryable, &error_msg, store, repo).await;
     if status == "needs_review" {
         tracing::warn!(task_id, "failover exhausted, task marked needs_review");
     }
 
     // Store failure memory for retry learning
-    response::store_failure_memory(task_id, new_attempts, agent_name, model_name, &error_msg);
+    response::store_failure_memory(
+        task_id,
+        new_attempts,
+        agent_name,
+        model_name,
+        &error_msg,
+        store,
+        repo,
+    )
+    .await;
 
     Ok(ErrorHandleResult::Continue { status })
 }

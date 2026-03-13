@@ -6,11 +6,243 @@
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cmd::CommandErrorContext;
-use crate::db::TaskStatus;
 use crate::engine::tasks::TaskManager;
-use crate::sidecar;
+use crate::store::TaskStatus;
+use crate::store::TaskStore;
 use std::sync::Arc;
 use tokio::process::Command;
+
+/// Try to read a task field from the store.
+///
+/// Convenience wrapper that handles `Option<Arc<TaskStore>>`:
+/// if store is `None`, returns `None`.
+pub(crate) async fn opt_store_get_field(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    field: &str,
+) -> Option<String> {
+    if let Some(ref s) = store {
+        store_get_field(s, repo, task_id, field).await
+    } else {
+        None
+    }
+}
+
+/// Try to read a task field from the store.
+///
+/// Supports common fields: worktree, branch, summary, agent, model, last_error,
+/// worktree_cleaned, last_review_ts, last_comment_review_ts, review_cycles,
+/// merge_conflict_retries, ci_merge_failures, pr_create_failures, attempts,
+/// pr_number, route_reason, complexity.
+pub(crate) async fn store_get_field(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    field: &str,
+) -> Option<String> {
+    // Try store first
+    if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+        if let Ok(task) = store.get(store_id).await {
+            let val: Option<String> = match field {
+                "worktree" if !task.worktree.is_empty() => Some(task.worktree.clone()),
+                "branch" if !task.branch.is_empty() => Some(task.branch.clone()),
+                "summary" if !task.summary.is_empty() => Some(task.summary.clone()),
+                "agent" => task.agent.clone(),
+                "model" => task.model.clone(),
+                "last_error" if !task.last_error.is_empty() => Some(task.last_error.clone()),
+                "worktree_cleaned" => Some(task.worktree_cleaned.to_string()),
+                "last_review_ts" if !task.last_review_ts.is_empty() => {
+                    Some(task.last_review_ts.clone())
+                }
+                "last_comment_review_ts" if !task.last_comment_review_ts.is_empty() => {
+                    Some(task.last_comment_review_ts.clone())
+                }
+                "review_cycles" if task.review_cycles > 0 => Some(task.review_cycles.to_string()),
+                "merge_conflict_retries" if task.merge_conflict_retries > 0 => {
+                    Some(task.merge_conflict_retries.to_string())
+                }
+                "ci_merge_failures" if task.ci_merge_failures > 0 => {
+                    Some(task.ci_merge_failures.to_string())
+                }
+                "pr_create_failures" if task.pr_create_failures > 0 => {
+                    Some(task.pr_create_failures.to_string())
+                }
+                "review_agent_failures" if task.review_agent_failures > 0 => {
+                    Some(task.review_agent_failures.to_string())
+                }
+                "attempts" if task.attempts > 0 => Some(task.attempts.to_string()),
+                "pr_number" => task.pr_number.map(|n| n.to_string()),
+                "route_reason" if !task.route_reason.is_empty() => Some(task.route_reason.clone()),
+                "complexity" if !task.complexity.is_empty() => Some(task.complexity.clone()),
+                "budget_warning" if !task.budget_warning.is_empty() => {
+                    Some(task.budget_warning.clone())
+                }
+                "budget_exceeded" if task.budget_exceeded => Some("true".to_string()),
+                "title" if !task.title.is_empty() => Some(task.title.clone()),
+                "body" if !task.body.is_empty() => Some(task.body.clone()),
+                "parent_id" => task.parent_id.map(|id| id.to_string()),
+                "pr_review_context" if !task.pr_review_context.is_empty() => {
+                    Some(task.pr_review_context.clone())
+                }
+                "limit_reroute_chain" if !task.limit_reroute_chain.is_empty() => {
+                    Some(task.limit_reroute_chain.clone())
+                }
+                "model_reroute_chain" if !task.model_reroute_chain.is_empty() => {
+                    Some(task.model_reroute_chain.clone())
+                }
+                "input_tokens" if task.input_tokens > 0 => Some(task.input_tokens.to_string()),
+                "output_tokens" if task.output_tokens > 0 => Some(task.output_tokens.to_string()),
+                "input_cost_usd" if task.input_cost_usd > 0.0 => {
+                    Some(task.input_cost_usd.to_string())
+                }
+                "output_cost_usd" if task.output_cost_usd > 0.0 => {
+                    Some(task.output_cost_usd.to_string())
+                }
+                "total_cost_usd" if task.total_cost_usd > 0.0 => {
+                    Some(task.total_cost_usd.to_string())
+                }
+                "route_attempts" if task.route_attempts > 0 => {
+                    Some(task.route_attempts.to_string())
+                }
+                "agent_profile" if !task.agent_profile.is_empty() => {
+                    Some(task.agent_profile.clone())
+                }
+                "selected_skills" if !task.selected_skills.is_empty() => {
+                    Some(task.selected_skills.clone())
+                }
+                "delegations" => {
+                    let json = serde_json::to_string(&task.delegations).unwrap_or_default();
+                    if json != "[]" && !json.is_empty() {
+                        Some(json)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            return val;
+        }
+    }
+    None
+}
+
+/// Write fields to the task store.
+///
+/// `store` may be None if the store isn't initialized yet.
+pub(crate) async fn store_set(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    store_fields: &[(&str, serde_json::Value)],
+) {
+    if let Some(ref store) = store {
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            if let Err(e) = store.set_fields(store_id, store_fields).await {
+                tracing::warn!(task_id, error = %e, "store set_fields failed");
+            }
+        }
+    }
+}
+
+/// Increment a counter in the task store.
+///
+/// Uses `store.increment()` for an atomic SQL `field + 1`.
+/// Returns the new value, or 0 if the store is unavailable.
+pub(crate) async fn store_increment(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    field: &str,
+) -> u64 {
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
+            if let Ok(new_val) = s.increment(store_id, field).await {
+                return new_val as u64;
+            }
+        }
+    }
+    0
+}
+
+/// Reset all task counters in the task store.
+pub(crate) async fn store_reset_counters(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) {
+    if let Some(ref store) = store {
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            let _ = store.reset_counters(store_id).await;
+        }
+    }
+}
+
+/// Get token usage from the store.
+pub(crate) async fn get_token_usage(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> crate::store::TokenUsage {
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
+            if let Ok(task) = s.get(store_id).await {
+                return crate::store::TokenUsage {
+                    input_tokens: task.input_tokens as u64,
+                    output_tokens: task.output_tokens as u64,
+                };
+            }
+        }
+    }
+    crate::store::TokenUsage::default()
+}
+
+/// Get cost estimate from the store.
+pub(crate) async fn get_cost_estimate(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> crate::store::CostEstimate {
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
+            if let Ok(task) = s.get(store_id).await {
+                return crate::store::CostEstimate {
+                    input_cost_usd: task.input_cost_usd,
+                    output_cost_usd: task.output_cost_usd,
+                    total_cost_usd: task.total_cost_usd,
+                };
+            }
+        }
+    }
+    crate::store::CostEstimate::default()
+}
+
+/// Get total tokens from the store.
+pub(crate) async fn get_total_tokens(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> u64 {
+    let usage = get_token_usage(store, repo, task_id).await;
+    usage.total_tokens()
+}
+
+/// Get recent memory from the store.
+pub(crate) async fn get_recent_memory(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    max_entries: usize,
+) -> Vec<crate::store::MemoryEntry> {
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
+            if let Ok(memory) = s.recent_memory(store_id, max_entries).await {
+                return memory;
+            }
+        }
+    }
+    vec![]
+}
 
 /// Options controlling the worktree janitor.
 #[derive(Debug, Clone)]
@@ -68,9 +300,10 @@ pub(crate) async fn cleanup_done_worktrees(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     let opts = JanitorOptions::from_config();
-    cleanup_done_worktrees_with_opts(backend, repo, task_manager, &opts).await
+    cleanup_done_worktrees_with_opts(backend, repo, task_manager, store, &opts).await
 }
 
 /// Cleanup worktrees for completed tasks with explicit options.
@@ -82,9 +315,23 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<()> {
-    let done_tasks = backend.list_by_status(Status::Done).await?;
+    // Read done tasks from the store first; fall back to backend before first sync.
+    let done_tasks = {
+        if store.has_tasks(repo).await {
+            store
+                .list_by_status(repo, crate::store::TaskStatus::Done)
+                .await?
+                .iter()
+                .filter(|t| t.origin != "internal")
+                .map(crate::engine::tasks::store_task_to_external)
+                .collect()
+        } else {
+            backend.list_by_status(Status::Done).await?
+        }
+    };
     tracing::debug!(count = done_tasks.len(), "checking done tasks for cleanup");
 
     // Collect task IDs from external done tasks.
@@ -94,6 +341,8 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     // When a PR merge auto-closes a GitHub issue (via "Fixes #N"), the issue
     // state becomes "closed" but orch never updates the status label to "done".
     // These orphaned worktrees accumulate unless we catch them here.
+    // Note: This still queries the backend because GitHub `state` (open/closed)
+    // is backend-specific and not tracked in the store.
     match backend.list_all_tasks().await {
         Ok(all_tasks) => {
             let done_set: std::collections::HashSet<String> = task_ids.iter().cloned().collect();
@@ -108,7 +357,10 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
                     "closed issue with stale status label — reconciling to done and cleaning up"
                 );
                 // Reconcile: update the status label so other flows stay consistent.
-                if let Err(e) = backend.update_status(&task.id, Status::Done).await {
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::Done)
+                    .await
+                {
                     tracing::warn!(
                         task_id = task.id.0,
                         err = %e,
@@ -124,23 +376,16 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     }
 
     // Also include internal done tasks.
-    if let Ok(internal_done) = task_manager
-        .db_list_internal_by_status(TaskStatus::Done)
-        .await
-    {
-        for t in internal_done {
-            task_ids.push(format!("internal:{}", t.id));
-        }
+    if let Ok(internal_done) = task_manager.list_internal_by_status(TaskStatus::Done).await {
+        task_ids.extend(internal_done.iter().map(|t| t.id.0.clone()));
     }
 
     // Also include internal blocked tasks (terminal state, worktree is useless).
     if let Ok(internal_blocked) = task_manager
-        .db_list_internal_by_status(TaskStatus::Blocked)
+        .list_internal_by_status(TaskStatus::Blocked)
         .await
     {
-        for t in internal_blocked {
-            task_ids.push(format!("internal:{}", t.id));
-        }
+        task_ids.extend(internal_blocked.iter().map(|t| t.id.0.clone()));
     }
 
     tracing::debug!(
@@ -150,12 +395,12 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 
     for task_id in &task_ids {
         // Skip if already cleaned
-        let worktree_cleaned = sidecar::get(task_id, "worktree_cleaned").ok();
+        let worktree_cleaned = store_get_field(store, repo, task_id, "worktree_cleaned").await;
         if worktree_cleaned.as_deref() == Some("true") || worktree_cleaned.as_deref() == Some("1") {
             continue;
         }
 
-        if let Err(e) = cleanup_task_worktree_with_opts(task_id, repo, opts).await {
+        if let Err(e) = cleanup_task_worktree_with_opts(task_id, repo, store, opts).await {
             tracing::warn!(task_id, err = %e, "worktree cleanup failed for task");
         }
     }
@@ -166,28 +411,33 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 /// Cleanup a single task's worktree and branches.
 ///
 /// Removes the git worktree, deletes local + remote branches,
-/// pulls main to stay up-to-date, and marks sidecar as cleaned.
+/// pulls main to stay up-to-date, and marks the task as cleaned.
 ///
 /// This function is used for inline post-merge cleanup (called from
 /// auto-merge flows) and must attempt immediate removal — it constructs
 /// janitor options with `ttl_hours = 0` so the janitor age guard does not
 /// postpone removing freshly-created worktrees.
-pub(crate) async fn cleanup_task_worktree(task_id: &str, repo: &str) -> anyhow::Result<()> {
+pub(crate) async fn cleanup_task_worktree(
+    task_id: &str,
+    repo: &str,
+    store: &Arc<TaskStore>,
+) -> anyhow::Result<()> {
     let opts = JanitorOptions {
         ttl_hours: 0,
         ..Default::default()
     };
-    cleanup_task_worktree_with_opts(task_id, repo, &opts).await
+    cleanup_task_worktree_with_opts(task_id, repo, store, &opts).await
 }
 
 /// Cleanup a single task's worktree and branches with explicit janitor options.
 pub(crate) async fn cleanup_task_worktree_with_opts(
     task_id: &str,
     repo: &str,
+    store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<()> {
-    let worktree = sidecar::get(task_id, "worktree").ok();
-    let branch = sidecar::get(task_id, "branch").ok();
+    let worktree = store_get_field(store, repo, task_id, "worktree").await;
+    let branch = store_get_field(store, repo, task_id, "branch").await;
 
     let worktree_path = worktree.as_ref().map(std::path::PathBuf::from);
 
@@ -198,7 +448,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     // Determine which directory to remove.
     //
     // Priority:
-    //   1. sidecar "worktree" path, if it exists on disk.
+    //   1. stored "worktree" path, if it exists on disk.
     //   2. Construct from worktrees_base + project name + branch, if it exists.
     let worktree_to_remove = if let Some(ref wt) = worktree_path {
         if wt.exists() {
@@ -222,7 +472,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             }
         }
     } else if let Some(ref b) = branch {
-        // No worktree path in sidecar at all — try branch-based path.
+        // No worktree path in store — try branch-based path.
         let project = repo
             .rsplit('/')
             .next()
@@ -297,9 +547,9 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             }
         }
 
-        // Mark as cleaned in sidecar
-        if let Err(e) = sidecar::set(task_id, &["worktree_cleaned=true".to_string()]) {
-            tracing::warn!(task_id, err = %e, "failed to mark worktree_cleaned");
+        // Mark as cleaned in store
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            let _ = store.mark_cleaned(store_id).await;
         }
     }
 
@@ -474,9 +724,35 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
 ///
 /// Queries status:in_review and status:needs_review tasks, checks if their PR
 /// is merged, and updates status to done if merged.
-pub(crate) async fn check_merged_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<()> {
-    let in_review_tasks = backend.list_by_status(Status::InReview).await?;
-    let needs_review_tasks = backend.list_by_status(Status::NeedsReview).await?;
+pub(crate) async fn check_merged_prs(
+    backend: &Arc<dyn ExternalBackend>,
+    repo: &str,
+    store: &Arc<TaskStore>,
+    task_manager: &Arc<TaskManager>,
+) -> anyhow::Result<()> {
+    // Read from the store first; fall back to backend if the store has no data.
+    let in_review_tasks = if store.has_tasks(repo).await {
+        store
+            .list_by_status(repo, crate::store::TaskStatus::InReview)
+            .await?
+            .iter()
+            .filter(|t| t.origin != "internal")
+            .map(crate::engine::tasks::store_task_to_external)
+            .collect()
+    } else {
+        backend.list_by_status(Status::InReview).await?
+    };
+    let needs_review_tasks = if store.has_tasks(repo).await {
+        store
+            .list_by_status(repo, crate::store::TaskStatus::NeedsReview)
+            .await?
+            .iter()
+            .filter(|t| t.origin != "internal")
+            .map(crate::engine::tasks::store_task_to_external)
+            .collect()
+    } else {
+        backend.list_by_status(Status::NeedsReview).await?
+    };
     let all_review_tasks: Vec<_> = in_review_tasks
         .into_iter()
         .chain(needs_review_tasks)
@@ -489,9 +765,9 @@ pub(crate) async fn check_merged_prs(backend: &Arc<dyn ExternalBackend>) -> anyh
     for task in all_review_tasks {
         let task_id = &task.id.0;
 
-        // Get branch from sidecar
-        let branch = match sidecar::get(task_id, "branch") {
-            Ok(b) if !b.is_empty() => b,
+        // Get branch from store
+        let branch = match store_get_field(store, repo, task_id, "branch").await {
+            Some(b) if !b.is_empty() => b,
             _ => {
                 tracing::debug!(task_id, "no branch info, skipping PR check");
                 continue;
@@ -505,7 +781,7 @@ pub(crate) async fn check_merged_prs(backend: &Arc<dyn ExternalBackend>) -> anyh
 
                 // Update status to done
                 let id = ExternalId(task_id.clone());
-                if let Err(e) = backend.update_status(&id, Status::Done).await {
+                if let Err(e) = task_manager.update_task_status(&id, Status::Done).await {
                     tracing::warn!(task_id, err = %e, "failed to update status to done");
                     continue;
                 }
@@ -735,7 +1011,7 @@ mod tests {
 
     #[test]
     fn fallback_branch_path_construction() {
-        // Verify the new fallback logic: when worktree sidecar is absent but
+        // Verify the new fallback logic: when worktree path is absent but
         // branch is known, we should construct the path correctly.
         let tmp = tempfile::tempdir().unwrap();
         let wt_dir = tmp.path().join("myrepo").join("gh-task-7-fix");
@@ -758,5 +1034,614 @@ mod tests {
             candidate.exists(),
             "fallback path should point to existing dir"
         );
+    }
+
+    // ── store_get_field ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_get_field_reads_from_store() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("42".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Test task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .set_fields(id, &[("branch", serde_json::json!("gh-42-fix"))])
+            .await
+            .unwrap();
+        store
+            .set_fields(id, &[("worktree", serde_json::json!("/tmp/wt42"))])
+            .await
+            .unwrap();
+
+        // Should read from store
+        let branch = store_get_field(&store, "owner/repo", "42", "branch").await;
+        assert_eq!(branch.as_deref(), Some("gh-42-fix"));
+
+        let wt = store_get_field(&store, "owner/repo", "42", "worktree").await;
+        assert_eq!(wt.as_deref(), Some("/tmp/wt42"));
+    }
+
+    #[tokio::test]
+    async fn store_get_field_falls_back_for_unknown_task() {
+        use crate::store::TaskStore;
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Task doesn't exist in store — should return None
+        let result = store_get_field(&store, "owner/repo", "unknown-999", "branch").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_get_field_counter_fields() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("55".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Counter test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Zero counters should return None
+        let retries = store_get_field(&store, "owner/repo", "55", "merge_conflict_retries").await;
+        assert!(retries.is_none());
+
+        // Set counter
+        store.increment(id, "merge_conflict_retries").await.unwrap();
+        let retries = store_get_field(&store, "owner/repo", "55", "merge_conflict_retries").await;
+        assert_eq!(retries.as_deref(), Some("1"));
+
+        // Agent (Option field)
+        store
+            .set_fields(id, &[("agent", serde_json::json!("claude"))])
+            .await
+            .unwrap();
+        let agent = store_get_field(&store, "owner/repo", "55", "agent").await;
+        assert_eq!(agent.as_deref(), Some("claude"));
+    }
+
+    // ── opt_store_get_field with None store ────────────────────────────
+
+    #[tokio::test]
+    async fn opt_store_get_field_with_none_store() {
+        // When store is None, should return None without panicking
+        let store: Option<Arc<TaskStore>> = None;
+        let result = opt_store_get_field(&store, "owner/repo", "nonexistent-999", "branch").await;
+        // Should not panic; value is None because task doesn't exist
+        assert!(result.is_none());
+    }
+
+    // ── get_token_usage from store ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_token_usage_from_store() {
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("70".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Token test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Set token fields
+        store
+            .set_fields(
+                id,
+                &[
+                    ("input_tokens", serde_json::json!(1500)),
+                    ("output_tokens", serde_json::json!(800)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let opt_store = Some(store);
+        let usage = get_token_usage(&opt_store, "owner/repo", "70").await;
+        assert_eq!(usage.input_tokens, 1500);
+        assert_eq!(usage.output_tokens, 800);
+        assert_eq!(usage.total_tokens(), 2300);
+    }
+
+    // ── get_cost_estimate from store ────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_cost_estimate_from_store() {
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("71".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Cost test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .set_fields(
+                id,
+                &[
+                    ("input_cost_usd", serde_json::json!(0.05)),
+                    ("output_cost_usd", serde_json::json!(0.10)),
+                    ("total_cost_usd", serde_json::json!(0.15)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let opt_store = Some(store);
+        let cost = get_cost_estimate(&opt_store, "owner/repo", "71").await;
+        assert!((cost.input_cost_usd - 0.05).abs() < f64::EPSILON);
+        assert!((cost.output_cost_usd - 0.10).abs() < f64::EPSILON);
+        assert!((cost.total_cost_usd - 0.15).abs() < f64::EPSILON);
+    }
+
+    // ── get_recent_memory from store ────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_recent_memory_from_store() {
+        use crate::store::MemoryEntry;
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("72".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Memory test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let entry1 = MemoryEntry {
+            attempt: 1,
+            agent: "claude".to_string(),
+            model: Some("opus".to_string()),
+            learnings: vec!["learned A".to_string()],
+            error: None,
+            files_modified: vec!["src/main.rs".to_string()],
+            approach: "first try".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let entry2 = MemoryEntry {
+            attempt: 2,
+            agent: "codex".to_string(),
+            model: Some("gpt-5".to_string()),
+            learnings: vec!["learned B".to_string()],
+            error: Some("timeout".to_string()),
+            files_modified: vec![],
+            approach: "second try".to_string(),
+            timestamp: "2026-01-01T01:00:00Z".to_string(),
+        };
+
+        store.append_memory(id, &entry1).await.unwrap();
+        store.append_memory(id, &entry2).await.unwrap();
+
+        let opt_store = Some(store);
+        let memory = get_recent_memory(&opt_store, "owner/repo", "72", 10).await;
+        assert_eq!(memory.len(), 2);
+        assert_eq!(memory[0].attempt, 1);
+        assert_eq!(memory[1].attempt, 2);
+        assert_eq!(memory[0].agent, "claude");
+        assert_eq!(memory[1].agent, "codex");
+    }
+
+    // ── increment returns new value ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn increment_returns_new_value() {
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("73".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Increment test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let opt_store = Some(store);
+        let v1 = store_increment(&opt_store, "owner/repo", "73", "attempts").await;
+        assert_eq!(v1, 1);
+
+        let v2 = store_increment(&opt_store, "owner/repo", "73", "attempts").await;
+        assert_eq!(v2, 2);
+
+        let v3 = store_increment(&opt_store, "owner/repo", "73", "attempts").await;
+        assert_eq!(v3, 3);
+
+        // Verify store has the correct value
+        let task = opt_store.as_ref().unwrap().get(id).await.unwrap();
+        assert_eq!(task.attempts, 3);
+    }
+
+    // ── increment without store returns zero ──────────────────────────
+
+    #[tokio::test]
+    async fn increment_without_store_returns_zero() {
+        let store: Option<Arc<TaskStore>> = None;
+        let v = store_increment(&store, "owner/repo", "no-store-task", "attempts").await;
+        // No store available — returns 0
+        assert_eq!(v, 0);
+    }
+
+    // ── store_get_field: route_attempts and agent_profile ─────────────────
+
+    #[tokio::test]
+    async fn store_get_field_reads_route_attempts() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("80".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Route attempts test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .set_fields(id, &[("route_attempts", serde_json::json!(3))])
+            .await
+            .unwrap();
+
+        let val = store_get_field(&store, "owner/repo", "80", "route_attempts").await;
+        assert_eq!(val.as_deref(), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn store_get_field_reads_agent_profile() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("81".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Agent profile test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .set_fields(
+                id,
+                &[
+                    (
+                        "agent_profile",
+                        serde_json::json!(r#"{"role":"backend specialist"}"#),
+                    ),
+                    ("selected_skills", serde_json::json!("git,rust,gh")),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let profile = store_get_field(&store, "owner/repo", "81", "agent_profile").await;
+        assert_eq!(profile.as_deref(), Some(r#"{"role":"backend specialist"}"#));
+
+        let skills = store_get_field(&store, "owner/repo", "81", "selected_skills").await;
+        assert_eq!(skills.as_deref(), Some("git,rust,gh"));
+    }
+
+    // ── store_set with None store ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_set_with_none_store() {
+        // When store is None, store_set should not panic and return normally.
+        let store: Option<Arc<TaskStore>> = None;
+        // Should complete without panicking
+        store_set(
+            &store,
+            "owner/repo",
+            "42",
+            &[("branch", serde_json::json!("main"))],
+        )
+        .await;
+    }
+
+    // ── store_set with valid store ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_set_writes_fields() {
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("90".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Store set test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let opt_store = Some(store.clone());
+        store_set(
+            &opt_store,
+            "owner/repo",
+            "90",
+            &[
+                ("branch", serde_json::json!("fix-bug")),
+                ("worktree", serde_json::json!("/tmp/wt")),
+            ],
+        )
+        .await;
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.branch, "fix-bug");
+        assert_eq!(task.worktree, "/tmp/wt");
+    }
+
+    #[tokio::test]
+    async fn store_set_ignores_unknown_task() {
+        use crate::store::TaskStore;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let opt_store = Some(store);
+        // Should not panic for a task that doesn't exist
+        store_set(
+            &opt_store,
+            "owner/repo",
+            "nonexistent-999",
+            &[("branch", serde_json::json!("main"))],
+        )
+        .await;
+    }
+
+    // ── store_reset_counters ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_reset_counters_zeroes_counters() {
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("91".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Reset test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Increment some counters
+        let opt_store = Some(store.clone());
+        store_increment(&opt_store, "owner/repo", "91", "attempts").await;
+        store_increment(&opt_store, "owner/repo", "91", "attempts").await;
+        store_increment(&opt_store, "owner/repo", "91", "merge_conflict_retries").await;
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.attempts, 2);
+        assert_eq!(task.merge_conflict_retries, 1);
+
+        // Reset
+        store_reset_counters(&opt_store, "owner/repo", "91").await;
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.attempts, 0);
+        assert_eq!(task.merge_conflict_retries, 0);
+    }
+
+    #[tokio::test]
+    async fn store_reset_counters_noop_without_store() {
+        let store: Option<Arc<TaskStore>> = None;
+        // Should not panic
+        store_reset_counters(&store, "owner/repo", "no-task").await;
+    }
+
+    // ── get_total_tokens ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_total_tokens_sums_input_and_output() {
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        store
+            .create(&NewTask {
+                external_id: Some("92".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Tokens test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        store
+            .set_fields(
+                1,
+                &[
+                    ("input_tokens", serde_json::json!(5000)),
+                    ("output_tokens", serde_json::json!(3000)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let opt_store = Some(store);
+        let total = get_total_tokens(&opt_store, "owner/repo", "92").await;
+        assert_eq!(total, 8000);
+    }
+
+    #[tokio::test]
+    async fn get_total_tokens_returns_zero_without_store() {
+        let store: Option<Arc<TaskStore>> = None;
+        let total = get_total_tokens(&store, "owner/repo", "any").await;
+        assert_eq!(total, 0);
+    }
+
+    // ── store_get_field edge cases ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_get_field_returns_none_for_empty_string_fields() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        store
+            .create(&NewTask {
+                external_id: Some("93".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Empty fields test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Fields that are empty strings should return None (fallthrough)
+        let branch = store_get_field(&store, "owner/repo", "93", "branch").await;
+        assert!(branch.is_none(), "empty branch should return None");
+
+        let summary = store_get_field(&store, "owner/repo", "93", "summary").await;
+        assert!(summary.is_none(), "empty summary should return None");
+
+        let last_error = store_get_field(&store, "owner/repo", "93", "last_error").await;
+        assert!(last_error.is_none(), "empty last_error should return None");
+    }
+
+    #[tokio::test]
+    async fn store_get_field_returns_none_for_unknown_field() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        store
+            .create(&NewTask {
+                external_id: Some("94".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Unknown field test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let result = store_get_field(&store, "owner/repo", "94", "nonexistent_field").await;
+        assert!(result.is_none(), "unknown field should return None");
+    }
+
+    #[tokio::test]
+    async fn store_get_field_reads_pr_number() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("95".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "PR number test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // pr_number is None by default
+        let pr = store_get_field(&store, "owner/repo", "95", "pr_number").await;
+        assert!(pr.is_none(), "null pr_number should return None");
+
+        // Set pr_number
+        store
+            .set_fields(id, &[("pr_number", serde_json::json!(42))])
+            .await
+            .unwrap();
+
+        let pr = store_get_field(&store, "owner/repo", "95", "pr_number").await;
+        assert_eq!(pr.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn store_get_field_reads_delegations() {
+        use crate::store::{NewTask, TaskStore};
+        use std::sync::Arc;
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("96".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Delegations test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Empty delegations → None
+        let d = store_get_field(&store, "owner/repo", "96", "delegations").await;
+        assert!(d.is_none(), "empty delegations should return None");
+
+        // Set delegations
+        store
+            .set_fields(
+                id,
+                &[("delegations", serde_json::json!(r#"[{"task_id":"sub:1"}]"#))],
+            )
+            .await
+            .unwrap();
+
+        let d = store_get_field(&store, "owner/repo", "96", "delegations").await;
+        assert!(d.is_some(), "non-empty delegations should return Some");
+    }
+
+    // ── get_recent_memory edge cases ────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_recent_memory_returns_empty_without_store() {
+        let store: Option<Arc<TaskStore>> = None;
+        let memory = get_recent_memory(&store, "owner/repo", "any", 10).await;
+        assert!(memory.is_empty());
     }
 }

@@ -1,15 +1,43 @@
-use crate::backends::{ExternalId, Status};
+use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cli::init_task_manager;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
+use crate::engine::cleanup as store_helpers;
 use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
-use crate::engine::tasks::{parse_internal_id, CreateTaskRequest, Task, TaskFilter, TaskType};
+use crate::engine::tasks::{
+    parse_internal_id, status_to_task_status, CreateTaskRequest, Task, TaskFilter, TaskType,
+};
 use crate::home;
-use crate::sidecar;
+use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use std::sync::Arc;
+
+/// Store-first status update for CLI: updates SQLite first, then mirrors to backend.
+async fn update_status_store_first(
+    store: &Option<Arc<TaskStore>>,
+    backend: &Arc<dyn ExternalBackend>,
+    repo: &str,
+    id: &ExternalId,
+    status: Status,
+) -> anyhow::Result<()> {
+    let db_status = status_to_task_status(status);
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, &id.0).await {
+            s.update_status(store_id, db_status).await?;
+        }
+    }
+    if let Err(e) = backend.update_status(id, status).await {
+        tracing::warn!(
+            task_id = id.0,
+            ?status,
+            err = %e,
+            "failed to mirror status to backend — store is authoritative"
+        );
+    }
+    Ok(())
+}
 
 /// List tasks with optional filters.
 pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Result<()> {
@@ -21,6 +49,9 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
         println!("No tasks found.");
         return Ok(());
     }
+
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
 
     println!(
         "{:<15} {:<12} {:<20} {:<10} TITLE",
@@ -37,7 +68,9 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
                     .find(|l| l.starts_with("status:"))
                     .map(|s| s.replace("status:", ""))
                     .unwrap_or_else(|| "unknown".to_string());
-                let agent = sidecar::get(&ext.id.0, "agent").unwrap_or_default();
+                let agent = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "agent")
+                    .await
+                    .unwrap_or_default();
                 println!(
                     "{:<15} {:<12} {:<20} {:<10} {}",
                     ext.id.0, "external", status, agent, ext.title
@@ -45,7 +78,7 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
             }
             Task::Internal(int) => {
                 let agent = int.agent.as_deref().unwrap_or("-");
-                let title = if int.status == crate::db::TaskStatus::Blocked {
+                let title = if int.status == crate::store::TaskStatus::Blocked {
                     if let Some(ref reason) = int.block_reason {
                         format!("{} [blocked: {}]", int.title, reason)
                     } else {
@@ -112,6 +145,9 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
     let task_manager = init_task_manager().await?;
     let task = task_manager.get_task(id).await?;
 
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
+
     match task {
         Task::External(ext) => {
             println!("ID: {} (external)", ext.id.0);
@@ -123,11 +159,15 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             println!("Created: {}", ext.created_at);
             println!("Updated: {}", ext.updated_at);
 
-            // Show sidecar info if available
-            if let Ok(agent) = sidecar::get(&ext.id.0, "agent") {
+            // Show agent/branch info if available
+            if let Some(agent) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "agent").await
+            {
                 println!("Agent: {}", agent);
             }
-            if let Ok(branch) = sidecar::get(&ext.id.0, "branch") {
+            if let Some(branch) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "branch").await
+            {
                 println!("Branch: {}", branch);
             }
 
@@ -144,8 +184,8 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             if let Some(reason) = &int.block_reason {
                 println!("Block reason: {}", reason);
             }
-            println!("Created: {}", int.created_at.to_rfc3339());
-            println!("Updated: {}", int.updated_at.to_rfc3339());
+            println!("Created: {}", int.created_at);
+            println!("Updated: {}", int.updated_at);
             println!("\n{}", int.body);
         }
     }
@@ -155,7 +195,7 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
 
 /// Show task status summary.
 pub async fn status(json: bool) -> anyhow::Result<()> {
-    use crate::db::TaskStatus;
+    use crate::store::TaskStatus;
 
     let task_manager = init_task_manager().await?;
 
@@ -171,7 +211,7 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
 
     // Fetch all tasks from both backends
     let all_external = task_manager.list_all_external_tasks().await?;
-    let all_internal = task_manager.db.list_all_internal_tasks().await?;
+    let all_internal = task_manager.list_all_internal().await.unwrap_or_default();
 
     // Count external tasks per status via labels
     let ext_counts: Vec<usize> = statuses
@@ -203,20 +243,26 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         .collect();
 
     // Calculate total cost across all external tasks
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
     let mut total_cost: f64 = 0.0;
 
     for task in &all_external {
-        total_input_tokens += sidecar::get_u64(&task.id.0, "input_tokens");
-        total_output_tokens += sidecar::get_u64(&task.id.0, "output_tokens");
-        total_cost += sidecar::get_f64(&task.id.0, "total_cost_usd");
+        let usage = store_helpers::get_token_usage(&store, &repo, &task.id.0).await;
+        let cost = store_helpers::get_cost_estimate(&store, &repo, &task.id.0).await;
+        total_input_tokens += usage.input_tokens;
+        total_output_tokens += usage.output_tokens;
+        total_cost += cost.total_cost_usd;
     }
     for task in &all_internal {
         let id = format!("internal:{}", task.id);
-        total_input_tokens += sidecar::get_u64(&id, "input_tokens");
-        total_output_tokens += sidecar::get_u64(&id, "output_tokens");
-        total_cost += sidecar::get_f64(&id, "total_cost_usd");
+        let usage = store_helpers::get_token_usage(&store, &repo, &id).await;
+        let cost = store_helpers::get_cost_estimate(&store, &repo, &id).await;
+        total_input_tokens += usage.input_tokens;
+        total_output_tokens += usage.output_tokens;
+        total_cost += cost.total_cost_usd;
     }
 
     if json {
@@ -297,16 +343,19 @@ pub async fn route(id: i64) -> anyhow::Result<()> {
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let store: Arc<TaskStore> = Arc::new(crate::cli::init_store().await?);
 
     let ext_id = ExternalId(id.to_string());
     let task = backend.get_task(&ext_id).await?;
 
-    let router = Router::from_config();
-    let result = router.route(&task).await?;
+    let mut router = Router::from_config();
+    let result = router.route(&task, &store, &repo).await?;
 
-    // Store in sidecar
-    router.store_route_result(&ext_id.0, &result)?;
+    // Store route result
+    router
+        .store_route_result(&ext_id.0, &result, &store, &repo)
+        .await?;
 
     // Set labels
     let labels = vec![
@@ -314,7 +363,7 @@ pub async fn route(id: i64) -> anyhow::Result<()> {
         format!("complexity:{}", result.complexity),
     ];
     backend.set_labels(&ext_id, &labels).await?;
-    backend.update_status(&ext_id, Status::Routed).await?;
+    update_status_store_first(&Some(store), &backend, &repo, &ext_id, Status::Routed).await?;
 
     println!(
         "Routed task #{} → {} (complexity: {}, reason: {})",
@@ -333,6 +382,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let store: Arc<TaskStore> = Arc::new(crate::cli::init_store().await?);
 
     // Resolve task ID
     let task_id = match id {
@@ -354,7 +404,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
     };
 
     // Get routing info
-    let route_result = get_route_result(&task_id).ok();
+    let route_result = get_route_result(&store, &repo, &task_id).await.ok();
     let agent = route_result.as_ref().map(|r| r.agent.clone());
     let model = route_result.as_ref().and_then(|r| r.model.clone());
 
@@ -367,10 +417,17 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 
     // Mark in progress
     let ext_id = ExternalId(task_id.clone());
-    backend.update_status(&ext_id, Status::InProgress).await?;
+    update_status_store_first(
+        &Some(store.clone()),
+        &backend,
+        &repo,
+        &ext_id,
+        Status::InProgress,
+    )
+    .await?;
 
-    // Run via TaskRunner
-    let runner = TaskRunner::new(repo);
+    // Run via TaskRunner (with store for audit trail + token tracking)
+    let runner = TaskRunner::new(repo).with_store(store);
     runner
         .run(
             &task_id,
@@ -388,28 +445,32 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 pub async fn retry(id: i64) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
-    use crate::db::{Db, TaskStatus};
-    use crate::home;
+    use crate::store::TaskStatus;
 
-    // Check if this is an internal task in the DB first.
-    let db_path = home::db_path().context("could not resolve DB path")?;
-    let db = Db::open(&db_path)?;
-    if let Ok(task) = db.get_internal_task(id).await {
-        let internal_id = format!("internal:{}", task.id);
-        // Reset sidecar (attempts + all failure counters)
-        crate::sidecar::reset_task_counters(&internal_id);
-        // Reset DB status to New
-        db.update_internal_task_status(id, TaskStatus::New).await?;
-        println!(
-            "Task #{} reset to new (attempts reset, will be re-routed)",
-            id
-        );
-        return Ok(());
+    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
+
+    // Check if this is an internal task in the store.
+    if let Some(ref s) = store {
+        if let Ok(task) = s.get(id).await {
+            if task.origin == "internal" {
+                let internal_id = task
+                    .external_id
+                    .unwrap_or_else(|| format!("internal:{}", task.id));
+                // Reset store counters
+                crate::engine::cleanup::store_reset_counters(&store, &repo, &internal_id).await;
+                // Reset status to New
+                s.update_status(id, TaskStatus::New).await?;
+                println!(
+                    "Task #{} reset to new (attempts reset, will be re-routed)",
+                    id
+                );
+                return Ok(());
+            }
+        }
     }
 
-    let repo =
-        config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
 
     let ext_id = ExternalId(id.to_string());
 
@@ -421,11 +482,11 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
         }
     }
 
-    // Reset sidecar state (attempts + all failure counters) so the task starts fresh
-    crate::sidecar::reset_task_counters(&ext_id.0);
+    // Reset store state (attempts + all failure counters)
+    crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id.0).await;
 
     // Reset to new
-    backend.update_status(&ext_id, Status::New).await?;
+    update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
 
     println!(
         "Task #{} reset to new (attempts reset, will be re-routed)",
@@ -434,23 +495,25 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn reset_internal_sidecar(id: i64) {
+async fn reset_counters(
+    id: i64,
+    store: &Option<std::sync::Arc<crate::store::TaskStore>>,
+    repo: &str,
+) {
     let internal_id = format!("internal:{}", id);
-    crate::sidecar::reset_task_counters(&internal_id);
+    crate::engine::cleanup::store_reset_counters(store, repo, &internal_id).await;
 }
 
 /// Unblock a task or all blocked tasks.
 pub async fn unblock(id: &str) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
-    use crate::db::{Db, TaskStatus};
-    use crate::home;
+    use crate::store::TaskStatus;
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
-    let db_path = home::db_path().context("could not resolve DB path")?;
-    let db = Db::open(&db_path)?;
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
 
     if id == "all" {
         let blocked = backend.list_by_status(Status::Blocked).await?;
@@ -458,23 +521,30 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
         let mut external_count = 0;
         for task in blocked.iter().chain(needs_review.iter()) {
-            crate::sidecar::reset_task_counters(&task.id.0);
-            backend.update_status(&task.id, Status::New).await?;
+            crate::engine::cleanup::store_reset_counters(&store, &repo, &task.id.0).await;
+            update_status_store_first(&store, &backend, &repo, &task.id, Status::New).await?;
             external_count += 1;
         }
 
-        let internal_blocked = db
-            .list_internal_tasks_by_status(TaskStatus::Blocked)
-            .await?;
-        let internal_needs_review = db
-            .list_internal_tasks_by_status(TaskStatus::NeedsReview)
-            .await?;
         let mut internal_count = 0;
-        for task in internal_blocked.iter().chain(internal_needs_review.iter()) {
-            reset_internal_sidecar(task.id).await;
-            db.update_internal_task_status(task.id, TaskStatus::New)
-                .await?;
-            internal_count += 1;
+        if let Some(ref s) = store {
+            let internal_blocked = s
+                .list_internal_by_status(&repo, TaskStatus::Blocked)
+                .await
+                .unwrap_or_default();
+            let internal_needs_review = s
+                .list_internal_by_status(&repo, TaskStatus::NeedsReview)
+                .await
+                .unwrap_or_default();
+            for task in internal_blocked.iter().chain(internal_needs_review.iter()) {
+                let ext_id = task
+                    .external_id
+                    .clone()
+                    .unwrap_or_else(|| format!("internal:{}", task.id));
+                crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id).await;
+                s.update_status(task.id, TaskStatus::New).await?;
+                internal_count += 1;
+            }
         }
 
         let total = external_count + internal_count;
@@ -485,37 +555,41 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if let Some(stripped) = id.strip_prefix("internal:") {
-        let parsed = stripped
-            .parse::<i64>()
-            .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
-        db.get_internal_task(parsed).await?;
-        reset_internal_sidecar(parsed).await;
-        db.update_internal_task_status(parsed, TaskStatus::New)
-            .await?;
-        println!(
-            "Unblocked internal task #{} (attempts reset, will be re-routed)",
-            parsed
-        );
-        return Ok(());
-    }
+    // Try to resolve as a store task (internal or external)
+    if let Some(ref s) = store {
+        if let Some(stripped) = id.strip_prefix("internal:") {
+            let parsed = stripped
+                .parse::<i64>()
+                .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
+            if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
+                reset_counters(store_id, &store, &repo).await;
+                s.update_status(store_id, TaskStatus::New).await?;
+                println!(
+                    "Unblocked internal task #{} (attempts reset, will be re-routed)",
+                    parsed
+                );
+                return Ok(());
+            }
+        }
 
-    if let Ok(parsed) = id.parse::<i64>() {
-        if db.get_internal_task(parsed).await.is_ok() {
-            reset_internal_sidecar(parsed).await;
-            db.update_internal_task_status(parsed, TaskStatus::New)
-                .await?;
-            println!(
-                "Unblocked internal task #{} (attempts reset, will be re-routed)",
-                parsed
-            );
-            return Ok(());
+        if let Ok(parsed) = id.parse::<i64>() {
+            if let Ok(task) = s.get(parsed).await {
+                if task.origin == "internal" {
+                    reset_counters(parsed, &store, &repo).await;
+                    s.update_status(parsed, TaskStatus::New).await?;
+                    println!(
+                        "Unblocked internal task #{} (attempts reset, will be re-routed)",
+                        parsed
+                    );
+                    return Ok(());
+                }
+            }
         }
     }
 
     let ext_id = ExternalId(id.to_string());
-    crate::sidecar::reset_task_counters(&ext_id.0);
-    backend.update_status(&ext_id, Status::New).await?;
+    crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id.0).await;
+    update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
     println!("Unblocked task #{} (attempts reset)", id);
 
     Ok(())
@@ -546,12 +620,17 @@ pub async fn live() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
+
     println!("{:<30} {:<15} {:<10} ACTIVE", "SESSION", "TASK", "AGENT");
     println!("{}", "-".repeat(70));
 
     for session in &sessions {
         let active = tmux.is_session_active(&session.name).await;
-        let agent = sidecar::get(&session.task_id, "agent").unwrap_or_default();
+        let agent = store_helpers::opt_store_get_field(&store, &repo, &session.task_id, "agent")
+            .await
+            .unwrap_or_default();
         println!(
             "{:<30} {:<15} {:<10} {}",
             session.name,
@@ -583,9 +662,9 @@ pub async fn publish(id: i64, labels: Vec<String>) -> anyhow::Result<()> {
 }
 
 /// Show token cost breakdown for a task.
-pub fn cost(id: &str) -> anyhow::Result<()> {
+pub async fn cost(id: &str) -> anyhow::Result<()> {
     // Delegate to cli::cost::show_task for consistent formatting
-    super::cost::show_task(id)
+    super::cost::show_task(id).await
 }
 
 /// Show task tree view (parent-child relationships).
@@ -661,28 +740,32 @@ pub async fn tree(id: Option<i64>) -> anyhow::Result<()> {
 /// Show logs / post-mortem for a task (internal or external).
 pub async fn logs(id: &str) -> anyhow::Result<()> {
     let task_manager = init_task_manager().await?;
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
 
-    // Resolve sidecar key and print basic metadata where available.
-    let mut sidecar_key = id.to_string();
+    // Resolve task key for store lookups.
+    let mut task_key = id.to_string();
 
-    // If user passed `internal:N` or the task resolves to an internal task,
-    // prefer the internal sidecar key format `internal:{n}` so we read the
-    // correct file.
+    // If user passed `internal:N`, use `internal:{n}` format for store lookups.
     if let Some(n) = parse_internal_id(id) {
-        sidecar_key = format!("internal:{}", n);
-        // Fetch internal task metadata
-        if let Ok(internal) = task_manager.db.get_internal_task(n).await {
-            println!("ID: {} (internal)", internal.id);
-            println!("Title: {}", internal.title);
-            println!("Status: {}", internal.status.as_str());
-            if let Some(agent) = &internal.agent {
-                println!("Agent: {}", agent);
+        task_key = format!("internal:{}", n);
+        // Fetch internal task metadata from store
+        if let Some(ref s) = store {
+            if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
+                if let Ok(internal) = s.get(store_id).await {
+                    println!("ID: {} (internal)", internal.id);
+                    println!("Title: {}", internal.title);
+                    println!("Status: {}", internal.status.as_str());
+                    if let Some(agent) = &internal.agent {
+                        println!("Agent: {}", agent);
+                    }
+                    if let Some(reason) = &internal.block_reason {
+                        println!("Block reason: {}", reason);
+                    }
+                    println!("Created: {}", internal.created_at);
+                    println!("Updated: {}", internal.updated_at);
+                }
             }
-            if let Some(reason) = &internal.block_reason {
-                println!("Block reason: {}", reason);
-            }
-            println!("Created: {}", internal.created_at.to_rfc3339());
-            println!("Updated: {}", internal.updated_at.to_rfc3339());
         }
     } else if let Ok(num) = id.parse::<i64>() {
         // Numeric ID: try DB first (TaskManager::get_task will check both)
@@ -696,7 +779,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                 println!("URL: {}", ext.url);
                 println!("Created: {}", ext.created_at);
                 println!("Updated: {}", ext.updated_at);
-                sidecar_key = ext.id.0.clone();
+                task_key = ext.id.0.clone();
             }
             Ok(Task::Internal(int)) => {
                 println!("ID: {} (internal)", int.id);
@@ -705,9 +788,12 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                 if let Some(agent) = &int.agent {
                     println!("Agent: {}", agent);
                 }
-                println!("Created: {}", int.created_at.to_rfc3339());
-                println!("Updated: {}", int.updated_at.to_rfc3339());
-                sidecar_key = format!("internal:{}", int.id);
+                println!("Created: {}", int.created_at);
+                println!("Updated: {}", int.updated_at);
+                task_key = int
+                    .external_id
+                    .clone()
+                    .unwrap_or_else(|| format!("internal:{}", int.id));
             }
             Err(e) => {
                 // Could not resolve task metadata; continue and try sidecar only
@@ -720,90 +806,81 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
         println!("ID: {}", id);
     }
 
-    // Sidecar path and existence
-    match sidecar::sidecar_path(&sidecar_key) {
-        Ok(path) => {
-            if !path.exists() {
-                println!(
-                    "\nNo sidecar found for task {} — looked at: {}",
-                    sidecar_key,
-                    path.display()
-                );
-            } else {
-                println!("\nSidecar: {}", path.display());
+    // Task store fields
+    {
+        {
+            // Agent & model from store
+            if let Some(agent) =
+                store_helpers::opt_store_get_field(&store, &repo, &task_key, "agent").await
+            {
+                println!("Agent: {}", agent);
+            }
+            if let Some(model) =
+                store_helpers::opt_store_get_field(&store, &repo, &task_key, "model").await
+            {
+                println!("Model: {}", model);
+            }
 
-                // Agent & model
-                if let Ok(agent) = sidecar::get(&sidecar_key, "agent") {
-                    println!("Agent: {}", agent);
-                }
-                let model = sidecar::get_model(&sidecar_key);
-                if !model.is_empty() {
-                    println!("Model: {}", model);
-                }
+            // Attempts
+            if let Some(attempts) =
+                store_helpers::opt_store_get_field(&store, &repo, &task_key, "attempts").await
+            {
+                println!("Attempts: {}", attempts);
+            }
 
-                // Attempts
-                if let Ok(attempts) = sidecar::get(&sidecar_key, "attempts") {
-                    println!("Attempts: {}", attempts);
-                }
+            // Token & cost summary
+            let usage = store_helpers::get_token_usage(&store, &repo, &task_key).await;
+            let cost = store_helpers::get_cost_estimate(&store, &repo, &task_key).await;
+            let total_tokens = usage.total_tokens();
+            if total_tokens > 0 || cost.total_cost_usd > 0.0 {
+                println!("\nCost summary:");
+                println!("  input tokens:  {}", usage.input_tokens);
+                println!("  output tokens: {}", usage.output_tokens);
+                println!("  total tokens:  {}", total_tokens);
+                println!("  estimated $:   ${:.6}", cost.total_cost_usd);
+            }
 
-                // Token & cost summary
-                let usage = sidecar::get_token_usage(&sidecar_key);
-                let cost = sidecar::get_cost_estimate(&sidecar_key);
-                let total_tokens = usage.total_tokens();
-                if total_tokens > 0 || cost.total_cost_usd > 0.0 {
-                    println!("\nCost summary:");
-                    println!("  input tokens:  {}", usage.input_tokens);
-                    println!("  output tokens: {}", usage.output_tokens);
-                    println!("  total tokens:  {}", total_tokens);
-                    println!("  estimated $:   ${:.6}", cost.total_cost_usd);
-                }
-
-                // Memory (recent attempts)
-                if let Ok(mem) = sidecar::get_recent_memory(&sidecar_key, 10) {
-                    if !mem.is_empty() {
-                        println!("\nMemory (recent attempts):");
-                        for m in mem {
-                            println!(
-                                "- Attempt {} @ {}: agent={} model={}",
-                                m.attempt,
-                                m.timestamp,
-                                m.agent,
-                                m.model.clone().unwrap_or_default()
-                            );
-                            if let Some(err) = m.error.as_ref() {
-                                println!("    Error: {}", err);
+            // Memory (recent attempts)
+            {
+                let mem = store_helpers::get_recent_memory(&store, &repo, &task_key, 10).await;
+                if !mem.is_empty() {
+                    println!("\nMemory (recent attempts):");
+                    for m in mem {
+                        println!(
+                            "- Attempt {} @ {}: agent={} model={}",
+                            m.attempt,
+                            m.timestamp,
+                            m.agent,
+                            m.model.clone().unwrap_or_default()
+                        );
+                        if let Some(err) = m.error.as_ref() {
+                            println!("    Error: {}", err);
+                        }
+                        if !m.learnings.is_empty() {
+                            println!("    Learnings:");
+                            for l in &m.learnings {
+                                println!("      - {}", l);
                             }
-                            if !m.learnings.is_empty() {
-                                println!("    Learnings:");
-                                for l in &m.learnings {
-                                    println!("      - {}", l);
-                                }
-                            }
-                            if !m.files_modified.is_empty() {
-                                println!("    Files modified:");
-                                for f in &m.files_modified {
-                                    println!("      - {}", f);
-                                }
+                        }
+                        if !m.files_modified.is_empty() {
+                            println!("    Files modified:");
+                            for f in &m.files_modified {
+                                println!("      - {}", f);
                             }
                         }
                     }
                 }
             }
         }
-        Err(e) => {
-            println!(
-                "\nCould not resolve sidecar path for {}: {}",
-                sidecar_key, e
-            );
-        }
     }
 
     // Show agent output from last attempt if available
-    let repo = config::get_current_repo().unwrap_or_default();
-    if let Ok(attempts_str) = sidecar::get(&sidecar_key, "attempts") {
+    if let Some(attempts_str) =
+        store_helpers::opt_store_get_field(&store, &repo, &task_key, "attempts").await
+    {
         if let Ok(attempt_n) = attempts_str.parse::<u32>() {
             if attempt_n > 0 {
-                match home::task_attempt_dir(&repo, &sidecar_key, attempt_n) {
+                match home::task_attempt_dir(&repo, &task_key, attempt_n) {
                     Ok(attempt_dir) => {
                         let output_file = attempt_dir.join("output.json");
                         let exit_file = attempt_dir.join("exit.txt");
@@ -842,7 +919,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     }
 
     // Show review agent output if available
-    let review_task_id = format!("{}-review", sidecar_key);
+    let review_task_id = format!("{}-review", task_key);
     if let Ok(review_attempt_dir) = home::task_attempt_dir(&repo, &review_task_id, 1) {
         let review_output_file = review_attempt_dir.join("output.json");
         if review_output_file.exists() {
@@ -853,9 +930,45 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
         }
     }
 
+    // Show audit trail from task_runs table (if available in store)
+    if let Ok(store) = crate::cli::init_store().await {
+        if let Ok(Some(store_id)) = store.resolve_task_id(&repo, &task_key).await {
+            if let Ok(runs) = store.get_runs(store_id).await {
+                if !runs.is_empty() {
+                    println!("\n--- Run audit trail ({} runs) ---", runs.len());
+                    for run in &runs {
+                        println!(
+                            "\n  Run #{} [{}] agent={} model={} outcome={}",
+                            run.attempt, run.run_type, run.agent, run.model, run.outcome,
+                        );
+                        if let Some(code) = run.exit_code {
+                            println!("    exit_code: {}", code);
+                        }
+                        if !run.error.is_empty() {
+                            println!("    error: {}", run.error);
+                        }
+                        if run.total_cost_usd > 0.0 {
+                            println!(
+                                "    tokens: {}in/{}out  cost: ${:.6}  duration: {:.1}s",
+                                run.input_tokens,
+                                run.output_tokens,
+                                run.total_cost_usd,
+                                run.duration_secs,
+                            );
+                        }
+                        println!("    started: {}", run.started_at);
+                        if let Some(ref completed) = run.completed_at {
+                            println!("    completed: {}", completed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // If tmux session is live, append recent pane capture
     let tmux = TmuxManager::new();
-    let session = tmux.session_name(&repo, &sidecar_key);
+    let session = tmux.session_name(&repo, &task_key);
     if tmux.session_exists(&session).await {
         println!(
             "\nLive tmux session detected: {} — appending recent output:\n---",

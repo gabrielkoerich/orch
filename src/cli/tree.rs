@@ -39,10 +39,13 @@ impl TreeNode {
         }
     }
 
-    /// Create a tree node for an internal task (limited info).
-    pub fn from_internal(task: &crate::db::InternalTask) -> Self {
+    /// Create a tree node for an internal task (from store).
+    pub fn from_internal(task: &crate::store::Task) -> Self {
         Self {
-            id: task.id.to_string(),
+            id: task
+                .external_id
+                .clone()
+                .unwrap_or_else(|| task.id.to_string()),
             title: task.title.clone(),
             status: task.status.as_str().to_string(),
             agent: task.agent.clone(),
@@ -78,7 +81,11 @@ pub fn build_forest(tasks: Vec<Task>) -> Vec<TreeNode> {
             Task::Internal(int) => {
                 // Internal tasks don't have parent labels (for now)
                 let node = TreeNode::from_internal(int);
-                (int.id.to_string(), None, node)
+                let id = int
+                    .external_id
+                    .clone()
+                    .unwrap_or_else(|| int.id.to_string());
+                (id, None, node)
             }
         };
 

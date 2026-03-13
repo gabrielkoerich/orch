@@ -41,11 +41,11 @@ use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
 use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use crate::config;
-use crate::db::Db;
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{rate_limit_metrics, GhHttp};
-use crate::sidecar::REPO_CONTEXT;
+use crate::repo_context::REPO_CONTEXT;
+use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use runner::WeightSignal;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,6 +53,14 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 
 use crate::backends::Status;
+
+/// Lightweight reference tuple for channel message handling.
+type EngineRef = (
+    String,
+    Arc<dyn ExternalBackend>,
+    Arc<TaskManager>,
+    Option<Arc<TaskStore>>,
+);
 
 /// Per-project engine state.
 ///
@@ -63,6 +71,7 @@ pub struct ProjectEngine {
     pub backend: Arc<dyn ExternalBackend>,
     pub task_manager: Arc<TaskManager>,
     pub runner: Arc<runner::TaskRunner>,
+    pub store: Arc<TaskStore>,
 }
 
 /// Engine configuration.
@@ -227,21 +236,25 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         }
         tracing::info!(repo = %repo, backend = backend.name(), "backend connected");
 
-        // Initialize database (shared between task manager and runner for metrics)
-        let db = Arc::new(Db::open(&crate::db::default_path()?)?);
-        db.migrate().await?;
+        // Initialize unified task store (sqlx)
+        let store = Arc::new(TaskStore::open(&crate::store::default_db_path()?).await?);
 
-        // Initialize task manager
-        let task_manager = Arc::new(TaskManager::new(db.clone(), backend.clone()));
+        // Initialize task manager (with unified store)
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            repo.clone(),
+        ));
 
-        // Task runner (with db for metrics)
-        let runner = Arc::new(runner::TaskRunner::new(repo.clone()).with_db(db.clone()));
+        // Task runner (with store for metrics)
+        let runner = Arc::new(runner::TaskRunner::new(repo.clone()).with_store(store.clone()));
 
         engines.push(ProjectEngine {
             repo,
             backend,
             task_manager,
             runner,
+            store,
         });
     }
 
@@ -268,9 +281,6 @@ pub async fn serve() -> anyhow::Result<()> {
 
     let mut config = EngineConfig::from_config();
 
-    // Initialize internal database (shared across all projects)
-    let db = Arc::new(Db::open(&crate::db::default_path()?)?);
-    db.migrate().await?;
     tracing::info!("internal database ready");
 
     // Initialize project engines — retry with backoff so a network outage at
@@ -295,9 +305,13 @@ pub async fn serve() -> anyhow::Result<()> {
         "initialized project engines"
     );
 
-    // Re-create task managers with shared db
+    // Re-create task managers with shared store
     for engine in &mut project_engines {
-        engine.task_manager = Arc::new(TaskManager::new(db.clone(), engine.backend.clone()));
+        engine.task_manager = Arc::new(TaskManager::with_store(
+            engine.backend.clone(),
+            engine.store.clone(),
+            engine.repo.clone(),
+        ));
     }
 
     // Initialize tmux manager (shared across all projects)
@@ -394,9 +408,16 @@ pub async fn serve() -> anyhow::Result<()> {
     let capture_for_messages = capture_for_tick.clone();
     let channels_for_messages = channel_registry.clone();
     // Lightweight engine references for command execution and task creation
-    let engine_refs: Vec<(String, Arc<dyn ExternalBackend>, Arc<TaskManager>)> = project_engines
+    let engine_refs: Vec<EngineRef> = project_engines
         .iter()
-        .map(|e| (e.repo.clone(), e.backend.clone(), e.task_manager.clone()))
+        .map(|e| {
+            (
+                e.repo.clone(),
+                e.backend.clone(),
+                e.task_manager.clone(),
+                Some(e.store.clone()),
+            )
+        })
         .collect();
     for mut rx in channel_receivers {
         let transport = transport_for_messages.clone();
@@ -686,14 +707,14 @@ pub async fn serve() -> anyhow::Result<()> {
         }
 
         // Also reset internal (SQLite) InReview tasks on startup.
-        use crate::db::TaskStatus as DbStatus;
+        use crate::store::TaskStatus as DbStatus;
         if let Ok(internal_in_review) = engine
             .task_manager
-            .db_list_internal_by_status(DbStatus::InReview)
+            .list_internal_by_status(DbStatus::InReview)
             .await
         {
             for task in &internal_in_review {
-                let task_id = format!("internal:{}", task.id);
+                let task_id = task.id.0.clone();
                 if let Err(e) = engine
                     .task_manager
                     .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
@@ -800,7 +821,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     );
                 } else {
                     // Core tick: poll tasks for all projects
-                    let router_guard = router.read().await;
+                    let mut router_guard = router.write().await;
                     for engine in &project_engines {
                         let repo = engine.repo.clone();
                         REPO_CONTEXT.scope(repo, async {
@@ -813,13 +834,13 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &semaphore,
                                 &config,
                                 &jobs_path,
-                                &db,
-                                &router_guard,
+                                &mut router_guard,
                                 &router,
                                 &engine.task_manager,
                                 &weight_tx,
                                 &transport,
                                 &dispatching,
+                                &engine.store,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
                             }
@@ -832,7 +853,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         for engine in &project_engines {
                             let repo = engine.repo.clone();
                             REPO_CONTEXT.scope(repo, async {
-                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &db, &config, &semaphore, &router, &engine.task_manager).await {
+                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &config, &semaphore, &router, &engine.task_manager, &engine.store).await {
                                     tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
                                 }
                             }).await;
@@ -890,7 +911,7 @@ pub async fn serve() -> anyhow::Result<()> {
                 } else {
                     tracing::info!("webhook event triggered immediate tick");
 
-                    let router_guard = router.read().await;
+                    let mut router_guard = router.write().await;
                     for engine in &project_engines {
                         let repo = engine.repo.clone();
                         REPO_CONTEXT.scope(repo, async {
@@ -903,13 +924,13 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &semaphore,
                                 &config,
                                 &jobs_path,
-                                &db,
-                                &router_guard,
+                                &mut router_guard,
                                 &router,
                                 &engine.task_manager,
                                 &weight_tx,
                                 &transport,
                                 &dispatching,
+                                &engine.store,
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
                             }
@@ -1087,7 +1108,7 @@ async fn handle_channel_message(
     _tmux: &Arc<TmuxManager>,
     capture: &Arc<CaptureService>,
     channels: &Arc<ChannelRegistry>,
-    engine_refs: &[(String, Arc<dyn ExternalBackend>, Arc<TaskManager>)],
+    engine_refs: &[EngineRef],
 ) {
     use crate::backends::ExternalId;
     use crate::channels::stream::fanout_output;
@@ -1104,10 +1125,12 @@ async fn handle_channel_message(
             if body.starts_with('/') {
                 // Parse slash command and execute it on the bound task
                 if let Some(cmd) = parse_command(&body) {
-                    if let Some((repo, backend, _)) = engine_refs.first() {
+                    if let Some((repo, backend, task_manager, store)) = engine_refs.first() {
                         let gh = GhHttp::new();
                         let ext_id = ExternalId(task_id.clone());
-                        let result = execute_command(backend, &gh, repo, &ext_id, &cmd).await;
+                        let result =
+                            execute_command(backend, &gh, repo, &ext_id, &cmd, store, task_manager)
+                                .await;
                         let reply = match result {
                             Ok(r) => r,
                             Err(e) => format!("Command `{cmd}` failed: {e}"),
@@ -1132,7 +1155,7 @@ async fn handle_channel_message(
             // /status is not in OwnerCommand — handle it specially
             if cmd_str == "/status" || cmd_str.starts_with("/status ") {
                 let mut lines = vec!["**Active tasks:**".to_string()];
-                for (repo, _, task_manager) in engine_refs {
+                for (repo, _, task_manager, _) in engine_refs {
                     match task_manager
                         .list_external_by_status(Status::InProgress)
                         .await
@@ -1170,7 +1193,7 @@ async fn handle_channel_message(
             let thread_id = msg.thread_id.clone();
 
             // Pick the first configured project for new tasks from channels
-            if let Some((repo, _, task_manager)) = engine_refs.first() {
+            if let Some((repo, _, task_manager, _)) = engine_refs.first() {
                 let title = if msg.body.len() > 80 {
                     format!("{}…", &msg.body[..80])
                 } else {

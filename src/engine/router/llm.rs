@@ -73,6 +73,7 @@ impl LlmRouter {
         task: &ExternalTask,
         available_agents: &[String],
         config: &RouterConfig,
+        last_agent: &mut Option<String>,
     ) -> anyhow::Result<RouteResult> {
         if available_agents.is_empty() {
             anyhow::bail!("no agent CLIs found in PATH");
@@ -167,9 +168,7 @@ impl LlmRouter {
         let warning = self.check_routing_sanity(task, &agent, &profile);
 
         // Track last routed agent for distribution
-        if let Err(e) = crate::sidecar::set("_router", &[format!("last_agent={}", agent)]) {
-            tracing::warn!(error = ?e, "failed to persist last_agent");
-        }
+        *last_agent = Some(agent.clone());
 
         Ok(RouteResult {
             agent,

@@ -15,7 +15,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::cmd::CommandErrorContext;
-use crate::db::{Db, ErrorStat, MetricsSummary, SlowTaskInfo, TaskStatus};
+use crate::store::{ErrorStat, MetricsSummary, SlowTaskInfo, TaskStatus};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -161,7 +161,8 @@ fn is_not_found_error(e: &anyhow::Error) -> bool {
 pub async fn tick(
     jobs_path: &PathBuf,
     backend: &Arc<dyn ExternalBackend>,
-    db: &Arc<Db>,
+    store: Option<&Arc<crate::store::TaskStore>>,
+    repo: &str,
 ) -> anyhow::Result<()> {
     let mut jobs = load_jobs(jobs_path)?;
     let mut changed = false;
@@ -234,45 +235,38 @@ pub async fn tick(
                     }
                 }
             } else {
-                // Check internal (SQLite) task
-                // Parse "internal:{id}" format
-                if let Some(internal_id_str) = task_id_clone.strip_prefix("internal:") {
-                    if let Ok(internal_id) = internal_id_str.parse::<i64>() {
-                        match db.get_internal_task(internal_id).await {
+                // Check internal task via store
+                if let Some(s) = store {
+                    if let Ok(Some(store_id)) = s.resolve_task_id(repo, &task_id_clone).await {
+                        match s.get(store_id).await {
                             Ok(task) => match task.status {
                                 TaskStatus::New | TaskStatus::Routed | TaskStatus::InProgress => {
                                     true
                                 }
-                                _ => false, // Terminal state (done, blocked, needs_review, etc.)
+                                _ => false, // Terminal state
                             },
                             Err(e) => {
-                                if let Some(rusqlite::Error::QueryReturnedNoRows) =
-                                    e.downcast_ref::<rusqlite::Error>()
-                                {
-                                    tracing::warn!(
-                                        job_id = job.id,
-                                        task_id = task_id_clone,
-                                        "internal task not found, clearing active_task_id"
-                                    );
-                                } else {
-                                    tracing::warn!(
-                                        job_id = job.id,
-                                        task_id = task_id_clone,
-                                        ?e,
-                                        "cannot fetch internal task, clearing active_task_id"
-                                    );
-                                }
+                                tracing::warn!(
+                                    job_id = job.id,
+                                    task_id = task_id_clone,
+                                    ?e,
+                                    "cannot fetch internal task from store, clearing active_task_id"
+                                );
                                 should_clear_task_id = true;
                                 false
                             }
                         }
                     } else {
-                        // Invalid format — clear it
+                        tracing::warn!(
+                            job_id = job.id,
+                            task_id = task_id_clone,
+                            "internal task not found in store, clearing active_task_id"
+                        );
                         should_clear_task_id = true;
                         false
                     }
                 } else {
-                    // Legacy format without prefix — clear it
+                    // No store — clear stale task id
                     should_clear_task_id = true;
                     false
                 }
@@ -341,10 +335,10 @@ pub async fn tick(
                                 job.last_task_status = Some("failed".to_string());
                             }
                         }
-                    } else {
-                        // Create internal (SQLite) task
-                        match db
-                            .create_internal_task(&template.title, &template.body, "cron", &job.id)
+                    } else if let Some(s) = store {
+                        // Create internal task via store
+                        match s
+                            .create_internal(repo, &template.title, &template.body, "cron", &job.id)
                             .await
                         {
                             Ok(internal_id) => {
@@ -362,6 +356,12 @@ pub async fn tick(
                                 job.last_task_status = Some("failed".to_string());
                             }
                         }
+                    } else {
+                        tracing::error!(
+                            job_id = job.id,
+                            "no store available for internal task creation"
+                        );
+                        job.last_task_status = Some("failed".to_string());
                     }
                 }
             }
@@ -400,7 +400,7 @@ pub async fn tick(
             }
             "self-review" => {
                 // Analyze metrics and create self-improvement issues
-                match run_self_review(db, backend).await {
+                match run_self_review(backend, store).await {
                     Ok(issues_created) => {
                         tracing::info!(job_id = job.id, issues_created, "self-review completed");
                         job.last_task_status = Some(if issues_created > 0 {
@@ -429,11 +429,16 @@ pub async fn tick(
 }
 
 /// Run the self-review job: analyze metrics and create improvement issues.
-async fn run_self_review(db: &Arc<Db>, backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<i64> {
+async fn run_self_review(
+    backend: &Arc<dyn ExternalBackend>,
+    store: Option<&Arc<crate::store::TaskStore>>,
+) -> anyhow::Result<i64> {
     let mut issues_created: i64 = 0;
 
+    let s = store.ok_or_else(|| anyhow::anyhow!("no store available for self-review"))?;
+
     // Check rate limit
-    let current_count = db.count_self_improvement_issues_7d().await?;
+    let current_count = s.count_self_improvement_issues_7d().await?;
     if current_count >= MAX_SELF_IMPROVEMENT_ISSUES_PER_WEEK {
         tracing::info!(
             current_count,
@@ -444,9 +449,11 @@ async fn run_self_review(db: &Arc<Db>, backend: &Arc<dyn ExternalBackend>) -> an
     }
 
     // Gather metrics data
-    let summary = db.get_metrics_summary_24h().await?;
-    let slow_tasks = db.get_slow_tasks_7d().await?;
-    let error_distribution = db.get_error_distribution_7d().await?;
+    let (summary, slow_tasks, error_distribution) = (
+        s.get_metrics_summary_24h().await?,
+        s.get_slow_tasks_7d().await?,
+        s.get_error_distribution_7d().await?,
+    );
 
     // Analyze and create issues for each pattern
     let remaining_slots = MAX_SELF_IMPROVEMENT_ISSUES_PER_WEEK - current_count;
@@ -458,7 +465,7 @@ async fn run_self_review(db: &Arc<Db>, backend: &Arc<dyn ExternalBackend>) -> an
                 .await
                 .is_ok()
             {
-                db.increment_self_improvement_counter().await?;
+                s.increment_self_improvement_counter().await?;
                 issues_created += 1;
             }
         }
@@ -471,7 +478,7 @@ async fn run_self_review(db: &Arc<Db>, backend: &Arc<dyn ExternalBackend>) -> an
                 .await
                 .is_ok()
             {
-                db.increment_self_improvement_counter().await?;
+                s.increment_self_improvement_counter().await?;
                 issues_created += 1;
             }
         }
@@ -484,7 +491,7 @@ async fn run_self_review(db: &Arc<Db>, backend: &Arc<dyn ExternalBackend>) -> an
                 .await
                 .is_ok()
             {
-                db.increment_self_improvement_counter().await?;
+                s.increment_self_improvement_counter().await?;
                 issues_created += 1;
             }
         }
@@ -523,7 +530,7 @@ async fn create_self_improvement_issue(
 }
 
 /// Detect if any agent has a high failure rate (>50% failures).
-fn detect_high_failure_agent(agent_stats: &[crate::db::AgentStat]) -> Option<ImprovementIssue> {
+fn detect_high_failure_agent(agent_stats: &[crate::store::AgentStat]) -> Option<ImprovementIssue> {
     for stat in agent_stats {
         if stat.total_runs >= 3 && stat.success_rate < 50.0 {
             return Some(ImprovementIssue {
@@ -668,7 +675,6 @@ struct ImprovementIssue {
 mod tests {
     use super::*;
     use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
-    use crate::db::Db;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -750,10 +756,14 @@ mod tests {
             error_msg: "GitHub API GET https://api.github.com/repos/foo/bar/issues/42 failed (404): Not Found".into(),
             created_ids: Arc::new(Mutex::new(vec![])),
         });
-        let db = Arc::new(Db::open_memory().unwrap());
-        tick(&path, &(backend.clone() as Arc<dyn ExternalBackend>), &db)
-            .await
-            .unwrap();
+        tick(
+            &path,
+            &(backend.clone() as Arc<dyn ExternalBackend>),
+            None,
+            "test/repo",
+        )
+        .await
+        .unwrap();
 
         let jobs = load_jobs(&path).unwrap();
         // active_task_id should point to the newly created task, not the old deleted one
@@ -791,10 +801,14 @@ mod tests {
             error_msg: "GitHub API GET https://api.github.com/repos/foo/bar/issues/99 failed (429): rate limit exceeded".into(),
             created_ids: Arc::new(Mutex::new(vec![])),
         });
-        let db = Arc::new(Db::open_memory().unwrap());
-        tick(&path, &(backend.clone() as Arc<dyn ExternalBackend>), &db)
-            .await
-            .unwrap();
+        tick(
+            &path,
+            &(backend.clone() as Arc<dyn ExternalBackend>),
+            None,
+            "test/repo",
+        )
+        .await
+        .unwrap();
 
         let jobs = load_jobs(&path).unwrap();
         // active_task_id must be preserved — transient error, don't lose the reference
@@ -981,13 +995,13 @@ mod tests {
     #[test]
     fn detect_high_failure_agent_with_high_failure() {
         let agent_stats = vec![
-            crate::db::AgentStat {
+            crate::store::AgentStat {
                 agent: "claude".to_string(),
                 total_runs: 10,
                 success_count: 3,
                 success_rate: 30.0,
             },
-            crate::db::AgentStat {
+            crate::store::AgentStat {
                 agent: "codex".to_string(),
                 total_runs: 5,
                 success_count: 4,
@@ -1005,7 +1019,7 @@ mod tests {
     #[test]
     fn detect_high_failure_agent_ignores_low_runs() {
         // Agent with high failure rate but only 2 runs should be ignored
-        let agent_stats = vec![crate::db::AgentStat {
+        let agent_stats = vec![crate::store::AgentStat {
             agent: "claude".to_string(),
             total_runs: 2,
             success_count: 0,
@@ -1018,7 +1032,7 @@ mod tests {
 
     #[test]
     fn detect_high_failure_agent_ignores_good_success_rate() {
-        let agent_stats = vec![crate::db::AgentStat {
+        let agent_stats = vec![crate::store::AgentStat {
             agent: "claude".to_string(),
             total_runs: 10,
             success_count: 9,

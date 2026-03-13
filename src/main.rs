@@ -5,13 +5,13 @@ mod cmd;
 mod cmd_cache;
 mod config;
 mod cron;
-mod db;
 mod engine;
 mod github;
 mod home;
 mod parser;
+mod repo_context;
 pub mod security;
-mod sidecar;
+mod store;
 mod template;
 mod tmux;
 mod webhook_status;
@@ -150,11 +150,6 @@ enum Commands {
         #[arg(long)]
         since: Option<String>,
     },
-    /// Read/write sidecar JSON files
-    Sidecar {
-        #[command(subcommand)]
-        action: SidecarAction,
-    },
     /// Read config values
     Config {
         /// Config key (dot-separated path)
@@ -225,30 +220,14 @@ enum Commands {
         #[command(subcommand)]
         action: WebhookAction,
     },
+    /// Migrate sidecar files and internal tasks to SQLite store
+    Migrate,
 }
 
 #[derive(Subcommand)]
 enum WebhookAction {
     /// Show webhook server health status
     Status,
-}
-
-#[derive(Subcommand)]
-enum SidecarAction {
-    /// Get a field from a sidecar file
-    Get {
-        /// Task ID
-        task_id: String,
-        /// Field name
-        field: String,
-    },
-    /// Set a field in a sidecar file
-    Set {
-        /// Task ID
-        task_id: String,
-        /// Field=value pairs
-        fields: Vec<String>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -472,15 +451,6 @@ async fn main() -> anyhow::Result<()> {
             let matches = cron::check(&expression, since.as_deref())?;
             std::process::exit(if matches { 0 } else { 1 });
         }
-        Commands::Sidecar { action } => match action {
-            SidecarAction::Get { task_id, field } => {
-                let val = sidecar::get(&task_id, &field)?;
-                println!("{val}");
-            }
-            SidecarAction::Set { task_id, fields } => {
-                sidecar::set(&task_id, &fields)?;
-            }
-        },
         Commands::Config { key } => {
             let val = config::get(&key)?;
             println!("{val}");
@@ -534,7 +504,7 @@ async fn main() -> anyhow::Result<()> {
                 cli::task::publish(id, labels).await?;
             }
             TaskAction::Cost { id } => {
-                cli::task::cost(&id)?;
+                cli::task::cost(&id).await?;
             }
             TaskAction::Tree { id } => {
                 cli::task::tree(id).await?;
@@ -628,7 +598,7 @@ async fn main() -> anyhow::Result<()> {
             model,
         } => {
             if let Some(id) = task_id {
-                cli::cost::show_task(&id)?;
+                cli::cost::show_task(&id).await?;
             } else if agent {
                 cli::cost::show_by_agent().await?;
             } else if model {
@@ -649,6 +619,16 @@ async fn main() -> anyhow::Result<()> {
                 cli::webhook::status()?;
             }
         },
+        Commands::Migrate => {
+            let store = cli::init_store().await?;
+            let default_repo = config::get_current_repo().unwrap_or_default();
+            println!("Migrating sidecars, internal tasks, KV, metrics, and rate limits to SQLite store...");
+            let result = store.migrate_sidecars(&default_repo).await?;
+            println!(
+                "Migration complete: {} migrated, {} skipped, {} errors",
+                result.migrated, result.skipped, result.errors
+            );
+        }
     }
 
     Ok(())

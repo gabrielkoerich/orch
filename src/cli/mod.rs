@@ -234,12 +234,9 @@ pub fn agents() {
 
 /// Show task metrics summary.
 pub async fn metrics() -> anyhow::Result<()> {
-    use crate::db::Db;
+    let store = init_store().await?;
 
-    let db = Db::open(&crate::db::default_path()?)?;
-    db.migrate().await?;
-
-    let summary = db.get_metrics_summary_24h().await?;
+    let summary = store.get_metrics_summary_24h().await?;
 
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
@@ -727,14 +724,18 @@ fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
 pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
-    use crate::db::Db;
+    use crate::store::TaskStore;
 
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo));
-    let db = Arc::new(Db::open(&crate::db::default_path()?)?);
-    db.migrate().await?;
-    Ok(TaskManager::new(db, backend))
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let store = Arc::new(TaskStore::open(&crate::store::default_db_path()?).await?);
+    Ok(TaskManager::with_store(backend, store, repo))
+}
+
+/// Initialize the unified task store for CLI commands.
+pub async fn init_store() -> anyhow::Result<crate::store::TaskStore> {
+    crate::store::TaskStore::open(&crate::store::default_db_path()?).await
 }
 
 #[cfg(test)]

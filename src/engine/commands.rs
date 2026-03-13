@@ -5,9 +5,26 @@
 //! executed against the issue's task and a confirmation comment is posted.
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
-use crate::db::Db;
 use crate::github::http::GhHttp;
+use crate::store::TaskStore;
 use std::sync::Arc;
+
+/// Read a KV value from the store.
+async fn kv_get(store: &Option<Arc<TaskStore>>, key: &str) -> Option<String> {
+    if let Some(ref s) = store {
+        if let Ok(v) = s.kv_get(key).await {
+            return v;
+        }
+    }
+    None
+}
+
+/// Write a KV value to the store.
+async fn kv_set(store: &Option<Arc<TaskStore>>, key: &str, value: &str) {
+    if let Some(ref s) = store {
+        let _ = s.kv_set(key, value).await;
+    }
+}
 
 /// Parsed owner command from an issue comment.
 #[derive(Debug, Clone, PartialEq)]
@@ -100,16 +117,17 @@ fn extract_issue_number(issue_url: &str) -> Option<String> {
 /// Reuses the same comment endpoint as `scan_mentions`.
 pub async fn scan_commands(
     backend: &Arc<dyn ExternalBackend>,
-    db: &Arc<Db>,
     repo: &str,
+    store: &Option<Arc<crate::store::TaskStore>>,
+    task_manager: &Arc<crate::engine::tasks::TaskManager>,
 ) -> anyhow::Result<()> {
     let gh = GhHttp::new();
 
     // Use persisted cursor, fall back to 24h ago
     let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-    let since_str = match db.kv_get("owner_commands_last_checked").await {
-        Ok(Some(ts)) => ts,
-        _ => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    let since_str = match kv_get(store, "owner_commands_last_checked").await {
+        Some(ts) => ts,
+        None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
 
     // Fetch recent comments (same endpoint as mentions)
@@ -124,15 +142,15 @@ pub async fn scan_commands(
     if comments.is_empty() {
         // Still advance cursor even if no comments
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        db.kv_set("owner_commands_last_checked", &now).await.ok();
+        kv_set(store, "owner_commands_last_checked", &now).await;
         return Ok(());
     }
 
     // Build dedup set from already-processed command comment IDs.
     // We store processed IDs in KV to survive restarts within the cursor window.
     let processed_ids: std::collections::HashSet<String> =
-        match db.kv_get("owner_commands_processed_ids").await {
-            Ok(Some(ids)) if !ids.is_empty() => ids.split(',').map(String::from).collect(),
+        match kv_get(store, "owner_commands_processed_ids").await {
+            Some(ids) if !ids.is_empty() => ids.split(',').map(String::from).collect(),
             _ => std::collections::HashSet::new(),
         };
 
@@ -213,7 +231,8 @@ pub async fn scan_commands(
         let task_id = ExternalId(issue_number.clone());
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-        let result = execute_command(backend, &gh, repo, &task_id, &command).await;
+        let result =
+            execute_command(backend, &gh, repo, &task_id, &command, store, task_manager).await;
 
         match result {
             Ok(msg) => {
@@ -260,16 +279,12 @@ pub async fn scan_commands(
         if all.len() > 500 {
             all = all.split_off(all.len() - 500);
         }
-        db.kv_set("owner_commands_processed_ids", &all.join(","))
-            .await
-            .ok();
+        kv_set(store, "owner_commands_processed_ids", &all.join(",")).await;
     }
 
     // Advance cursor
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    if let Err(e) = db.kv_set("owner_commands_last_checked", &now).await {
-        tracing::warn!(err = %e, "failed to persist owner commands cursor");
-    }
+    kv_set(store, "owner_commands_last_checked", &now).await;
 
     Ok(())
 }
@@ -281,6 +296,8 @@ pub async fn execute_command(
     repo: &str,
     task_id: &ExternalId,
     command: &OwnerCommand,
+    store: &Option<Arc<crate::store::TaskStore>>,
+    task_manager: &Arc<crate::engine::tasks::TaskManager>,
 ) -> anyhow::Result<String> {
     match command {
         OwnerCommand::Retry => {
@@ -291,9 +308,11 @@ pub async fn execute_command(
                     backend.remove_label(task_id, label).await.ok();
                 }
             }
-            // Reset sidecar state (attempts + all failure counters) so the task starts fresh
-            crate::sidecar::reset_task_counters(&task_id.0);
-            backend.update_status(task_id, Status::New).await?;
+            // Reset store state (attempts + all failure counters) so the task starts fresh
+            crate::engine::cleanup::store_reset_counters(store, repo, &task_id.0).await;
+            task_manager
+                .update_task_status(task_id, Status::New)
+                .await?;
             Ok("`/retry` — reset attempts, cleared agent, reset to `status:new`".to_string())
         }
 
@@ -305,14 +324,16 @@ pub async fn execute_command(
                     backend.remove_label(task_id, label).await.ok();
                 }
             }
-            // Reset sidecar state (attempts + all failure counters) so the task starts fresh
-            crate::sidecar::reset_task_counters(&task_id.0);
+            // Reset store state (attempts + all failure counters) so the task starts fresh
+            crate::engine::cleanup::store_reset_counters(store, repo, &task_id.0).await;
             // Optionally set new agent
             if let Some(agent_name) = agent {
                 let label = format!("agent:{agent_name}");
                 backend.set_labels(task_id, &[label]).await?;
             }
-            backend.update_status(task_id, Status::New).await?;
+            task_manager
+                .update_task_status(task_id, Status::New)
+                .await?;
             match agent {
                 Some(a) => Ok(format!(
                     "`/reroute {a}` — cleared agent, reset attempts, forced `agent:{a}`, reset to `status:new`"
@@ -324,13 +345,17 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Close => {
-            backend.update_status(task_id, Status::Done).await?;
+            task_manager
+                .update_task_status(task_id, Status::Done)
+                .await?;
             gh.close_issue(repo, &task_id.0).await?;
             Ok("`/close` — marked `status:done` and closed issue".to_string())
         }
 
         OwnerCommand::Block(reason) => {
-            backend.update_status(task_id, Status::Blocked).await?;
+            task_manager
+                .update_task_status(task_id, Status::Blocked)
+                .await?;
             match reason {
                 Some(r) => Ok(format!("`/block` — marked `status:blocked`: {r}")),
                 None => Ok("`/block` — marked `status:blocked`".to_string()),
@@ -338,12 +363,16 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Unblock => {
-            backend.update_status(task_id, Status::New).await?;
+            task_manager
+                .update_task_status(task_id, Status::New)
+                .await?;
             Ok("`/unblock` — marked `status:new`, will re-dispatch".to_string())
         }
 
         OwnerCommand::Review => {
-            backend.update_status(task_id, Status::NeedsReview).await?;
+            task_manager
+                .update_task_status(task_id, Status::NeedsReview)
+                .await?;
             Ok(
                 "`/review` — set `status:needs_review`, review agent will pick up on next tick"
                     .to_string(),
@@ -494,5 +523,54 @@ mod tests {
         assert_eq!(OwnerCommand::Block(None).to_string(), "/block");
         assert_eq!(OwnerCommand::Unblock.to_string(), "/unblock");
         assert_eq!(OwnerCommand::Review.to_string(), "/review");
+    }
+
+    // ── kv_get / kv_set store-first helpers ──────────────────────────
+
+    #[tokio::test]
+    async fn kv_get_reads_from_store() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+
+        store.kv_set("key1", "from_store").await.unwrap();
+
+        let opt_store = Some(store);
+        let val = kv_get(&opt_store, "key1").await;
+        assert_eq!(val.as_deref(), Some("from_store"));
+    }
+
+    #[tokio::test]
+    async fn kv_get_returns_none_without_store() {
+        let opt_store: Option<Arc<crate::store::TaskStore>> = None;
+        let val = kv_get(&opt_store, "key2").await;
+        assert_eq!(val, None);
+    }
+
+    #[tokio::test]
+    async fn kv_get_returns_none_for_missing_key() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+
+        let opt_store = Some(store);
+        let val = kv_get(&opt_store, "nonexistent").await;
+        assert_eq!(val, None);
+    }
+
+    #[tokio::test]
+    async fn kv_set_writes_to_store_when_present() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+
+        let opt_store = Some(Arc::clone(&store));
+        kv_set(&opt_store, "key3", "value3").await;
+
+        assert_eq!(
+            store.kv_get("key3").await.unwrap().as_deref(),
+            Some("value3")
+        );
+    }
+
+    #[tokio::test]
+    async fn kv_set_noop_without_store() {
+        let opt_store: Option<Arc<crate::store::TaskStore>> = None;
+        // Should not panic
+        kv_set(&opt_store, "key4", "value4").await;
     }
 }

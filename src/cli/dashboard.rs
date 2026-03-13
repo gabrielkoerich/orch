@@ -1,9 +1,12 @@
 use crate::backends::Status;
 use crate::cli::init_task_manager;
-use crate::db::TaskStatus;
-use crate::sidecar;
+use crate::config;
+use crate::engine::cleanup as store_helpers;
+use crate::store::TaskStatus;
+use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use chrono::{DateTime, Duration, Utc};
+use std::sync::Arc;
 
 /// Simple dashboard command combining task status, active sessions, and recent activity.
 pub async fn dashboard() -> anyhow::Result<()> {
@@ -21,7 +24,7 @@ pub async fn dashboard() -> anyhow::Result<()> {
 
     // Fetch all tasks from both backends
     let all_external = task_manager.list_all_external_tasks().await?;
-    let all_internal = task_manager.db.list_all_internal_tasks().await?;
+    let all_internal = task_manager.list_all_internal().await.unwrap_or_default();
 
     let mut counts: Vec<(Status, usize, usize)> = Vec::new(); // (status, external, internal)
     let mut total = 0usize;
@@ -68,11 +71,16 @@ pub async fn dashboard() -> anyhow::Result<()> {
         }
     }
 
+    let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
+
     println!("\nActive Sessions");
     let tmux = TmuxManager::new();
     let sessions = tmux.list_sessions().await.unwrap_or_default();
     for s in sessions.iter() {
-        let agent = sidecar::get(&s.task_id, "agent").unwrap_or_default();
+        let agent = store_helpers::opt_store_get_field(&store, &repo, &s.task_id, "agent")
+            .await
+            .unwrap_or_default();
         println!("  {:<25} {:<8} #{}", s.name, agent, s.task_id);
     }
 
@@ -82,7 +90,9 @@ pub async fn dashboard() -> anyhow::Result<()> {
         if let Ok(dt) = DateTime::parse_from_rfc3339(&r.updated_at) {
             let dt_utc = dt.with_timezone(&Utc);
             if dt_utc >= cutoff {
-                let agent = sidecar::get(&r.id.0, "agent").unwrap_or_default();
+                let agent = store_helpers::opt_store_get_field(&store, &repo, &r.id.0, "agent")
+                    .await
+                    .unwrap_or_default();
                 let elapsed = Utc::now() - dt_utc;
                 let mins = elapsed.num_minutes();
                 println!(

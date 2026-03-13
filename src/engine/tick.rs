@@ -14,12 +14,12 @@ use crate::channels::capture::CaptureService;
 use crate::channels::notification::TaskNotification;
 use crate::channels::transport::Transport;
 use crate::config;
-use crate::db::Db;
 use crate::engine::jobs;
 use crate::engine::router::{get_route_result, Router};
 use crate::engine::runner::{TaskRunner, WeightSignal};
 use crate::engine::tasks::{is_internal_id, TaskManager};
-use crate::sidecar::{self, REPO_CONTEXT};
+use crate::repo_context::REPO_CONTEXT;
+use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Semaphore};
@@ -62,6 +62,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
     repo: &str,
     task_manager: &Arc<TaskManager>,
     config: &EngineConfig,
+    store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
     let in_progress = task_manager
@@ -113,22 +114,18 @@ pub(crate) async fn tick_recover_stuck_tasks(
                     backend.remove_label(&task.id, label).await.ok();
                 }
             }
-            if let Err(e) = sidecar::set(
+            super::cleanup::store_set(
+                &Some(Arc::clone(store)),
+                repo,
                 &task.id.0,
                 &[
-                    "agent=".to_string(),
-                    "model=".to_string(),
-                    "route_attempts=0".to_string(),
+                    ("agent", serde_json::Value::Null),
+                    ("model", serde_json::Value::Null),
+                    ("route_attempts", serde_json::json!(0)),
                 ],
-            ) {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    ?e,
-                    "failed to reset sidecar for stuck task"
-                );
-                continue;
-            }
-            if let Err(e) = backend.update_status(&task.id, Status::New).await {
+            )
+            .await;
+            if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
                 tracing::warn!(task_id = task.id.0, ?e, "failed to reset stuck task status");
                 continue;
             }
@@ -167,12 +164,12 @@ pub(crate) async fn tick_recover_stuck_tasks(
 
     // Recover internal (SQLite) tasks stuck in in_progress.
     // These have no GitHub labels or comments — just reset the DB status to New.
-    use crate::db::TaskStatus as DbStatus;
+    use crate::store::TaskStatus as DbStatus;
     let internal_in_progress = task_manager
-        .db_list_internal_by_status(DbStatus::InProgress)
+        .list_internal_by_status(DbStatus::InProgress)
         .await?;
     for task in &internal_in_progress {
-        let task_id = format!("internal:{}", task.id);
+        let task_id = task.id.0.clone();
         let session_name = tmux.session_name(repo, &task_id);
         let has_session = tmux.session_exists(&session_name).await;
 
@@ -182,7 +179,11 @@ pub(crate) async fn tick_recover_stuck_tasks(
             config.no_session_stuck_timeout
         };
 
-        let age = chrono::Utc::now() - task.updated_at;
+        let age = if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
+            chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc)
+        } else {
+            continue;
+        };
 
         if age.num_seconds() > threshold as i64 {
             if has_session {
@@ -216,7 +217,9 @@ pub(crate) async fn tick_recover_stuck_tasks(
 pub(crate) async fn tick_route_tasks(
     backend: &Arc<dyn ExternalBackend>,
     task_manager: &Arc<TaskManager>,
-    router: &Router,
+    router: &mut Router,
+    store: &Arc<TaskStore>,
+    repo: &str,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase3a.route").entered();
     let new_tasks = task_manager.list_routable().await?;
@@ -227,10 +230,13 @@ pub(crate) async fn tick_route_tasks(
 
     for task in routable {
         let _task_span = tracing::info_span!("engine.route", task_id = %task.id.0).entered();
-        match router.route(task).await {
+        match router.route(task, store, repo).await {
             Ok(result) => {
-                // Store route result in sidecar
-                if let Err(e) = router.store_route_result(&task.id.0, &result) {
+                // Store route result in store
+                if let Err(e) = router
+                    .store_route_result(&task.id.0, &result, store, repo)
+                    .await
+                {
                     tracing::warn!(task_id = task.id.0, ?e, "failed to store route result");
                 }
 
@@ -257,8 +263,56 @@ pub(crate) async fn tick_route_tasks(
                     }
 
                     // Transition to routed
-                    if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::Routed)
+                        .await
+                    {
                         tracing::warn!(task_id = task.id.0, ?e, "failed to set status:routed");
+                    }
+                }
+
+                // Dual-write: upsert task + store route result in SQLite
+                match store.ensure_external_task(repo, task).await {
+                    Ok(store_id) => {
+                        let profile_json =
+                            serde_json::to_string(&result.profile).unwrap_or_default();
+                        let skills_json =
+                            serde_json::to_string(&result.selected_skills).unwrap_or_default();
+                        if let Err(e) = store
+                            .store_route(&crate::store::StoreRoute {
+                                id: store_id,
+                                agent: &result.agent,
+                                model: result.model.as_deref(),
+                                complexity: &result.complexity,
+                                reason: &result.reason,
+                                profile: &profile_json,
+                                skills: &skills_json,
+                            })
+                            .await
+                        {
+                            tracing::debug!(
+                                task_id = task.id.0,
+                                ?e,
+                                "dual-write: store_route failed"
+                            );
+                        }
+                        if let Err(e) = store
+                            .update_status(store_id, crate::store::TaskStatus::Routed)
+                            .await
+                        {
+                            tracing::debug!(
+                                task_id = task.id.0,
+                                ?e,
+                                "dual-write: update_status failed"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            task_id = task.id.0,
+                            ?e,
+                            "dual-write: ensure_external_task failed"
+                        );
                     }
                 }
 
@@ -296,6 +350,7 @@ pub(crate) async fn tick_dispatch_tasks(
     transport: &Arc<Transport>,
     router_arc: &Arc<RwLock<Router>>,
     dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase3b.dispatch").entered();
     // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
@@ -303,23 +358,11 @@ pub(crate) async fn tick_dispatch_tasks(
     let mut routed_tasks = task_manager.list_external_by_status(Status::Routed).await?;
 
     // Also include internal tasks in Routed status.
-    use crate::db::TaskStatus as DbStatus;
+    use crate::store::TaskStatus as DbStatus;
     let internal_routed = task_manager
-        .db_list_internal_by_status(DbStatus::Routed)
+        .list_internal_by_status(DbStatus::Routed)
         .await?;
-    for t in internal_routed {
-        routed_tasks.push(ExternalTask {
-            id: ExternalId(format!("internal:{}", t.id)),
-            title: t.title,
-            body: t.body,
-            state: "open".to_string(),
-            labels: vec!["status:routed".to_string()],
-            author: t.source,
-            created_at: t.created_at.to_rfc3339(),
-            updated_at: t.updated_at.to_rfc3339(),
-            url: String::new(),
-        });
-    }
+    routed_tasks.extend(internal_routed);
 
     let dispatchable: Vec<&ExternalTask> = routed_tasks
         .iter()
@@ -366,13 +409,9 @@ pub(crate) async fn tick_dispatch_tasks(
 
         // Mark in_progress BEFORE spawning to prevent double dispatch.
         let task_id = task.id.0.clone();
-        let set_in_progress_result = if is_internal_id(&task_id) {
-            task_manager
-                .update_task_status(&task.id, Status::InProgress)
-                .await
-        } else {
-            backend.update_status(&task.id, Status::InProgress).await
-        };
+        let set_in_progress_result = task_manager
+            .update_task_status(&task.id, Status::InProgress)
+            .await;
         if let Err(e) = set_in_progress_result {
             tracing::error!(task_id, ?e, "failed to set in_progress, skipping dispatch");
             drop(permit);
@@ -405,9 +444,10 @@ pub(crate) async fn tick_dispatch_tasks(
         let dispatching_for_cleanup = dispatching.clone();
         let dispatch_key_for_cleanup = dispatch_key.clone();
         let task_manager_for_spawn = task_manager.clone();
+        let store_for_spawn = store.clone();
 
-        // Load routing result from sidecar (stored during Phase 3a)
-        let route_result = get_route_result(&task_id).ok();
+        // Load routing result from store (stored during Phase 3a)
+        let route_result = get_route_result(store, repo, &task_id).await.ok();
         let agent_name = route_result
             .as_ref()
             .map(|r| r.agent.clone())
@@ -429,7 +469,9 @@ pub(crate) async fn tick_dispatch_tasks(
                     tracing::info!(task_id, "task runner completed");
 
                     // Send task completion notification
-                    let summary = sidecar::get(&task_id, "summary").unwrap_or_default();
+                    let summary = super::cleanup::store_get_field(&store_for_spawn, &repo_owned, &task_id, "summary")
+                        .await
+                        .unwrap_or_default();
                     let duration = dispatch_start.elapsed().as_secs_f64();
 
                     // Derive a display status from the weight signal for the notification.
@@ -478,6 +520,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                     let tmux_clone = tmux.clone();
                                     let task_owned_clone = task_owned.clone();
                                     let router_for_review = router_clone.clone();
+                                    let store_for_review = store_for_spawn.clone();
                                     let task_id_for_review = task_id.clone();
                                     let repo_ctx = repo_owned.clone();
                                     tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
@@ -488,6 +531,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                             &repo_owned,
                                             &router_for_review,
                                             &task_manager_for_review,
+                                            &store_for_review,
                                         )
                                         .await
                                         {
@@ -505,17 +549,14 @@ pub(crate) async fn tick_dispatch_tasks(
                                                     .await;
                                             }
                                             Ok(ReviewDecision::Failed(reason)) => {
-                                                let failures = sidecar::get_u64(
-                                                    &task_id_for_review,
-                                                    "review_agent_failures",
-                                                )
-                                                .saturating_add(1);
-                                                let _ = sidecar::set(
-                                                    &task_id_for_review,
-                                                    &[format!(
-                                                        "review_agent_failures={failures}"
-                                                    )],
-                                                );
+                                                let failures =
+                                                    super::cleanup::store_increment(
+                                                        &Some(store_for_review.clone()),
+                                                        &repo_owned,
+                                                        &task_id_for_review,
+                                                        "review_agent_failures",
+                                                    )
+                                                    .await;
                                                 if failures >= MAX_REVIEW_AGENT_FAILURES {
                                                     tracing::error!(
                                                         task_id = task_id_for_review,
@@ -549,17 +590,14 @@ pub(crate) async fn tick_dispatch_tasks(
                                                 }
                                             }
                                             Err(e) => {
-                                                let failures = sidecar::get_u64(
-                                                    &task_id_for_review,
-                                                    "review_agent_failures",
-                                                )
-                                                .saturating_add(1);
-                                                let _ = sidecar::set(
-                                                    &task_id_for_review,
-                                                    &[format!(
-                                                        "review_agent_failures={failures}"
-                                                    )],
-                                                );
+                                                let failures =
+                                                    super::cleanup::store_increment(
+                                                        &Some(store_for_review.clone()),
+                                                        &repo_owned,
+                                                        &task_id_for_review,
+                                                        "review_agent_failures",
+                                                    )
+                                                    .await;
                                                 if failures >= MAX_REVIEW_AGENT_FAILURES {
                                                     tracing::error!(
                                                         task_id = task_id_for_review,
@@ -595,15 +633,12 @@ pub(crate) async fn tick_dispatch_tasks(
                                             Ok(_) => {
                                                 // Reset all review-cycle failure counters on success
                                                 // so a subsequent retry doesn't inherit stale values.
-                                                let _ = sidecar::set(
+                                                super::cleanup::store_reset_counters(
+                                                    &Some(store_for_review.clone()),
+                                                    &repo_owned,
                                                     &task_id_for_review,
-                                                    &[
-                                                        "review_agent_failures=0".to_string(),
-                                                        "merge_conflict_retries=0".to_string(),
-                                                        "pr_create_failures=0".to_string(),
-                                                        "ci_merge_failures=0".to_string(),
-                                                    ],
-                                                );
+                                                )
+                                                .await;
                                             } // Approve or RequestChanges handled inside
                                         }
                                     }));
@@ -746,7 +781,7 @@ pub(crate) async fn tick_unblock_parents(
                 children = children.len(),
                 "all children done, unblocking parent"
             );
-            if let Err(e) = backend.update_status(&task.id, Status::New).await {
+            if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
                 tracing::warn!(task_id = task.id.0, ?e, "failed to unblock parent");
             }
         }
@@ -758,9 +793,10 @@ pub(crate) async fn tick_unblock_parents(
 pub(crate) async fn tick_job_scheduler(
     jobs_path: &std::path::PathBuf,
     backend: &Arc<dyn ExternalBackend>,
-    db: &Arc<Db>,
+    store: Option<&Arc<crate::store::TaskStore>>,
+    repo: &str,
 ) -> anyhow::Result<()> {
-    jobs::tick(jobs_path, backend, db).await
+    jobs::tick(jobs_path, backend, store, repo).await
 }
 
 /// Core tick — runs every 10s.
@@ -782,18 +818,18 @@ pub(crate) async fn tick(
     semaphore: &Arc<Semaphore>,
     config: &EngineConfig,
     jobs_path: &std::path::PathBuf,
-    db: &Arc<Db>,
-    router: &Router,
+    router: &mut Router,
     router_arc: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
     transport: &Arc<Transport>,
     dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
     tick_check_session_completions(tmux, repo, capture).await?;
-    tick_recover_stuck_tasks(backend, tmux, repo, task_manager, config).await?;
-    tick_route_tasks(backend, task_manager, router).await?;
+    tick_recover_stuck_tasks(backend, tmux, repo, task_manager, config, store).await?;
+    tick_route_tasks(backend, task_manager, router, store, repo).await?;
     tick_dispatch_tasks(
         backend,
         tmux,
@@ -806,10 +842,11 @@ pub(crate) async fn tick(
         transport,
         router_arc,
         dispatching,
+        store,
     )
     .await?;
     tick_unblock_parents(backend, task_manager).await?;
-    if let Err(e) = tick_job_scheduler(jobs_path, backend, db).await {
+    if let Err(e) = tick_job_scheduler(jobs_path, backend, Some(store), repo).await {
         tracing::error!(?e, "job scheduler tick failed");
     }
     Ok(())
@@ -943,8 +980,7 @@ mod tests {
     }
 
     fn make_task_manager(backend: Arc<dyn ExternalBackend>) -> Arc<TaskManager> {
-        let db = Arc::new(crate::db::Db::open_memory().unwrap());
-        Arc::new(TaskManager::new(db, backend))
+        Arc::new(TaskManager::new(backend))
     }
 
     // ── tick_unblock_parents ─────────────────────────────────────────────────

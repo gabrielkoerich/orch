@@ -6,10 +6,9 @@
 //! 3. Classifies errors (timeout, usage limit, auth, tooling)
 //! 4. Determines next action (success, reroute, needs_review)
 
-use crate::sidecar;
-use fs2::FileExt; // for try_lock_exclusive / unlock
-use std::io::{Read, Seek, Write};
+use crate::store::TaskStore;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Outcome signal for the engine to update router weights.
 ///
@@ -62,14 +61,14 @@ pub fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> Strin
     }
 
     // Legacy fallback locations
-    let state_dir = sidecar::state_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let state_dir = crate::home::state_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
 
     let mut fallbacks = vec![
         PathBuf::from(format!("/tmp/output-{task_id}.json")),
         state_dir.join(format!("output-{task_id}.json")),
     ];
 
-    if let Ok(legacy_path) = sidecar::state_file(&format!("output-{task_id}.json")) {
+    if let Ok(legacy_path) = crate::home::state_file(&format!("output-{task_id}.json")) {
         if !fallbacks.contains(&legacy_path) {
             fallbacks.push(legacy_path);
         }
@@ -95,14 +94,22 @@ const AGENT_COOLDOWN_SECS: i64 = 30 * 60;
 /// model-specific rate limit), we ban that combo for longer.
 const MODEL_COOLDOWN_SECS: i64 = 60 * 60;
 
-/// Path to the agent cooldowns file.
-fn cooldowns_path() -> std::path::PathBuf {
-    crate::sidecar::state_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-        .join("agent_cooldowns.json")
+/// In-memory cooldown entry. The orchestrator is a single process, so
+/// cross-process file locking (fs2) is unnecessary. Cooldowns are short-lived
+/// (30-60 min) so losing them on restart is acceptable.
+struct CooldownEntry {
+    failed_at: i64,
+    #[allow(dead_code)]
+    reason: String,
 }
 
-// Expose lockable file operations to tests or other modules if needed
+/// Global in-memory cooldown map, protected by a Mutex.
+fn cooldowns() -> &'static std::sync::Mutex<std::collections::HashMap<String, CooldownEntry>> {
+    use std::sync::Mutex;
+    static COOLDOWNS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, CooldownEntry>>> =
+        std::sync::OnceLock::new();
+    COOLDOWNS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
 
 /// Record that an agent has failed and should be temporarily avoided.
 pub fn record_agent_failure(agent_name: &str) {
@@ -131,145 +138,37 @@ pub fn is_agent_in_cooldown(agent_name: &str) -> bool {
 
 /// Shared helper: check if a given key is in cooldown within `max_age_secs`.
 fn is_key_in_cooldown(key: &str, max_age_secs: i64) -> bool {
-    let cooldowns = read_cooldowns_file();
-    if let Some(entry) = cooldowns.get(key) {
-        if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
-            let now = chrono::Utc::now().timestamp();
-            return (now - failed_at) < max_age_secs;
-        }
+    let map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = map.get(key) {
+        let now = chrono::Utc::now().timestamp();
+        return (now - entry.failed_at) < max_age_secs;
     }
     false
 }
 
-/// Read and parse the cooldowns JSON file. Returns empty map on any error.
-fn read_cooldowns_file() -> serde_json::Map<String, serde_json::Value> {
-    let path = cooldowns_path();
-    if !path.exists() {
-        return serde_json::Map::new();
-    }
-    // Read without locking; callers use locking where needed
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    serde_json::from_str(&content).unwrap_or_default()
-}
-
 fn record_failure_with_reason(key: &str, reason: &str) {
-    let path = cooldowns_path();
-    // Ensure the directory exists
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    // Use an advisory file lock to guard read-modify-write across processes.
-    // fs2 provides a simple cross-platform lock via File::try_lock_exclusive().
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-    {
-        // Use blocking lock to avoid race conditions (try_lock + fallback is unsafe)
-        if f.lock_exclusive().is_ok() {
-            let mut cooldowns = serde_json::Map::new();
-            // Read existing content
-            let mut content = String::new();
-            if f.read_to_string(&mut content).is_ok() && !content.is_empty() {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(map) = v.as_object() {
-                        cooldowns = map.clone();
-                    }
-                }
-            }
-
-            // Record failure with current timestamp
-            let timestamp = chrono::Utc::now().timestamp();
-            cooldowns.insert(
-                key.to_string(),
-                serde_json::json!({ "failed_at": timestamp, "reason": reason }),
-            );
-
-            if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns))
-            {
-                // Truncate then write
-                let _ = f.set_len(0);
-                let _ = f.rewind();
-                let _ = f.write_all(content.as_bytes());
-            }
-
-            let _ = f.unlock();
-        } else {
-            tracing::warn!("could not acquire lock on cooldowns file, skipping write");
-        }
-    } else {
-        // Can't open file — write directly
-        let mut cooldowns = read_cooldowns_file();
-        let timestamp = chrono::Utc::now().timestamp();
-        cooldowns.insert(
-            key.to_string(),
-            serde_json::json!({ "failed_at": timestamp, "reason": reason }),
-        );
-        if let Ok(content) = serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns)) {
-            std::fs::write(&path, content).ok();
-        }
-    }
+    let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(
+        key.to_string(),
+        CooldownEntry {
+            failed_at: chrono::Utc::now().timestamp(),
+            reason: reason.to_string(),
+        },
+    );
 }
 
-/// Clear expired cooldowns from the file.
+/// Clear expired cooldowns from the in-memory map.
 pub fn clear_expired_cooldowns() {
-    let path = cooldowns_path();
-    if !path.exists() {
-        return;
-    }
-
-    // Use same file-locking strategy as record_failure_with_reason
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-    {
-        // Use blocking lock to avoid race conditions
-        if f.lock_exclusive().is_ok() {
-            let mut content = String::new();
-            if f.read_to_string(&mut content).is_ok() {
-                let mut cooldowns = if !content.is_empty() {
-                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&content)
-                        .unwrap_or_default()
-                } else {
-                    serde_json::Map::new()
-                };
-
-                let now = chrono::Utc::now().timestamp();
-                let mut to_remove = Vec::new();
-                for (agent, entry) in &cooldowns {
-                    if let Some(failed_at) = entry.get("failed_at").and_then(|v| v.as_i64()) {
-                        let timeout = if agent.contains(':') {
-                            MODEL_COOLDOWN_SECS
-                        } else {
-                            AGENT_COOLDOWN_SECS
-                        };
-                        if (now - failed_at) >= timeout {
-                            to_remove.push(agent.clone());
-                        }
-                    }
-                }
-                for agent in to_remove {
-                    cooldowns.remove(&agent);
-                }
-
-                if let Ok(content) =
-                    serde_json::to_string_pretty(&serde_json::Value::Object(cooldowns))
-                {
-                    let _ = f.set_len(0);
-                    let _ = f.rewind();
-                    let _ = f.write_all(content.as_bytes());
-                }
-            }
-
-            let _ = f.unlock();
+    let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    let now = chrono::Utc::now().timestamp();
+    map.retain(|key, entry| {
+        let timeout = if key.contains(':') {
+            MODEL_COOLDOWN_SECS
         } else {
-            tracing::warn!("could not acquire lock on cooldowns file, skipping cleanup");
-        }
-    }
+            AGENT_COOLDOWN_SECS
+        };
+        (now - entry.failed_at) < timeout
+    });
 }
 
 /// Pick a fallback agent, avoiding agents already in the reroute chain and agents in cooldown.
@@ -315,8 +214,9 @@ pub enum RetryableError {
 }
 
 impl RetryableError {
-    /// Return a short classified string for this error type, stored in sidecar
-    /// and used for DB metrics rather than parsing `last_error` strings.
+    /// Return a short classified string for this error type.
+    /// Used in DB rate-limit metrics and test assertions.
+    #[allow(dead_code)]
     pub fn type_str(self) -> &'static str {
         match self {
             RetryableError::Timeout => "timeout",
@@ -331,16 +231,18 @@ impl RetryableError {
 /// Returns the resulting status string: "new" if rerouted, "needs_review" otherwise.
 ///
 /// Note: DB recording of rate limit events is handled by the caller (mod.rs)
-/// which has async context. This function only handles sidecar state + cooldowns.
-pub fn handle_failover(
+/// which has async context. This function only handles store state + cooldowns.
+pub async fn handle_failover(
     task_id: &str,
     agent_name: &str,
     error_type: RetryableError,
     error_message: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
 ) -> String {
     // Get the reroute chain
-    let chain = get_reroute_chain(task_id);
-    let chain = update_reroute_chain(task_id, agent_name, &chain);
+    let chain = get_reroute_chain(task_id, store, repo).await;
+    let chain = update_reroute_chain(task_id, agent_name, &chain, store, repo).await;
 
     // Get all available agents
     let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
@@ -363,15 +265,14 @@ pub fn handle_failover(
             agent = agent_name,
             "all agents exhausted, marking needs_review"
         );
-        if let Err(e) = sidecar::set(
+        let msg = format!("{error_message} (all agents exhausted)");
+        crate::engine::cleanup::store_set(
+            store,
+            repo,
             task_id,
-            &[
-                format!("last_error={error_message} (all agents exhausted)"),
-                format!("error_type={}", error_type.type_str()),
-            ],
-        ) {
-            tracing::error!(task_id, ?e, "failed to update task status during failover");
-        }
+            &[("last_error", serde_json::json!(msg))],
+        )
+        .await;
         return "needs_review".to_string();
     }
 
@@ -391,44 +292,55 @@ pub fn handle_failover(
             record_agent_failure(agent_name);
         }
 
-        if let Err(e) = sidecar::set(
+        let msg = format!("{error_message}, rerouted to {next}");
+        crate::engine::cleanup::store_set(
+            store,
+            repo,
             task_id,
             &[
-                format!("agent={next}"),
-                "model=".to_string(),
-                format!("last_error={error_message}, rerouted to {next}"),
-                format!("error_type={}", error_type.type_str()),
+                ("agent", serde_json::json!(next)),
+                ("model", serde_json::json!("")),
+                ("last_error", serde_json::json!(msg)),
             ],
-        ) {
-            tracing::error!(task_id, ?e, "failed to update task status during failover");
-        }
+        )
+        .await;
         return "new".to_string();
     }
 
     // No fallback available
     tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
-    if let Err(e) = sidecar::set(
+    let msg = format!("{error_message}, no fallback agents");
+    crate::engine::cleanup::store_set(
+        store,
+        repo,
         task_id,
-        &[
-            format!("last_error={error_message}, no fallback agents"),
-            format!("error_type={}", error_type.type_str()),
-        ],
-    ) {
-        tracing::error!(task_id, ?e, "failed to update task status during failover");
-    }
+        &[("last_error", serde_json::json!(msg))],
+    )
+    .await;
     "needs_review".to_string()
 }
 
-/// Get the reroute chain from sidecar.
-pub fn get_reroute_chain(task_id: &str) -> String {
-    sidecar::get(task_id, "limit_reroute_chain")
+/// Get the reroute chain from store.
+pub async fn get_reroute_chain(
+    task_id: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> String {
+    crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "limit_reroute_chain")
+        .await
         .unwrap_or_default()
         .trim()
         .to_string()
 }
 
-/// Update the reroute chain in sidecar.
-pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: &str) -> String {
+/// Update the reroute chain in store.
+pub async fn update_reroute_chain(
+    task_id: &str,
+    current_agent: &str,
+    existing_chain: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> String {
     let mut chain = existing_chain.to_string();
     if chain.is_empty() {
         chain = current_agent.to_string();
@@ -436,9 +348,13 @@ pub fn update_reroute_chain(task_id: &str, current_agent: &str, existing_chain: 
         chain = format!("{chain},{current_agent}");
     }
 
-    if let Err(e) = sidecar::set(task_id, &[format!("limit_reroute_chain={chain}")]) {
-        tracing::warn!(task_id, error = ?e, "failed to update reroute chain");
-    }
+    crate::engine::cleanup::store_set(
+        store,
+        repo,
+        task_id,
+        &[("limit_reroute_chain", serde_json::json!(chain))],
+    )
+    .await;
     chain
 }
 
@@ -580,16 +496,19 @@ fn extract_json_block(text: &str) -> Option<String> {
 }
 
 /// Extract learnings and store as memory for future attempts.
-pub fn store_learnings_from_response(
+#[allow(clippy::too_many_arguments)]
+pub async fn store_learnings_from_response(
     task_id: &str,
     attempt: u32,
     agent: &str,
     model: Option<&str>,
     response: &crate::parser::AgentResponse,
     error: Option<&str>,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
 ) {
     // Build the memory entry
-    let entry = crate::sidecar::MemoryEntry {
+    let entry = crate::store::MemoryEntry {
         attempt,
         agent: agent.to_string(),
         model: model.map(String::from),
@@ -600,22 +519,28 @@ pub fn store_learnings_from_response(
         timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
 
-    if let Err(e) = crate::sidecar::store_memory(task_id, &entry) {
-        tracing::warn!(task_id, error = ?e, "failed to store memory");
-    } else {
-        tracing::debug!(task_id, attempt, "stored memory for attempt");
+    if let Some(ref st) = store {
+        if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
+            if let Err(e) = st.append_memory(store_id, &entry).await {
+                tracing::warn!(task_id, error = ?e, "failed to store memory");
+            } else {
+                tracing::debug!(task_id, attempt, "stored memory for attempt");
+            }
+        }
     }
 }
 
 /// Store a memory entry for a failed attempt (without a full AgentResponse).
-pub fn store_failure_memory(
+pub async fn store_failure_memory(
     task_id: &str,
     attempt: u32,
     agent: &str,
     model: Option<&str>,
     error: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
 ) {
-    let entry = crate::sidecar::MemoryEntry {
+    let entry = crate::store::MemoryEntry {
         attempt,
         agent: agent.to_string(),
         model: model.map(String::from),
@@ -626,10 +551,14 @@ pub fn store_failure_memory(
         timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     };
 
-    if let Err(e) = crate::sidecar::store_memory(task_id, &entry) {
-        tracing::warn!(task_id, error = ?e, "failed to store failure memory");
-    } else {
-        tracing::debug!(task_id, attempt, "stored failure memory");
+    if let Some(ref st) = store {
+        if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
+            if let Err(e) = st.append_memory(store_id, &entry).await {
+                tracing::warn!(task_id, error = ?e, "failed to store failure memory");
+            } else {
+                tracing::debug!(task_id, attempt, "stored failure memory");
+            }
+        }
     }
 }
 
@@ -709,7 +638,38 @@ mod tests {
         assert!(patterns::detect_missing_tool("").is_none());
     }
 
-    // Use fake agent names so real cooldowns on disk don't affect tests.
+    // ── Cooldown tests ────────────────────────────────────────────
+
+    #[test]
+    fn record_and_check_agent_cooldown() {
+        // Use unique names to avoid interference from other tests
+        let agent = "test_cooldown_agent_1";
+        assert!(!is_agent_in_cooldown(agent));
+        record_agent_failure(agent);
+        assert!(is_agent_in_cooldown(agent));
+    }
+
+    #[test]
+    fn record_and_check_model_cooldown() {
+        let agent = "test_cooldown_agent_2";
+        let model = "test_model_x";
+        assert!(!is_model_in_cooldown(agent, model));
+        record_model_failure(agent, model);
+        assert!(is_model_in_cooldown(agent, model));
+        // Different model should not be in cooldown
+        assert!(!is_model_in_cooldown(agent, "other_model"));
+    }
+
+    #[test]
+    fn clear_expired_does_not_remove_fresh_entries() {
+        let agent = "test_cooldown_agent_3";
+        record_agent_failure(agent);
+        clear_expired_cooldowns();
+        // Should still be in cooldown (just recorded)
+        assert!(is_agent_in_cooldown(agent));
+    }
+
+    // Use fake agent names so other tests don't interfere.
     #[test]
     fn pick_fallback_skips_current_agent() {
         let available = vec!["test_agent_a".to_string(), "test_agent_b".to_string()];

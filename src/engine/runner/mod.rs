@@ -28,12 +28,12 @@ pub mod worktree;
 
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
-use crate::db::{Db, InsertTaskMetric};
 use crate::engine::router::RouteResult;
 use crate::engine::tasks::is_internal_id;
 use crate::security;
-use crate::sidecar;
+use crate::store::InsertTaskMetric;
 use crate::tmux::TmuxManager;
+use anyhow::Context;
 use chrono::Utc;
 pub use response::WeightSignal;
 use std::path::PathBuf;
@@ -45,8 +45,8 @@ pub struct TaskRunner {
     repo: String,
     /// Path to the orchestrator home directory
     orch_home: PathBuf,
-    /// Database for storing metrics
-    db: Option<Arc<Db>>,
+    /// Unified task store for run audit trail
+    store: Option<Arc<crate::store::TaskStore>>,
 }
 
 impl TaskRunner {
@@ -57,14 +57,19 @@ impl TaskRunner {
         Self {
             repo,
             orch_home,
-            db: None,
+            store: None,
         }
     }
 
-    /// Set the database reference for metrics recording.
-    pub fn with_db(mut self, db: Arc<Db>) -> Self {
-        self.db = Some(db);
+    /// Set the unified task store for run audit trail.
+    pub fn with_store(mut self, store: Arc<crate::store::TaskStore>) -> Self {
+        self.store = Some(store);
         self
+    }
+
+    /// Read a field from the task store.
+    async fn get_field(&self, task_id: &str, field: &str) -> Option<String> {
+        crate::engine::cleanup::opt_store_get_field(&self.store, &self.repo, task_id, field).await
     }
 
     /// Run a task through the full execution pipeline.
@@ -86,7 +91,7 @@ impl TaskRunner {
         );
 
         // Check task guards; returns outcome indicating whether to proceed.
-        let attempts = match task_init::check_guards(task_id, &self.repo).await {
+        let attempts = match task_init::check_guards(task_id, &self.repo, &self.store).await {
             Ok(task_init::GuardOutcome::Proceed(a)) => a,
             Ok(task_init::GuardOutcome::Skip) => {
                 return Ok(None);
@@ -101,7 +106,10 @@ impl TaskRunner {
 
                     // If this was label-forced to a specific agent, remove the agent label
                     // so that /retry can route to a different agent instead of looping.
-                    let route_reason = sidecar::get(task_id, "route_reason").unwrap_or_default();
+                    let route_reason = self
+                        .get_field(task_id, "route_reason")
+                        .await
+                        .unwrap_or_default();
                     if route_reason.starts_with("label agent:") {
                         let agent_label = route_reason.trim_start_matches("label ");
                         let gh = crate::github::http::GhHttp::new();
@@ -129,6 +137,7 @@ impl TaskRunner {
             &self.repo,
             &project_dir,
             attempts,
+            &self.store,
         )
         .await?;
 
@@ -217,10 +226,11 @@ impl TaskRunner {
                     init.model_name.as_deref(),
                     init.new_attempts,
                     &self.repo,
+                    &self.store,
                 )
                 .await?;
                 if budget_exceeded {
-                    // Token budget exceeded — sidecar already updated, return without
+                    // Token budget exceeded — store already updated, return without
                     // tmux cleanup or metrics (preserves original behavior)
                     return Ok(Some(status));
                 }
@@ -234,7 +244,8 @@ impl TaskRunner {
                     &*agent_runner,
                     init.model_name.as_deref(),
                     init.new_attempts,
-                    self.db.as_ref(),
+                    &self.store,
+                    &self.repo,
                 )
                 .await?
                 {
@@ -293,12 +304,14 @@ impl TaskRunner {
 
         let complexity = route_result.as_ref().map(|r| r.complexity.clone());
         let files_changed = git_ops::count_changed_files(&PathBuf::from(
-            sidecar::get(task_id, "worktree").unwrap_or_default(),
+            self.get_field(task_id, "worktree")
+                .await
+                .unwrap_or_default(),
         ))
         .await
         .unwrap_or(0);
 
-        if let Some(ref db) = self.db {
+        if let Some(ref store) = self.store {
             // Only set error_type for non-success outcomes
             let db_error_type: Option<String> = if outcome == "success" {
                 None
@@ -306,9 +319,11 @@ impl TaskRunner {
                 Some(outcome.to_string())
             };
 
-            // Read cost data from sidecar
-            let usage = sidecar::get_token_usage(task_id);
-            let cost = sidecar::get_cost_estimate(task_id);
+            // Read cost data from store
+            let usage =
+                crate::engine::cleanup::get_token_usage(&self.store, &self.repo, task_id).await;
+            let cost =
+                crate::engine::cleanup::get_cost_estimate(&self.store, &self.repo, task_id).await;
             let input_tokens = if usage.input_tokens > 0 {
                 Some(usage.input_tokens as i64)
             } else {
@@ -354,7 +369,7 @@ impl TaskRunner {
                 total_cost_usd: total_cost,
             };
 
-            if let Err(e) = db.insert_task_metric(metric).await {
+            if let Err(e) = store.insert_task_metric(&metric).await {
                 tracing::error!(task_id, ?e, "failed to record task metrics");
             }
         }
@@ -379,14 +394,42 @@ impl TaskRunner {
         // Record start time for metrics (before any work begins)
         let started_at = Utc::now();
 
-        // Store task info in sidecar for prompt building
-        sidecar::set(
+        // Store task info for prompt building
+        crate::engine::cleanup::store_set(
+            &self.store,
+            &self.repo,
             task_id,
-            &[
-                format!("title={}", task.title),
-                format!("body={}", task.body),
-            ],
-        )?;
+            &[], // title/body already in store tasks table
+        )
+        .await;
+
+        // Record run start in task_runs audit trail
+        let run_audit_id = if let Some(ref store) = self.store {
+            let attempt: i32 = self
+                .get_field(task_id, "attempts")
+                .await
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+                + 1;
+            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, task_id).await {
+                store
+                    .start_run(&crate::store::StartRun {
+                        task_id: store_id,
+                        attempt,
+                        run_type: "agent",
+                        agent: &agent_name,
+                        model: model.unwrap_or(""),
+                        command: &format!("{} --model {}", agent_name, model.unwrap_or("default")),
+                        prompt: &task.body,
+                    })
+                    .await
+                    .ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Run the task
         let run_status = self.run(task_id, agent, model, Some(&**backend)).await?;
@@ -399,7 +442,10 @@ impl TaskRunner {
         let status = run_status.unwrap();
 
         // Process delegations if the agent requested subtasks
-        let delegations_raw = sidecar::get(task_id, "delegations").unwrap_or_default();
+        let delegations_raw = self
+            .get_field(task_id, "delegations")
+            .await
+            .unwrap_or_default();
         if !delegations_raw.is_empty() {
             if let Ok(delegations) =
                 serde_json::from_str::<Vec<crate::parser::Delegation>>(&delegations_raw)
@@ -407,15 +453,24 @@ impl TaskRunner {
                 if !delegations.is_empty() {
                     self.process_delegations(task, &delegations, backend)
                         .await?;
-                    // Clear delegations from sidecar after processing
-                    sidecar::set(task_id, &["delegations=".to_string()])?;
+                    // Clear delegations after processing
+                    crate::engine::cleanup::store_set(
+                        &self.store,
+                        &self.repo,
+                        task_id,
+                        &[("delegations", serde_json::json!([]))],
+                    )
+                    .await;
                 }
             }
         }
 
         // Post result to GitHub
-        let summary = sidecar::get(task_id, "summary").unwrap_or_default();
-        let last_error = sidecar::get(task_id, "last_error").unwrap_or_default();
+        let summary = self.get_field(task_id, "summary").await.unwrap_or_default();
+        let last_error = self
+            .get_field(task_id, "last_error")
+            .await
+            .unwrap_or_default();
 
         // Determine weight signal based on outcome
         let is_rate_limited = last_error.contains("usage")
@@ -437,8 +492,9 @@ impl TaskRunner {
 
         // Record metrics
         {
-            let attempts: u32 = sidecar::get(task_id, "attempts")
-                .ok()
+            let attempts: u32 = self
+                .get_field(task_id, "attempts")
+                .await
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             self.record_metrics(
@@ -458,10 +514,43 @@ impl TaskRunner {
             .await;
         }
 
+        // Complete run in task_runs audit trail
+        if let Some(run_id) = run_audit_id {
+            if let Some(ref store) = self.store {
+                let duration = (Utc::now() - started_at).num_milliseconds() as f64 / 1000.0;
+                let usage =
+                    crate::engine::cleanup::get_token_usage(&self.store, &self.repo, task_id).await;
+                let outcome = if status == "done" || status == "in_progress" {
+                    "success"
+                } else if is_rate_limited {
+                    "rate_limit"
+                } else {
+                    "failed"
+                };
+                let _ = store
+                    .complete_run(&crate::store::CompleteRun {
+                        run_id,
+                        exit_code: None, // TODO: capture from runner
+                        stdout: &summary,
+                        stderr: "",
+                        parsed: "",
+                        outcome,
+                        error: &last_error,
+                        tokens: crate::store::RunTokenUsage {
+                            input_tokens: usage.input_tokens as i64,
+                            output_tokens: usage.output_tokens as i64,
+                            total_cost_usd: 0.0, // computed by store
+                            duration_secs: duration,
+                        },
+                    })
+                    .await;
+            }
+        }
+
         // If task was rerouted (status=new after run), update GitHub agent label
         // so the router doesn't re-route back to the same failed agent.
         if status == "new" {
-            let new_agent = sidecar::get(task_id, "agent").unwrap_or_default();
+            let new_agent = self.get_field(task_id, "agent").await.unwrap_or_default();
             if !new_agent.is_empty() && new_agent != agent_name {
                 // Remove old agent label, add new one
                 let old_label = format!("agent:{agent_name}");
@@ -492,11 +581,36 @@ impl TaskRunner {
             "new" => Status::New, // Rerouted
             _ => Status::NeedsReview,
         };
-        backend.update_status(&task.id, new_status).await?;
+        // Store-first: update SQLite (must succeed), then mirror to backend.
+        if let Some(ref store) = self.store {
+            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &task.id.0).await {
+                store
+                    .update_status(
+                        store_id,
+                        crate::engine::tasks::status_to_task_status(new_status),
+                    )
+                    .await
+                    .context("store-first status update failed in runner")?;
+            }
+        }
+        if let Err(e) = backend.update_status(&task.id, new_status).await {
+            tracing::warn!(
+                task_id,
+                ?new_status,
+                err = %e,
+                "failed to mirror runner status to backend — store is authoritative"
+            );
+        }
 
         // Check for budget warnings and append to comment
-        let budget_warning = sidecar::get(task_id, "budget_warning").unwrap_or_default();
-        let budget_exceeded = sidecar::get(task_id, "budget_exceeded").unwrap_or_default();
+        let budget_warning = self
+            .get_field(task_id, "budget_warning")
+            .await
+            .unwrap_or_default();
+        let budget_exceeded = self
+            .get_field(task_id, "budget_exceeded")
+            .await
+            .unwrap_or_default();
 
         // Post comment (scan for secrets before posting to GitHub)
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
@@ -510,8 +624,10 @@ impl TaskRunner {
 
         // Append budget warnings to the GitHub comment
         if budget_exceeded == "true" {
-            let cost = sidecar::get_cost_estimate(task_id);
-            let total_tokens = sidecar::get_total_tokens(task_id);
+            let cost =
+                crate::engine::cleanup::get_cost_estimate(&self.store, &self.repo, task_id).await;
+            let total_tokens =
+                crate::engine::cleanup::get_total_tokens(&self.store, &self.repo, task_id).await;
             raw_comment.push_str(&format!(
                 "\n\n> **Budget exceeded**: {} tokens used (${:.4}). Task paused for review.",
                 total_tokens, cost.total_cost_usd
@@ -594,8 +710,22 @@ impl TaskRunner {
             }
         }
 
-        // Mark parent as blocked
-        backend.update_status(parent_id, Status::Blocked).await?;
+        // Mark parent as blocked — store-first, then mirror to backend.
+        if let Some(ref store) = self.store {
+            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &parent_id.0).await {
+                store
+                    .update_status(store_id, crate::store::TaskStatus::Blocked)
+                    .await
+                    .context("store-first: failed to block parent in store")?;
+            }
+        }
+        if let Err(e) = backend.update_status(parent_id, Status::Blocked).await {
+            tracing::warn!(
+                parent = parent_id.0,
+                err = %e,
+                "failed to mirror blocked status to backend — store is authoritative"
+            );
+        }
 
         // Post summary comment on parent
         let summary = delegations

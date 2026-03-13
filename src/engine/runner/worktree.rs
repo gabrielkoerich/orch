@@ -4,8 +4,9 @@
 //! Worktrees are stored at `~/.orch/worktrees/<project>/<branch>/`.
 
 use crate::cmd::CommandErrorContext;
-use crate::sidecar;
+use crate::store::TaskStore;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::process::Command;
 
 /// Result of worktree setup.
@@ -139,6 +140,8 @@ pub async fn setup_worktree(
     task_id: &str,
     title: &str,
     project_dir: &Path,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
 ) -> anyhow::Result<WorktreeSetup> {
     // Resolve to main repo (avoid nested worktrees)
     let main_dir = resolve_main_repo(project_dir).await;
@@ -156,9 +159,11 @@ pub async fn setup_worktree(
         .join(&project_name);
     std::fs::create_dir_all(&worktrees_base)?;
 
-    // Check if we have a saved branch/worktree in sidecar
-    let saved_branch = sidecar::get(task_id, "branch").ok();
-    let saved_worktree = sidecar::get(task_id, "worktree").ok();
+    // Check if we have a saved branch/worktree in store
+    let saved_branch =
+        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "branch").await;
+    let saved_worktree =
+        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "worktree").await;
 
     let (branch_name_str, worktree_dir) = if let Some(ref saved) = saved_branch {
         if !saved.is_empty() {
@@ -307,14 +312,20 @@ pub async fn setup_worktree(
         }
     }
 
-    // Save worktree info to sidecar
-    sidecar::set(
+    // Save worktree info to store
+    crate::engine::cleanup::store_set(
+        store,
+        repo,
         task_id,
         &[
-            format!("worktree={}", worktree_dir.display()),
-            format!("branch={branch_name_str}"),
+            (
+                "worktree",
+                serde_json::json!(worktree_dir.display().to_string()),
+            ),
+            ("branch", serde_json::json!(branch_name_str)),
         ],
-    )?;
+    )
+    .await;
 
     tracing::info!(
         task_id,
