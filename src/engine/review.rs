@@ -24,12 +24,14 @@ use crate::config;
 use crate::engine::runner;
 use crate::github::http::GhHttp;
 use crate::github::types::{GitHubReviewComment, PullRequestReview};
-use crate::sidecar;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::cleanup::cleanup_task_worktree;
+use super::cleanup::{
+    cleanup_task_worktree, store_and_sidecar_increment, store_and_sidecar_reset_counters,
+    store_and_sidecar_set,
+};
 use super::router::Router;
 use super::tasks::TaskManager;
 use super::EngineConfig;
@@ -160,17 +162,8 @@ pub(crate) async fn review_open_prs(
                     } else {
                         // Reset per-cycle counters so stale counts from the previous cycle
                         // don't prematurely block the new attempt.
-                        if let Err(e) = sidecar::set(
-                            task_id,
-                            &[
-                                "review_agent_failures=0".to_string(),
-                                "merge_conflict_retries=0".to_string(),
-                                "pr_create_failures=0".to_string(),
-                                "ci_merge_failures=0".to_string(),
-                            ],
-                        ) {
-                            tracing::warn!(task_id, err = %e, "failed to reset per-cycle counters on no-PR re-dispatch");
-                        }
+                        store_and_sidecar_reset_counters(&Some(Arc::clone(store)), repo, task_id)
+                            .await;
                     }
                 }
                 continue;
@@ -181,10 +174,15 @@ pub(crate) async fn review_open_prs(
             }
         };
 
-        // Store PR number in sidecar for follow-up tasks
-        if let Err(e) = sidecar::set(task_id, &[format!("pr_number={}", pr_number)]) {
-            tracing::warn!(task_id, err = %e, "failed to store PR number in sidecar");
-        }
+        // Store PR number in sidecar + store for follow-up tasks
+        store_and_sidecar_set(
+            &Some(Arc::clone(store)),
+            repo,
+            task_id,
+            &[format!("pr_number={}", pr_number)],
+            &[("pr_number", serde_json::json!(pr_number as i64))],
+        )
+        .await;
 
         // Get the last processed review timestamp to avoid re-processing the same reviews
         let last_review_ts =
@@ -321,12 +319,13 @@ pub(crate) async fn review_open_prs(
                         retries,
                         "PR approved but has merge conflicts — re-triggering review agent to rebase"
                     );
-                    if let Err(e) = sidecar::set(
+                    store_and_sidecar_increment(
+                        &Some(Arc::clone(store)),
+                        repo,
                         task_id,
-                        &[format!("merge_conflict_retries={}", retries + 1)],
-                    ) {
-                        tracing::warn!(task_id, err = %e, "failed to update merge_conflict_retries");
-                    }
+                        "merge_conflict_retries",
+                    )
+                    .await;
                     // Set NeedsReview — next tick re-triggers review agent
                     if let Err(e) = task_manager
                         .update_task_status(&task.id, Status::NeedsReview)
@@ -470,10 +469,17 @@ pub(crate) async fn review_open_prs(
                         review_context.push('\n');
 
                         // Track the timestamp
-                        let _ = sidecar::set(
+                        store_and_sidecar_set(
+                            &Some(Arc::clone(store)),
+                            repo,
                             task_id,
                             &[format!("last_comment_review_ts={}", c.created_at)],
-                        );
+                            &[(
+                                "last_comment_review_ts",
+                                serde_json::json!(c.created_at.clone()),
+                            )],
+                        )
+                        .await;
                         break; // Only the latest
                     }
                 }
@@ -498,18 +504,31 @@ pub(crate) async fn review_open_prs(
 
         // If we have new review feedback, store it and re-dispatch the task
         if !review_context.is_empty() {
-            // Store the review context in the sidecar
-            if let Err(e) =
-                sidecar::set(task_id, &[format!("pr_review_context={}", review_context)])
-            {
-                tracing::warn!(task_id, err = %e, "failed to store pr_review_context");
-            }
+            // Store the review context in sidecar + store
+            store_and_sidecar_set(
+                &Some(Arc::clone(store)),
+                repo,
+                task_id,
+                &[format!("pr_review_context={}", review_context)],
+                &[(
+                    "pr_review_context",
+                    serde_json::json!(review_context.clone()),
+                )],
+            )
+            .await;
 
             // Update the last review timestamp
-            if let Err(e) = sidecar::set(task_id, &[format!("last_review_ts={}", latest_review_ts)])
-            {
-                tracing::warn!(task_id, err = %e, "failed to update last_review_ts");
-            }
+            store_and_sidecar_set(
+                &Some(Arc::clone(store)),
+                repo,
+                task_id,
+                &[format!("last_review_ts={}", latest_review_ts)],
+                &[(
+                    "last_review_ts",
+                    serde_json::json!(latest_review_ts.clone()),
+                )],
+            )
+            .await;
 
             if let Err(e) = task_manager
                 .update_task_status(&task.id, Status::Routed)
@@ -520,17 +539,7 @@ pub(crate) async fn review_open_prs(
                 tracing::info!(task_id, "re-dispatching task to address review feedback");
                 // Reset per-cycle counters so transient failures from the previous review
                 // cycle don't count against the budget for the next cycle.
-                if let Err(e) = sidecar::set(
-                    task_id,
-                    &[
-                        "review_agent_failures=0".to_string(),
-                        "merge_conflict_retries=0".to_string(),
-                        "pr_create_failures=0".to_string(),
-                        "ci_merge_failures=0".to_string(),
-                    ],
-                ) {
-                    tracing::warn!(task_id, err = %e, "failed to reset per-cycle counters on re-dispatch");
-                }
+                store_and_sidecar_reset_counters(&Some(Arc::clone(store)), repo, task_id).await;
             }
         }
     }
@@ -648,7 +657,15 @@ pub(crate) async fn review_and_merge(
                         // Extract PR number from URL and update sidecar so subsequent
                         // review cycles check the correct PR (not a stale pr_number).
                         if let Some(pr_num) = url.rsplit('/').next() {
-                            let _ = sidecar::set(&task.id.0, &[format!("pr_number={pr_num}")]);
+                            let pr_num_i64 = pr_num.parse::<i64>().unwrap_or(0);
+                            store_and_sidecar_set(
+                                &Some(Arc::clone(store)),
+                                repo,
+                                &task.id.0,
+                                &[format!("pr_number={pr_num}")],
+                                &[("pr_number", serde_json::json!(pr_num_i64))],
+                            )
+                            .await;
                         }
                         tracing::info!(
                             task_id = task.id.0,
@@ -689,8 +706,15 @@ pub(crate) async fn review_and_merge(
                                 // gh pr create prints the PR URL to stdout
                                 let stdout = String::from_utf8_lossy(&o.stdout);
                                 if let Some(pr_num) = stdout.trim().rsplit('/').next() {
-                                    let _ =
-                                        sidecar::set(&task.id.0, &[format!("pr_number={pr_num}")]);
+                                    let pr_num_i64 = pr_num.parse::<i64>().unwrap_or(0);
+                                    store_and_sidecar_set(
+                                        &Some(Arc::clone(store)),
+                                        repo,
+                                        &task.id.0,
+                                        &[format!("pr_number={pr_num}")],
+                                        &[("pr_number", serde_json::json!(pr_num_i64))],
+                                    )
+                                    .await;
                                 }
                                 tracing::info!(
                                     task_id = task.id.0,
@@ -709,20 +733,13 @@ pub(crate) async fn review_and_merge(
                                     stderr = %stderr,
                                     "failed to create missing PR — work may be stuck"
                                 );
-                                let failures = super::cleanup::store_or_sidecar(
-                                    store,
+                                let failures = store_and_sidecar_increment(
+                                    &Some(Arc::clone(store)),
                                     repo,
                                     &task.id.0,
                                     "pr_create_failures",
                                 )
-                                .await
-                                .and_then(|s| s.parse::<u64>().ok())
-                                .unwrap_or(0)
-                                .saturating_add(1);
-                                let _ = sidecar::set(
-                                    &task.id.0,
-                                    &[format!("pr_create_failures={failures}")],
-                                );
+                                .await;
                                 if failures >= MAX_PR_CREATE_FAILURES {
                                     return Ok(ReviewDecision::Blocked(format!(
                                         "no PR, create failed {failures} times: {stderr}"
@@ -738,20 +755,13 @@ pub(crate) async fn review_and_merge(
                                     error = %e,
                                     "failed to run gh pr create"
                                 );
-                                let failures = super::cleanup::store_or_sidecar(
-                                    store,
+                                let failures = store_and_sidecar_increment(
+                                    &Some(Arc::clone(store)),
                                     repo,
                                     &task.id.0,
                                     "pr_create_failures",
                                 )
-                                .await
-                                .and_then(|s| s.parse::<u64>().ok())
-                                .unwrap_or(0)
-                                .saturating_add(1);
-                                let _ = sidecar::set(
-                                    &task.id.0,
-                                    &[format!("pr_create_failures={failures}")],
-                                );
+                                .await;
                                 if failures >= MAX_PR_CREATE_FAILURES {
                                     return Ok(ReviewDecision::Blocked(format!(
                                         "no PR, gh error {failures} times: {e}"
@@ -1228,13 +1238,13 @@ pub(crate) async fn auto_merge_pr(
             "success" => break,
             "failure" => {
                 // CI already in terminal failure — increment counter and re-route or block
-                let ci_failures =
-                    super::cleanup::store_or_sidecar(store, repo, &task.id.0, "ci_merge_failures")
-                        .await
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0)
-                        .saturating_add(1);
-                let _ = sidecar::set(&task.id.0, &[format!("ci_merge_failures={ci_failures}")]);
+                let ci_failures = store_and_sidecar_increment(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    "ci_merge_failures",
+                )
+                .await;
                 if ci_failures >= MAX_CI_MERGE_FAILURES {
                     tracing::error!(
                         task_id = task.id.0,
@@ -1262,17 +1272,13 @@ pub(crate) async fn auto_merge_pr(
             _ => {
                 // pending — wait up to max_wait
                 if start.elapsed() >= max_wait {
-                    let ci_failures = super::cleanup::store_or_sidecar(
-                        store,
+                    let ci_failures = store_and_sidecar_increment(
+                        &Some(Arc::clone(store)),
                         repo,
                         &task.id.0,
                         "ci_merge_failures",
                     )
-                    .await
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                    let _ = sidecar::set(&task.id.0, &[format!("ci_merge_failures={ci_failures}")]);
+                    .await;
                     if ci_failures >= MAX_CI_MERGE_FAILURES {
                         tracing::error!(
                             task_id = task.id.0,
@@ -1375,10 +1381,13 @@ pub(crate) async fn auto_merge_pr(
                                 task_id = task.id.0,
                                 "rebase succeeded — retrying merge"
                             );
-                            let _ = sidecar::set(
+                            store_and_sidecar_increment(
+                                &Some(Arc::clone(store)),
+                                repo,
                                 &task.id.0,
-                                &[format!("merge_conflict_retries={}", retries + 1)],
-                            );
+                                "merge_conflict_retries",
+                            )
+                            .await;
                             // Retry merge once after successful rebase
                             if let Err(merge_err) = gh.merge_pr(repo, pr_number, true).await {
                                 tracing::error!(
@@ -1464,7 +1473,14 @@ pub(crate) async fn auto_merge_pr(
 
     // 6. Update status to done (auto-closes the issue via backend)
     // Reset CI failure counter on successful merge.
-    let _ = sidecar::set(&task.id.0, &["ci_merge_failures=0".to_string()]);
+    store_and_sidecar_set(
+        &Some(Arc::clone(store)),
+        repo,
+        &task.id.0,
+        &["ci_merge_failures=0".to_string()],
+        &[("ci_merge_failures", serde_json::json!(0))],
+    )
+    .await;
     task_manager
         .update_task_status(&task.id, Status::Done)
         .await?;
@@ -1591,14 +1607,27 @@ pub(crate) async fn handle_review_changes(
         "A reviewer has requested changes on your PR. Please address the following feedback:\n\n{}",
         comment
     );
-    let _ = sidecar::set(
+    store_and_sidecar_set(
+        &Some(Arc::clone(store)),
+        repo,
         &task.id.0,
         &[
             format!("review_cycles={}", review_cycles + 1),
             format!("review_notes={}", notes),
             format!("pr_review_context={}", review_context),
         ],
-    );
+        &[
+            (
+                "review_cycles",
+                serde_json::json!((review_cycles + 1) as i64),
+            ),
+            (
+                "pr_review_context",
+                serde_json::json!(review_context.clone()),
+            ),
+        ],
+    )
+    .await;
 
     // 4. Create a child internal task to address the review feedback.
     //    Each PR must be tied to its own issue — re-dispatching the same task can

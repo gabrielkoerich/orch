@@ -19,7 +19,7 @@ use crate::engine::jobs;
 use crate::engine::router::{get_route_result, Router};
 use crate::engine::runner::{TaskRunner, WeightSignal};
 use crate::engine::tasks::{is_internal_id, TaskManager};
-use crate::sidecar::{self, REPO_CONTEXT};
+use crate::sidecar::REPO_CONTEXT;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
@@ -63,6 +63,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
     repo: &str,
     task_manager: &Arc<TaskManager>,
     config: &EngineConfig,
+    store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
     let in_progress = task_manager
@@ -114,21 +115,22 @@ pub(crate) async fn tick_recover_stuck_tasks(
                     backend.remove_label(&task.id, label).await.ok();
                 }
             }
-            if let Err(e) = sidecar::set(
+            super::cleanup::store_and_sidecar_set(
+                &Some(Arc::clone(store)),
+                repo,
                 &task.id.0,
                 &[
                     "agent=".to_string(),
                     "model=".to_string(),
                     "route_attempts=0".to_string(),
                 ],
-            ) {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    ?e,
-                    "failed to reset sidecar for stuck task"
-                );
-                continue;
-            }
+                &[
+                    ("agent", serde_json::Value::Null),
+                    ("model", serde_json::Value::Null),
+                    ("route_attempts", serde_json::json!(0)),
+                ],
+            )
+            .await;
             if let Err(e) = backend.update_status(&task.id, Status::New).await {
                 tracing::warn!(task_id = task.id.0, ?e, "failed to reset stuck task status");
                 continue;
@@ -564,22 +566,14 @@ pub(crate) async fn tick_dispatch_tasks(
                                                     .await;
                                             }
                                             Ok(ReviewDecision::Failed(reason)) => {
-                                                let failures = super::cleanup::store_or_sidecar(
-                                                    &store_for_review,
-                                                    &repo_owned,
-                                                    &task_id_for_review,
-                                                    "review_agent_failures",
-                                                )
-                                                .await
-                                                .and_then(|s| s.parse::<u64>().ok())
-                                                .unwrap_or(0)
-                                                .saturating_add(1);
-                                                let _ = sidecar::set(
-                                                    &task_id_for_review,
-                                                    &[format!(
-                                                        "review_agent_failures={failures}"
-                                                    )],
-                                                );
+                                                let failures =
+                                                    super::cleanup::store_and_sidecar_increment(
+                                                        &Some(store_for_review.clone()),
+                                                        &repo_owned,
+                                                        &task_id_for_review,
+                                                        "review_agent_failures",
+                                                    )
+                                                    .await;
                                                 if failures >= MAX_REVIEW_AGENT_FAILURES {
                                                     tracing::error!(
                                                         task_id = task_id_for_review,
@@ -613,22 +607,14 @@ pub(crate) async fn tick_dispatch_tasks(
                                                 }
                                             }
                                             Err(e) => {
-                                                let failures = super::cleanup::store_or_sidecar(
-                                                    &store_for_review,
-                                                    &repo_owned,
-                                                    &task_id_for_review,
-                                                    "review_agent_failures",
-                                                )
-                                                .await
-                                                .and_then(|s| s.parse::<u64>().ok())
-                                                .unwrap_or(0)
-                                                .saturating_add(1);
-                                                let _ = sidecar::set(
-                                                    &task_id_for_review,
-                                                    &[format!(
-                                                        "review_agent_failures={failures}"
-                                                    )],
-                                                );
+                                                let failures =
+                                                    super::cleanup::store_and_sidecar_increment(
+                                                        &Some(store_for_review.clone()),
+                                                        &repo_owned,
+                                                        &task_id_for_review,
+                                                        "review_agent_failures",
+                                                    )
+                                                    .await;
                                                 if failures >= MAX_REVIEW_AGENT_FAILURES {
                                                     tracing::error!(
                                                         task_id = task_id_for_review,
@@ -664,15 +650,12 @@ pub(crate) async fn tick_dispatch_tasks(
                                             Ok(_) => {
                                                 // Reset all review-cycle failure counters on success
                                                 // so a subsequent retry doesn't inherit stale values.
-                                                let _ = sidecar::set(
+                                                super::cleanup::store_and_sidecar_reset_counters(
+                                                    &Some(store_for_review.clone()),
+                                                    &repo_owned,
                                                     &task_id_for_review,
-                                                    &[
-                                                        "review_agent_failures=0".to_string(),
-                                                        "merge_conflict_retries=0".to_string(),
-                                                        "pr_create_failures=0".to_string(),
-                                                        "ci_merge_failures=0".to_string(),
-                                                    ],
-                                                );
+                                                )
+                                                .await;
                                             } // Approve or RequestChanges handled inside
                                         }
                                     }));
@@ -862,7 +845,7 @@ pub(crate) async fn tick(
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
     tick_check_session_completions(tmux, repo, capture).await?;
-    tick_recover_stuck_tasks(backend, tmux, repo, task_manager, config).await?;
+    tick_recover_stuck_tasks(backend, tmux, repo, task_manager, config, store).await?;
     tick_route_tasks(backend, task_manager, router, store, repo).await?;
     tick_dispatch_tasks(
         backend,

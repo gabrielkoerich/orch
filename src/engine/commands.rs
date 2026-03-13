@@ -102,6 +102,7 @@ pub async fn scan_commands(
     backend: &Arc<dyn ExternalBackend>,
     db: &Arc<Db>,
     repo: &str,
+    store: &Option<Arc<crate::store::TaskStore>>,
 ) -> anyhow::Result<()> {
     let gh = GhHttp::new();
 
@@ -213,7 +214,7 @@ pub async fn scan_commands(
         let task_id = ExternalId(issue_number.clone());
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-        let result = execute_command(backend, &gh, repo, &task_id, &command).await;
+        let result = execute_command(backend, &gh, repo, &task_id, &command, store).await;
 
         match result {
             Ok(msg) => {
@@ -281,6 +282,7 @@ pub async fn execute_command(
     repo: &str,
     task_id: &ExternalId,
     command: &OwnerCommand,
+    store: &Option<Arc<crate::store::TaskStore>>,
 ) -> anyhow::Result<String> {
     match command {
         OwnerCommand::Retry => {
@@ -291,8 +293,8 @@ pub async fn execute_command(
                     backend.remove_label(task_id, label).await.ok();
                 }
             }
-            // Reset sidecar state (attempts + all failure counters) so the task starts fresh
-            crate::sidecar::reset_task_counters(&task_id.0);
+            // Reset sidecar + store state (attempts + all failure counters) so the task starts fresh
+            crate::engine::cleanup::store_and_sidecar_reset_counters(store, repo, &task_id.0).await;
             backend.update_status(task_id, Status::New).await?;
             Ok("`/retry` — reset attempts, cleared agent, reset to `status:new`".to_string())
         }
@@ -305,8 +307,8 @@ pub async fn execute_command(
                     backend.remove_label(task_id, label).await.ok();
                 }
             }
-            // Reset sidecar state (attempts + all failure counters) so the task starts fresh
-            crate::sidecar::reset_task_counters(&task_id.0);
+            // Reset sidecar + store state (attempts + all failure counters) so the task starts fresh
+            crate::engine::cleanup::store_and_sidecar_reset_counters(store, repo, &task_id.0).await;
             // Optionally set new agent
             if let Some(agent_name) = agent {
                 let label = format!("agent:{agent_name}");

@@ -82,6 +82,73 @@ pub(crate) async fn store_or_sidecar(
     sidecar::get(task_id, field).ok()
 }
 
+/// Dual-write: set fields in both store and sidecar.
+///
+/// Writes to sidecar first (always works), then best-effort to store.
+/// `store` may be None if the store isn't initialized yet.
+pub(crate) async fn store_and_sidecar_set(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    sidecar_fields: &[String],
+    store_fields: &[(&str, serde_json::Value)],
+) {
+    // Sidecar write (always)
+    let _ = sidecar::set(task_id, sidecar_fields);
+
+    // Store write (best-effort)
+    if let Some(ref store) = store {
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            if let Err(e) = store.set_fields(store_id, store_fields).await {
+                tracing::warn!(task_id, error = %e, "dual-write set_fields failed");
+            }
+        }
+    }
+}
+
+/// Dual-write: increment a counter in both store and sidecar.
+pub(crate) async fn store_and_sidecar_increment(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    field: &str,
+) -> u64 {
+    let current = if let Some(ref s) = store {
+        store_or_sidecar(s, repo, task_id, field)
+            .await
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        sidecar::get_u64(task_id, field)
+    };
+    let new_val = current.saturating_add(1);
+
+    let _ = sidecar::set(task_id, &[format!("{field}={new_val}")]);
+
+    if let Some(ref store) = store {
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            let _ = store.increment(store_id, field).await;
+        }
+    }
+
+    new_val
+}
+
+/// Dual-write: reset all task counters in both store and sidecar.
+pub(crate) async fn store_and_sidecar_reset_counters(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) {
+    sidecar::reset_task_counters(task_id);
+
+    if let Some(ref store) = store {
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            let _ = store.reset_counters(store_id).await;
+        }
+    }
+}
+
 /// Options controlling the worktree janitor.
 #[derive(Debug, Clone)]
 pub struct JanitorOptions {

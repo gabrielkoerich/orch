@@ -55,6 +55,14 @@ use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 
 use crate::backends::Status;
 
+/// Lightweight reference tuple for channel message handling.
+type EngineRef = (
+    String,
+    Arc<dyn ExternalBackend>,
+    Arc<TaskManager>,
+    Option<Arc<TaskStore>>,
+);
+
 /// Per-project engine state.
 ///
 /// Each project has its own backend, task runner, and task manager,
@@ -414,9 +422,16 @@ pub async fn serve() -> anyhow::Result<()> {
     let capture_for_messages = capture_for_tick.clone();
     let channels_for_messages = channel_registry.clone();
     // Lightweight engine references for command execution and task creation
-    let engine_refs: Vec<(String, Arc<dyn ExternalBackend>, Arc<TaskManager>)> = project_engines
+    let engine_refs: Vec<EngineRef> = project_engines
         .iter()
-        .map(|e| (e.repo.clone(), e.backend.clone(), e.task_manager.clone()))
+        .map(|e| {
+            (
+                e.repo.clone(),
+                e.backend.clone(),
+                e.task_manager.clone(),
+                Some(e.store.clone()),
+            )
+        })
         .collect();
     for mut rx in channel_receivers {
         let transport = transport_for_messages.clone();
@@ -1109,7 +1124,7 @@ async fn handle_channel_message(
     _tmux: &Arc<TmuxManager>,
     capture: &Arc<CaptureService>,
     channels: &Arc<ChannelRegistry>,
-    engine_refs: &[(String, Arc<dyn ExternalBackend>, Arc<TaskManager>)],
+    engine_refs: &[EngineRef],
 ) {
     use crate::backends::ExternalId;
     use crate::channels::stream::fanout_output;
@@ -1126,10 +1141,11 @@ async fn handle_channel_message(
             if body.starts_with('/') {
                 // Parse slash command and execute it on the bound task
                 if let Some(cmd) = parse_command(&body) {
-                    if let Some((repo, backend, _)) = engine_refs.first() {
+                    if let Some((repo, backend, _, store)) = engine_refs.first() {
                         let gh = GhHttp::new();
                         let ext_id = ExternalId(task_id.clone());
-                        let result = execute_command(backend, &gh, repo, &ext_id, &cmd).await;
+                        let result =
+                            execute_command(backend, &gh, repo, &ext_id, &cmd, store).await;
                         let reply = match result {
                             Ok(r) => r,
                             Err(e) => format!("Command `{cmd}` failed: {e}"),
@@ -1154,7 +1170,7 @@ async fn handle_channel_message(
             // /status is not in OwnerCommand — handle it specially
             if cmd_str == "/status" || cmd_str.starts_with("/status ") {
                 let mut lines = vec!["**Active tasks:**".to_string()];
-                for (repo, _, task_manager) in engine_refs {
+                for (repo, _, task_manager, _) in engine_refs {
                     match task_manager
                         .list_external_by_status(Status::InProgress)
                         .await
@@ -1192,7 +1208,7 @@ async fn handle_channel_message(
             let thread_id = msg.thread_id.clone();
 
             // Pick the first configured project for new tasks from channels
-            if let Some((repo, _, task_manager)) = engine_refs.first() {
+            if let Some((repo, _, task_manager, _)) = engine_refs.first() {
                 let title = if msg.body.len() > 80 {
                     format!("{}…", &msg.body[..80])
                 } else {

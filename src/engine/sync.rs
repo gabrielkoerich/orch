@@ -15,7 +15,7 @@ use crate::config;
 use crate::db::{Db, TaskStatus};
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
-use crate::sidecar::{self, REPO_CONTEXT};
+use crate::sidecar::REPO_CONTEXT;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -156,17 +156,13 @@ pub(crate) async fn sync_tick(
                         ReviewOutcome::Block
                     }
                     Ok(ReviewDecision::Failed(reason)) => {
-                        let failures = super::cleanup::store_or_sidecar(
-                            &store_c,
+                        let failures = super::cleanup::store_and_sidecar_increment(
+                            &Some(store_c.clone()),
                             &repo_s,
                             &tid,
                             "review_agent_failures",
                         )
-                        .await
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0)
-                        .saturating_add(1);
-                        let _ = sidecar::set(&tid, &[format!("review_agent_failures={failures}")]);
+                        .await;
                         if failures >= MAX_REVIEW_AGENT_FAILURES {
                             tracing::error!(
                                 task_id = tid,
@@ -186,17 +182,13 @@ pub(crate) async fn sync_tick(
                         }
                     }
                     Err(e) => {
-                        let failures = super::cleanup::store_or_sidecar(
-                            &store_c,
+                        let failures = super::cleanup::store_and_sidecar_increment(
+                            &Some(store_c.clone()),
                             &repo_s,
                             &tid,
                             "review_agent_failures",
                         )
-                        .await
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0)
-                        .saturating_add(1);
-                        let _ = sidecar::set(&tid, &[format!("review_agent_failures={failures}")]);
+                        .await;
                         if failures >= MAX_REVIEW_AGENT_FAILURES {
                             tracing::error!(
                                 task_id = tid,
@@ -216,15 +208,12 @@ pub(crate) async fn sync_tick(
                         }
                     }
                     Ok(_) => {
-                        let _ = sidecar::set(
+                        super::cleanup::store_and_sidecar_reset_counters(
+                            &Some(store_c.clone()),
+                            &repo_s,
                             &tid,
-                            &[
-                                "review_agent_failures=0".to_string(),
-                                "merge_conflict_retries=0".to_string(),
-                                "pr_create_failures=0".to_string(),
-                                "ci_merge_failures=0".to_string(),
-                            ],
-                        );
+                        )
+                        .await;
                         ReviewOutcome::Ok
                     }
                 };
@@ -304,9 +293,14 @@ pub(crate) async fn sync_tick(
                 // Reset the failure counter: stale-session recovery is an infrastructure
                 // event (tmux crash, service restart) not a genuine agent parse failure.
                 // Keeping the counter would unfairly consume the budget for the next cycle.
-                if let Err(e) = sidecar::set(&task.id.0, &["review_agent_failures=0".to_string()]) {
-                    tracing::warn!(task_id = %task.id.0, err = %e, "failed to reset review_agent_failures on stale-session recovery");
-                }
+                super::cleanup::store_and_sidecar_set(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    &["review_agent_failures=0".to_string()],
+                    &[("review_agent_failures", serde_json::json!(0))],
+                )
+                .await;
                 if let Err(e) = task_manager
                     .update_task_status(&task.id, Status::NeedsReview)
                     .await
@@ -318,7 +312,9 @@ pub(crate) async fn sync_tick(
     }
 
     // 6. Scan for owner /slash commands in issue comments
-    if let Err(e) = super::commands::scan_commands(backend, db, repo).await {
+    if let Err(e) =
+        super::commands::scan_commands(backend, db, repo, &Some(Arc::clone(store))).await
+    {
         tracing::warn!(err = %e, "owner command scan failed");
     }
 
