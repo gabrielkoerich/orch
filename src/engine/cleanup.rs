@@ -357,7 +357,10 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
                     "closed issue with stale status label — reconciling to done and cleaning up"
                 );
                 // Reconcile: update the status label so other flows stay consistent.
-                if let Err(e) = backend.update_status(&task.id, Status::Done).await {
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::Done)
+                    .await
+                {
                     tracing::warn!(
                         task_id = task.id.0,
                         err = %e,
@@ -725,6 +728,7 @@ pub(crate) async fn check_merged_prs(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     store: &Arc<TaskStore>,
+    task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
     // Read from the store first; fall back to backend if the store has no data.
     let in_review_tasks = if store.has_tasks(repo).await {
@@ -777,7 +781,7 @@ pub(crate) async fn check_merged_prs(
 
                 // Update status to done
                 let id = ExternalId(task_id.clone());
-                if let Err(e) = backend.update_status(&id, Status::Done).await {
+                if let Err(e) = task_manager.update_task_status(&id, Status::Done).await {
                     tracing::warn!(task_id, err = %e, "failed to update status to done");
                     continue;
                 }

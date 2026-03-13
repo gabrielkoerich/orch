@@ -1141,11 +1141,12 @@ async fn handle_channel_message(
             if body.starts_with('/') {
                 // Parse slash command and execute it on the bound task
                 if let Some(cmd) = parse_command(&body) {
-                    if let Some((repo, backend, _, store)) = engine_refs.first() {
+                    if let Some((repo, backend, task_manager, store)) = engine_refs.first() {
                         let gh = GhHttp::new();
                         let ext_id = ExternalId(task_id.clone());
                         let result =
-                            execute_command(backend, &gh, repo, &ext_id, &cmd, store).await;
+                            execute_command(backend, &gh, repo, &ext_id, &cmd, store, task_manager)
+                                .await;
                         let reply = match result {
                             Ok(r) => r,
                             Err(e) => format!("Command `{cmd}` failed: {e}"),

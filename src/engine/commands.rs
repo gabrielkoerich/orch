@@ -124,6 +124,7 @@ pub async fn scan_commands(
     db: &Arc<Db>,
     repo: &str,
     store: &Option<Arc<crate::store::TaskStore>>,
+    task_manager: &Arc<crate::engine::tasks::TaskManager>,
 ) -> anyhow::Result<()> {
     let gh = GhHttp::new();
 
@@ -235,7 +236,8 @@ pub async fn scan_commands(
         let task_id = ExternalId(issue_number.clone());
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-        let result = execute_command(backend, &gh, repo, &task_id, &command, store).await;
+        let result =
+            execute_command(backend, &gh, repo, &task_id, &command, store, task_manager).await;
 
         match result {
             Ok(msg) => {
@@ -300,6 +302,7 @@ pub async fn execute_command(
     task_id: &ExternalId,
     command: &OwnerCommand,
     store: &Option<Arc<crate::store::TaskStore>>,
+    task_manager: &Arc<crate::engine::tasks::TaskManager>,
 ) -> anyhow::Result<String> {
     match command {
         OwnerCommand::Retry => {
@@ -312,7 +315,9 @@ pub async fn execute_command(
             }
             // Reset store state (attempts + all failure counters) so the task starts fresh
             crate::engine::cleanup::store_reset_counters(store, repo, &task_id.0).await;
-            backend.update_status(task_id, Status::New).await?;
+            task_manager
+                .update_task_status(task_id, Status::New)
+                .await?;
             Ok("`/retry` — reset attempts, cleared agent, reset to `status:new`".to_string())
         }
 
@@ -331,7 +336,9 @@ pub async fn execute_command(
                 let label = format!("agent:{agent_name}");
                 backend.set_labels(task_id, &[label]).await?;
             }
-            backend.update_status(task_id, Status::New).await?;
+            task_manager
+                .update_task_status(task_id, Status::New)
+                .await?;
             match agent {
                 Some(a) => Ok(format!(
                     "`/reroute {a}` — cleared agent, reset attempts, forced `agent:{a}`, reset to `status:new`"
@@ -343,13 +350,17 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Close => {
-            backend.update_status(task_id, Status::Done).await?;
+            task_manager
+                .update_task_status(task_id, Status::Done)
+                .await?;
             gh.close_issue(repo, &task_id.0).await?;
             Ok("`/close` — marked `status:done` and closed issue".to_string())
         }
 
         OwnerCommand::Block(reason) => {
-            backend.update_status(task_id, Status::Blocked).await?;
+            task_manager
+                .update_task_status(task_id, Status::Blocked)
+                .await?;
             match reason {
                 Some(r) => Ok(format!("`/block` — marked `status:blocked`: {r}")),
                 None => Ok("`/block` — marked `status:blocked`".to_string()),
@@ -357,12 +368,16 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Unblock => {
-            backend.update_status(task_id, Status::New).await?;
+            task_manager
+                .update_task_status(task_id, Status::New)
+                .await?;
             Ok("`/unblock` — marked `status:new`, will re-dispatch".to_string())
         }
 
         OwnerCommand::Review => {
-            backend.update_status(task_id, Status::NeedsReview).await?;
+            task_manager
+                .update_task_status(task_id, Status::NeedsReview)
+                .await?;
             Ok(
                 "`/review` — set `status:needs_review`, review agent will pick up on next tick"
                     .to_string(),

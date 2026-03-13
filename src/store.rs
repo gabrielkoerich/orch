@@ -5403,7 +5403,11 @@ mod tests {
         };
         store.start_run(&review_run).await.unwrap();
 
-        let last_review = store.get_last_run(task_id, "review").await.unwrap().unwrap();
+        let last_review = store
+            .get_last_run(task_id, "review")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(last_review.agent, "codex");
         assert_eq!(last_review.run_type, "review");
 
@@ -5421,7 +5425,10 @@ mod tests {
             .create_internal("owner/repo", "task", "body", "manual", "")
             .await
             .unwrap();
-        store.update_status(task_id, TaskStatus::Done).await.unwrap();
+        store
+            .update_status(task_id, TaskStatus::Done)
+            .await
+            .unwrap();
         // Backdate the task so it appears old
         sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
             .bind(task_id)
@@ -5452,7 +5459,10 @@ mod tests {
             .create_internal("owner/repo", "task", "body", "manual", "")
             .await
             .unwrap();
-        store.update_status(task_id, TaskStatus::Done).await.unwrap();
+        store
+            .update_status(task_id, TaskStatus::Done)
+            .await
+            .unwrap();
         // Task stays with recent updated_at (default = now)
 
         let run = StartRun {

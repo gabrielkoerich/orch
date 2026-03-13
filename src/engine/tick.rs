@@ -126,7 +126,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 ],
             )
             .await;
-            if let Err(e) = backend.update_status(&task.id, Status::New).await {
+            if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
                 tracing::warn!(task_id = task.id.0, ?e, "failed to reset stuck task status");
                 continue;
             }
@@ -264,7 +264,10 @@ pub(crate) async fn tick_route_tasks(
                     }
 
                     // Transition to routed
-                    if let Err(e) = backend.update_status(&task.id, Status::Routed).await {
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::Routed)
+                        .await
+                    {
                         tracing::warn!(task_id = task.id.0, ?e, "failed to set status:routed");
                     }
                 }
@@ -407,13 +410,9 @@ pub(crate) async fn tick_dispatch_tasks(
 
         // Mark in_progress BEFORE spawning to prevent double dispatch.
         let task_id = task.id.0.clone();
-        let set_in_progress_result = if is_internal_id(&task_id) {
-            task_manager
-                .update_task_status(&task.id, Status::InProgress)
-                .await
-        } else {
-            backend.update_status(&task.id, Status::InProgress).await
-        };
+        let set_in_progress_result = task_manager
+            .update_task_status(&task.id, Status::InProgress)
+            .await;
         if let Err(e) = set_in_progress_result {
             tracing::error!(task_id, ?e, "failed to set in_progress, skipping dispatch");
             drop(permit);
@@ -783,7 +782,7 @@ pub(crate) async fn tick_unblock_parents(
                 children = children.len(),
                 "all children done, unblocking parent"
             );
-            if let Err(e) = backend.update_status(&task.id, Status::New).await {
+            if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
                 tracing::warn!(task_id = task.id.0, ?e, "failed to unblock parent");
             }
         }

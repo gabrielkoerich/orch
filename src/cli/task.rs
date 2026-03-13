@@ -1,16 +1,43 @@
-use crate::backends::{ExternalId, Status};
+use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cli::init_task_manager;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::cleanup as store_helpers;
 use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
-use crate::engine::tasks::{parse_internal_id, CreateTaskRequest, Task, TaskFilter, TaskType};
+use crate::engine::tasks::{
+    parse_internal_id, status_to_task_status, CreateTaskRequest, Task, TaskFilter, TaskType,
+};
 use crate::home;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use std::sync::Arc;
+
+/// Store-first status update for CLI: updates SQLite first, then mirrors to backend.
+async fn update_status_store_first(
+    store: &Option<Arc<TaskStore>>,
+    backend: &Arc<dyn ExternalBackend>,
+    repo: &str,
+    id: &ExternalId,
+    status: Status,
+) -> anyhow::Result<()> {
+    let db_status = status_to_task_status(status);
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, &id.0).await {
+            s.update_status(store_id, db_status).await?;
+        }
+    }
+    if let Err(e) = backend.update_status(id, status).await {
+        tracing::warn!(
+            task_id = id.0,
+            ?status,
+            err = %e,
+            "failed to mirror status to backend — store is authoritative"
+        );
+    }
+    Ok(())
+}
 
 /// List tasks with optional filters.
 pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Result<()> {
@@ -336,7 +363,7 @@ pub async fn route(id: i64) -> anyhow::Result<()> {
         format!("complexity:{}", result.complexity),
     ];
     backend.set_labels(&ext_id, &labels).await?;
-    backend.update_status(&ext_id, Status::Routed).await?;
+    update_status_store_first(&Some(store), &backend, &repo, &ext_id, Status::Routed).await?;
 
     println!(
         "Routed task #{} → {} (complexity: {}, reason: {})",
@@ -390,7 +417,14 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 
     // Mark in progress
     let ext_id = ExternalId(task_id.clone());
-    backend.update_status(&ext_id, Status::InProgress).await?;
+    update_status_store_first(
+        &Some(store.clone()),
+        &backend,
+        &repo,
+        &ext_id,
+        Status::InProgress,
+    )
+    .await?;
 
     // Run via TaskRunner
     let runner = TaskRunner::new(repo);
@@ -452,7 +486,7 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
     crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id.0).await;
 
     // Reset to new
-    backend.update_status(&ext_id, Status::New).await?;
+    update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
 
     println!(
         "Task #{} reset to new (attempts reset, will be re-routed)",
@@ -488,7 +522,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
         let mut external_count = 0;
         for task in blocked.iter().chain(needs_review.iter()) {
             crate::engine::cleanup::store_reset_counters(&store, &repo, &task.id.0).await;
-            backend.update_status(&task.id, Status::New).await?;
+            update_status_store_first(&store, &backend, &repo, &task.id, Status::New).await?;
             external_count += 1;
         }
 
@@ -555,7 +589,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
     let ext_id = ExternalId(id.to_string());
     crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id.0).await;
-    backend.update_status(&ext_id, Status::New).await?;
+    update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
     println!("Unblocked task #{} (attempts reset)", id);
 
     Ok(())

@@ -304,18 +304,26 @@ impl TaskManager {
             return Ok(());
         }
 
-        // External tasks: update backend + mirror to store
-        let result = self.backend.update_status(id, status).await;
-
-        if result.is_ok() {
-            if let Some(ref store) = self.store {
-                if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &id.0).await {
-                    let _ = store.update_status(store_id, task_status).await;
-                }
+        // External tasks: store-first, then mirror to backend.
+        // SQLite is the source of truth; backend sync is best-effort.
+        if let Some(ref store) = self.store {
+            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &id.0).await {
+                store.update_status(store_id, task_status).await?;
             }
         }
 
-        result
+        // Mirror to backend (GitHub labels). Log failure but don't fail the operation
+        // since the store already has the correct status.
+        if let Err(e) = self.backend.update_status(id, status).await {
+            tracing::warn!(
+                task_id = id.0,
+                ?status,
+                err = %e,
+                "failed to mirror status to backend — store is authoritative"
+            );
+        }
+
+        Ok(())
     }
 
     /// List internal tasks by status from the store.
@@ -959,5 +967,73 @@ mod tests {
 
         let all = tm.list_all_external_tasks().await.unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    // ── store-first update_task_status ──────────────────────────────
+
+    #[tokio::test]
+    async fn update_task_status_writes_store_first_for_external() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let tm = TaskManager::with_store(
+            db,
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        );
+
+        // Upsert an external task
+        let store_id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "42",
+                title: "Test",
+                body: "",
+                author: "user",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.get(store_id).await.unwrap().status, TaskStatus::New);
+
+        // Update via task_manager — store should update first
+        let ext_id = ExternalId("42".to_string());
+        tm.update_task_status(&ext_id, Status::Routed)
+            .await
+            .unwrap();
+
+        // Store should now have Routed
+        let task = store.get(store_id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::Routed);
+    }
+
+    #[tokio::test]
+    async fn update_task_status_handles_internal_tasks() {
+        let db = Arc::new(crate::db::Db::open_memory().unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let tm = TaskManager::with_store(
+            db,
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        );
+
+        // Create an internal task
+        let store_id = store
+            .create_internal("owner/repo", "task", "body", "manual", "")
+            .await
+            .unwrap();
+
+        let internal_id = ExternalId(format!("internal:{}", store_id));
+        tm.update_task_status(&internal_id, Status::InProgress)
+            .await
+            .unwrap();
+
+        let task = store.get(store_id).await.unwrap();
+        assert_eq!(task.status, TaskStatus::InProgress);
     }
 }

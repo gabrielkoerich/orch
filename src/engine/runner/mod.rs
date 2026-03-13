@@ -595,7 +595,25 @@ impl TaskRunner {
             "new" => Status::New, // Rerouted
             _ => Status::NeedsReview,
         };
-        backend.update_status(&task.id, new_status).await?;
+        // Store-first: update SQLite, then mirror to backend.
+        if let Some(ref store) = self.store {
+            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &task.id.0).await {
+                let _ = store
+                    .update_status(
+                        store_id,
+                        crate::engine::tasks::status_to_task_status(new_status),
+                    )
+                    .await;
+            }
+        }
+        if let Err(e) = backend.update_status(&task.id, new_status).await {
+            tracing::warn!(
+                task_id,
+                ?new_status,
+                err = %e,
+                "failed to mirror runner status to backend — store is authoritative"
+            );
+        }
 
         // Check for budget warnings and append to comment
         let budget_warning = self
