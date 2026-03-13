@@ -227,6 +227,8 @@ enum Commands {
         #[command(subcommand)]
         action: WebhookAction,
     },
+    /// Migrate sidecar files and internal tasks to SQLite store
+    Migrate,
 }
 
 #[derive(Subcommand)]
@@ -651,6 +653,17 @@ async fn main() -> anyhow::Result<()> {
                 cli::webhook::status()?;
             }
         },
+        Commands::Migrate => {
+            let store = cli::init_store().await?;
+            let db = db::Db::open(&db::default_path()?)?;
+            let default_repo = config::get_current_repo().unwrap_or_default();
+            println!("Migrating sidecar files and internal tasks to SQLite store...");
+            let result = store.migrate_sidecars(&db, &default_repo).await?;
+            println!(
+                "Migration complete: {} migrated, {} skipped, {} errors",
+                result.migrated, result.skipped, result.errors
+            );
+        }
     }
 
     Ok(())

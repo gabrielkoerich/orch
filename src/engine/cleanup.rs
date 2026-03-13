@@ -42,9 +42,7 @@ pub(crate) async fn store_or_sidecar(
                 "last_comment_review_ts" if !task.last_comment_review_ts.is_empty() => {
                     Some(task.last_comment_review_ts.clone())
                 }
-                "review_cycles" if task.review_cycles > 0 => {
-                    Some(task.review_cycles.to_string())
-                }
+                "review_cycles" if task.review_cycles > 0 => Some(task.review_cycles.to_string()),
                 "merge_conflict_retries" if task.merge_conflict_retries > 0 => {
                     Some(task.merge_conflict_retries.to_string())
                 }
@@ -59,9 +57,7 @@ pub(crate) async fn store_or_sidecar(
                 }
                 "attempts" if task.attempts > 0 => Some(task.attempts.to_string()),
                 "pr_number" => task.pr_number.map(|n| n.to_string()),
-                "route_reason" if !task.route_reason.is_empty() => {
-                    Some(task.route_reason.clone())
-                }
+                "route_reason" if !task.route_reason.is_empty() => Some(task.route_reason.clone()),
                 "complexity" if !task.complexity.is_empty() => Some(task.complexity.clone()),
                 "budget_warning" if !task.budget_warning.is_empty() => {
                     Some(task.budget_warning.clone())

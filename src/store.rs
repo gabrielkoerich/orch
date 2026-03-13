@@ -1032,6 +1032,171 @@ impl TaskStore {
             completed_at: row.get("completed_at"),
         })
     }
+
+    /// Migrate sidecar JSON files into the unified tasks table.
+    ///
+    /// Walks `~/.orch/state/{owner}/{repo}/tasks/*/sidecar.json` and upserts
+    /// each into the store. Also migrates internal_tasks from the old SQLite table.
+    pub async fn migrate_sidecars(
+        &self,
+        db: &crate::db::Db,
+        default_repo: &str,
+    ) -> anyhow::Result<MigrateResult> {
+        let mut result = MigrateResult::default();
+
+        // 1. Migrate internal tasks from old SQLite table
+        // InternalTask has no repo field, so we use the provided default_repo
+        if let Ok(tasks) = db.list_all_internal_tasks().await {
+            for task in tasks {
+                if default_repo.is_empty() {
+                    result.skipped += 1;
+                    continue;
+                }
+                match self
+                    .create(&NewTask {
+                        external_id: None,
+                        repo: default_repo.to_string(),
+                        origin: "internal".to_string(),
+                        title: task.title.clone(),
+                        body: task.body.clone(),
+                        source: task.source.clone(),
+                        source_id: task.source_id.clone(),
+                        author: "".to_string(),
+                        url: "".to_string(),
+                        labels: vec![],
+                    })
+                    .await
+                {
+                    Ok(id) => {
+                        let _ = self.update_status(id, task.status).await;
+                        // Sync sidecar fields
+                        let sidecar_key = format!("internal:{}", task.id);
+                        self.sync_sidecar_to_store(id, &sidecar_key).await;
+                        result.migrated += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id = task.id, err = %e, "failed to migrate internal task");
+                        result.errors += 1;
+                    }
+                }
+            }
+        }
+
+        // 2. Walk sidecar files for external tasks
+        let state_dir = match crate::home::orch_home() {
+            Ok(h) => h.join("state"),
+            Err(_) => return Ok(result),
+        };
+
+        if !state_dir.exists() {
+            return Ok(result);
+        }
+
+        // Walk: state/{owner}/{repo}/tasks/{id}/sidecar.json
+        for owner_entry in std::fs::read_dir(&state_dir).into_iter().flatten() {
+            let owner_entry = match owner_entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !owner_entry.path().is_dir() {
+                continue;
+            }
+            let owner = owner_entry.file_name().to_string_lossy().to_string();
+            if owner.starts_with('.') || owner == "orch.log" {
+                continue;
+            }
+
+            for repo_entry in std::fs::read_dir(owner_entry.path()).into_iter().flatten() {
+                let repo_entry = match repo_entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                if !repo_entry.path().is_dir() {
+                    continue;
+                }
+                let repo_name = repo_entry.file_name().to_string_lossy().to_string();
+                let repo_slug = format!("{}/{}", owner, repo_name);
+
+                let tasks_dir = repo_entry.path().join("tasks");
+                if !tasks_dir.exists() {
+                    continue;
+                }
+
+                for task_entry in std::fs::read_dir(&tasks_dir).into_iter().flatten() {
+                    let task_entry = match task_entry {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+                    let task_id = task_entry.file_name().to_string_lossy().to_string();
+                    let sidecar_file = task_entry.path().join("sidecar.json");
+                    if !sidecar_file.exists() {
+                        continue;
+                    }
+
+                    // Read sidecar JSON
+                    let content = match std::fs::read_to_string(&sidecar_file) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            result.errors += 1;
+                            continue;
+                        }
+                    };
+                    let json: serde_json::Value = match serde_json::from_str(&content) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            result.errors += 1;
+                            continue;
+                        }
+                    };
+
+                    // Upsert into store
+                    let title = json
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&format!("Task #{}", task_id))
+                        .to_string();
+                    let body = json
+                        .get("body")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    match self
+                        .upsert_external(&UpsertExternal {
+                            repo: &repo_slug,
+                            ext_id: &task_id,
+                            title: &title,
+                            body: &body,
+                            author: "",
+                            url: "",
+                            labels: &[],
+                            origin: "github",
+                        })
+                        .await
+                    {
+                        Ok(id) => {
+                            self.sync_sidecar_to_store(id, &task_id).await;
+                            result.migrated += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(task_id, repo = repo_slug, err = %e, "failed to migrate sidecar");
+                            result.errors += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+/// Result of a sidecar migration.
+#[derive(Debug, Default)]
+pub struct MigrateResult {
+    pub migrated: usize,
+    pub skipped: usize,
+    pub errors: usize,
 }
 
 #[cfg(test)]
@@ -3313,5 +3478,68 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         // Just verify it compiles and the builder works
         let _runner = TaskRunner::new("owner/repo".to_string()).with_store(store);
+    }
+
+    #[tokio::test]
+    async fn migrate_internal_tasks_from_old_db() {
+        // Set up old rusqlite DB with internal tasks
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        db.migrate().await.unwrap();
+
+        // Create two internal tasks
+        db.create_internal_task("Task A", "Body A", "cron", "daily-a")
+            .await
+            .unwrap();
+        db.create_internal_task("Task B", "Body B", "manual", "")
+            .await
+            .unwrap();
+
+        let store = TaskStore::open_memory().await.unwrap();
+        let result = store.migrate_sidecars(&db, "owner/repo").await.unwrap();
+
+        // At least our 2 internal tasks migrated (real ~/.orch sidecars may add more)
+        assert!(
+            result.migrated >= 2,
+            "expected at least 2, got {}",
+            result.migrated
+        );
+        assert_eq!(result.skipped, 0);
+
+        // Verify the internal tasks landed in the store with correct repo scope
+        let tasks = store
+            .list_by_status("owner/repo", TaskStatus::New)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().any(|t| t.title == "Task A"));
+        assert!(tasks.iter().any(|t| t.title == "Task B"));
+        assert!(tasks.iter().all(|t| t.origin == "internal"));
+    }
+
+    #[tokio::test]
+    async fn migrate_skips_when_no_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        db.migrate().await.unwrap();
+
+        db.create_internal_task("Task X", "Body X", "cron", "x")
+            .await
+            .unwrap();
+
+        let store = TaskStore::open_memory().await.unwrap();
+        // Empty repo should cause internal task skips (sidecar walk may still find real files)
+        let result = store.migrate_sidecars(&db, "").await.unwrap();
+
+        assert_eq!(result.skipped, 1);
+        // Verify no internal-origin tasks were created (the skip worked)
+        // External sidecars from real ~/.orch may still have been migrated
+        let internal = store.list_by_status("", TaskStatus::New).await.unwrap();
+        assert!(
+            internal.is_empty(),
+            "no tasks should exist under empty repo"
+        );
     }
 }

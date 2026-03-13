@@ -187,9 +187,10 @@ pub(crate) async fn review_open_prs(
         }
 
         // Get the last processed review timestamp to avoid re-processing the same reviews
-        let last_review_ts = super::cleanup::store_or_sidecar(store, repo, task_id, "last_review_ts")
-            .await
-            .unwrap_or_default();
+        let last_review_ts =
+            super::cleanup::store_or_sidecar(store, repo, task_id, "last_review_ts")
+                .await
+                .unwrap_or_default();
 
         // Fetch PR reviews
         let reviews = match gh.get_pr_reviews(repo, pr_number).await {
@@ -290,10 +291,15 @@ pub(crate) async fn review_open_prs(
                     .unwrap_or(false);
 
                 if is_conflicting {
-                    let retries = super::cleanup::store_or_sidecar(store, repo, task_id, "merge_conflict_retries")
-                        .await
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
+                    let retries = super::cleanup::store_or_sidecar(
+                        store,
+                        repo,
+                        task_id,
+                        "merge_conflict_retries",
+                    )
+                    .await
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
                     if retries >= MAX_MERGE_CONFLICT_RETRIES {
                         tracing::error!(
                             task_id,
@@ -338,14 +344,12 @@ pub(crate) async fn review_open_prs(
                     "PR approved but not yet merged — attempting auto-merge"
                 );
                 // Get the task agent and model (store-first, sidecar fallback)
-                let task_agent =
-                    super::cleanup::store_or_sidecar(store, repo, &task.id.0, "agent")
-                        .await
-                        .unwrap_or_else(|| "orch".to_string());
-                let task_model =
-                    super::cleanup::store_or_sidecar(store, repo, &task.id.0, "model")
-                        .await
-                        .unwrap_or_else(|| "unknown".to_string());
+                let task_agent = super::cleanup::store_or_sidecar(store, repo, &task.id.0, "agent")
+                    .await
+                    .unwrap_or_else(|| "orch".to_string());
+                let task_model = super::cleanup::store_or_sidecar(store, repo, &task.id.0, "model")
+                    .await
+                    .unwrap_or_else(|| "unknown".to_string());
                 if let Err(e) = auto_merge_pr(
                     &task,
                     &branch,
@@ -549,14 +553,11 @@ pub(crate) async fn review_and_merge(
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<ReviewDecision> {
     // 2. Load worktree path, branch, agent (store-first, sidecar fallback)
-    let worktree =
-        super::cleanup::store_or_sidecar(store, repo, &task.id.0, "worktree").await;
-    let branch =
-        super::cleanup::store_or_sidecar(store, repo, &task.id.0, "branch").await;
-    let agent_summary =
-        super::cleanup::store_or_sidecar(store, repo, &task.id.0, "summary")
-            .await
-            .unwrap_or_default();
+    let worktree = super::cleanup::store_or_sidecar(store, repo, &task.id.0, "worktree").await;
+    let branch = super::cleanup::store_or_sidecar(store, repo, &task.id.0, "branch").await;
+    let agent_summary = super::cleanup::store_or_sidecar(store, repo, &task.id.0, "summary")
+        .await
+        .unwrap_or_default();
 
     let worktree_path = match worktree {
         Some(w) if !w.is_empty() => std::path::PathBuf::from(w),
@@ -708,11 +709,16 @@ pub(crate) async fn review_and_merge(
                                     stderr = %stderr,
                                     "failed to create missing PR — work may be stuck"
                                 );
-                                let failures = super::cleanup::store_or_sidecar(store, repo, &task.id.0, "pr_create_failures")
-                                    .await
-                                    .and_then(|s| s.parse::<u64>().ok())
-                                    .unwrap_or(0)
-                                    .saturating_add(1);
+                                let failures = super::cleanup::store_or_sidecar(
+                                    store,
+                                    repo,
+                                    &task.id.0,
+                                    "pr_create_failures",
+                                )
+                                .await
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0)
+                                .saturating_add(1);
                                 let _ = sidecar::set(
                                     &task.id.0,
                                     &[format!("pr_create_failures={failures}")],
@@ -732,11 +738,16 @@ pub(crate) async fn review_and_merge(
                                     error = %e,
                                     "failed to run gh pr create"
                                 );
-                                let failures = super::cleanup::store_or_sidecar(store, repo, &task.id.0, "pr_create_failures")
-                                    .await
-                                    .and_then(|s| s.parse::<u64>().ok())
-                                    .unwrap_or(0)
-                                    .saturating_add(1);
+                                let failures = super::cleanup::store_or_sidecar(
+                                    store,
+                                    repo,
+                                    &task.id.0,
+                                    "pr_create_failures",
+                                )
+                                .await
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0)
+                                .saturating_add(1);
                                 let _ = sidecar::set(
                                     &task.id.0,
                                     &[format!("pr_create_failures={failures}")],
@@ -772,9 +783,10 @@ pub(crate) async fn review_and_merge(
                     return Ok(ReviewDecision::Skipped);
                 }
 
-                let last_error = super::cleanup::store_or_sidecar(store, repo, &task.id.0, "last_error")
-                    .await
-                    .unwrap_or_default();
+                let last_error =
+                    super::cleanup::store_or_sidecar(store, repo, &task.id.0, "last_error")
+                        .await
+                        .unwrap_or_default();
                 let reason = if !agent_summary.is_empty() {
                     agent_summary.clone()
                 } else {
@@ -1250,12 +1262,16 @@ pub(crate) async fn auto_merge_pr(
             _ => {
                 // pending — wait up to max_wait
                 if start.elapsed() >= max_wait {
-                    let ci_failures =
-                        super::cleanup::store_or_sidecar(store, repo, &task.id.0, "ci_merge_failures")
-                            .await
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(0)
-                            .saturating_add(1);
+                    let ci_failures = super::cleanup::store_or_sidecar(
+                        store,
+                        repo,
+                        &task.id.0,
+                        "ci_merge_failures",
+                    )
+                    .await
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    .saturating_add(1);
                     let _ = sidecar::set(&task.id.0, &[format!("ci_merge_failures={ci_failures}")]);
                     if ci_failures >= MAX_CI_MERGE_FAILURES {
                         tracing::error!(
@@ -1301,10 +1317,11 @@ pub(crate) async fn auto_merge_pr(
         if is_conflict {
             // Merge failed due to conflicts — attempt rebase in the worktree directly.
             // Do NOT re-trigger the full review cycle; that doesn't fix the conflict.
-            let retries = super::cleanup::store_or_sidecar(store, repo, &task.id.0, "merge_conflict_retries")
-                .await
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+            let retries =
+                super::cleanup::store_or_sidecar(store, repo, &task.id.0, "merge_conflict_retries")
+                    .await
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
             if retries >= MAX_MERGE_CONFLICT_RETRIES {
                 tracing::error!(
                     task_id = task.id.0,
@@ -1331,7 +1348,8 @@ pub(crate) async fn auto_merge_pr(
             }
 
             // Try rebase in the worktree
-            let worktree_path = super::cleanup::store_or_sidecar(store, repo, &task.id.0, "worktree").await;
+            let worktree_path =
+                super::cleanup::store_or_sidecar(store, repo, &task.id.0, "worktree").await;
             if let Some(wt) = worktree_path {
                 let wt_path = std::path::PathBuf::from(&wt);
                 if wt_path.exists() {
@@ -1491,10 +1509,11 @@ pub(crate) async fn handle_review_changes(
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     // 1. Check review cycle count (max 2 review rounds)
-    let review_cycles: u32 = super::cleanup::store_or_sidecar(store, repo, &task.id.0, "review_cycles")
-        .await
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let review_cycles: u32 =
+        super::cleanup::store_or_sidecar(store, repo, &task.id.0, "review_cycles")
+            .await
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
 
     let max_cycles: u32 = config::get("workflow.max_review_cycles")
         .ok()

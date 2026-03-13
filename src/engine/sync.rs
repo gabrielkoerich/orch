@@ -156,12 +156,16 @@ pub(crate) async fn sync_tick(
                         ReviewOutcome::Block
                     }
                     Ok(ReviewDecision::Failed(reason)) => {
-                        let failures =
-                            super::cleanup::store_or_sidecar(&store_c, &repo_s, &tid, "review_agent_failures")
-                                .await
-                                .and_then(|s| s.parse::<u64>().ok())
-                                .unwrap_or(0)
-                                .saturating_add(1);
+                        let failures = super::cleanup::store_or_sidecar(
+                            &store_c,
+                            &repo_s,
+                            &tid,
+                            "review_agent_failures",
+                        )
+                        .await
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0)
+                        .saturating_add(1);
                         let _ = sidecar::set(&tid, &[format!("review_agent_failures={failures}")]);
                         if failures >= MAX_REVIEW_AGENT_FAILURES {
                             tracing::error!(
@@ -182,12 +186,16 @@ pub(crate) async fn sync_tick(
                         }
                     }
                     Err(e) => {
-                        let failures =
-                            super::cleanup::store_or_sidecar(&store_c, &repo_s, &tid, "review_agent_failures")
-                                .await
-                                .and_then(|s| s.parse::<u64>().ok())
-                                .unwrap_or(0)
-                                .saturating_add(1);
+                        let failures = super::cleanup::store_or_sidecar(
+                            &store_c,
+                            &repo_s,
+                            &tid,
+                            "review_agent_failures",
+                        )
+                        .await
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0)
+                        .saturating_add(1);
                         let _ = sidecar::set(&tid, &[format!("review_agent_failures={failures}")]);
                         if failures >= MAX_REVIEW_AGENT_FAILURES {
                             tracing::error!(

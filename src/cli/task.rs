@@ -862,11 +862,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                     for run in &runs {
                         println!(
                             "\n  Run #{} [{}] agent={} model={} outcome={}",
-                            run.attempt,
-                            run.run_type,
-                            run.agent,
-                            run.model,
-                            run.outcome,
+                            run.attempt, run.run_type, run.agent, run.model, run.outcome,
                         );
                         if let Some(code) = run.exit_code {
                             println!("    exit_code: {}", code);
@@ -877,8 +873,10 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                         if run.total_cost_usd > 0.0 {
                             println!(
                                 "    tokens: {}in/{}out  cost: ${:.6}  duration: {:.1}s",
-                                run.input_tokens, run.output_tokens,
-                                run.total_cost_usd, run.duration_secs,
+                                run.input_tokens,
+                                run.output_tokens,
+                                run.total_cost_usd,
+                                run.duration_secs,
                             );
                         }
                         println!("    started: {}", run.started_at);
