@@ -78,7 +78,7 @@ pub(crate) async fn review_open_prs(
             .filter(|t| t.origin != "internal")
             .map(crate::engine::tasks::store_task_to_external)
             .collect();
-        if store.list_all(repo).await.map_or(0, |t| t.len()) > 0 {
+        if store.has_tasks(repo).await {
             external
         } else {
             backend.list_by_status(Status::InReview).await?

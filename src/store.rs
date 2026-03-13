@@ -552,8 +552,18 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
+    /// Check whether the store has any tasks for a repo (cheap existence check).
+    pub async fn has_tasks(&self, repo: &str) -> bool {
+        sqlx::query_scalar::<_, i32>("SELECT 1 FROM tasks WHERE repo = ? LIMIT 1")
+            .bind(repo)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
     /// List all tasks for a repo, ordered by creation time descending.
-    #[allow(dead_code)]
     pub async fn list_all(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query("SELECT * FROM tasks WHERE repo = ? ORDER BY created_at DESC")
             .bind(repo)
@@ -720,12 +730,12 @@ impl TaskStore {
         );
 
         let sql = format!(
-            "UPDATE tasks SET {field} = {field} + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? RETURNING {field}"
+            "UPDATE tasks SET {field} = {field} + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? RETURNING {field} AS val"
         );
 
         let row = sqlx::query(&sql).bind(id).fetch_one(&self.pool).await?;
 
-        Ok(row.get(0))
+        Ok(row.get("val"))
     }
 
     /// Reset all failure/retry counters to zero.
@@ -5265,5 +5275,215 @@ mod tests {
             assert_eq!(period.task_count, 1);
             assert!(period.total_cost_usd > 0.0);
         }
+    }
+
+    // ── has_tasks ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn has_tasks_returns_false_for_empty_repo() {
+        let store = TaskStore::open_memory().await.unwrap();
+        assert!(!store.has_tasks("owner/repo").await);
+    }
+
+    #[tokio::test]
+    async fn has_tasks_returns_true_after_insert() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .create_internal("owner/repo", "task", "body", "manual", "")
+            .await
+            .unwrap();
+        assert!(store.has_tasks("owner/repo").await);
+        // Different repo should still be false
+        assert!(!store.has_tasks("other/repo").await);
+    }
+
+    // ── list_cleanable ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_cleanable_returns_done_with_worktree() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create_internal("owner/repo", "task", "body", "manual", "")
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Done).await.unwrap();
+        store
+            .set_fields(id, &[("worktree", serde_json::json!("/tmp/wt"))])
+            .await
+            .unwrap();
+
+        let cleanable = store.list_cleanable("owner/repo").await.unwrap();
+        assert_eq!(cleanable.len(), 1);
+        assert_eq!(cleanable[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn list_cleanable_excludes_already_cleaned() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create_internal("owner/repo", "task", "body", "manual", "")
+            .await
+            .unwrap();
+        store.update_status(id, TaskStatus::Done).await.unwrap();
+        store
+            .set_fields(id, &[("worktree", serde_json::json!("/tmp/wt"))])
+            .await
+            .unwrap();
+        store.mark_cleaned(id).await.unwrap();
+
+        let cleanable = store.list_cleanable("owner/repo").await.unwrap();
+        assert!(cleanable.is_empty());
+    }
+
+    // ── get_last_run ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_last_run_returns_most_recent() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let task_id = store
+            .create_internal("owner/repo", "task", "body", "manual", "")
+            .await
+            .unwrap();
+
+        // Create two runs
+        let run1 = StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "claude",
+            model: "sonnet",
+            command: "cmd1",
+            prompt: "p1",
+        };
+        store.start_run(&run1).await.unwrap();
+
+        let run2 = StartRun {
+            task_id,
+            attempt: 2,
+            run_type: "agent",
+            agent: "claude",
+            model: "opus",
+            command: "cmd2",
+            prompt: "p2",
+        };
+        store.start_run(&run2).await.unwrap();
+
+        let last = store.get_last_run(task_id, "agent").await.unwrap().unwrap();
+        assert_eq!(last.attempt, 2);
+        assert_eq!(last.model, "opus");
+    }
+
+    #[tokio::test]
+    async fn get_last_run_filters_by_type() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let task_id = store
+            .create_internal("owner/repo", "task", "body", "manual", "")
+            .await
+            .unwrap();
+
+        let agent_run = StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "claude",
+            model: "sonnet",
+            command: "",
+            prompt: "",
+        };
+        store.start_run(&agent_run).await.unwrap();
+
+        let review_run = StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "review",
+            agent: "codex",
+            model: "gpt-5",
+            command: "",
+            prompt: "",
+        };
+        store.start_run(&review_run).await.unwrap();
+
+        let last_review = store.get_last_run(task_id, "review").await.unwrap().unwrap();
+        assert_eq!(last_review.agent, "codex");
+        assert_eq!(last_review.run_type, "review");
+
+        // No route run exists
+        let no_route = store.get_last_run(task_id, "route").await.unwrap();
+        assert!(no_route.is_none());
+    }
+
+    // ── prune_old_runs ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn prune_old_runs_removes_completed_task_runs() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let task_id = store
+            .create_internal("owner/repo", "task", "body", "manual", "")
+            .await
+            .unwrap();
+        store.update_status(task_id, TaskStatus::Done).await.unwrap();
+        // Backdate the task so it appears old
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(task_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let run = StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "claude",
+            model: "sonnet",
+            command: "",
+            prompt: "",
+        };
+        store.start_run(&run).await.unwrap();
+
+        let pruned = store.prune_old_runs(30).await.unwrap();
+        assert_eq!(pruned, 1);
+        assert!(store.get_runs(task_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_old_runs_keeps_recent_task_runs() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let task_id = store
+            .create_internal("owner/repo", "task", "body", "manual", "")
+            .await
+            .unwrap();
+        store.update_status(task_id, TaskStatus::Done).await.unwrap();
+        // Task stays with recent updated_at (default = now)
+
+        let run = StartRun {
+            task_id,
+            attempt: 1,
+            run_type: "agent",
+            agent: "claude",
+            model: "sonnet",
+            command: "",
+            prompt: "",
+        };
+        store.start_run(&run).await.unwrap();
+
+        let pruned = store.prune_old_runs(30).await.unwrap();
+        assert_eq!(pruned, 0);
+        assert_eq!(store.get_runs(task_id).await.unwrap().len(), 1);
+    }
+
+    // ── increment named column alias ────────────────────────────────
+
+    #[tokio::test]
+    async fn increment_returns_new_value_via_named_column() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let id = store
+            .create_internal("owner/repo", "task", "body", "manual", "")
+            .await
+            .unwrap();
+
+        let v1 = store.increment(id, "attempts").await.unwrap();
+        assert_eq!(v1, 1);
+        let v2 = store.increment(id, "attempts").await.unwrap();
+        assert_eq!(v2, 2);
     }
 }

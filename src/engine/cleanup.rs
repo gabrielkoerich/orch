@@ -320,8 +320,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 ) -> anyhow::Result<()> {
     // Read done tasks from the store first; fall back to backend before first sync.
     let done_tasks = {
-        let store_populated = store.list_all(repo).await.map_or(0, |t| t.len()) > 0;
-        if store_populated {
+        if store.has_tasks(repo).await {
             store
                 .list_by_status(repo, crate::db::TaskStatus::Done)
                 .await?
@@ -728,8 +727,7 @@ pub(crate) async fn check_merged_prs(
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     // Read from the store first; fall back to backend if the store has no data.
-    let store_populated = store.list_all(repo).await.map_or(0, |t| t.len()) > 0;
-    let in_review_tasks = if store_populated {
+    let in_review_tasks = if store.has_tasks(repo).await {
         store
             .list_by_status(repo, crate::db::TaskStatus::InReview)
             .await?
@@ -740,7 +738,7 @@ pub(crate) async fn check_merged_prs(
     } else {
         backend.list_by_status(Status::InReview).await?
     };
-    let needs_review_tasks = if store_populated {
+    let needs_review_tasks = if store.has_tasks(repo).await {
         store
             .list_by_status(repo, crate::db::TaskStatus::NeedsReview)
             .await?

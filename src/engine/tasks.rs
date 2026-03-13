@@ -254,8 +254,7 @@ impl TaskManager {
                 .collect();
             // If the store has data for this repo, trust it even if empty for this status.
             // Only fall back to the backend if the store has no data at all (pre-first-sync).
-            let any_tasks_in_store = store.list_all(&self.repo).await.map_or(0, |t| t.len());
-            if any_tasks_in_store > 0 {
+            if store.has_tasks(&self.repo).await {
                 return Ok(external);
             }
         }
@@ -269,9 +268,7 @@ impl TaskManager {
         if let Some(ref store) = self.store {
             let all_new = store.list_routable(&self.repo).await?;
             let tasks: Vec<ExternalTask> = all_new.iter().map(store_task_to_external).collect();
-            // If store has any data, trust it (even empty = nothing routable)
-            let any_tasks_in_store = store.list_all(&self.repo).await.map_or(0, |t| t.len());
-            if any_tasks_in_store > 0 {
+            if store.has_tasks(&self.repo).await {
                 return Ok(tasks);
             }
         }

@@ -110,8 +110,7 @@ pub(crate) async fn sync_tick(
         // Collect all NeedsReview tasks (external + internal) from the store.
         // Falls back to backend if the store has no data yet.
         let needs_review_tasks = {
-            let store_populated = store.list_all(repo).await.map_or(0, |t| t.len()) > 0;
-            if store_populated {
+            if store.has_tasks(repo).await {
                 store
                     .list_by_status(repo, TaskStatus::NeedsReview)
                     .await
@@ -271,8 +270,7 @@ pub(crate) async fn sync_tick(
         // Detect stale InReview tasks (review agent crashed, no active tmux session).
         // Read from the store (includes both external and internal tasks).
         let in_review_tasks = {
-            let store_populated = store.list_all(repo).await.map_or(0, |t| t.len()) > 0;
-            if store_populated {
+            if store.has_tasks(repo).await {
                 store
                     .list_by_status(repo, TaskStatus::InReview)
                     .await
