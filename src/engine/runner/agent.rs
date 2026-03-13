@@ -247,8 +247,11 @@ pub fn build_system_prompt(
     _task: &crate::backends::ExternalTask,
     context: &super::context::TaskContext,
     route_result: Option<&crate::engine::router::RouteResult>,
+    default_branch: &str,
 ) -> String {
     let mut vars = HashMap::new();
+
+    vars.insert("DEFAULT_BRANCH".to_string(), default_branch.to_string());
 
     if let Some(rr) = route_result {
         vars.insert("ROLE".to_string(), rr.profile.role.clone());
@@ -377,11 +380,13 @@ pub fn build_review_prompt(
     agent_summary: &str,
     git_diff: &str,
     git_log: &str,
+    default_branch: &str,
 ) -> String {
     let mut vars = HashMap::new();
     vars.insert("TASK_ID".to_string(), task.id.0.clone());
     vars.insert("TASK_TITLE".to_string(), task.title.clone());
     vars.insert("TASK_BODY".to_string(), task.body.clone());
+    vars.insert("DEFAULT_BRANCH".to_string(), default_branch.to_string());
 
     if !agent_summary.is_empty() {
         vars.insert("AGENT_SUMMARY".to_string(), agent_summary.to_string());

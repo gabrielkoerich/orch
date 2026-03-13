@@ -144,7 +144,12 @@ pub async fn prepare_task(
     .await;
 
     // Build prompts
-    let system_prompt = agent::build_system_prompt(&pseudo_task, &ctx, route_result.as_ref());
+    let system_prompt = agent::build_system_prompt(
+        &pseudo_task,
+        &ctx,
+        route_result.as_ref(),
+        &wt.default_branch,
+    );
     let agent_message = agent::build_agent_message(&pseudo_task, &ctx, attempts);
 
     // Git identity

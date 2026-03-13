@@ -44,18 +44,18 @@ Everything outside your current working directory is **read-only**. Never `cd ..
 
 ## Workflow — CRITICAL
 
-1. **Update and rebase**: before starting any work, integrate any existing remote work on your branch, then rebase on main:
+1. **Update and rebase**: before starting any work, integrate any existing remote work on your branch, then rebase on the default branch:
    ```
    git rebase origin/$(git branch --show-current) 2>/dev/null || true
-   git rebase origin/main
+   git rebase origin/{{DEFAULT_BRANCH}}
    ```
    The orchestrator has already run `git fetch origin` (all branches) before launching you — do NOT run `git fetch` or `git pull` yourself (they will fail in sandboxed environments because they need to write outside the worktree directory). Use `git rebase origin/<branch>` instead — the remote refs are already local. If the rebase has conflicts, resolve them before proceeding.
-2. **On retry**: check `git diff main` and `git log main..HEAD` first to see what previous attempts already did. Build on existing work — do not start over. If a PR already exists, read its review comments (`gh pr view --comments`) — fix everything the reviewer asked for, rebase on main, resolve any conflicts, and make sure CI passes before pushing.
+2. **On retry**: check `git diff {{DEFAULT_BRANCH}}` and `git log {{DEFAULT_BRANCH}}..HEAD` first to see what previous attempts already did. Build on existing work — do not start over. If a PR already exists, read its review comments (`gh pr view --comments`) — fix everything the reviewer asked for, rebase on the default branch, resolve any conflicts, and make sure CI passes before pushing.
 3. **Commit step by step** as you work, not one big commit at the end. Use conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, etc.).
 4. **Lockfiles**: if you add, remove, or update dependencies, regenerate the lockfile before committing (`bun install`, `npm install`, `cargo update`, etc.). Always commit the updated lockfile with your changes.
 5. **Run CI checks locally before pushing**: look at `.github/workflows/` to see what CI runs and run those exact commands locally. Fix any failures before committing. Do NOT push code that will fail CI. If you cannot fix a failure, set status to `needs_review` and explain it.
 6. **Push**: `git push origin HEAD` after committing.
-7. **Create PR**: if no PR exists for this branch, create one with `gh pr create --base main --title "<title>" --body "<body>"`. Rules:
+7. **Create PR**: if no PR exists for this branch, create one with `gh pr create --base {{DEFAULT_BRANCH}} --title "<title>" --body "<body>"`. Rules:
    - **Title**: use the issue title or a concise description of the change.
    - **Body**: write a detailed PR description that explains the implementation. Include:
      - A summary of the approach taken (2-4 sentences explaining *what* you did and *why*)

@@ -796,8 +796,13 @@ pub(crate) async fn review_and_merge(
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
 
     // 4. Build review prompt
-    let review_prompt =
-        runner::agent::build_review_prompt(task, &agent_summary, &git_diff, &git_log);
+    let review_prompt = runner::agent::build_review_prompt(
+        task,
+        &agent_summary,
+        &git_diff,
+        &git_log,
+        &default_branch,
+    );
 
     // 5. Pick review agent via round-robin, excluding the agent that did the work
     let task_agent = sidecar::get(&task.id.0, "agent").unwrap_or_default();
