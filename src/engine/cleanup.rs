@@ -9,8 +9,70 @@ use crate::cmd::CommandErrorContext;
 use crate::db::TaskStatus;
 use crate::engine::tasks::TaskManager;
 use crate::sidecar;
+use crate::store::TaskStore;
 use std::sync::Arc;
 use tokio::process::Command;
+
+/// Try to read a task field from the store first, falling back to sidecar.
+///
+/// Supports common fields: worktree, branch, summary, agent, model, last_error,
+/// worktree_cleaned, last_review_ts, last_comment_review_ts, review_cycles,
+/// merge_conflict_retries, ci_merge_failures, pr_create_failures, attempts,
+/// pr_number, route_reason, complexity.
+pub(crate) async fn store_or_sidecar(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    field: &str,
+) -> Option<String> {
+    // Try store first
+    if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+        if let Ok(task) = store.get(store_id).await {
+            let val: Option<String> = match field {
+                "worktree" if !task.worktree.is_empty() => Some(task.worktree.clone()),
+                "branch" if !task.branch.is_empty() => Some(task.branch.clone()),
+                "summary" if !task.summary.is_empty() => Some(task.summary.clone()),
+                "agent" => task.agent.clone(),
+                "model" => task.model.clone(),
+                "last_error" if !task.last_error.is_empty() => Some(task.last_error.clone()),
+                "worktree_cleaned" => Some(task.worktree_cleaned.to_string()),
+                "last_review_ts" if !task.last_review_ts.is_empty() => {
+                    Some(task.last_review_ts.clone())
+                }
+                "last_comment_review_ts" if !task.last_comment_review_ts.is_empty() => {
+                    Some(task.last_comment_review_ts.clone())
+                }
+                "review_cycles" if task.review_cycles > 0 => {
+                    Some(task.review_cycles.to_string())
+                }
+                "merge_conflict_retries" if task.merge_conflict_retries > 0 => {
+                    Some(task.merge_conflict_retries.to_string())
+                }
+                "ci_merge_failures" if task.ci_merge_failures > 0 => {
+                    Some(task.ci_merge_failures.to_string())
+                }
+                "pr_create_failures" if task.pr_create_failures > 0 => {
+                    Some(task.pr_create_failures.to_string())
+                }
+                "review_agent_failures" if task.review_agent_failures > 0 => {
+                    Some(task.review_agent_failures.to_string())
+                }
+                "attempts" if task.attempts > 0 => Some(task.attempts.to_string()),
+                "pr_number" => task.pr_number.map(|n| n.to_string()),
+                "route_reason" if !task.route_reason.is_empty() => {
+                    Some(task.route_reason.clone())
+                }
+                "complexity" if !task.complexity.is_empty() => Some(task.complexity.clone()),
+                _ => None,
+            };
+            if val.is_some() {
+                return val;
+            }
+        }
+    }
+    // Fallback to sidecar
+    sidecar::get(task_id, field).ok()
+}
 
 /// Options controlling the worktree janitor.
 #[derive(Debug, Clone)]
@@ -68,9 +130,10 @@ pub(crate) async fn cleanup_done_worktrees(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     let opts = JanitorOptions::from_config();
-    cleanup_done_worktrees_with_opts(backend, repo, task_manager, &opts).await
+    cleanup_done_worktrees_with_opts(backend, repo, task_manager, store, &opts).await
 }
 
 /// Cleanup worktrees for completed tasks with explicit options.
@@ -82,6 +145,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<()> {
     let done_tasks = backend.list_by_status(Status::Done).await?;
@@ -150,12 +214,12 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 
     for task_id in &task_ids {
         // Skip if already cleaned
-        let worktree_cleaned = sidecar::get(task_id, "worktree_cleaned").ok();
+        let worktree_cleaned = store_or_sidecar(store, repo, task_id, "worktree_cleaned").await;
         if worktree_cleaned.as_deref() == Some("true") || worktree_cleaned.as_deref() == Some("1") {
             continue;
         }
 
-        if let Err(e) = cleanup_task_worktree_with_opts(task_id, repo, opts).await {
+        if let Err(e) = cleanup_task_worktree_with_opts(task_id, repo, store, opts).await {
             tracing::warn!(task_id, err = %e, "worktree cleanup failed for task");
         }
     }
@@ -172,22 +236,27 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 /// auto-merge flows) and must attempt immediate removal — it constructs
 /// janitor options with `ttl_hours = 0` so the janitor age guard does not
 /// postpone removing freshly-created worktrees.
-pub(crate) async fn cleanup_task_worktree(task_id: &str, repo: &str) -> anyhow::Result<()> {
+pub(crate) async fn cleanup_task_worktree(
+    task_id: &str,
+    repo: &str,
+    store: &Arc<TaskStore>,
+) -> anyhow::Result<()> {
     let opts = JanitorOptions {
         ttl_hours: 0,
         ..Default::default()
     };
-    cleanup_task_worktree_with_opts(task_id, repo, &opts).await
+    cleanup_task_worktree_with_opts(task_id, repo, store, &opts).await
 }
 
 /// Cleanup a single task's worktree and branches with explicit janitor options.
 pub(crate) async fn cleanup_task_worktree_with_opts(
     task_id: &str,
     repo: &str,
+    store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<()> {
-    let worktree = sidecar::get(task_id, "worktree").ok();
-    let branch = sidecar::get(task_id, "branch").ok();
+    let worktree = store_or_sidecar(store, repo, task_id, "worktree").await;
+    let branch = store_or_sidecar(store, repo, task_id, "branch").await;
 
     let worktree_path = worktree.as_ref().map(std::path::PathBuf::from);
 
@@ -297,9 +366,12 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             }
         }
 
-        // Mark as cleaned in sidecar
+        // Mark as cleaned in store + sidecar
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            let _ = store.mark_cleaned(store_id).await;
+        }
         if let Err(e) = sidecar::set(task_id, &["worktree_cleaned=true".to_string()]) {
-            tracing::warn!(task_id, err = %e, "failed to mark worktree_cleaned");
+            tracing::warn!(task_id, err = %e, "failed to mark worktree_cleaned in sidecar");
         }
     }
 
@@ -474,7 +546,11 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
 ///
 /// Queries status:in_review and status:needs_review tasks, checks if their PR
 /// is merged, and updates status to done if merged.
-pub(crate) async fn check_merged_prs(backend: &Arc<dyn ExternalBackend>) -> anyhow::Result<()> {
+pub(crate) async fn check_merged_prs(
+    backend: &Arc<dyn ExternalBackend>,
+    repo: &str,
+    store: &Arc<TaskStore>,
+) -> anyhow::Result<()> {
     let in_review_tasks = backend.list_by_status(Status::InReview).await?;
     let needs_review_tasks = backend.list_by_status(Status::NeedsReview).await?;
     let all_review_tasks: Vec<_> = in_review_tasks
@@ -489,9 +565,9 @@ pub(crate) async fn check_merged_prs(backend: &Arc<dyn ExternalBackend>) -> anyh
     for task in all_review_tasks {
         let task_id = &task.id.0;
 
-        // Get branch from sidecar
-        let branch = match sidecar::get(task_id, "branch") {
-            Ok(b) if !b.is_empty() => b,
+        // Get branch from store (fallback to sidecar)
+        let branch = match store_or_sidecar(store, repo, task_id, "branch").await {
+            Some(b) if !b.is_empty() => b,
             _ => {
                 tracing::debug!(task_id, "no branch info, skipping PR check");
                 continue;

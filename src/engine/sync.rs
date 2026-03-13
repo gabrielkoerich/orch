@@ -53,12 +53,12 @@ pub(crate) async fn sync_tick(
     }
 
     // 1. Cleanup worktrees for done tasks
-    if let Err(e) = cleanup_done_worktrees(backend, repo, task_manager).await {
+    if let Err(e) = cleanup_done_worktrees(backend, repo, task_manager, store).await {
         tracing::warn!(err = %e, "worktree cleanup failed");
     }
 
     // 2. Check for merged PRs (in_review → done)
-    if let Err(e) = check_merged_prs(backend).await {
+    if let Err(e) = check_merged_prs(backend, repo, store).await {
         tracing::warn!(err = %e, "PR merge check failed");
     }
 
@@ -68,7 +68,7 @@ pub(crate) async fn sync_tick(
     }
 
     // 4. Review open PRs (parse review comments, create follow-ups)
-    if let Err(e) = review_open_prs(backend, db, repo, config, task_manager).await {
+    if let Err(e) = review_open_prs(backend, db, repo, config, task_manager, store).await {
         tracing::warn!(err = %e, "PR review failed");
     }
 
@@ -127,6 +127,7 @@ pub(crate) async fn sync_tick(
             let task_c = task.clone();
             let repo_s = repo.to_string();
             let router_c = router.clone();
+            let store_c = store.clone();
             let repo_ctx = repo_s.clone();
             tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                 let tid = task_c.id.0.clone();
@@ -142,6 +143,7 @@ pub(crate) async fn sync_tick(
                     &repo_s,
                     &router_c,
                     &task_manager_c,
+                    &store_c,
                 )
                 .await
                 {
@@ -155,7 +157,11 @@ pub(crate) async fn sync_tick(
                     }
                     Ok(ReviewDecision::Failed(reason)) => {
                         let failures =
-                            sidecar::get_u64(&tid, "review_agent_failures").saturating_add(1);
+                            super::cleanup::store_or_sidecar(&store_c, &repo_s, &tid, "review_agent_failures")
+                                .await
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0)
+                                .saturating_add(1);
                         let _ = sidecar::set(&tid, &[format!("review_agent_failures={failures}")]);
                         if failures >= MAX_REVIEW_AGENT_FAILURES {
                             tracing::error!(
@@ -177,7 +183,11 @@ pub(crate) async fn sync_tick(
                     }
                     Err(e) => {
                         let failures =
-                            sidecar::get_u64(&tid, "review_agent_failures").saturating_add(1);
+                            super::cleanup::store_or_sidecar(&store_c, &repo_s, &tid, "review_agent_failures")
+                                .await
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(0)
+                                .saturating_add(1);
                         let _ = sidecar::set(&tid, &[format!("review_agent_failures={failures}")]);
                         if failures >= MAX_REVIEW_AGENT_FAILURES {
                             tracing::error!(

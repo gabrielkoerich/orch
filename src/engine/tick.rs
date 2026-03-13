@@ -484,7 +484,9 @@ pub(crate) async fn tick_dispatch_tasks(
                     }
 
                     // Send task completion notification
-                    let summary = sidecar::get(&task_id, "summary").unwrap_or_default();
+                    let summary = super::cleanup::store_or_sidecar(&store_for_spawn, &repo_owned, &task_id, "summary")
+                        .await
+                        .unwrap_or_default();
                     let duration = dispatch_start.elapsed().as_secs_f64();
 
                     // Derive a display status from the weight signal for the notification.
@@ -533,6 +535,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                     let tmux_clone = tmux.clone();
                                     let task_owned_clone = task_owned.clone();
                                     let router_for_review = router_clone.clone();
+                                    let store_for_review = store_for_spawn.clone();
                                     let task_id_for_review = task_id.clone();
                                     let repo_ctx = repo_owned.clone();
                                     tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
@@ -543,6 +546,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                             &repo_owned,
                                             &router_for_review,
                                             &task_manager_for_review,
+                                            &store_for_review,
                                         )
                                         .await
                                         {
@@ -560,10 +564,15 @@ pub(crate) async fn tick_dispatch_tasks(
                                                     .await;
                                             }
                                             Ok(ReviewDecision::Failed(reason)) => {
-                                                let failures = sidecar::get_u64(
+                                                let failures = super::cleanup::store_or_sidecar(
+                                                    &store_for_review,
+                                                    &repo_owned,
                                                     &task_id_for_review,
                                                     "review_agent_failures",
                                                 )
+                                                .await
+                                                .and_then(|s| s.parse::<u64>().ok())
+                                                .unwrap_or(0)
                                                 .saturating_add(1);
                                                 let _ = sidecar::set(
                                                     &task_id_for_review,
@@ -604,10 +613,15 @@ pub(crate) async fn tick_dispatch_tasks(
                                                 }
                                             }
                                             Err(e) => {
-                                                let failures = sidecar::get_u64(
+                                                let failures = super::cleanup::store_or_sidecar(
+                                                    &store_for_review,
+                                                    &repo_owned,
                                                     &task_id_for_review,
                                                     "review_agent_failures",
                                                 )
+                                                .await
+                                                .and_then(|s| s.parse::<u64>().ok())
+                                                .unwrap_or(0)
                                                 .saturating_add(1);
                                                 let _ = sidecar::set(
                                                     &task_id_for_review,
