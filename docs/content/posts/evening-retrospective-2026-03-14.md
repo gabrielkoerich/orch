@@ -28,16 +28,23 @@ address tomorrow.
 | `2ae3202` | fix: prevent auto-merge race condition with per-task dispatching lock |
 | `62a7bbf` | Code development: orch (#622) |
 | `e29e830` | fix: stop pulling main every 45s in cleanup tick, pull only when needed |
+| `6f23b1c` | docs: fix missing runner.sh and result.json in artifacts listing, remove duplicate PLAN entry |
 | `c55a8c8` | docs: update all markdown to reflect current architecture (#621) |
 | `d7e55d6` | fix: tell agents not to pollute summary with push failure messages |
+| `28e1249` | docs: update AGENTS.md to recommend cargo nextest run (matches CI) |
 | `5c16bc5` | fix: skip build-macos on chore/docs commits to save runner minutes |
-| `9de4a8d` | fix: break dispatch loop when work already merged + fix CI tmux test |
-| `a14f1ee` | fix: recover from poisoned mutex in tick, slack, telegram |
-| `0cae1cb` | fix: recover from poisoned mutex in telegram, slack, and runner modules |
-| `5c6a879` | Reliability: Audit & remove panicking unwrap/expect (http, tmux, sidecar, token) |
-| `ee3bb02` | fix: recover from poisoned mutex in webhook status guards |
-| `cb4f70a` | fix: recover from poisoned mutex in ensure_watcher |
-| `ea0730d` | fix: replace risky unwrap/expect in cli, slack, and http core modules |
+| `6918397` | fix: mark tmux integration test as #[ignore] to fix CI |
+| `9de4a8d` | fix: break dispatch loop when work already merged + fix CI tmux test (#620) |
+| `a14f1ee` | fix: recover from poisoned mutex in tick, slack, telegram; remove fragile unwrap in codex error detection (#615) |
+| `0c4f8a5` | ci: retrigger review-gate check (#617) |
+| `83aea43` | Code review: orch (#581) |
+| `0cae1cb` | fix: recover from poisoned mutex in telegram, slack, and runner modules (#614) |
+| `5c6a879` | Reliability: Audit & remove panicking unwrap/expect across core modules (http, tmux, sidecar, token, template, home) (#608) |
+| `ee3bb02` | fix: recover from poisoned mutex in webhook status guards (#605) |
+| `cb4f70a` | fix: recover from poisoned mutex in ensure_watcher (#602) |
+| `ea0730d` | fix: replace risky unwrap/expect in cli, slack, and http core modules (#595) |
+| `d1d03a0` | Daily morning review: improvements and optimization (#584) |
+| `e96dba1` | fix: replace unwrap() in get_all_pages with safe pagination termination (#587) |
 
 ---
 
@@ -65,9 +72,19 @@ internal tasks, and unlabeled GitHub issues are correctly ingested (#855a44e,
 **Docs** — Comprehensive architecture update (#621) and AGENTS.md/PLAN.md
 corrections.
 
-**Morning review items** — All three items from the 2026-03-13 retro were
-addressed: PR #562 (SQLite store migration) is confirmed merged, dispatch
-loop fixed (#620), SQLite improvements landed.
+**Morning review items (2026-03-14)** — The morning review tracked three
+carry-over items from the 2026-03-13 retro and dispatched three tasks:
+
+| Item | Plan | Outcome |
+|------|------|---------|
+| Issue #582: pagination unwrap panic | In progress as of morning | ✓ Fixed — `e96dba1` replaces unwrap in `get_all_pages` |
+| Issue #583: reliability audit (unwrap/expect) | In progress as of morning | ✓ Completed — 5 PRs merged (#602, #605, #608, #614, #615) |
+| "No open PR" race condition | Monitor for recurrence | ✓ No recurrence observed; dispatch loop fix (#620) reinforces this |
+| Router timeout 120s → 60s | Low priority, one-line change | ✗ Still unaddressed |
+
+The morning review explicitly flagged no new issues were needed and health
+was good. All substantive planned items were resolved. The router timeout
+remains the only carry-over that did not land.
 
 ---
 
