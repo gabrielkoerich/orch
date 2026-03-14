@@ -1611,8 +1611,6 @@ mod tests {
         assert_eq!(parse_link_next(&headers), None);
     }
 
-    
-
     fn make_rl(base_secs: u64, max_secs: u64) -> RateLimit {
         RateLimit {
             remaining: None,
