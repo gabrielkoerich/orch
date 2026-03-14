@@ -532,21 +532,24 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_returns_none_when_no_env_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK should not be poisoned");
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
         // Disable gh fallback so we don't actually call gh CLI in tests
         let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
         resolver.clear_cache().await;
 
-        let token = resolver.get_token().await.unwrap();
+        let token = resolver
+            .get_token()
+            .await
+            .expect("get_token should succeed");
         assert!(token.is_none());
     }
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK should not be poisoned");
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
         let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
@@ -556,7 +559,10 @@ mod tests {
         env::remove_var("GITHUB_TOKEN");
 
         let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
-        let token = resolver.get_token().await.unwrap();
+        let token = resolver
+            .get_token()
+            .await
+            .expect("get_token should succeed");
         assert_eq!(token, Some("gh_token_value".to_string()));
 
         env::remove_var("GH_TOKEN");
@@ -565,7 +571,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_falls_back_to_github_token() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK should not be poisoned");
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
         let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
@@ -573,7 +579,10 @@ mod tests {
 
         env::set_var("GITHUB_TOKEN", "github_token_value");
 
-        let token = resolver.get_token().await.unwrap();
+        let token = resolver
+            .get_token()
+            .await
+            .expect("get_token should succeed");
         assert_eq!(token, Some("github_token_value".to_string()));
 
         env::remove_var("GITHUB_TOKEN");
@@ -582,7 +591,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token_over_github_token() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK should not be poisoned");
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
         let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
@@ -591,7 +600,10 @@ mod tests {
         env::set_var("GH_TOKEN", "gh_token_value");
         env::set_var("GITHUB_TOKEN", "github_token_value");
 
-        let token = resolver.get_token().await.unwrap();
+        let token = resolver
+            .get_token()
+            .await
+            .expect("get_token should succeed");
         // GH_TOKEN should be preferred
         assert_eq!(token, Some("gh_token_value".to_string()));
 
@@ -602,7 +614,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_ignores_empty_env_vars() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK should not be poisoned");
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
         let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
@@ -611,7 +623,10 @@ mod tests {
         env::set_var("GH_TOKEN", "");
         env::set_var("GITHUB_TOKEN", "");
 
-        let token = resolver.get_token().await.unwrap();
+        let token = resolver
+            .get_token()
+            .await
+            .expect("get_token should succeed");
         assert!(token.is_none());
 
         env::remove_var("GH_TOKEN");
@@ -621,7 +636,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_sync_env_mode() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK should not be poisoned");
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
         let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
@@ -629,7 +644,9 @@ mod tests {
 
         env::set_var("GH_TOKEN", "sync_test_token");
 
-        let token = resolver.get_token_sync().unwrap();
+        let token = resolver
+            .get_token_sync()
+            .expect("get_token_sync should succeed");
         assert_eq!(token, Some("sync_test_token".to_string()));
 
         env::remove_var("GH_TOKEN");
@@ -650,7 +667,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn clear_cache_clears_token() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK should not be poisoned");
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
         let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
@@ -659,14 +676,20 @@ mod tests {
         env::set_var("GH_TOKEN", "cached_token");
 
         // First call should cache the token
-        let token1 = resolver.get_token().await.unwrap();
+        let token1 = resolver
+            .get_token()
+            .await
+            .expect("first get_token should succeed");
         assert_eq!(token1, Some("cached_token".to_string()));
 
         // Clear cache
         resolver.clear_cache().await;
 
         // Token should still resolve (fresh lookup)
-        let token2 = resolver.get_token().await.unwrap();
+        let token2 = resolver
+            .get_token()
+            .await
+            .expect("second get_token should succeed after cache clear");
         assert_eq!(token2, Some("cached_token".to_string()));
 
         env::remove_var("GH_TOKEN");
@@ -674,7 +697,7 @@ mod tests {
 
     #[test]
     fn resolve_env_token_returns_none_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK should not be poisoned");
         env::remove_var("GH_TOKEN");
         env::remove_var("GITHUB_TOKEN");
 
@@ -684,7 +707,7 @@ mod tests {
 
     #[test]
     fn resolve_env_token_prefers_gh_token() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().expect("ENV_LOCK should not be poisoned");
         env::set_var("GH_TOKEN", "gh_pref");
         env::set_var("GITHUB_TOKEN", "github_pref");
 

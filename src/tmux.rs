@@ -320,7 +320,7 @@ mod tests {
             "orch-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system time should be after Unix epoch")
                 .as_millis()
         )
     }
@@ -347,11 +347,15 @@ mod tests {
             .output()
             .await;
 
-        if create_result.is_err() || !create_result.unwrap().status.success() {
-            // Skip test if tmux is not available or fails
-            eprintln!("Skipping test: tmux not available or failed to create test session");
-            return;
-        }
+        let created = match create_result {
+            Ok(out) if out.status.success() => out,
+            _ => {
+                // Skip test if tmux is not available or fails
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        };
+        let _ = created;
 
         // Use our helper to set an environment variable
         let result = tmux.set_env(&session, "TEST_VAR", "test_value").await;
@@ -363,7 +367,8 @@ mod tests {
             .output()
             .await;
 
-        let output = check_result.expect("should be able to check environment");
+        let output =
+            check_result.expect("tmux show-environment should succeed after session created");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("TEST_VAR=test_value"),
@@ -389,10 +394,14 @@ mod tests {
             .output()
             .await;
 
-        if create_result.is_err() || !create_result.unwrap().status.success() {
-            eprintln!("Skipping test: tmux not available or failed to create test session");
-            return;
-        }
+        let created = match create_result {
+            Ok(out) if out.status.success() => out,
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        };
+        let _ = created;
 
         // First set a variable
         let set_result = tmux.set_env(&session, "TO_DELETE", "temporary").await;
@@ -403,7 +412,7 @@ mod tests {
             .args(["show-environment", "-t", &session, "TO_DELETE"])
             .output()
             .await
-            .expect("should be able to check environment");
+            .expect("tmux show-environment should succeed after session created");
         assert!(
             String::from_utf8_lossy(&check_before.stdout).contains("TO_DELETE"),
             "Variable should exist before unset"

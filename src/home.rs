@@ -158,24 +158,24 @@ mod tests {
 
     #[test]
     fn test_orch_home_creates_directory() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("should create temp dir");
         let home = temp.path().join("home");
-        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&home).expect("should create home dir");
 
         let orch_path = home.join(HOME_DIR);
-        std::fs::create_dir_all(&orch_path).unwrap();
+        std::fs::create_dir_all(&orch_path).expect("should create orch path");
 
         assert!(orch_path.exists());
     }
 
     #[test]
     fn test_state_dir() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("should create temp dir");
         let home = temp.path().join("home");
-        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&home).expect("should create home dir");
 
         let state = home.join(HOME_DIR).join("state");
-        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&state).expect("should create state dir");
 
         assert!(state.exists());
     }
@@ -183,11 +183,11 @@ mod tests {
     #[test]
     fn test_task_dir_creates_path() {
         // Use a temporary HOME so we don't touch the developer's real home dir.
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("should create temp dir");
         let home = temp.path();
         std::env::set_var("HOME", home);
 
-        let dir = task_dir("test-owner/test-repo", "42").unwrap();
+        let dir = task_dir("test-owner/test-repo", "42").expect("task_dir should succeed");
         assert!(dir.exists());
         assert!(dir.ends_with("test-owner/test-repo/tasks/42"));
         // Cleanup is handled by TempDir when it drops.
@@ -196,11 +196,12 @@ mod tests {
     #[test]
     fn test_task_attempt_dir_creates_path() {
         // Use a temporary HOME so we don't touch the developer's real home dir.
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("should create temp dir");
         let home = temp.path();
         std::env::set_var("HOME", home);
 
-        let dir = task_attempt_dir("test-owner/test-repo", "42", 1).unwrap();
+        let dir = task_attempt_dir("test-owner/test-repo", "42", 1)
+            .expect("task_attempt_dir should succeed");
         assert!(dir.exists());
         assert!(dir.ends_with("test-owner/test-repo/tasks/42/attempts/1"));
         // Cleanup is handled by TempDir when it drops.
@@ -208,12 +209,14 @@ mod tests {
 
     #[test]
     fn test_repo_state_dir_separates_repos() {
-        let temp = TempDir::new().unwrap();
+        let temp = TempDir::new().expect("should create temp dir");
         let home = temp.path();
         std::env::set_var("HOME", home);
 
-        let dir_a = repo_state_dir("owner/repo-a").unwrap();
-        let dir_b = repo_state_dir("owner/repo-b").unwrap();
+        let dir_a =
+            repo_state_dir("owner/repo-a").expect("repo_state_dir should succeed for repo-a");
+        let dir_b =
+            repo_state_dir("owner/repo-b").expect("repo_state_dir should succeed for repo-b");
         assert_ne!(dir_a, dir_b);
         // Cleanup is handled by TempDir when it drops.
     }

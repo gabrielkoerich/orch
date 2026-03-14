@@ -109,10 +109,16 @@ mod tests {
             std::env::set_var("ORCH_TEST_SECRET_TOKEN", "should-not-appear");
         }
 
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "hello world").unwrap();
+        let mut f = NamedTempFile::new().expect("should create temp file");
+        writeln!(f, "hello world").expect("should write to temp file");
 
-        let result = render_template(f.path().to_str().unwrap(), &[]).unwrap();
+        let result = render_template(
+            f.path()
+                .to_str()
+                .expect("temp file path should be valid UTF-8"),
+            &[],
+        )
+        .expect("render_template should succeed");
         assert!(
             !result.contains("should-not-appear"),
             "env var leaked into rendered template"
@@ -125,11 +131,16 @@ mod tests {
 
     #[test]
     fn render_template_uses_explicit_vars() {
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "value={{{{MY_VAR}}}}").unwrap();
+        let mut f = NamedTempFile::new().expect("should create temp file");
+        writeln!(f, "value={{{{MY_VAR}}}}").expect("should write to temp file");
 
-        let result =
-            render_template(f.path().to_str().unwrap(), &["MY_VAR=hello".to_string()]).unwrap();
+        let result = render_template(
+            f.path()
+                .to_str()
+                .expect("temp file path should be valid UTF-8"),
+            &["MY_VAR=hello".to_string()],
+        )
+        .expect("render_template should succeed");
         assert_eq!(result.trim(), "value=hello");
     }
 }
