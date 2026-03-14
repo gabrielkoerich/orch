@@ -539,7 +539,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
         // Initialise status: configured, not yet healthy.
         {
-            let mut s = webhook_status.lock().unwrap();
+            let mut s = webhook_status.lock().unwrap_or_else(|e| e.into_inner());
             s.configured = true;
             s.port = Some(port);
             s.healthy = false;
@@ -581,7 +581,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 orch_webhook_in_fallback = true,
                                 "webhook server giving up, switching to polling fallback"
                             );
-                            let mut s = status_for_spawn.lock().unwrap();
+                            let mut s = status_for_spawn.lock().unwrap_or_else(|e| e.into_inner());
                             s.fallback_mode = true;
                             s.healthy = false;
                             s.last_failure_reason = Some(reason);
@@ -597,7 +597,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             "webhook bind failed (transient), retrying with backoff"
                         );
                         {
-                            let mut s = status_for_spawn.lock().unwrap();
+                            let mut s = status_for_spawn.lock().unwrap_or_else(|e| e.into_inner());
                             s.startup_attempts = attempt;
                             s.last_failure_reason = Some(reason);
                             s.save();
@@ -632,7 +632,7 @@ pub async fn serve() -> anyhow::Result<()> {
         webhook_port = None;
         webhook_healthy = false;
         {
-            let mut s = webhook_status.lock().unwrap();
+            let mut s = webhook_status.lock().unwrap_or_else(|e| e.into_inner());
             s.configured = false;
             s.fallback_mode = true;
             s.save();
@@ -886,7 +886,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             }
                             // Persist updated status.
                             {
-                                let mut s = webhook_status.lock().unwrap();
+                                let mut s = webhook_status.lock().unwrap_or_else(|e| e.into_inner());
                                 s.healthy = health;
                                 s.last_check_utc = Some(chrono::Utc::now());
                                 if health {
