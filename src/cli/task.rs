@@ -343,7 +343,7 @@ pub async fn route(id: i64) -> anyhow::Result<()> {
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
     let store: Arc<TaskStore> = Arc::new(crate::cli::init_store().await?);
 
     let ext_id = ExternalId(id.to_string());
@@ -381,7 +381,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
     let store: Arc<TaskStore> = Arc::new(crate::cli::init_store().await?);
 
     // Resolve task ID
@@ -470,7 +470,7 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
         }
     }
 
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
 
     let ext_id = ExternalId(id.to_string());
 
@@ -512,7 +512,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
     let repo =
         config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
     let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
 
     if id == "all" {

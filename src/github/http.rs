@@ -207,18 +207,18 @@ impl GhHttp {
     /// The result is cached in the shared resolver for the life of the process,
     /// so `gh auth token` is only called once regardless of how many instances
     /// are created.
-    pub fn new() -> Self {
+    pub fn new() -> anyhow::Result<Self> {
         let client = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("BUG: failed to build reqwest client — TLS initialization failed");
+            .map_err(|e| anyhow::anyhow!("failed to build reqwest client (TLS init): {e}"))?;
 
-        Self {
+        Ok(Self {
             client,
             token_resolver: token::shared(),
-        }
+        })
     }
 
     // ── Rate-limit helpers ────────────────────────────────────────

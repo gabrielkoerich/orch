@@ -388,7 +388,7 @@ pub async fn create_pr_if_needed(
     repo: &str,
     base_branch: &str,
 ) -> PrCreateResult<Option<String>> {
-    let gh = GhHttp::new();
+    let gh = GhHttp::new()?;
 
     // Check if PR already exists using GhHttp API
     match gh.get_pr_number(repo, branch).await {
@@ -522,7 +522,7 @@ async fn link_issue_to_branch(repo: &str, task_id: &str, branch: &str) -> anyhow
         return Ok(());
     }
 
-    let gh = GhHttp::new();
+    let gh = GhHttp::new()?;
 
     // Parse task_id as issue number
     let issue_number: u64 = task_id

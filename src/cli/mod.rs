@@ -728,7 +728,7 @@ pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
 
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone()));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
     let store = Arc::new(TaskStore::open(&crate::store::default_db_path()?).await?);
     Ok(TaskManager::with_store(backend, store, repo))
 }

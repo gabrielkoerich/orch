@@ -106,7 +106,7 @@ pub(crate) async fn review_open_prs(
         "checking in_review tasks for PR reviews"
     );
 
-    let gh = GhHttp::new();
+    let gh = GhHttp::new()?;
 
     for task in in_review_tasks {
         let task_id = &task.id.0;
@@ -579,7 +579,7 @@ pub(crate) async fn review_and_merge(
     };
 
     // 2b. Verify an open PR exists before running the (expensive) review agent
-    let gh_check = GhHttp::new();
+    let gh_check = GhHttp::new()?;
     let pr_number_early = match gh_check.get_pr_number(repo, &branch_name).await {
         Ok(Some(n)) => {
             tracing::info!(
@@ -642,7 +642,7 @@ pub(crate) async fn review_and_merge(
                 let pr_body = format!(
                     "Resolves {task_ref}\n\nAuto-created by orch review gate (agent forgot to open PR)"
                 );
-                let gh = GhHttp::new();
+                let gh = GhHttp::new()?;
                 match gh
                     .create_pr(repo, &task.title, &pr_body, &branch_name, &default_branch)
                     .await
@@ -1037,7 +1037,7 @@ pub(crate) async fn review_and_merge(
     );
 
     // 12. Post automated review comment on the PR
-    let gh = GhHttp::new();
+    let gh = GhHttp::new()?;
     let pr_number = gh.get_pr_number(repo, &branch_name).await.ok().flatten();
 
     if let Some(pr_num) = pr_number {
@@ -1166,7 +1166,7 @@ pub(crate) async fn auto_merge_pr(
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     // 1. Get PR number from branch
-    let gh = GhHttp::new();
+    let gh = GhHttp::new()?;
     let pr_number = match gh.get_pr_number(repo, branch).await? {
         Some(n) => n,
         None => {
@@ -1527,7 +1527,7 @@ pub(crate) async fn handle_review_changes(
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
 
-    let gh = GhHttp::new();
+    let gh = GhHttp::new()?;
     let pr_num_str = pr_number.to_string();
 
     if review_cycles >= max_cycles {

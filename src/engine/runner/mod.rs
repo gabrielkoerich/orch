@@ -112,11 +112,19 @@ impl TaskRunner {
                         .unwrap_or_default();
                     if route_reason.starts_with("label agent:") {
                         let agent_label = route_reason.trim_start_matches("label ");
-                        let gh = crate::github::http::GhHttp::new();
-                        if let Err(e) = gh.remove_label(&self.repo, task_id, agent_label).await {
-                            tracing::warn!(task_id, label = agent_label, err = %e, "failed to remove agent label after max attempts");
-                        } else {
-                            tracing::info!(task_id, label = agent_label, "removed forced agent label after max attempts — /retry will use free routing");
+                        match crate::github::http::GhHttp::new() {
+                            Err(e) => {
+                                tracing::warn!(task_id, err = %e, "failed to build http client for label removal")
+                            }
+                            Ok(gh) => {
+                                if let Err(e) =
+                                    gh.remove_label(&self.repo, task_id, agent_label).await
+                                {
+                                    tracing::warn!(task_id, label = agent_label, err = %e, "failed to remove agent label after max attempts");
+                                } else {
+                                    tracing::info!(task_id, label = agent_label, "removed forced agent label after max attempts — /retry will use free routing");
+                                }
+                            }
                         }
                     }
                 }

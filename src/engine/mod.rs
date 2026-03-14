@@ -208,7 +208,7 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
 
         // Initialize backend
         let backend: Arc<dyn ExternalBackend> =
-            Arc::new(crate::backends::github::GitHubBackend::new(repo.clone()));
+            Arc::new(crate::backends::github::GitHubBackend::new(repo.clone())?);
 
         // Health check — verifies network and GitHub authentication
         if let Err(e) = backend.health_check().await {
@@ -1126,14 +1126,25 @@ async fn handle_channel_message(
                 // Parse slash command and execute it on the bound task
                 if let Some(cmd) = parse_command(&body) {
                     if let Some((repo, backend, task_manager, store)) = engine_refs.first() {
-                        let gh = GhHttp::new();
-                        let ext_id = ExternalId(task_id.clone());
-                        let result =
-                            execute_command(backend, &gh, repo, &ext_id, &cmd, store, task_manager)
-                                .await;
-                        let reply = match result {
-                            Ok(r) => r,
+                        let reply = match GhHttp::new() {
                             Err(e) => format!("Command `{cmd}` failed: {e}"),
+                            Ok(gh) => {
+                                let ext_id = ExternalId(task_id.clone());
+                                match execute_command(
+                                    backend,
+                                    &gh,
+                                    repo,
+                                    &ext_id,
+                                    &cmd,
+                                    store,
+                                    task_manager,
+                                )
+                                .await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => format!("Command `{cmd}` failed: {e}"),
+                                }
+                            }
                         };
                         send_channel_reply(channels, &channel, &thread_id, reply).await;
                     }
