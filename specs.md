@@ -63,13 +63,13 @@ async fn review_and_merge(
         return Ok(ReviewDecision::Skip);
     }
 
-    // 2. Load sidecar for worktree path, branch, agent
-    let sidecar = sidecar::read(&self.repo, &task.id.0)?;
-    let worktree = sidecar.get("worktree");
-    let branch = sidecar.get("branch");
+    // 2. Load task state from store for worktree path, branch, agent
+    let store_task = store.resolve_and_get(&self.repo, &task.id.0).await?;
+    let worktree = store_task.worktree.as_deref().unwrap_or("");
+    let branch = store_task.branch.as_deref().unwrap_or("");
 
     // 3. Build review prompt
-    let review_prompt = build_review_prompt(task, &sidecar);
+    let review_prompt = build_review_prompt(task, &store_task);
 
     // 4. Pick review agent (config: workflow.review_agent, default: claude)
     let review_agent = config::get("workflow.review_agent")
@@ -231,11 +231,12 @@ async fn handle_review_changes(
     task: &ExternalTask,
     review: &ReviewResponse,
     backend: &dyn ExternalBackend,
+    store: &TaskStore,
 ) -> anyhow::Result<()> {
-    // 1. Check review cycle count (max 2 review rounds)
-    let sidecar = sidecar::read(&self.repo, &task.id.0)?;
-    let review_cycles: u32 = sidecar.get("review_cycles")
-        .and_then(|v| v.parse().ok())
+    // 1. Check review cycle count from the store (max 2 review rounds)
+    let review_cycles = store.get_field(&self.repo, &task.id.0, "review_cycles")
+        .await
+        .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
 
     if review_cycles >= 2 {
@@ -252,15 +253,14 @@ async fn handle_review_changes(
     let comment = format_review_comment(review);
     backend.post_comment(&task.id, &comment).await?;
 
-    // 3. Update sidecar
-    sidecar::merge(&self.repo, &task.id.0, &serde_json::json!({
-        "review_cycles": (review_cycles + 1).to_string(),
-        "review_notes": review.notes,
-        "status": "in_progress",
-    }))?;
+    // 3. Update task state in the store
+    store.set_fields(&self.repo, &task.id.0, &[
+        ("review_cycles", json!((review_cycles + 1))),
+        ("pr_review_context", json!(review.notes)),
+    ]).await?;
 
-    // 4. Re-dispatch — set status back to routed (keeps same agent/branch/worktree)
-    backend.update_status(&task.id, Status::Routed).await?;
+    // 4. Re-route — set status back to New (keeps same agent/branch/worktree)
+    backend.update_status(&task.id, Status::New).await?;
     // Engine will pick it up on next tick, agent sees review feedback in context
 }
 ```
@@ -296,7 +296,7 @@ new → routed → in_progress → done (agent finishes)
 3. Add `review_and_merge()` to `src/engine/review.rs` — called after Phase 3b dispatch completes with `status:done`
 4. Add `auto_merge()` using `gh pr merge --squash --delete-branch`
 5. Add `handle_review_changes()` to re-dispatch with review context
-6. Add `review_cycles` tracking in sidecar
+6. Add `review_cycles` tracking in the SQLite store
 7. Add config keys: `workflow.enable_review_agent`, `workflow.review_agent`, `workflow.auto_merge`, `workflow.max_review_cycles`
 8. Add review context to `build_agent_message()` — on re-dispatch, agent sees review notes
 9. Tests: review response parsing, cycle counting, auto-merge flow

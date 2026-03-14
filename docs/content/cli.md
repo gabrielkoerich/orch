@@ -110,7 +110,7 @@ orch agents                 # list available agents and their status
 |-----|----------|
 | Server log | `~/.orch/state/orch.log` |
 | Server archive | `~/.orch/state/orch.archive.log` |
-| Per-task sidecar | `~/.orch/state/<repo>/tasks/<id>/sidecar.json` |
+| Task database | `~/.orch/orch.db` (SQLite — all task state) |
 | Per-task output | `~/.orch/state/<repo>/tasks/<id>/attempts/<n>/output.json` |
 | Per-task prompts | `~/.orch/state/<repo>/tasks/<id>/attempts/<n>/prompt-sys.md` |
 | Brew stdout | `/opt/homebrew/var/log/orch.log` |

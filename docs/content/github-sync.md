@@ -51,7 +51,7 @@ orch project info --fix     # auto-fills project field/option IDs into config
 | labels | Issue labels (non-prefixed) |
 | parent_id | Sub-issue relationship |
 | summary, response | Structured comment with `<!-- orch:agent-response -->` marker |
-| branch, worktree | Local sidecar file (`$STATE_DIR/tasks/{id}.json`) |
+| branch, worktree | SQLite store (`~/.orch/orch.db`) |
 
 ### Agent Response Comments
 
@@ -72,9 +72,9 @@ When an agent completes a task, the orchestrator posts a structured comment:
 - `scheduled` and `job:{id}` — for job-created tasks
 - When task is `done`, `auto_close` controls whether to close the issue
 
-### Local Sidecar
+### Local Task State
 
-Machine-specific fields (branch, worktree path, attempt count) are stored in `$STATE_DIR/tasks/{id}.json`. These are ephemeral and not synced.
+Machine-specific fields (branch, worktree path, attempt count, agent, model, pr_number, memory) are stored in the unified SQLite database (`~/.orch/orch.db`). These fields are not synced to GitHub.
 
 ## Backoff
 

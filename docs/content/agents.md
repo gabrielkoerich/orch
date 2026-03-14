@@ -18,7 +18,7 @@ Agent sessions run inside tmux sessions. The orchestrator spawns the agent CLI a
 
 ## Agent Output
 
-The agent writes a JSON file to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json` and the orchestrator also stores a sidecar at `~/.orch/state/{repo}/tasks/{id}/sidecar.json`:
+The agent writes a JSON file to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json`. Task metadata (branch, worktree, agent, model, attempts, memory, etc.) is stored in the unified SQLite database at `~/.orch/orch.db`. The expected agent output format:
 
 ```json
 {
@@ -97,7 +97,7 @@ Every agent receives a rich context built from multiple sources:
 | System prompt | `prompts/agent_system.md` | Always |
 | Task details | SQLite store (`~/.orch/orch.db`) | Always |
 | Agent profile | Router-generated role/skills/tools/constraints | Always |
-| Error history | Task store + sidecar | On retries |
+| Error history | SQLite store | On retries |
 | Last error | Task store `last_error` field | On retries |
 | GitHub issue comments | GitHub API | If issue linked |
 | Prior run context | `contexts/task-{id}.md` | On retries |

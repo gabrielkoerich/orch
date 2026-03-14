@@ -218,8 +218,6 @@ orch log 100                  # Show last N lines
 orch log watch                # Tail logs live
 orch version                  # Show version
 orch config <key>             # Read config value (e.g., orch config gh.repo)
-orch sidecar get <id> <field> # Read task metadata
-orch sidecar set <id> field=value  # Write task metadata
 orch completions <shell>      # Generate shell completions (bash, zsh, fish)
 ```
 
@@ -420,18 +418,18 @@ Task artifacts are organized per-repo, per-task, per-attempt:
 
 ```
 ~/.orch/state/{owner}/{repo}/tasks/{id}/
-  sidecar.json              # Task metadata
   attempts/
     1/
       prompt-sys.md         # System prompt
       prompt-msg.md         # Task prompt
-      runner.sh             # Runner script
       exit.txt              # Exit code
       stderr.txt            # Agent stderr
       output.json           # Agent response
     2/                      # Retry attempt
       ...
 ```
+
+Task metadata (branch, worktree, agent, model, attempts, pr_number, memory, etc.) is stored in the unified SQLite database at `~/.orch/orch.db`, not in per-task JSON files.
 
 ## Development
 

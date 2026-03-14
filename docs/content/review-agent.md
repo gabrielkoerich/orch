@@ -107,4 +107,4 @@ Review events appear in:
 - **SQLite store**: `review_decision` field and review counters
 - **GitHub PR**: review comment with `## Automated Review` header
 - **Server logs**: structured tracing spans for review agent lifecycle
-- **Sidecar JSON**: per-task review metadata at `~/.orch/state/{repo}/tasks/{id}/sidecar.json`
+- **Per-task artifacts**: prompts and agent output at `~/.orch/state/{repo}/tasks/{id}/attempts/`

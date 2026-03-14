@@ -263,7 +263,7 @@ Override the router by adding labels to tasks:
 
 ### RouteResult Struct
 
-Routing results are stored in the sidecar file (`~/.orch/state/{task_id}.json`):
+Routing results are stored in the unified SQLite task store (`~/.orch/orch.db`):
 
 ```rust
 pub struct RouteResult {
@@ -313,7 +313,7 @@ The routing prompt template is at `prompts/route.md`. It includes:
     owner/repo.git       #   each has .orch.yml inside
   worktrees/             # agent worktrees (all projects)
     repo/branch/         #   created by the runner, one per task
-  state/                 # runtime state (logs, prompts, pid, locks, sidecar JSON)
+  state/                 # runtime state (logs, prompts, per-task artifacts)
   skills/                # cloned skill repositories
 ```
 
