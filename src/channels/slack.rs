@@ -85,7 +85,7 @@ impl SlackChannel {
         ];
 
         {
-            let last = self.last_ts.lock().unwrap();
+            let last = self.last_ts.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref ts) = *last {
                 // `oldest` is exclusive — add a tiny epsilon to avoid re-fetching the last msg
                 params.push(("oldest", ts.clone()));
@@ -217,7 +217,7 @@ impl Channel for SlackChannel {
 
                     // Update last_ts to the maximum ts seen
                     {
-                        let mut last = last_ts.lock().unwrap();
+                        let mut last = last_ts.lock().unwrap_or_else(|e| e.into_inner());
                         if last.as_ref().is_none_or(|prev: &String| msg.ts > *prev) {
                             *last = Some(msg.ts.clone());
                         }
