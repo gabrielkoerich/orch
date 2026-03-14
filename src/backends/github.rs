@@ -309,11 +309,21 @@ impl ExternalBackend for GitHubBackend {
     }
 
     async fn has_open_issue_with_title(&self, title: &str, label: &str) -> anyhow::Result<bool> {
-        let issues = self.gh.list_issues(&self.repo, label).await?;
-        Ok(issues
-            .iter()
-            .filter(|i| i.pull_request.is_none()) // Exclude PRs
-            .any(|i| i.title == title))
+        // Check open issues first
+        let open_issues = self.gh.list_issues(&self.repo, label).await?;
+        if open_issues.iter().any(|i| i.title == title) {
+            return Ok(true);
+        }
+        // Also check issues closed within the last 24h — prevents re-creating a bug
+        // that was just fixed and merged (the PR close event removes the open issue).
+        let since = (chrono::Utc::now() - chrono::Duration::hours(24))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let closed = self
+            .gh
+            .list_issues_closed_since(&self.repo, label, &since)
+            .await?;
+        Ok(closed.iter().any(|i| i.title == title))
     }
 
     async fn health_check(&self) -> anyhow::Result<()> {

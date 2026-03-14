@@ -721,6 +721,33 @@ impl GhHttp {
             .collect())
     }
 
+    /// List closed issues updated since `since` (ISO 8601), filtered by label.
+    ///
+    /// Used for dedup checks — prevents re-creating issues that were recently closed.
+    pub async fn list_issues_closed_since(
+        &self,
+        repo: &str,
+        label: &str,
+        since: &str,
+    ) -> anyhow::Result<Vec<GitHubIssue>> {
+        let url = format!("{GITHUB_API}/repos/{repo}/issues");
+        let all: Vec<GitHubIssue> = self
+            .get_all_pages(
+                &url,
+                &[
+                    ("labels", label),
+                    ("state", "closed"),
+                    ("since", since),
+                    ("per_page", "100"),
+                ],
+            )
+            .await?;
+        Ok(all
+            .into_iter()
+            .filter(|i| i.pull_request.is_none())
+            .collect())
+    }
+
     /// List all open issues (no label filter, paginated).
     pub async fn list_all_open_issues(&self, repo: &str) -> anyhow::Result<Vec<GitHubIssue>> {
         let url = format!("{GITHUB_API}/repos/{repo}/issues");
