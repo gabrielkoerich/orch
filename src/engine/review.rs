@@ -779,9 +779,12 @@ pub(crate) async fn review_and_merge(
                         branch = %branch_name,
                         "PR already merged, marking done"
                     );
-                    let _ = task_manager
+                    if let Err(e) = task_manager
                         .update_task_status(&task.id, crate::backends::Status::Done)
-                        .await;
+                        .await
+                    {
+                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Done) failed — task may be stuck in InReview");
+                    }
                     return Ok(ReviewDecision::Skipped);
                 }
 
@@ -803,9 +806,12 @@ pub(crate) async fn review_and_merge(
                         branch = %branch_name,
                         "no PR and no commits after max attempts — marking blocked to stop loop"
                     );
-                    let _ = task_manager
+                    if let Err(e) = task_manager
                         .update_task_status(&task.id, crate::backends::Status::Blocked)
-                        .await;
+                        .await
+                    {
+                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
+                    }
                     return Ok(ReviewDecision::Skipped);
                 }
 
@@ -815,9 +821,12 @@ pub(crate) async fn review_and_merge(
                     reason = %reason,
                     "no PR and no commits — re-routing for retry"
                 );
-                let _ = task_manager
+                if let Err(e) = task_manager
                     .update_task_status(&task.id, crate::backends::Status::New)
-                    .await;
+                    .await
+                {
+                    tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+                }
                 return Ok(ReviewDecision::Skipped);
             }
         }

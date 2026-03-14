@@ -36,7 +36,9 @@ async fn kv_get_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str) -> Opti
 /// Write a KV value to the store.
 async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: &str) {
     if let Some(s) = store {
-        let _ = s.kv_set(key, value).await;
+        if let Err(e) = s.kv_set(key, value).await {
+            tracing::warn!(key, err = %e, "kv_set failed");
+        }
     }
 }
 
@@ -242,14 +244,20 @@ pub(crate) async fn sync_tick(
                 };
                 match outcome {
                     ReviewOutcome::Reset => {
-                        let _ = task_manager_c
+                        if let Err(e) = task_manager_c
                             .update_task_status(&ExternalId(tid.clone()), Status::NeedsReview)
-                            .await;
+                            .await
+                        {
+                            tracing::error!(task_id = %tid, err = %e, "update_task_status(NeedsReview) failed — task may be stuck in InReview");
+                        }
                     }
                     ReviewOutcome::Block => {
-                        let _ = task_manager_c
+                        if let Err(e) = task_manager_c
                             .update_task_status(&ExternalId(tid.clone()), Status::Blocked)
-                            .await;
+                            .await
+                        {
+                            tracing::error!(task_id = %tid, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
+                        }
                     }
                     ReviewOutcome::Ok => {}
                 }
@@ -288,15 +296,25 @@ pub(crate) async fn sync_tick(
             // review agent to start its tmux session before treating it as stale.
             // A task is only considered stale if it has been in InReview for > 5 minutes.
             const MIN_STALE_MINUTES: i64 = 5;
-            if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
-                let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
-                if age.num_minutes() < MIN_STALE_MINUTES {
-                    tracing::debug!(
+            match chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
+                Ok(updated_at) => {
+                    let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
+                    if age.num_minutes() < MIN_STALE_MINUTES {
+                        tracing::debug!(
+                            task_id = task.id.0,
+                            age_seconds = age.num_seconds(),
+                            "InReview task is too young to be considered stale, skipping"
+                        );
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
                         task_id = task.id.0,
-                        age_seconds = age.num_seconds(),
-                        "InReview task is too young to be considered stale, skipping"
+                        ts = %task.updated_at,
+                        err = %e,
+                        "invalid updated_at timestamp — treating task as potentially stale"
                     );
-                    continue;
                 }
             }
 

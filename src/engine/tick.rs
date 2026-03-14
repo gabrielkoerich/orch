@@ -541,12 +541,15 @@ pub(crate) async fn tick_dispatch_tasks(
                                                     reason,
                                                     "review gate blocked after repeated failures — marking task blocked"
                                                 );
-                                                let _ = task_manager_for_review
+                                                if let Err(e) = task_manager_for_review
                                                     .update_task_status(
                                                         &ExternalId(task_id_for_review.clone()),
                                                         Status::Blocked,
                                                     )
-                                                    .await;
+                                                    .await
+                                                {
+                                                    tracing::error!(task_id = task_id_for_review, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
+                                                }
                                             }
                                             Ok(ReviewDecision::Failed(reason)) => {
                                                 let failures =
@@ -564,14 +567,17 @@ pub(crate) async fn tick_dispatch_tasks(
                                                         failures,
                                                         "review agent failed too many times — blocking task"
                                                     );
-                                                    let _ = task_manager_for_review
+                                                    if let Err(e) = task_manager_for_review
                                                         .update_task_status(
                                                             &ExternalId(
                                                                 task_id_for_review.clone(),
                                                             ),
                                                             Status::Blocked,
                                                         )
-                                                        .await;
+                                                        .await
+                                                    {
+                                                        tracing::error!(task_id = task_id_for_review, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
+                                                    }
                                                 } else {
                                                     tracing::error!(
                                                         task_id = task_id_for_review,
@@ -579,14 +585,17 @@ pub(crate) async fn tick_dispatch_tasks(
                                                         failures,
                                                         "review agent failed — resetting to NeedsReview for retry"
                                                     );
-                                                    let _ = task_manager_for_review
+                                                    if let Err(e) = task_manager_for_review
                                                         .update_task_status(
                                                             &ExternalId(
                                                                 task_id_for_review.clone(),
                                                             ),
                                                             Status::NeedsReview,
                                                         )
-                                                        .await;
+                                                        .await
+                                                    {
+                                                        tracing::error!(task_id = task_id_for_review, err = %e, "update_task_status(NeedsReview) failed — task may be stuck in InReview");
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
@@ -605,14 +614,17 @@ pub(crate) async fn tick_dispatch_tasks(
                                                         failures,
                                                         "review_and_merge failed too many times — blocking task"
                                                     );
-                                                    let _ = task_manager_for_review
+                                                    if let Err(ue) = task_manager_for_review
                                                         .update_task_status(
                                                             &ExternalId(
                                                                 task_id_for_review.clone(),
                                                             ),
                                                             Status::Blocked,
                                                         )
-                                                        .await;
+                                                        .await
+                                                    {
+                                                        tracing::error!(task_id = task_id_for_review, err = %ue, "update_task_status(Blocked) failed — task may be stuck in InReview");
+                                                    }
                                                 } else {
                                                     tracing::error!(
                                                         task_id = task_id_for_review,
@@ -620,14 +632,17 @@ pub(crate) async fn tick_dispatch_tasks(
                                                         failures,
                                                         "review_and_merge failed — resetting to NeedsReview for retry"
                                                     );
-                                                    let _ = task_manager_for_review
+                                                    if let Err(ue) = task_manager_for_review
                                                         .update_task_status(
                                                             &ExternalId(
                                                                 task_id_for_review.clone(),
                                                             ),
                                                             Status::NeedsReview,
                                                         )
-                                                        .await;
+                                                        .await
+                                                    {
+                                                        tracing::error!(task_id = task_id_for_review, err = %ue, "update_task_status(NeedsReview) failed — task may be stuck in InReview");
+                                                    }
                                                 }
                                             }
                                             Ok(_) => {
@@ -646,12 +661,15 @@ pub(crate) async fn tick_dispatch_tasks(
                             }
                         } else {
                             // Review disabled: persist needs_review status.
-                            let _ = task_manager_for_spawn
+                            if let Err(e) = task_manager_for_spawn
                                 .update_task_status(
                                     &ExternalId(task_id.clone()),
                                     Status::NeedsReview,
                                 )
-                                .await;
+                                .await
+                            {
+                                tracing::error!(task_id, err = %e, "update_task_status(NeedsReview) failed — task may be stuck");
+                            }
                         }
                     } else {
                         // done, blocked, or new (rate-limited): update status directly.
@@ -672,9 +690,12 @@ pub(crate) async fn tick_dispatch_tasks(
                     tracing::error!(task_id, ?e, "task runner failed");
                     if is_internal_id(&task_id) {
                         // Internal tasks have no GitHub issue to comment on.
-                        let _ = task_manager_for_spawn
+                        if let Err(ue) = task_manager_for_spawn
                             .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
-                            .await;
+                            .await
+                        {
+                            tracing::error!(task_id, err = %ue, "update_task_status(NeedsReview) failed — task may be stuck");
+                        }
                     } else {
                         // Post comment (best-effort)
                         if let Err(comment_err) = backend
@@ -696,9 +717,12 @@ pub(crate) async fn tick_dispatch_tasks(
                         }
                         // Update status immediately to NeedsReview so external tasks
                         // don't remain stuck in InProgress until the no-session timeout.
-                        let _ = task_manager_for_spawn
+                        if let Err(ue) = task_manager_for_spawn
                             .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
-                            .await;
+                            .await
+                        {
+                            tracing::error!(task_id, err = %ue, "update_task_status(NeedsReview) failed — task may be stuck");
+                        }
                     }
 
                     // Send error notification
