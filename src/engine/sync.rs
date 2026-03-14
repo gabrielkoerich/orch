@@ -69,9 +69,17 @@ pub(crate) async fn sync_tick(
         tracing::debug!(err = %e, "external task ingest failed");
     }
 
-    // 1. Cleanup worktrees for done tasks
-    if let Err(e) = cleanup_done_worktrees(backend, repo, task_manager, store).await {
-        tracing::warn!(err = %e, "worktree cleanup failed");
+    // 1. Cleanup worktrees for done tasks (background — must not block routing/dispatch)
+    {
+        let backend = Arc::clone(backend);
+        let repo = repo.to_string();
+        let task_manager = Arc::clone(task_manager);
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(e) = cleanup_done_worktrees(&backend, &repo, &task_manager, &store).await {
+                tracing::warn!(err = %e, "worktree cleanup failed");
+            }
+        });
     }
 
     // 2. Check for merged PRs (in_review → done)
