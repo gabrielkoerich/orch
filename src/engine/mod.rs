@@ -1310,30 +1310,20 @@ mod tests {
         );
     }
 
+    /// Integration test that requires a fully working tmux environment with
+    /// reliable capture-pane timing. Runs locally but not in CI (GitHub Actions
+    /// has tmux installed but capture-pane timing is unreliable).
+    ///
+    /// DO NOT REMOVE #[ignore] — this test was un-ignored in PR #608 which
+    /// broke CI. The `tmux -V` skip check is insufficient because tmux CAN
+    /// create sessions on CI runners, but capture-pane output is empty or
+    /// delayed, causing the assertion to fail after a 10s timeout.
     #[tokio::test]
+    #[ignore]
     async fn integration_channel_to_tmux_to_capture() {
         use crate::channels::capture::CaptureService;
         use crate::channels::transport::Transport;
         use std::sync::Arc;
-
-        // Skip test if tmux cannot create sessions (CI has tmux binary but no server)
-        let probe_session = "orch-test-probe";
-        let probe_ok = tokio::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", probe_session])
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !probe_ok {
-            tracing::warn!(
-                "tmux cannot create sessions, skipping integration_channel_to_tmux_to_capture test"
-            );
-            return;
-        }
-        let _ = tokio::process::Command::new("tmux")
-            .args(["kill-session", "-t", probe_session])
-            .output()
-            .await;
 
         // Create transport and capture service
         let transport = Arc::new(Transport::new());
