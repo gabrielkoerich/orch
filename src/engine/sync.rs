@@ -572,15 +572,32 @@ async fn skills_sync() -> anyhow::Result<()> {
 /// Ingest all active external tasks into the unified SQLite store.
 ///
 /// Upserts each task so the store stays in sync with the backend.
-/// Also syncs fields for each task so the store has the latest
-/// routing, execution, and cost data. This is best-effort — individual
-/// task failures are logged and skipped.
+/// Fetches all open issues (including unlabeled ones) so newly created
+/// issues appear in the store immediately, not only after they get a
+/// `status:*` label.  This is best-effort — individual task failures
+/// are logged and skipped.
 pub(crate) async fn ingest_external_tasks(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
     store: &Arc<crate::store::TaskStore>,
 ) -> anyhow::Result<()> {
-    // Ingest tasks across all active statuses.
+    // Fetch all open issues in one call (includes unlabeled issues).
+    // Also fetch routable tasks which catches unlabeled issues on backends
+    // where list_all_tasks only returns labeled ones.
+    let mut seen = std::collections::HashSet::new();
+    let mut all_tasks: Vec<(crate::backends::ExternalTask, Option<Status>)> = Vec::new();
+
+    // 1. Routable tasks (unlabeled + status:new) — these are the ones that
+    //    were previously missed because the per-status loop skipped them.
+    if let Ok(routable) = backend.list_routable().await {
+        for task in routable {
+            if seen.insert(task.id.0.clone()) {
+                all_tasks.push((task, None));
+            }
+        }
+    }
+
+    // 2. All labeled active statuses — for status sync on first ingest.
     let active_statuses = [
         Status::New,
         Status::Routed,
@@ -589,7 +606,6 @@ pub(crate) async fn ingest_external_tasks(
         Status::InReview,
         Status::Blocked,
     ];
-
     for status in &active_statuses {
         let tasks = match backend.list_by_status(*status).await {
             Ok(t) => t,
@@ -598,14 +614,22 @@ pub(crate) async fn ingest_external_tasks(
                 continue;
             }
         };
+        for task in tasks {
+            if seen.insert(task.id.0.clone()) {
+                all_tasks.push((task, Some(*status)));
+            }
+        }
+    }
 
-        for task in &tasks {
-            match store.ensure_external_task(repo, task).await {
-                Ok(store_id) => {
-                    // Only sync status from backend → store for NEW tasks (first ingest).
-                    // Once a task exists in the store, its status is authoritative —
-                    // re-ingestion must not overwrite store-first status changes
-                    // (e.g., store has Routed but GitHub still shows New labels).
+    // 3. Upsert into the store.
+    for (task, status) in &all_tasks {
+        match store.ensure_external_task(repo, task).await {
+            Ok(store_id) => {
+                // Only sync status from backend → store for NEW tasks (first ingest).
+                // Once a task exists in the store, its status is authoritative —
+                // re-ingestion must not overwrite store-first status changes
+                // (e.g., store has Routed but GitHub still shows New labels).
+                if let Some(status) = status {
                     if let Ok(existing) = store.get(store_id).await {
                         if existing.status == crate::store::TaskStatus::New {
                             let db_status = crate::engine::tasks::status_to_task_status(*status);
@@ -621,9 +645,9 @@ pub(crate) async fn ingest_external_tasks(
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::debug!(task_id = task.id.0, ?e, "ingest: upsert failed");
-                }
+            }
+            Err(e) => {
+                tracing::debug!(task_id = task.id.0, ?e, "ingest: upsert failed");
             }
         }
     }
