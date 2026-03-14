@@ -318,6 +318,28 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<()> {
+    // Pull main once up-front so new worktrees start from a fresh base.
+    if !opts.dry_run {
+        if let Ok(repo_root) = resolve_repo_root(repo).await {
+            let pull_result = Command::new("git")
+                .args(["-C", &repo_root, "pull", "--ff-only"])
+                .output_with_context()
+                .await;
+            match pull_result {
+                Ok(output) if output.status.success() => {
+                    tracing::info!("pulled main before cleanup");
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::debug!(err = %stderr, "git pull skipped before cleanup");
+                }
+                Err(e) => {
+                    tracing::debug!(err = %e, "git pull failed before cleanup");
+                }
+            }
+        }
+    }
+
     // Read done tasks from the store first; fall back to backend before first sync.
     let done_tasks = {
         if store.has_tasks(repo).await {
@@ -393,6 +415,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         "checking all terminal tasks for cleanup"
     );
 
+    let mut cleaned_any = false;
     for task_id in &task_ids {
         // Skip if already cleaned
         let worktree_cleaned = store_get_field(store, repo, task_id, "worktree_cleaned").await;
@@ -402,6 +425,29 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 
         if let Err(e) = cleanup_task_worktree_with_opts(task_id, repo, store, opts).await {
             tracing::warn!(task_id, err = %e, "worktree cleanup failed for task");
+        }
+        cleaned_any = true;
+    }
+
+    // Pull main once after all worktrees are cleaned (not per-task).
+    if cleaned_any && !opts.dry_run {
+        if let Ok(repo_root) = resolve_repo_root(repo).await {
+            let pull_result = Command::new("git")
+                .args(["-C", &repo_root, "pull", "--ff-only"])
+                .output_with_context()
+                .await;
+            match pull_result {
+                Ok(output) if output.status.success() => {
+                    tracing::info!("pulled main after cleanup");
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::debug!(err = %stderr, "git pull skipped after cleanup");
+                }
+                Err(e) => {
+                    tracing::debug!(err = %e, "git pull failed after cleanup");
+                }
+            }
         }
     }
 
@@ -426,7 +472,17 @@ pub(crate) async fn cleanup_task_worktree(
         ttl_hours: 0,
         ..Default::default()
     };
-    cleanup_task_worktree_with_opts(task_id, repo, store, &opts).await
+    cleanup_task_worktree_with_opts(task_id, repo, store, &opts).await?;
+
+    // Pull main once after inline cleanup (post-merge single-task path).
+    if let Ok(repo_root) = resolve_repo_root(repo).await {
+        let _ = Command::new("git")
+            .args(["-C", &repo_root, "pull", "--ff-only"])
+            .output_with_context()
+            .await;
+    }
+
+    Ok(())
 }
 
 /// Cleanup a single task's worktree and branches with explicit janitor options.
@@ -529,24 +585,6 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     }
 
     if !opts.dry_run {
-        // Pull main to keep local repo up-to-date for future worktrees
-        let pull_result = Command::new("git")
-            .args(["-C", &repo_root, "pull", "--ff-only"])
-            .output_with_context()
-            .await;
-        match pull_result {
-            Ok(output) if output.status.success() => {
-                tracing::info!(task_id, "pulled main after cleanup");
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::debug!(task_id, err = %stderr, "git pull skipped");
-            }
-            Err(e) => {
-                tracing::debug!(task_id, err = %e, "git pull failed");
-            }
-        }
-
         // Mark as cleaned in store
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
             let _ = store.mark_cleaned(store_id).await;
