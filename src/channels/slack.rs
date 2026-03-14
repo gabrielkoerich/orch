@@ -161,7 +161,11 @@ impl Channel for SlackChannel {
 
         let bot_token = self.bot_token.clone();
         let client = self.client.clone();
-        let channel_id = self.channel_id.clone().unwrap();
+        // SAFETY: checked is_none() above and returned early
+        let channel_id = self
+            .channel_id
+            .clone()
+            .expect("BUG: channel_id is Some; None case returned early above");
         let last_ts = self.last_ts.clone();
 
         tracing::info!(
