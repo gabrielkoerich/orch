@@ -59,7 +59,9 @@ fn invalidate_cache(path: &PathBuf) {
 
 /// Start the file watcher if not already running.
 fn ensure_watcher() {
-    let mut watcher_guard = FILE_WATCHER.lock().unwrap();
+    let Ok(mut watcher_guard) = FILE_WATCHER.lock() else {
+        return;
+    };
     if watcher_guard.is_some() {
         return;
     }

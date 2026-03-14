@@ -189,6 +189,25 @@ static METRIC_WAIT_SECS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 // ── Shared token resolver ────────────────────────────────────────────
 
+// ── Shared reqwest client ─────────────────────────────────────────────
+
+/// Process-wide reqwest Client shared across all [`GhHttp`] instances.
+///
+/// `Client::builder()` with this configuration cannot fail: the only
+/// failure modes are an invalid proxy or a missing TLS backend, neither
+/// of which apply to our hardcoded settings. Using a `LazyLock` here is
+/// consistent with the `LazyLock<Regex>` pattern used elsewhere, and the
+/// `BUG:` prefix signals that a panic here indicates a programmer error
+/// (e.g. a broken TLS backend), not a runtime condition we can recover from.
+static HTTP_CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(|| {
+    Client::builder()
+        .user_agent("orch/0.1 (reqwest)")
+        .pool_max_idle_per_host(4)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("BUG: reqwest Client failed to initialize — system TLS library unavailable")
+});
+
 // ── GhHttp client ────────────────────────────────────────────────────
 
 /// Native HTTP client for the GitHub API with connection pooling and
@@ -208,17 +227,8 @@ impl GhHttp {
     /// so `gh auth token` is only called once regardless of how many instances
     /// are created.
     pub fn new() -> Self {
-        let client = Client::builder()
-            .user_agent("orch/0.1 (reqwest)")
-            .pool_max_idle_per_host(4)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect(
-                "BUG: reqwest client config is statically valid; TLS init failure is unrecoverable",
-            );
-
         Self {
-            client,
+            client: HTTP_CLIENT.clone(),
             token_resolver: token::shared(),
         }
     }
