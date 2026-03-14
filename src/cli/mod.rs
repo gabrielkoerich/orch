@@ -233,7 +233,7 @@ pub fn agents() {
 }
 
 /// Show task metrics summary.
-pub async fn metrics() -> anyhow::Result<()> {
+pub async fn metrics(details: bool) -> anyhow::Result<()> {
     let store = init_store().await?;
 
     let summary = store.get_metrics_summary_24h().await?;
@@ -284,6 +284,48 @@ pub async fn metrics() -> anyhow::Result<()> {
     // Rate limits
     println!(" Rate Limit Events: {:>6}", summary.rate_limits_24h);
     println!();
+
+    if details {
+        // Slow tasks (last 7 days)
+        let slow = store.get_slow_tasks_7d().await?;
+        if !slow.is_empty() {
+            println!(" Slowest Tasks (Last 7 Days):");
+            println!(
+                "   {:<20} {:<12} {:<10} DURATION",
+                "TASK ID", "AGENT", "COMPLEXITY"
+            );
+            println!("   {}", "-".repeat(56));
+            for t in &slow {
+                println!(
+                    "   {:<20} {:<12} {:<10} {:.1}s",
+                    t.task_id,
+                    t.agent,
+                    t.complexity.as_deref().unwrap_or("-"),
+                    t.duration_seconds
+                );
+            }
+            println!();
+        }
+
+        // Error distribution (last 7 days)
+        let errors = store.get_error_distribution_7d().await?;
+        if !errors.is_empty() {
+            println!(" Error Distribution (Last 7 Days):");
+            println!("   {:<30} {:>6}", "ERROR TYPE", "COUNT");
+            println!("   {}", "-".repeat(38));
+            for e in &errors {
+                println!(
+                    "   {:<30} {:>6}",
+                    e.error_type.as_deref().unwrap_or("unknown"),
+                    e.count
+                );
+            }
+            println!();
+        } else {
+            println!(" Error Distribution (Last 7 Days): none");
+            println!();
+        }
+    }
 
     Ok(())
 }
