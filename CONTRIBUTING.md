@@ -29,6 +29,12 @@ cargo test                    # all tests
 cargo test -- test_name       # specific test
 ```
 
+## Reliability guardrails
+
+- Avoid `unwrap()` / `expect()` in production paths (engine, HTTP, tmux, token, store/sidecar, template/home helpers).
+- Propagate errors with `anyhow::Result` and add context via `.context(...)` / `.with_context(...)`.
+- Reserve panics for test code or truly unreachable programmer-error invariants.
+
 ## Commit message conventions
 
 Use Conventional Commits:
