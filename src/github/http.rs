@@ -1553,6 +1553,20 @@ pub fn status_label_color(label: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    /// Verify `GhHttp::new()` returns `Ok` and does not panic on construction.
+    ///
+    /// This test guards against regressions where `GhHttp::new()` might panic
+    /// (e.g., if TLS initialisation fails or the builder API changes).
+    #[test]
+    fn gh_http_new_returns_ok() {
+        let result = GhHttp::new();
+        assert!(
+            result.is_ok(),
+            "GhHttp::new() must not panic and must return Ok; got: {:?}",
+            result.err()
+        );
+    }
+
     #[test]
     fn status_label_colors_match_bash_palette() {
         assert_eq!(status_label_color("status:new"), "0e8a16");
