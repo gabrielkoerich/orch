@@ -1413,9 +1413,12 @@ impl GhHttp {
         let total = runs.len() as u64;
         let state = if failing > 0 {
             "failure".to_string()
-        } else if pending > 0 || total == 0 {
+        } else if pending > 0 {
             "pending".to_string()
         } else {
+            // total == 0 (no checks registered) or all passing — treat as success.
+            // Previously total==0 returned "pending", causing auto_merge_pr to poll
+            // for 5 minutes and then incorrectly count it as a CI timeout failure.
             "success".to_string()
         };
 
