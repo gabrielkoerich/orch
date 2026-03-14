@@ -179,6 +179,7 @@ pub async fn handle_success(
                     has_pr = true;
                 }
                 Err(e) => {
+                    let err_str = format!("{e}");
                     tracing::error!(task_id, error = ?e, "create PR failed");
                     let msg = format!("create PR failed: {e}");
                     crate::engine::cleanup::store_set(
@@ -188,6 +189,17 @@ pub async fn handle_success(
                         &[("last_error", serde_json::json!(msg))],
                     )
                     .await;
+                    // 422 with "head" invalid means the branch has no diff
+                    // from main — the work is already merged. Clear
+                    // has_pushed so we fall through to the "done" path
+                    // instead of spinning in the review gate.
+                    if err_str.contains("422") && err_str.contains("head") {
+                        tracing::info!(
+                            task_id,
+                            "PR creation returned 422/head-invalid — branch has no diff from main, clearing has_pushed"
+                        );
+                        has_pushed = false;
+                    }
                 }
             }
         }
