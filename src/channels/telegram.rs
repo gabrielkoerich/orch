@@ -133,7 +133,7 @@ impl Channel for TelegramChannel {
         tokio::spawn(async move {
             loop {
                 let current_offset = {
-                    let off = offset.lock().unwrap();
+                    let off = offset.lock().unwrap_or_else(|e| e.into_inner());
                     *off
                 };
 
@@ -156,7 +156,7 @@ impl Channel for TelegramChannel {
 
                     // Update offset
                     {
-                        let mut off = offset.lock().unwrap();
+                        let mut off = offset.lock().unwrap_or_else(|e| e.into_inner());
                         if update.update_id + 1 > *off {
                             *off = update.update_id + 1;
                         }

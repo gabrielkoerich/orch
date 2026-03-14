@@ -439,7 +439,7 @@ impl TaskRunner {
             tracing::info!(task_id, "guard skipped task — not posting stale result");
             return Ok(WeightSignal::None);
         }
-        let status = run_status.unwrap();
+        let status = run_status.expect("checked above: None case returned early");
 
         // Process delegations if the agent requested subtasks
         let delegations_raw = self
