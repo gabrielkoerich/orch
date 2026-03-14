@@ -62,6 +62,7 @@ pub(crate) async fn sync_tick(
     router: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
     store: &Arc<crate::store::TaskStore>,
+    dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
 
@@ -95,7 +96,7 @@ pub(crate) async fn sync_tick(
     }
 
     // 4. Review open PRs (parse review comments, create follow-ups)
-    if let Err(e) = review_open_prs(backend, repo, config, task_manager, store).await {
+    if let Err(e) = review_open_prs(backend, repo, config, task_manager, store, dispatching).await {
         tracing::warn!(err = %e, "PR review failed");
     }
 
@@ -132,6 +133,18 @@ pub(crate) async fn sync_tick(
 
         for task in needs_review_tasks {
             let task_id = &task.id.0;
+            // Skip tasks currently being processed by the main tick (dispatch + review flow).
+            let dispatch_key = format!("{}/{}", repo, task_id);
+            {
+                let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.contains(&dispatch_key) {
+                    tracing::debug!(
+                        task_id,
+                        "task locked by dispatch flow, skipping sync review trigger"
+                    );
+                    continue;
+                }
+            }
             tracing::info!(task_id, "triggering review agent for needs_review task");
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
@@ -292,6 +305,18 @@ pub(crate) async fn sync_tick(
             }
         };
         for task in in_review_tasks {
+            // Skip tasks currently being processed by the main tick (dispatch + review flow).
+            let dispatch_key = format!("{}/{}", repo, task.id.0);
+            {
+                let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.contains(&dispatch_key) {
+                    tracing::debug!(
+                        task_id = task.id.0,
+                        "task locked by dispatch flow, skipping stale check"
+                    );
+                    continue;
+                }
+            }
             // Skip tasks that just transitioned to InReview — allow time for the
             // review agent to start its tmux session before treating it as stale.
             // A task is only considered stale if it has been in InReview for > 5 minutes.
@@ -882,5 +907,100 @@ mod tests {
         let opt: Option<&Arc<crate::store::TaskStore>> = None;
         // Should not panic
         kv_set_prefer_store(&opt, "k4", "val4").await;
+    }
+
+    // ── dispatching lock tests ──────────────────────────────────────────
+
+    #[test]
+    fn dispatching_set_blocks_duplicate_processing() {
+        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+        let repo = "owner/repo";
+        let task_id = "42";
+        let dispatch_key = format!("{}/{}", repo, task_id);
+
+        // Initially not in the set
+        {
+            let guard = dispatching.lock().unwrap();
+            assert!(!guard.contains(&dispatch_key));
+        }
+
+        // Insert — simulates dispatch starting
+        {
+            let mut guard = dispatching.lock().unwrap();
+            guard.insert(dispatch_key.clone());
+        }
+
+        // Now should be blocked
+        {
+            let guard = dispatching.lock().unwrap();
+            assert!(
+                guard.contains(&dispatch_key),
+                "task should be locked while dispatching"
+            );
+        }
+
+        // Remove — simulates review completion
+        {
+            let mut guard = dispatching.lock().unwrap();
+            guard.remove(&dispatch_key);
+        }
+
+        // Now should be free again
+        {
+            let guard = dispatching.lock().unwrap();
+            assert!(
+                !guard.contains(&dispatch_key),
+                "task should be unlocked after review completes"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatching_set_does_not_block_other_tasks() {
+        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+        let repo = "owner/repo";
+
+        // Lock task 42
+        let key_42 = format!("{}/42", repo);
+        {
+            let mut guard = dispatching.lock().unwrap();
+            guard.insert(key_42.clone());
+        }
+
+        // Task 43 should NOT be blocked
+        let key_43 = format!("{}/43", repo);
+        {
+            let guard = dispatching.lock().unwrap();
+            assert!(guard.contains(&key_42), "task 42 should be locked");
+            assert!(!guard.contains(&key_43), "task 43 should not be locked");
+        }
+    }
+
+    #[test]
+    fn dispatching_key_includes_repo_for_cross_project_isolation() {
+        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+        // Lock task 42 in repo A
+        let key_a = "owner/repo-a/42".to_string();
+        {
+            let mut guard = dispatching.lock().unwrap();
+            guard.insert(key_a.clone());
+        }
+
+        // Same task ID in repo B should NOT be blocked
+        let key_b = "owner/repo-b/42".to_string();
+        {
+            let guard = dispatching.lock().unwrap();
+            assert!(guard.contains(&key_a));
+            assert!(
+                !guard.contains(&key_b),
+                "same task ID in different repo should not be blocked"
+            );
+        }
     }
 }

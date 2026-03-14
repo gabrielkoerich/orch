@@ -66,6 +66,7 @@ pub(crate) async fn review_open_prs(
     config: &EngineConfig,
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
+    dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) -> anyhow::Result<()> {
     // Get tasks that are in review (have open PRs).
     // Read from the store first; fall back to backend if the store is empty.
@@ -110,6 +111,19 @@ pub(crate) async fn review_open_prs(
 
     for task in in_review_tasks {
         let task_id = &task.id.0;
+
+        // Skip tasks currently being processed by the main tick (dispatch + review flow).
+        let dispatch_key = format!("{}/{}", repo, task_id);
+        {
+            let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.contains(&dispatch_key) {
+                tracing::debug!(
+                    task_id,
+                    "task locked by dispatch flow, skipping review_open_prs"
+                );
+                continue;
+            }
+        }
 
         // Get branch from store
         let branch = match super::cleanup::store_get_field(store, repo, task_id, "branch").await {

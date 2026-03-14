@@ -460,6 +460,9 @@ pub(crate) async fn tick_dispatch_tasks(
             tracing::info!(task_id, "dispatching task");
 
             let dispatch_start = std::time::Instant::now();
+            // Track whether the review agent was spawned for this task.
+            // When true, the review spawn owns the dispatching lock removal.
+            let mut review_spawned = false;
 
             match runner
                 .run_with_context(&task_owned, &backend, &tmux, route_result.as_ref())
@@ -515,6 +518,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                     tracing::warn!(task_id, err = %e, "failed to transition to InReview");
                                 }
                                 Ok(_) => {
+                                    review_spawned = true;
                                     let backend_clone = backend.clone();
                                     let task_manager_for_review = task_manager_for_spawn.clone();
                                     let tmux_clone = tmux.clone();
@@ -522,6 +526,8 @@ pub(crate) async fn tick_dispatch_tasks(
                                     let router_for_review = router_clone.clone();
                                     let store_for_review = store_for_spawn.clone();
                                     let task_id_for_review = task_id.clone();
+                                    let dispatching_for_review = dispatching_for_cleanup.clone();
+                                    let dispatch_key_for_review = dispatch_key_for_cleanup.clone();
                                     let repo_ctx = repo_owned.clone();
                                     tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                                         match review_and_merge(
@@ -656,6 +662,11 @@ pub(crate) async fn tick_dispatch_tasks(
                                                 .await;
                                             } // Approve or RequestChanges handled inside
                                         }
+                                        // Release the per-task lock so sync_tick can act on this task.
+                                        {
+                                            let mut guard = dispatching_for_review.lock().unwrap_or_else(|e| e.into_inner());
+                                            guard.remove(&dispatch_key_for_review);
+                                        }
                                     }));
                                 }
                             }
@@ -741,8 +752,9 @@ pub(crate) async fn tick_dispatch_tasks(
             // Unregister session from capture
             capture.unregister_session(&task_id_for_cleanup).await;
 
-            // Remove from dispatching set so the task can be re-dispatched if needed
-            {
+            // Remove from dispatching set so the task can be re-dispatched if needed.
+            // If a review was spawned, the review task owns the lock and removes it on completion.
+            if !review_spawned {
                 let mut guard = dispatching_for_cleanup.lock().unwrap_or_else(|e| e.into_inner());
                 guard.remove(&dispatch_key_for_cleanup);
             }
