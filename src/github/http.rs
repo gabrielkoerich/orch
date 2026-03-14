@@ -552,7 +552,7 @@ impl GhHttp {
                     .send()
                     .await?
             } else {
-                let u = next_url.as_ref().unwrap();
+                let Some(u) = next_url.as_ref() else { break };
                 let auth = self.auth_header().await?;
                 self.client
                     .get(u)
@@ -1604,6 +1604,14 @@ mod tests {
         assert_eq!(parse_link_next(&headers), None);
     }
 
+    #[test]
+    fn parse_link_next_none_when_malformed() {
+        let mut headers = header::HeaderMap::new();
+        // Malformed: no angle-bracket URL, just garbage
+        headers.insert("link", "garbage; rel=\"next\"".parse().unwrap());
+        assert_eq!(parse_link_next(&headers), None);
+    }
+
     fn make_rl(base_secs: u64, max_secs: u64) -> RateLimit {
         RateLimit {
             remaining: None,
@@ -1709,5 +1717,152 @@ mod tests {
         // Backoff should use reset_at (~46s) not the base (30s)
         assert!(rl.backoff_delay.as_secs() >= 45);
         assert!(rl.backoff_delay.as_secs() <= 47);
+    }
+
+    // ── get_all_pages integration tests (wiremock) ────────────────────────
+
+    #[cfg(test)]
+    mod pagination {
+        use super::super::*;
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Build a minimal GhHttp pointing at a wiremock server.
+        /// The token resolver reads GH_TOKEN; we set it to a dummy value.
+        fn make_client() -> GhHttp {
+            // Ensure a token is available so auth_header() doesn't bail.
+            unsafe { std::env::set_var("GH_TOKEN", "test_token") };
+            GhHttp {
+                client: reqwest::Client::new(),
+                token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
+            }
+        }
+
+        #[tokio::test]
+        async fn get_all_pages_single_page() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/items"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([{"id": 1}, {"id": 2}])),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let gh = make_client();
+            let url = format!("{}/items", server.uri());
+            let result: Vec<serde_json::Value> = gh.get_all_pages(&url, &[]).await.unwrap();
+
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0]["id"], 1);
+            assert_eq!(result[1]["id"], 2);
+        }
+
+        #[tokio::test]
+        async fn get_all_pages_follows_link_next() {
+            let server = MockServer::start().await;
+
+            // Page 1 — includes Link header pointing to page 2
+            Mock::given(method("GET"))
+                .and(path("/items"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([{"id": 1}]))
+                        .insert_header(
+                            "Link",
+                            format!("<{}/items/page2>; rel=\"next\"", server.uri()),
+                        ),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            // Page 2 — no Link header (last page)
+            Mock::given(method("GET"))
+                .and(path("/items/page2"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([{"id": 2}, {"id": 3}])),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let gh = make_client();
+            let url = format!("{}/items", server.uri());
+            let result: Vec<serde_json::Value> = gh.get_all_pages(&url, &[]).await.unwrap();
+
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[0]["id"], 1);
+            assert_eq!(result[1]["id"], 2);
+            assert_eq!(result[2]["id"], 3);
+        }
+
+        #[tokio::test]
+        async fn get_all_pages_stops_when_link_header_absent_on_subsequent_page() {
+            // Simulates a proxy/transient response that drops the Link header mid-pagination.
+            // The previous `.unwrap()` would panic here; the fix breaks the loop instead.
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/items"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([{"id": 1}]))
+                        .insert_header(
+                            "Link",
+                            format!("<{}/items/page2>; rel=\"next\"", server.uri()),
+                        ),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            // Page 2 response has NO Link header — pagination should stop cleanly.
+            Mock::given(method("GET"))
+                .and(path("/items/page2"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{"id": 2}])),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let gh = make_client();
+            let url = format!("{}/items", server.uri());
+            let result: Vec<serde_json::Value> = gh.get_all_pages(&url, &[]).await.unwrap();
+
+            // Must not panic and must return both items collected so far.
+            assert_eq!(result.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn get_all_pages_stops_on_malformed_link_header() {
+            // A malformed Link header (no angle-bracket URL) yields None from parse_link_next,
+            // which should stop pagination rather than panic.
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/items"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([{"id": 1}]))
+                        .insert_header("Link", "garbage; rel=\"next\""),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let gh = make_client();
+            let url = format!("{}/items", server.uri());
+            let result: Vec<serde_json::Value> = gh.get_all_pages(&url, &[]).await.unwrap();
+
+            // Malformed Link header → pagination stops after first page, no panic.
+            assert_eq!(result.len(), 1);
+        }
     }
 }

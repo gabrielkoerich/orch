@@ -89,6 +89,7 @@ futures = "0.3"
 tempfile = "3"
 tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
 
 [profile.release]
 opt-level = 3
