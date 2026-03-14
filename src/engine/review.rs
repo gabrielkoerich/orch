@@ -1615,72 +1615,19 @@ pub(crate) async fn handle_review_changes(
     )
     .await;
 
-    // 4. Create a child internal task to address the review feedback.
-    //    Each PR must be tied to its own issue — re-dispatching the same task can
-    //    create a second PR for the same task if the branch is gone. Instead, we
-    //    create a new child task that opens its own PR with the fixes.
-    let child_title = format!("Fix review feedback: {}", task.title);
-    let child_body = format!(
-        "Address the review feedback for PR #{pr_number} (original task: {task_id}):\n\n\
-        **Original task:** {title}\n\n\
-        **Review feedback:**\n{review_context}\n\n\
-        Please create a new PR with the requested fixes.{footer}",
-        pr_number = pr_number,
+    // 4. Re-route the same task so the agent can address feedback on the same branch/PR.
+    //    The existing worktree and branch are reused — the agent gets pr_review_context
+    //    from the store and pushes fixes to the same PR.
+    task_manager
+        .update_task_status(&task.id, Status::New)
+        .await?;
+
+    tracing::info!(
         task_id = task.id.0,
-        title = task.title,
-        review_context = review_context,
-        footer = crate::engine::orch_footer(),
+        review_cycles = review_cycles + 1,
+        pr_number,
+        "re-routing task to address review feedback on same PR"
     );
-
-    let create_req = crate::engine::tasks::CreateTaskRequest {
-        title: child_title,
-        body: child_body,
-        task_type: crate::engine::tasks::TaskType::Internal,
-        labels: vec![],
-        source: "review".to_string(),
-        source_id: task.id.0.clone(),
-    };
-
-    match task_manager.create_task(create_req).await {
-        Ok(child) => {
-            let child_id = match &child {
-                crate::engine::tasks::Task::Internal(t) => format!("internal:{}", t.id),
-                crate::engine::tasks::Task::External(t) => t.id.0.clone(),
-            };
-            tracing::info!(
-                task_id = task.id.0,
-                child_id,
-                review_cycles = review_cycles + 1,
-                "created child task to address review feedback"
-            );
-            // Parent is Done — its PR is superseded by the child's work.
-            if let Err(e) = task_manager
-                .update_task_status(&task.id, Status::Done)
-                .await
-            {
-                tracing::warn!(task_id = task.id.0, err = %e, "failed to mark parent Done after creating child");
-            }
-            // Leave a note on the parent PR.
-            let close_comment = format!(
-                "Review requested changes. A follow-up task ({child_id}) has been created to address the feedback.{}",
-                crate::engine::orch_footer()
-            );
-            if let Err(e) = gh.add_comment(repo, &pr_num_str, &close_comment).await {
-                tracing::warn!(task_id = task.id.0, pr_number, err = %e, "failed to post follow-up comment on PR");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                task_id = task.id.0,
-                err = %e,
-                "failed to create child task, falling back to re-dispatch"
-            );
-            // Fallback: re-dispatch same task.
-            task_manager
-                .update_task_status(&task.id, Status::Routed)
-                .await?;
-        }
-    }
 
     Ok(())
 }
