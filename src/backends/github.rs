@@ -14,11 +14,11 @@ pub struct GitHubBackend {
 }
 
 impl GitHubBackend {
-    pub fn new(repo: String) -> Self {
-        Self {
+    pub fn new(repo: String) -> anyhow::Result<Self> {
+        Ok(Self {
             repo,
-            gh: GhHttp::new(),
-        }
+            gh: GhHttp::new()?,
+        })
     }
 }
 

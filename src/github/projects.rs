@@ -52,11 +52,19 @@ impl ProjectSync {
             }
         }
 
+        let gh = match GhHttp::new() {
+            Ok(gh) => gh,
+            Err(e) => {
+                tracing::warn!(error = %e, "project sync disabled: failed to build HTTP client");
+                return None;
+            }
+        };
+
         Some(Self {
             project_id,
             status_field_id,
             status_map,
-            gh: GhHttp::new(),
+            gh,
         })
     }
 
@@ -65,7 +73,7 @@ impl ProjectSync {
     /// Queries the project's fields via GraphQL and finds the single-select
     /// "Status" field, returning a `ProjectSync` populated with field/option IDs.
     pub async fn discover_fields(project_id: &str) -> anyhow::Result<Self> {
-        let gh = GhHttp::new();
+        let gh = GhHttp::new()?;
         let query = format!(
             r#"{{ node(id: "{}") {{ ... on ProjectV2 {{ fields(first: 100) {{ nodes {{ ... on ProjectV2SingleSelectField {{ id name options {{ id name }} }} }} }} }} }} }}"#,
             project_id
@@ -132,7 +140,7 @@ impl ProjectSync {
 
     /// List all accessible projects for the authenticated user and their orgs.
     pub async fn list_projects() -> anyhow::Result<Vec<ProjectInfo>> {
-        let gh = GhHttp::new();
+        let gh = GhHttp::new()?;
         let mut projects = Vec::new();
 
         // Get current user login
