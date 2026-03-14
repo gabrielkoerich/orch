@@ -13,3 +13,4 @@ opencode.json
 skills/
 tasks.yml
 tasks.yml.lock*
+lcov.info

@@ -28,8 +28,10 @@ jobs:
           rustflags: ""
           components: clippy, rustfmt
 
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install cargo-llvm-cov and nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -43,11 +45,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run secret leak tests
-        run: cargo test --test secret_leak
+      - name: Run tests
+        run: cargo nextest run --no-fail-fast
 
       - name: Run tests with coverage
-        run: cargo llvm-cov --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
