@@ -547,8 +547,18 @@ pub(crate) async fn ingest_external_tasks(
         Status::Blocked,
     ];
 
-    for status in &active_statuses {
-        let tasks = match backend.list_by_status(*status).await {
+    // Fire all list_by_status queries concurrently — they are independent reads.
+    let futures: Vec<_> = active_statuses
+        .iter()
+        .map(|&status| {
+            let backend = Arc::clone(backend);
+            async move { (status, backend.list_by_status(status).await) }
+        })
+        .collect();
+    let results = futures::future::join_all(futures).await;
+
+    for (status, result) in results {
+        let tasks = match result {
             Ok(t) => t,
             Err(e) => {
                 tracing::debug!(?status, ?e, "ingest: failed to list tasks");
@@ -565,7 +575,7 @@ pub(crate) async fn ingest_external_tasks(
                     // (e.g., store has Routed but GitHub still shows New labels).
                     if let Ok(existing) = store.get(store_id).await {
                         if existing.status == crate::store::TaskStatus::New {
-                            let db_status = crate::engine::tasks::status_to_task_status(*status);
+                            let db_status = crate::engine::tasks::status_to_task_status(status);
                             if db_status != crate::store::TaskStatus::New {
                                 if let Err(e) = store.update_status(store_id, db_status).await {
                                     tracing::debug!(
