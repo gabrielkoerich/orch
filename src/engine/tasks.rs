@@ -198,16 +198,22 @@ impl TaskManager {
                 }
             }
         } else {
-            // No filters — return all internal tasks + new external tasks
+            // No filters — return all tasks (internal + external)
             if let Some(ref store) = self.store {
-                let internal_tasks = store.list_all_internal(&self.repo).await?;
-                for t in internal_tasks {
-                    tasks.push(Task::Internal(t));
+                let all_tasks = store.list_all(&self.repo).await?;
+                for t in all_tasks {
+                    if t.origin == "internal" {
+                        tasks.push(Task::Internal(t));
+                    } else {
+                        tasks.push(Task::External(store_task_to_external(&t)));
+                    }
                 }
-            }
-            let external_tasks = self.backend.list_by_status(Status::New).await?;
-            for t in external_tasks {
-                tasks.push(Task::External(t));
+            } else {
+                // No store — fall back to backend for external tasks
+                let external_tasks = self.backend.list_all_tasks().await?;
+                for t in external_tasks {
+                    tasks.push(Task::External(t));
+                }
             }
         }
 

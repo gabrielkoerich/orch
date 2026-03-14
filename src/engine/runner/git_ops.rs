@@ -524,6 +524,12 @@ async fn link_issue_to_branch(repo: &str, task_id: &str, branch: &str) -> anyhow
 
     let gh = GhHttp::new()?;
 
+    // Internal tasks don't have GitHub issue numbers — skip silently
+    if task_id.starts_with("internal:") {
+        tracing::debug!(task_id, "skipping link_issue_to_branch: internal task");
+        return Ok(());
+    }
+
     // Parse task_id as issue number
     let issue_number: u64 = task_id
         .parse()
