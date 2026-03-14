@@ -1256,7 +1256,7 @@ pub(crate) async fn auto_merge_pr(
                         "CI failed — re-routing to agent to fix"
                     );
                     task_manager
-                        .update_task_status(&task.id, Status::NeedsReview)
+                        .update_task_status(&task.id, Status::New)
                         .await?;
                 }
                 return Ok(());
