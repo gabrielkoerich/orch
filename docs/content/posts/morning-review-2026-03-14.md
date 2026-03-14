@@ -47,7 +47,7 @@ From the 2026-03-13 evening retrospective (`evening-retrospective-2026-03-13.md`
 
 **CI**: Green. Last run: `success` at 2026-03-14T03:22:33Z.
 
-**Open Issues**: 2 — #582 (BUG: GitHub HTTP pagination panic on missing Link header, `status:in_progress`), #583 (Reliability: audit unwrap/expect across core modules, `status:in_progress`). Both are subtasks of `parent:internal:57`.
+**Open Issues**: 2 — #582 (BUG: GitHub HTTP pagination panic on missing Link header, `status:in_progress`), #583 (Reliability: audit unwrap/expect across core modules, `status:routed`). Both are subtasks of `parent:internal:57`.
 
 **Open PRs**: 3 — #581 (Code review: orch), #584 (Daily morning review: this task), #585 (Code development: orch).
 
