@@ -52,11 +52,19 @@ impl ProjectSync {
             }
         }
 
+        let gh = match GhHttp::new() {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!("project sync disabled: failed to build HTTP client: {e}");
+                return None;
+            }
+        };
+
         Some(Self {
             project_id,
             status_field_id,
             status_map,
-            gh: GhHttp::new().ok()?,
+            gh,
         })
     }
 
