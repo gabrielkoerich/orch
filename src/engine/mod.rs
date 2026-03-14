@@ -1298,6 +1298,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires real tmux; run with `cargo nextest run -- --ignored`"]
     async fn integration_channel_to_tmux_to_capture() {
         use crate::channels::capture::CaptureService;
         use crate::channels::transport::Transport;

@@ -166,12 +166,10 @@ jobs:
           echo "Version: $NEW_VERSION (${BUMP} bump)"
 
   # Cross-compile build jobs for macOS targets.
-  # NOTE: Do NOT add a skip check here. check-release is a dependency — if it
-  # is skipped (non-main) or outputs skip=true, GitHub Actions automatically
-  # skips this job. The release job handles the skip guard.
+  # Only run when a release is actually needed (skip=false from check-release).
   build-macos:
     needs: [check-release]
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && needs.check-release.outputs.skip == 'false'
     strategy:
       matrix:
         include:
