@@ -367,11 +367,15 @@ impl TokenResolver {
                 return Ok(Some(jwt));
             }
 
-            tracing::debug!(installation, "Exchanging GitHub App JWT for installation token");
+            tracing::debug!(
+                installation,
+                "Exchanging GitHub App JWT for installation token"
+            );
 
             // Exchange JWT for installation access token via REST API
             let client = reqwest::Client::new();
-            let url = format!("https://api.github.com/app/installations/{installation}/access_tokens");
+            let url =
+                format!("https://api.github.com/app/installations/{installation}/access_tokens");
             let resp = client
                 .post(&url)
                 .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
@@ -379,7 +383,9 @@ impl TokenResolver {
                 .header(reqwest::header::USER_AGENT, "orch")
                 .send()
                 .await
-                .with_context(|| format!("failed to POST to installation access_tokens endpoint: {url}"))?;
+                .with_context(|| {
+                    format!("failed to POST to installation access_tokens endpoint: {url}")
+                })?;
 
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
