@@ -7,7 +7,7 @@ job = "morning-review"
 
 ## Summary
 
-Clean overnight session. Three targeted reliability and performance fixes landed on main. CI is green, no open issues, no open PRs. Service restarted and dispatched internal:57, :58, :59 this morning at 10:09 UTC. System health is good.
+Clean overnight session. Three targeted reliability and performance fixes landed on main. CI is green. Two open issues (#582, #583) and three open PRs (#581, #584, #585) are active. Service restarted and dispatched internal:57, :58, :59 this morning at 10:09 UTC. System health is good.
 
 ---
 
@@ -31,13 +31,15 @@ Three commits in 24 hours. All reliability and performance fixes — no new feat
 
 ## Evening Retro Priorities: Status
 
-Previous evening retro context was not captured in a dedicated issue (last issue was from 2026-03-13 evening). Morning review 2026-03-13 noted:
+From the 2026-03-13 evening retrospective (`evening-retrospective-2026-03-13.md`):
 
 | Item | Status |
 |------|--------|
-| PR #559 (counter-reset additional paths) | ✓ Merged (part of recent fix chain) |
-| PR #562 (SQLite store, Phase 1–5) | Status unknown — not in open PRs list |
-| Router timeout 120s → 60s | Not addressed — low priority |
+| PR #562 (SQLite store, Phase 4 complete — sidecar removed) | Not in open PRs — merged or closed. See notes below. |
+| "No open PR" race condition (cleanup vs review agent) | Not recurred — monitoring |
+| Router timeout 120s → 60s | Still not addressed — low priority, one-line change |
+
+**PR #562 update**: The 2026-03-13 retro noted PR #562 (SQLite store migration, 4000+ lines, Phase 4 complete) was draft and ready for final review before merge. It no longer appears in open PRs — either merged to main or closed. The current `status:in_progress` issues (#582, #583) are subtasks of `internal:57` (code-development), suggesting active agent work continues on reliability improvements.
 
 ---
 
@@ -45,9 +47,9 @@ Previous evening retro context was not captured in a dedicated issue (last issue
 
 **CI**: Green. Last run: `success` at 2026-03-14T03:22:33Z.
 
-**Open Issues**: Zero.
+**Open Issues**: 2 — #582 (BUG: GitHub HTTP pagination panic on missing Link header, `status:in_progress`), #583 (Reliability: audit unwrap/expect across core modules, `status:in_progress`). Both are subtasks of `parent:internal:57`.
 
-**Open PRs**: Zero.
+**Open PRs**: 3 — #581 (Code review: orch), #584 (Daily morning review: this task), #585 (Code development: orch).
 
 **Service**: Running. Engine dispatched 3 tasks at 10:09:53 UTC today:
 - `internal:57` (opencode, fix task — existing worktree reused)
