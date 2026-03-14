@@ -290,7 +290,10 @@ pub async fn metrics(details: bool) -> anyhow::Result<()> {
         let slow = store.get_slow_tasks_7d().await?;
         if !slow.is_empty() {
             println!(" Slowest Tasks (Last 7 Days):");
-            println!("   {:<20} {:<12} {:<10} DURATION", "TASK ID", "AGENT", "COMPLEXITY");
+            println!(
+                "   {:<20} {:<12} {:<10} DURATION",
+                "TASK ID", "AGENT", "COMPLEXITY"
+            );
             println!("   {}", "-".repeat(56));
             for t in &slow {
                 println!(
