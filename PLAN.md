@@ -838,6 +838,8 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Graceful shutdown with session handoff — see `src/engine/mod.rs` serve() loop (signal handlers at line 770+)
 - [x] Slack channel integration — `src/channels/slack.rs` (polling via `conversations.history`, `chat.postMessage`, `auth.test` health check; wired in `src/engine/mod.rs:311-323`)
 - [x] Context file per issue (persistent context accumulation) — see `src/engine/runner/context.rs:40-45`
+- [x] `orch metrics --details` — expose slow tasks + error distribution (7-day window) from `get_slow_tasks_7d()` / `get_error_distribution_7d()` — `src/cli/mod.rs`
+- [x] Composite DB index `idx_tasks_repo_origin_status` — migration 003, speeds up `list_internal_by_status()` hot query path — `migrations/003_indexes.sql`
 
 ---
 

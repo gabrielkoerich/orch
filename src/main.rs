@@ -183,7 +183,11 @@ enum Commands {
         action: ServiceAction,
     },
     /// Show task metrics summary
-    Metrics,
+    Metrics {
+        /// Show slow tasks and error distribution (last 7 days)
+        #[arg(long)]
+        details: bool,
+    },
     /// Combined dashboard: tasks, sessions, recent activity
     Dashboard,
     /// GitHub Projects V2 board management
@@ -559,8 +563,8 @@ async fn main() -> anyhow::Result<()> {
                 cli::service::status()?;
             }
         },
-        Commands::Metrics => {
-            cli::metrics().await?;
+        Commands::Metrics { details } => {
+            cli::metrics(details).await?;
         }
         // Combined dashboard view: tasks, sessions, recent activity
         Commands::Dashboard => {
