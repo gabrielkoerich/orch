@@ -198,10 +198,13 @@ impl TaskManager {
                 }
             }
         } else {
-            // No filters — return all tasks (internal + external)
+            // No filters — return all active tasks (exclude done)
             if let Some(ref store) = self.store {
                 let all_tasks = store.list_all(&self.repo).await?;
                 for t in all_tasks {
+                    if t.status == TaskStatus::Done {
+                        continue;
+                    }
                     if t.origin == "internal" {
                         tasks.push(Task::Internal(t));
                     } else {
@@ -380,7 +383,12 @@ pub fn store_task_to_external(t: &store::Task) -> ExternalTask {
         body: t.body.clone(),
         state: "open".to_string(),
         labels: {
-            let mut labels = t.labels.clone();
+            let mut labels: Vec<String> = t
+                .labels
+                .iter()
+                .filter(|l| !l.starts_with("status:"))
+                .cloned()
+                .collect();
             labels.push(format!("status:{}", t.status.as_str()));
             labels
         },
