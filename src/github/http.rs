@@ -213,7 +213,7 @@ impl GhHttp {
             .pool_max_idle_per_host(4)
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("failed to build reqwest client");
+            .expect("BUG: failed to build reqwest client — TLS initialization failed");
 
         Self {
             client,
@@ -552,7 +552,9 @@ impl GhHttp {
                     .send()
                     .await?
             } else {
-                let u = next_url.as_ref().unwrap();
+                let u = next_url.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("BUG: pagination loop entered else branch with next_url=None")
+                })?;
                 let auth = self.auth_header().await?;
                 self.client
                     .get(u)
