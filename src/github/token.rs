@@ -357,12 +357,52 @@ impl TokenResolver {
         // Generate JWT
         let jwt = generate_github_app_jwt(app_id, &private_key)?;
 
-        // Exchange JWT for installation token (requires installation_id)
-        // For now, just return the JWT (this is a placeholder for full implementation)
-        tracing::warn!(
-            "GitHub App JWT generation is available but token exchange requires installation_id"
-        );
+        // If an installation_id is configured, exchange the JWT for an
+        // installation access token. Otherwise, return the raw JWT so callers
+        // can perform manual exchanges or use it as-is.
+        let installation_id = crate::config::get("github.installation_id").ok();
+        if let Some(installation) = installation_id {
+            if installation.trim().is_empty() {
+                tracing::warn!("github.installation_id is empty — returning raw JWT");
+                return Ok(Some(jwt));
+            }
 
+            tracing::debug!(installation, "Exchanging GitHub App JWT for installation token");
+
+            // Exchange JWT for installation access token via REST API
+            let client = reqwest::Client::new();
+            let url = format!("https://api.github.com/app/installations/{installation}/access_tokens");
+            let resp = client
+                .post(&url)
+                .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
+                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                .header(reqwest::header::USER_AGENT, "orch")
+                .send()
+                .await
+                .with_context(|| format!("failed to POST to installation access_tokens endpoint: {url}"))?;
+
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                tracing::warn!(status = %status, body = %text, "installation token exchange failed");
+                anyhow::bail!("installation token exchange failed ({status}): {text}");
+            }
+
+            // Parse token from response
+            let v: serde_json::Value = serde_json::from_str(&text)
+                .with_context(|| "failed to parse installation token response as JSON")?;
+            if let Some(tok) = v.get("token").and_then(|t| t.as_str()) {
+                tracing::debug!(installation, "obtained installation token via GitHub App");
+                return Ok(Some(tok.to_string()));
+            }
+
+            anyhow::bail!("installation token response missing 'token' field: {v:?}");
+        }
+
+        // No installation configured — return JWT
+        tracing::warn!(
+            "GitHub App JWT generation is available but github.installation_id not configured; returning raw JWT"
+        );
         Ok(Some(jwt))
     }
 
