@@ -318,28 +318,6 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<()> {
-    // Pull main once up-front so new worktrees start from a fresh base.
-    if !opts.dry_run {
-        if let Ok(repo_root) = resolve_repo_root(repo).await {
-            let pull_result = Command::new("git")
-                .args(["-C", &repo_root, "pull", "--ff-only"])
-                .output_with_context()
-                .await;
-            match pull_result {
-                Ok(output) if output.status.success() => {
-                    tracing::info!("pulled main before cleanup");
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::debug!(err = %stderr, "git pull skipped before cleanup");
-                }
-                Err(e) => {
-                    tracing::debug!(err = %e, "git pull failed before cleanup");
-                }
-            }
-        }
-    }
-
     // Read done tasks from the store first; fall back to backend before first sync.
     let done_tasks = {
         if store.has_tasks(repo).await {
@@ -465,7 +443,7 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         cleaned_any = true;
     }
 
-    // Pull main once after all worktrees are cleaned (not per-task).
+    // Pull main after worktrees are cleaned so the repo stays current.
     if cleaned_any && !opts.dry_run {
         if let Ok(repo_root) = resolve_repo_root(repo).await {
             let pull_result = Command::new("git")
@@ -474,14 +452,14 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
                 .await;
             match pull_result {
                 Ok(output) if output.status.success() => {
-                    tracing::info!("pulled main after cleanup");
+                    tracing::info!(%repo, "pulled main after worktree cleanup");
                 }
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::debug!(err = %stderr, "git pull skipped after cleanup");
+                    tracing::debug!(%repo, err = %stderr, "git pull skipped after cleanup");
                 }
                 Err(e) => {
-                    tracing::debug!(err = %e, "git pull failed after cleanup");
+                    tracing::debug!(%repo, err = %e, "git pull failed after cleanup");
                 }
             }
         }

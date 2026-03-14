@@ -216,7 +216,7 @@ pub async fn setup_worktree(
     if !worktree_dir.exists() {
         tracing::info!(task_id, worktree = %worktree_dir.display(), "creating worktree");
 
-        // Fetch if bare repo
+        // Pull/fetch latest so the new branch starts from up-to-date main.
         if is_bare_repo(&main_dir).await {
             let _ = Command::new("git")
                 .args([
@@ -226,6 +226,11 @@ pub async fn setup_worktree(
                     "--all",
                     "--prune",
                 ])
+                .output_with_context()
+                .await;
+        } else {
+            let _ = Command::new("git")
+                .args(["-C", &main_dir.to_string_lossy(), "pull", "--ff-only"])
                 .output_with_context()
                 .await;
         }
