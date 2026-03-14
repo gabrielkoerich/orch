@@ -23,7 +23,7 @@ Before reviewing any PR, orient yourself:
 
 Before making ANY decision:
 1. Look at `.github/workflows/` to find the exact CI commands for this project
-2. Run them in the worktree (e.g. `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`)
+2. Run them in the worktree (e.g. `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo nextest run` or `cargo test`)
 3. If ANY check fails, your decision MUST be `request_changes`
 
 If you can fix the issue yourself (run formatter, fix a lint warning), do it, commit, re-run checks, then approve.

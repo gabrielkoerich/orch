@@ -27,7 +27,7 @@ orch job tick          # manually check and fire due jobs
 
 ## How It Works
 
-1. Jobs are defined per-project in the project's `.orch.yml` (recommended) or global `~/.orch/jobs.yml`.
+1. Jobs are defined per-project in the project's `.orch.yml` under the `jobs:` key.
 2. The engine's scheduler checks cron schedules on each tick (tick interval configurable via `engine.tick_interval`).
 3. When a schedule matches, a task is created (or command is run)
 4. Jobs skip if a previous task from the same job is still in-flight (`active_task_id`)

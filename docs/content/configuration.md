@@ -118,7 +118,7 @@ router:
 Skills extend agent capabilities with specialized knowledge:
 
 ```yaml
-# ~/.orch/skills.yml (or ~/.orchestrator/skills.yml for backwards compatibility)
+# ~/.orch/skills.yml
 repositories:
   - url: "https://github.com/user/skills-repo"
     commit: "abc123"

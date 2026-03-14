@@ -39,18 +39,18 @@ graph TB
         JUST["justfile<br/>(task runner)"]
     end
 
-    subgraph "Service Loop — serve.sh"
-        SERVE["serve.sh<br/>main loop<br/>(sleep 10s)"]
-        POLL["poll.sh<br/>task dispatcher"]
-        JOBS["jobs_tick.sh<br/>cron scheduler"]
-        MENTIONS["gh_mentions.sh<br/>@mention scanner"]
-        REVIEW["review_prs.sh<br/>PR review agent"]
-        CLEANUP["cleanup_worktrees.sh<br/>worktree janitor"]
+    subgraph "Engine — engine/mod.rs"
+        SERVE["engine serve<br/>tokio event loop"]
+        POLL["tick.rs<br/>task dispatcher"]
+        JOBS["jobs.rs<br/>cron scheduler"]
+        MENTIONS["sync.rs<br/>@mention scanner"]
+        REVIEW["review.rs<br/>PR review agent"]
+        CLEANUP["cleanup.rs<br/>worktree janitor"]
     end
 
-    subgraph "Task Execution — run_task.sh"
-        ROUTE["route_task.sh<br/>LLM router"]
-        RUN["run_task.sh<br/>agent orchestration"]
+    subgraph "Task Execution — runner/"
+        ROUTE["router/mod.rs<br/>LLM router"]
+        RUN["runner/mod.rs<br/>agent orchestration"]
         TMUX["tmux sessions<br/>orch-{project}-{id}"]
     end
 
@@ -69,9 +69,9 @@ graph TB
     end
 
     subgraph "Data Storage"
-        ISSUES["GitHub Issues<br/>(source of truth)"]
-        SIDECAR["Sidecar JSON<br/>.orchestrator/tasks/*.json"]
-        CONFIG["config.yml<br/>+ .orchestrator.yml<br/>(includes jobs)"]
+        ISSUES["GitHub Issues<br/>(external tasks)"]
+        STORE["SQLite orch.db<br/>(unified task store)"]
+        CONFIG["config.yml<br/>+ .orch.yml<br/>(includes jobs)"]
     end
 
     BREW --> SERVE
@@ -98,7 +98,7 @@ graph TB
     ROUTE --> GH
 
     GH --> ISSUES
-    RUN --> SIDECAR
+    RUN --> STORE
     YQ --> CONFIG
 ```
 
@@ -106,44 +106,43 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant S as serve.sh
-    participant P as poll.sh
-    participant J as jobs_tick.sh
-    participant R as run_task.sh
-    participant GH as gh CLI → GitHub API
+    participant S as engine (serve)
+    participant P as tick.rs
+    participant J as jobs.rs
+    participant R as runner/mod.rs
+    participant GH as reqwest → GitHub API
     participant T as tmux
     participant A as Agent (claude/codex)
 
     loop Every 10 seconds
-        S->>P: poll.sh
-        P->>GH: GET /issues?labels=status:in_progress (5 status checks)
+        S->>P: tick()
+        P->>GH: GET /issues?labels=status:in_progress (native HTTP)
         GH-->>P: issues list
         P->>GH: GET /issues?labels=status:new
         GH-->>P: new tasks
-        P->>R: xargs -P 4 run_task.sh {id}
+        P->>R: tokio::spawn dispatch
 
         R->>GH: GET /issues/{id} (load task)
         R->>GH: POST /issues/{id}/labels (status:in_progress)
         R->>GIT: git worktree add
-        R->>PY: python3 render_template (prompt)
+        R->>R: render prompt (template.rs)
         R->>T: tmux new-session -d -s orch-{project}-{id}
         T->>A: claude/codex/opencode
         loop Every 5 seconds
             R->>T: tmux has-session -t orch-{project}-{id}?
         end
         A-->>T: JSON response
-        R->>PY: python3 normalize_json.py
+        R->>R: parser.rs normalize
         R->>GH: POST /issues/{id}/labels (status:done)
         R->>GH: POST /issues/{id}/comments (result)
         R->>GIT: git push
         R->>GH: gh pr create
 
-        S->>J: jobs_tick.sh
-        J->>YQ: yq read jobs.yml
-        J->>PY: python3 cron_match.py
+        S->>J: jobs tick
+        J->>J: cron match (native)
     end
 
-    Note over S,GH: Every 120s: mentions + review_prs + cleanup_worktrees
+    Note over S,GH: Every 45s: sync tick (mentions, review, cleanup, skills)
 ```
 
 ### Task Lifecycle (Status Flow)
@@ -684,12 +683,12 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 
 | Metric | How to Measure |
 |--------|---------------|
-| Tick latency | Timestamp start/end in serve.sh |
-| API calls per tick | Count `gh_api` invocations |
-| Error rate | grep error logs |
-| Task completion time | history timestamps |
-| Agent success rate | done vs needs_review ratio |
-| Subprocess count | strace/dtrace per tick |
+| Tick latency | Structured tracing spans in engine |
+| API calls per tick | reqwest connection pool metrics |
+| Error rate | Structured log queries (`rg` or tracing filters) |
+| Task completion time | SQLite task_metrics table |
+| Agent success rate | done vs needs_review ratio from store |
+| Subprocess count | Minimal — only git + agent CLI per task |
 
 ---
 
@@ -728,8 +727,8 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Stuck task recovery — Phase 2 of tick()
 - [x] Parent/child unblocking — Phase 4 of tick()
 - [x] Job scheduler (native cron with catch-up) — `src/engine/jobs.rs`
-- [x] Internal task SQLite database — `src/db.rs` (schema, CRUD, migrations)
-- [x] Internal task API — `src/engine/internal_tasks.rs`
+- [x] Unified SQLite task store — `src/store.rs` (tasks, metrics, KV, rate limits)
+- [x] Task manager (unified internal + external) — `src/engine/tasks.rs`
 - [x] TaskManager (unified internal + external) — `src/engine/tasks.rs`
 - [x] Agent router (label-based, round-robin, LLM classification) — `src/engine/router.rs`
 - [x] Router wired into engine dispatch loop (Phase 3a route → Phase 3b dispatch)
@@ -869,7 +868,8 @@ src/
 │   ├── tmux.rs              # tmux channel (pane monitoring)
 │   ├── github.rs            # GitHub channel: webhooks + polling fallback
 │   ├── telegram.rs          # Telegram Bot API (HTTP long-poll)
-│   ├── discord.rs           # Discord channel (HTTP polling)
+│   ├── discord.rs           # Discord channel (registration + REST helpers)
+│   ├── discord_ws.rs        # Discord Gateway websocket (real-time events)
 │   └── slack.rs             # Slack channel (conversations.history polling + chat.postMessage)
 │
 ├── engine/
@@ -1118,7 +1118,7 @@ end
 
 ```
 push to main
-  → CI: cargo test + cargo clippy + cargo fmt --check
+  → CI: cargo nextest run + cargo clippy + cargo fmt --check
   → CI: cargo build --release (macOS arm64 + x86_64)
   → CI: create universal binary (lipo)
   → CI: auto-tag (semver from conventional commits)
@@ -1279,7 +1279,7 @@ Last updated: 2026-03-03 (366 tests, ~98% parity)
 | Feature | Status | Priority | Notes |
 |---------|--------|----------|-------|
 | `orch project add/remove/list` CLI | Implemented | Done | See `src/cli/mod.rs:484-710` |
-| Wire Telegram/Discord into engine loop | Implemented | Done | See `src/channels/telegram.rs`, `src/channels/discord.rs`, `src/engine/mod.rs:251-296` |
+| Wire Telegram/Discord into engine loop | Implemented | Done | See `src/channels/telegram.rs`, `src/channels/discord_ws.rs`, `src/engine/mod.rs` |
 | Mention detection via webhooks | Implemented | Done | Polling works, webhook receives events via `start_webhook_server()` in `src/channels/github.rs` |
 | Review Agent + Auto-Merge | Implemented | Done | See `src/engine/review.rs` `review_and_merge()` function |
 | PR Review Comments → Fix Dispatch | Implemented | Done | See `src/engine/review.rs` `review_open_prs()` function |

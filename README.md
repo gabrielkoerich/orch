@@ -372,8 +372,8 @@ src/
 │   ├── github.rs        # GitHub webhooks
 │   ├── slack.rs         # Slack integration
 │   ├── telegram.rs      # Telegram bot
-│   ├── discord.rs       # Discord HTTP bot
-│   └── discord_ws.rs    # Discord Gateway websocket
+│   ├── discord.rs       # Discord registration + REST helpers
+│   └── discord_ws.rs    # Discord Gateway websocket (real-time events)
 ├── cli/                 # CLI command implementations
 │   ├── mod.rs           # Init, agents, board, project, metrics
 │   ├── task.rs          # Task CRUD
