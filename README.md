@@ -218,8 +218,6 @@ orch log 100                  # Show last N lines
 orch log watch                # Tail logs live
 orch version                  # Show version
 orch config <key>             # Read config value (e.g., orch config gh.repo)
-orch sidecar get <id> <field> # Read task metadata
-orch sidecar set <id> field=value  # Write task metadata
 orch completions <shell>      # Generate shell completions (bash, zsh, fish)
 ```
 
@@ -351,14 +349,17 @@ src/
 ├── main.rs              # CLI entrypoint (clap)
 ├── config/
 │   └── mod.rs           # Config loading, hot-reload, multi-project
-├── db.rs                # SQLite for internal tasks
-├── sidecar.rs           # JSON sidecar file I/O + agent memory
+├── store.rs             # Unified SQLite task store (tasks, metrics, KV, rate limits)
 ├── parser.rs            # Agent response normalization
 ├── cron.rs              # Cron expression matching
 ├── template.rs          # Template rendering
 ├── tmux.rs              # tmux session management
 ├── security.rs          # Secret scanning + redaction
 ├── home.rs              # Home directory (~/.orch/) + per-repo state paths
+├── cmd.rs               # Command execution helpers with error context
+├── cmd_cache.rs         # Cached command results
+├── repo_context.rs      # Per-repo task-local context
+├── webhook_status.rs    # Webhook health tracking
 ├── backends/            # External task backends
 │   ├── mod.rs           # ExternalBackend trait
 │   └── github.rs        # GitHub Issues + Projects V2 sync
@@ -366,31 +367,48 @@ src/
 │   ├── transport.rs     # Output broadcasting
 │   ├── capture.rs       # tmux output capture
 │   ├── notification.rs  # Unified notifications
+│   ├── stream.rs        # Live output streaming
 │   ├── tmux.rs          # tmux bridge
 │   ├── github.rs        # GitHub webhooks
+│   ├── slack.rs         # Slack integration
 │   ├── telegram.rs      # Telegram bot
-│   └── discord.rs       # Discord bot
+│   ├── discord.rs       # Discord registration + REST helpers
+│   └── discord_ws.rs    # Discord Gateway websocket (real-time events)
 ├── cli/                 # CLI command implementations
 │   ├── mod.rs           # Init, agents, board, project, metrics
 │   ├── task.rs          # Task CRUD
 │   ├── job.rs           # Job management
 │   └── service.rs       # Service lifecycle
 ├── github/              # GitHub API helpers
-│   ├── cli.rs           # gh CLI wrapper
-│   ├── types.rs         # Issue, Comment, Label types
+│   ├── cli_wrapper.rs   # gh CLI wrapper
+│   ├── http.rs          # Native HTTP client (reqwest, connection pooling)
+│   ├── token.rs         # Token resolution (env, config, gh CLI, GitHub App)
+│   ├── types.rs         # Issue, Comment, Label, PR review types
 │   └── projects.rs      # Projects V2 GraphQL operations
 └── engine/              # Core orchestration
-    ├── mod.rs           # Main event loop + PR review integration
-    ├── tasks.rs         # Task manager (internal + external)
-    ├── router.rs        # Agent routing (label, round-robin, LLM)
+    ├── mod.rs           # Main event loop, project init, struct defs
+    ├── tick.rs          # Core tick phases (sessions, routing, dispatch, unblock)
+    ├── sync.rs          # Periodic sync (cleanup, PR review, mentions, skills)
+    ├── review.rs        # PR review pipeline (review agent, auto-merge, re-route)
+    ├── cleanup.rs       # Worktree cleanup, merged-PR detection, store helpers
+    ├── commands.rs      # Owner /slash commands in issue comments
+    ├── tasks.rs         # Task manager (internal + external, unified store)
+    ├── router/          # Agent routing (label, round-robin, LLM)
+    │   ├── mod.rs       # Router logic and RouteResult
+    │   ├── config.rs    # Router configuration
+    │   └── weights.rs   # Routing weight signals
     ├── jobs.rs          # Job scheduler + self-review
     └── runner/          # Task execution
         ├── mod.rs       # Full task lifecycle
+        ├── task_init.rs # Guard checks, worktree setup, invocation building
+        ├── session.rs   # tmux session lifecycle and output collection
         ├── context.rs   # Prompt context building
         ├── worktree.rs  # Git worktree management
         ├── agent.rs     # Agent invocation + prompt building
         ├── agents/      # Per-agent runners (Claude, Codex, OpenCode)
-        ├── response.rs  # Response handling, cooldowns, memory
+        ├── response.rs  # Response parsing, weight signals
+        ├── response_handler.rs # Success path: commit, push, PR, budget
+        ├── fallback.rs  # Error classification and recovery strategies
         └── git_ops.rs   # Auto-commit, push, PR creation
 ```
 
@@ -400,18 +418,18 @@ Task artifacts are organized per-repo, per-task, per-attempt:
 
 ```
 ~/.orch/state/{owner}/{repo}/tasks/{id}/
-  sidecar.json              # Task metadata
   attempts/
     1/
       prompt-sys.md         # System prompt
       prompt-msg.md         # Task prompt
-      runner.sh             # Runner script
       exit.txt              # Exit code
       stderr.txt            # Agent stderr
       output.json           # Agent response
     2/                      # Retry attempt
       ...
 ```
+
+Task metadata (branch, worktree, agent, model, attempts, pr_number, memory, etc.) is stored in the unified SQLite database at `~/.orch/orch.db`, not in per-task JSON files.
 
 ## Development
 
@@ -426,8 +444,11 @@ cargo build --release
 ### Running tests
 
 ```bash
-cargo test
+cargo nextest run            # preferred (matches CI)
+cargo test                   # fallback if nextest is not installed
 ```
+
+Install nextest: `cargo binstall cargo-nextest` (requires [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)).
 
 ### Logs
 

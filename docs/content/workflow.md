@@ -56,15 +56,25 @@ new → routed → in_progress → needs_review → in_review → done (merged)
 
 ## Engine Tick
 
-The Rust engine ticks every `engine.tick_interval` seconds (default 10s):
+The Rust engine ticks every `engine.tick_interval` seconds (default 10s). Each tick runs sequential phases:
 
-1. **Sync** — imports new GitHub issues, syncs labels, detects PR events (webhook or polling)
-2. **Route** — assigns agent, model, and profile to `new` tasks via LLM router
-3. **Dispatch** — launches routed tasks in tmux sessions inside worktrees
-4. **Unblock** — if all children of a blocked parent are `done`, resets parent to `new`
-5. **Review** — when a task transitions `needs_review → in_review`, launches review agent
+1. **Poll sessions** — checks tmux for finished agent sessions, collects results
+2. **Recover stuck tasks** — detects `in_progress` tasks with no tmux session and age >10 min, resets to `new`
+3. **Route** — assigns agent, model, and profile to `new` tasks via LLM router
+4. **Dispatch** — launches routed tasks in tmux sessions inside worktrees; breaks the loop early if work is already merged
+5. **Unblock** — if all children of a blocked parent are `done`, resets parent to `new`
 6. **Jobs** — runs due scheduled jobs (cron, per-project)
-7. **Recovery** — detects stuck `in_progress` tasks (no tmux session, >10 min) and resets to `new`
+
+A separate **sync tick** (~45s) handles less-frequent operations:
+
+1. **Cleanup** — removes worktrees for done tasks (runs in background), deletes orphaned remote branches, pulls main once per cycle
+2. **Merged PR detection** — marks tasks done when their PRs are merged
+3. **Mention scanning** — detects `@orchestrator` mentions in issue comments
+4. **PR review processing** — re-routes tasks when reviews request changes (not child task creation), resets `ci_merge_failures` counter on re-route
+5. **Review agent** — spawns review agent for `needs_review` tasks
+6. **Stale review detection** — resets `in_review` tasks with no active tmux session (>5 min)
+7. **Owner commands** — scans for `/slash` commands in issue comments
+8. **Skills sync** — clones/pulls skill repositories
 
 ### Channels & Live Sessions
 

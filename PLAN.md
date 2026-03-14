@@ -39,18 +39,18 @@ graph TB
         JUST["justfile<br/>(task runner)"]
     end
 
-    subgraph "Service Loop — serve.sh"
-        SERVE["serve.sh<br/>main loop<br/>(sleep 10s)"]
-        POLL["poll.sh<br/>task dispatcher"]
-        JOBS["jobs_tick.sh<br/>cron scheduler"]
-        MENTIONS["gh_mentions.sh<br/>@mention scanner"]
-        REVIEW["review_prs.sh<br/>PR review agent"]
-        CLEANUP["cleanup_worktrees.sh<br/>worktree janitor"]
+    subgraph "Engine — engine/mod.rs"
+        SERVE["engine serve<br/>tokio event loop"]
+        POLL["tick.rs<br/>task dispatcher"]
+        JOBS["jobs.rs<br/>cron scheduler"]
+        MENTIONS["sync.rs<br/>@mention scanner"]
+        REVIEW["review.rs<br/>PR review agent"]
+        CLEANUP["cleanup.rs<br/>worktree janitor"]
     end
 
-    subgraph "Task Execution — run_task.sh"
-        ROUTE["route_task.sh<br/>LLM router"]
-        RUN["run_task.sh<br/>agent orchestration"]
+    subgraph "Task Execution — runner/"
+        ROUTE["router/mod.rs<br/>LLM router"]
+        RUN["runner/mod.rs<br/>agent orchestration"]
         TMUX["tmux sessions<br/>orch-{project}-{id}"]
     end
 
@@ -69,9 +69,9 @@ graph TB
     end
 
     subgraph "Data Storage"
-        ISSUES["GitHub Issues<br/>(source of truth)"]
-        SIDECAR["Sidecar JSON<br/>.orchestrator/tasks/*.json"]
-        CONFIG["config.yml<br/>+ .orchestrator.yml<br/>(includes jobs)"]
+        ISSUES["GitHub Issues<br/>(external tasks)"]
+        STORE["SQLite orch.db<br/>(unified task store)"]
+        CONFIG["config.yml<br/>+ .orch.yml<br/>(includes jobs)"]
     end
 
     BREW --> SERVE
@@ -98,7 +98,7 @@ graph TB
     ROUTE --> GH
 
     GH --> ISSUES
-    RUN --> SIDECAR
+    RUN --> STORE
     YQ --> CONFIG
 ```
 
@@ -106,44 +106,43 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant S as serve.sh
-    participant P as poll.sh
-    participant J as jobs_tick.sh
-    participant R as run_task.sh
-    participant GH as gh CLI → GitHub API
+    participant S as engine (serve)
+    participant P as tick.rs
+    participant J as jobs.rs
+    participant R as runner/mod.rs
+    participant GH as reqwest → GitHub API
     participant T as tmux
     participant A as Agent (claude/codex)
 
     loop Every 10 seconds
-        S->>P: poll.sh
-        P->>GH: GET /issues?labels=status:in_progress (5 status checks)
+        S->>P: tick()
+        P->>GH: GET /issues?labels=status:in_progress (native HTTP)
         GH-->>P: issues list
         P->>GH: GET /issues?labels=status:new
         GH-->>P: new tasks
-        P->>R: xargs -P 4 run_task.sh {id}
+        P->>R: tokio::spawn dispatch
 
         R->>GH: GET /issues/{id} (load task)
         R->>GH: POST /issues/{id}/labels (status:in_progress)
         R->>GIT: git worktree add
-        R->>PY: python3 render_template (prompt)
+        R->>R: render prompt (template.rs)
         R->>T: tmux new-session -d -s orch-{project}-{id}
         T->>A: claude/codex/opencode
         loop Every 5 seconds
             R->>T: tmux has-session -t orch-{project}-{id}?
         end
         A-->>T: JSON response
-        R->>PY: python3 normalize_json.py
+        R->>R: parser.rs normalize
         R->>GH: POST /issues/{id}/labels (status:done)
         R->>GH: POST /issues/{id}/comments (result)
         R->>GIT: git push
         R->>GH: gh pr create
 
-        S->>J: jobs_tick.sh
-        J->>YQ: yq read jobs.yml
-        J->>PY: python3 cron_match.py
+        S->>J: jobs tick
+        J->>J: cron match (native)
     end
 
-    Note over S,GH: Every 120s: mentions + review_prs + cleanup_worktrees
+    Note over S,GH: Every 45s: sync tick (mentions, review, cleanup, skills)
 ```
 
 ### Task Lifecycle (Status Flow)
@@ -177,7 +176,7 @@ in_progress → needs_review → in_review → done
 
 ### Recent doc updates (docs/content)
 
-- Updated docs to reflect actual runtime paths (`~/.orch`), worktree layout, and sidecar locations
+- Updated docs to reflect actual runtime paths (`~/.orch`), worktree layout, and SQLite store
 - Documented that `GH_TOKEN` is injected into runner env at spawn time and that agents should not call GitHub directly
 - Documented centralized GitHub token resolution (`github.token_mode`, GitHub App config, and `gh.allow_gh_fallback` (default true))
 - Clarified that jobs are per-project in `.orch.yml` (preferred) and scheduler runs from engine tick
@@ -190,8 +189,8 @@ in_progress → needs_review → in_review → done
 
 - Purpose: print a concise post-mortem (summary + memory + token/costs + recent tmux output) for a completed task.
 - Works with internal tasks (`internal:<n>`) and external GitHub tasks (issue number).
-- Fields shown: ID, title, status, agent, model, attempts, cost summary (tokens + USD), recent memory entries (learnings, errors, files modified), sidecar path. If a live tmux session exists, appends recent pane output.
-- Missing sidecar: prints a clear message with the inspected path instead of failing.
+- Fields shown: ID, title, status, agent, model, attempts, cost summary (tokens + USD), recent memory entries (learnings, errors, files modified). If a live tmux session exists, appends recent pane output.
+- Missing task: prints a clear message instead of failing.
 
 Usage example:
 
@@ -201,7 +200,7 @@ Implemented in `src/cli/task.rs:664` (`pub async fn logs`) and wired into the ma
 
 ### Review Agent & Status Invariants
 
-**Review agent**: triggered by engine when a task is in `needs_review` and has a branch. The engine transitions the task to `in_review` before spawning — the status itself is the duplicate guard (no sidecar flags needed). On failure, the engine resets to `needs_review` for retry.
+**Review agent**: triggered by engine when a task is in `needs_review` and has a branch. The engine transitions the task to `in_review` before spawning — the status transition itself is the duplicate guard. On failure, the engine resets to `needs_review` for retry.
 
 **Key invariant**: `done` means task is finished (PR merged or no code changes). `needs_review` means PR exists and is queued for review. `in_review` means a review agent is actively running. `blocked` means human intervention is required. The runner decides: if agent said "done" AND a PR exists → `needs_review`; otherwise → agent's reported status.
 
@@ -257,7 +256,7 @@ Implemented in `src/cli/task.rs:664` (`pub async fn logs`) and wired into the ma
 | Telegram/Discord bots | Can't maintain websocket | tokio |
 | Output streaming | Polling tmux capture-pane | Async broadcast channels |
 | Concurrent I/O | `xargs -P` is crude | tokio::spawn |
-| Internal tasks | No local DB without sqlite3 deps | Built-in SQLite (rusqlite) |
+| Internal tasks | No local DB without sqlite3 deps | Built-in SQLite (sqlx) |
 | Graceful shutdown | Trap-based, fragile | tokio signal handlers |
 
 ---
@@ -309,10 +308,10 @@ graph TB
     end
 
     subgraph "Data"
-        GH_ISSUES["GitHub Issues<br/>(external tasks)"]
-        LOCAL_DB["SQLite<br/>(internal tasks)"]
-        YAML[".orchestrator.yml<br/>+ config.yml"]
-        SIDE["Sidecar JSON<br/>(ephemeral state)"]
+        GH_ISSUES["GitHub Issues<br/>(external sync)"]
+        LOCAL_DB["SQLite orch.db<br/>(unified task store)"]
+        YAML[".orch.yml<br/>+ config.yml"]
+        SIDE["Per-task artifacts<br/>(prompts, output, logs)"]
     end
 
     GH_CH --> TRANSPORT
@@ -433,9 +432,9 @@ In v1, the tmux bridge changes this completely:
 | Agent invocation | bash script | `runner/agent.rs` (PTY runner + tmux fallback) | **Done** |
 | Mention detection | `gh_mentions.sh` (polling) | Rust polling (webhook future) | **Done** (polling) |
 | PR review trigger | `review_prs.sh` (polling) | Rust polling (webhook future) | **Done** (polling) |
-| Sidecar I/O | `jq` read/write | Direct file I/O | **Done** |
+| Task state I/O | `jq` read/write sidecar JSON | Unified SQLite store (`src/store.rs`) | **Done** |
 | Template rendering | `python3 render_template()` | Native Rust | **Done** |
-| Internal task DB | Not supported | `rusqlite` (embedded SQLite) | **Done** |
+| Internal task DB | Not supported | `sqlx` (async SQLite) | **Done** |
 | CLI entry point | `justfile` (34+ recipes) | Native `clap` subcommands | **Done** |
 
 ### Total Subprocess Savings
@@ -533,16 +532,15 @@ trait ExternalBackend: Send + Sync {
 | `post_comment` | `gh api repos/O/R/issues/N/comments` | `commentCreate` | `POST /comment` |
 | `set_labels` | `gh api repos/O/R/issues/N/labels` | `issueAddLabel` | Tag update |
 
-### GitHub Backend: `gh` CLI, not raw HTTP
+### GitHub Backend: Native HTTP via `reqwest`
 
-The GitHub backend shells out to `gh api` rather than using `reqwest` directly. Reasons:
+> **Update:** The GitHub backend now uses native HTTP via `reqwest` with connection pooling (`src/github/http.rs`), replacing the earlier `gh api` subprocess approach. Token resolution is handled by `src/github/token.rs` (env vars, config, GitHub App JWT, `gh auth token` fallback).
 
-1. **Auth is free** — `gh` handles OAuth, tokens, SSH keys, SSO. No JWT/App setup needed.
-2. **Everyone has it** — any user with `gh` installed can use orch immediately.
-3. **Rate limit handling** — `gh` has built-in retry/backoff for 429s.
-4. **Less code** — no token refresh, no auth middleware, no credential storage.
-
-The Rust side handles structured I/O: builds the `gh api` command args, parses JSON output via `serde`. No `jq` needed — Rust deserializes directly.
+Benefits of the native HTTP approach:
+1. **Connection pooling** — reuses connections across API calls (~100ms/call vs ~150ms for `gh` CLI startup)
+2. **Structured types** — `serde` deserialization directly into Rust structs
+3. **GitHub App support** — automatic JWT generation and installation token refresh
+4. **Rate limit handling** — built-in backoff with configurable strategy (wait or skip)
 
 ```rust
 impl ExternalBackend for GitHubBackend {
@@ -685,12 +683,12 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 
 | Metric | How to Measure |
 |--------|---------------|
-| Tick latency | Timestamp start/end in serve.sh |
-| API calls per tick | Count `gh_api` invocations |
-| Error rate | grep error logs |
-| Task completion time | history timestamps |
-| Agent success rate | done vs needs_review ratio |
-| Subprocess count | strace/dtrace per tick |
+| Tick latency | Structured tracing spans in engine |
+| API calls per tick | reqwest connection pool metrics |
+| Error rate | Structured log queries (`rg` or tracing filters) |
+| Task completion time | SQLite task_metrics table |
+| Agent success rate | done vs needs_review ratio from store |
+| Subprocess count | Minimal — only git + agent CLI per task |
 
 ---
 
@@ -708,14 +706,14 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 **Goal:** Single Rust binary (`orch`) that replaces jq/python3/yq calls.
 
 - [x] Config loading (config.yml, .orchestrator.yml) — `src/config.rs` (hot-reload via `notify`)
-- [x] Sidecar JSON I/O (read/write/merge) — `src/sidecar.rs`
+- [x] ~~Sidecar JSON I/O~~ — replaced by unified SQLite store (`src/store.rs`)
 - [x] GitHub API client (gh CLI wrapper with serde parsing) — ~~`src/github/cli.rs`~~ removed, `src/github/types.rs`
 - [x] Native HTTP client (reqwest, connection pooling, header-based rate limiting) — `src/github/http.rs` (supersedes `cli.rs`)
 - [ ] ~~GitHub App auth (JWT, token refresh, GH_TOKEN export)~~ — using `gh auth token` / `GH_TOKEN` env instead
 - [x] Agent response parser — `src/parser.rs`
 - [x] Cron matcher — `src/cron.rs`
 - [x] Template renderer — `src/template.rs`
-- [x] CLI: `orch config`, `orch sidecar`, `orch parse`, `orch cron`, `orch template`, `orch stream`
+- [x] CLI: `orch config`, `orch parse`, `orch cron`, `orch template`, `orch stream`
 
 ### Phase 2: Engine (replace serve.sh/poll.sh) ✅ MOSTLY DONE
 
@@ -729,8 +727,8 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Stuck task recovery — Phase 2 of tick()
 - [x] Parent/child unblocking — Phase 4 of tick()
 - [x] Job scheduler (native cron with catch-up) — `src/engine/jobs.rs`
-- [x] Internal task SQLite database — `src/db.rs` (schema, CRUD, migrations)
-- [x] Internal task API — `src/engine/internal_tasks.rs`
+- [x] Unified SQLite task store — `src/store.rs` (tasks, metrics, KV, rate limits)
+- [x] Task manager (unified internal + external) — `src/engine/tasks.rs`
 - [x] TaskManager (unified internal + external) — `src/engine/tasks.rs`
 - [x] Agent router (label-based, round-robin, LLM classification) — `src/engine/router.rs`
 - [x] Router wired into engine dispatch loop (Phase 3a route → Phase 3b dispatch)
@@ -775,7 +773,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 
 - [x] `orch serve` — start engine
 - [x] `orch config <key>` — read config
-- [x] `orch sidecar get/set` — task metadata
+- [x] ~~`orch sidecar get/set`~~ — removed, task metadata now in SQLite store
 - [x] `orch parse <path>` — parse agent response
 - [x] `orch cron <expr>` — cron matching
 - [x] `orch template <path>` — render templates
@@ -870,7 +868,8 @@ src/
 │   ├── tmux.rs              # tmux channel (pane monitoring)
 │   ├── github.rs            # GitHub channel: webhooks + polling fallback
 │   ├── telegram.rs          # Telegram Bot API (HTTP long-poll)
-│   ├── discord.rs           # Discord channel (HTTP polling)
+│   ├── discord.rs           # Discord channel (registration + REST helpers)
+│   ├── discord_ws.rs        # Discord Gateway websocket (real-time events)
 │   └── slack.rs             # Slack channel (conversations.history polling + chat.postMessage)
 │
 ├── engine/
@@ -900,7 +899,7 @@ src/
 │       │   ├── claude.rs    # Claude/Kimi/MiniMax runner (JSON envelope parser)
 │       │   ├── codex.rs     # Codex runner (NDJSON stream parser)
 │       │   └── opencode.rs  # OpenCode runner (NDJSON parser + free model discovery)
-│       ├── task_init.rs     # Task setup: sidecar init, guard checks, worktree bootstrap
+│       ├── task_init.rs     # Task setup: guard checks, worktree bootstrap
 │       ├── session.rs       # tmux session lifecycle: create, watch, kill
 │       ├── response_handler.rs  # Post-run: parse agent response, status resolution, comment posting
 │       ├── fallback.rs      # Failover logic: cooldowns, reroute, agent weight signals
@@ -914,8 +913,7 @@ src/
 │   ├── types.rs             # GitHubIssue, GitHubComment, GitHubLabel, etc.
 │   └── projects.rs          # GitHub Projects V2 GraphQL operations
 │
-├── db.rs                    # SQLite for internal tasks (schema + migrations)
-├── sidecar.rs               # JSON sidecar file I/O + agent memory persistence
+├── store.rs                 # Unified SQLite task store (tasks, metrics, KV, rate limits)
 ├── parser.rs                # Agent response normalization (JSON → AgentResponse)
 ├── template.rs              # Template rendering (env var substitution)
 ├── tmux.rs                  # TmuxManager (session create/kill/list/capture)
@@ -930,9 +928,9 @@ src/
 
 ### Agent Memory System
 
-**Location:** `src/sidecar.rs` (memory storage), `src/engine/runner/response.rs` (write), `src/engine/runner/context.rs` (read)
+**Location:** `src/store.rs` (memory storage), `src/engine/runner/response.rs` (write), `src/engine/runner/context.rs` (read)
 
-Agents persist learnings across retries so subsequent attempts don't repeat the same mistakes. Memory entries are stored in the task's sidecar JSON file (`~/.orch/state/{task_id}.json`) under the `"memory"` key.
+Agents persist learnings across retries so subsequent attempts don't repeat the same mistakes. Memory entries are stored in the task's `memory` field in the SQLite store (`~/.orch/orch.db`).
 
 **`MemoryEntry` structure:**
 
@@ -949,7 +947,7 @@ Agents persist learnings across retries so subsequent attempts don't repeat the 
 
 **How it works:**
 
-1. After each attempt, `store_memory()` or `store_failure_memory()` writes a `MemoryEntry` to the sidecar.
+1. After each attempt, `store_memory()` or `store_failure_memory()` writes a `MemoryEntry` to the SQLite store.
 2. On retry, `build_memory_context()` in `context.rs` fetches the most recent entries and formats them as a markdown section in the agent prompt.
 3. Max **3 entries** per task (`MAX_MEMORY_ENTRIES = 3`) to prevent context overflow.
 
@@ -994,7 +992,7 @@ Automatically creates follow-up tasks when a PR receives a `CHANGES_REQUESTED` r
    - `pr-review-followup`
    - `status:new`
    - `agent:{original_agent}` — routes to the same agent that created the PR
-5. Each follow-up task's sidecar stores: `pr_number`, `branch`, `reviewer`, `file_path`, `parent_task_id`.
+5. Review feedback is stored in the task's `pr_review_context` field in the SQLite store.
 
 **Deduplication:** Uses `review_comment_{pr_number}_{comment_id}` as a key to prevent duplicate follow-up tasks for the same review comment.
 
@@ -1120,7 +1118,7 @@ end
 
 ```
 push to main
-  → CI: cargo test + cargo clippy + cargo fmt --check
+  → CI: cargo nextest run + cargo clippy + cargo fmt --check
   → CI: cargo build --release (macOS arm64 + x86_64)
   → CI: create universal binary (lipo)
   → CI: auto-tag (semver from conventional commits)
@@ -1272,7 +1270,7 @@ Last updated: 2026-03-03 (366 tests, ~98% parity)
 | Simplified service management (brew wrapper) | `src/cli/service.rs` | — |
 | Permission rules per-agent translation | `src/engine/runner/agents/` | — |
 | PR review integration | `src/engine/review.rs` | PR #125 |
-| Agent memory across retries | `src/sidecar.rs` | PR #122 |
+| Agent memory across retries | `src/store.rs` (was `src/sidecar.rs`) | PR #122 |
 | Self-improvement loop | `src/engine/jobs.rs` | PR #120 |
 | Polling fallback for webhooks | `src/channels/github.rs` | PR #131 |
 
@@ -1281,7 +1279,7 @@ Last updated: 2026-03-03 (366 tests, ~98% parity)
 | Feature | Status | Priority | Notes |
 |---------|--------|----------|-------|
 | `orch project add/remove/list` CLI | Implemented | Done | See `src/cli/mod.rs:484-710` |
-| Wire Telegram/Discord into engine loop | Implemented | Done | See `src/channels/telegram.rs`, `src/channels/discord.rs`, `src/engine/mod.rs:251-296` |
+| Wire Telegram/Discord into engine loop | Implemented | Done | See `src/channels/telegram.rs`, `src/channels/discord_ws.rs`, `src/engine/mod.rs` |
 | Mention detection via webhooks | Implemented | Done | Polling works, webhook receives events via `start_webhook_server()` in `src/channels/github.rs` |
 | Review Agent + Auto-Merge | Implemented | Done | See `src/engine/review.rs` `review_and_merge()` function |
 | PR Review Comments → Fix Dispatch | Implemented | Done | See `src/engine/review.rs` `review_open_prs()` function |
@@ -1318,7 +1316,6 @@ Old layout (flat): `~/.orch/state/prompt-42-sys.txt`, `runner-42.sh`, etc.
 New layout (per-repo, per-task, per-attempt):
 ```
 ~/.orch/state/{owner}/{repo}/tasks/{id}/
-  sidecar.json
   attempts/
     1/
       prompt-sys.md
@@ -1329,6 +1326,8 @@ New layout (per-repo, per-task, per-attempt):
     2/  (retry)
       ...
 ```
+
+Task metadata (branch, worktree, agent, model, attempts, pr_number, memory, etc.) is stored in the SQLite database at `~/.orch/orch.db`, not in per-task JSON files.
 
 PTY runner removes `runner.sh` from the attempt folder; legacy tmux command mode still uses an in-memory shell command but does not write scripts to disk.
 
@@ -1351,7 +1350,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | `anyhow` / `thiserror` | Error handling | In use |
 | `sha2` | Hashing (dedup) | In use |
 | `cron` | Cron expressions | In use |
-| `rusqlite` | Internal task SQLite DB | In use |
+| `sqlx` | Unified SQLite task store (async, WAL mode) | In use |
 | `reqwest` | HTTP client | In use |
 | `regex` | Secret/leak detection | In use |
 | `notify` | Config file watching | In use |
@@ -1362,7 +1361,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | `urlencoding` | URL encoding for labels | In use |
 | `axum` | Webhook HTTP server | In use |
 | `teloxide` | Telegram bot | Not used — implemented via raw HTTP polling in `src/channels/telegram.rs` |
-| `serenity` | Discord bot | Not used — implemented via raw HTTP polling in `src/channels/discord.rs` |
+| `serenity` | Discord bot | Not used — implemented via Gateway websocket in `src/channels/discord_ws.rs` |
 | `cargo-llvm-cov` | Coverage tracking in CI | CI tooling |
 
 ---
@@ -1375,7 +1374,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 | Issue | Title | Description |
 |-------|-------|-------------|
-| - | Agent column in `orch task list` and `orch task live` | `orch task list` now shows AGENT column (from struct for internal tasks, from sidecar for external); blocked internal tasks show inline block reason; `orch task live` now shows agent from sidecar — `src/cli/task.rs:15-65, 545-580` |
+| - | Agent column in `orch task list` and `orch task live` | `orch task list` now shows AGENT column (from store for all tasks); blocked internal tasks show inline block reason; `orch task live` now shows agent from store — `src/cli/task.rs:15-65, 545-580` |
 | #509 | Show agent output in `orch task logs` | `orch task logs <id>` now displays agent output from `output.json` (last 2000 chars via `safe_utf8_tail`), exit code from `exit.txt`, and review agent output from `{task_id}-review/attempts/1/output.json` — `src/cli/task.rs:803-860` |
 | #361 | PR coverage comments | `romeovs/lcov-reporter-action@v0.4.0` comments coverage % on each PR — `.github/workflows/release.yml:52-57` |
 | #230 | Break `tick()` into named phases | Extracted 4-5 phases of the `tick()` function into independent methods. |

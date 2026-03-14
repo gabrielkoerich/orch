@@ -12,21 +12,13 @@ Once routed, agents run in full agentic mode with tool access:
 
 Agents execute inside an isolated git worktree created for the task (not your main repo), so they can read project files, edit code, and run commands.
 
-## PTY Runner
+## tmux Runner
 
-Agent sessions now prefer a PTY-based runner. The orchestrator spawns agent CLIs directly under a pseudo-terminal, streams output into tmux, and avoids generating on-disk runner scripts. Prompt files remain in per-attempt directories for auditability.
-
-To fall back to the legacy tmux command runner:
-
-```yaml
-runner:
-  pty:
-    enabled: false
-```
+Agent sessions run inside tmux sessions. The orchestrator spawns the agent CLI as the tmux session shell, so tmux provides the PTY. There is no external PTY process or `portable_pty` crate. Prompt files are written to per-attempt directories for auditability.
 
 ## Agent Output
 
-The agent writes a JSON file to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json` and the orchestrator also stores a sidecar at `~/.orch/state/{repo}/tasks/{id}/sidecar.json`:
+The agent writes a JSON file to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/output.json`. Task metadata (branch, worktree, agent, model, attempts, memory, etc.) is stored in the unified SQLite database at `~/.orch/orch.db`. The expected agent output format:
 
 ```json
 {
@@ -103,10 +95,10 @@ Every agent receives a rich context built from multiple sources:
 | Context | Source | When |
 |---------|--------|------|
 | System prompt | `prompts/agent_system.md` | Always |
-| Task details | `tasks.yml` | Always |
+| Task details | SQLite store (`~/.orch/orch.db`) | Always |
 | Agent profile | Router-generated role/skills/tools/constraints | Always |
-| Error history | `tasks.yml` `.history[]` | On retries |
-| Last error | `tasks.yml` `.last_error` | On retries |
+| Error history | SQLite store | On retries |
+| Last error | Task store `last_error` field | On retries |
 | GitHub issue comments | GitHub API | If issue linked |
 | Prior run context | `contexts/task-{id}.md` | On retries |
 | Tool call summaries | `.orch/tools-{id}.json` | On retries |

@@ -6,30 +6,28 @@ weight = 2
 
 ## Task Schema
 
-Each task in `tasks.yml` includes:
+Tasks are stored in a unified SQLite database (`~/.orch/orch.db`). Both internal tasks (cron jobs, mentions) and external tasks (GitHub Issues) share the same schema and lifecycle. External tasks are also synced to GitHub Issues via labels and comments.
+
+Key fields:
 
 | Field | Description |
 |-------|-------------|
-| `id` | Unique integer ID |
+| `id` | Internal store ID (auto-increment) |
+| `external_id` | GitHub issue number (if external) |
+| `repo` | Repository slug (`owner/repo`) |
 | `title`, `body`, `labels` | Task description and metadata |
 | `status` | `new`, `routed`, `in_progress`, `done`, `in_review`, `blocked`, `needs_review` |
-| `agent` | Executor (`codex`, `claude`, or `opencode`) |
-| `agent_model` | Model chosen by the router |
-| `agent_profile` | Dynamically generated role/skills/tools/constraints |
-| `selected_skills` | Skill IDs from `skills.yml` |
+| `agent` | Executor (`codex`, `claude`, `opencode`, `kimi`, `minimax`) |
+| `model` | Model chosen by the router |
 | `complexity` | Router-assigned complexity (`simple`, `medium`, `complex`) |
-| `parent_id`, `children` | For delegation (parent-child relationships) |
 | `summary`, `reason` | What was done / why blocked |
-| `accomplished`, `remaining`, `blockers` | Progress tracking |
-| `files_changed` | List of modified files |
 | `attempts`, `last_error` | Retry tracking |
-| `duration` | Execution time in seconds |
+| `branch`, `worktree` | Git worktree path and branch name |
+| `pr_number` | Associated PR number |
 | `input_tokens`, `output_tokens` | Token usage |
-| `prompt_hash` | SHA-256 prefix of the prompt |
-| `review_decision`, `review_notes` | Review agent output |
-| `history` | Status changes with timestamps |
-
-GitHub metadata (optional): `gh_issue_number`, `gh_url`, `gh_state`, `gh_updated_at`, `gh_synced_at`.
+| `input_cost_usd`, `output_cost_usd`, `total_cost_usd` | Cost tracking |
+| `origin` | Source: `github`, `internal`, `mention`, `job` |
+| `source`, `source_id` | For dedup (e.g., mention ID, job ID) |
 
 ## Task Lifecycle
 
@@ -69,9 +67,9 @@ The orchestrator will:
 - Block the parent until children are done
 - Re-run the parent via `poll` or `rejoin`
 
-## Concurrency & Locking
+## Concurrency
 
-- `poll` runs new tasks in parallel (up to `POLL_JOBS=4`)
-- File writes are protected by a global lock (`tasks.yml.lock`)
-- Each task also has a per-task lock to prevent double-run
-- Stale locks are auto-cleared after `LOCK_STALE_SECONDS` (default 600)
+- The engine dispatches tasks concurrently using a `tokio::sync::Semaphore` (configurable concurrency limit)
+- SQLite WAL mode allows concurrent reads; writes are serialized by SQLite
+- The `needs_review` to `in_review` status transition serves as an atomic guard against duplicate review agent spawns
+- Worktree cleanup runs in a background task so it does not block routing or dispatch

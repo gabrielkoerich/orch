@@ -63,13 +63,13 @@ async fn review_and_merge(
         return Ok(ReviewDecision::Skip);
     }
 
-    // 2. Load sidecar for worktree path, branch, agent
-    let sidecar = sidecar::read(&self.repo, &task.id.0)?;
-    let worktree = sidecar.get("worktree");
-    let branch = sidecar.get("branch");
+    // 2. Load task state from store for worktree path, branch, agent
+    let store_task = store.resolve_and_get(&self.repo, &task.id.0).await?;
+    let worktree = store_task.worktree.as_deref().unwrap_or("");
+    let branch = store_task.branch.as_deref().unwrap_or("");
 
     // 3. Build review prompt
-    let review_prompt = build_review_prompt(task, &sidecar);
+    let review_prompt = build_review_prompt(task, &store_task);
 
     // 4. Pick review agent (config: workflow.review_agent, default: claude)
     let review_agent = config::get("workflow.review_agent")
@@ -231,11 +231,12 @@ async fn handle_review_changes(
     task: &ExternalTask,
     review: &ReviewResponse,
     backend: &dyn ExternalBackend,
+    store: &TaskStore,
 ) -> anyhow::Result<()> {
-    // 1. Check review cycle count (max 2 review rounds)
-    let sidecar = sidecar::read(&self.repo, &task.id.0)?;
-    let review_cycles: u32 = sidecar.get("review_cycles")
-        .and_then(|v| v.parse().ok())
+    // 1. Check review cycle count from the store (max 2 review rounds)
+    let review_cycles = store.get_field(&self.repo, &task.id.0, "review_cycles")
+        .await
+        .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
 
     if review_cycles >= 2 {
@@ -252,15 +253,14 @@ async fn handle_review_changes(
     let comment = format_review_comment(review);
     backend.post_comment(&task.id, &comment).await?;
 
-    // 3. Update sidecar
-    sidecar::merge(&self.repo, &task.id.0, &serde_json::json!({
-        "review_cycles": (review_cycles + 1).to_string(),
-        "review_notes": review.notes,
-        "status": "in_progress",
-    }))?;
+    // 3. Update task state in the store
+    store.set_fields(&self.repo, &task.id.0, &[
+        ("review_cycles", json!((review_cycles + 1))),
+        ("pr_review_context", json!(review.notes)),
+    ]).await?;
 
-    // 4. Re-dispatch — set status back to routed (keeps same agent/branch/worktree)
-    backend.update_status(&task.id, Status::Routed).await?;
+    // 4. Re-route — set status back to New (keeps same agent/branch/worktree)
+    backend.update_status(&task.id, Status::New).await?;
     // Engine will pick it up on next tick, agent sees review feedback in context
 }
 ```
@@ -296,7 +296,7 @@ new → routed → in_progress → done (agent finishes)
 3. Add `review_and_merge()` to `src/engine/review.rs` — called after Phase 3b dispatch completes with `status:done`
 4. Add `auto_merge()` using `gh pr merge --squash --delete-branch`
 5. Add `handle_review_changes()` to re-dispatch with review context
-6. Add `review_cycles` tracking in sidecar
+6. Add `review_cycles` tracking in the SQLite store
 7. Add config keys: `workflow.enable_review_agent`, `workflow.review_agent`, `workflow.auto_merge`, `workflow.max_review_cycles`
 8. Add review context to `build_agent_message()` — on re-dispatch, agent sees review notes
 9. Tests: review response parsing, cycle counting, auto-merge flow
@@ -306,12 +306,8 @@ new → routed → in_progress → done (agent finishes)
 ## 2. PR Review Comments → Fix Dispatch
 
 **Priority:** Critical
-**Status:** Implemented — `review_open_prs()` re-dispatches on `CHANGES_REQUESTED`, creates follow-up tasks with PR context
-**Files:** `src/engine/review.rs` (`review_open_prs()` at line 44), `src/engine/runner/`
-
-### Problem
-
-When a human reviewer requests changes on a PR via GitHub's review UI, the orchestrator should automatically dispatch the original agent to fix the issues. Currently `review_open_prs()` creates internal follow-up tasks, but doesn't re-dispatch to the same worktree/branch.
+**Status:** Implemented — `review_open_prs()` re-routes the original task on `CHANGES_REQUESTED` (not child task creation)
+**Files:** `src/engine/review.rs` (`review_open_prs()`), `src/engine/runner/`
 
 ### Current State
 
@@ -319,67 +315,20 @@ When a human reviewer requests changes on a PR via GitHub's review UI, the orche
 1. Lists tasks with `status:in_review`
 2. Fetches PR reviews via GitHub API
 3. Filters for `CHANGES_REQUESTED` reviews
-4. Creates internal follow-up tasks with `pr-review-followup` label
+4. Re-routes the original task back to `New` status with review feedback in `pr_review_context`
+5. The agent reuses the existing worktree/branch and pushes fixes to the same PR
+6. `ci_merge_failures` counter is reset on auto re-route
 
-### What's Missing
+### Design (Implemented)
 
-The follow-up tasks are internal SQLite tasks — they don't have the original worktree, branch, or PR context. The agent starts fresh instead of fixing the existing PR.
+The original external task is re-routed with review context stored in the unified SQLite store. The agent reuses the existing worktree/branch and pushes fixes to the same PR. Key behaviors:
 
-### Design
-
-Instead of creating a new internal task, re-dispatch the **original external task** with review context:
-
-```rust
-async fn handle_pr_review_changes(
-    &self,
-    task: &ExternalTask,
-    review_comments: Vec<GitHubReviewComment>,
-    backend: &dyn ExternalBackend,
-) -> anyhow::Result<()> {
-    // 1. Build review context from comments
-    let review_context = review_comments.iter()
-        .map(|c| format!("**{}** on `{}` (line {}):\n> {}",
-            c.user.login, c.path, c.position.unwrap_or(0), c.body))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    // 2. Store review context in sidecar (agent will see it in build_agent_message)
-    sidecar::merge(&self.repo, &task.id.0, &serde_json::json!({
-        "pr_review_context": review_context,
-        "status": "routed",
-    }))?;
-
-    // 3. Set task back to routed (same agent, same worktree, same branch)
-    backend.update_status(&task.id, Status::Routed).await?;
-
-    // 4. Post comment acknowledging the review
-    backend.post_comment(&task.id, &format!(
-        "Received {} review comment(s). Re-dispatching agent to address feedback.",
-        review_comments.len()
-    )).await?;
-}
-```
-
-The agent sees the review context in `build_agent_message()`:
-
-```rust
-// In context.rs or agent.rs
-if !context.pr_review_context.is_empty() {
-    msg.push_str("## PR Review Feedback\n\n");
-    msg.push_str("A reviewer has requested changes. Address each comment:\n\n");
-    msg.push_str(&context.pr_review_context);
-    msg.push('\n');
-}
-```
-
-### Implementation Steps
-
-1. Add `pr_review_context` field to `TaskContext` struct in `context.rs`
-2. Load it from sidecar in `build_task_context()`
-3. Include in `build_agent_message()` when non-empty
-4. Change `review_open_prs()` to call `handle_pr_review_changes()` instead of creating internal tasks
-5. Remove internal task creation for `pr-review-followup` (or keep as fallback)
-6. Dedup: track `last_review_handled_at` in sidecar to avoid re-dispatching for same review
+- Review feedback is stored in the `pr_review_context` field via the store
+- The task is re-routed to `New` (not `Routed`) so it goes through the full routing pipeline
+- The `ci_merge_failures` counter is reset on auto re-route
+- `review_cycles` is incremented; when `>= max_review_cycles`, the task is blocked for human review
+- The agent sees review context in `build_agent_message()` when non-empty
+- Dedup: `last_review_ts` / `last_comment_review_ts` tracked in the store to avoid re-dispatching for the same review
 
 ---
 

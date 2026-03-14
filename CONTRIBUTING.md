@@ -18,15 +18,35 @@ Clone + sanity check:
 git clone https://github.com/gabrielkoerich/orch.git
 cd orch
 cargo build       # build orch binary
-cargo test        # run tests
-cargo clippy      # lint
+cargo nextest run # run tests (preferred, matches CI)
+cargo clippy --all-targets -- -D warnings  # lint (warnings are errors)
 ```
+
+Install nextest: `cargo binstall cargo-nextest` (requires [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)).
 
 ## Running tests
 
 ```bash
-cargo test                    # all tests
-cargo test -- test_name       # specific test
+cargo nextest run              # all tests (preferred, matches CI)
+cargo nextest run -E 'test(name)' # specific test by name
+cargo test                     # fallback if nextest is not installed
+cargo test -- test_name        # specific test (fallback)
+```
+
+## Required checks before committing
+
+CI enforces all three — run them locally before pushing:
+
+```bash
+cargo fmt -- --check                       # formatting
+cargo clippy --all-targets -- -D warnings  # lints (warnings are errors, incl. test code)
+cargo nextest run                          # tests
+```
+
+Or all at once:
+
+```bash
+cargo fmt && cargo clippy --all-targets -- -D warnings && cargo nextest run
 ```
 
 ## Commit message conventions
