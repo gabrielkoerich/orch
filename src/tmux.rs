@@ -217,8 +217,10 @@ impl TmuxManager {
 
             if !self.is_session_active(session).await {
                 // Process finished — capture final output
-                let output = self.capture_pane(session, 500).await.unwrap_or_default();
-                return Ok(output);
+                return self
+                    .capture_pane(session, 500)
+                    .await
+                    .with_context(|| format!("capturing final tmux output for session {session}"));
             }
 
             tokio::time::sleep(poll_interval).await;
@@ -227,7 +229,13 @@ impl TmuxManager {
 
     /// Snapshot all active sessions — for engine tick monitoring.
     pub async fn snapshot(&self) -> HashMap<String, bool> {
-        let sessions = self.list_sessions().await.unwrap_or_default();
+        let sessions = match self.list_sessions().await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(%error, "failed to list tmux sessions for snapshot");
+                return HashMap::new();
+            }
+        };
         let mut map = HashMap::new();
         for s in sessions {
             let active = self.is_session_active(&s.name).await;
@@ -316,13 +324,11 @@ mod tests {
 
     /// Helper to get a test session name with unique ID
     fn test_session_name() -> String {
-        format!(
-            "orch-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        )
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        format!("orch-test-{ts}")
     }
 
     #[test]
@@ -347,7 +353,12 @@ mod tests {
             .output()
             .await;
 
-        if create_result.is_err() || !create_result.unwrap().status.success() {
+        let Ok(create_output) = create_result else {
+            // Skip test if tmux is not available or fails
+            eprintln!("Skipping test: tmux not available or failed to create test session");
+            return;
+        };
+        if !create_output.status.success() {
             // Skip test if tmux is not available or fails
             eprintln!("Skipping test: tmux not available or failed to create test session");
             return;
@@ -363,7 +374,11 @@ mod tests {
             .output()
             .await;
 
-        let output = check_result.expect("should be able to check environment");
+        let Ok(output) = check_result else {
+            let _ = tmux.kill_session(&session).await;
+            eprintln!("Skipping test: unable to check environment");
+            return;
+        };
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("TEST_VAR=test_value"),
@@ -389,7 +404,11 @@ mod tests {
             .output()
             .await;
 
-        if create_result.is_err() || !create_result.unwrap().status.success() {
+        let Ok(create_output) = create_result else {
+            eprintln!("Skipping test: tmux not available or failed to create test session");
+            return;
+        };
+        if !create_output.status.success() {
             eprintln!("Skipping test: tmux not available or failed to create test session");
             return;
         }
@@ -402,8 +421,12 @@ mod tests {
         let check_before = tokio::process::Command::new("tmux")
             .args(["show-environment", "-t", &session, "TO_DELETE"])
             .output()
-            .await
-            .expect("should be able to check environment");
+            .await;
+        let Ok(check_before) = check_before else {
+            let _ = tmux.kill_session(&session).await;
+            eprintln!("Skipping test: unable to check environment");
+            return;
+        };
         assert!(
             String::from_utf8_lossy(&check_before.stdout).contains("TO_DELETE"),
             "Variable should exist before unset"

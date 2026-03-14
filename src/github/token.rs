@@ -20,6 +20,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
+fn unix_epoch_secs() -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?
+        .as_secs())
+}
+
 /// Token source mode for GitHub authentication.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum TokenMode {
@@ -158,10 +165,14 @@ impl TokenResolver {
             if let Some(ref entry) = *cached {
                 // Check expiration if present
                 if let Some(expires_at) = entry.expires_at {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let now = match unix_epoch_secs() {
+                        Ok(now) => now,
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to read current unix timestamp");
+                            // If system time is invalid, treat cache as expired and resolve again.
+                            0
+                        }
+                    };
                     if now < expires_at {
                         return Ok(Some(entry.token.clone()));
                     }
@@ -371,10 +382,13 @@ impl TokenResolver {
         match self.mode {
             // GitHub App JWTs expire (typically 10 minutes)
             TokenMode::GitHubApp { .. } => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let now = match unix_epoch_secs() {
+                    Ok(now) => now,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to compute JWT cache expiration");
+                        return None;
+                    }
+                };
                 // JWT valid for 9 minutes (GitHub allows up to 10)
                 Some(now + 540)
             }
@@ -423,10 +437,7 @@ fn generate_github_app_jwt(app_id: &str, private_key_pem: &str) -> anyhow::Resul
         iss: String,
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = unix_epoch_secs().context("failed to compute JWT timestamp")?;
 
     let claims = Claims {
         iat: now - 60,  // Allow 60 seconds clock skew

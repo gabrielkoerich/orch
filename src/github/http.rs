@@ -13,13 +13,14 @@ use super::token;
 use super::types::{
     GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview, GitHubReviewComment,
 };
+use anyhow::Context;
 use reqwest::{header, Client, Response, StatusCode};
 use serde::Serialize;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use urlencoding;
 
 const GITHUB_API: &str = "https://api.github.com";
@@ -92,16 +93,18 @@ impl RateLimit {
 
         // Prefer reset_at when available — avoids over-waiting with exponential backoff
         if let Some(reset_epoch) = self.reset_at {
-            let now_epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if reset_epoch > now_epoch {
-                let wait_secs = reset_epoch - now_epoch + 1;
-                self.backoff_delay = Duration::from_secs(wait_secs);
-                self.backoff_until = Some(Instant::now() + self.backoff_delay);
-                tracing::warn!(wait_secs, "GitHub rate limit hit, waiting until reset time");
-                return;
+            if let Ok(now_epoch) = unix_epoch_now() {
+                if reset_epoch > now_epoch {
+                    let wait_secs = reset_epoch - now_epoch + 1;
+                    self.backoff_delay = Duration::from_secs(wait_secs);
+                    self.backoff_until = Some(Instant::now() + self.backoff_delay);
+                    tracing::warn!(wait_secs, "GitHub rate limit hit, waiting until reset time");
+                    return;
+                }
+            } else {
+                tracing::warn!(
+                    "failed to compute current unix timestamp, using exponential backoff"
+                );
             }
         }
 
@@ -143,12 +146,14 @@ impl RateLimit {
         if let Some(remaining) = self.remaining {
             if remaining < self.throttle_threshold {
                 if let Some(reset_epoch) = self.reset_at {
-                    let now_epoch = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if now_epoch < reset_epoch {
-                        return Some(Duration::from_secs(reset_epoch - now_epoch + 1));
+                    if let Ok(now_epoch) = unix_epoch_now() {
+                        if now_epoch < reset_epoch {
+                            return Some(Duration::from_secs(reset_epoch - now_epoch + 1));
+                        }
+                    } else {
+                        tracing::warn!(
+                            "failed to compute current unix timestamp, skipping proactive wait"
+                        );
                     }
                 }
             }
@@ -189,6 +194,13 @@ static METRIC_WAIT_SECS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 // ── Shared token resolver ────────────────────────────────────────────
 
+fn unix_epoch_now() -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?
+        .as_secs())
+}
+
 // ── GhHttp client ────────────────────────────────────────────────────
 
 /// Native HTTP client for the GitHub API with connection pooling and
@@ -208,14 +220,17 @@ impl GhHttp {
     /// so `gh auth token` is only called once regardless of how many instances
     /// are created.
     pub fn new() -> Self {
-        let client = Client::builder()
+        let client_builder = Client::builder()
             .user_agent("orch/0.1 (reqwest)")
             .pool_max_idle_per_host(4)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect(
-                "BUG: reqwest client config is statically valid; TLS init failure is unrecoverable",
-            );
+            .timeout(Duration::from_secs(30));
+        let client = match client_builder.build() {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::error!(%error, "failed to build configured reqwest client, falling back");
+                Client::new()
+            }
+        };
 
         Self {
             client,
@@ -367,6 +382,19 @@ impl GhHttp {
 
     // ── Low-level HTTP helpers ────────────────────────────────────
 
+    async fn response_text(resp: Response, context: &str) -> anyhow::Result<String> {
+        resp.text()
+            .await
+            .with_context(|| format!("failed to read GitHub response body for {context}"))
+    }
+
+    async fn response_text_for_error(resp: Response, context: &str) -> String {
+        match resp.text().await {
+            Ok(body) => body,
+            Err(error) => format!("<failed to read GitHub response body for {context}: {error}>"),
+        }
+    }
+
     async fn auth_header(&self) -> anyhow::Result<String> {
         match self.token_resolver.get_token().await? {
             Some(token) if !token.is_empty() => Ok(format!("Bearer {token}")),
@@ -390,11 +418,12 @@ impl GhHttp {
         Self::record_response(&resp);
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::response_text_for_error(resp, &format!("GET {url}")).await;
             Self::maybe_record_rate_limit_from_body(status, &body);
             anyhow::bail!("GitHub API GET {url} failed ({status}): {body}");
         }
-        Ok(serde_json::from_str(&resp.text().await?)?)
+        let body = Self::response_text(resp, &format!("GET {url}")).await?;
+        Ok(serde_json::from_str(&body)?)
     }
 
     /// GET raw bytes (for endpoints that return non-JSON or we parse manually).
@@ -413,7 +442,7 @@ impl GhHttp {
         Self::record_response(&resp);
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::response_text_for_error(resp, &format!("GET {url}")).await;
             Self::maybe_record_rate_limit_from_body(status, &body);
             anyhow::bail!("GitHub API GET {url} failed ({status}): {body}");
         }
@@ -441,11 +470,12 @@ impl GhHttp {
         Self::record_response(&resp);
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::response_text_for_error(resp, &format!("GET {url}")).await;
             Self::maybe_record_rate_limit_from_body(status, &body);
             anyhow::bail!("GitHub API GET {url} failed ({status}): {body}");
         }
-        Ok(serde_json::from_str(&resp.text().await?)?)
+        let body = Self::response_text(resp, &format!("GET {url}")).await?;
+        Ok(serde_json::from_str(&body)?)
     }
 
     /// POST with JSON body, returns raw response text.
@@ -464,7 +494,7 @@ impl GhHttp {
             .await?;
         Self::record_response(&resp);
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = Self::response_text(resp, &format!("POST {url}")).await?;
         if !status.is_success() {
             Self::maybe_record_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub API POST {url} failed ({status}): {text}");
@@ -498,7 +528,7 @@ impl GhHttp {
             .await?;
         Self::record_response(&resp);
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = Self::response_text(resp, &format!("PATCH {url}")).await?;
         if !status.is_success() {
             Self::maybe_record_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub API PATCH {url} failed ({status}): {text}");
@@ -522,7 +552,7 @@ impl GhHttp {
         Self::record_response(&resp);
         let status = resp.status();
         if !status.is_success() && status != StatusCode::NOT_FOUND {
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::response_text_for_error(resp, &format!("DELETE {url}")).await;
             Self::maybe_record_rate_limit_from_body(status, &body);
             anyhow::bail!("GitHub API DELETE {url} failed ({status}): {body}");
         }
@@ -571,12 +601,12 @@ impl GhHttp {
             next_url = parse_link_next(resp.headers());
 
             if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
+                let body = Self::response_text_for_error(resp, "paginated GET").await;
                 Self::maybe_record_rate_limit_from_body(status, &body);
                 anyhow::bail!("GitHub API GET (paginated) failed ({status}): {body}");
             }
 
-            let text = resp.text().await?;
+            let text = Self::response_text(resp, "paginated GET").await?;
             let page: Vec<T> = serde_json::from_str(&text)?;
             all.extend(page);
 
@@ -613,7 +643,7 @@ impl GhHttp {
         let resp = req.send().await?;
         Self::record_graphql_response(&resp);
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = Self::response_text(resp, "GraphQL request").await?;
         if !status.is_success() {
             Self::maybe_record_graphql_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub GraphQL failed ({status}): {text}");
@@ -968,7 +998,7 @@ impl GhHttp {
 
         Self::record_response(&response);
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let text = Self::response_text(response, &format!("POST {url}")).await?;
         if !status.is_success() {
             Self::maybe_record_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub API POST {url} failed ({status}): {text}");
@@ -1052,7 +1082,7 @@ impl GhHttp {
         } else if status == StatusCode::NOT_FOUND {
             Ok(false)
         } else {
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::response_text_for_error(resp, &format!("GET {url}")).await;
             anyhow::bail!("GitHub API collaborator check failed ({status}): {body}");
         }
     }
@@ -1269,7 +1299,7 @@ impl GhHttp {
         Self::record_response(&resp);
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = Self::response_text_for_error(resp, &format!("PUT {url}")).await;
             anyhow::bail!("GitHub PR merge failed ({status}): {body}");
         }
         Self::record_success();

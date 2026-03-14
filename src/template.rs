@@ -5,24 +5,28 @@ use std::io::{self, Write};
 use std::sync::LazyLock;
 
 /// Matches `{{#if VAR}}...{{/if}}` blocks (non-greedy, dotall).
-static IF_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)\{\{#if\s+(\w+)\}\}(.*?)\{\{/if\}\}")
-        .expect("BUG: if_pattern regex is invalid")
-});
+static IF_PATTERN: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"(?s)\{\{#if\s+(\w+)\}\}(.*?)\{\{/if\}\}"));
 
 /// Matches `{{VAR}}` variable placeholders.
-static VAR_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{\{(\w+)\}\}").expect("BUG: var_pattern regex is invalid"));
+static VAR_PATTERN: LazyLock<Result<Regex, regex::Error>> =
+    LazyLock::new(|| Regex::new(r"\{\{(\w+)\}\}"));
 
 fn render_template_with_vars(
     template: &str,
     vars: &HashMap<String, String>,
 ) -> Result<String, String> {
+    let if_pattern = IF_PATTERN
+        .as_ref()
+        .map_err(|e| format!("invalid if template regex: {e}"))?;
+    let var_pattern = VAR_PATTERN
+        .as_ref()
+        .map_err(|e| format!("invalid variable template regex: {e}"))?;
     let mut data = template.to_string();
 
     loop {
         let mut changed = false;
-        let new_data = IF_PATTERN
+        let new_data = if_pattern
             .replace_all(&data, |caps: &regex::Captures| {
                 changed = true;
                 let var_name = &caps[1];
@@ -40,7 +44,7 @@ fn render_template_with_vars(
         }
     }
 
-    let result = VAR_PATTERN
+    let result = var_pattern
         .replace_all(&data, |caps: &regex::Captures| {
             let var_name = &caps[1];
             vars.get(var_name).cloned().unwrap_or_default()
@@ -103,16 +107,20 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn render_template_does_not_leak_env_vars() {
+    fn render_template_does_not_leak_env_vars() -> anyhow::Result<()> {
         // Set a sensitive env var that must NOT appear in the rendered output
         unsafe {
             std::env::set_var("ORCH_TEST_SECRET_TOKEN", "should-not-appear");
         }
 
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "hello world").unwrap();
+        let mut f = NamedTempFile::new()?;
+        writeln!(f, "hello world")?;
 
-        let result = render_template(f.path().to_str().unwrap(), &[]).unwrap();
+        let path = f
+            .path()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("temp path is not valid UTF-8"))?;
+        let result = render_template(path, &[]).map_err(|e| anyhow::anyhow!(e))?;
         assert!(
             !result.contains("should-not-appear"),
             "env var leaked into rendered template"
@@ -121,15 +129,21 @@ mod tests {
         unsafe {
             std::env::remove_var("ORCH_TEST_SECRET_TOKEN");
         }
+        Ok(())
     }
 
     #[test]
-    fn render_template_uses_explicit_vars() {
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "value={{{{MY_VAR}}}}").unwrap();
+    fn render_template_uses_explicit_vars() -> anyhow::Result<()> {
+        let mut f = NamedTempFile::new()?;
+        writeln!(f, "value={{{{MY_VAR}}}}")?;
 
+        let path = f
+            .path()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("temp path is not valid UTF-8"))?;
         let result =
-            render_template(f.path().to_str().unwrap(), &["MY_VAR=hello".to_string()]).unwrap();
+            render_template(path, &["MY_VAR=hello".to_string()]).map_err(|e| anyhow::anyhow!(e))?;
         assert_eq!(result.trim(), "value=hello");
+        Ok(())
     }
 }
