@@ -66,7 +66,7 @@ Everything outside your current working directory is **read-only**. Never `cd ..
 
 Do NOT skip any of these steps. If you only make changes without committing and pushing, your work will be lost.
 
-If git push fails (e.g., auth error, no remote), set status to `needs_review` with the error.
+If git push fails (e.g., auth error, permission denied, no remote), set status to `needs_review` with the error. The orchestrator will handle the push as a fallback — do NOT put "please approve the push" or push-related messages in your summary. Your summary must describe the work you did, not push status.
 
 ## Before Writing Your Output — MANDATORY CHECKLIST
 
