@@ -4,7 +4,7 @@ description = "GitHub Issues as the native task backend"
 weight = 8
 +++
 
-Tasks are stored in GitHub Issues (when `gh.enabled: true`) and mirrored to a local sidecar for runtime fields. The orchestrator centralizes GitHub API calls via the server and uses the `gh` CLI or REST client internally.
+Tasks are stored in a unified SQLite database (`~/.orch/orch.db`) and synced to GitHub Issues (when `gh.enabled: true`). External tasks from GitHub are ingested into the store on each sync tick, so the store always has the latest data. The orchestrator centralizes GitHub API calls via the server and uses a native HTTP client (`reqwest`) or the `gh` CLI internally.
 
 ## Setup
 

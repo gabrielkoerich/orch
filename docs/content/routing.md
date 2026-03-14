@@ -8,13 +8,12 @@ The orchestrator uses an LLM-as-classifier to route each task to the best agent.
 
 ## How It Works
 
-1. `route_task.sh` sends the task title, body, labels, and the skills catalog to a lightweight LLM (default: `claude --model haiku --print`).
-2. The router LLM returns JSON (or the CLI parser normalizes simple string responses into JSON):
+1. The Rust router (`src/engine/router/`) sends the task title, body, labels, and the skills catalog to a lightweight LLM (default: `claude --model haiku --print`).
+2. The router LLM returns JSON:
    ```json
    {
      "executor": "claude",
-     "model": "sonnet",
-     "decompose": false,
+     "complexity": "medium",
      "reason": "why this agent/model",
      "profile": {
        "role": "DeFi Protocol Engineer",
@@ -25,7 +24,7 @@ The orchestrator uses an LLM-as-classifier to route each task to the best agent.
      "selected_skills": ["solana-best-practices"]
    }
    ```
-3. Sanity checks run — e.g. warns if a backend task gets routed to claude, or a docs task to codex. If the router fails repeatedly, the router falls back to `router.fallback_executor` and increments a route-failure counter.
+3. Sanity checks run -- e.g. warns if a backend task gets routed to claude, or a docs task to codex. If the router fails repeatedly (configurable via `max_route_attempts`, default 3), it falls back to round-robin.
 4. If the router fails, it falls back to `config.yml`'s `router.fallback_executor` (default: `codex`).
 
 ## Config
@@ -54,6 +53,10 @@ router:
 | `codex` | Coding, repo changes, automation, tooling |
 | `claude` | Analysis, synthesis, planning, writing |
 | `opencode` | Lightweight coding and quick iterations |
+| `kimi` | Alternative coding agent |
+| `minimax` | Alternative coding agent |
+
+Agents are auto-discovered from PATH. The router only picks from installed agents.
 
 ## Complexity-Based Model Selection
 

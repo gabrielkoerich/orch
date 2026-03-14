@@ -257,7 +257,7 @@ Implemented in `src/cli/task.rs:664` (`pub async fn logs`) and wired into the ma
 | Telegram/Discord bots | Can't maintain websocket | tokio |
 | Output streaming | Polling tmux capture-pane | Async broadcast channels |
 | Concurrent I/O | `xargs -P` is crude | tokio::spawn |
-| Internal tasks | No local DB without sqlite3 deps | Built-in SQLite (rusqlite) |
+| Internal tasks | No local DB without sqlite3 deps | Built-in SQLite (sqlx) |
 | Graceful shutdown | Trap-based, fragile | tokio signal handlers |
 
 ---
@@ -309,10 +309,10 @@ graph TB
     end
 
     subgraph "Data"
-        GH_ISSUES["GitHub Issues<br/>(external tasks)"]
-        LOCAL_DB["SQLite<br/>(internal tasks)"]
-        YAML[".orchestrator.yml<br/>+ config.yml"]
-        SIDE["Sidecar JSON<br/>(ephemeral state)"]
+        GH_ISSUES["GitHub Issues<br/>(external sync)"]
+        LOCAL_DB["SQLite orch.db<br/>(unified task store)"]
+        YAML[".orch.yml<br/>+ config.yml"]
+        SIDE["Sidecar JSON<br/>(ephemeral per-task state)"]
     end
 
     GH_CH --> TRANSPORT
@@ -435,7 +435,7 @@ In v1, the tmux bridge changes this completely:
 | PR review trigger | `review_prs.sh` (polling) | Rust polling (webhook future) | **Done** (polling) |
 | Sidecar I/O | `jq` read/write | Direct file I/O | **Done** |
 | Template rendering | `python3 render_template()` | Native Rust | **Done** |
-| Internal task DB | Not supported | `rusqlite` (embedded SQLite) | **Done** |
+| Internal task DB | Not supported | `sqlx` (async SQLite) | **Done** |
 | CLI entry point | `justfile` (34+ recipes) | Native `clap` subcommands | **Done** |
 
 ### Total Subprocess Savings
@@ -533,16 +533,15 @@ trait ExternalBackend: Send + Sync {
 | `post_comment` | `gh api repos/O/R/issues/N/comments` | `commentCreate` | `POST /comment` |
 | `set_labels` | `gh api repos/O/R/issues/N/labels` | `issueAddLabel` | Tag update |
 
-### GitHub Backend: `gh` CLI, not raw HTTP
+### GitHub Backend: Native HTTP via `reqwest`
 
-The GitHub backend shells out to `gh api` rather than using `reqwest` directly. Reasons:
+> **Update:** The GitHub backend now uses native HTTP via `reqwest` with connection pooling (`src/github/http.rs`), replacing the earlier `gh api` subprocess approach. Token resolution is handled by `src/github/token.rs` (env vars, config, GitHub App JWT, `gh auth token` fallback).
 
-1. **Auth is free** — `gh` handles OAuth, tokens, SSH keys, SSO. No JWT/App setup needed.
-2. **Everyone has it** — any user with `gh` installed can use orch immediately.
-3. **Rate limit handling** — `gh` has built-in retry/backoff for 429s.
-4. **Less code** — no token refresh, no auth middleware, no credential storage.
-
-The Rust side handles structured I/O: builds the `gh api` command args, parses JSON output via `serde`. No `jq` needed — Rust deserializes directly.
+Benefits of the native HTTP approach:
+1. **Connection pooling** — reuses connections across API calls (~100ms/call vs ~150ms for `gh` CLI startup)
+2. **Structured types** — `serde` deserialization directly into Rust structs
+3. **GitHub App support** — automatic JWT generation and installation token refresh
+4. **Rate limit handling** — built-in backoff with configurable strategy (wait or skip)
 
 ```rust
 impl ExternalBackend for GitHubBackend {
@@ -1351,7 +1350,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | `anyhow` / `thiserror` | Error handling | In use |
 | `sha2` | Hashing (dedup) | In use |
 | `cron` | Cron expressions | In use |
-| `rusqlite` | Internal task SQLite DB | In use |
+| `sqlx` | Unified SQLite task store (async, WAL mode) | In use |
 | `reqwest` | HTTP client | In use |
 | `regex` | Secret/leak detection | In use |
 | `notify` | Config file watching | In use |
@@ -1362,7 +1361,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | `urlencoding` | URL encoding for labels | In use |
 | `axum` | Webhook HTTP server | In use |
 | `teloxide` | Telegram bot | Not used — implemented via raw HTTP polling in `src/channels/telegram.rs` |
-| `serenity` | Discord bot | Not used — implemented via raw HTTP polling in `src/channels/discord.rs` |
+| `serenity` | Discord bot | Not used — implemented via Gateway websocket in `src/channels/discord_ws.rs` |
 | `cargo-llvm-cov` | Coverage tracking in CI | CI tooling |
 
 ---

@@ -17,9 +17,11 @@ The review agent automatically reviews pull requests after an agent completes a 
    - Parses the review decision
 
 4. Based on the decision:
-   - **approve** → posts `gh pr review --approve`, task stays `in_review` with `review_decision: approve`
-   - **request_changes** → posts `gh pr review --request-changes`, task goes to `needs_review`
-   - **reject** → posts `gh pr review --request-changes`, closes the PR, task goes to `needs_review`
+   - **approve** → posts a comment with `## Automated Review -- Approve` header on the PR, auto-merges if CI passes
+   - **request_changes** → posts a comment with `## Automated Review -- Changes Requested` header, task re-routes to `New` for the agent to fix
+   - **reject** → posts review comment, closes the PR, task goes to `needs_review`
+
+   Review comments use a `## Automated Review` header as the protocol. A CI workflow (`.github/workflows/orch-review.yml`) reads PR comments with this header to determine approval status.
 
 ## Agent Selection
 
@@ -89,18 +91,20 @@ All `gh pr review` calls are non-fatal (`|| true`) — if the API fails, the rev
 ## Task Flow
 
 ```
-agent completes (done) → PR detected → in_review → review agent runs
-                                                   ├─ approve → stays in_review (PR ready to merge)
-                                                   ├─ request_changes → needs_review
-                                                   └─ reject → needs_review (PR closed)
+agent completes (done) → PR detected → needs_review → in_review → review agent runs
+                                                                   ├─ approve → auto-merge → done
+                                                                   ├─ request_changes → re-route to new → agent fixes
+                                                                   └─ reject → needs_review (PR closed)
 ```
+
+Review re-routing: when a review requests changes, the task is re-routed back to `New` status (not a child task). The agent reuses the existing worktree/branch and pushes fixes to the same PR. If `review_cycles >= max_review_cycles`, the task is blocked for human review.
 
 Without the review agent enabled, tasks with open PRs still transition to `in_review` but skip the automated review step.
 
 ## Observability
 
 Review events appear in:
-- **Task history**: `review approved by claude`, `review requested changes`, `review rejected`
-- **Task YAML**: `review_decision` and `review_notes` fields
-- **GitHub PR**: real PR review with the reviewer's notes as the review body
-- **Server logs**: `[run] task=N starting review by claude for PR #42`
+- **SQLite store**: `review_decision` field and review counters
+- **GitHub PR**: review comment with `## Automated Review` header
+- **Server logs**: structured tracing spans for review agent lifecycle
+- **Sidecar JSON**: per-task review metadata at `~/.orch/state/{repo}/tasks/{id}/sidecar.json`

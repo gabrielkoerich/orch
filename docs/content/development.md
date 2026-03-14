@@ -9,21 +9,32 @@ weight = 11
 ```bash
 git clone https://github.com/gabrielkoerich/orch.git
 cd orch
-cargo test          # run tests (Rust unit/integration tests)
-just                # list available commands (project Make-like helper)
+cargo build                                    # build orch binary
+cargo nextest run                              # run tests (preferred, matches CI)
+cargo clippy --all-targets -- -D warnings      # lint
 ```
 
-Requires: `yq`, `jq`, `just`, `python3`, `rg`, `fd`, `bats`.
+Requires: Rust toolchain, `rg`, `fd`. Install nextest: `cargo binstall cargo-nextest`.
 
 ## Tests
 
-Run unit and integration tests with `cargo test`. Integration tests mock external agents and the `gh` CLI where appropriate. See `tests/` for fixtures and mocked responses.
+Run unit and integration tests with `cargo nextest run` (preferred, matches CI) or `cargo test` as a fallback. Integration tests mock external agents and the `gh` CLI where appropriate.
 
-## ShellCheck / security audit
+## Required checks before committing
 
-CI runs `./bin/security-audit --strict`, which includes ShellCheck (`shellcheck -S error`) across shell-like scripts.
+CI enforces all three -- run them locally before pushing:
 
-Bash treats backticks (`` `like this` ``) as command substitution inside double-quoted strings. If you want to print markdown that contains backticks (for example in CLI acknowledgements or issue comments), prefer single quotes, `printf`, or `$'...'` so the backticks are treated as literal characters (and ShellCheck won’t fail with parse errors like `SC1072` / `SC1073`).
+```bash
+cargo fmt -- --check                       # formatting
+cargo clippy --all-targets -- -D warnings  # lints (warnings are errors, incl. test code)
+cargo nextest run                          # tests
+```
+
+Or all at once:
+
+```bash
+cargo fmt && cargo clippy --all-targets -- -D warnings && cargo nextest run
+```
 
 ## Release Pipeline
 
@@ -44,27 +55,21 @@ Use prefixes in commit messages:
 ## Project Structure
 
 ```
-scripts/
-  lib.sh            — shared helpers (logging, locking, yq wrappers, GitHub API)
-  backend.sh        — backend interface loader + jobs CRUD (YAML-backed)
-  backend_github.sh — GitHub Issues backend implementation
-  serve.sh          — main loop (poll, jobs, reviews)
-  poll.sh           — finds and runs pending tasks
-  run_task.sh       — runs a single task (route → agent → parse → push → PR)
-  route_task.sh     — routes tasks via LLM
-  add_task.sh       — creates tasks (GitHub issues)
-  output.sh         — shared formatting (tables, sections)
-  normalize_json.py — JSON extraction, tool history, token usage
-  cron_match.py     — cron expression matcher
+src/
+  main.rs           — CLI entrypoint (clap)
+  store.rs          — Unified SQLite task store (tasks, metrics, KV, rate limits)
+  config/           — Config loading, hot-reload, multi-project
+  engine/           — Core orchestration (tick, sync, review, cleanup, router, runner)
+  github/           — GitHub API (HTTP client, token resolution, types, Projects V2)
+  backends/         — External task backends (GitHub Issues)
+  channels/         — Communication channels (Telegram, Discord, Slack, GitHub, tmux)
+  cli/              — CLI command implementations
 prompts/
-  system.md         — system prompt
-  agent.md          — execution prompt
-  plan.md           — planning/decomposition prompt
+  agent_system.md   — agent system prompt
+  agent_message.md  — agent task message
   route.md          — routing prompt
-  review.md         — review agent prompt
-tests/
-  orchestrator.bats — 200 bats tests
-  gh_mock.sh        — comprehensive gh CLI mock
+  review_system.md  — review agent system prompt
+  review_task.md    — review agent task prompt
 docs/
   content/          — documentation pages (Zola site)
   templates/        — Zola HTML templates
