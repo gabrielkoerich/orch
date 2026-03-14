@@ -333,14 +333,18 @@ Always run these before committing — CI enforces them and will fail otherwise:
 ```bash
 cargo fmt -- --check                    # formatting
 cargo clippy --all-targets -- -D warnings # lints (warnings are errors, incl. test code)
-cargo test                              # unit tests
+cargo nextest run                       # unit tests (faster, matches CI)
 ```
 
 Or all at once:
 
 ```bash
-cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
+cargo fmt && cargo clippy --all-targets -- -D warnings && cargo nextest run
 ```
+
+**Installing nextest locally:** CI uses prebuilt binaries via `taiki-e/install-action`. For local use,
+install with `cargo binstall cargo-nextest` (requires [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)),
+or fall back to `cargo test` if nextest is unavailable.
 
 ## Release pipeline
 
