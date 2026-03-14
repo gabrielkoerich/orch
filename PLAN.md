@@ -728,7 +728,6 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] Parent/child unblocking — Phase 4 of tick()
 - [x] Job scheduler (native cron with catch-up) — `src/engine/jobs.rs`
 - [x] Unified SQLite task store — `src/store.rs` (tasks, metrics, KV, rate limits)
-- [x] Task manager (unified internal + external) — `src/engine/tasks.rs`
 - [x] TaskManager (unified internal + external) — `src/engine/tasks.rs`
 - [x] Agent router (label-based, round-robin, LLM classification) — `src/engine/router.rs`
 - [x] Router wired into engine dispatch loop (Phase 3a route → Phase 3b dispatch)

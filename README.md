@@ -422,9 +422,11 @@ Task artifacts are organized per-repo, per-task, per-attempt:
     1/
       prompt-sys.md         # System prompt
       prompt-msg.md         # Task prompt
+      runner.sh             # Runner script
       exit.txt              # Exit code
       stderr.txt            # Agent stderr
       output.json           # Agent response
+      result.json           # Parsed result (status, summary, etc.)
     2/                      # Retry attempt
       ...
 ```
