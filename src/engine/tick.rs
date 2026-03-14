@@ -382,7 +382,7 @@ pub(crate) async fn tick_dispatch_tasks(
         // session_exists check alone is insufficient.
         let dispatch_key = format!("{}/{}", repo, task.id.0);
         {
-            let guard = dispatching.lock().unwrap();
+            let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
             if guard.contains(&dispatch_key) {
                 tracing::debug!(
                     task_id = task.id.0,
@@ -422,7 +422,7 @@ pub(crate) async fn tick_dispatch_tasks(
         // This prevents the webhook-triggered tick (fired by label removal during
         // update_status) from re-dispatching the same task.
         {
-            let mut guard = dispatching.lock().unwrap();
+            let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
             guard.insert(dispatch_key.clone());
         }
 
@@ -743,7 +743,7 @@ pub(crate) async fn tick_dispatch_tasks(
 
             // Remove from dispatching set so the task can be re-dispatched if needed
             {
-                let mut guard = dispatching_for_cleanup.lock().unwrap();
+                let mut guard = dispatching_for_cleanup.lock().unwrap_or_else(|e| e.into_inner());
                 guard.remove(&dispatch_key_for_cleanup);
             }
 

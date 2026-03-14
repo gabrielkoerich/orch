@@ -142,13 +142,14 @@ impl CodexRunner {
             };
 
             if let Some(err) = classified {
-                best = Some(match (&best, &err) {
-                    // Prefer specific errors over generic AgentFailed
-                    (Some(AgentError::AgentFailed { .. }), _) => err,
-                    (None, _) => err,
-                    // Keep existing specific error
-                    _ => best.unwrap(),
-                });
+                // Replace if no best yet, or if current best is only a generic AgentFailed.
+                // Keep existing specific errors as-is.
+                match &best {
+                    None | Some(AgentError::AgentFailed { .. }) => {
+                        best = Some(err);
+                    }
+                    Some(_) => {}
+                }
             }
         }
 
