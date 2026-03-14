@@ -582,6 +582,13 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             tracing::info!(task_id, worktree = %wt.display(), "removing worktree");
             remove_worktree_and_branch(task_id, &wt, branch.as_deref(), &repo_root).await;
         }
+    } else if let Some(ref br) = branch {
+        // Worktree directory is already gone, but the branch may still exist
+        // on the remote. Delete it to avoid orphaned branches.
+        if !opts.dry_run {
+            tracing::debug!(task_id, branch = %br, "no worktree on disk, cleaning up branch only");
+            delete_branches(task_id, br, &repo_root).await;
+        }
     }
 
     if !opts.dry_run {
@@ -625,45 +632,50 @@ async fn remove_worktree_and_branch(
 
     // Delete local and remote branch from the main repo root (worktree is already gone)
     if let Some(br) = branch {
-        let branch_delete_result = Command::new("git")
-            .args(["-C", repo_root, "branch", "-D", br])
-            .output_with_context()
-            .await;
+        delete_branches(task_id, br, repo_root).await;
+    }
+}
 
-        match branch_delete_result {
-            Ok(output) if output.status.success() => {
-                tracing::info!(task_id, branch = %br, "local branch deleted");
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::debug!(
-                    task_id,
-                    err = %stderr,
-                    "local branch delete skipped (may not exist)"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(task_id, err = %e, "failed to delete local branch");
-            }
+/// Delete local and remote branches for a task.
+async fn delete_branches(task_id: &str, br: &str, repo_root: &str) {
+    let branch_delete_result = Command::new("git")
+        .args(["-C", repo_root, "branch", "-D", br])
+        .output_with_context()
+        .await;
+
+    match branch_delete_result {
+        Ok(output) if output.status.success() => {
+            tracing::info!(task_id, branch = %br, "local branch deleted");
         }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!(
+                task_id,
+                err = %stderr,
+                "local branch delete skipped (may not exist)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "failed to delete local branch");
+        }
+    }
 
-        // Delete remote branch
-        let remote_delete = Command::new("git")
-            .args(["-C", repo_root, "push", "origin", "--delete", br])
-            .output_with_context()
-            .await;
+    // Delete remote branch
+    let remote_delete = Command::new("git")
+        .args(["-C", repo_root, "push", "origin", "--delete", br])
+        .output_with_context()
+        .await;
 
-        match remote_delete {
-            Ok(output) if output.status.success() => {
-                tracing::info!(task_id, branch = %br, "remote branch deleted");
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::debug!(task_id, err = %stderr, "remote branch delete skipped");
-            }
-            Err(e) => {
-                tracing::warn!(task_id, err = %e, "failed to delete remote branch");
-            }
+    match remote_delete {
+        Ok(output) if output.status.success() => {
+            tracing::info!(task_id, branch = %br, "remote branch deleted");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!(task_id, err = %stderr, "remote branch delete skipped");
+        }
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "failed to delete remote branch");
         }
     }
 }
