@@ -552,7 +552,14 @@ impl GhHttp {
                     .send()
                     .await?
             } else {
-                let u = next_url.as_ref().unwrap();
+                // Be defensive: if next_url is unexpectedly None, treat it as end
+                // of pagination instead of panicking. This avoids crashes when a
+                // previous response advertised a `rel=next` URL that cannot be
+                // parsed or was removed upstream between calls.
+                let u = match next_url.as_ref() {
+                    Some(u) => u,
+                    None => break,
+                };
                 let auth = self.auth_header().await?;
                 self.client
                     .get(u)
@@ -1603,6 +1610,8 @@ mod tests {
         let headers = header::HeaderMap::new();
         assert_eq!(parse_link_next(&headers), None);
     }
+
+    
 
     fn make_rl(base_secs: u64, max_secs: u64) -> RateLimit {
         RateLimit {
