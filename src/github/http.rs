@@ -213,7 +213,9 @@ impl GhHttp {
             .pool_max_idle_per_host(4)
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("failed to build reqwest client");
+            .expect(
+                "BUG: reqwest client config is statically valid; TLS init failure is unrecoverable",
+            );
 
         Self {
             client,

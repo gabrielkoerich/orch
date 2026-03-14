@@ -554,7 +554,10 @@ fn project_add_github(owner: &str, repo: &str) -> anyhow::Result<()> {
         println!("Bare clone already exists: {}", bare_path.display());
     } else {
         // Create parent directory
-        std::fs::create_dir_all(bare_path.parent().unwrap())?;
+        let parent = bare_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("bare path has no parent: {}", bare_path.display()))?;
+        std::fs::create_dir_all(parent)?;
 
         println!("Cloning {slug} as bare repo...");
         let status = std::process::Command::new("gh")
