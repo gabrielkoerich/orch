@@ -147,43 +147,36 @@ engine:
 
 ## PR Review Integration
 
-The orchestrator automatically creates follow-up tasks when PR reviews request changes, closing the feedback loop between code review and agent execution.
+The orchestrator re-routes tasks when PR reviews request changes, closing the feedback loop between code review and agent execution.
 
 ### How It Works
 
 1. The engine periodically checks tasks in `in_review` status (every sync interval)
 2. For each task with an open PR, it fetches PR reviews from GitHub
 3. When a review requests changes (`CHANGES_REQUESTED`), it:
-   - Creates an internal follow-up task for each actionable review comment
-   - Links the follow-up to the parent task via `source_id`
-   - Stores PR context (PR number, branch, reviewer, file path) in the sidecar
-   - Routes the follow-up to the same agent that created the original PR
-   - Posts a comment on the original issue about the follow-up task
+   - Stores the review feedback in `pr_review_context` field
+   - Increments the `review_cycles` counter
+   - Posts a review comment on the PR with the feedback
+   - Re-routes the task back to `New` status for re-dispatch
+   - The agent reuses the existing worktree/branch and pushes fixes to the same PR
+4. If `review_cycles >= max_review_cycles`, the task is blocked for human review
 
 ### Configuration
 
 ```yaml
 workflow:
-  # Auto-create follow-up tasks when PR reviews request changes (default: true)
-  auto_create_followup_on_changes: true
+  # Max review cycles before escalating to human (default: 2)
+  max_review_cycles: 2
   # Auto-close task (mark Done) when all PR reviews are approved (default: false).
   # Note: this does NOT merge the PR -- only updates the task status.
   auto_close_task_on_approval: false
 ```
 
-### Follow-up Task Content
-
-Follow-up tasks include:
-- File path and line number from the review comment
-- Diff context (truncated if > 2000 chars)
-- The reviewer's comment
-- Overall review notes from the review body
-- Link to the parent task
-
 ### Status Updates
 
-- Parent task remains in `in_review` while follow-ups are addressed
-- When a review is approved and `auto_close_task_on_approval` is enabled, the parent task is marked as `done`
+- Task is re-routed (`New`) when review requests changes — same branch/PR is reused
+- Task is blocked when max review cycles exceeded — requires human intervention
+- When a review is approved and `auto_close_task_on_approval` is enabled, the task is marked as `done`
 
 ## Complexity-based model routing
 
