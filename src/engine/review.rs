@@ -815,6 +815,23 @@ pub(crate) async fn review_and_merge(
                     return Ok(ReviewDecision::Skipped);
                 }
 
+                // If the PR creation failed with 422/head-invalid, the work
+                // is already merged into main. Mark done instead of looping.
+                if last_error.contains("422") && last_error.contains("head") {
+                    tracing::info!(
+                        task_id = task.id.0,
+                        branch = %branch_name,
+                        "no PR — 422/head-invalid means work already merged, marking done"
+                    );
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, crate::backends::Status::Done)
+                        .await
+                    {
+                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Done) failed");
+                    }
+                    return Ok(ReviewDecision::Skipped);
+                }
+
                 tracing::warn!(
                     task_id = task.id.0,
                     branch = %branch_name,

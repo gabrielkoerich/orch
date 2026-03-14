@@ -1316,16 +1316,24 @@ mod tests {
         use crate::channels::transport::Transport;
         use std::sync::Arc;
 
-        // Skip test if tmux is not available in the environment (CI may not have tmux)
-        if tokio::process::Command::new("tmux")
-            .arg("-V")
+        // Skip test if tmux cannot create sessions (CI has tmux binary but no server)
+        let probe_session = "orch-test-probe";
+        let probe_ok = tokio::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", probe_session])
             .output()
             .await
-            .is_err()
-        {
-            tracing::warn!("tmux not found, skipping integration_channel_to_tmux_to_capture test");
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !probe_ok {
+            tracing::warn!(
+                "tmux cannot create sessions, skipping integration_channel_to_tmux_to_capture test"
+            );
             return;
         }
+        let _ = tokio::process::Command::new("tmux")
+            .args(["kill-session", "-t", probe_session])
+            .output()
+            .await;
 
         // Create transport and capture service
         let transport = Arc::new(Transport::new());
