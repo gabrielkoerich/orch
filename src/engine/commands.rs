@@ -121,7 +121,7 @@ pub async fn scan_commands(
     store: &Option<Arc<crate::store::TaskStore>>,
     task_manager: &Arc<crate::engine::tasks::TaskManager>,
 ) -> anyhow::Result<()> {
-    let gh = GhHttp::new();
+    let gh = GhHttp::new()?;
 
     // Use persisted cursor, fall back to 24h ago
     let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
