@@ -182,8 +182,8 @@ impl TaskManager {
                 }
             }
 
-            // Get external tasks with this status
-            let external_tasks = self.backend.list_by_status(backend_status).await?;
+            // Get external tasks with this status (store-first, same pattern as list_external_by_status)
+            let external_tasks = self.list_external_by_status(backend_status).await?;
             for t in external_tasks {
                 tasks.push(Task::External(t));
             }
