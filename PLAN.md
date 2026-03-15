@@ -782,6 +782,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] `orch task route <id>` — route task to agent
 - [x] `orch task run <id>` — execute task
 - [x] `orch task retry <id>` — retry failed task
+- [x] `orch task close <id>` — mark task done without running agent (supports `--note` for external tasks)
 - [x] `orch task attach <id>` — attach to tmux session
 - [x] `orch task kill <id>` — kill agent session
 - [x] `orch task live` — list active sessions

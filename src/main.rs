@@ -325,6 +325,14 @@ enum TaskAction {
         /// Task ID (e.g. "internal:8" or issue number)
         id: String,
     },
+    /// Mark a task as done (without running an agent)
+    Close {
+        /// Task ID (e.g. "internal:8" or issue number)
+        id: String,
+        /// Optional note to add as a comment on external tasks
+        #[arg(short, long)]
+        note: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -515,6 +523,9 @@ async fn main() -> anyhow::Result<()> {
             }
             TaskAction::Logs { id } => {
                 cli::task::logs(&id).await?;
+            }
+            TaskAction::Close { id, note } => {
+                cli::task::close(&id, note.as_deref()).await?;
             }
         },
         Commands::Job { action } => match action {
