@@ -173,7 +173,21 @@ pub async fn handle_success(
             )
             .await
             {
-                Ok(Some(_url)) => has_pr = true,
+                Ok(Some(ref url)) => {
+                    has_pr = true;
+                    // Save pr_number to the store so the review gate can find it
+                    // immediately without racing GitHub's list-API cache (~300 ms lag).
+                    if let Some(pr_num) = url.rsplit('/').next().and_then(|n| n.parse::<i64>().ok())
+                    {
+                        crate::engine::cleanup::store_set(
+                            store,
+                            repo,
+                            task_id,
+                            &[("pr_number", serde_json::json!(pr_num))],
+                        )
+                        .await;
+                    }
+                }
                 Ok(None) => {
                     // PR already existed
                     has_pr = true;
