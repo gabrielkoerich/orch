@@ -204,7 +204,9 @@ pub async fn tick(
                         match status.map(|s| s.as_str()) {
                             Some("status:in_progress")
                             | Some("status:routed")
-                            | Some("status:new") => true,
+                            | Some("status:new")
+                            | Some("status:needs_review")
+                            | Some("status:in_review") => true,
                             None => true,     // No status label — treat as active
                             Some(_) => false, // Terminal state
                         }
@@ -240,9 +242,11 @@ pub async fn tick(
                     if let Ok(Some(store_id)) = s.resolve_task_id(repo, &task_id_clone).await {
                         match s.get(store_id).await {
                             Ok(task) => match task.status {
-                                TaskStatus::New | TaskStatus::Routed | TaskStatus::InProgress => {
-                                    true
-                                }
+                                TaskStatus::New
+                                | TaskStatus::Routed
+                                | TaskStatus::InProgress
+                                | TaskStatus::NeedsReview
+                                | TaskStatus::InReview => true,
                                 _ => false, // Terminal state
                             },
                             Err(e) => {
