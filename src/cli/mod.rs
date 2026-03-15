@@ -28,7 +28,14 @@ pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     let config_path = orch_home.join("config.yml");
 
     let repo_value = match repo {
-        Some(r) => r,
+        Some(r) => {
+            // Normalize: accept SSH URLs, HTTPS URLs, or owner/repo slugs
+            if let Some((owner, name)) = parse_github_slug(&r) {
+                format!("{}/{}", owner, name)
+            } else {
+                r
+            }
+        }
         None => {
             // Try to detect from git remote (origin) by reading the remote URL
             let git_remote = std::process::Command::new("git")
@@ -491,6 +498,19 @@ pub fn board_info() -> anyhow::Result<()> {
 ///
 /// Returns `None` if the input looks like a local path.
 fn parse_github_slug(input: &str) -> Option<(String, String)> {
+    // SSH URL format: git@github.com:owner/repo.git
+    if input.starts_with("git@github.com:") {
+        let path = input
+            .trim_start_matches("git@github.com:")
+            .trim_end_matches('/')
+            .trim_end_matches(".git");
+        let parts: Vec<&str> = path.splitn(3, '/').collect();
+        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+        return None;
+    }
+
     // GitHub URL format
     if input.starts_with("https://github.com/") || input.starts_with("http://github.com/") {
         let path = input
@@ -852,5 +872,23 @@ mod tests {
     fn parse_slug_three_segments_returns_none() {
         // Three segments like a deep path shouldn't match as a slug
         assert_eq!(parse_github_slug("a/b/c"), None);
+    }
+
+    #[test]
+    fn parse_slug_ssh_url() {
+        let result = parse_github_slug("git@github.com:gabrielkoerich/bean.git");
+        assert_eq!(
+            result,
+            Some(("gabrielkoerich".to_string(), "bean".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_slug_ssh_url_no_git_suffix() {
+        let result = parse_github_slug("git@github.com:gabrielkoerich/bean");
+        assert_eq!(
+            result,
+            Some(("gabrielkoerich".to_string(), "bean".to_string()))
+        );
     }
 }
