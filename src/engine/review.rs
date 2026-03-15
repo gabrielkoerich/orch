@@ -1327,7 +1327,7 @@ pub(crate) async fn auto_merge_pr(
                             "CI checks still pending after timeout — re-routing to agent"
                         );
                         task_manager
-                            .update_task_status(&task.id, Status::NeedsReview)
+                            .update_task_status(&task.id, Status::New)
                             .await?;
                     }
                     return Ok(());
