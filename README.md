@@ -173,6 +173,8 @@ orch task attach <id>         # Attach to running tmux session
 orch task live                # List active agent sessions
 orch task kill <id>           # Kill a running agent session
 orch task cost <id>           # Show token cost breakdown
+orch task close <id>          # Manually mark a task as done
+orch task close <id> --note "msg"  # Mark done with a comment
 ```
 
 ### Project Management
