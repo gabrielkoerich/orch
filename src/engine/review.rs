@@ -592,285 +592,362 @@ pub(crate) async fn review_and_merge(
         }
     };
 
-    // 2b. Verify an open PR exists before running the (expensive) review agent
+    // 2b. Verify an open PR exists before running the (expensive) review agent.
+    // Check the store first (written by the runner right after PR creation) to
+    // avoid GitHub's list-API cache race (~300 ms between PR creation and review).
+    let stored_pr_number = super::cleanup::store_get_field(store, repo, &task.id.0, "pr_number")
+        .await
+        .and_then(|s| s.parse::<u64>().ok());
     let gh_check = GhHttp::new()?;
-    let pr_number_early = match gh_check.get_pr_number(repo, &branch_name).await {
-        Ok(Some(n)) => {
-            tracing::info!(
-                task_id = task.id.0,
-                pr_number = n,
-                branch = %branch_name,
-                "open PR found, proceeding with review"
-            );
-            n
-        }
-        Ok(None) => {
-            // No open PR — check if branch has commits ahead of default branch.
-            // If yes: agent forgot to create PR, try to create one and retry review.
-            // If no: read-only task (e.g. code review), safe to mark done.
-            let default_branch =
-                config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
-            let has_commits = tokio::process::Command::new("git")
-                .args([
-                    "-C",
-                    worktree_path.to_str().unwrap_or("."),
-                    "rev-list",
-                    "--count",
-                    &format!("origin/{default_branch}..HEAD"),
-                ])
-                .output()
-                .await
-                .ok()
-                .and_then(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .trim()
-                        .parse::<u64>()
-                        .ok()
-                })
-                .unwrap_or(0)
-                > 0;
-
-            if has_commits {
-                // Branch has unpushed or un-PR'd work — try to create a PR
-                tracing::warn!(
+    let pr_number_early = if let Some(n) = stored_pr_number {
+        tracing::info!(
+            task_id = task.id.0,
+            pr_number = n,
+            branch = %branch_name,
+            "open PR found in store, proceeding with review"
+        );
+        n
+    } else {
+        match gh_check.get_pr_number(repo, &branch_name).await {
+            Ok(Some(n)) => {
+                tracing::info!(
                     task_id = task.id.0,
+                    pr_number = n,
                     branch = %branch_name,
-                    "no open PR but branch has commits — attempting to create PR"
+                    "open PR found, proceeding with review"
                 );
-                // Push first in case agent forgot
-                let _ = tokio::process::Command::new("git")
+                n
+            }
+            Ok(None) => {
+                // No open PR — check if branch has commits ahead of default branch.
+                // If yes: agent forgot to create PR, try to create one and retry review.
+                // If no: read-only task (e.g. code review), safe to mark done.
+                let default_branch =
+                    config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+                let has_commits = tokio::process::Command::new("git")
                     .args([
                         "-C",
                         worktree_path.to_str().unwrap_or("."),
-                        "push",
-                        "-u",
-                        "origin",
-                        &branch_name,
+                        "rev-list",
+                        "--count",
+                        &format!("origin/{default_branch}..HEAD"),
                     ])
                     .output()
-                    .await;
-                // Try to create PR using GhHttp API first
-                let default_branch =
-                    config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
-                let task_ref = runner::git_ops::format_task_ref(&task.id.0);
-                let pr_body = format!(
+                    .await
+                    .ok()
+                    .and_then(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .trim()
+                            .parse::<u64>()
+                            .ok()
+                    })
+                    .unwrap_or(0)
+                    > 0;
+
+                if has_commits {
+                    // Branch has unpushed or un-PR'd work — try to create a PR
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        branch = %branch_name,
+                        "no open PR but branch has commits — attempting to create PR"
+                    );
+                    // Push first in case agent forgot
+                    let _ = tokio::process::Command::new("git")
+                        .args([
+                            "-C",
+                            worktree_path.to_str().unwrap_or("."),
+                            "push",
+                            "-u",
+                            "origin",
+                            &branch_name,
+                        ])
+                        .output()
+                        .await;
+                    // Try to create PR using GhHttp API first
+                    let default_branch =
+                        config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+                    let task_ref = runner::git_ops::format_task_ref(&task.id.0);
+                    let pr_body = format!(
                     "Resolves {task_ref}\n\nAuto-created by orch review gate (agent forgot to open PR)"
                 );
-                let gh = GhHttp::new()?;
-                match gh
-                    .create_pr(repo, &task.title, &pr_body, &branch_name, &default_branch)
-                    .await
-                {
-                    Ok(url) => {
-                        // Extract PR number from URL and update store so subsequent
-                        // review cycles check the correct PR (not a stale pr_number).
-                        if let Some(pr_num) = url.rsplit('/').next() {
-                            let pr_num_i64 = pr_num.parse::<i64>().unwrap_or(0);
-                            store_set(
-                                &Some(Arc::clone(store)),
-                                repo,
-                                &task.id.0,
-                                &[("pr_number", serde_json::json!(pr_num_i64))],
-                            )
-                            .await;
+                    let gh = GhHttp::new()?;
+                    match gh
+                        .create_pr(repo, &task.title, &pr_body, &branch_name, &default_branch)
+                        .await
+                    {
+                        Ok(url) => {
+                            // Extract PR number from URL and update store so subsequent
+                            // review cycles check the correct PR (not a stale pr_number).
+                            if let Some(pr_num) = url.rsplit('/').next() {
+                                let pr_num_i64 = pr_num.parse::<i64>().unwrap_or(0);
+                                store_set(
+                                    &Some(Arc::clone(store)),
+                                    repo,
+                                    &task.id.0,
+                                    &[("pr_number", serde_json::json!(pr_num_i64))],
+                                )
+                                .await;
+                            }
+                            tracing::info!(
+                                task_id = task.id.0,
+                                branch = %branch_name,
+                                pr_url = %url,
+                                "created missing PR via GhHttp — retrying review"
+                            );
+                            return Ok(ReviewDecision::Failed(
+                                "created missing PR, retry".to_string(),
+                            ));
                         }
-                        tracing::info!(
-                            task_id = task.id.0,
-                            branch = %branch_name,
-                            pr_url = %url,
-                            "created missing PR via GhHttp — retrying review"
-                        );
-                        return Ok(ReviewDecision::Failed(
-                            "created missing PR, retry".to_string(),
-                        ));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            task_id = task.id.0,
-                            branch = %branch_name,
-                            error = %e,
-                            "create_pr failed via GhHttp, falling back to CLI"
-                        );
-                        // Fall back to CLI
-                        let pr_result = tokio::process::Command::new("gh")
-                            .args([
-                                "pr",
-                                "create",
-                                "--repo",
-                                repo,
-                                "--head",
-                                &branch_name,
-                                "--title",
-                                &task.title,
-                                "--body",
-                                &pr_body,
-                            ])
-                            .current_dir(&worktree_path)
-                            .output()
-                            .await;
-                        match pr_result {
-                            Ok(o) if o.status.success() => {
-                                // gh pr create prints the PR URL to stdout
-                                let stdout = String::from_utf8_lossy(&o.stdout);
-                                if let Some(pr_num) = stdout.trim().rsplit('/').next() {
-                                    let pr_num_i64 = pr_num.parse::<i64>().unwrap_or(0);
+                        Err(e) => {
+                            let e_str = format!("{e}");
+                            // If 422 "already exists", the PR was just created — GitHub's list
+                            // API has brief eventual-consistency delays (observed ~300 ms).
+                            // Retry get_pr_number after a short pause instead of trying to
+                            // create again (which will also 422 and spin).
+                            if e_str.contains("already exists") {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                if let Ok(Some(n)) =
+                                    gh_check.get_pr_number(repo, &branch_name).await
+                                {
+                                    tracing::info!(
+                                        task_id = task.id.0,
+                                        pr_number = n,
+                                        branch = %branch_name,
+                                        "found existing PR after create_pr 422 — retrying review"
+                                    );
                                     store_set(
                                         &Some(Arc::clone(store)),
                                         repo,
                                         &task.id.0,
-                                        &[("pr_number", serde_json::json!(pr_num_i64))],
+                                        &[("pr_number", serde_json::json!(n as i64))],
                                     )
                                     .await;
+                                    return Ok(ReviewDecision::Failed(
+                                        "found existing PR after 422, retry".to_string(),
+                                    ));
                                 }
-                                tracing::info!(
-                                    task_id = task.id.0,
-                                    branch = %branch_name,
-                                    "created missing PR via CLI — retrying review"
-                                );
-                                return Ok(ReviewDecision::Failed(
-                                    "created missing PR, retry".to_string(),
-                                ));
                             }
-                            Ok(o) => {
-                                let stderr = String::from_utf8_lossy(&o.stderr);
-                                tracing::error!(
-                                    task_id = task.id.0,
-                                    branch = %branch_name,
-                                    stderr = %stderr,
-                                    "failed to create missing PR — work may be stuck"
-                                );
-                                let failures = store_increment(
-                                    &Some(Arc::clone(store)),
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                branch = %branch_name,
+                                error = %e,
+                                "create_pr failed via GhHttp, falling back to CLI"
+                            );
+                            // Fall back to CLI
+                            let pr_result = tokio::process::Command::new("gh")
+                                .args([
+                                    "pr",
+                                    "create",
+                                    "--repo",
                                     repo,
-                                    &task.id.0,
-                                    "pr_create_failures",
-                                )
+                                    "--head",
+                                    &branch_name,
+                                    "--title",
+                                    &task.title,
+                                    "--body",
+                                    &pr_body,
+                                ])
+                                .current_dir(&worktree_path)
+                                .output()
                                 .await;
-                                if failures >= MAX_PR_CREATE_FAILURES {
-                                    return Ok(ReviewDecision::Blocked(format!(
-                                        "no PR, create failed {failures} times: {stderr}"
+                            match pr_result {
+                                Ok(o) if o.status.success() => {
+                                    // gh pr create prints the PR URL to stdout
+                                    let stdout = String::from_utf8_lossy(&o.stdout);
+                                    if let Some(pr_num) = stdout.trim().rsplit('/').next() {
+                                        let pr_num_i64 = pr_num.parse::<i64>().unwrap_or(0);
+                                        store_set(
+                                            &Some(Arc::clone(store)),
+                                            repo,
+                                            &task.id.0,
+                                            &[("pr_number", serde_json::json!(pr_num_i64))],
+                                        )
+                                        .await;
+                                    }
+                                    tracing::info!(
+                                        task_id = task.id.0,
+                                        branch = %branch_name,
+                                        "created missing PR via CLI — retrying review"
+                                    );
+                                    return Ok(ReviewDecision::Failed(
+                                        "created missing PR, retry".to_string(),
+                                    ));
+                                }
+                                Ok(o) => {
+                                    let stderr = String::from_utf8_lossy(&o.stderr);
+                                    // gh pr create prints "already exists:\nhttps://..." to stderr
+                                    // when the PR already exists — extract URL and proceed.
+                                    if stderr.contains("already exists") {
+                                        if let Some(pr_url) = stderr
+                                            .lines()
+                                            .find(|l| l.trim().starts_with("https://"))
+                                        {
+                                            let pr_url = pr_url.trim();
+                                            if let Some(pr_num) = pr_url
+                                                .rsplit('/')
+                                                .next()
+                                                .and_then(|n| n.parse::<i64>().ok())
+                                            {
+                                                store_set(
+                                                    &Some(Arc::clone(store)),
+                                                    repo,
+                                                    &task.id.0,
+                                                    &[("pr_number", serde_json::json!(pr_num))],
+                                                )
+                                                .await;
+                                            }
+                                            tracing::info!(
+                                                task_id = task.id.0,
+                                                branch = %branch_name,
+                                                pr_url = %pr_url,
+                                                "PR already exists (from CLI stderr) — retrying review"
+                                            );
+                                            return Ok(ReviewDecision::Failed(
+                                                "PR already exists, retry".to_string(),
+                                            ));
+                                        }
+                                    }
+                                    tracing::error!(
+                                        task_id = task.id.0,
+                                        branch = %branch_name,
+                                        stderr = %stderr,
+                                        "failed to create missing PR — work may be stuck"
+                                    );
+                                    let failures = store_increment(
+                                        &Some(Arc::clone(store)),
+                                        repo,
+                                        &task.id.0,
+                                        "pr_create_failures",
+                                    )
+                                    .await;
+                                    if failures >= MAX_PR_CREATE_FAILURES {
+                                        return Ok(ReviewDecision::Blocked(format!(
+                                            "no PR, create failed {failures} times: {stderr}"
+                                        )));
+                                    }
+                                    return Ok(ReviewDecision::Failed(format!(
+                                        "no PR, create failed: {stderr}"
                                     )));
                                 }
-                                return Ok(ReviewDecision::Failed(format!(
-                                    "no PR, create failed: {stderr}"
-                                )));
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    task_id = task.id.0,
-                                    error = %e,
-                                    "failed to run gh pr create"
-                                );
-                                let failures = store_increment(
-                                    &Some(Arc::clone(store)),
-                                    repo,
-                                    &task.id.0,
-                                    "pr_create_failures",
-                                )
-                                .await;
-                                if failures >= MAX_PR_CREATE_FAILURES {
-                                    return Ok(ReviewDecision::Blocked(format!(
-                                        "no PR, gh error {failures} times: {e}"
+                                Err(e) => {
+                                    tracing::error!(
+                                        task_id = task.id.0,
+                                        error = %e,
+                                        "failed to run gh pr create"
+                                    );
+                                    let failures = store_increment(
+                                        &Some(Arc::clone(store)),
+                                        repo,
+                                        &task.id.0,
+                                        "pr_create_failures",
+                                    )
+                                    .await;
+                                    if failures >= MAX_PR_CREATE_FAILURES {
+                                        return Ok(ReviewDecision::Blocked(format!(
+                                            "no PR, gh error {failures} times: {e}"
+                                        )));
+                                    }
+                                    return Ok(ReviewDecision::Failed(format!(
+                                        "no PR, gh error: {e}"
                                     )));
                                 }
-                                return Ok(ReviewDecision::Failed(format!("no PR, gh error: {e}")));
                             }
                         }
                     }
-                }
-            } else {
-                // No PR and no commits — agent either failed or completed a read-only task.
-                let merged = match gh_check.is_pr_merged(repo, &branch_name).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(task_id = task.id.0, branch = %branch_name, err = %e, "merge check failed, skipping task this tick");
-                        return Ok(ReviewDecision::Failed(format!("merge check failed: {e}")));
-                    }
-                };
-                if merged {
-                    tracing::info!(
-                        task_id = task.id.0,
-                        branch = %branch_name,
-                        "PR already merged, marking done"
-                    );
-                    if let Err(e) = task_manager
-                        .update_task_status(&task.id, crate::backends::Status::Done)
-                        .await
-                    {
-                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Done) failed — task may be stuck in InReview");
-                    }
-                    return Ok(ReviewDecision::Skipped);
-                }
-
-                let last_error =
-                    super::cleanup::store_get_field(store, repo, &task.id.0, "last_error")
-                        .await
-                        .unwrap_or_default();
-                let reason = if !agent_summary.is_empty() {
-                    agent_summary.clone()
                 } else {
-                    last_error.clone()
-                };
+                    // No PR and no commits — agent either failed or completed a read-only task.
+                    let merged = match gh_check.is_pr_merged(repo, &branch_name).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(task_id = task.id.0, branch = %branch_name, err = %e, "merge check failed, skipping task this tick");
+                            return Ok(ReviewDecision::Failed(format!("merge check failed: {e}")));
+                        }
+                    };
+                    if merged {
+                        tracing::info!(
+                            task_id = task.id.0,
+                            branch = %branch_name,
+                            "PR already merged, marking done"
+                        );
+                        if let Err(e) = task_manager
+                            .update_task_status(&task.id, crate::backends::Status::Done)
+                            .await
+                        {
+                            tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Done) failed — task may be stuck in InReview");
+                        }
+                        return Ok(ReviewDecision::Skipped);
+                    }
 
-                // If the task has exhausted all attempts, block it.
-                // Continuing to re-route would spin forever since max_attempts is already hit.
-                if last_error.contains("exceeded max attempts") {
+                    let last_error =
+                        super::cleanup::store_get_field(store, repo, &task.id.0, "last_error")
+                            .await
+                            .unwrap_or_default();
+                    let reason = if !agent_summary.is_empty() {
+                        agent_summary.clone()
+                    } else {
+                        last_error.clone()
+                    };
+
+                    // If the task has exhausted all attempts, block it.
+                    // Continuing to re-route would spin forever since max_attempts is already hit.
+                    if last_error.contains("exceeded max attempts") {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            branch = %branch_name,
+                            "no PR and no commits after max attempts — marking blocked to stop loop"
+                        );
+                        if let Err(e) = task_manager
+                            .update_task_status(&task.id, crate::backends::Status::Blocked)
+                            .await
+                        {
+                            tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
+                        }
+                        return Ok(ReviewDecision::Skipped);
+                    }
+
+                    // If the PR creation failed with 422/head-invalid, the work
+                    // is already merged into main. Mark done instead of looping.
+                    if last_error.contains("422") && last_error.contains("head") {
+                        tracing::info!(
+                            task_id = task.id.0,
+                            branch = %branch_name,
+                            "no PR — 422/head-invalid means work already merged, marking done"
+                        );
+                        if let Err(e) = task_manager
+                            .update_task_status(&task.id, crate::backends::Status::Done)
+                            .await
+                        {
+                            tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Done) failed");
+                        }
+                        return Ok(ReviewDecision::Skipped);
+                    }
+
                     tracing::warn!(
                         task_id = task.id.0,
                         branch = %branch_name,
-                        "no PR and no commits after max attempts — marking blocked to stop loop"
+                        reason = %reason,
+                        "no PR and no commits — re-routing for retry"
                     );
                     if let Err(e) = task_manager
-                        .update_task_status(&task.id, crate::backends::Status::Blocked)
+                        .update_task_status(&task.id, crate::backends::Status::New)
                         .await
                     {
-                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
+                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
                     }
                     return Ok(ReviewDecision::Skipped);
                 }
-
-                // If the PR creation failed with 422/head-invalid, the work
-                // is already merged into main. Mark done instead of looping.
-                if last_error.contains("422") && last_error.contains("head") {
-                    tracing::info!(
-                        task_id = task.id.0,
-                        branch = %branch_name,
-                        "no PR — 422/head-invalid means work already merged, marking done"
-                    );
-                    if let Err(e) = task_manager
-                        .update_task_status(&task.id, crate::backends::Status::Done)
-                        .await
-                    {
-                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Done) failed");
-                    }
-                    return Ok(ReviewDecision::Skipped);
-                }
-
+            }
+            Err(e) => {
                 tracing::warn!(
                     task_id = task.id.0,
                     branch = %branch_name,
-                    reason = %reason,
-                    "no PR and no commits — re-routing for retry"
+                    error = %e,
+                    "failed to check PR status"
                 );
-                if let Err(e) = task_manager
-                    .update_task_status(&task.id, crate::backends::Status::New)
-                    .await
-                {
-                    tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
-                }
-                return Ok(ReviewDecision::Skipped);
+                return Ok(ReviewDecision::Failed(format!("PR check failed: {e}")));
             }
         }
-        Err(e) => {
-            tracing::warn!(
-                task_id = task.id.0,
-                branch = %branch_name,
-                error = %e,
-                "failed to check PR status"
-            );
-            return Ok(ReviewDecision::Failed(format!("PR check failed: {e}")));
-        }
-    };
+    }; // end if let Some(stored_pr_number) else match
 
     // 3. Build diff context (rebase is handled by the review agent via prompt)
     let default_branch = config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
