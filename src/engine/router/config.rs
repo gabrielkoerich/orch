@@ -97,7 +97,7 @@ impl Default for RouterConfig {
             mode: "llm".to_string(),
             router_agent: "claude".to_string(),
             router_model: "claude-haiku-4-5-20251001".to_string(),
-            timeout_seconds: 120,
+            timeout_seconds: 60,
             fallback_executor: "codex".to_string(),
             agents: DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect(),
             max_route_attempts: 3,

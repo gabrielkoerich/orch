@@ -68,6 +68,8 @@ Do NOT skip any of these steps. If you only make changes without committing and 
 
 If git push fails (e.g., auth error, permission denied, no remote), set status to `needs_review` with the error. The orchestrator will handle the push as a fallback — do NOT put "please approve the push" or push-related messages in your summary. Your summary must describe the work you did, not push status.
 
+**Infrastructure failures — STOP, do not file issues**: If GitHub setup operations fail (e.g., branch creation, `gh issue develop`, `gh issue link`, GraphQL link errors), **stop immediately and set status to `needs_review`**. Do NOT create GitHub issues about these failures — they are orchestrator-level infrastructure problems, not bugs in the codebase you are working on.
+
 ## Before Writing Your Output — MANDATORY CHECKLIST
 
 Before you write the output JSON, run these checks. If ANY fails, go back and fix it:
