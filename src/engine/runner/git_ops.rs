@@ -287,7 +287,8 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     tracing::info!(branch = branch_to_push, "pushing branch");
 
     let token = crate::github::token::shared()
-        .get_token_sync()
+        .get_token()
+        .await
         .ok()
         .flatten();
     let insteadof = token.map_or_else(
