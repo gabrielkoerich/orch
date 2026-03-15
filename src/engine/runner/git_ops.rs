@@ -255,6 +255,49 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
     }
 }
 
+/// Build git `-c` config args that inject GitHub token credentials.
+///
+/// This handles two scenarios:
+/// - **SSH remotes** (`git@github.com:user/repo.git`): rewritten to
+///   `https://x-access-token:TOKEN@github.com/…` via `insteadOf`.
+/// - **HTTPS remotes** (`https://github.com/user/repo.git`): rewritten to
+///   `https://x-access-token:TOKEN@github.com/…` via a second `insteadOf`.
+///
+/// When no token is available, falls back to the legacy SSH→HTTPS conversion
+/// without credentials (works for repos that use credential helpers or SSH keys).
+///
+/// Returns a `Vec<String>` of alternating `-c KEY=VALUE` pairs suitable for
+/// prepending to any `git` command's argument list.
+fn build_git_auth_args() -> Vec<String> {
+    let token = crate::github::token::shared()
+        .get_token_sync()
+        .ok()
+        .flatten();
+
+    match token {
+        Some(t) if !t.is_empty() => {
+            // Map both SSH and HTTPS origins → HTTPS with token auth.
+            // Having two insteadOf rules pointing at the same replacement is
+            // valid: git picks the longest matching prefix.
+            let authed = format!("url.https://x-access-token:{t}@github.com/.insteadOf");
+            vec![
+                "-c".to_string(),
+                format!("{authed}=https://github.com/"),
+                "-c".to_string(),
+                format!("{authed}=git@github.com:"),
+            ]
+        }
+        _ => {
+            // No token: keep the legacy SSH→HTTPS conversion so SSH-origin
+            // repos can still push via credential helpers or SSH keys.
+            vec![
+                "-c".to_string(),
+                "url.https://github.com/.insteadOf=git@github.com:".to_string(),
+            ]
+        }
+    }
+}
+
 /// Push the branch to origin.
 pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyhow::Result<bool> {
     let current = get_current_branch(dir).await;
@@ -286,15 +329,15 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 
     tracing::info!(branch = branch_to_push, "pushing branch");
 
+    let auth_args = build_git_auth_args();
+    let push_args: Vec<&str> = auth_args
+        .iter()
+        .map(String::as_str)
+        .chain(["push", "-u", "origin", branch_to_push])
+        .collect();
+
     let output = Command::new("git")
-        .args([
-            "-c",
-            "url.https://github.com/.insteadOf=git@github.com:",
-            "push",
-            "-u",
-            "origin",
-            branch_to_push,
-        ])
+        .args(&push_args)
         .current_dir(dir)
         .output_with_context()
         .await?;
@@ -321,16 +364,14 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 
         match pull {
             Ok(p) if p.status.success() => {
-                // Retry push after rebase
+                // Retry push after rebase with the same auth args
+                let retry_push_args: Vec<&str> = auth_args
+                    .iter()
+                    .map(String::as_str)
+                    .chain(["push", "-u", "origin", branch_to_push])
+                    .collect();
                 let retry = Command::new("git")
-                    .args([
-                        "-c",
-                        "url.https://github.com/.insteadOf=git@github.com:",
-                        "push",
-                        "-u",
-                        "origin",
-                        branch_to_push,
-                    ])
+                    .args(&retry_push_args)
                     .current_dir(dir)
                     .output_with_context()
                     .await?;
@@ -664,5 +705,64 @@ mod tests {
         // This is a runtime test - empty branch should return Ok early
         // We can't easily test the async runtime behavior without tokio::test,
         // but we verify the function signature and error types compile correctly
+    }
+
+    #[test]
+    fn build_git_auth_args_without_token_falls_back_to_ssh_https_conversion() {
+        // Without a token in env the function must still return the legacy
+        // SSH→HTTPS insteadOf rule so SSH-origin repos can push.
+        let saved_gh = std::env::var("GH_TOKEN").ok();
+        let saved_gh2 = std::env::var("GITHUB_TOKEN").ok();
+        std::env::remove_var("GH_TOKEN");
+        std::env::remove_var("GITHUB_TOKEN");
+
+        let args = build_git_auth_args();
+
+        // Restore env
+        if let Some(v) = saved_gh {
+            std::env::set_var("GH_TOKEN", v);
+        }
+        if let Some(v) = saved_gh2 {
+            std::env::set_var("GITHUB_TOKEN", v);
+        }
+
+        // When no token is available the fallback must include the SSH insteadOf rule.
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("insteadOf=git@github.com:"),
+            "expected SSH insteadOf fallback, got: {joined}"
+        );
+    }
+
+    #[test]
+    fn build_git_auth_args_with_token_covers_both_ssh_and_https() {
+        // Temporarily inject a fake token so we can verify both insteadOf rules.
+        let saved = std::env::var("GH_TOKEN").ok();
+        std::env::set_var("GH_TOKEN", "ghp_testtoken1234");
+
+        let args = build_git_auth_args();
+
+        // Restore env
+        match saved {
+            Some(v) => std::env::set_var("GH_TOKEN", v),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+
+        let joined = args.join(" ");
+        // Must contain the token in the replacement URL
+        assert!(
+            joined.contains("x-access-token:ghp_testtoken1234@github.com"),
+            "expected token in auth URL, got: {joined}"
+        );
+        // Must cover HTTPS origins
+        assert!(
+            joined.contains("insteadOf=https://github.com/"),
+            "expected HTTPS insteadOf rule, got: {joined}"
+        );
+        // Must cover SSH origins
+        assert!(
+            joined.contains("insteadOf=git@github.com:"),
+            "expected SSH insteadOf rule, got: {joined}"
+        );
     }
 }
