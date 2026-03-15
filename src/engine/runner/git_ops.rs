@@ -286,15 +286,17 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 
     tracing::info!(branch = branch_to_push, "pushing branch");
 
+    let token = crate::github::token::shared()
+        .get_token_sync()
+        .ok()
+        .flatten();
+    let insteadof = token.map_or_else(
+        || "url.https://github.com/.insteadOf=git@github.com:".to_string(),
+        |t| format!("url.https://x-access-token:{t}@github.com/.insteadOf=git@github.com:"),
+    );
+
     let output = Command::new("git")
-        .args([
-            "-c",
-            "url.https://github.com/.insteadOf=git@github.com:",
-            "push",
-            "-u",
-            "origin",
-            branch_to_push,
-        ])
+        .args(["-c", &insteadof, "push", "-u", "origin", branch_to_push])
         .current_dir(dir)
         .output_with_context()
         .await?;
@@ -323,14 +325,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
             Ok(p) if p.status.success() => {
                 // Retry push after rebase
                 let retry = Command::new("git")
-                    .args([
-                        "-c",
-                        "url.https://github.com/.insteadOf=git@github.com:",
-                        "push",
-                        "-u",
-                        "origin",
-                        branch_to_push,
-                    ])
+                    .args(["-c", &insteadof, "push", "-u", "origin", branch_to_push])
                     .current_dir(dir)
                     .output_with_context()
                     .await?;
