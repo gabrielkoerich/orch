@@ -595,6 +595,59 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Mark a task as done (without running an agent).
+pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
+    use crate::backends::github::GitHubBackend;
+    use crate::backends::ExternalBackend;
+    use crate::store::TaskStatus;
+
+    let repo = config::get_current_repo().unwrap_or_default();
+    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
+
+    // Handle internal: prefix
+    if let Some(stripped) = id.strip_prefix("internal:") {
+        let parsed = stripped
+            .parse::<i64>()
+            .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
+        if let Some(ref s) = store {
+            if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
+                s.update_status(store_id, TaskStatus::Done).await?;
+                println!("Closed internal task #{} (marked done)", parsed);
+                return Ok(());
+            }
+        }
+        anyhow::bail!("internal task '{}' not found", id);
+    }
+
+    // Try numeric: check store first (may be internal)
+    if let Ok(parsed) = id.parse::<i64>() {
+        if let Some(ref s) = store {
+            if let Ok(task) = s.get(parsed).await {
+                if task.origin == "internal" {
+                    s.update_status(parsed, TaskStatus::Done).await?;
+                    println!("Closed internal task #{} (marked done)", parsed);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // External (GitHub) task
+    let backend: Arc<dyn ExternalBackend> = Arc::new(
+        GitHubBackend::new(repo.clone())
+            .context("'repo' not set — ensure .orch.yml has gh.repo")?,
+    );
+    let ext_id = ExternalId(id.to_string());
+
+    if let Some(text) = note {
+        backend.post_comment(&ext_id, text).await?;
+    }
+
+    update_status_store_first(&store, &backend, &repo, &ext_id, Status::Done).await?;
+    println!("Closed task #{} (marked done)", id);
+    Ok(())
+}
+
 /// Attach to a running agent's tmux session.
 pub fn attach(id: &str) -> anyhow::Result<()> {
     let tmux = TmuxManager::new();

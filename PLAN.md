@@ -782,6 +782,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] `orch task route <id>` — route task to agent
 - [x] `orch task run <id>` — execute task
 - [x] `orch task retry <id>` — retry failed task
+- [x] `orch task close <id>` — mark task done without running agent (supports `--note` for external tasks)
 - [x] `orch task attach <id>` — attach to tmux session
 - [x] `orch task kill <id>` — kill agent session
 - [x] `orch task live` — list active sessions
@@ -1375,6 +1376,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 | Issue | Title | Description |
 |-------|-------|-------------|
+| - | Record runner exit code in task_runs | Runner now returns the agent session exit code and `task_runs.complete_run` stores `exit_code` (improves auditability) — `src/engine/runner/mod.rs`, `src/store.rs` |
 | - | Agent column in `orch task list` and `orch task live` | `orch task list` now shows AGENT column (from store for all tasks); blocked internal tasks show inline block reason; `orch task live` now shows agent from store — `src/cli/task.rs:15-65, 545-580` |
 | #509 | Show agent output in `orch task logs` | `orch task logs <id>` now displays agent output from `output.json` (last 2000 chars via `safe_utf8_tail`), exit code from `exit.txt`, and review agent output from `{task_id}-review/attempts/1/output.json` — `src/cli/task.rs:803-860` |
 | #361 | PR coverage comments | `romeovs/lcov-reporter-action@v0.4.0` comments coverage % on each PR — `.github/workflows/release.yml:52-57` |
@@ -1405,4 +1407,3 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 
 - [x] Skills sync from config (auto-clone skill repos) — see `src/engine/sync.rs:263` (PR #158)
 - [x] Slack channel integration — `src/channels/slack.rs` implemented and wired into engine
-

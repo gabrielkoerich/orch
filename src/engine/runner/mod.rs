@@ -82,7 +82,7 @@ impl TaskRunner {
         agent: Option<&str>,
         model: Option<&str>,
         backend: Option<&dyn ExternalBackend>,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<Option<(String, Option<i32>)>> {
         tracing::info!(
             task_id,
             agent = agent.unwrap_or("default"),
@@ -120,7 +120,7 @@ impl TaskRunner {
                         }
                     }
                 }
-                return Ok(Some("needs_review".to_string()));
+                return Ok(Some(("needs_review".to_string(), None)));
             }
             Err(e) => return Err(e),
         };
@@ -232,7 +232,7 @@ impl TaskRunner {
                 if budget_exceeded {
                     // Token budget exceeded — store already updated, return without
                     // tmux cleanup or metrics (preserves original behavior)
-                    return Ok(Some(status));
+                    return Ok(Some((status, Some(session_output.exit_code))));
                 }
                 status
             }
@@ -251,7 +251,7 @@ impl TaskRunner {
                 {
                     fallback::ErrorHandleResult::EarlyReturn { status } => {
                         // Task rerouted — return (metrics recorded in run_with_context)
-                        return Ok(Some(status));
+                        return Ok(Some((status, Some(session_output.exit_code))));
                     }
                     fallback::ErrorHandleResult::Continue { status } => status,
                 }
@@ -261,7 +261,8 @@ impl TaskRunner {
         // Kill tmux session if still alive
         session::cleanup_session(task_id, &tmux, &tmux_session).await;
 
-        Ok(Some(final_status))
+        // Return final status and the session exit code so callers can record it.
+        Ok(Some((final_status, Some(session_output.exit_code))))
     }
 
     /// Record task execution metrics to the database.
@@ -432,14 +433,14 @@ impl TaskRunner {
         };
 
         // Run the task
-        let run_status = self.run(task_id, agent, model, Some(&**backend)).await?;
+        let run_result = self.run(task_id, agent, model, Some(&**backend)).await?;
 
         // If the runner guard skipped the task, do not re-post stale data as a new comment.
-        if run_status.is_none() {
+        if run_result.is_none() {
             tracing::info!(task_id, "guard skipped task — not posting stale result");
             return Ok(WeightSignal::None);
         }
-        let status = run_status.expect("checked above: None case returned early");
+        let (status, exit_code_opt) = run_result.expect("checked above: None case returned early");
 
         // Process delegations if the agent requested subtasks
         let delegations_raw = self
@@ -514,7 +515,7 @@ impl TaskRunner {
             .await;
         }
 
-        // Complete run in task_runs audit trail
+        // Complete run in task_runs audit trail (include exit code from runner when available)
         if let Some(run_id) = run_audit_id {
             if let Some(ref store) = self.store {
                 let duration = (Utc::now() - started_at).num_milliseconds() as f64 / 1000.0;
@@ -530,7 +531,7 @@ impl TaskRunner {
                 let _ = store
                     .complete_run(&crate::store::CompleteRun {
                         run_id,
-                        exit_code: None, // TODO: capture from runner
+                        exit_code: exit_code_opt,
                         stdout: &summary,
                         stderr: "",
                         parsed: "",
