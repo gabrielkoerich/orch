@@ -68,6 +68,7 @@ type EngineRef = (
 /// but they share the global tmux manager, transport, and semaphore.
 pub struct ProjectEngine {
     pub repo: String,
+    pub project_dir: std::path::PathBuf,
     pub backend: Arc<dyn ExternalBackend>,
     pub task_manager: Arc<TaskManager>,
     pub runner: Arc<runner::TaskRunner>,
@@ -186,10 +187,11 @@ impl EngineConfig {
 ///
 /// Returns a vector of ProjectEngine, one for each configured project.
 async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
-    let repos = config::get_projects()?;
+    let projects = config::get_projects_with_paths()?;
+    let repos: Vec<&str> = projects.iter().map(|(r, _)| r.as_str()).collect();
     tracing::info!(repos = ?repos, "loading projects from config");
 
-    if repos.is_empty() {
+    if projects.is_empty() {
         let config_path = crate::home::config_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "~/.orch/config.yml".to_string());
@@ -203,7 +205,7 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     let mut auth_failures = 0usize;
     let mut network_failures = 0usize;
 
-    for repo in repos {
+    for (repo, project_dir) in projects {
         tracing::info!(repo = %repo, "initializing project engine");
 
         // Initialize backend
@@ -251,6 +253,7 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
 
         engines.push(ProjectEngine {
             repo,
+            project_dir,
             backend,
             task_manager,
             runner,
@@ -655,9 +658,6 @@ pub async fn serve() -> anyhow::Result<()> {
         );
     }
 
-    // Jobs config path (from .orchestrator.yml or global config)
-    let mut jobs_path = jobs::resolve_jobs_path();
-
     // Concurrency limiter (shared across all projects)
     let semaphore = Arc::new(Semaphore::new(config.max_parallel));
 
@@ -824,6 +824,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     let mut router_guard = router.write().await;
                     for engine in &project_engines {
                         let repo = engine.repo.clone();
+                        let project_jobs_path = engine.project_dir.join(".orch.yml");
                         REPO_CONTEXT.scope(repo, async {
                             if let Err(e) = tick::tick(
                                 &engine.backend,
@@ -833,7 +834,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &capture_for_tick,
                                 &semaphore,
                                 &config,
-                                &jobs_path,
+                                &project_jobs_path,
                                 &mut router_guard,
                                 &router,
                                 &engine.task_manager,
@@ -914,6 +915,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     let mut router_guard = router.write().await;
                     for engine in &project_engines {
                         let repo = engine.repo.clone();
+                        let project_jobs_path = engine.project_dir.join(".orch.yml");
                         REPO_CONTEXT.scope(repo, async {
                             if let Err(e) = tick::tick(
                                 &engine.backend,
@@ -923,7 +925,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &capture_for_tick,
                                 &semaphore,
                                 &config,
-                                &jobs_path,
+                                &project_jobs_path,
                                 &mut router_guard,
                                 &router,
                                 &engine.task_manager,
@@ -964,9 +966,6 @@ pub async fn serve() -> anyhow::Result<()> {
                             router_guard.reload();
                         }
 
-                        // Reload jobs path
-                        jobs_path = jobs::resolve_jobs_path();
-
                         tracing::info!(
                             tick = ?config.tick_interval,
                             sync = ?config.sync_interval,
@@ -983,7 +982,6 @@ pub async fn serve() -> anyhow::Result<()> {
                             let mut router_guard = router.write().await;
                             router_guard.reload();
                         }
-                        jobs_path = jobs::resolve_jobs_path();
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         tracing::warn!("config change channel closed");

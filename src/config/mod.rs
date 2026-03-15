@@ -245,21 +245,19 @@ pub fn get_project_paths() -> anyhow::Result<Vec<String>> {
     Ok(vec![])
 }
 
-/// Get all project repo slugs (owner/repo) from the registered projects.
+/// Like `get_projects()` but also returns the project directory path.
 ///
-/// Reads `projects:` paths from global config, then reads `gh.repo` from
-/// each project's `.orch.yml`. Falls back to the global `gh.repo` key
-/// for backward compatibility.
-pub fn get_projects() -> anyhow::Result<Vec<String>> {
+/// Returns `(repo_slug, project_dir)` pairs. Used by the engine to resolve
+/// per-project config (e.g., jobs from each project's `.orch.yml`).
+pub fn get_projects_with_paths() -> anyhow::Result<Vec<(String, std::path::PathBuf)>> {
     let paths = get_project_paths()?;
 
     if !paths.is_empty() {
-        let mut repos = Vec::new();
+        let mut results = Vec::new();
         for path_str in &paths {
             let path = std::path::PathBuf::from(path_str);
             let orch_yml = path.join(".orch.yml");
 
-            // Try .orch.yml first, then .orchestrator.yml for backward compat
             let config_file = if orch_yml.exists() {
                 orch_yml
             } else {
@@ -267,11 +265,6 @@ pub fn get_projects() -> anyhow::Result<Vec<String>> {
                 if legacy.exists() {
                     legacy
                 } else {
-                    tracing::warn!(
-                        project_dir = %path_str,
-                        tried = %orch_yml.display(),
-                        "project config not found (expected .orch.yml with gh.repo key), skipping"
-                    );
                     continue;
                 }
             };
@@ -283,43 +276,25 @@ pub fn get_projects() -> anyhow::Result<Vec<String>> {
                         .and_then(|gh| gh.get("repo"))
                         .and_then(|r| r.as_str())
                     {
-                        repos.push(repo.to_string());
-                        continue;
+                        results.push((repo.to_string(), path));
                     }
                 }
             }
-
-            tracing::warn!(
-                config_file = %config_file.display(),
-                "project config exists but missing `gh.repo` key (expected gh: {{ repo: owner/name }})"
-            );
         }
 
-        if !repos.is_empty() {
-            return Ok(repos);
+        if !results.is_empty() {
+            return Ok(results);
         }
     }
 
-    // Fall back to global gh.repo for backward compatibility
+    // Fall back to global gh.repo (no project dir available)
     if let Ok(repo) = get("gh.repo") {
         if !repo.is_empty() {
-            return Ok(vec![repo]);
+            return Ok(vec![(repo, std::path::PathBuf::from("."))]);
         }
     }
 
-    // Try legacy top-level repo key
-    if let Ok(repo) = get("repo") {
-        if !repo.is_empty() {
-            return Ok(vec![repo]);
-        }
-    }
-
-    let config_path = global_config_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "~/.orch/config.yml".to_string());
-    anyhow::bail!(
-        "no projects configured. Add projects to {config_path} or run `orch project add <path>`"
-    )
+    Ok(vec![])
 }
 
 /// Resolve the repo slug for a specific project path.
