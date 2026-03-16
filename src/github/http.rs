@@ -1823,10 +1823,6 @@ mod tests {
         }
 
         fn make_client() -> GhHttp {
-            // Ensure a token is available so auth_header() doesn't bail. Use a
-            // TempEnvVar guard so tests remain hermetic when running in
-            // parallel.
-            let _guard = TempEnvVar::new("GH_TOKEN", "test_token");
             GhHttp {
                 client: reqwest::Client::new(),
                 token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
@@ -1835,6 +1831,7 @@ mod tests {
 
         #[tokio::test]
         async fn get_all_pages_single_page() {
+            let _guard = TempEnvVar::new("GH_TOKEN", "test_token");
             let server = MockServer::start().await;
 
             Mock::given(method("GET"))
@@ -1858,6 +1855,7 @@ mod tests {
 
         #[tokio::test]
         async fn get_all_pages_follows_link_next() {
+            let _guard = TempEnvVar::new("GH_TOKEN", "test_token");
             let server = MockServer::start().await;
 
             // Page 1 — includes Link header pointing to page 2
@@ -1900,6 +1898,7 @@ mod tests {
         async fn get_all_pages_stops_when_link_header_absent_on_subsequent_page() {
             // Simulates a proxy/transient response that drops the Link header mid-pagination.
             // The previous `.unwrap()` would panic here; the fix breaks the loop instead.
+            let _guard = TempEnvVar::new("GH_TOKEN", "test_token");
             let server = MockServer::start().await;
 
             Mock::given(method("GET"))
@@ -1938,6 +1937,7 @@ mod tests {
         async fn get_all_pages_stops_on_malformed_link_header() {
             // A malformed Link header (no angle-bracket URL) yields None from parse_link_next,
             // which should stop pagination rather than panic.
+            let _guard = TempEnvVar::new("GH_TOKEN", "test_token");
             let server = MockServer::start().await;
 
             Mock::given(method("GET"))
