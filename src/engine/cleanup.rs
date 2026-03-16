@@ -437,10 +437,16 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
             continue;
         }
 
-        if let Err(e) = cleanup_task_worktree_with_opts(task_id, repo, store, opts).await {
-            tracing::warn!(task_id, err = %e, "worktree cleanup failed for task");
+        match cleanup_task_worktree_with_opts(task_id, repo, store, opts).await {
+            Ok(true) => cleaned_any = true,
+            Ok(false) => {
+                // Skipped (TTL guard, tmux guard, or nothing to remove) — do not
+                // pull main; we did not change the repo state.
+            }
+            Err(e) => {
+                tracing::warn!(task_id, err = %e, "worktree cleanup failed for task");
+            }
         }
-        cleaned_any = true;
     }
 
     // Pull main after worktrees are cleaned so the repo stays current.
@@ -486,26 +492,34 @@ pub(crate) async fn cleanup_task_worktree(
         ttl_hours: 0,
         ..Default::default()
     };
-    cleanup_task_worktree_with_opts(task_id, repo, store, &opts).await?;
+    let cleaned = cleanup_task_worktree_with_opts(task_id, repo, store, &opts).await?;
 
     // Pull main once after inline cleanup (post-merge single-task path).
-    if let Ok(repo_root) = resolve_repo_root(repo).await {
-        let _ = Command::new("git")
-            .args(["-C", &repo_root, "pull", "--ff-only"])
-            .output_with_context()
-            .await;
+    // Only pull if cleanup actually happened (not skipped due to active session).
+    if cleaned {
+        if let Ok(repo_root) = resolve_repo_root(repo).await {
+            let _ = Command::new("git")
+                .args(["-C", &repo_root, "pull", "--ff-only"])
+                .output_with_context()
+                .await;
+        }
     }
 
     Ok(())
 }
 
 /// Cleanup a single task's worktree and branches with explicit janitor options.
+///
+/// Returns `Ok(true)` when cleanup was actually performed and the task was
+/// marked as cleaned.  Returns `Ok(false)` when cleanup was intentionally
+/// skipped (TTL guard, active tmux session guard, or nothing on disk to remove).
+/// Returns `Err` on unexpected failures (e.g. cannot resolve the repo root).
 pub(crate) async fn cleanup_task_worktree_with_opts(
     task_id: &str,
     repo: &str,
     store: &Arc<TaskStore>,
     opts: &JanitorOptions,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let worktree = store_get_field(store, repo, task_id, "worktree").await;
     let branch = store_get_field(store, repo, task_id, "branch").await;
 
@@ -571,7 +585,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                     ttl_hours = opts.ttl_hours,
                     "worktree too young for cleanup, skipping"
                 );
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -582,7 +596,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 worktree = %wt.display(),
                 "worktree is referenced by an active tmux session — skipping cleanup"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         if opts.dry_run {
@@ -610,9 +624,11 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
             let _ = store.mark_cleaned(store_id).await;
         }
+        return Ok(true);
     }
 
-    Ok(())
+    // dry_run — nothing was actually removed.
+    Ok(false)
 }
 
 /// Remove a git worktree directory and its local + remote branches.
