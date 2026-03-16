@@ -437,11 +437,6 @@ pub async fn create_pr_if_needed(
             tracing::info!(task_id, pr = pr_number, "PR already exists");
             // Append attribution footer if the agent created the PR without one.
             append_pr_footer_if_missing(&gh, repo, pr_number, task_id, agent, model).await;
-            // Link the issue to the branch — the agent may have created the PR
-            // via CLI, bypassing the orchestrator's link step.
-            if let Err(e) = link_issue_to_branch(repo, task_id, branch).await {
-                tracing::warn!(task_id, error = %e, "failed to link issue to branch (non-fatal)");
-            }
             return Ok(None);
         }
         Ok(None) => {
@@ -505,12 +500,6 @@ pub async fn create_pr_if_needed(
 
     tracing::info!(task_id, pr_url = %url, "created PR via GhHttp API");
 
-    // Link the issue to the PR branch via API (best effort, non-fatal)
-    if let Err(e) = link_issue_to_branch(repo, task_id, branch).await {
-        tracing::warn!(task_id, error = %e, "failed to link issue to branch (non-fatal)");
-        // Don't fail the whole operation if linking fails
-    }
-
     Ok(Some(url))
 }
 
@@ -554,52 +543,6 @@ async fn append_pr_footer_if_missing(
             pr = pr_number,
             "appended attribution footer to agent-created PR"
         );
-    }
-}
-
-/// Link an issue to a branch using the GitHub GraphQL API.
-///
-/// Creates a "Development" sidebar link in GitHub (similar to `gh issue develop`).
-/// This replaces the CLI-based implementation for consistent behavior across environments.
-///
-/// # Returns
-/// - `Ok(())` - Successfully linked or already linked
-/// - `Err(...)` - API error occurred
-async fn link_issue_to_branch(repo: &str, task_id: &str, branch: &str) -> anyhow::Result<()> {
-    if branch.is_empty() {
-        tracing::warn!(task_id, "skipping link_issue_to_branch: empty branch name");
-        return Ok(());
-    }
-
-    let gh = GhHttp::new()?;
-
-    // Internal tasks don't have GitHub issue numbers — skip silently
-    if task_id.starts_with("internal:") {
-        tracing::debug!(task_id, "skipping link_issue_to_branch: internal task");
-        return Ok(());
-    }
-
-    // Parse task_id as issue number
-    let issue_number: u64 = task_id
-        .parse()
-        .map_err(|_| anyhow::anyhow!("task_id is not a valid issue number: {}", task_id))?;
-
-    // Call the GhHttp method to link issue to branch
-    match gh.link_issue_to_branch(repo, issue_number, branch).await {
-        Ok(_) => {
-            tracing::info!(task_id, branch, "linked issue to branch via API");
-            Ok(())
-        }
-        Err(e) => {
-            let err_msg = format!("{}", e);
-            // Branch may already be linked — not an error
-            if err_msg.contains("already") || err_msg.contains("existing") {
-                tracing::debug!(task_id, branch, "issue already linked to branch");
-                Ok(())
-            } else {
-                Err(e)
-            }
-        }
     }
 }
 
@@ -706,13 +649,6 @@ mod tests {
         let anyhow_err = anyhow::anyhow!("source error");
         let pr_err: PrCreateError = anyhow_err.into();
         assert!(matches!(pr_err, PrCreateError::ApiError(_)));
-    }
-
-    #[test]
-    fn test_link_issue_to_branch_empty_branch() {
-        // This is a runtime test - empty branch should return Ok early
-        // We can't easily test the async runtime behavior without tokio::test,
-        // but we verify the function signature and error types compile correctly
     }
 
     #[test]
