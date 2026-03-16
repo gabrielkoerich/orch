@@ -174,7 +174,7 @@ workflow:
 
 ### Status Updates
 
-- Task is re-routed (`New`) when review requests changes — same branch/PR is reused
+- Task is re-routed (`Routed`) when review requests changes — same branch/PR is reused
 - Task is blocked when max review cycles exceeded — requires human intervention
 - When a review is approved and `auto_close_task_on_approval` is enabled, the task is marked as `done`
 
