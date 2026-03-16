@@ -111,18 +111,18 @@ jobs:
             echo "No new commits since $LAST_TAG — skipping release."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            # Skip release if ALL commits are chore-only
+            # Skip release if ALL commits are chore/docs/test-only (non-release commits)
             if [ -n "$LAST_TAG" ]; then
               SUBJECTS=$(git log "$LAST_TAG"..HEAD --pretty=format:"%s")
             else
               SUBJECTS=$(git log --pretty=format:"%s")
             fi
-            NON_CHORE=$(echo "$SUBJECTS" | grep -cvE '^chore(\(.*\))?:' || true)
-            if [ "$NON_CHORE" -eq 0 ]; then
-              echo "All $COMMIT_COUNT commits are chore — skipping release."
+            NON_RELEASE=$(echo "$SUBJECTS" | grep -cvE '^(chore|docs|test)(\(.*\))?:' || true)
+            if [ "$NON_RELEASE" -eq 0 ]; then
+              echo "All $COMMIT_COUNT commits are chore/docs/test — skipping release."
               echo "skip=true" >> "$GITHUB_OUTPUT"
             else
-              echo "$COMMIT_COUNT new commits since ${LAST_TAG:-beginning} ($NON_CHORE non-chore)"
+              echo "$COMMIT_COUNT new commits since ${LAST_TAG:-beginning} ($NON_RELEASE non-chore/docs/test)"
               echo "skip=false" >> "$GITHUB_OUTPUT"
             fi
           fi
@@ -267,7 +267,7 @@ jobs:
               FEATURES+="- ${line}"$'\n'
             elif echo "$line" | grep -qE '^fix(\(.*\))?:'; then
               FIXES+="- ${line}"$'\n'
-            elif echo "$line" | grep -qE '^chore(\(.*\))?:'; then
+            elif echo "$line" | grep -qE '^(chore|docs|test)(\(.*\))?:'; then
               continue
             else
               OTHER+="- ${line}"$'\n'
