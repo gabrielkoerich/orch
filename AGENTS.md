@@ -157,7 +157,7 @@ The orchestrator re-routes tasks when PR reviews request changes, closing the fe
    - Stores the review feedback in `pr_review_context` field
    - Increments the `review_cycles` counter
    - Posts a review comment on the PR with the feedback
-   - Re-routes the task back to `New` status for re-dispatch
+   - Re-routes the task back to `Routed` status for re-dispatch (skips LLM re-classification, reuses existing agent/model)
    - The agent reuses the existing worktree/branch and pushes fixes to the same PR
 4. If `review_cycles >= max_review_cycles`, the task is blocked for human review
 
@@ -174,7 +174,7 @@ workflow:
 
 ### Status Updates
 
-- Task is re-routed (`New`) when review requests changes — same branch/PR is reused
+- Task is re-routed (`Routed`) when review requests changes — same branch/PR is reused
 - Task is blocked when max review cycles exceeded — requires human intervention
 - When a review is approved and `auto_close_task_on_approval` is enabled, the task is marked as `done`
 
