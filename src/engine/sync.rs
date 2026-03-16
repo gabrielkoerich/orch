@@ -163,6 +163,12 @@ pub(crate) async fn sync_tick(
                 drop(permit);
                 continue;
             }
+            // Insert into dispatching set so review_open_prs (step 4) does not
+            // re-dispatch this task while the review agent is running.
+            {
+                let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
+                guard.insert(dispatch_key.clone());
+            }
             let backend_c = backend.clone();
             let task_manager_c = task_manager.clone();
             let tmux_c = tmux.clone();
@@ -171,6 +177,8 @@ pub(crate) async fn sync_tick(
             let router_c = router.clone();
             let store_c = store.clone();
             let repo_ctx = repo_s.clone();
+            let dispatching_c = dispatching.clone();
+            let dispatch_key_c = dispatch_key.clone();
             tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
                 let tid = task_c.id.0.clone();
                 enum ReviewOutcome {
@@ -275,6 +283,11 @@ pub(crate) async fn sync_tick(
                     ReviewOutcome::Ok => {}
                 }
 
+                // Release the per-task lock so step 4 (review_open_prs) can act on this task.
+                {
+                    let mut guard = dispatching_c.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.remove(&dispatch_key_c);
+                }
                 drop(permit);
             }));
         }
