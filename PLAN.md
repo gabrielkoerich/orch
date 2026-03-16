@@ -1395,6 +1395,7 @@ Benefits: per-repo isolation (no issue number collisions), per-attempt separatio
 | - | Dashboard CLI | `orch dashboard` in `src/cli/dashboard.rs` |
 | - | Task Tree CLI | `orch task tree` in `src/cli/tree.rs` |
 | - | Graceful Shutdown | SIGTERM/SIGINT handlers in `src/engine/mod.rs` (serve loop) |
+| #648 | Skip releases for chore/docs-only commits | Release workflow now skips tagging when all commits since the last tag are `chore:`/`docs:` — `.github/workflows/release.yml` |
 
 ### Code Quality
 

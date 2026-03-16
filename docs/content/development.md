@@ -52,6 +52,8 @@ Use prefixes in commit messages:
 - `chore:` — maintenance (no version bump)
 - `docs:` — documentation (no version bump)
 
+If all commits since the last tag are `chore:`/`docs:` only, the release job is skipped.
+
 ## Project Structure
 
 ```
