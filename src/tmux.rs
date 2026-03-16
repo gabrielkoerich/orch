@@ -343,7 +343,7 @@ mod tests {
 
         // Create a temporary detached session for testing
         let create_result = tokio::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"]) 
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
             .output()
             .await;
 
@@ -395,7 +395,7 @@ mod tests {
 
         // Create a temporary detached session for testing
         let create_result = tokio::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"]) 
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
             .output()
             .await;
 
@@ -413,7 +413,7 @@ mod tests {
 
         // Verify it exists
         let check_before = tokio::process::Command::new("tmux")
-            .args(["show-environment", "-t", &session, "TO_DELETE"]) 
+            .args(["show-environment", "-t", &session, "TO_DELETE"])
             .output()
             .await;
 
