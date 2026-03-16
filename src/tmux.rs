@@ -216,9 +216,15 @@ impl TmuxManager {
             }
 
             if !self.is_session_active(session).await {
-                // Process finished — capture final output
-                let output = self.capture_pane(session, 500).await.unwrap_or_default();
-                return Ok(output);
+                // Process finished — capture final output. Do not panic on capture errors;
+                // log and return empty output so callers can proceed gracefully.
+                match self.capture_pane(session, 500).await {
+                    Ok(output) => return Ok(output),
+                    Err(err) => {
+                        tracing::error!(session = %session, error = %err, "failed to capture final pane output");
+                        return Ok(String::new());
+                    }
+                }
             }
 
             tokio::time::sleep(poll_interval).await;
@@ -227,7 +233,13 @@ impl TmuxManager {
 
     /// Snapshot all active sessions — for engine tick monitoring.
     pub async fn snapshot(&self) -> HashMap<String, bool> {
-        let sessions = self.list_sessions().await.unwrap_or_default();
+        let sessions = match self.list_sessions().await {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to list tmux sessions — returning empty snapshot");
+                Vec::new()
+            }
+        };
         let mut map = HashMap::new();
         for s in sessions {
             let active = self.is_session_active(&s.name).await;
