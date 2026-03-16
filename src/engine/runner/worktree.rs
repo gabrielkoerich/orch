@@ -235,7 +235,7 @@ pub async fn setup_worktree(
                 .await;
         }
 
-        // Create branch from default
+        // Create local branch from default
         let _ = Command::new("git")
             .args([
                 "-C",
@@ -313,6 +313,27 @@ pub async fn setup_worktree(
                     worktree_dir.display(),
                     task_id
                 );
+            }
+        }
+    }
+
+    // Link issue to branch via GitHub API (Development sidebar).
+    // Must happen before the agent pushes — createLinkedBranch only works
+    // for branches that don't yet exist on GitHub.
+    if !task_id.starts_with("internal:") {
+        if let Ok(issue_num) = task_id.parse::<u64>() {
+            if let Ok(gh) = crate::github::http::GhHttp::new() {
+                match gh
+                    .link_issue_to_branch(repo, issue_num, &branch_name_str)
+                    .await
+                {
+                    Ok(id) => {
+                        tracing::info!(task_id, branch = %branch_name_str, linked = %id, "linked issue to branch");
+                    }
+                    Err(e) => {
+                        tracing::debug!(task_id, error = %e, "failed to link issue to branch (non-fatal)");
+                    }
+                }
             }
         }
     }

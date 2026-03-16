@@ -480,6 +480,14 @@ pub async fn create_pr_if_needed(
         }
     }
 
+    // Link PR to the issue so GitHub shows the connection in the sidebar.
+    // Only for external tasks (issue numbers), not internal ones.
+    if !task_id.starts_with("internal:") {
+        if let Ok(issue_num) = task_id.parse::<u64>() {
+            body.push_str(&format!("\n\nCloses #{issue_num}"));
+        }
+    }
+
     let model_str = model.map(|m| format!(" using `{m}`")).unwrap_or_default();
     let task_ref = format_task_ref(task_id);
     body.push_str(&format!(

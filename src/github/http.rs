@@ -1169,19 +1169,42 @@ impl GhHttp {
             .pointer("/data/repository/ref/target/oid")
             .and_then(|v| v.as_str());
 
-        // If branch doesn't exist yet, we can't link it - this is fine for new PRs
-        // where the branch was just pushed
+        // If branch doesn't exist yet, use the default branch OID.
+        // createLinkedBranch will create the branch at that OID AND link it.
         let branch_oid = match branch_oid {
             Some(oid) => oid.to_string(),
             None => {
-                tracing::debug!(
-                    repo,
-                    issue_number,
-                    branch,
-                    "branch not found for linking, may not be pushed yet"
+                // Get default branch OID as the base for the new branch
+                let default_query = format!(
+                    r#"{{
+                        repository(owner: "{}", name: "{}") {{
+                            defaultBranchRef {{
+                                target {{
+                                    oid
+                                }}
+                            }}
+                        }}
+                    }}"#,
+                    owner, repo_name
                 );
-                // Return a placeholder - the link will be created when the PR is opened
-                return Ok(format!("unlinked:{}", branch));
+                let default_result = self.graphql(&default_query).await?;
+                match default_result
+                    .pointer("/data/repository/defaultBranchRef/target/oid")
+                    .and_then(|v| v.as_str())
+                {
+                    Some(oid) => {
+                        tracing::debug!(
+                            repo,
+                            issue_number,
+                            branch,
+                            "branch not found, using default branch OID to create and link"
+                        );
+                        oid.to_string()
+                    }
+                    None => {
+                        return Ok(format!("unlinked:{}", branch));
+                    }
+                }
             }
         };
 
