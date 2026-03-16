@@ -320,8 +320,8 @@ mod tests {
             "orch-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
+                .map(|d| d.as_millis())
+                .unwrap_or_else(|_| 0)
         )
     }
 
@@ -343,14 +343,17 @@ mod tests {
 
         // Create a temporary detached session for testing
         let create_result = tokio::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"]) 
             .output()
             .await;
 
-        if create_result.is_err() || !create_result.unwrap().status.success() {
-            // Skip test if tmux is not available or fails
-            eprintln!("Skipping test: tmux not available or failed to create test session");
-            return;
+        // Skip test if tmux is not available or fails to create test session.
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
         }
 
         // Use our helper to set an environment variable
@@ -363,7 +366,14 @@ mod tests {
             .output()
             .await;
 
-        let output = check_result.expect("should be able to check environment");
+        let output = match check_result {
+            Ok(o) => o,
+            Err(_) => {
+                eprintln!("Skipping test: unable to check tmux environment");
+                let _ = tmux.kill_session(&session).await;
+                return;
+            }
+        };
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("TEST_VAR=test_value"),
@@ -385,13 +395,16 @@ mod tests {
 
         // Create a temporary detached session for testing
         let create_result = tokio::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"]) 
             .output()
             .await;
 
-        if create_result.is_err() || !create_result.unwrap().status.success() {
-            eprintln!("Skipping test: tmux not available or failed to create test session");
-            return;
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
         }
 
         // First set a variable
@@ -400,10 +413,19 @@ mod tests {
 
         // Verify it exists
         let check_before = tokio::process::Command::new("tmux")
-            .args(["show-environment", "-t", &session, "TO_DELETE"])
+            .args(["show-environment", "-t", &session, "TO_DELETE"]) 
             .output()
-            .await
-            .expect("should be able to check environment");
+            .await;
+
+        let check_before = match check_before {
+            Ok(o) => o,
+            Err(_) => {
+                eprintln!("Skipping test: unable to check tmux environment");
+                let _ = tmux.kill_session(&session).await;
+                return;
+            }
+        };
+
         assert!(
             String::from_utf8_lossy(&check_before.stdout).contains("TO_DELETE"),
             "Variable should exist before unset"
