@@ -1,4 +1,4 @@
-base_url = "https://orchestrator.gabrielkoerich.com"
+base_url = "https://orch.gabrielkoerich.com"
 compile_sass = true
 build_search_index = false
 title = "Orch"
