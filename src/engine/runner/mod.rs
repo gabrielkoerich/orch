@@ -436,11 +436,13 @@ impl TaskRunner {
         let run_result = self.run(task_id, agent, model, Some(&**backend)).await?;
 
         // If the runner guard skipped the task, do not re-post stale data as a new comment.
-        if run_result.is_none() {
-            tracing::info!(task_id, "guard skipped task — not posting stale result");
-            return Ok(WeightSignal::None);
-        }
-        let (status, exit_code_opt) = run_result.expect("checked above: None case returned early");
+        let (status, exit_code_opt) = match run_result {
+            None => {
+                tracing::info!(task_id, "guard skipped task — not posting stale result");
+                return Ok(WeightSignal::None);
+            }
+            Some(result) => result,
+        };
 
         // Process delegations if the agent requested subtasks
         let delegations_raw = self
