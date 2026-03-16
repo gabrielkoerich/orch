@@ -102,12 +102,38 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    /// Helper that sets an env var for the lifetime of this value and restores
+    /// the previous state when dropped. This makes tests that mutate process
+    /// environment hermetic and safe to run in parallel.
+    struct TempEnvVar {
+        key: String,
+        previous: Option<String>,
+    }
+
+    impl TempEnvVar {
+        fn new(key: &str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            TempEnvVar {
+                key: key.to_string(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for TempEnvVar {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
     #[test]
     fn render_template_does_not_leak_env_vars() {
         // Set a sensitive env var that must NOT appear in the rendered output
-        unsafe {
-            std::env::set_var("ORCH_TEST_SECRET_TOKEN", "should-not-appear");
-        }
+        let _guard = TempEnvVar::new("ORCH_TEST_SECRET_TOKEN", "should-not-appear");
 
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "hello world").unwrap();
@@ -118,9 +144,7 @@ mod tests {
             "env var leaked into rendered template"
         );
 
-        unsafe {
-            std::env::remove_var("ORCH_TEST_SECRET_TOKEN");
-        }
+        // `_guard` is dropped here and restores previous env state
     }
 
     #[test]

@@ -1797,9 +1797,36 @@ mod tests {
 
         /// Build a minimal GhHttp pointing at a wiremock server.
         /// The token resolver reads GH_TOKEN; we set it to a dummy value.
+        struct TempEnvVar {
+            key: String,
+            previous: Option<String>,
+        }
+
+        impl TempEnvVar {
+            fn new(key: &str, value: &str) -> Self {
+                let previous = std::env::var(key).ok();
+                std::env::set_var(key, value);
+                TempEnvVar {
+                    key: key.to_string(),
+                    previous,
+                }
+            }
+        }
+
+        impl Drop for TempEnvVar {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(v) => std::env::set_var(&self.key, v),
+                    None => std::env::remove_var(&self.key),
+                }
+            }
+        }
+
         fn make_client() -> GhHttp {
-            // Ensure a token is available so auth_header() doesn't bail.
-            unsafe { std::env::set_var("GH_TOKEN", "test_token") };
+            // Ensure a token is available so auth_header() doesn't bail. Use a
+            // TempEnvVar guard so tests remain hermetic when running in
+            // parallel.
+            let _guard = TempEnvVar::new("GH_TOKEN", "test_token");
             GhHttp {
                 client: reqwest::Client::new(),
                 token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
