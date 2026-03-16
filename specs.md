@@ -324,7 +324,7 @@ new → routed → in_progress → done (agent finishes)
 The original external task is re-routed with review context stored in the unified SQLite store. The agent reuses the existing worktree/branch and pushes fixes to the same PR. Key behaviors:
 
 - Review feedback is stored in the `pr_review_context` field via the store
-- The task is re-routed to `New` (not `Routed`) so it goes through the full routing pipeline
+- The task is re-routed to `Routed` for re-dispatch (skips LLM re-classification)
 - The `ci_merge_failures` counter is reset on auto re-route
 - `review_cycles` is incremented; when `>= max_review_cycles`, the task is blocked for human review
 - The agent sees review context in `build_agent_message()` when non-empty
