@@ -677,7 +677,28 @@ impl TaskRunner {
     ) -> anyhow::Result<()> {
         let parent_id = &parent_task.id;
 
+        // Fetch existing open tasks once for dedup — prevents creating duplicate
+        // GitHub issues when the same delegations are produced on repeated runs.
+        let existing_titles: std::collections::HashSet<String> =
+            match backend.list_all_tasks().await {
+                Ok(tasks) => tasks.into_iter().map(|t| t.title).collect(),
+                Err(e) => {
+                    tracing::warn!(err = %e, "failed to fetch tasks for dedup — will create all");
+                    std::collections::HashSet::new()
+                }
+            };
+
         for delegation in delegations {
+            // Skip if an issue with the same title already exists
+            if existing_titles.contains(&delegation.title) {
+                tracing::info!(
+                    parent = parent_id.0,
+                    title = delegation.title,
+                    "skipping delegation — issue with same title already exists"
+                );
+                continue;
+            }
+
             // Build labels: status:new + any labels from the delegation
             let mut labels = delegation.labels.clone();
             labels.push("status:new".to_string());
