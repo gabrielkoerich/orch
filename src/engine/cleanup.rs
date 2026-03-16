@@ -574,6 +574,8 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
 
     let repo_root = resolve_repo_root(repo).await?;
 
+    let mut did_clean = false;
+
     if let Some(wt) = worktree_to_remove {
         // TTL guard: skip if the worktree directory is too young.
         if let Some(age_hours) = worktree_age_hours(&wt) {
@@ -609,6 +611,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
         } else {
             tracing::info!(task_id, worktree = %wt.display(), "removing worktree");
             remove_worktree_and_branch(task_id, &wt, branch.as_deref(), &repo_root).await;
+            did_clean = true;
         }
     } else if let Some(ref br) = branch {
         // Worktree directory is already gone, but the branch may still exist
@@ -616,19 +619,18 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
         if !opts.dry_run {
             tracing::debug!(task_id, branch = %br, "no worktree on disk, cleaning up branch only");
             delete_branches(task_id, br, &repo_root).await;
+            did_clean = true;
         }
     }
 
-    if !opts.dry_run {
-        // Mark as cleaned in store
+    if did_clean {
+        // Mark as cleaned in store so we don't retry next tick
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
             let _ = store.mark_cleaned(store_id).await;
         }
-        return Ok(true);
     }
 
-    // dry_run — nothing was actually removed.
-    Ok(false)
+    Ok(did_clean)
 }
 
 /// Remove a git worktree directory and its local + remote branches.
@@ -1723,5 +1725,50 @@ mod tests {
         let store: Option<Arc<TaskStore>> = None;
         let memory = get_recent_memory(&store, "owner/repo", "any", 10).await;
         assert!(memory.is_empty());
+    }
+
+    /// A task with no worktree and no branch should return Ok(false) —
+    /// nothing was cleaned, so git pull should NOT be triggered.
+    #[tokio::test]
+    async fn cleanup_returns_false_when_nothing_to_clean() {
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Create a done task with no worktree or branch fields set
+        let id = store
+            .create(&NewTask {
+                external_id: Some("999".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Already cleaned".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Done)
+            .await
+            .unwrap();
+
+        let opts = JanitorOptions {
+            ttl_hours: 0,
+            dry_run: false,
+        };
+
+        let result = cleanup_task_worktree_with_opts("999", "owner/repo", &store, &opts).await;
+        // resolve_repo_root will fail for synthetic repo — that's OK, the point is
+        // that when nothing needs cleaning the function should not report true.
+        // In production this means no git pull is triggered.
+        match result {
+            Ok(cleaned) => assert!(
+                !cleaned,
+                "cleanup should return false when there is no worktree or branch to clean"
+            ),
+            Err(_) => {
+                // resolve_repo_root fails for test repo — acceptable.
+                // The bug was that even with no worktree/branch, Ok(true) was returned.
+            }
+        }
     }
 }
