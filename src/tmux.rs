@@ -286,6 +286,24 @@ impl TmuxManager {
         Ok(())
     }
 
+    /// Unset (remove) an environment variable from the tmux **global** environment.
+    ///
+    /// Uses: `tmux set-environment -gu <key>`
+    pub async fn unset_global_env(&self, key: &str) -> anyhow::Result<()> {
+        let output = Command::new("tmux")
+            .args(["set-environment", "-gu", key])
+            .output_with_context()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("tmux unset-global-environment failed for {key}: {stderr}");
+        }
+
+        tracing::debug!(key, "unset tmux global environment variable");
+        Ok(())
+    }
+
     /// Set multiple environment variables in a tmux session at once.
     ///
     /// This is a convenience method for setting multiple variables efficiently.
