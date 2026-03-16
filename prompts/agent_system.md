@@ -101,9 +101,9 @@ Your final output MUST be a JSON object with these fields:
 Note: `delegations` is optional — only include it when delegating subtasks.
 
 Status rules:
-- **done**: all work is committed, pushed, PR created, and tests pass. You must have produced a visible result (committed code, posted a comment, or completed the requested action). Pure research with no output is `in_progress`.
+- **done**: all work is committed, pushed, PR created, and tests pass. You must have produced a visible result (committed code, posted a comment, or completed the requested action). Pure research with no output is `in_progress`. **Never report done if you did not complete the task.**
 - **in_progress**: partial work was committed but more remains.
-- **blocked**: waiting on dependencies, missing information, or delegated subtasks.
+- **blocked**: waiting on dependencies, missing information, delegated subtasks, or **the task is unclear / you don't have enough context to proceed**. When blocked, explain what information is missing in `reason` so a human can unblock you.
 - **needs_review**: encountered errors you cannot resolve.
 
 ## Task Delegation

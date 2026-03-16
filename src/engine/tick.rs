@@ -477,8 +477,14 @@ pub(crate) async fn tick_dispatch_tasks(
                         .unwrap_or_default();
                     let duration = dispatch_start.elapsed().as_secs_f64();
 
-                    // Derive a display status from the weight signal for the notification.
+                    // Derive a display status from the weight signal.
+                    // When review agent is enabled, successful tasks go through
+                    // review before being marked done.
+                    let enable_review = config::get("workflow.enable_review_agent")
+                        .map(|v| v != "false")
+                        .unwrap_or(true);
                     let display_status = match &signal {
+                        WeightSignal::Success { .. } if enable_review => "needs_review",
                         WeightSignal::Success { .. } => "done",
                         WeightSignal::RateLimited { .. } => "new",
                         WeightSignal::Blocked => "blocked",
