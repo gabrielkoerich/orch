@@ -17,91 +17,105 @@ pub struct LeakMatch {
 
 /// Patterns that indicate leaked secrets.
 /// Each tuple: (rule_name, regex_pattern, is_high_confidence)
-static LEAK_PATTERNS: LazyLock<Vec<(&str, Regex, bool)>> = LazyLock::new(|| {
-    vec![
-        // API keys and tokens
-        (
-            "aws_access_key",
-            Regex::new(r"AKIA[0-9A-Z]{16}")
-                .expect("BUG: aws_access_key regex is invalid"),
-            true,
-        ),
-        (
-            "aws_secret_key",
-            Regex::new(r"(?i)aws[_\-]?secret[_\-]?access[_\-]?key\s*[=:]\s*\S+")
-                .expect("BUG: aws_secret_key regex is invalid"),
-            true,
-        ),
-        (
-            "github_token",
-            Regex::new(r"gh[pousr]_[A-Za-z0-9_]{36,}")
-                .expect("BUG: github_token regex is invalid"),
-            true,
-        ),
-        (
-            "github_pat",
-            Regex::new(r"github_pat_[A-Za-z0-9_]{22,}")
-                .expect("BUG: github_pat regex is invalid"),
-            true,
-        ),
-        (
-            "openai_api_key",
-            Regex::new(r"sk-[A-Za-z0-9\-]{20,}")
-                .expect("BUG: openai_api_key regex is invalid"),
-            true,
-        ),
-        (
-            "anthropic_api_key",
-            Regex::new(r"sk-ant-[A-Za-z0-9\-]{20,}")
-                .expect("BUG: anthropic_api_key regex is invalid"),
-            true,
-        ),
-        (
-            "slack_token",
-            Regex::new(r"xox[baprs]-[0-9A-Za-z\-]{10,}")
-                .expect("BUG: slack_token regex is invalid"),
-            true,
-        ),
-        (
-            "stripe_key",
-            Regex::new(r"[sr]k_(live|test)_[A-Za-z0-9]{20,}")
-                .expect("BUG: stripe_key regex is invalid"),
-            true,
-        ),
-        (
-            "telegram_bot_token",
-            Regex::new(r"\d{8,10}:[A-Za-z0-9_-]{35}")
-                .expect("BUG: telegram_bot_token regex is invalid"),
-            false, // lower confidence, could be other things
-        ),
-        // Private keys
-        (
-            "private_key",
-            Regex::new(r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")
-                .expect("BUG: private_key regex is invalid"),
-            true,
-        ),
-        // Generic patterns (lower confidence)
-        (
-            "generic_secret",
-            Regex::new(r#"(?i)(password|secret|token|api[_\-]?key)\s*[=:]\s*["']?[A-Za-z0-9+/=_\-]{16,}["']?"#)
-                .expect("BUG: generic_secret regex is invalid"),
-            false,
-        ),
-        (
-            "connection_string",
-            Regex::new(r"(?i)(postgres|mysql|mongodb|redis)://[^\s]{10,}")
-                .expect("BUG: connection_string regex is invalid"),
-            true,
-        ),
-        (
-            "bearer_token",
-            Regex::new(r"(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*")
-                .expect("BUG: bearer_token regex is invalid"),
-            false,
-        ),
-    ]
-});
+struct LeakPatternSpec {
+    rule: &'static str,
+    pattern: &'static str,
+    high_confidence: bool,
+}
+
+const LEAK_PATTERN_SPECS: &[LeakPatternSpec] = &[
+    // API keys and tokens
+    LeakPatternSpec {
+        rule: "aws_access_key",
+        pattern: r"AKIA[0-9A-Z]{16}",
+        high_confidence: true,
+    },
+    LeakPatternSpec {
+        rule: "aws_secret_key",
+        pattern: r"(?i)aws[_\-]?secret[_\-]?access[_\-]?key\s*[=:]\s*\S+",
+        high_confidence: true,
+    },
+    LeakPatternSpec {
+        rule: "github_token",
+        pattern: r"gh[pousr]_[A-Za-z0-9_]{36,}",
+        high_confidence: true,
+    },
+    LeakPatternSpec {
+        rule: "github_pat",
+        pattern: r"github_pat_[A-Za-z0-9_]{22,}",
+        high_confidence: true,
+    },
+    LeakPatternSpec {
+        rule: "openai_api_key",
+        pattern: r"sk-[A-Za-z0-9\-]{20,}",
+        high_confidence: true,
+    },
+    LeakPatternSpec {
+        rule: "anthropic_api_key",
+        pattern: r"sk-ant-[A-Za-z0-9\-]{20,}",
+        high_confidence: true,
+    },
+    LeakPatternSpec {
+        rule: "slack_token",
+        pattern: r"xox[baprs]-[0-9A-Za-z\-]{10,}",
+        high_confidence: true,
+    },
+    LeakPatternSpec {
+        rule: "stripe_key",
+        pattern: r"[sr]k_(live|test)_[A-Za-z0-9]{20,}",
+        high_confidence: true,
+    },
+    LeakPatternSpec {
+        rule: "telegram_bot_token",
+        pattern: r"\d{8,10}:[A-Za-z0-9_-]{35}",
+        high_confidence: false,
+    },
+    // Private keys
+    LeakPatternSpec {
+        rule: "private_key",
+        pattern: r"-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+        high_confidence: true,
+    },
+    // Generic patterns (lower confidence)
+    LeakPatternSpec {
+        rule: "generic_secret",
+        pattern: r#"(?i)(password|secret|token|api[_\-]?key)\s*[=:]\s*["']?[A-Za-z0-9+/=_\-]{16,}["']?"#,
+        high_confidence: false,
+    },
+    LeakPatternSpec {
+        rule: "connection_string",
+        pattern: r"(?i)(postgres|mysql|mongodb|redis)://[^\s]{10,}",
+        high_confidence: true,
+    },
+    LeakPatternSpec {
+        rule: "bearer_token",
+        pattern: r"(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*",
+        high_confidence: false,
+    },
+];
+
+fn build_leak_patterns(specs: &[LeakPatternSpec]) -> Vec<(&'static str, Regex, bool)> {
+    let mut patterns = Vec::new();
+
+    for spec in specs {
+        match Regex::new(spec.pattern) {
+            Ok(regex) => patterns.push((spec.rule, regex, spec.high_confidence)),
+            Err(err) => {
+                tracing::error!(
+                    rule = spec.rule,
+                    pattern = spec.pattern,
+                    error = %err,
+                    "failed to compile leak detection regex"
+                );
+            }
+        }
+    }
+
+    patterns
+}
+
+static LEAK_PATTERNS: LazyLock<Vec<(&str, Regex, bool)>> =
+    LazyLock::new(|| build_leak_patterns(LEAK_PATTERN_SPECS));
 
 /// Scan text for potential leaked secrets.
 ///
@@ -243,5 +257,26 @@ mod tests {
     fn clean_text_has_no_leaks() {
         let text = "This is normal agent output.\nFixed bug in parser.rs\nAll tests pass.";
         assert!(!has_leaks(text));
+    }
+
+    #[test]
+    fn build_leak_patterns_skips_invalid_regex() {
+        let specs = [
+            LeakPatternSpec {
+                rule: "good",
+                pattern: r"good",
+                high_confidence: true,
+            },
+            LeakPatternSpec {
+                rule: "bad",
+                pattern: r"(",
+                high_confidence: false,
+            },
+        ];
+
+        let patterns = build_leak_patterns(&specs);
+
+        assert!(patterns.iter().any(|(rule, _, _)| *rule == "good"));
+        assert!(!patterns.iter().any(|(rule, _, _)| *rule == "bad"));
     }
 }

@@ -5,14 +5,22 @@ use std::io::{self, Write};
 use std::sync::LazyLock;
 
 /// Matches `{{#if VAR}}...{{/if}}` blocks (non-greedy, dotall).
-static IF_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)\{\{#if\s+(\w+)\}\}(.*?)\{\{/if\}\}")
-        .expect("BUG: if_pattern regex is invalid")
-});
+fn compile_pattern(pattern: &str, label: &str) -> Result<Regex, String> {
+    Regex::new(pattern).map_err(|err| format!("invalid {label} regex: {err}"))
+}
+
+fn if_pattern() -> Result<&'static Regex, String> {
+    static IF_PATTERN: LazyLock<Result<Regex, String>> =
+        LazyLock::new(|| compile_pattern(r"(?s)\{\{#if\s+(\w+)\}\}(.*?)\{\{/if\}\}", "if_pattern"));
+    IF_PATTERN.as_ref().map_err(|err| err.clone())
+}
 
 /// Matches `{{VAR}}` variable placeholders.
-static VAR_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{\{(\w+)\}\}").expect("BUG: var_pattern regex is invalid"));
+fn var_pattern() -> Result<&'static Regex, String> {
+    static VAR_PATTERN: LazyLock<Result<Regex, String>> =
+        LazyLock::new(|| compile_pattern(r"\{\{(\w+)\}\}", "var_pattern"));
+    VAR_PATTERN.as_ref().map_err(|err| err.clone())
+}
 
 fn render_template_with_vars(
     template: &str,
@@ -22,7 +30,7 @@ fn render_template_with_vars(
 
     loop {
         let mut changed = false;
-        let new_data = IF_PATTERN
+        let new_data = if_pattern()?
             .replace_all(&data, |caps: &regex::Captures| {
                 changed = true;
                 let var_name = &caps[1];
@@ -40,7 +48,7 @@ fn render_template_with_vars(
         }
     }
 
-    let result = VAR_PATTERN
+    let result = var_pattern()?
         .replace_all(&data, |caps: &regex::Captures| {
             let var_name = &caps[1];
             vars.get(var_name).cloned().unwrap_or_default()
@@ -155,5 +163,11 @@ mod tests {
         let result =
             render_template(f.path().to_str().unwrap(), &["MY_VAR=hello".to_string()]).unwrap();
         assert_eq!(result.trim(), "value=hello");
+    }
+
+    #[test]
+    fn compile_pattern_rejects_invalid_regex() {
+        let err = compile_pattern("(", "bad_pattern").unwrap_err();
+        assert!(err.contains("bad_pattern"));
     }
 }
