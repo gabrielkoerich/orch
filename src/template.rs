@@ -99,15 +99,43 @@ pub fn render_and_print(template_path: &str, extra_vars: &[String]) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::NamedTempFile;
+
+    fn env_mutex() -> &'static Mutex<()> {
+        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn render_template_does_not_leak_env_vars() {
         // Set a sensitive env var that must NOT appear in the rendered output
-        unsafe {
-            std::env::set_var("ORCH_TEST_SECRET_TOKEN", "should-not-appear");
-        }
+        let _lock = env_mutex().lock().unwrap();
+        let _guard = EnvVarGuard::set("ORCH_TEST_SECRET_TOKEN", "should-not-appear");
 
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "hello world").unwrap();
@@ -117,10 +145,6 @@ mod tests {
             !result.contains("should-not-appear"),
             "env var leaked into rendered template"
         );
-
-        unsafe {
-            std::env::remove_var("ORCH_TEST_SECRET_TOKEN");
-        }
     }
 
     #[test]
