@@ -661,58 +661,45 @@ mod tests {
     fn build_git_auth_args_without_token_falls_back_to_ssh_https_conversion() {
         // Without a token in env the function must still return the legacy
         // SSH→HTTPS insteadOf rule so SSH-origin repos can push.
-        let saved_gh = std::env::var("GH_TOKEN").ok();
-        let saved_gh2 = std::env::var("GITHUB_TOKEN").ok();
-        std::env::remove_var("GH_TOKEN");
-        std::env::remove_var("GITHUB_TOKEN");
+        // temp_env ensures the variables are scoped to this closure only.
+        temp_env::with_vars(
+            [("GH_TOKEN", None::<&str>), ("GITHUB_TOKEN", None::<&str>)],
+            || {
+                let args = build_git_auth_args();
 
-        let args = build_git_auth_args();
-
-        // Restore env
-        if let Some(v) = saved_gh {
-            std::env::set_var("GH_TOKEN", v);
-        }
-        if let Some(v) = saved_gh2 {
-            std::env::set_var("GITHUB_TOKEN", v);
-        }
-
-        // When no token is available the fallback must include the SSH insteadOf rule.
-        let joined = args.join(" ");
-        assert!(
-            joined.contains("insteadOf=git@github.com:"),
-            "expected SSH insteadOf fallback, got: {joined}"
+                // When no token is available the fallback must include the SSH insteadOf rule.
+                let joined = args.join(" ");
+                assert!(
+                    joined.contains("insteadOf=git@github.com:"),
+                    "expected SSH insteadOf fallback, got: {joined}"
+                );
+            },
         );
     }
 
     #[test]
     fn build_git_auth_args_with_token_covers_both_ssh_and_https() {
         // Temporarily inject a fake token so we can verify both insteadOf rules.
-        let saved = std::env::var("GH_TOKEN").ok();
-        std::env::set_var("GH_TOKEN", "ghp_testtoken1234");
+        // temp_env ensures the variable is scoped to this closure only.
+        temp_env::with_var("GH_TOKEN", Some("ghp_testtoken1234"), || {
+            let args = build_git_auth_args();
 
-        let args = build_git_auth_args();
-
-        // Restore env
-        match saved {
-            Some(v) => std::env::set_var("GH_TOKEN", v),
-            None => std::env::remove_var("GH_TOKEN"),
-        }
-
-        let joined = args.join(" ");
-        // Must contain the token in the replacement URL
-        assert!(
-            joined.contains("x-access-token:ghp_testtoken1234@github.com"),
-            "expected token in auth URL, got: {joined}"
-        );
-        // Must cover HTTPS origins
-        assert!(
-            joined.contains("insteadOf=https://github.com/"),
-            "expected HTTPS insteadOf rule, got: {joined}"
-        );
-        // Must cover SSH origins
-        assert!(
-            joined.contains("insteadOf=git@github.com:"),
-            "expected SSH insteadOf rule, got: {joined}"
-        );
+            let joined = args.join(" ");
+            // Must contain the token in the replacement URL
+            assert!(
+                joined.contains("x-access-token:ghp_testtoken1234@github.com"),
+                "expected token in auth URL, got: {joined}"
+            );
+            // Must cover HTTPS origins
+            assert!(
+                joined.contains("insteadOf=https://github.com/"),
+                "expected HTTPS insteadOf rule, got: {joined}"
+            );
+            // Must cover SSH origins
+            assert!(
+                joined.contains("insteadOf=git@github.com:"),
+                "expected SSH insteadOf rule, got: {joined}"
+            );
+        });
     }
 }
