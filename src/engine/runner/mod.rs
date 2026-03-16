@@ -904,13 +904,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dir_str = dir.path().to_string_lossy().to_string();
 
-        // Temporarily set the env var — note: tests run in parallel so we use a
-        // dedicated key that only this test touches. std::env::set_var is not
-        // thread-safe in general, but the subsequent call is synchronous and
-        // isolated to the temp dir created above.
-        std::env::set_var("PROJECT_DIR", &dir_str);
-        let result = runner.resolve_project_dir();
-        std::env::remove_var("PROJECT_DIR");
+        // temp_env ensures the variable is scoped to this closure only.
+        let result = temp_env::with_var("PROJECT_DIR", Some(&dir_str), || {
+            runner.resolve_project_dir()
+        });
 
         assert!(
             result.is_ok(),
@@ -923,9 +920,9 @@ mod tests {
     fn resolve_project_dir_empty_project_dir_env_falls_through() {
         // An empty PROJECT_DIR should be ignored and fall through to other logic.
         let runner = TaskRunner::new("owner/testrepo-nonexistent".to_string());
-        std::env::set_var("PROJECT_DIR", "");
-        let result = runner.resolve_project_dir();
-        std::env::remove_var("PROJECT_DIR");
+
+        // temp_env ensures the variable is scoped to this closure only.
+        let result = temp_env::with_var("PROJECT_DIR", Some(""), || runner.resolve_project_dir());
 
         // Should succeed (falls back to current dir) without panicking.
         assert!(result.is_ok());
@@ -1058,77 +1055,73 @@ mod tests {
     async fn process_delegations_creates_subtasks_and_blocks_parent() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_home = TempDir::new().unwrap();
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", temp_home.path());
 
-        let runner = TaskRunner::new("owner/repo".to_string());
-        let parent = make_task("99");
-        let backend = Arc::new(TrackingBackend::new());
-        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> = backend.clone();
+        // temp_env ensures HOME is restored after the closure, even on panic.
+        temp_env::with_var("HOME", Some(temp_home.path()), || async {
+            let runner = TaskRunner::new("owner/repo".to_string());
+            let parent = make_task("99");
+            let backend = Arc::new(TrackingBackend::new());
+            let backend_dyn: Arc<dyn crate::backends::ExternalBackend> = backend.clone();
 
-        let delegations = vec![
-            crate::parser::Delegation {
-                title: "Subtask A".to_string(),
-                body: "Do A".to_string(),
-                labels: vec!["enhancement".to_string()],
-            },
-            crate::parser::Delegation {
-                title: "Subtask B".to_string(),
-                body: "Do B".to_string(),
-                labels: vec![],
-            },
-        ];
+            let delegations = vec![
+                crate::parser::Delegation {
+                    title: "Subtask A".to_string(),
+                    body: "Do A".to_string(),
+                    labels: vec!["enhancement".to_string()],
+                },
+                crate::parser::Delegation {
+                    title: "Subtask B".to_string(),
+                    body: "Do B".to_string(),
+                    labels: vec![],
+                },
+            ];
 
-        runner
-            .process_delegations(&parent, &delegations, &backend_dyn)
-            .await
-            .unwrap();
+            runner
+                .process_delegations(&parent, &delegations, &backend_dyn)
+                .await
+                .unwrap();
 
-        // Two sub-tasks should have been created
-        let created = backend.sub_tasks_created.lock().unwrap();
-        assert_eq!(created.len(), 2);
-        assert_eq!(created[0].1, "99", "parent id should be 99");
-        assert!(
-            created.iter().any(|(t, _)| t == "Subtask A"),
-            "Subtask A should be created"
-        );
-        assert!(
-            created.iter().any(|(t, _)| t == "Subtask B"),
-            "Subtask B should be created"
-        );
-        drop(created);
+            // Two sub-tasks should have been created
+            let created = backend.sub_tasks_created.lock().unwrap();
+            assert_eq!(created.len(), 2);
+            assert_eq!(created[0].1, "99", "parent id should be 99");
+            assert!(
+                created.iter().any(|(t, _)| t == "Subtask A"),
+                "Subtask A should be created"
+            );
+            assert!(
+                created.iter().any(|(t, _)| t == "Subtask B"),
+                "Subtask B should be created"
+            );
+            drop(created);
 
-        // Parent should be marked blocked
-        let updates = backend.status_updates.lock().unwrap();
-        assert!(
-            updates
-                .iter()
-                .any(|(id, s)| id == "99" && *s == Status::Blocked),
-            "parent should be blocked"
-        );
-        drop(updates);
+            // Parent should be marked blocked
+            let updates = backend.status_updates.lock().unwrap();
+            assert!(
+                updates
+                    .iter()
+                    .any(|(id, s)| id == "99" && *s == Status::Blocked),
+                "parent should be blocked"
+            );
+            drop(updates);
 
-        // A comment summarising the delegations should be posted
-        let comments = backend.comments.lock().unwrap();
-        assert!(
-            !comments.is_empty(),
-            "a delegation summary comment should be posted"
-        );
-        let comment_body = &comments[0].1;
-        assert!(
-            comment_body.contains("Subtask A"),
-            "summary should mention Subtask A"
-        );
-        assert!(
-            comment_body.contains("Subtask B"),
-            "summary should mention Subtask B"
-        );
-
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
-        } else {
-            std::env::remove_var("HOME");
-        }
+            // A comment summarising the delegations should be posted
+            let comments = backend.comments.lock().unwrap();
+            assert!(
+                !comments.is_empty(),
+                "a delegation summary comment should be posted"
+            );
+            let comment_body = &comments[0].1;
+            assert!(
+                comment_body.contains("Subtask A"),
+                "summary should mention Subtask A"
+            );
+            assert!(
+                comment_body.contains("Subtask B"),
+                "summary should mention Subtask B"
+            );
+        })
+        .await;
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -1136,50 +1129,46 @@ mod tests {
     async fn process_delegations_single_subtask() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_home = TempDir::new().unwrap();
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", temp_home.path());
 
-        let runner = TaskRunner::new("owner/repo".to_string());
-        let parent = make_task("101");
-        let backend = Arc::new(TrackingBackend::new());
-        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> = backend.clone();
+        // temp_env ensures HOME is restored after the closure, even on panic.
+        temp_env::with_var("HOME", Some(temp_home.path()), || async {
+            let runner = TaskRunner::new("owner/repo".to_string());
+            let parent = make_task("101");
+            let backend = Arc::new(TrackingBackend::new());
+            let backend_dyn: Arc<dyn crate::backends::ExternalBackend> = backend.clone();
 
-        let delegations = vec![crate::parser::Delegation {
-            title: "Only Child".to_string(),
-            body: "Do only child".to_string(),
-            labels: vec!["feature".to_string()],
-        }];
+            let delegations = vec![crate::parser::Delegation {
+                title: "Only Child".to_string(),
+                body: "Do only child".to_string(),
+                labels: vec!["feature".to_string()],
+            }];
 
-        runner
-            .process_delegations(&parent, &delegations, &backend_dyn)
-            .await
-            .unwrap();
+            runner
+                .process_delegations(&parent, &delegations, &backend_dyn)
+                .await
+                .unwrap();
 
-        let created = backend.sub_tasks_created.lock().unwrap();
-        assert_eq!(created.len(), 1);
-        assert_eq!(created[0].0, "Only Child");
-        drop(created);
+            let created = backend.sub_tasks_created.lock().unwrap();
+            assert_eq!(created.len(), 1);
+            assert_eq!(created[0].0, "Only Child");
+            drop(created);
 
-        let updates = backend.status_updates.lock().unwrap();
-        assert!(
-            updates
-                .iter()
-                .any(|(id, s)| id == "101" && *s == Status::Blocked),
-            "parent should be blocked"
-        );
-        drop(updates);
+            let updates = backend.status_updates.lock().unwrap();
+            assert!(
+                updates
+                    .iter()
+                    .any(|(id, s)| id == "101" && *s == Status::Blocked),
+                "parent should be blocked"
+            );
+            drop(updates);
 
-        let comments = backend.comments.lock().unwrap();
-        let body = &comments[0].1;
-        assert!(
-            body.contains("1 subtask"),
-            "comment should count one subtask"
-        );
-
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
-        } else {
-            std::env::remove_var("HOME");
-        }
+            let comments = backend.comments.lock().unwrap();
+            let body = &comments[0].1;
+            assert!(
+                body.contains("1 subtask"),
+                "comment should count one subtask"
+            );
+        })
+        .await;
     }
 }

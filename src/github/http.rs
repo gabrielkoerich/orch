@@ -1791,43 +1791,18 @@ mod tests {
     #[cfg(test)]
     mod pagination {
         use super::super::*;
-        use std::ffi::OsString;
         use std::sync::Arc;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        struct EnvVarGuard {
-            key: &'static str,
-            previous: Option<OsString>,
-        }
-
-        impl EnvVarGuard {
-            fn set(key: &'static str, value: &str) -> Self {
-                let previous = std::env::var_os(key);
-                std::env::set_var(key, value);
-                Self { key, previous }
-            }
-        }
-
-        impl Drop for EnvVarGuard {
-            fn drop(&mut self) {
-                match self.previous.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-
         /// Build a minimal GhHttp pointing at a wiremock server.
-        /// The token resolver reads GH_TOKEN; we set it to a dummy value.
-        fn make_client() -> (GhHttp, EnvVarGuard) {
-            // Ensure a token is available so auth_header() doesn't bail.
-            let guard = EnvVarGuard::set("GH_TOKEN", "test_token");
-            let client = GhHttp {
+        /// The token resolver reads GH_TOKEN; tests should wrap calls using
+        /// temp_env to set this variable for proper isolation.
+        fn make_client() -> GhHttp {
+            GhHttp {
                 client: reqwest::Client::new(),
                 token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
-            };
-            (client, guard)
+            }
         }
 
         #[tokio::test]
@@ -1844,9 +1819,13 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let (gh, _guard) = make_client();
             let url = format!("{}/items", server.uri());
-            let result: Vec<serde_json::Value> = gh.get_all_pages(&url, &[]).await.unwrap();
+            let result: Vec<serde_json::Value> =
+                temp_env::with_var("GH_TOKEN", Some("test_token"), || async {
+                    let gh = make_client();
+                    gh.get_all_pages(&url, &[]).await.unwrap()
+                })
+                .await;
 
             assert_eq!(result.len(), 2);
             assert_eq!(result[0]["id"], 1);
@@ -1883,9 +1862,13 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let (gh, _guard) = make_client();
             let url = format!("{}/items", server.uri());
-            let result: Vec<serde_json::Value> = gh.get_all_pages(&url, &[]).await.unwrap();
+            let result: Vec<serde_json::Value> =
+                temp_env::with_var("GH_TOKEN", Some("test_token"), || async {
+                    let gh = make_client();
+                    gh.get_all_pages(&url, &[]).await.unwrap()
+                })
+                .await;
 
             assert_eq!(result.len(), 3);
             assert_eq!(result[0]["id"], 1);
@@ -1923,9 +1906,13 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let (gh, _guard) = make_client();
             let url = format!("{}/items", server.uri());
-            let result: Vec<serde_json::Value> = gh.get_all_pages(&url, &[]).await.unwrap();
+            let result: Vec<serde_json::Value> =
+                temp_env::with_var("GH_TOKEN", Some("test_token"), || async {
+                    let gh = make_client();
+                    gh.get_all_pages(&url, &[]).await.unwrap()
+                })
+                .await;
 
             // Must not panic and must return both items collected so far.
             assert_eq!(result.len(), 2);
@@ -1948,9 +1935,13 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let (gh, _guard) = make_client();
             let url = format!("{}/items", server.uri());
-            let result: Vec<serde_json::Value> = gh.get_all_pages(&url, &[]).await.unwrap();
+            let result: Vec<serde_json::Value> =
+                temp_env::with_var("GH_TOKEN", Some("test_token"), || async {
+                    let gh = make_client();
+                    gh.get_all_pages(&url, &[]).await.unwrap()
+                })
+                .await;
 
             // Malformed Link header → pagination stops after first page, no panic.
             assert_eq!(result.len(), 1);
