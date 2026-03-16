@@ -97,7 +97,7 @@ agent completes (done) → PR detected → needs_review → in_review → review
                                                                    └─ reject → needs_review (PR closed)
 ```
 
-Review re-routing: when a review requests changes, the task is re-routed back to `New` status (not a child task). The agent reuses the existing worktree/branch and pushes fixes to the same PR. If `review_cycles >= max_review_cycles`, the task is blocked for human review.
+Review re-routing: when a review requests changes, the task is re-routed back to `Routed` status (not a child task). The agent reuses the existing worktree/branch and pushes fixes to the same PR. If `review_cycles >= max_review_cycles`, the task is blocked for human review.
 
 Without the review agent enabled, tasks with open PRs still transition to `in_review` but skip the automated review step.
 
