@@ -659,7 +659,11 @@ mod tests {
             Task::Internal(t) => {
                 assert_eq!(t.title, "Internal task");
                 assert_eq!(t.origin, "internal");
-                assert!(t.external_id.as_deref().map(|s| s.starts_with("internal:")).unwrap_or(false));
+                assert!(t
+                    .external_id
+                    .as_deref()
+                    .map(|s| s.starts_with("internal:"))
+                    .unwrap_or(false));
             }
             Task::External(_) => panic!("expected Internal variant"),
         }
