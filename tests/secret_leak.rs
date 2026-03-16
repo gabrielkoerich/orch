@@ -77,11 +77,11 @@ fn assert_no_secrets_in_files(files: &[(PathBuf, String)]) {
 }
 
 /// Create a temporary HOME directory for isolated testing.
+/// Returns the temp dir and home path. Uses temp_env to ensure hermetic tests.
 fn setup_temp_home() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("failed to create temp dir");
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).expect("failed to create home dir");
-    std::env::set_var("HOME", &home);
     (temp, home)
 }
 
@@ -221,67 +221,65 @@ mod integration_tests {
     /// prompt files or other artifacts that might be logged/committed.
     #[test]
     fn test_runner_script_with_env_token() {
-        let (_temp, home) = setup_temp_home();
-
-        // Set GH_TOKEN in environment (simulating real deployment)
         let test_token = "ghp_test1234567890abcdefghijklmnopqrstuvwxyz12";
-        std::env::set_var("GH_TOKEN", test_token);
 
-        // Create a minimal agent invocation
-        let attempt_dir = home.join(".orch/state/owner/repo/tasks/456/attempts/1");
-        std::fs::create_dir_all(&attempt_dir).unwrap();
+        // Use temp_env for hermetic environment handling
+        temp_env::with_var("GH_TOKEN", Some(test_token), || {
+            let (_temp, home) = setup_temp_home();
 
-        let sys_file = attempt_dir.join("prompt-sys.md");
-        let msg_file = attempt_dir.join("prompt-msg.md");
+            // Create a minimal agent invocation
+            let attempt_dir = home.join(".orch/state/owner/repo/tasks/456/attempts/1");
+            std::fs::create_dir_all(&attempt_dir).unwrap();
 
-        // Write prompt files (these should NEVER contain the token)
-        let sys_prompt = "System prompt without secrets".to_string();
-        let msg_prompt = "Message prompt without secrets".to_string();
+            let sys_file = attempt_dir.join("prompt-sys.md");
+            let msg_file = attempt_dir.join("prompt-msg.md");
 
-        std::fs::write(&sys_file, &sys_prompt).unwrap();
-        std::fs::write(&msg_file, &msg_prompt).unwrap();
+            // Write prompt files (these should NEVER contain the token)
+            let sys_prompt = "System prompt without secrets".to_string();
+            let msg_prompt = "Message prompt without secrets".to_string();
 
-        // Simulate what build_runner_script does: write the token export line
-        let runner_script = format!(
-            r#"#!/usr/bin/env bash
+            std::fs::write(&sys_file, &sys_prompt).unwrap();
+            std::fs::write(&msg_file, &msg_prompt).unwrap();
+
+            // Simulate what build_runner_script does: write the token export line
+            let runner_script = format!(
+                r#"#!/usr/bin/env bash
 set -euo pipefail
 
 export GH_TOKEN="{}"
 export GIT_AUTHOR_NAME="Test User"
 export GIT_AUTHOR_EMAIL="test@example.com"
 "#,
-            test_token
-        );
+                test_token
+            );
 
-        let runner_file = attempt_dir.join("runner.sh");
-        std::fs::write(&runner_file, &runner_script).unwrap();
+            let runner_file = attempt_dir.join("runner.sh");
+            std::fs::write(&runner_file, &runner_script).unwrap();
 
-        // Verify prompt files have no secrets
-        let prompt_files = vec![
-            (sys_file.clone(), sys_prompt),
-            (msg_file.clone(), msg_prompt),
-        ];
-        assert_no_secrets_in_files(&prompt_files);
-
-        // Clean up env var
-        std::env::remove_var("GH_TOKEN");
+            // Verify prompt files have no secrets
+            let prompt_files = vec![
+                (sys_file.clone(), sys_prompt),
+                (msg_file.clone(), msg_prompt),
+            ];
+            assert_no_secrets_in_files(&prompt_files);
+        });
     }
 
     /// Test that when no GH_TOKEN is in environment, the runner script
     /// doesn't contain hardcoded fallback tokens.
     #[test]
     fn test_runner_script_without_env_token() {
-        let (_temp, home) = setup_temp_home();
+        // Use temp_env to ensure no GH_TOKEN/GITHUB_TOKEN in environment
+        temp_env::with_vars(
+            [("GH_TOKEN", None::<&str>), ("GITHUB_TOKEN", None::<&str>)],
+            || {
+                let (_temp, home) = setup_temp_home();
 
-        // Ensure no GH_TOKEN in environment
-        std::env::remove_var("GH_TOKEN");
-        std::env::remove_var("GITHUB_TOKEN");
+                let attempt_dir = home.join(".orch/state/owner/repo/tasks/789/attempts/1");
+                std::fs::create_dir_all(&attempt_dir).unwrap();
 
-        let attempt_dir = home.join(".orch/state/owner/repo/tasks/789/attempts/1");
-        std::fs::create_dir_all(&attempt_dir).unwrap();
-
-        // Simulate a runner script generated when no token is available
-        let runner_script = r#"#!/usr/bin/env bash
+                // Simulate a runner script generated when no token is available
+                let runner_script = r#"#!/usr/bin/env bash
 set -euo pipefail
 
 # No GH_TOKEN available - agent will need to authenticate via other means
@@ -292,12 +290,14 @@ export GIT_AUTHOR_EMAIL="test@example.com"
 [ -f "$HOME/.private" ] && source "$HOME/.private"
 "#;
 
-        let runner_file = attempt_dir.join("runner.sh");
-        std::fs::write(&runner_file, runner_script).unwrap();
+                let runner_file = attempt_dir.join("runner.sh");
+                std::fs::write(&runner_file, runner_script).unwrap();
 
-        // Verify the script has no hardcoded tokens
-        let files = vec![(runner_file, runner_script.to_string())];
-        assert_no_secrets_in_files(&files);
+                // Verify the script has no hardcoded tokens
+                let files = vec![(runner_file, runner_script.to_string())];
+                assert_no_secrets_in_files(&files);
+            },
+        );
     }
 
     /// Test comprehensive artifact scanning - simulates a full task attempt

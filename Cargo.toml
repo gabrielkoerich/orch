@@ -90,7 +90,7 @@ tempfile = "3"
 tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
-temp-env = "0.3"
+temp-env = { version = "0.3", features = ["async_closure"] }
 
 [profile.release]
 opt-level = 3

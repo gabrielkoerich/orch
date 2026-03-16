@@ -533,106 +533,118 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_returns_none_when_no_env_set() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
-        // Disable gh fallback so we don't actually call gh CLI in tests
-        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
-        resolver.clear_cache().await;
+        // Use temp_env for hermetic environment handling - vars are unset for this scope
+        temp_env::async_with_vars(
+            [("GH_TOKEN", None::<&str>), ("GITHUB_TOKEN", None::<&str>)],
+            async {
+                // Disable gh fallback so we don't actually call gh CLI in tests
+                let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
+                resolver.clear_cache().await;
 
-        let token = resolver.get_token().await.unwrap();
-        assert!(token.is_none());
+                let token = resolver.get_token().await.unwrap();
+                assert!(token.is_none());
+            },
+        )
+        .await;
     }
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
-        resolver.clear_cache().await;
+        temp_env::async_with_vars(
+            [
+                ("GH_TOKEN", Some("gh_token_value")),
+                ("GITHUB_TOKEN", None::<&str>),
+            ],
+            async {
+                let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
+                resolver.clear_cache().await;
 
-        env::set_var("GH_TOKEN", "gh_token_value");
-        env::remove_var("GITHUB_TOKEN");
-
-        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
-        let token = resolver.get_token().await.unwrap();
-        assert_eq!(token, Some("gh_token_value".to_string()));
-
-        env::remove_var("GH_TOKEN");
+                let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
+                let token = resolver.get_token().await.unwrap();
+                assert_eq!(token, Some("gh_token_value".to_string()));
+            },
+        )
+        .await;
     }
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_falls_back_to_github_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
-        resolver.clear_cache().await;
+        temp_env::async_with_vars(
+            [
+                ("GH_TOKEN", None::<&str>),
+                ("GITHUB_TOKEN", Some("github_token_value")),
+            ],
+            async {
+                let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
+                resolver.clear_cache().await;
 
-        env::set_var("GITHUB_TOKEN", "github_token_value");
-
-        let token = resolver.get_token().await.unwrap();
-        assert_eq!(token, Some("github_token_value".to_string()));
-
-        env::remove_var("GITHUB_TOKEN");
+                let token = resolver.get_token().await.unwrap();
+                assert_eq!(token, Some("github_token_value".to_string()));
+            },
+        )
+        .await;
     }
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_prefers_gh_token_over_github_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
-        resolver.clear_cache().await;
+        temp_env::async_with_vars(
+            [
+                ("GH_TOKEN", Some("gh_token_value")),
+                ("GITHUB_TOKEN", Some("github_token_value")),
+            ],
+            async {
+                let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
+                resolver.clear_cache().await;
 
-        env::set_var("GH_TOKEN", "gh_token_value");
-        env::set_var("GITHUB_TOKEN", "github_token_value");
-
-        let token = resolver.get_token().await.unwrap();
-        // GH_TOKEN should be preferred
-        assert_eq!(token, Some("gh_token_value".to_string()));
-
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+                let token = resolver.get_token().await.unwrap();
+                // GH_TOKEN should be preferred
+                assert_eq!(token, Some("gh_token_value".to_string()));
+            },
+        )
+        .await;
     }
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_ignores_empty_env_vars() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
-        resolver.clear_cache().await;
+        temp_env::async_with_vars(
+            [("GH_TOKEN", Some("")), ("GITHUB_TOKEN", Some(""))],
+            async {
+                let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
+                resolver.clear_cache().await;
 
-        env::set_var("GH_TOKEN", "");
-        env::set_var("GITHUB_TOKEN", "");
-
-        let token = resolver.get_token().await.unwrap();
-        assert!(token.is_none());
-
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+                let token = resolver.get_token().await.unwrap();
+                assert!(token.is_none());
+            },
+        )
+        .await;
     }
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_token_sync_env_mode() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
-        resolver.clear_cache().await;
+        temp_env::async_with_vars(
+            [
+                ("GH_TOKEN", Some("sync_test_token")),
+                ("GITHUB_TOKEN", None::<&str>),
+            ],
+            async {
+                let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
+                resolver.clear_cache().await;
 
-        env::set_var("GH_TOKEN", "sync_test_token");
-
-        let token = resolver.get_token_sync().unwrap();
-        assert_eq!(token, Some("sync_test_token".to_string()));
-
-        env::remove_var("GH_TOKEN");
+                let token = resolver.get_token_sync().unwrap();
+                assert_eq!(token, Some("sync_test_token".to_string()));
+            },
+        )
+        .await;
     }
 
     #[test]
@@ -651,47 +663,54 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn clear_cache_clears_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
-        let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
-        resolver.clear_cache().await;
+        temp_env::async_with_vars(
+            [
+                ("GH_TOKEN", Some("cached_token")),
+                ("GITHUB_TOKEN", None::<&str>),
+            ],
+            async {
+                let resolver = TokenResolver::new(TokenMode::Env).with_gh_fallback(false);
+                resolver.clear_cache().await;
 
-        env::set_var("GH_TOKEN", "cached_token");
+                // First call should cache the token
+                let token1 = resolver.get_token().await.unwrap();
+                assert_eq!(token1, Some("cached_token".to_string()));
 
-        // First call should cache the token
-        let token1 = resolver.get_token().await.unwrap();
-        assert_eq!(token1, Some("cached_token".to_string()));
+                // Clear cache
+                resolver.clear_cache().await;
 
-        // Clear cache
-        resolver.clear_cache().await;
-
-        // Token should still resolve (fresh lookup)
-        let token2 = resolver.get_token().await.unwrap();
-        assert_eq!(token2, Some("cached_token".to_string()));
-
-        env::remove_var("GH_TOKEN");
+                // Token should still resolve (fresh lookup)
+                let token2 = resolver.get_token().await.unwrap();
+                assert_eq!(token2, Some("cached_token".to_string()));
+            },
+        )
+        .await;
     }
 
     #[test]
     fn resolve_env_token_returns_none_when_unset() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
-
-        let token = TokenResolver::resolve_env_token();
-        assert!(token.is_none());
+        temp_env::with_vars(
+            [("GH_TOKEN", None::<&str>), ("GITHUB_TOKEN", None::<&str>)],
+            || {
+                let token = TokenResolver::resolve_env_token();
+                assert!(token.is_none());
+            },
+        );
     }
 
     #[test]
     fn resolve_env_token_prefers_gh_token() {
         let _guard = ENV_LOCK.lock().unwrap();
-        env::set_var("GH_TOKEN", "gh_pref");
-        env::set_var("GITHUB_TOKEN", "github_pref");
-
-        let token = TokenResolver::resolve_env_token();
-        assert_eq!(token, Some("gh_pref".to_string()));
-
-        env::remove_var("GH_TOKEN");
-        env::remove_var("GITHUB_TOKEN");
+        temp_env::with_vars(
+            [
+                ("GH_TOKEN", Some("gh_pref")),
+                ("GITHUB_TOKEN", Some("github_pref")),
+            ],
+            || {
+                let token = TokenResolver::resolve_env_token();
+                assert_eq!(token, Some("gh_pref".to_string()));
+            },
+        );
     }
 }
