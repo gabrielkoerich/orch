@@ -269,7 +269,13 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
 /// Returns a `Vec<String>` of alternating `-c KEY=VALUE` pairs suitable for
 /// prepending to any `git` command's argument list.
 fn build_git_auth_args() -> Vec<String> {
-    let token = crate::github::token::shared()
+    // Use a fresh resolver here so tests that temporarily set env vars
+    // are not affected by a process-wide cached resolver. The global
+    // `shared()` resolver intentionally caches tokens for the running
+    // process, but tests frequently mutate `GH_TOKEN`/`GITHUB_TOKEN` and
+    // expecting immediate visibility. Creating a local resolver reads the
+    // current environment without relying on the cached singleton.
+    let token = crate::github::token::TokenResolver::default_env()
         .get_token_sync()
         .ok()
         .flatten();

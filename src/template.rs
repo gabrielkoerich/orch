@@ -142,9 +142,10 @@ mod tests {
     #[test]
     fn render_template_does_not_leak_env_vars() {
         // Set a sensitive env var that must NOT appear in the rendered output
+        // Acquire a process-wide mutex to serialize env mutation with other tests
+        // and use EnvVarGuard to restore previous state on drop.
         let _lock = env_mutex().lock().unwrap();
         let _guard = EnvVarGuard::set("ORCH_TEST_SECRET_TOKEN", "should-not-appear");
-
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "hello world").unwrap();
 
