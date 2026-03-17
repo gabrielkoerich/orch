@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-03-17 — CLI: show AGE and TRIES in task list
+
+### Summary
+
+Small UX improvement: `orch task list` now shows two new columns:
+
+- `AGE` — human-readable time since the task was last updated (e.g. `5s`, `3m`, `2h`, `4d`, `1y`)
+- `TRIES` — number of agent attempts recorded for the task
+
+### Files Changed
+
+- `src/cli/task.rs` — added `format_age` helper, updated task list output to include `AGE` and `TRIES`, and added unit tests for the helper
+
+### Tests
+
+- Unit tests added for the age formatting helper; existing CI (fmt, clippy, tests) was run locally for the branch.
+
+
 ## 2026-02-27 — Comment-Based Review Workflow & PR Maintenance
 
 ### Summary

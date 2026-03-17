@@ -12,7 +12,34 @@ use crate::home;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
+
+/// Format a timestamp as a human-readable age (e.g. "5m", "2h", "3d").
+fn format_age(updated_at: &str) -> String {
+    let Ok(dt) = DateTime::parse_from_rfc3339(updated_at) else {
+        return "-".to_string();
+    };
+    let secs = (Utc::now() - dt.with_timezone(&Utc)).num_seconds();
+    if secs < 0 {
+        return "now".to_string();
+    }
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        let days = secs / 86400;
+        if days >= 365 {
+            let years = days / 365;
+            format!("{}y", years)
+        } else {
+            format!("{}d", days)
+        }
+    }
+}
 
 /// Store-first status update for CLI: updates SQLite first, then mirrors to backend.
 async fn update_status_store_first(
@@ -54,10 +81,10 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
     let repo = config::get_current_repo().unwrap_or_default();
 
     println!(
-        "{:<15} {:<12} {:<20} {:<10} TITLE",
-        "ID", "TYPE", "STATUS", "AGENT"
+        "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} TITLE",
+        "ID", "TYPE", "STATUS", "AGENT", "AGE", "TRIES"
     );
-    println!("{}", "-".repeat(90));
+    println!("{}", "-".repeat(100));
 
     for task in tasks {
         match task {
@@ -71,13 +98,24 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
                 let agent = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "agent")
                     .await
                     .unwrap_or_default();
+                let age = format_age(&ext.updated_at);
+                let tries =
+                    store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "attempts")
+                        .await
+                        .unwrap_or_default();
                 println!(
-                    "{:<15} {:<12} {:<20} {:<10} {}",
-                    ext.id.0, "external", status, agent, ext.title
+                    "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} {}",
+                    ext.id.0, "external", status, agent, age, tries, ext.title
                 );
             }
             Task::Internal(int) => {
                 let agent = int.agent.as_deref().unwrap_or("-");
+                let age = format_age(&int.updated_at);
+                let tries = if int.attempts > 0 {
+                    int.attempts.to_string()
+                } else {
+                    "-".to_string()
+                };
                 let title = if int.status == crate::store::TaskStatus::Blocked {
                     if let Some(ref reason) = int.block_reason {
                         format!("{} [blocked: {}]", int.title, reason)
@@ -88,11 +126,13 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
                     int.title.clone()
                 };
                 println!(
-                    "{:<15} {:<12} {:<20} {:<10} {}",
+                    "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} {}",
                     format!("internal:{}", int.id),
                     "internal",
                     int.status.as_str(),
                     agent,
+                    age,
+                    tries,
                     title
                 );
             }
@@ -1038,4 +1078,43 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_age_seconds() {
+        let ts = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        let age = format_age(&ts);
+        assert!(age.ends_with('s'), "expected seconds format, got {age}");
+    }
+
+    #[test]
+    fn format_age_minutes() {
+        let ts = (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        let age = format_age(&ts);
+        assert!(age.ends_with('m'), "expected minutes format, got {age}");
+    }
+
+    #[test]
+    fn format_age_hours() {
+        let ts = (Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        let age = format_age(&ts);
+        assert!(age.ends_with('h'), "expected hours format, got {age}");
+    }
+
+    #[test]
+    fn format_age_days() {
+        let ts = (Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        let age = format_age(&ts);
+        assert!(age.ends_with('d'), "expected days format, got {age}");
+    }
+
+    #[test]
+    fn format_age_invalid_returns_dash() {
+        let age = format_age("not-a-timestamp");
+        assert_eq!(age, "-");
+    }
 }
