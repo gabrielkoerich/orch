@@ -203,14 +203,17 @@ pub async fn handle_success(
                         &[("last_error", serde_json::json!(msg))],
                     )
                     .await;
-                    // 422 with "head" invalid means the branch has no diff
-                    // from main — the work is already merged. Clear
-                    // has_pushed so we fall through to the "done" path
-                    // instead of spinning in the review gate.
-                    if err_str.contains("422") && err_str.contains("head") {
+                    // 422 "No commits between main and branch" means the agent
+                    // made no code changes — the task is done without a PR.
+                    // Also handles the "head" invalid variant (already merged).
+                    // Clear has_pushed so we fall through to the "done" path
+                    // instead of spinning in the review gate indefinitely.
+                    if err_str.contains("422")
+                        && (err_str.contains("No commits between") || err_str.contains("head"))
+                    {
                         tracing::info!(
                             task_id,
-                            "PR creation returned 422/head-invalid — branch has no diff from main, clearing has_pushed"
+                            "PR creation returned 422/no-commits — agent made no code changes, marking done"
                         );
                         has_pushed = false;
                     }
