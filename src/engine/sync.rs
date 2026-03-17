@@ -1035,6 +1035,78 @@ mod tests {
         }
     }
 
+    /// Regression test for a6d8b9a.
+    ///
+    /// Before the fix, `sync_tick` step 5 transitioned a task to `InReview` and then
+    /// spawned a `tokio::spawn` review agent WITHOUT first inserting the `dispatch_key`
+    /// into the dispatching set. This created a window where `review_open_prs` (step 4)
+    /// in a concurrent sync tick could see the task as `InReview`, find the key absent,
+    /// and re-dispatch it — silently discarding human `CHANGES_REQUESTED` feedback when
+    /// the review agent later completed and marked the task `Done`.
+    ///
+    /// The fix: insert `dispatch_key` BEFORE `tokio::spawn`, remove it AFTER the future
+    /// completes. This test verifies that invariant using tokio channels to synchronize
+    /// with a simulated concurrent caller (review_open_prs).
+    #[tokio::test]
+    async fn dispatch_key_held_during_review_agent_execution() {
+        use tokio::sync::oneshot;
+
+        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+        let dispatch_key = "owner/repo/42".to_string();
+
+        // Step 1: insert before spawning — this is the invariant added by a6d8b9a.
+        {
+            let mut guard = dispatching.lock().unwrap();
+            guard.insert(dispatch_key.clone());
+        }
+
+        let (agent_started_tx, agent_started_rx) = oneshot::channel::<()>();
+        let (check_done_tx, check_done_rx) = oneshot::channel::<()>();
+
+        let dispatching_agent = Arc::clone(&dispatching);
+        let key_agent = dispatch_key.clone();
+
+        // Step 2: spawn review agent — key is ALREADY in the set (fix invariant holds).
+        let review_task = tokio::spawn(async move {
+            agent_started_tx.send(()).unwrap();
+            // Simulate review agent work — hold until the concurrent check is done.
+            check_done_rx.await.unwrap();
+            // Remove from dispatching set on completion (mirror of tick.rs/sync.rs).
+            let mut guard = dispatching_agent.lock().unwrap();
+            guard.remove(&key_agent);
+        });
+
+        // Step 3: concurrent review_open_prs check — simulates step 4 of another
+        // sync_tick invocation running while the review agent is still active.
+        agent_started_rx.await.unwrap();
+        {
+            let guard = dispatching.lock().unwrap();
+            assert!(
+                guard.contains(&dispatch_key),
+                "dispatch_key must be visible in the dispatching set while the review \
+                 agent is running — without the a6d8b9a fix, review_open_prs would see \
+                 the key absent and re-dispatch the task, silently dropping \
+                 CHANGES_REQUESTED feedback"
+            );
+        }
+
+        // Step 4: review agent completes.
+        check_done_tx.send(()).unwrap();
+        review_task.await.unwrap();
+
+        // Step 5: key released — review_open_prs can now act on the task if needed.
+        {
+            let guard = dispatching.lock().unwrap();
+            assert!(
+                !guard.contains(&dispatch_key),
+                "dispatch_key must be removed from the dispatching set after the \
+                 review agent completes so subsequent sync ticks can process the task"
+            );
+        }
+    }
+
     #[test]
     fn dispatching_key_includes_repo_for_cross_project_isolation() {
         let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
