@@ -890,6 +890,28 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Reset transient failure/retry counters to zero, preserving `review_cycles`.
+    ///
+    /// Use this after `RequestChanges` to clear per-attempt noise without
+    /// undoing the review-cycle count that `handle_review_changes` just set.
+    pub async fn reset_failure_counters(&self, id: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE tasks SET
+                attempts = 0,
+                route_attempts = 0,
+                review_agent_failures = 0,
+                merge_conflict_retries = 0,
+                pr_create_failures = 0,
+                ci_merge_failures = 0,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // ---------------------------------------------------------------
     // Routing
     // ---------------------------------------------------------------
@@ -3042,6 +3064,42 @@ mod tests {
         assert_eq!(task.agent, Some("claude".to_string()));
         assert_eq!(task.branch, "fix-123");
         assert_eq!(task.summary, "did something");
+    }
+
+    #[tokio::test]
+    async fn reset_failure_counters_preserves_review_cycles() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id = store
+            .create(&NewTask {
+                external_id: None,
+                repo: "owner/repo".to_string(),
+                origin: "internal".to_string(),
+                title: "Test".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Simulate counters after a review cycle: review_cycles=1, plus transient failures
+        store.increment(id, "review_cycles").await.unwrap();
+        store.increment(id, "attempts").await.unwrap();
+        store.increment(id, "review_agent_failures").await.unwrap();
+        store.increment(id, "merge_conflict_retries").await.unwrap();
+
+        // reset_failure_counters must zero transient counters but preserve review_cycles
+        store.reset_failure_counters(id).await.unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.review_cycles, 1, "review_cycles must be preserved");
+        assert_eq!(task.attempts, 0);
+        assert_eq!(task.review_agent_failures, 0);
+        assert_eq!(task.merge_conflict_retries, 0);
     }
 
     #[tokio::test]

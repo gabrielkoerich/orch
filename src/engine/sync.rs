@@ -257,9 +257,20 @@ pub(crate) async fn sync_tick(
                             ReviewOutcome::Reset
                         }
                     }
-                    Ok(_) => {
+                    Ok(ReviewDecision::Approve) | Ok(ReviewDecision::Skipped) => {
                         super::cleanup::store_reset_counters(&Some(store_c.clone()), &repo_s, &tid)
                             .await;
+                        ReviewOutcome::Ok
+                    }
+                    Ok(ReviewDecision::RequestChanges { .. }) => {
+                        // handle_review_changes already incremented review_cycles —
+                        // only reset transient per-attempt counters.
+                        super::cleanup::store_reset_failure_counters(
+                            &Some(store_c.clone()),
+                            &repo_s,
+                            &tid,
+                        )
+                        .await;
                         ReviewOutcome::Ok
                     }
                 };
