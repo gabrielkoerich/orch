@@ -178,6 +178,22 @@ pub(crate) async fn store_reset_counters(
     }
 }
 
+/// Reset transient failure/retry counters, preserving `review_cycles`.
+///
+/// Use this after a `RequestChanges` review decision so that per-attempt
+/// noise is cleared without undoing the cycle count set by `handle_review_changes`.
+pub(crate) async fn store_reset_failure_counters(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) {
+    if let Some(ref store) = store {
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            let _ = store.reset_failure_counters(store_id).await;
+        }
+    }
+}
+
 /// Get token usage from the store.
 pub(crate) async fn get_token_usage(
     store: &Option<Arc<TaskStore>>,
@@ -1559,6 +1575,39 @@ mod tests {
         let store: Option<Arc<TaskStore>> = None;
         // Should not panic
         store_reset_counters(&store, "owner/repo", "no-task").await;
+    }
+
+    #[tokio::test]
+    async fn store_reset_failure_counters_preserves_review_cycles() {
+        use crate::store::{NewTask, TaskStore};
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let id = store
+            .create(&NewTask {
+                external_id: Some("93".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Failure counter test".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let opt_store = Some(store.clone());
+        store_increment(&opt_store, "owner/repo", "93", "review_cycles").await;
+        store_increment(&opt_store, "owner/repo", "93", "attempts").await;
+        store_increment(&opt_store, "owner/repo", "93", "merge_conflict_retries").await;
+
+        // Calling the failure-only reset must preserve review_cycles
+        store_reset_failure_counters(&opt_store, "owner/repo", "93").await;
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.review_cycles, 1,
+            "review_cycles must survive failure counter reset"
+        );
+        assert_eq!(task.attempts, 0);
+        assert_eq!(task.merge_conflict_retries, 0);
     }
 
     // ── get_total_tokens ──────────────────────────────────────────────────

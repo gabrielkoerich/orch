@@ -670,16 +670,29 @@ pub(crate) async fn tick_dispatch_tasks(
                                                     }
                                                 }
                                             }
-                                            Ok(_) => {
-                                                // Reset all review-cycle failure counters on success
-                                                // so a subsequent retry doesn't inherit stale values.
+                                            Ok(super::review::ReviewDecision::Approve)
+                                            | Ok(super::review::ReviewDecision::Skipped) => {
+                                                // Full reset: task is done with the review cycle.
                                                 super::cleanup::store_reset_counters(
                                                     &Some(store_for_review.clone()),
                                                     &repo_owned,
                                                     &task_id_for_review,
                                                 )
                                                 .await;
-                                            } // Approve or RequestChanges handled inside
+                                            }
+                                            Ok(super::review::ReviewDecision::RequestChanges {
+                                                ..
+                                            }) => {
+                                                // handle_review_changes already incremented
+                                                // review_cycles — only reset transient per-attempt
+                                                // counters so the cycle count is preserved.
+                                                super::cleanup::store_reset_failure_counters(
+                                                    &Some(store_for_review.clone()),
+                                                    &repo_owned,
+                                                    &task_id_for_review,
+                                                )
+                                                .await;
+                                            }
                                         }
                                         // Release the per-task lock so sync_tick can act on this task.
                                         {
