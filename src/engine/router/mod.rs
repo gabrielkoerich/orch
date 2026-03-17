@@ -118,6 +118,13 @@ impl Router {
         self.weights.ensure_agents(&new_agents);
     }
 
+    /// Invalidate the skills catalog cache so the next routing call reloads from disk.
+    ///
+    /// Call this after `skills_sync()` writes new/updated skill files.
+    pub fn invalidate_skills_catalog(&self) {
+        self.llm_router.invalidate_skills_catalog();
+    }
+
     /// Discover available agent CLIs in PATH.
     /// Checks all agents from the configured list.
     fn discover_agents(configured_agents: &[String]) -> Vec<String> {
