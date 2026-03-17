@@ -31,7 +31,13 @@ fn format_age(updated_at: &str) -> String {
     } else if secs < 86400 {
         format!("{}h", secs / 3600)
     } else {
-        format!("{}d", secs / 86400)
+        let days = secs / 86400;
+        if days >= 365 {
+            let years = days / 365;
+            format!("{}y", years)
+        } else {
+            format!("{}d", days)
+        }
     }
 }
 
