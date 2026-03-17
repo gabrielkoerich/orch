@@ -1301,9 +1301,11 @@ pub(crate) async fn auto_merge_pr(
             tracing::warn!(
                 task_id = task.id.0,
                 pr_number,
-                "automated review says changes_requested — skipping merge"
+                "automated review says changes_requested — approve comment was not posted, returning error"
             );
-            return Ok(());
+            anyhow::bail!(
+                "approve comment was not posted (latest review is changes_requested); task should be re-queued"
+            );
         }
         _ => {
             tracing::info!(
