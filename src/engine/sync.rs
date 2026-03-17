@@ -393,8 +393,15 @@ pub(crate) async fn sync_tick(
     }
 
     // 7. Sync skill repositories
-    if let Err(e) = skills_sync().await {
-        tracing::warn!(err = %e, "skills sync failed");
+    match skills_sync().await {
+        Ok(()) => {
+            // Invalidate the LLM router's skills catalog cache so new/updated
+            // skill files are picked up on the next routing call.
+            router.read().await.invalidate_skills_catalog();
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "skills sync failed");
+        }
     }
 
     Ok(())

@@ -201,6 +201,19 @@ pub(crate) async fn tick_recover_stuck_tasks(
                     "recovering stuck internal task: no session found — reclaiming early → new"
                 );
             }
+            // Reset routing state so the LLM router is used on the next attempt
+            // (same reset that external tasks perform).
+            super::cleanup::store_set(
+                &Some(Arc::clone(store)),
+                repo,
+                &task_id,
+                &[
+                    ("agent", serde_json::Value::Null),
+                    ("model", serde_json::Value::Null),
+                    ("route_attempts", serde_json::json!(0)),
+                ],
+            )
+            .await;
             if let Err(e) = task_manager
                 .update_task_status(&ExternalId(task_id.clone()), Status::New)
                 .await

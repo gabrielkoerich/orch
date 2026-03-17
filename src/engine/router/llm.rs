@@ -210,6 +210,15 @@ impl LlmRouter {
         Ok(prompt)
     }
 
+    /// Invalidate the skills catalog cache so the next routing call reloads from disk.
+    ///
+    /// Called after `skills_sync()` updates skill files on disk.
+    pub fn invalidate_skills_catalog(&self) {
+        if let Ok(mut cache) = self.skills_catalog.lock() {
+            *cache = None;
+        }
+    }
+
     /// Load skills catalog from skills.yml or skills directory.
     /// Cached after first load to avoid blocking I/O in async context.
     fn load_skills_catalog(&self) -> String {
