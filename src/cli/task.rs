@@ -41,6 +41,15 @@ fn format_age(updated_at: &str) -> String {
     }
 }
 
+/// Truncate an error message to a maximum length, appending an ellipsis when truncated.
+fn truncate_err(err: &str, max: usize) -> String {
+    if err.len() > max {
+        format!("{}…", &err[..max])
+    } else {
+        err.to_string()
+    }
+}
+
 /// Store-first status update for CLI: updates SQLite first, then mirrors to backend.
 async fn update_status_store_first(
     store: &Option<Arc<TaskStore>>,
@@ -221,9 +230,59 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             if let Some(agent) = &int.agent {
                 println!("Agent: {}", agent);
             }
+<<<<<<< HEAD
             if let Some(reason) = &int.block_reason {
                 println!("Block reason: {}", reason);
             }
+=======
+            if let Some(model) = &int.model {
+                println!("Model: {}", model);
+            }
+            if !int.complexity.is_empty() {
+                println!("Complexity: {}", int.complexity);
+            }
+            if let Some(reason) = &int.block_reason {
+                println!("Block reason: {}", reason);
+            }
+            // Routing & execution counters
+            if int.route_attempts > 0 {
+                println!("Route attempts: {}", int.route_attempts);
+            }
+            if int.attempts > 0 {
+                println!("Attempts: {}", int.attempts);
+            }
+            if int.review_cycles > 0 {
+                println!("Review cycles: {}", int.review_cycles);
+            }
+            // PR info
+            if let Some(pr) = int.pr_number {
+                println!("PR: #{}", pr);
+            }
+            // Branch / worktree
+            if !int.branch.is_empty() {
+                println!("Branch: {}", int.branch);
+            }
+            // Last error (truncated to 200 chars)
+            if !int.last_error.is_empty() {
+                let err = if int.last_error.len() > 200 {
+                    format!("{}…", &int.last_error[..200])
+                } else {
+                    int.last_error.clone()
+                };
+                println!("Last error: {}", err);
+            }
+            // Parent
+            if let Some(parent) = int.parent_id {
+                println!("Parent: internal:{}", parent);
+            }
+            // Cost summary (if any tokens recorded)
+            if int.input_tokens > 0 || int.output_tokens > 0 {
+                println!(
+                    "Tokens: {} in / {} out — ${:.6}",
+                    int.input_tokens, int.output_tokens, int.total_cost_usd
+                );
+            }
+>>>>>>> 3c666a0 (feat: show diagnostic fields in `orch task get` for internal tasks)
             println!("Created: {}", int.created_at);
             println!("Updated: {}", int.updated_at);
             println!("\n{}", int.body);
