@@ -11,14 +11,46 @@ use chrono::{DateTime, Utc};
 use cron::Schedule;
 use std::str::FromStr;
 
+/// Normalize day-of-week field: standard cron allows 0 for Sunday, but the
+/// `cron` crate only accepts 1-7 (Sun=1). Replace standalone `0` with `7`.
+fn normalize_dow(expression: &str) -> String {
+    let fields: Vec<&str> = expression.split_whitespace().collect();
+    if fields.len() != 5 {
+        return expression.to_string();
+    }
+    let dow = fields[4];
+    // Replace 0 with 7 in the DOW field, handling ranges/lists (e.g. "0,3" → "7,3", "0-5" → "7-5")
+    let normalized_dow = dow
+        .split(',')
+        .map(|part| {
+            if part == "0" {
+                "7".to_string()
+            } else if let Some(rest) = part.strip_prefix("0-") {
+                format!("7-{rest}")
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{} {} {} {} {}",
+        fields[0], fields[1], fields[2], fields[3], normalized_dow
+    )
+}
+
 /// Check if a cron expression matches now, or (with `since`) has matched
 /// at any point between `since` and now.
 ///
 /// Returns `true` if the cron fired, `false` otherwise.
 pub fn check(expression: &str, since: Option<&str>) -> anyhow::Result<bool> {
     // cron crate expects 7-field expressions (sec min hour dom mon dow year)
-    // We accept 5-field (min hour dom mon dow) and wrap with "0" seconds + "*" year
-    let full_expr = format!("0 {expression} *");
+    // We accept 5-field (min hour dom mon dow) and wrap with "0" seconds + "*" year.
+    //
+    // The cron crate uses 1-7 for DOW (Sun=1..Sat=7), but standard cron uses
+    // 0-7 where both 0 and 7 mean Sunday. Normalize DOW=0 → DOW=7.
+    let normalized = normalize_dow(expression);
+    let full_expr = format!("0 {normalized} *");
 
     let schedule = Schedule::from_str(&full_expr)
         .with_context(|| format!("invalid cron expression: {expression}"))?;
@@ -123,6 +155,35 @@ mod tests {
     fn invalid_since_timestamp_errors() {
         let result = check("* * * * *", Some("not-a-date"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sunday_as_zero_parses() {
+        // Standard cron uses 0 for Sunday; the cron crate uses 1-7 (Sun=1)
+        let result = check("0 20 * * 0", None);
+        assert!(
+            result.is_ok(),
+            "DOW=0 (Sunday) should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn sunday_as_seven_still_works() {
+        let result = check("0 20 * * 7", None);
+        assert!(
+            result.is_ok(),
+            "DOW=7 (Sunday) should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn dow_zero_in_list_parses() {
+        // e.g. "every Sunday and Wednesday"
+        let result = check("0 20 * * 0,3", None);
+        assert!(
+            result.is_ok(),
+            "DOW=0 in list should be accepted: {result:?}"
+        );
     }
 
     #[test]
