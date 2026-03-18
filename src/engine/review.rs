@@ -1251,6 +1251,24 @@ pub(crate) async fn review_and_merge(
                     );
                     return Ok(ReviewDecision::Failed(format!("merge failed: {e}")));
                 }
+            } else {
+                // auto_close_task_on_approval=false: PR stays open for human to merge,
+                // but orch's review is complete — mark Done to stop the NeedsReview loop.
+                tracing::info!(
+                    task_id = task.id.0,
+                    pr_number = pr_number_early,
+                    "review approved, PR left open for human merge — marking task done"
+                );
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::Done)
+                    .await
+                {
+                    tracing::error!(
+                        task_id = task.id.0,
+                        err = %e,
+                        "update_task_status(Done) failed — task may be stuck in InReview"
+                    );
+                }
             }
             Ok(ReviewDecision::Approve)
         }
