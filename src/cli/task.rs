@@ -287,14 +287,6 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             println!("Title: {}", int.title);
             println!("Status: {}", int.status.as_str());
             println!("Source: {}", int.source);
-            if let Some(agent) = &int.agent {
-                println!("Agent: {}", agent);
-            }
-<<<<<<< HEAD
-            if let Some(reason) = &int.block_reason {
-                println!("Block reason: {}", reason);
-            }
-=======
             if let Some(model) = &int.model {
                 println!("Model: {}", model);
             }
@@ -324,11 +316,7 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             }
             // Last error (truncated to 200 chars)
             if !int.last_error.is_empty() {
-                let err = if int.last_error.len() > 200 {
-                    format!("{}…", &int.last_error[..200])
-                } else {
-                    int.last_error.clone()
-                };
+                let err = truncate_err(&int.last_error, 200);
                 println!("Last error: {}", err);
             }
             // Parent
@@ -342,7 +330,6 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
                     int.input_tokens, int.output_tokens, int.total_cost_usd
                 );
             }
->>>>>>> 3c666a0 (feat: show diagnostic fields in `orch task get` for internal tasks)
             println!("Created: {}", int.created_at);
             println!("Updated: {}", int.updated_at);
             println!("\n{}", int.body);
