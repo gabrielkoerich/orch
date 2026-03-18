@@ -467,7 +467,7 @@ impl LlmRouter {
         &self,
         task: &ExternalTask,
         agent: &str,
-        profile: &AgentProfile,
+        _profile: &AgentProfile,
     ) -> Option<String> {
         let labels_lower: Vec<String> = task.labels.iter().map(|l| l.to_lowercase()).collect();
 
@@ -494,11 +494,6 @@ impl LlmRouter {
 
         if !docs_labels.is_empty() && agent == "codex" {
             return Some("docs-labeled task routed to codex".to_string());
-        }
-
-        // Check for missing skills
-        if profile.skills.is_empty() {
-            return Some("profile missing skills".to_string());
         }
 
         None
@@ -777,16 +772,6 @@ mod tests {
         let profile = make_profile(vec!["markdown"]);
         let warning = router.check_routing_sanity(&task, "codex", &profile);
         assert!(warning.is_some());
-    }
-
-    #[test]
-    fn sanity_warns_empty_skills_in_profile() {
-        let router = make_router();
-        let task = make_task(vec!["feature"]);
-        let profile = make_profile(vec![]); // no skills
-        let warning = router.check_routing_sanity(&task, "opencode", &profile);
-        assert!(warning.is_some(), "should warn when profile has no skills");
-        assert!(warning.unwrap().contains("skills"));
     }
 
     #[test]
