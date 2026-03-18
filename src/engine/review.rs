@@ -1215,9 +1215,11 @@ pub(crate) async fn review_and_merge(
     match decision {
         ReviewDecision::Approve => {
             // Use the same flag as the human-review path (review_open_prs).
-            // Falls back to workflow.auto_merge for backwards-compatibility,
-            // but auto_close_task_on_approval takes precedence when set.
+            // Falls back to workflow.auto_close (common config key), then
+            // workflow.auto_merge for backwards-compatibility.
+            // Must match the fallback chain in EngineConfig::from_config().
             let auto_merge = config::get("workflow.auto_close_task_on_approval")
+                .or_else(|_| config::get("workflow.auto_close"))
                 .or_else(|_| config::get("workflow.auto_merge"))
                 .map(|v| v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
