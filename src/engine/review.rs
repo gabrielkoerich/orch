@@ -28,7 +28,10 @@ use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::cleanup::{cleanup_task_worktree, store_increment, store_reset_counters, store_set};
+use super::cleanup::{
+    cleanup_task_worktree, store_increment, store_reset_counters, store_reset_failure_counters,
+    store_set,
+};
 use super::router::Router;
 use super::tasks::TaskManager;
 use super::EngineConfig;
@@ -547,7 +550,9 @@ pub(crate) async fn review_open_prs(
                 tracing::info!(task_id, "re-dispatching task to address review feedback");
                 // Reset per-cycle counters so transient failures from the previous review
                 // cycle don't count against the budget for the next cycle.
-                store_reset_counters(&Some(Arc::clone(store)), repo, task_id).await;
+                // Use store_reset_failure_counters (not store_reset_counters) to preserve
+                // review_cycles so max_review_cycles guard remains effective.
+                store_reset_failure_counters(&Some(Arc::clone(store)), repo, task_id).await;
             }
         }
     }
@@ -1383,7 +1388,7 @@ pub(crate) async fn auto_merge_pr(
                     task_manager
                         .update_task_status(&task.id, Status::Routed)
                         .await?;
-                    store_reset_counters(&Some(Arc::clone(store)), repo, &task.id.0).await;
+                    store_reset_failure_counters(&Some(Arc::clone(store)), repo, &task.id.0).await;
                 }
                 return Ok(());
             }
@@ -1415,7 +1420,8 @@ pub(crate) async fn auto_merge_pr(
                         task_manager
                             .update_task_status(&task.id, Status::Routed)
                             .await?;
-                        store_reset_counters(&Some(Arc::clone(store)), repo, &task.id.0).await;
+                        store_reset_failure_counters(&Some(Arc::clone(store)), repo, &task.id.0)
+                            .await;
                     }
                     return Ok(());
                 }
