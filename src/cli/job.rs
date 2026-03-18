@@ -3,8 +3,8 @@ use crate::engine::jobs::{self, Job, TaskTemplate};
 use anyhow::Context;
 use std::sync::Arc;
 
-/// List scheduled jobs.
-pub fn list() -> anyhow::Result<()> {
+/// List scheduled jobs (with runtime state from SQLite).
+pub async fn list() -> anyhow::Result<()> {
     let path = jobs::resolve_jobs_path();
     let jobs = jobs::load_jobs(&path)?;
 
@@ -13,6 +13,21 @@ pub fn list() -> anyhow::Result<()> {
         println!("Add one with: orch job add \"0 9 * * *\" \"Daily review\"");
         return Ok(());
     }
+
+    // Load runtime state from SQLite
+    let store = crate::cli::init_store().await.ok().map(Arc::new);
+    let repo = config::get_current_repo().unwrap_or_default();
+    let states: std::collections::HashMap<String, crate::store::JobState> =
+        if let Some(ref s) = store {
+            s.list_job_states(&repo)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|st| (st.job_id.clone(), st))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
 
     println!(
         "{:<20} {:<8} {:<20} {:<10} TITLE/COMMAND",
@@ -35,12 +50,14 @@ pub fn list() -> anyhow::Result<()> {
             desc,
         );
 
-        if let Some(ref last_run) = job.last_run {
-            println!(
-                "  Last run: {} (status: {})",
-                last_run,
-                job.last_task_status.as_deref().unwrap_or("unknown")
-            );
+        if let Some(state) = states.get(&job.id) {
+            if let Some(ref last_run) = state.last_run {
+                println!(
+                    "  Last run: {} (status: {})",
+                    last_run,
+                    state.last_task_status.as_deref().unwrap_or("unknown")
+                );
+            }
         }
     }
 
@@ -90,9 +107,6 @@ pub fn add(
         dir: None,
         enabled: true,
         external: true,
-        last_run: None,
-        last_task_status: None,
-        active_task_id: None,
     };
 
     jobs.push(job);

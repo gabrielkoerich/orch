@@ -530,7 +530,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Job { action } => match action {
             JobAction::List => {
-                cli::job::list()?;
+                cli::job::list().await?;
             }
             JobAction::Add {
                 schedule,

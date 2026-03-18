@@ -147,6 +147,16 @@ pub struct CostByGroup {
     pub task_count: i64,
 }
 
+/// Runtime state for a scheduled job, stored in SQLite (not in .orch.yml).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct JobState {
+    pub repo: String,
+    pub job_id: String,
+    pub last_run: Option<String>,
+    pub last_task_status: Option<String>,
+    pub active_task_id: Option<String>,
+}
+
 // ── End types ───────────────────────────────────────────────────────
 
 /// Build the week-scoped KV key for the self-improvement counter.
@@ -1274,6 +1284,70 @@ impl TaskStore {
         .bind(value)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Job State
+    // ---------------------------------------------------------------
+
+    /// Get runtime state for a job, keyed by (repo, job_id).
+    pub async fn get_job_state(
+        &self,
+        repo: &str,
+        job_id: &str,
+    ) -> anyhow::Result<Option<JobState>> {
+        let row: Option<JobState> = sqlx::query_as(
+            "SELECT repo, job_id, last_run, last_task_status, active_task_id
+             FROM job_state WHERE repo = ? AND job_id = ?",
+        )
+        .bind(repo)
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Upsert runtime state for a job.
+    pub async fn upsert_job_state(&self, state: &JobState) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO job_state (repo, job_id, last_run, last_task_status, active_task_id)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(repo, job_id) DO UPDATE SET
+               last_run = excluded.last_run,
+               last_task_status = excluded.last_task_status,
+               active_task_id = excluded.active_task_id",
+        )
+        .bind(&state.repo)
+        .bind(&state.job_id)
+        .bind(&state.last_run)
+        .bind(&state.last_task_status)
+        .bind(&state.active_task_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List all job states for a repo.
+    pub async fn list_job_states(&self, repo: &str) -> anyhow::Result<Vec<JobState>> {
+        let rows: Vec<JobState> = sqlx::query_as(
+            "SELECT repo, job_id, last_run, last_task_status, active_task_id
+             FROM job_state WHERE repo = ?",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Delete job state (for cleanup when a job is removed from config).
+    #[allow(dead_code)]
+    pub async fn delete_job_state(&self, repo: &str, job_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM job_state WHERE repo = ? AND job_id = ?")
+            .bind(repo)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

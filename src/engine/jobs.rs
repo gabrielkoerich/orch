@@ -15,7 +15,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::cmd::CommandErrorContext;
-use crate::store::{ErrorStat, MetricsSummary, SlowTaskInfo, TaskStatus};
+use crate::store::{ErrorStat, JobState, MetricsSummary, SlowTaskInfo, TaskStatus};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -41,12 +41,6 @@ pub struct Job {
     pub enabled: bool,
     #[serde(default = "default_external")]
     pub external: bool, // true = GitHub Issue, false (default) = internal SQLite task
-    #[serde(default)]
-    pub last_run: Option<String>,
-    #[serde(default)]
-    pub last_task_status: Option<String>,
-    #[serde(default)]
-    pub active_task_id: Option<String>,
 }
 
 /// Template for creating a task from a job.
@@ -158,23 +152,46 @@ fn is_not_found_error(e: &anyhow::Error) -> bool {
 }
 
 /// Check all jobs and execute due ones.
+///
+/// Runtime state (last_run, active_task_id, last_task_status) is stored in
+/// SQLite via the `job_state` table, not in the YAML config file.
 pub async fn tick(
     jobs_path: &PathBuf,
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<crate::store::TaskStore>>,
     repo: &str,
 ) -> anyhow::Result<()> {
-    let mut jobs = load_jobs(jobs_path)?;
-    let mut changed = false;
+    let jobs = load_jobs(jobs_path)?;
     let now = chrono::Utc::now();
 
-    for job in &mut jobs {
+    for job in &jobs {
         if !job.enabled {
             continue;
         }
 
+        // Load runtime state from SQLite
+        let mut state = if let Some(s) = store {
+            s.get_job_state(repo, &job.id)
+                .await?
+                .unwrap_or_else(|| JobState {
+                    repo: repo.to_string(),
+                    job_id: job.id.clone(),
+                    last_run: None,
+                    last_task_status: None,
+                    active_task_id: None,
+                })
+        } else {
+            JobState {
+                repo: repo.to_string(),
+                job_id: job.id.clone(),
+                last_run: None,
+                last_task_status: None,
+                active_task_id: None,
+            }
+        };
+
         // Check if schedule matches
-        let is_due = match &job.last_run {
+        let is_due = match &state.last_run {
             Some(last) => crate::cron::check(&job.schedule, Some(last))?,
             None => crate::cron::check(&job.schedule, None)?,
         };
@@ -187,14 +204,13 @@ pub async fn tick(
         let mut should_clear_task_id = false;
         let mut should_skip = false;
 
-        if let Some(ref task_id) = job.active_task_id {
+        if let Some(ref task_id) = state.active_task_id {
             if task_id.is_empty() {
-                job.active_task_id = None;
-                should_clear_task_id = false; // already cleared
+                state.active_task_id = None;
             }
         }
 
-        if let Some(ref task_id) = job.active_task_id {
+        if let Some(ref task_id) = state.active_task_id {
             let task_id_clone = task_id.clone();
             let is_active = if job.external {
                 // Check external (GitHub) task
@@ -213,18 +229,14 @@ pub async fn tick(
                     }
                     Err(e) => {
                         if is_not_found_error(&e) {
-                            // Task was permanently deleted — clear the stale reference
-                            // so the job can create a new task this tick.
                             tracing::warn!(
                                 job_id = job.id,
                                 task_id = task_id_clone,
                                 "active task not found (404), clearing active_task_id"
                             );
                             should_clear_task_id = true;
-                            job.last_task_status = Some("error".to_string());
+                            state.last_task_status = Some("error".to_string());
                         } else {
-                            // Transient error (rate limit, 5xx, network hiccup) — preserve
-                            // active_task_id and skip this tick. Will retry next cycle.
                             tracing::warn!(
                                 job_id = job.id,
                                 task_id = task_id_clone,
@@ -270,7 +282,6 @@ pub async fn tick(
                         false
                     }
                 } else {
-                    // No store — clear stale task id
                     should_clear_task_id = true;
                     false
                 }
@@ -289,7 +300,7 @@ pub async fn tick(
 
         // Apply deferred mutations
         if should_clear_task_id {
-            job.active_task_id = None;
+            state.active_task_id = None;
         }
 
         if should_skip {
@@ -299,14 +310,12 @@ pub async fn tick(
         tracing::info!(job_id = job.id, r#type = job.r#type, "job due, executing");
 
         // Set last_run BEFORE execution (prevents catch-up loops on restart)
-        job.last_run = Some(now.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-        changed = true;
+        state.last_run = Some(now.format("%Y-%m-%dT%H:%M:%SZ").to_string());
 
         match job.r#type.as_str() {
             "task" => {
                 if let Some(ref template) = job.task {
                     if job.external {
-                        // Create external (GitHub) task
                         let mut labels = template.labels.clone();
                         labels.push("scheduled".to_string());
                         labels.push(format!("job:{}", job.id));
@@ -327,8 +336,8 @@ pub async fn tick(
                                     task_id = ext_id.0,
                                     "created external task"
                                 );
-                                job.active_task_id = Some(ext_id.0);
-                                job.last_task_status = Some("new".to_string());
+                                state.active_task_id = Some(ext_id.0);
+                                state.last_task_status = Some("new".to_string());
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -336,11 +345,10 @@ pub async fn tick(
                                     ?e,
                                     "failed to create external task"
                                 );
-                                job.last_task_status = Some("failed".to_string());
+                                state.last_task_status = Some("failed".to_string());
                             }
                         }
                     } else if let Some(s) = store {
-                        // Create internal task via store
                         match s
                             .create_internal(repo, &template.title, &template.body, "cron", &job.id)
                             .await
@@ -348,8 +356,8 @@ pub async fn tick(
                             Ok(internal_id) => {
                                 let task_id = format!("internal:{}", internal_id);
                                 tracing::info!(job_id = job.id, task_id, "created internal task");
-                                job.active_task_id = Some(task_id);
-                                job.last_task_status = Some("new".to_string());
+                                state.active_task_id = Some(task_id);
+                                state.last_task_status = Some("new".to_string());
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -357,7 +365,7 @@ pub async fn tick(
                                     ?e,
                                     "failed to create internal task"
                                 );
-                                job.last_task_status = Some("failed".to_string());
+                                state.last_task_status = Some("failed".to_string());
                             }
                         }
                     } else {
@@ -365,7 +373,7 @@ pub async fn tick(
                             job_id = job.id,
                             "no store available for internal task creation"
                         );
-                        job.last_task_status = Some("failed".to_string());
+                        state.last_task_status = Some("failed".to_string());
                     }
                 }
             }
@@ -383,7 +391,7 @@ pub async fn tick(
 
                     match output {
                         Ok(o) if o.status.success() => {
-                            job.last_task_status = Some("done".to_string());
+                            state.last_task_status = Some("done".to_string());
                         }
                         Ok(o) => {
                             let stderr = String::from_utf8_lossy(&o.stderr);
@@ -393,40 +401,40 @@ pub async fn tick(
                                 %stderr,
                                 "bash command failed"
                             );
-                            job.last_task_status = Some("failed".to_string());
+                            state.last_task_status = Some("failed".to_string());
                         }
                         Err(e) => {
                             tracing::error!(job_id = job.id, ?e, "bash command error");
-                            job.last_task_status = Some("failed".to_string());
+                            state.last_task_status = Some("failed".to_string());
                         }
                     }
                 }
             }
-            "self-review" => {
-                // Analyze metrics and create self-improvement issues
-                match run_self_review(backend, store).await {
-                    Ok(issues_created) => {
-                        tracing::info!(job_id = job.id, issues_created, "self-review completed");
-                        job.last_task_status = Some(if issues_created > 0 {
-                            "done".to_string()
-                        } else {
-                            "no_issues".to_string()
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!(job_id = job.id, ?e, "self-review failed");
-                        job.last_task_status = Some("failed".to_string());
-                    }
+            "self-review" => match run_self_review(backend, store).await {
+                Ok(issues_created) => {
+                    tracing::info!(job_id = job.id, issues_created, "self-review completed");
+                    state.last_task_status = Some(if issues_created > 0 {
+                        "done".to_string()
+                    } else {
+                        "no_issues".to_string()
+                    });
                 }
-            }
+                Err(e) => {
+                    tracing::error!(job_id = job.id, ?e, "self-review failed");
+                    state.last_task_status = Some("failed".to_string());
+                }
+            },
             other => {
                 tracing::warn!(job_id = job.id, r#type = other, "unknown job type");
             }
         }
-    }
 
-    if changed {
-        save_jobs(jobs_path, &jobs)?;
+        // Persist state to SQLite
+        if let Some(s) = store {
+            if let Err(e) = s.upsert_job_state(&state).await {
+                tracing::error!(job_id = job.id, ?e, "failed to persist job state");
+            }
+        }
     }
 
     Ok(())
@@ -736,6 +744,11 @@ mod tests {
         }
     }
 
+    /// Create a temporary in-memory TaskStore for tests.
+    async fn test_store() -> Arc<crate::store::TaskStore> {
+        Arc::new(crate::store::TaskStore::open_memory().await.unwrap())
+    }
+
     #[tokio::test]
     async fn tick_clears_active_task_id_on_404() {
         // A 404 error (task deleted) should clear active_task_id and spawn a new task.
@@ -750,11 +763,22 @@ mod tests {
     task:
       title: Test task
       body: ""
-    last_run: "2000-01-01T00:00:00Z"
-    active_task_id: "old-task-42"
 "#,
         )
         .unwrap();
+
+        let store = test_store().await;
+        // Seed initial state in SQLite
+        store
+            .upsert_job_state(&JobState {
+                repo: "test/repo".into(),
+                job_id: "test-job".into(),
+                last_run: Some("2000-01-01T00:00:00Z".into()),
+                last_task_status: None,
+                active_task_id: Some("old-task-42".into()),
+            })
+            .await
+            .unwrap();
 
         let backend = Arc::new(ErrorBackend {
             error_msg: "GitHub API GET https://api.github.com/repos/foo/bar/issues/42 failed (404): Not Found".into(),
@@ -763,16 +787,20 @@ mod tests {
         tick(
             &path,
             &(backend.clone() as Arc<dyn ExternalBackend>),
-            None,
+            Some(&store),
             "test/repo",
         )
         .await
         .unwrap();
 
-        let jobs = load_jobs(&path).unwrap();
+        let state = store
+            .get_job_state("test/repo", "test-job")
+            .await
+            .unwrap()
+            .expect("state should exist");
         // active_task_id should point to the newly created task, not the old deleted one
         assert_ne!(
-            jobs[0].active_task_id,
+            state.active_task_id,
             Some("old-task-42".into()),
             "stale 404 ID should be cleared"
         );
@@ -795,11 +823,22 @@ mod tests {
     task:
       title: Test task
       body: ""
-    last_run: "2000-01-01T00:00:00Z"
-    active_task_id: "in-progress-99"
 "#,
         )
         .unwrap();
+
+        let store = test_store().await;
+        // Seed initial state: task in progress with old last_run
+        store
+            .upsert_job_state(&JobState {
+                repo: "test/repo".into(),
+                job_id: "test-job".into(),
+                last_run: Some("2000-01-01T00:00:00Z".into()),
+                last_task_status: None,
+                active_task_id: Some("in-progress-99".into()),
+            })
+            .await
+            .unwrap();
 
         let backend = Arc::new(ErrorBackend {
             error_msg: "GitHub API GET https://api.github.com/repos/foo/bar/issues/99 failed (429): rate limit exceeded".into(),
@@ -808,16 +847,20 @@ mod tests {
         tick(
             &path,
             &(backend.clone() as Arc<dyn ExternalBackend>),
-            None,
+            Some(&store),
             "test/repo",
         )
         .await
         .unwrap();
 
-        let jobs = load_jobs(&path).unwrap();
+        let state = store
+            .get_job_state("test/repo", "test-job")
+            .await
+            .unwrap()
+            .expect("state should exist");
         // active_task_id must be preserved — transient error, don't lose the reference
         assert_eq!(
-            jobs[0].active_task_id,
+            state.active_task_id,
             Some("in-progress-99".into()),
             "active_task_id must be preserved on transient error"
         );
@@ -940,19 +983,13 @@ mod tests {
             dir: None,
             enabled: true,
             external: true,
-            last_run: Some("2026-02-22T10:00:00Z".to_string()),
-            last_task_status: Some("done".to_string()),
-            active_task_id: None,
         }];
 
         save_jobs(&path, &jobs).unwrap();
         let reloaded = load_jobs(&path).unwrap();
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded[0].id, "test");
-        assert_eq!(
-            reloaded[0].last_run,
-            Some("2026-02-22T10:00:00Z".to_string())
-        );
+        assert_eq!(reloaded[0].schedule, "0 9 * * 1");
     }
 
     #[test]
