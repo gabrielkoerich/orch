@@ -714,6 +714,29 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
+    /// List all active (non-done) tasks across all repos.
+    ///
+    /// Used by the CLI when no project context is available (e.g. running from
+    /// a worktree without a `.orch.yml`). Does not require a repo argument.
+    pub async fn list_all_active_global(&self) -> anyhow::Result<Vec<Task>> {
+        let rows =
+            sqlx::query("SELECT * FROM tasks WHERE status != 'done' ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
+    /// List all active tasks matching an optional status filter, across all repos.
+    ///
+    /// Used by the CLI fallback path when no project context is available.
+    pub async fn list_all_by_status_global(&self, status: TaskStatus) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query("SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC")
+            .bind(status.as_str())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
     /// Aggregate cost and token data for a repo.
     /// Returns (total_input_tokens, total_output_tokens, total_cost_usd).
     #[allow(dead_code)]
@@ -3495,6 +3518,87 @@ mod tests {
         let all_b = store.list_all("owner/repo-b").await.unwrap();
         assert_eq!(all_b.len(), 1);
         assert_eq!(all_b[0].title, "Task B1");
+    }
+
+    #[tokio::test]
+    async fn list_all_active_global_returns_tasks_across_repos() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        // Tasks in two different repos
+        let id1 = store
+            .create(&NewTask {
+                external_id: Some("1".to_string()),
+                repo: "owner/repo-a".to_string(),
+                origin: "github".to_string(),
+                title: "Active A".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .create(&NewTask {
+                external_id: Some("2".to_string()),
+                repo: "owner/repo-b".to_string(),
+                origin: "github".to_string(),
+                title: "Active B".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Mark one as done — should be excluded
+        store.update_status(id1, TaskStatus::Done).await.unwrap();
+
+        let active = store.list_all_active_global().await.unwrap();
+        assert_eq!(active.len(), 1, "only non-done tasks returned: {active:?}");
+        assert_eq!(active[0].title, "Active B");
+    }
+
+    #[tokio::test]
+    async fn list_all_by_status_global_filters_correctly() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        let id1 = store
+            .create(&NewTask {
+                external_id: Some("1".to_string()),
+                repo: "owner/repo-a".to_string(),
+                origin: "github".to_string(),
+                title: "New task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .create(&NewTask {
+                external_id: Some("2".to_string()),
+                repo: "owner/repo-b".to_string(),
+                origin: "github".to_string(),
+                title: "Another new task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id1, TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        let new_tasks = store
+            .list_all_by_status_global(TaskStatus::New)
+            .await
+            .unwrap();
+        assert_eq!(
+            new_tasks.len(),
+            1,
+            "one new task across repos: {new_tasks:?}"
+        );
+        assert_eq!(new_tasks[0].title, "Another new task");
+
+        let in_progress = store
+            .list_all_by_status_global(TaskStatus::InProgress)
+            .await
+            .unwrap();
+        assert_eq!(in_progress.len(), 1);
+        assert_eq!(in_progress[0].title, "New task");
     }
 
     #[tokio::test]
