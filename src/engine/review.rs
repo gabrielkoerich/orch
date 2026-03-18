@@ -1716,11 +1716,10 @@ pub(crate) async fn handle_review_changes(
         tracing::warn!(task_id = task.id.0, pr_number, err = %e, "failed to post review comment on PR");
     }
 
-    // 3. Build review context
-    let review_context = format!(
-        "A reviewer has requested changes on your PR. Please address the following feedback:\n\n{}",
-        comment
-    );
+    // 3. Store review context.
+    //    The template (prompts/agent_message.md) already wraps PR_REVIEW_CONTEXT with
+    //    "A reviewer has requested changes on your PR. Please address the following feedback:",
+    //    so we store the comment body directly to avoid duplicating that header in the prompt.
     store_set(
         &Some(Arc::clone(store)),
         repo,
@@ -1730,10 +1729,7 @@ pub(crate) async fn handle_review_changes(
                 "review_cycles",
                 serde_json::json!((review_cycles + 1) as i64),
             ),
-            (
-                "pr_review_context",
-                serde_json::json!(review_context.clone()),
-            ),
+            ("pr_review_context", serde_json::json!(comment.clone())),
         ],
     )
     .await;
@@ -2098,9 +2094,26 @@ mod tests {
         );
 
         // pr_review_context must be stored for injection into the agent prompt.
+        // It must NOT contain the "A reviewer has requested changes" prefix — that
+        // prefix is already provided by the agent_message.md template wrapper so
+        // storing it here would duplicate the header in the agent prompt.
         assert!(
             !updated.pr_review_context.is_empty(),
             "pr_review_context must be stored so the re-dispatched agent sees the feedback"
+        );
+        assert!(
+            !updated
+                .pr_review_context
+                .starts_with("A reviewer has requested changes"),
+            "pr_review_context must NOT start with the template header — \
+             agent_message.md already adds it, double-prefix confuses the agent"
+        );
+        // The stored context must include the actual review content.
+        assert!(
+            updated
+                .pr_review_context
+                .contains("Please fix the type error on line 42"),
+            "pr_review_context must contain the review notes passed to handle_review_changes"
         );
 
         // review_cycles must have been incremented.
