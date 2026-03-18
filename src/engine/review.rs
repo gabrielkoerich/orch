@@ -1716,11 +1716,10 @@ pub(crate) async fn handle_review_changes(
         tracing::warn!(task_id = task.id.0, pr_number, err = %e, "failed to post review comment on PR");
     }
 
-    // 3. Build review context
-    let review_context = format!(
-        "A reviewer has requested changes on your PR. Please address the following feedback:\n\n{}",
-        comment
-    );
+    // 3. Store review context.
+    //    The template (prompts/agent_message.md) already wraps PR_REVIEW_CONTEXT with
+    //    "A reviewer has requested changes on your PR. Please address the following feedback:",
+    //    so we store the comment body directly to avoid duplicating that header in the prompt.
     store_set(
         &Some(Arc::clone(store)),
         repo,
@@ -1730,26 +1729,25 @@ pub(crate) async fn handle_review_changes(
                 "review_cycles",
                 serde_json::json!((review_cycles + 1) as i64),
             ),
-            (
-                "pr_review_context",
-                serde_json::json!(review_context.clone()),
-            ),
+            ("pr_review_context", serde_json::json!(comment.clone())),
         ],
     )
     .await;
 
-    // 4. Re-route the same task so the agent can address feedback on the same branch/PR.
-    //    The existing worktree and branch are reused — the agent gets pr_review_context
-    //    from the store and pushes fixes to the same PR.
+    // 4. Skip LLM re-classification and dispatch directly — the agent, model, and
+    //    worktree from the first routing cycle are reused. Setting Routed (not New)
+    //    bypasses the router so the existing store_route result is preserved.
+    //    This is consistent with review_open_prs which also sets Routed for
+    //    human-requested changes.
     task_manager
-        .update_task_status(&task.id, Status::New)
+        .update_task_status(&task.id, Status::Routed)
         .await?;
 
     tracing::info!(
         task_id = task.id.0,
         review_cycles = review_cycles + 1,
         pr_number,
-        "re-routing task to address review feedback on same PR"
+        "re-dispatching task (skipping re-route) to address review feedback on same PR"
     );
 
     Ok(())
@@ -1918,5 +1916,210 @@ mod tests {
     fn test_get_model_for_complexity_unknown_agent() {
         let model = get_model_for_complexity("simple", "unknown_agent_xyz");
         assert!(!model.is_empty());
+    }
+
+    /// Regression test: handle_review_changes must set status to Routed (not New).
+    ///
+    /// Before this fix, the function set status to New, which caused the task to
+    /// re-enter the LLM router on the next tick. This:
+    ///   1. Wasted an LLM routing call per review cycle.
+    ///   2. Risked the router selecting a different agent/model, discarding the
+    ///      existing store_route result that tracked agent, complexity, and skills.
+    ///   3. Was inconsistent with review_open_prs which correctly uses Routed for
+    ///      human-requested changes.
+    ///
+    /// The fix sets status to Routed so the dispatch tick picks up the task
+    /// directly without going through the routing phase, preserving the
+    /// existing agent/model assignment.
+    #[tokio::test]
+    async fn handle_review_changes_sets_routed_not_new() {
+        use crate::backends::{ExternalId, ExternalTask, Mention};
+        use crate::engine::tasks::TaskManager;
+        use crate::store::{NewTask, TaskStatus, TaskStore};
+        use async_trait::async_trait;
+
+        struct NoopBackend;
+        #[async_trait]
+        impl crate::backends::ExternalBackend for NoopBackend {
+            fn name(&self) -> &str {
+                "noop"
+            }
+            async fn create_task(
+                &self,
+                _t: &str,
+                _b: &str,
+                _l: &[String],
+            ) -> anyhow::Result<ExternalId> {
+                Ok(ExternalId("new".into()))
+            }
+            async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask> {
+                Ok(ExternalTask {
+                    id: id.clone(),
+                    title: "t".into(),
+                    body: "".into(),
+                    state: "open".into(),
+                    labels: vec![],
+                    author: "bot".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    url: "".into(),
+                })
+            }
+            async fn list_by_status(&self, _s: Status) -> anyhow::Result<Vec<ExternalTask>> {
+                Ok(vec![])
+            }
+            async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+                Ok(vec![])
+            }
+            async fn post_comment(&self, _id: &ExternalId, _b: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn set_labels(&self, _id: &ExternalId, _l: &[String]) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn remove_label(&self, _id: &ExternalId, _l: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+                Ok(vec![])
+            }
+            async fn create_sub_task(
+                &self,
+                _p: &ExternalId,
+                _t: &str,
+                _b: &str,
+                _l: &[String],
+            ) -> anyhow::Result<ExternalId> {
+                Ok(ExternalId("child".into()))
+            }
+            async fn ensure_status_label(&self, _l: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn has_open_issue_with_title(&self, _t: &str, _l: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn health_check(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn is_pr_merged(&self, _b: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+                Ok(Some("bot".into()))
+            }
+            async fn get_mentions(&self, _s: &str) -> anyhow::Result<Vec<Mention>> {
+                Ok(vec![])
+            }
+            async fn update_status(&self, _id: &ExternalId, _s: Status) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+
+        // Create an internal task in InReview status (simulates the state when the
+        // review agent has requested changes).
+        let task_id_num = store
+            .create(&NewTask {
+                external_id: None,
+                repo: repo.to_string(),
+                origin: "internal".to_string(),
+                title: "Implement feature X".to_string(),
+                body: "body".to_string(),
+                source: "cron".to_string(),
+                source_id: "daily".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(task_id_num, TaskStatus::InReview)
+            .await
+            .unwrap();
+
+        let task_id_str = format!("internal:{task_id_num}");
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(NoopBackend);
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            repo.to_string(),
+        ));
+
+        let task = ExternalTask {
+            id: ExternalId(task_id_str.clone()),
+            title: "Implement feature X".to_string(),
+            body: "body".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "".to_string(),
+        };
+
+        // Call handle_review_changes. The GhHttp::add_comment call inside will fail
+        // (no real GitHub token in tests) but the error is silently ignored — only
+        // the status update and store writes matter for this test.
+        let result = handle_review_changes(
+            &task,
+            "Please fix the type error on line 42",
+            &[],
+            &backend,
+            repo,
+            101,
+            "claude",
+            "sonnet",
+            &task_manager,
+            &store,
+        )
+        .await;
+
+        // The function must succeed even when the comment post fails.
+        assert!(
+            result.is_ok(),
+            "handle_review_changes returned Err: {result:?}"
+        );
+
+        // Status must be Routed (not New) — the task should skip the LLM router and
+        // be picked up directly by tick_dispatch_tasks.
+        let updated = store.get(task_id_num).await.unwrap();
+        assert_eq!(
+            updated.status,
+            TaskStatus::Routed,
+            "handle_review_changes must set Routed, not New, to reuse the existing \
+             agent/model assignment and skip unnecessary LLM re-classification"
+        );
+
+        // pr_review_context must be stored for injection into the agent prompt.
+        // It must NOT contain the "A reviewer has requested changes" prefix — that
+        // prefix is already provided by the agent_message.md template wrapper so
+        // storing it here would duplicate the header in the agent prompt.
+        assert!(
+            !updated.pr_review_context.is_empty(),
+            "pr_review_context must be stored so the re-dispatched agent sees the feedback"
+        );
+        assert!(
+            !updated
+                .pr_review_context
+                .starts_with("A reviewer has requested changes"),
+            "pr_review_context must NOT start with the template header — \
+             agent_message.md already adds it, double-prefix confuses the agent"
+        );
+        // The stored context must include the actual review content.
+        assert!(
+            updated
+                .pr_review_context
+                .contains("Please fix the type error on line 42"),
+            "pr_review_context must contain the review notes passed to handle_review_changes"
+        );
+
+        // review_cycles must have been incremented.
+        assert_eq!(
+            updated.review_cycles, 1,
+            "review_cycles must be incremented on each review change request"
+        );
     }
 }
