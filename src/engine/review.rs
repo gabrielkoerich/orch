@@ -1381,8 +1381,9 @@ pub(crate) async fn auto_merge_pr(
                         "CI failed — re-routing to agent to fix"
                     );
                     task_manager
-                        .update_task_status(&task.id, Status::New)
+                        .update_task_status(&task.id, Status::Routed)
                         .await?;
+                    store_reset_counters(&Some(Arc::clone(store)), repo, &task.id.0).await;
                 }
                 return Ok(());
             }
@@ -1412,8 +1413,9 @@ pub(crate) async fn auto_merge_pr(
                             "CI checks still pending after timeout — re-routing to agent"
                         );
                         task_manager
-                            .update_task_status(&task.id, Status::New)
+                            .update_task_status(&task.id, Status::Routed)
                             .await?;
+                        store_reset_counters(&Some(Arc::clone(store)), repo, &task.id.0).await;
                     }
                     return Ok(());
                 }
