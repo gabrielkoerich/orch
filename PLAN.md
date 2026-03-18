@@ -709,7 +709,7 @@ Before any Rust work, the current bash version needs to be rock-solid. This give
 - [x] ~~Sidecar JSON I/O~~ — replaced by unified SQLite store (`src/store.rs`)
 - [x] GitHub API client (gh CLI wrapper with serde parsing) — ~~`src/github/cli.rs`~~ removed, `src/github/types.rs`
 - [x] Native HTTP client (reqwest, connection pooling, header-based rate limiting) — `src/github/http.rs` (supersedes `cli.rs`)
-- [ ] ~~GitHub App auth (JWT, token refresh, GH_TOKEN export)~~ — using `gh auth token` / `GH_TOKEN` env instead
+ - [x] ~~GitHub App auth (JWT, token refresh, GH_TOKEN export)~~ — using `gh auth token` / `GH_TOKEN` env instead
 - [x] Agent response parser — `src/parser.rs`
 - [x] Cron matcher — `src/cron.rs`
 - [x] Template renderer — `src/template.rs`

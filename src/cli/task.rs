@@ -41,6 +41,15 @@ fn format_age(updated_at: &str) -> String {
     }
 }
 
+/// Truncate an error message to a maximum length, appending an ellipsis when truncated.
+fn truncate_err(err: &str, max: usize) -> String {
+    if err.len() > max {
+        format!("{}…", &err[..max])
+    } else {
+        err.to_string()
+    }
+}
+
 /// Store-first status update for CLI: updates SQLite first, then mirrors to backend.
 async fn update_status_store_first(
     store: &Option<Arc<TaskStore>>,
@@ -205,10 +214,70 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             {
                 println!("Agent: {}", agent);
             }
+
+            // Additional diagnostic fields (when recorded in the store)
+            if let Some(model) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "model").await
+            {
+                println!("Model: {}", model);
+            }
+            if let Some(complexity) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "complexity").await
+            {
+                if !complexity.is_empty() {
+                    println!("Complexity: {}", complexity);
+                }
+            }
+            if let Some(route_attempts) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "route_attempts").await
+            {
+                if !route_attempts.is_empty() {
+                    println!("Route attempts: {}", route_attempts);
+                }
+            }
+            if let Some(tries) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "attempts").await
+            {
+                if !tries.is_empty() {
+                    println!("Attempts: {}", tries);
+                }
+            }
+            if let Some(review_cycles) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "review_cycles").await
+            {
+                if !review_cycles.is_empty() {
+                    println!("Review cycles: {}", review_cycles);
+                }
+            }
+            if let Some(pr) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "pr_number").await
+            {
+                if !pr.is_empty() {
+                    println!("PR: #{}", pr);
+                }
+            }
             if let Some(branch) =
                 store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "branch").await
             {
-                println!("Branch: {}", branch);
+                if !branch.is_empty() {
+                    println!("Branch: {}", branch);
+                }
+            }
+            if let Some(last_err) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "last_error").await
+            {
+                if !last_err.is_empty() {
+                    println!("Last error: {}", truncate_err(&last_err, 200));
+                }
+            }
+            // Cost summary (if any tokens recorded)
+            let usage = store_helpers::get_token_usage(&store, &repo, &ext.id.0).await;
+            let cost = store_helpers::get_cost_estimate(&store, &repo, &ext.id.0).await;
+            if usage.total_tokens() > 0 || cost.total_cost_usd > 0.0 {
+                println!(
+                    "Tokens: {} in / {} out — ${:.6}",
+                    usage.input_tokens, usage.output_tokens, cost.total_cost_usd
+                );
             }
 
             println!("\n{}", ext.body);
@@ -218,11 +287,48 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             println!("Title: {}", int.title);
             println!("Status: {}", int.status.as_str());
             println!("Source: {}", int.source);
-            if let Some(agent) = &int.agent {
-                println!("Agent: {}", agent);
+            if let Some(model) = &int.model {
+                println!("Model: {}", model);
+            }
+            if !int.complexity.is_empty() {
+                println!("Complexity: {}", int.complexity);
             }
             if let Some(reason) = &int.block_reason {
                 println!("Block reason: {}", reason);
+            }
+            // Routing & execution counters
+            if int.route_attempts > 0 {
+                println!("Route attempts: {}", int.route_attempts);
+            }
+            if int.attempts > 0 {
+                println!("Attempts: {}", int.attempts);
+            }
+            if int.review_cycles > 0 {
+                println!("Review cycles: {}", int.review_cycles);
+            }
+            // PR info
+            if let Some(pr) = int.pr_number {
+                println!("PR: #{}", pr);
+            }
+            // Branch / worktree
+            if !int.branch.is_empty() {
+                println!("Branch: {}", int.branch);
+            }
+            // Last error (truncated to 200 chars)
+            if !int.last_error.is_empty() {
+                let err = truncate_err(&int.last_error, 200);
+                println!("Last error: {}", err);
+            }
+            // Parent
+            if let Some(parent) = int.parent_id {
+                println!("Parent: internal:{}", parent);
+            }
+            // Cost summary (if any tokens recorded)
+            if int.input_tokens > 0 || int.output_tokens > 0 {
+                println!(
+                    "Tokens: {} in / {} out — ${:.6}",
+                    int.input_tokens, int.output_tokens, int.total_cost_usd
+                );
             }
             println!("Created: {}", int.created_at);
             println!("Updated: {}", int.updated_at);
