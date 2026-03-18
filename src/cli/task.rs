@@ -77,7 +77,16 @@ async fn update_status_store_first(
 
 /// List tasks with optional filters.
 pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Result<()> {
-    let task_manager = init_task_manager().await?;
+    // When no project context is available (e.g. running from a worktree without
+    // .orch.yml), fall back to a store-only listing across all configured projects
+    // instead of printing a fatal error.
+    let task_manager = match init_task_manager().await {
+        Ok(tm) => tm,
+        Err(e) => {
+            tracing::debug!("no project context available, falling back to global store: {e:#}");
+            return list_from_global_store(status, source).await;
+        }
+    };
     let filter = TaskFilter { status, source };
     let tasks = task_manager.list_tasks(filter).await?;
 
@@ -146,6 +155,92 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
                 );
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Fallback listing used when no project context is available (no `.orch.yml` in CWD or parents).
+///
+/// Queries the global SQLite store directly without scoping to a specific repo.
+/// This suppresses the fatal "no valid projects" error that previously appeared
+/// when agents ran `orch task list` from inside a worktree.
+async fn list_from_global_store(
+    status: Option<String>,
+    source: Option<String>,
+) -> anyhow::Result<()> {
+    let store = match crate::cli::init_store().await {
+        Ok(s) => s,
+        Err(_) => {
+            println!("No tasks found.");
+            return Ok(());
+        }
+    };
+
+    let tasks = if let Some(ref status_str) = status {
+        let task_status =
+            crate::store::TaskStatus::from_str(status_str).unwrap_or(crate::store::TaskStatus::New);
+        store.list_all_by_status_global(task_status).await?
+    } else {
+        store.list_all_active_global().await?
+    };
+
+    // Apply optional source filter.
+    let tasks: Vec<_> = tasks
+        .into_iter()
+        .filter(|t| source.as_ref().map(|s| &t.source == s).unwrap_or(true))
+        .collect();
+
+    if tasks.is_empty() {
+        println!("No tasks found.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} TITLE",
+        "ID", "TYPE", "STATUS", "AGENT", "AGE", "TRIES"
+    );
+    println!("{}", "-".repeat(100));
+
+    for task in tasks {
+        let type_str = if task.origin == "internal" {
+            "internal"
+        } else {
+            "external"
+        };
+        let id_str = if task.origin == "internal" {
+            format!("internal:{}", task.id)
+        } else {
+            task.external_id
+                .clone()
+                .unwrap_or_else(|| task.id.to_string())
+        };
+        let agent = task.agent.as_deref().unwrap_or("-");
+        let age = format_age(&task.updated_at);
+        let tries = if task.attempts > 0 {
+            task.attempts.to_string()
+        } else {
+            "-".to_string()
+        };
+        let title = if task.status == crate::store::TaskStatus::Blocked {
+            if let Some(ref reason) = task.block_reason {
+                format!("{} [blocked: {}]", task.title, reason)
+            } else {
+                task.title.clone()
+            }
+        } else {
+            task.title.clone()
+        };
+        println!(
+            "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} {}",
+            id_str,
+            type_str,
+            task.status.as_str(),
+            agent,
+            age,
+            tries,
+            title
+        );
     }
 
     Ok(())
