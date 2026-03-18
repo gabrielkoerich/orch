@@ -82,7 +82,10 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
     // instead of printing a fatal error.
     let task_manager = match init_task_manager().await {
         Ok(tm) => tm,
-        Err(_) => return list_from_global_store(status, source).await,
+        Err(e) => {
+            tracing::debug!("no project context available, falling back to global store: {e:#}");
+            return list_from_global_store(status, source).await;
+        }
     };
     let filter = TaskFilter { status, source };
     let tasks = task_manager.list_tasks(filter).await?;
