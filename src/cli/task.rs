@@ -209,45 +209,63 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             println!("Updated: {}", ext.updated_at);
 
             // Show agent/branch info if available
-            if let Some(agent) = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "agent").await {
+            if let Some(agent) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "agent").await
+            {
                 println!("Agent: {}", agent);
             }
 
             // Additional diagnostic fields (when recorded in the store)
-            if let Some(model) = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "model").await {
+            if let Some(model) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "model").await
+            {
                 println!("Model: {}", model);
             }
-            if let Some(complexity) = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "complexity").await {
+            if let Some(complexity) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "complexity").await
+            {
                 if !complexity.is_empty() {
                     println!("Complexity: {}", complexity);
                 }
             }
-            if let Some(route_attempts) = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "route_attempts").await {
+            if let Some(route_attempts) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "route_attempts").await
+            {
                 if !route_attempts.is_empty() {
                     println!("Route attempts: {}", route_attempts);
                 }
             }
-            if let Some(tries) = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "attempts").await {
+            if let Some(tries) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "attempts").await
+            {
                 if !tries.is_empty() {
                     println!("Attempts: {}", tries);
                 }
             }
-            if let Some(review_cycles) = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "review_cycles").await {
+            if let Some(review_cycles) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "review_cycles").await
+            {
                 if !review_cycles.is_empty() {
                     println!("Review cycles: {}", review_cycles);
                 }
             }
-            if let Some(pr) = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "pr_number").await {
+            if let Some(pr) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "pr_number").await
+            {
                 if !pr.is_empty() {
                     println!("PR: #{}", pr);
                 }
             }
-            if let Some(branch) = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "branch").await {
+            if let Some(branch) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "branch").await
+            {
                 if !branch.is_empty() {
                     println!("Branch: {}", branch);
                 }
             }
-            if let Some(last_err) = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "last_error").await {
+            if let Some(last_err) =
+                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "last_error").await
+            {
                 if !last_err.is_empty() {
                     println!("Last error: {}", truncate_err(&last_err, 200));
                 }
