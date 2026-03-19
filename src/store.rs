@@ -738,6 +738,18 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
+    /// List all internal tasks across all repos.
+    ///
+    /// Used by the CLI fallback path when no project context is available
+    /// (e.g. running from a worktree without `.orch.yml`).
+    pub async fn list_all_internal_global(&self) -> anyhow::Result<Vec<Task>> {
+        let rows =
+            sqlx::query("SELECT * FROM tasks WHERE origin = 'internal' ORDER BY created_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
     /// Aggregate cost and token data for a repo.
     /// Returns (total_input_tokens, total_output_tokens, total_cost_usd).
     pub async fn cost_summary(&self, repo: &str) -> anyhow::Result<(i64, i64, f64)> {
