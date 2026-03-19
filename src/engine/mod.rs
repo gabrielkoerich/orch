@@ -1684,10 +1684,9 @@ async fn handle_stream_command(
     let task_id = parts[1].trim();
 
     // Check if the task has an active binding (i.e. is running)
-    if transport.get_binding(task_id).await.is_some() {
+    if let Some(binding) = transport.get_binding(task_id).await {
         // Bind this channel/thread as an additional output target
         // The session name is retrieved from the existing binding
-        let binding = transport.get_binding(task_id).await.unwrap();
         transport
             .bind(task_id, &binding.tmux_session, channel, thread_id)
             .await;
