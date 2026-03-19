@@ -49,7 +49,7 @@ use crate::repo_context::REPO_CONTEXT;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use runner::WeightSignal;
-use std::sync::atomic::{AtomicBool, Ordering};
+// AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 
@@ -818,14 +818,7 @@ pub async fn serve() -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
-    // Graceful shutdown flag — when set, the engine stops dispatching new tasks
-    // but continues ticking to monitor running sessions until they complete.
-    let shutting_down = Arc::new(AtomicBool::new(false));
-    let mut drain_deadline: Option<tokio::time::Instant> = None;
-
     loop {
-        let is_draining = shutting_down.load(Ordering::Relaxed);
-
         tokio::select! {
             _ = interval.tick() => {
                 // Drain any pending weight signals from completed tasks
@@ -846,33 +839,6 @@ pub async fn serve() -> anyhow::Result<()> {
                 {
                     let mut rw = router.write().await;
                     rw.tick_weight_recovery();
-                }
-
-                // During graceful shutdown, only check session completions —
-                // no new routing, dispatch, or sync work.
-                if is_draining {
-                    for engine in &project_engines {
-                        let repo = engine.repo.clone();
-                        REPO_CONTEXT.scope(repo, async {
-                            if let Err(e) = tick::tick_check_session_completions(&tmux, &engine.repo, &capture_for_tick).await {
-                                tracing::error!(repo = %engine.repo, ?e, "session completion check failed during drain");
-                            }
-                        }).await;
-                    }
-
-                    // Check if all sessions have finished
-                    let sessions = tmux.list_sessions().await.unwrap_or_default();
-                    if sessions.is_empty() {
-                        tracing::info!("all agent sessions completed, shutting down");
-                        break;
-                    } else {
-                        tracing::info!(
-                            remaining = sessions.len(),
-                            sessions = ?sessions.iter().map(|s| &s.name).collect::<Vec<_>>(),
-                            "waiting for agent sessions to complete"
-                        );
-                    }
-                    continue;
                 }
 
                 // Skip tick/sync entirely if GitHub API is rate-limited
@@ -971,7 +937,7 @@ pub async fn serve() -> anyhow::Result<()> {
                 }
             }
             // Webhook events trigger an immediate tick (bypass polling interval)
-            _ = webhook_notify.notified(), if !is_draining => {
+            _ = webhook_notify.notified() => {
                 if let Some(remaining) = GhHttp::is_rate_limited() {
                     tracing::warn!(
                         remaining_secs = remaining.as_secs(),
@@ -1012,7 +978,7 @@ pub async fn serve() -> anyhow::Result<()> {
                 // Also reset the interval so we don't get a redundant tick right after
                 interval.reset();
             }
-            result = config_rx.recv(), if !is_draining => {
+            result = config_rx.recv() => {
                 match result {
                     Ok(path) => {
                         tracing::info!(path = %path.display(), "config file changed, reloading");
@@ -1063,38 +1029,39 @@ pub async fn serve() -> anyhow::Result<()> {
                     _ = sighup.recv() => "SIGHUP",
                 }
             } => {
-                if is_draining {
-                    tracing::warn!(signal = signal_name, "received signal during drain, forcing immediate shutdown");
-                    break;
-                }
                 tracing::info!(signal = signal_name, "beginning graceful shutdown");
-                shutting_down.store(true, Ordering::Relaxed);
 
-                let sessions = tmux.list_sessions().await.unwrap_or_default();
-                if sessions.is_empty() {
-                    tracing::info!("no active sessions, shutting down immediately");
-                    break;
+                // Reset in_progress tasks to routed so they re-dispatch after restart.
+                // The tmux sessions will be killed when the process exits.
+                let mut reset_count = 0u32;
+                for engine in &project_engines {
+                    if let Ok(tasks) = engine.task_manager.list_external_by_status(Status::InProgress).await {
+                        for task in &tasks {
+                            if let Err(e) = engine.task_manager.update_task_status(&task.id, Status::Routed).await {
+                                tracing::warn!(task_id = task.id.0, ?e, "failed to reset task on shutdown");
+                            } else {
+                                reset_count += 1;
+                            }
+                        }
+                    }
+                    // Also reset internal in_progress tasks
+                    if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, crate::store::TaskStatus::InProgress).await {
+                        for task in &tasks {
+                            let task_id = format!("internal:{}", task.id);
+                            if let Err(e) = engine.task_manager.update_task_status(
+                                &crate::backends::ExternalId(task_id.clone()),
+                                Status::Routed,
+                            ).await {
+                                tracing::warn!(task_id, ?e, "failed to reset internal task on shutdown");
+                            } else {
+                                reset_count += 1;
+                            }
+                        }
+                    }
                 }
-                tracing::info!(
-                    count = sessions.len(),
-                    timeout_secs = config.graceful_shutdown_timeout.as_secs(),
-                    "waiting for running agents to complete before shutdown"
-                );
-                // Switch to a faster tick for drain monitoring
-                interval = tokio::time::interval(std::time::Duration::from_secs(5));
-                drain_deadline = Some(tokio::time::Instant::now() + config.graceful_shutdown_timeout);
-            }
-        }
-
-        // Check drain deadline
-        if let Some(deadline) = drain_deadline {
-            if tokio::time::Instant::now() >= deadline {
-                let sessions = tmux.list_sessions().await.unwrap_or_default();
-                tracing::warn!(
-                    remaining = sessions.len(),
-                    sessions = ?sessions.iter().map(|s| &s.name).collect::<Vec<_>>(),
-                    "graceful shutdown timeout reached, exiting with sessions still running"
-                );
+                if reset_count > 0 {
+                    tracing::info!(reset_count, "reset in_progress tasks to routed for re-dispatch");
+                }
                 break;
             }
         }
