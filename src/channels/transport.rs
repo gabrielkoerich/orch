@@ -289,6 +289,7 @@ mod tests {
             body: "hello".to_string(),
             timestamp: chrono::Utc::now(),
             metadata: serde_json::json!({}),
+            topic_id: None,
         };
 
         match transport.route(&msg).await {
@@ -309,6 +310,7 @@ mod tests {
             body: "/status".to_string(),
             timestamp: chrono::Utc::now(),
             metadata: serde_json::json!({}),
+            topic_id: None,
         };
 
         match transport.route(&msg).await {

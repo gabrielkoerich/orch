@@ -42,6 +42,9 @@ pub struct IncomingMessage {
     /// Optional metadata (labels, attachments, etc.)
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// Optional forum topic / thread ID (e.g. Telegram forum topic)
+    #[serde(default)]
+    pub topic_id: Option<String>,
 }
 
 /// A message to send to a channel.
@@ -56,6 +59,9 @@ pub struct OutgoingMessage {
     /// Optional metadata for channel-specific features
     #[serde(default)]
     pub metadata: serde_json::Value,
+    /// Optional forum topic / thread ID (e.g. Telegram forum topic)
+    #[serde(default)]
+    pub topic_id: Option<String>,
 }
 
 /// An agent output chunk for streaming.

@@ -409,6 +409,7 @@ fn parse_github_event(
                             "issue_number": issue.number,
                             "labels": labels
                         }),
+                        topic_id: None,
                     });
                 }
             }
@@ -430,6 +431,7 @@ fn parse_github_event(
                             "pr_number": pr.number,
                             "pr_title": pr.title
                         }),
+                        topic_id: None,
                     });
                 }
             }
@@ -451,6 +453,7 @@ fn parse_github_event(
                             "action": action,
                             "issue_number": issue.number
                         }),
+                        topic_id: None,
                     });
                 }
             }
@@ -476,6 +479,7 @@ fn parse_github_event(
                             "pr_number": pr.number,
                             "review_state": review.state
                         }),
+                        topic_id: None,
                     });
                 }
             }

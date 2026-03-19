@@ -76,6 +76,7 @@ async fn send_to_thread(
                 body,
                 reply_to: None,
                 metadata: serde_json::json!({}),
+                topic_id: None,
             };
             if let Err(e) = ch.send(&msg).await {
                 tracing::warn!(channel = channel_name, thread_id, ?e, "stream: send failed");

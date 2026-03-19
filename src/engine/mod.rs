@@ -482,6 +482,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 body,
                                 reply_to: None,
                                 metadata: serde_json::json!({}),
+                                topic_id: None,
                             };
 
                             if let Err(e) = channel.send(&msg).await {
@@ -1055,6 +1056,7 @@ async fn send_channel_reply(
                 body,
                 reply_to: None,
                 metadata: serde_json::json!({}),
+                topic_id: None,
             };
             if let Err(e) = ch.send(&msg).await {
                 tracing::warn!(

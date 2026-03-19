@@ -242,6 +242,7 @@ impl Channel for SlackChannel {
                         body: text,
                         timestamp,
                         metadata: serde_json::json!({ "channel_id": channel_id }),
+                        topic_id: None,
                     };
 
                     if tx.send(incoming).await.is_err() {

@@ -69,6 +69,51 @@ impl DiscordGateway {
         format!("https://discord.com/api/v10{endpoint}")
     }
 
+    /// Send a message with action row buttons to a specific channel.
+    ///
+    /// Returns the message ID of the sent message.
+    #[allow(dead_code)]
+    pub async fn send_with_buttons(
+        &self,
+        channel_id: &str,
+        text: &str,
+        buttons: &[(String, String)], // (label, custom_id)
+    ) -> anyhow::Result<String> {
+        let components = vec![serde_json::json!({
+            "type": 1, // ActionRow
+            "components": buttons.iter().map(|(label, custom_id)| {
+                serde_json::json!({
+                    "type": 2, // Button
+                    "style": 1, // Primary
+                    "label": label,
+                    "custom_id": custom_id
+                })
+            }).collect::<Vec<_>>()
+        })];
+
+        let body = serde_json::json!({
+            "content": text,
+            "components": components
+        });
+
+        let url = self.api_url(&format!("/channels/{channel_id}/messages"));
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("discord API error: {}", body);
+        }
+
+        let result: serde_json::Value = response.json().await?;
+        Ok(result["id"].as_str().unwrap_or("").to_string())
+    }
+
     async fn send_message(&self, channel_id: &str, content: &str) -> anyhow::Result<()> {
         let url = self.api_url(&format!("/channels/{channel_id}/messages"));
         let resp = self
@@ -100,25 +145,25 @@ impl Channel for DiscordGateway {
     async fn start(&self) -> anyhow::Result<mpsc::Receiver<IncomingMessage>> {
         let (tx, rx) = mpsc::channel(64);
         let token = self.token.clone();
-        let channel_id = self.channel_id.clone();
         let shard_id = self.shard_id;
         let shard_count = self.shard_count;
 
         tracing::info!(shard_id, shard_count, "discord gateway starting");
 
         tokio::spawn(async move {
-            run_gateway(token, channel_id, shard_id, shard_count, tx).await;
+            run_gateway(token, shard_id, shard_count, tx).await;
         });
 
         Ok(rx)
     }
 
     async fn send(&self, msg: &OutgoingMessage) -> anyhow::Result<()> {
-        let channel_id = self
-            .channel_id
+        let target_channel = msg
+            .topic_id
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("discord channel_id not configured"))?;
-        self.send_message(channel_id, &msg.body).await
+            .or(self.channel_id.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("no target channel for discord message"))?;
+        self.send_message(target_channel, &msg.body).await
     }
 
     async fn health_check(&self) -> anyhow::Result<()> {
@@ -185,7 +230,6 @@ impl GatewayState {
 /// Main gateway loop — connects, handles protocol, reconnects on error.
 async fn run_gateway(
     token: String,
-    channel_id: Option<String>,
     shard_id: u64,
     shard_count: u64,
     tx: mpsc::Sender<IncomingMessage>,
@@ -201,16 +245,8 @@ async fn run_gateway(
             Ok((ws, _)) => {
                 backoff = Duration::from_secs(1); // reset on success
 
-                let result = handle_connection(
-                    ws,
-                    &token,
-                    channel_id.as_deref(),
-                    shard_id,
-                    shard_count,
-                    &mut state,
-                    &tx,
-                )
-                .await;
+                let result =
+                    handle_connection(ws, &token, shard_id, shard_count, &mut state, &tx).await;
 
                 match result {
                     Ok(true) => {
@@ -255,7 +291,6 @@ async fn handle_connection(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     token: &str,
-    channel_id: Option<&str>,
     shard_id: u64,
     shard_count: u64,
     state: &mut GatewayState,
@@ -344,7 +379,6 @@ async fn handle_connection(
                                 if let Err(e) = handle_dispatch(
                                     payload.t.as_deref(),
                                     &payload.d,
-                                    channel_id,
                                     &mut state.session_id,
                                     &mut state.resume_url,
                                     tx,
@@ -449,7 +483,6 @@ where
 async fn handle_dispatch(
     event_type: Option<&str>,
     data: &Value,
-    channel_id: Option<&str>,
     session_id: &mut Option<String>,
     resume_url: &mut Option<String>,
     tx: &mpsc::Sender<IncomingMessage>,
@@ -470,13 +503,6 @@ async fn handle_dispatch(
         }
         Some("MESSAGE_CREATE") => {
             let msg_channel_id = data["channel_id"].as_str().unwrap_or("");
-
-            // Filter by configured channel_id when set
-            if let Some(configured) = channel_id {
-                if msg_channel_id != configured {
-                    return Ok(());
-                }
-            }
 
             // Skip messages from bots (avoid reacting to ourselves)
             if data["author"]["bot"].as_bool().unwrap_or(false) {
@@ -503,11 +529,60 @@ async fn handle_dispatch(
                 body,
                 timestamp,
                 metadata: serde_json::json!({}),
+                topic_id: Some(msg_channel_id.to_string()),
             };
 
             tx.send(incoming)
                 .await
                 .map_err(|_| anyhow::anyhow!("receiver closed"))?;
+        }
+        Some("INTERACTION_CREATE") => {
+            // Handle message component interactions (e.g. button clicks)
+            let interaction_type = data["type"].as_u64().unwrap_or(0);
+            if interaction_type == 3 {
+                // MESSAGE_COMPONENT
+                let interaction_id = data["id"].as_str().unwrap_or("").to_string();
+                let interaction_token = data["token"].as_str().unwrap_or("").to_string();
+                let custom_id = data["data"]["custom_id"].as_str().unwrap_or("").to_string();
+                let inter_channel_id = data["channel_id"].as_str().unwrap_or("").to_string();
+                let author = data["member"]["user"]["username"]
+                    .as_str()
+                    .or_else(|| data["user"]["username"].as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                // Acknowledge the interaction (type 6 = DEFERRED_UPDATE_MESSAGE)
+                let callback_url = format!(
+                    "https://discord.com/api/v10/interactions/{}/{}/callback",
+                    interaction_id, interaction_token
+                );
+                let client = Client::new();
+                let _ = client
+                    .post(&callback_url)
+                    .header("Content-Type", "application/json")
+                    .json(&serde_json::json!({ "type": 6 }))
+                    .send()
+                    .await;
+
+                let incoming = IncomingMessage {
+                    channel: "discord".to_string(),
+                    id: interaction_id.clone(),
+                    thread_id: inter_channel_id.clone(),
+                    author,
+                    body: custom_id.clone(),
+                    timestamp: Utc::now(),
+                    metadata: serde_json::json!({
+                        "interaction_id": interaction_id,
+                        "interaction_token": interaction_token,
+                        "custom_id": custom_id,
+                    }),
+                    topic_id: Some(inter_channel_id),
+                };
+
+                tx.send(incoming)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("receiver closed"))?;
+            }
         }
         Some(t) => {
             tracing::debug!(event_type = %t, "discord gateway: unhandled event");
@@ -541,7 +616,6 @@ mod tests {
         handle_dispatch(
             Some("MESSAGE_CREATE"),
             &data,
-            None,
             &mut session_id,
             &mut resume_url,
             &tx,
@@ -552,6 +626,7 @@ mod tests {
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.id, "123456789");
         assert_eq!(msg.thread_id, "987654321");
+        assert_eq!(msg.topic_id, Some("987654321".to_string()));
         assert_eq!(msg.author, "testuser");
         assert_eq!(msg.body, "hello world");
         assert_eq!(msg.channel, "discord");
@@ -574,7 +649,6 @@ mod tests {
         handle_dispatch(
             Some("MESSAGE_CREATE"),
             &data,
-            None,
             &mut session_id,
             &mut resume_url,
             &tx,
@@ -587,42 +661,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_dispatch_filters_by_channel_id() {
-        let (tx, mut rx) = mpsc::channel(10);
-        let data = serde_json::json!({
-            "id": "111",
-            "channel_id": "other-channel",
-            "author": {"username": "user", "bot": false},
-            "content": "wrong channel",
-            "timestamp": "2024-01-01T00:00:00+00:00",
-        });
-
-        let mut session_id = None;
-        let mut resume_url = None;
-
-        handle_dispatch(
-            Some("MESSAGE_CREATE"),
-            &data,
-            Some("configured-channel"), // only accept from this channel
-            &mut session_id,
-            &mut resume_url,
-            &tx,
-        )
-        .await
-        .unwrap();
-
-        // Should be filtered out
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn handle_dispatch_passes_matching_channel_id() {
+    async fn handle_dispatch_accepts_any_channel() {
         let (tx, mut rx) = mpsc::channel(10);
         let data = serde_json::json!({
             "id": "999",
-            "channel_id": "configured-channel",
+            "channel_id": "any-channel-id",
             "author": {"username": "user", "bot": false},
-            "content": "hello",
+            "content": "hello from any channel",
             "timestamp": "2024-01-01T00:00:00+00:00",
         });
 
@@ -632,7 +677,6 @@ mod tests {
         handle_dispatch(
             Some("MESSAGE_CREATE"),
             &data,
-            Some("configured-channel"),
             &mut session_id,
             &mut resume_url,
             &tx,
@@ -641,8 +685,9 @@ mod tests {
         .unwrap();
 
         let msg = rx.recv().await.unwrap();
-        assert_eq!(msg.body, "hello");
-        assert_eq!(msg.thread_id, "configured-channel");
+        assert_eq!(msg.body, "hello from any channel");
+        assert_eq!(msg.thread_id, "any-channel-id");
+        assert_eq!(msg.topic_id, Some("any-channel-id".to_string()));
     }
 
     #[tokio::test]
@@ -657,27 +702,20 @@ mod tests {
         let mut session_id = None;
         let mut resume_url = None;
 
-        handle_dispatch(
-            Some("READY"),
-            &data,
-            None,
-            &mut session_id,
-            &mut resume_url,
-            &tx,
-        )
-        .await
-        .unwrap();
+        handle_dispatch(Some("READY"), &data, &mut session_id, &mut resume_url, &tx)
+            .await
+            .unwrap();
 
         assert_eq!(session_id.as_deref(), Some("abc123"));
         assert_eq!(resume_url.as_deref(), Some("wss://us-east1.discord.gg"));
     }
 
     #[tokio::test]
-    async fn handle_dispatch_no_channel_filter_accepts_any() {
+    async fn handle_dispatch_accepts_messages_from_any_channel() {
         let (tx, mut rx) = mpsc::channel(10);
         let data = serde_json::json!({
             "id": "42",
-            "channel_id": "any-channel",
+            "channel_id": "random-channel",
             "author": {"username": "user", "bot": false},
             "content": "open message",
             "timestamp": "2024-01-01T00:00:00+00:00",
@@ -689,7 +727,6 @@ mod tests {
         handle_dispatch(
             Some("MESSAGE_CREATE"),
             &data,
-            None,
             &mut session_id,
             &mut resume_url,
             &tx,
@@ -699,7 +736,8 @@ mod tests {
 
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.id, "42");
-        assert_eq!(msg.thread_id, "any-channel");
+        assert_eq!(msg.thread_id, "random-channel");
+        assert_eq!(msg.topic_id, Some("random-channel".to_string()));
     }
 
     #[tokio::test]
@@ -721,7 +759,6 @@ mod tests {
         let result = handle_dispatch(
             Some("MESSAGE_CREATE"),
             &data,
-            None,
             &mut session_id,
             &mut resume_url,
             &tx,
@@ -730,5 +767,82 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("receiver closed"));
+    }
+
+    #[tokio::test]
+    async fn handle_dispatch_interaction_create_button_click() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let data = serde_json::json!({
+            "type": 3, // MESSAGE_COMPONENT
+            "id": "interaction-123",
+            "token": "interaction-token-abc",
+            "channel_id": "chan-456",
+            "data": {
+                "custom_id": "select_project:owner/repo"
+            },
+            "member": {
+                "user": {"username": "clicker"}
+            }
+        });
+
+        let mut session_id = None;
+        let mut resume_url = None;
+
+        handle_dispatch(
+            Some("INTERACTION_CREATE"),
+            &data,
+            &mut session_id,
+            &mut resume_url,
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.channel, "discord");
+        assert_eq!(msg.id, "interaction-123");
+        assert_eq!(msg.thread_id, "chan-456");
+        assert_eq!(msg.topic_id, Some("chan-456".to_string()));
+        assert_eq!(msg.body, "select_project:owner/repo");
+        assert_eq!(msg.author, "clicker");
+        assert_eq!(
+            msg.metadata["custom_id"].as_str(),
+            Some("select_project:owner/repo")
+        );
+        assert_eq!(
+            msg.metadata["interaction_id"].as_str(),
+            Some("interaction-123")
+        );
+        assert_eq!(
+            msg.metadata["interaction_token"].as_str(),
+            Some("interaction-token-abc")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_dispatch_interaction_create_ignores_non_component() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let data = serde_json::json!({
+            "type": 1, // PING, not MESSAGE_COMPONENT
+            "id": "interaction-999",
+            "token": "tok",
+            "channel_id": "ch",
+        });
+
+        let mut session_id = None;
+        let mut resume_url = None;
+
+        handle_dispatch(
+            Some("INTERACTION_CREATE"),
+            &data,
+            &mut session_id,
+            &mut resume_url,
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        // Should not produce a message for non-component interactions
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -29,6 +29,8 @@ struct TelegramMessage {
     chat: TelegramChat,
     text: Option<String>,
     date: i64,
+    #[serde(default)]
+    message_thread_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -37,9 +39,18 @@ struct TelegramChat {
 }
 
 #[derive(Deserialize)]
+struct CallbackQuery {
+    id: String,
+    from: TelegramUser,
+    message: Option<TelegramMessage>,
+    data: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct Update {
     update_id: i64,
     message: Option<TelegramMessage>,
+    callback_query: Option<CallbackQuery>,
 }
 
 #[derive(Deserialize)]
@@ -68,7 +79,7 @@ impl TelegramChannel {
         let params = serde_json::json!({
             "offset": offset,
             "timeout": 30,
-            "allowed_updates": ["message"]
+            "allowed_updates": ["message", "callback_query"]
         });
 
         let response = self.client.post(&url).json(&params).send().await?;
@@ -87,14 +98,22 @@ impl TelegramChannel {
         Ok(updates.result)
     }
 
-    async fn send_message(&self, chat_id: i64, text: &str) -> anyhow::Result<()> {
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        topic_id: Option<i64>,
+    ) -> anyhow::Result<()> {
         let url = self.api_url("sendMessage");
 
-        let params = serde_json::json!({
+        let mut params = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "Markdown"
         });
+        if let Some(tid) = topic_id {
+            params["message_thread_id"] = serde_json::json!(tid);
+        }
 
         let response = self.client.post(&url).json(&params).send().await?;
 
@@ -103,6 +122,63 @@ impl TelegramChannel {
             anyhow::bail!("telegram API error: {}", body);
         }
 
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn send_inline_keyboard(
+        &self,
+        chat_id: i64,
+        topic_id: Option<i64>,
+        text: &str,
+        buttons: &[(String, String)], // (label, callback_data)
+    ) -> anyhow::Result<i64> {
+        let keyboard: Vec<Vec<serde_json::Value>> = buttons
+            .iter()
+            .map(|(label, data)| {
+                vec![serde_json::json!({
+                    "text": label,
+                    "callback_data": data
+                })]
+            })
+            .collect();
+
+        let mut params = serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": { "inline_keyboard": keyboard }
+        });
+        if let Some(tid) = topic_id {
+            params["message_thread_id"] = serde_json::json!(tid);
+        }
+
+        let url = self.api_url("sendMessage");
+        let response = self.client.post(&url).json(&params).send().await?;
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("telegram API error: {}", body);
+        }
+        let result: serde_json::Value = response.json().await?;
+        let message_id = result["result"]["message_id"].as_i64().unwrap_or(0);
+        Ok(message_id)
+    }
+
+    #[allow(dead_code)]
+    pub async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let url = self.api_url("answerCallbackQuery");
+        let params = serde_json::json!({
+            "callback_query_id": callback_query_id,
+            "text": text
+        });
+        let response = self.client.post(&url).json(&params).send().await?;
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("telegram API error: {}", body);
+        }
         Ok(())
     }
 }
@@ -149,11 +225,6 @@ impl Channel for TelegramChannel {
                 let has_updates = !updates.is_empty();
 
                 for update in updates {
-                    let msg = match update.message {
-                        Some(m) => m,
-                        None => continue,
-                    };
-
                     // Update offset
                     {
                         let mut off = offset.lock().unwrap_or_else(|e| e.into_inner());
@@ -161,6 +232,59 @@ impl Channel for TelegramChannel {
                             *off = update.update_id + 1;
                         }
                     }
+
+                    // Handle callback queries
+                    if let Some(cb) = update.callback_query {
+                        let chat_id_val = cb
+                            .message
+                            .as_ref()
+                            .map(|m| m.chat.id.to_string())
+                            .unwrap_or_default();
+                        let topic_id = cb
+                            .message
+                            .as_ref()
+                            .and_then(|m| m.message_thread_id)
+                            .map(|id| id.to_string());
+                        let author = cb
+                            .from
+                            .username
+                            .clone()
+                            .unwrap_or(cb.from.first_name.clone());
+                        let body = cb.data.clone().unwrap_or_default();
+                        let msg_id = cb
+                            .message
+                            .as_ref()
+                            .map(|m| m.message_id.to_string())
+                            .unwrap_or_default();
+                        let msg_date = cb.message.as_ref().map(|m| m.date).unwrap_or(0);
+
+                        let incoming = IncomingMessage {
+                            channel: "telegram".to_string(),
+                            id: msg_id,
+                            thread_id: chat_id_val,
+                            author,
+                            body,
+                            timestamp: DateTime::from_timestamp(msg_date, 0)
+                                .unwrap_or_else(Utc::now),
+                            metadata: serde_json::json!({
+                                "callback_query_id": cb.id,
+                                "callback_data": cb.data
+                            }),
+                            topic_id,
+                        };
+
+                        if tx.send(incoming).await.is_err() {
+                            tracing::debug!("telegram channel receiver dropped");
+                            return;
+                        }
+                        continue;
+                    }
+
+                    // Handle regular messages
+                    let msg = match update.message {
+                        Some(m) => m,
+                        None => continue,
+                    };
 
                     let author = msg
                         .from
@@ -175,6 +299,8 @@ impl Channel for TelegramChannel {
                         continue;
                     }
 
+                    let topic_id = msg.message_thread_id.map(|id| id.to_string());
+
                     let incoming = IncomingMessage {
                         channel: "telegram".to_string(),
                         id: msg.message_id.to_string(),
@@ -183,6 +309,7 @@ impl Channel for TelegramChannel {
                         body,
                         timestamp: DateTime::from_timestamp(msg.date, 0).unwrap_or_else(Utc::now),
                         metadata: serde_json::json!({ "chat_id": msg.chat.id }),
+                        topic_id,
                     };
 
                     if tx.send(incoming).await.is_err() {
@@ -209,7 +336,8 @@ impl Channel for TelegramChannel {
             .parse::<i64>()
             .map_err(|_| anyhow::anyhow!("invalid chat_id"))?;
 
-        self.send_message(chat_id, &msg.body).await
+        let topic_id = msg.topic_id.as_ref().and_then(|t| t.parse::<i64>().ok());
+        self.send_message(chat_id, &msg.body, topic_id).await
     }
 
     async fn health_check(&self) -> anyhow::Result<()> {
