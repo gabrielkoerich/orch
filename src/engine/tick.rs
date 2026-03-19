@@ -511,6 +511,7 @@ pub(crate) async fn tick_dispatch_tasks(
                         agent: agent_name.clone(),
                         duration_seconds: duration,
                         summary: summary.clone(),
+                        repo: Some(repo_owned.clone()),
                     });
 
                     // Send weight signal back to the router
@@ -777,6 +778,7 @@ pub(crate) async fn tick_dispatch_tasks(
                         agent: agent_name.clone(),
                         duration_seconds: duration,
                         summary: format!("Task runner failed: {e}"),
+                        repo: Some(repo_owned.clone()),
                     });
                 }
             }

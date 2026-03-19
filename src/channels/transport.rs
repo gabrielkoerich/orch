@@ -228,6 +228,7 @@ mod tests {
             agent: "claude".to_string(),
             duration_seconds: 60.0,
             summary: "Completed successfully".to_string(),
+            repo: None,
         };
 
         transport.push_notification(notification.clone());
@@ -252,6 +253,7 @@ mod tests {
             agent: "codex".to_string(),
             duration_seconds: 10.0,
             summary: "Done".to_string(),
+            repo: None,
         });
 
         let n1 = rx1.recv().await.unwrap();
@@ -271,6 +273,7 @@ mod tests {
             agent: "claude".to_string(),
             duration_seconds: 0.0,
             summary: "Done".to_string(),
+            repo: None,
         });
     }
 

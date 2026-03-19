@@ -56,6 +56,8 @@ pub struct TaskNotification {
     pub agent: String,
     pub duration_seconds: f64,
     pub summary: String,
+    /// Repository (owner/repo) this task belongs to, for multi-project routing.
+    pub repo: Option<String>,
 }
 
 impl TaskNotification {
@@ -122,6 +124,27 @@ impl TaskNotification {
             duration = duration,
             summary = self.summary,
         )
+    }
+
+    /// Format with project prefix (for General/subscribed channels).
+    ///
+    /// Prepends `[project_name]` to the channel-specific formatted message
+    /// so recipients of multi-project channels can identify the source.
+    pub fn format_with_project(&self, channel: &str) -> String {
+        let project_name = self
+            .repo
+            .as_deref()
+            .and_then(|r| r.split('/').last())
+            .unwrap_or("unknown");
+
+        let base = match channel {
+            "telegram" => self.format_telegram(),
+            "discord" => self.format_discord(),
+            "slack" => self.format_slack(),
+            _ => self.format_telegram(), // fallback
+        };
+
+        format!("[{project_name}] {base}")
     }
 }
 
@@ -227,6 +250,7 @@ mod tests {
             agent: "claude".to_string(),
             duration_seconds: 120.0,
             summary: "Fixed the OAuth flow".to_string(),
+            repo: Some("owner/my-project".to_string()),
         };
         let msg = n.format_telegram();
         assert!(msg.contains("✅"));
@@ -247,6 +271,7 @@ mod tests {
             agent: "claude".to_string(),
             duration_seconds: 10.0,
             summary: "Done".to_string(),
+            repo: None,
         };
         let msg = n.format_telegram();
         assert!(msg.contains("Fix \\_underscores\\_ and \\*bold\\*"));
@@ -261,6 +286,7 @@ mod tests {
             agent: "claude".to_string(),
             duration_seconds: 60.0,
             summary: "Decomposed mod.rs".to_string(),
+            repo: Some("org/refactor-repo".to_string()),
         };
         let msg = n.format_slack();
         assert!(msg.contains("✅"));
@@ -281,6 +307,7 @@ mod tests {
             agent: "codex".to_string(),
             duration_seconds: 1800.0,
             summary: "Timed out waiting for tests".to_string(),
+            repo: Some("acme/deploy-svc".to_string()),
         };
         let msg = n.format_discord();
         assert!(msg.contains("⚠️"));
@@ -288,6 +315,37 @@ mod tests {
         assert!(msg.contains("needs_review"));
         assert!(msg.contains("codex"));
         assert!(msg.contains("30m 0s"));
+    }
+
+    #[test]
+    fn format_with_project_prepends_repo_name() {
+        let n = TaskNotification {
+            task_id: "10".to_string(),
+            title: "Add feature".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 45.0,
+            summary: "Feature added".to_string(),
+            repo: Some("acme/widgets".to_string()),
+        };
+        let msg = n.format_with_project("telegram");
+        assert!(msg.starts_with("[widgets] "));
+        assert!(msg.contains("Task #10"));
+    }
+
+    #[test]
+    fn format_with_project_unknown_when_no_repo() {
+        let n = TaskNotification {
+            task_id: "11".to_string(),
+            title: "Task".to_string(),
+            status: "done".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 5.0,
+            summary: "Done".to_string(),
+            repo: None,
+        };
+        let msg = n.format_with_project("discord");
+        assert!(msg.starts_with("[unknown] "));
     }
 
     #[test]
