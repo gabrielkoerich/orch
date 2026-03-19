@@ -130,11 +130,12 @@ impl TaskNotification {
     ///
     /// Prepends `[project_name]` to the channel-specific formatted message
     /// so recipients of multi-project channels can identify the source.
+    #[allow(dead_code)]
     pub fn format_with_project(&self, channel: &str) -> String {
         let project_name = self
             .repo
             .as_deref()
-            .and_then(|r| r.split('/').last())
+            .and_then(|r| r.split('/').next_back())
             .unwrap_or("unknown");
 
         let base = match channel {

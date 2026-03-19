@@ -35,6 +35,7 @@ use crate::channels::capture::CaptureService;
 use crate::channels::discord_ws::DiscordGateway;
 use crate::channels::github::start_webhook_server;
 use crate::channels::notification::NotificationLevel;
+use crate::channels::routing::{ChannelRouter, GlobalChannelConfig, ProjectChannelConfig};
 use crate::channels::slack::SlackChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::channels::tmux::TmuxChannel;
@@ -276,6 +277,41 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     Ok(engines)
 }
 
+/// Read per-project channel configuration from `.orch.yml`.
+fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelConfig {
+    let config_path = project_dir.join(".orch.yml");
+    if !config_path.exists() {
+        return ProjectChannelConfig::default();
+    }
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return ProjectChannelConfig::default(),
+    };
+    let val: serde_yml::Value = match serde_yml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return ProjectChannelConfig::default(),
+    };
+    let channels = match val.get("channels") {
+        Some(c) => c,
+        None => return ProjectChannelConfig::default(),
+    };
+    let get_str = |section: &str, key: &str| -> Option<String> {
+        channels
+            .get(section)
+            .and_then(|s| s.get(key))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+    ProjectChannelConfig {
+        telegram_topic_id: get_str("telegram", "topic_id"),
+        telegram_bot_token: get_str("telegram", "bot_token"),
+        telegram_chat_id: get_str("telegram", "chat_id"),
+        discord_channel_id: get_str("discord", "channel_id"),
+        discord_bot_token: get_str("discord", "bot_token"),
+        discord_guild_id: get_str("discord", "guild_id"),
+    }
+}
+
 /// Start the orchestrator service.
 ///
 /// This is the main entry point — called by `orch serve`.
@@ -316,6 +352,27 @@ pub async fn serve() -> anyhow::Result<()> {
             engine.repo.clone(),
         ));
     }
+
+    // Build ChannelRouter from global config + per-project configs
+    let global_channel_config = GlobalChannelConfig {
+        telegram_general_topic_id: crate::config::get("channels.telegram.general_topic_id").ok(),
+        discord_general_channel_id: crate::config::get("channels.discord.general_channel_id").ok(),
+    };
+    let project_channel_configs: Vec<(String, ProjectChannelConfig)> = project_engines
+        .iter()
+        .map(|e| {
+            let cfg = read_project_channel_config(&e.project_dir);
+            (e.repo.clone(), cfg)
+        })
+        .collect();
+    let channel_router = Arc::new(ChannelRouter::new(
+        &global_channel_config,
+        &project_channel_configs,
+    ));
+    tracing::info!(
+        projects = ?channel_router.projects(),
+        "channel router initialized"
+    );
 
     // Initialize tmux manager (shared across all projects)
     let tmux = Arc::new(TmuxManager::new());
@@ -422,17 +479,27 @@ pub async fn serve() -> anyhow::Result<()> {
             )
         })
         .collect();
+    let router_for_messages = channel_router.clone();
     for mut rx in channel_receivers {
         let transport = transport_for_messages.clone();
         let tmux = tmux_for_messages.clone();
         let capture = capture_for_messages.clone();
         let channels = channels_for_messages.clone();
         let engine_refs = engine_refs.clone();
+        let ch_router = router_for_messages.clone();
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received message from channel");
-                handle_channel_message(msg, &transport, &tmux, &capture, &channels, &engine_refs)
-                    .await;
+                handle_channel_message(
+                    msg,
+                    &transport,
+                    &tmux,
+                    &capture,
+                    &channels,
+                    &engine_refs,
+                    &ch_router,
+                )
+                .await;
             }
         });
     }
@@ -1043,11 +1110,13 @@ pub async fn serve() -> anyhow::Result<()> {
 ///
 /// Iterates the channel registry and finds the channel by name,
 /// then sends the message to the given thread ID.
+/// Optionally sends to a specific topic (e.g. Telegram forum topic).
 async fn send_channel_reply(
     channels: &Arc<ChannelRegistry>,
     channel_name: &str,
     thread_id: &str,
     body: String,
+    topic_id: Option<&str>,
 ) {
     for ch in channels.iter() {
         if ch.name() == channel_name {
@@ -1056,7 +1125,7 @@ async fn send_channel_reply(
                 body,
                 reply_to: None,
                 metadata: serde_json::json!({}),
-                topic_id: None,
+                topic_id: topic_id.map(String::from),
             };
             if let Err(e) = ch.send(&msg).await {
                 tracing::warn!(
@@ -1100,8 +1169,11 @@ async fn forward_to_tmux(transport: &Arc<Transport>, task_id: &str, text: &str) 
 /// Handle an incoming channel message by routing it to the appropriate action.
 ///
 /// - `TaskSession`: slash command → execute on task; otherwise → forward to tmux
-/// - `Command`: global commands like `/status`; task-specific commands need a task thread
+/// - `Command`: global commands like `/status`, `/stats`, `/subscribe`, `/unsubscribe`, `/stream`
 /// - `NewTask`: create an internal task, bind thread, start output fanout
+///
+/// The `channel_router` resolves which project a message targets based on
+/// its topic/channel ID. This enables per-project task creation and status views.
 async fn handle_channel_message(
     msg: IncomingMessage,
     transport: &Arc<Transport>,
@@ -1109,12 +1181,19 @@ async fn handle_channel_message(
     capture: &Arc<CaptureService>,
     channels: &Arc<ChannelRegistry>,
     engine_refs: &[EngineRef],
+    channel_router: &Arc<ChannelRouter>,
 ) {
     use crate::backends::ExternalId;
     use crate::channels::stream::fanout_output;
     use crate::channels::transport::MessageRoute;
     use crate::engine::commands::{execute_command, parse_command};
     use crate::engine::tasks::{CreateTaskRequest, TaskType};
+
+    // Resolve project from incoming message topic/channel
+    let topic_id = msg.topic_id.as_deref().unwrap_or(&msg.thread_id);
+    let resolved_repo = channel_router.resolve_project(&msg.channel, topic_id);
+    let is_general = channel_router.is_general(&msg.channel, topic_id);
+    let msg_topic_id = msg.topic_id.clone();
 
     match transport.route(&msg).await {
         MessageRoute::TaskSession { task_id } => {
@@ -1135,6 +1214,7 @@ async fn handle_channel_message(
                                     &channel,
                                     &thread_id,
                                     format!("Command `{cmd}` failed: {e}"),
+                                    msg_topic_id.as_deref(),
                                 )
                                 .await;
                                 return;
@@ -1148,7 +1228,14 @@ async fn handle_channel_message(
                             Ok(r) => r,
                             Err(e) => format!("Command `{cmd}` failed: {e}"),
                         };
-                        send_channel_reply(channels, &channel, &thread_id, reply).await;
+                        send_channel_reply(
+                            channels,
+                            &channel,
+                            &thread_id,
+                            reply,
+                            msg_topic_id.as_deref(),
+                        )
+                        .await;
                     }
                 } else {
                     // Unknown command — forward to agent as-is
@@ -1165,39 +1252,97 @@ async fn handle_channel_message(
             let channel = msg.channel.clone();
             let thread_id = msg.thread_id.clone();
 
-            // /status is not in OwnerCommand — handle it specially
             if cmd_str == "/status" || cmd_str.starts_with("/status ") {
-                let mut lines = vec!["**Active tasks:**".to_string()];
-                for (repo, _, task_manager, _) in engine_refs {
-                    match task_manager
-                        .list_external_by_status(Status::InProgress)
-                        .await
-                    {
-                        Ok(tasks) => {
-                            for t in &tasks {
-                                lines.push(format!("- #{} [{}]: {}", t.id.0, repo, t.title));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(repo, err = %e, "failed to list in-progress tasks");
-                        }
-                    }
-                }
-                if lines.len() == 1 {
-                    lines.push("No tasks currently in progress.".to_string());
-                }
-                send_channel_reply(channels, &channel, &thread_id, lines.join("\n")).await;
+                // /status — project-aware: show tasks for resolved project or all
+                let reply = handle_status_command(engine_refs, resolved_repo).await;
+                send_channel_reply(
+                    channels,
+                    &channel,
+                    &thread_id,
+                    reply,
+                    msg_topic_id.as_deref(),
+                )
+                .await;
+            } else if cmd_str == "/stats" || cmd_str.starts_with("/stats ") {
+                let reply = handle_stats_command(engine_refs, resolved_repo, is_general).await;
+                send_channel_reply(
+                    channels,
+                    &channel,
+                    &thread_id,
+                    reply,
+                    msg_topic_id.as_deref(),
+                )
+                .await;
+            } else if cmd_str.starts_with("/subscribe") {
+                let reply = handle_subscribe_command(
+                    &cmd_str,
+                    &channel,
+                    &thread_id,
+                    engine_refs,
+                    channel_router,
+                )
+                .await;
+                send_channel_reply(
+                    channels,
+                    &channel,
+                    &thread_id,
+                    reply,
+                    msg_topic_id.as_deref(),
+                )
+                .await;
+            } else if cmd_str.starts_with("/unsubscribe") {
+                let reply = handle_unsubscribe_command(
+                    &cmd_str,
+                    &channel,
+                    &thread_id,
+                    engine_refs,
+                    channel_router,
+                )
+                .await;
+                send_channel_reply(
+                    channels,
+                    &channel,
+                    &thread_id,
+                    reply,
+                    msg_topic_id.as_deref(),
+                )
+                .await;
+            } else if cmd_str.starts_with("/stream") {
+                let reply = handle_stream_command(&cmd_str, &channel, &thread_id, transport).await;
+                send_channel_reply(
+                    channels,
+                    &channel,
+                    &thread_id,
+                    reply,
+                    msg_topic_id.as_deref(),
+                )
+                .await;
             } else if let Some(cmd) = parse_command(&cmd_str) {
                 let reply = format!(
                     "Command `{cmd}` requires a task context. \
                      Send it in a thread that is bound to a running task."
                 );
-                send_channel_reply(channels, &channel, &thread_id, reply).await;
+                send_channel_reply(
+                    channels,
+                    &channel,
+                    &thread_id,
+                    reply,
+                    msg_topic_id.as_deref(),
+                )
+                .await;
             } else {
-                let reply = "Available commands: /status (list tasks), /retry, /close, \
-                             /block, /unblock, /review — send task-specific commands in a task thread."
+                let reply = "Available commands: /status, /stats, /subscribe, /unsubscribe, \
+                             /stream, /retry, /close, /block, /unblock, /review — \
+                             send task-specific commands in a task thread."
                     .to_string();
-                send_channel_reply(channels, &channel, &thread_id, reply).await;
+                send_channel_reply(
+                    channels,
+                    &channel,
+                    &thread_id,
+                    reply,
+                    msg_topic_id.as_deref(),
+                )
+                .await;
             }
         }
 
@@ -1205,8 +1350,14 @@ async fn handle_channel_message(
             let channel = msg.channel.clone();
             let thread_id = msg.thread_id.clone();
 
-            // Pick the first configured project for new tasks from channels
-            if let Some((repo, _, task_manager, _)) = engine_refs.first() {
+            // Resolve target project: resolved_repo → specific project, else first
+            let target_engine_ref = if let Some(repo) = resolved_repo {
+                engine_refs.iter().find(|(r, _, _, _)| r == repo)
+            } else {
+                engine_refs.first()
+            };
+
+            if let Some((repo, _, task_manager, _)) = target_engine_ref {
                 let title = if msg.body.len() > 80 {
                     format!("{}…", &msg.body[..80])
                 } else {
@@ -1247,20 +1398,243 @@ async fn handle_channel_message(
                         tokio::spawn(async move {
                             fanout_output(task_id_clone, transport_clone, channels_clone).await;
                         });
-                        let reply =
-                            format!("Task created: `{task_id}` — I'll start working on it now.");
-                        send_channel_reply(channels, &channel, &thread_id, reply).await;
+                        let project_label = if resolved_repo.is_some() {
+                            String::new()
+                        } else {
+                            format!(" in [{repo}]")
+                        };
+                        let reply = format!(
+                            "Task created: `{task_id}`{project_label} — I'll start working on it now."
+                        );
+                        send_channel_reply(
+                            channels,
+                            &channel,
+                            &thread_id,
+                            reply,
+                            msg_topic_id.as_deref(),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::warn!(repo, err = %e, "failed to create task from channel message");
                         let reply = format!("Failed to create task: {e}");
-                        send_channel_reply(channels, &channel, &thread_id, reply).await;
+                        send_channel_reply(
+                            channels,
+                            &channel,
+                            &thread_id,
+                            reply,
+                            msg_topic_id.as_deref(),
+                        )
+                        .await;
                     }
                 }
             } else {
                 tracing::warn!("no project configured, cannot create task from channel message");
             }
         }
+    }
+}
+
+/// Handle `/status` command with project-aware filtering.
+async fn handle_status_command(engine_refs: &[EngineRef], resolved_repo: Option<&str>) -> String {
+    let mut lines = vec!["**Active tasks:**".to_string()];
+    for (repo, _, task_manager, _) in engine_refs {
+        // If a specific project was resolved, only show that project
+        if let Some(target) = resolved_repo {
+            if repo != target {
+                continue;
+            }
+        }
+        match task_manager
+            .list_external_by_status(Status::InProgress)
+            .await
+        {
+            Ok(tasks) => {
+                for t in &tasks {
+                    lines.push(format!("- #{} [{}]: {}", t.id.0, repo, t.title));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(repo, err = %e, "failed to list in-progress tasks");
+            }
+        }
+    }
+    if lines.len() == 1 {
+        lines.push("No tasks currently in progress.".to_string());
+    }
+    lines.join("\n")
+}
+
+/// Handle `/stats` command — show 24h metrics, optionally per-project.
+async fn handle_stats_command(
+    engine_refs: &[EngineRef],
+    resolved_repo: Option<&str>,
+    is_general: bool,
+) -> String {
+    let mut lines = vec!["**Stats (24h)**".to_string(), String::new()];
+
+    // Determine which repos to query
+    let repos_to_query: Vec<&str> = if let Some(repo) = resolved_repo {
+        vec![repo]
+    } else {
+        engine_refs.iter().map(|(r, _, _, _)| r.as_str()).collect()
+    };
+
+    for repo in &repos_to_query {
+        // Find the store for this repo
+        let store = engine_refs
+            .iter()
+            .find(|(r, _, _, _)| r == repo)
+            .and_then(|(_, _, _, s)| s.as_ref());
+
+        let store = match store {
+            Some(s) => s,
+            None => continue,
+        };
+
+        match store.get_metrics_summary_24h_by_repo(repo).await {
+            Ok(summary) => {
+                let total = summary.tasks_completed_24h + summary.tasks_failed_24h;
+                let rate = if total > 0 {
+                    (summary.tasks_completed_24h as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                };
+                // Show repo name only if showing multiple (general or no resolution)
+                if is_general || resolved_repo.is_none() {
+                    lines.push(format!(
+                        "**{}**: {} done, {} failed ({:.1}%)",
+                        repo, summary.tasks_completed_24h, summary.tasks_failed_24h, rate
+                    ));
+                } else {
+                    lines.push(format!(
+                        "{} done, {} failed ({:.1}%)",
+                        summary.tasks_completed_24h, summary.tasks_failed_24h, rate
+                    ));
+                }
+                // Per-agent breakdown
+                for agent in &summary.agent_stats {
+                    lines.push(format!(
+                        "  {}: {} runs ({:.0}%)",
+                        agent.agent, agent.total_runs, agent.success_rate
+                    ));
+                }
+                if !summary.agent_stats.is_empty() {
+                    lines.push(String::new());
+                }
+            }
+            Err(e) => {
+                tracing::warn!(repo, err = %e, "failed to query metrics");
+                lines.push(format!("**{}**: error fetching metrics", repo));
+            }
+        }
+    }
+
+    if lines.len() <= 2 {
+        lines.push("No metrics data available.".to_string());
+    }
+    lines.join("\n")
+}
+
+/// Handle `/subscribe <project>` command.
+async fn handle_subscribe_command(
+    cmd_str: &str,
+    channel: &str,
+    thread_id: &str,
+    engine_refs: &[EngineRef],
+    channel_router: &Arc<ChannelRouter>,
+) -> String {
+    let parts: Vec<&str> = cmd_str.splitn(2, ' ').collect();
+    if parts.len() < 2 || parts[1].trim().is_empty() {
+        let projects: Vec<&str> = channel_router
+            .projects()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        return format!(
+            "Usage: `/subscribe <project>`\nAvailable projects: {}",
+            projects.join(", ")
+        );
+    }
+    let project = parts[1].trim();
+
+    // Validate project exists
+    if !channel_router.projects().iter().any(|p| p == project) {
+        return format!(
+            "Unknown project `{project}`. Available: {}",
+            channel_router
+                .projects()
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    // Find a store to use for subscription
+    if let Some((_, _, _, Some(store))) = engine_refs.first() {
+        match store.subscribe_channel(channel, thread_id, project).await {
+            Ok(()) => format!("Subscribed to notifications from `{project}`."),
+            Err(e) => format!("Failed to subscribe: {e}"),
+        }
+    } else {
+        "No store available for subscription management.".to_string()
+    }
+}
+
+/// Handle `/unsubscribe <project>` command.
+async fn handle_unsubscribe_command(
+    cmd_str: &str,
+    channel: &str,
+    thread_id: &str,
+    engine_refs: &[EngineRef],
+    channel_router: &Arc<ChannelRouter>,
+) -> String {
+    let parts: Vec<&str> = cmd_str.splitn(2, ' ').collect();
+    if parts.len() < 2 || parts[1].trim().is_empty() {
+        return "Usage: `/unsubscribe <project>`".to_string();
+    }
+    let project = parts[1].trim();
+
+    // Validate project exists
+    if !channel_router.projects().iter().any(|p| p == project) {
+        return format!("Unknown project `{project}`.");
+    }
+
+    if let Some((_, _, _, Some(store))) = engine_refs.first() {
+        match store.unsubscribe_channel(channel, thread_id, project).await {
+            Ok(()) => format!("Unsubscribed from `{project}` notifications."),
+            Err(e) => format!("Failed to unsubscribe: {e}"),
+        }
+    } else {
+        "No store available for subscription management.".to_string()
+    }
+}
+
+/// Handle `/stream <task_id>` command — bind channel to task output stream.
+async fn handle_stream_command(
+    cmd_str: &str,
+    channel: &str,
+    thread_id: &str,
+    transport: &Arc<Transport>,
+) -> String {
+    let parts: Vec<&str> = cmd_str.splitn(2, ' ').collect();
+    if parts.len() < 2 || parts[1].trim().is_empty() {
+        return "Usage: `/stream <task_id>`".to_string();
+    }
+    let task_id = parts[1].trim();
+
+    // Check if the task has an active binding (i.e. is running)
+    if transport.get_binding(task_id).await.is_some() {
+        // Bind this channel/thread as an additional output target
+        // The session name is retrieved from the existing binding
+        let binding = transport.get_binding(task_id).await.unwrap();
+        transport
+            .bind(task_id, &binding.tmux_session, channel, thread_id)
+            .await;
+        format!("Streaming output from task `{task_id}` to this channel.")
+    } else {
+        format!("Task `{task_id}` is not currently running or has no active session.")
     }
 }
 
