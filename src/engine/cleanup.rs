@@ -995,7 +995,7 @@ mod tests {
             .path()
             .join("worktrees")
             .join("repo.git")
-            .join("gh-task-42-test");
+            .join("gh-issue-42-test");
         std::fs::create_dir_all(wt_dir.parent()?).ok()?;
         let wt_out = std::process::Command::new("git")
             .args([
@@ -1004,7 +1004,7 @@ mod tests {
                 "worktree",
                 "add",
                 "-b",
-                "gh-task-42-test",
+                "gh-issue-42-test",
                 wt_dir.to_str()?,
             ])
             .output()
@@ -1112,11 +1112,11 @@ mod tests {
         // Verify the new fallback logic: when worktree path is absent but
         // branch is known, we should construct the path correctly.
         let tmp = tempfile::tempdir().unwrap();
-        let wt_dir = tmp.path().join("myrepo").join("gh-task-7-fix");
+        let wt_dir = tmp.path().join("myrepo").join("gh-issue-7-fix");
         std::fs::create_dir_all(&wt_dir).unwrap();
 
-        // Simulate: worktree=None, branch=Some("gh-task-7-fix"), repo="owner/myrepo"
-        let branch = "gh-task-7-fix";
+        // Simulate: worktree=None, branch=Some("gh-issue-7-fix"), repo="owner/myrepo"
+        let branch = "gh-issue-7-fix";
         let repo = "owner/myrepo";
         let worktrees_base = tmp.path();
 

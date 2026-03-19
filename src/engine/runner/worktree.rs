@@ -23,14 +23,13 @@ pub struct WorktreeSetup {
 
 /// Generate a branch name from task ID and title.
 ///
-/// Format: `orch-{issue}-{slug}` for internal tasks, `gh-task-{issue}-{slug}` for external.
+/// Format: `internal-{id}-{slug}` for internal tasks, `gh-issue-{id}-{slug}` for external.
 /// Slug is lowercase, non-alphanum→`-`, max 40 chars.
 pub fn branch_name(task_id: &str, title: &str) -> String {
-    let sanitized_id = sanitize_task_id(task_id);
-    let prefix = if task_id.starts_with("internal:") {
-        "orch"
+    let (prefix, sanitized_id) = if let Some(num) = task_id.strip_prefix("internal:") {
+        ("internal", num.to_string())
     } else {
-        "gh-task"
+        ("gh-issue", sanitize_task_id(task_id))
     };
 
     let raw: String = title
@@ -376,21 +375,28 @@ pub async fn setup_worktree(
 
 /// Find an existing worktree by task ID prefix.
 fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<PathBuf> {
-    let sanitized_id = sanitize_task_id(task_id);
-    let prefix_new = if task_id.starts_with("internal:") {
-        format!("orch-{sanitized_id}-")
+    let (prefix_new, legacy_prefixes) = if let Some(num) = task_id.strip_prefix("internal:") {
+        (
+            format!("internal-{num}-"),
+            vec![
+                format!("gh-task-internal-{num}-"),
+                format!("gh-issue-internal-{num}-"),
+            ],
+        )
     } else {
-        format!("gh-task-{sanitized_id}-")
+        let sanitized_id = sanitize_task_id(task_id);
+        (
+            format!("gh-issue-{sanitized_id}-"),
+            vec![format!("gh-task-{sanitized_id}-")],
+        )
     };
-    // Also check legacy prefix for internal tasks created before the rename
-    let prefix_legacy = format!("gh-task-{sanitized_id}-");
 
     if let Ok(entries) = std::fs::read_dir(worktrees_base) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if (name.starts_with(&prefix_new) || name.starts_with(&prefix_legacy))
-                && entry.path().is_dir()
-            {
+            let matches = name.starts_with(&prefix_new)
+                || legacy_prefixes.iter().any(|p| name.starts_with(p));
+            if matches && entry.path().is_dir() {
                 return Some(entry.path());
             }
         }
@@ -406,19 +412,19 @@ mod tests {
     #[test]
     fn branch_name_basic() {
         let name = branch_name("42", "Fix login bug");
-        assert_eq!(name, "gh-task-42-fix-login-bug");
+        assert_eq!(name, "gh-issue-42-fix-login-bug");
     }
 
     #[test]
     fn branch_name_internal_task() {
         let name = branch_name("internal:8", "Fix login bug");
-        assert_eq!(name, "orch-internal-8-fix-login-bug");
+        assert_eq!(name, "internal-8-fix-login-bug");
     }
 
     #[test]
     fn branch_name_special_chars() {
         let name = branch_name("7", "Add OAuth2/OIDC (Google & GitHub)");
-        assert_eq!(name, "gh-task-7-add-oauth2-oidc-google-github");
+        assert_eq!(name, "gh-issue-7-add-oauth2-oidc-google-github");
     }
 
     #[test]
@@ -427,7 +433,7 @@ mod tests {
             "This is a very long task title that should be truncated to forty characters maximum";
         let name = branch_name("1", title);
         // slug part should be max 40 chars
-        let slug = name.strip_prefix("gh-task-1-").unwrap();
+        let slug = name.strip_prefix("gh-issue-1-").unwrap();
         assert!(slug.len() <= 40, "slug length {} > 40", slug.len());
     }
 
@@ -443,28 +449,28 @@ mod tests {
     #[test]
     fn branch_name_empty_title() {
         let name = branch_name("99", "");
-        assert_eq!(name, "gh-task-99");
+        assert_eq!(name, "gh-issue-99");
     }
 
     #[test]
     fn branch_name_empty_title_internal() {
         let name = branch_name("internal:99", "");
-        assert_eq!(name, "orch-internal-99");
+        assert_eq!(name, "internal-99");
     }
 
     #[test]
     fn branch_name_all_special_chars() {
         let name = branch_name("10", "--- ??? ---");
-        assert_eq!(name, "gh-task-10");
+        assert_eq!(name, "gh-issue-10");
         assert!(!name.is_empty());
     }
 
     #[test]
     fn branch_name_chinese_chars_no_panic() {
         let name = branch_name("265", "implement 用户认证 user auth");
-        assert!(name.starts_with("gh-task-265-"));
+        assert!(name.starts_with("gh-issue-265-"));
         assert!(!name.is_empty());
-        let slug = name.strip_prefix("gh-task-265-").unwrap();
+        let slug = name.strip_prefix("gh-issue-265-").unwrap();
         assert!(slug.len() <= 40, "slug too long: {}", slug.len());
         assert!(slug.is_ascii(), "slug contains non-ASCII: {slug}");
     }
@@ -472,15 +478,15 @@ mod tests {
     #[test]
     fn branch_name_emoji_no_panic() {
         let name = branch_name("265", "fix 🚀 deployment pipeline 🔥");
-        assert!(name.starts_with("gh-task-265-"));
-        let slug = name.strip_prefix("gh-task-265-").unwrap();
+        assert!(name.starts_with("gh-issue-265-"));
+        let slug = name.strip_prefix("gh-issue-265-").unwrap();
         assert!(slug.is_ascii(), "slug contains non-ASCII: {slug}");
     }
 
     #[test]
     fn branch_name_all_non_ascii_falls_back_to_task_id() {
         let name = branch_name("265", "用户认证 실행 тест");
-        assert_eq!(name, "gh-task-265");
+        assert_eq!(name, "gh-issue-265");
     }
 
     #[test]
@@ -492,7 +498,7 @@ mod tests {
     #[test]
     fn find_existing_worktree_matches_prefix() {
         let dir = tempfile::tempdir().unwrap();
-        let wt_dir = dir.path().join("gh-task-42-fix-login-bug");
+        let wt_dir = dir.path().join("gh-issue-42-fix-login-bug");
         std::fs::create_dir(&wt_dir).unwrap();
 
         let result = find_existing_worktree(dir.path(), "42");
@@ -502,7 +508,7 @@ mod tests {
     #[test]
     fn find_existing_worktree_matches_internal_prefix() {
         let dir = tempfile::tempdir().unwrap();
-        let wt_dir = dir.path().join("orch-internal-8-fix");
+        let wt_dir = dir.path().join("internal-8-fix");
         std::fs::create_dir(&wt_dir).unwrap();
 
         let result = find_existing_worktree(dir.path(), "internal:8");
@@ -510,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn find_existing_worktree_matches_legacy_internal_prefix() {
+    fn find_existing_worktree_matches_legacy_gh_task_prefix() {
         // Old worktrees created before the rename should still be found
         let dir = tempfile::tempdir().unwrap();
         let wt_dir = dir.path().join("gh-task-internal-8-fix");
@@ -521,9 +527,20 @@ mod tests {
     }
 
     #[test]
+    fn find_existing_worktree_matches_legacy_external_prefix() {
+        // Old external worktrees with gh-task- prefix should still be found
+        let dir = tempfile::tempdir().unwrap();
+        let wt_dir = dir.path().join("gh-task-42-fix-login-bug");
+        std::fs::create_dir(&wt_dir).unwrap();
+
+        let result = find_existing_worktree(dir.path(), "42");
+        assert_eq!(result, Some(wt_dir));
+    }
+
+    #[test]
     fn find_existing_worktree_ignores_other_tasks() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("gh-task-43-other-task")).unwrap();
+        std::fs::create_dir(dir.path().join("gh-issue-43-other-task")).unwrap();
 
         assert!(find_existing_worktree(dir.path(), "42").is_none());
     }
