@@ -214,6 +214,12 @@ enum Commands {
         #[arg(long)]
         model: bool,
     },
+    /// Show task metrics and statistics
+    Stats {
+        /// Aggregate all projects into one table
+        #[arg(long)]
+        all: bool,
+    },
     /// Generate shell completions
     Completions {
         /// Shell type
@@ -624,6 +630,9 @@ async fn main() -> anyhow::Result<()> {
                 // Default: show summary
                 cli::cost::show_summary().await?;
             }
+        }
+        Commands::Stats { all } => {
+            cli::stats::stats(all).await?;
         }
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();

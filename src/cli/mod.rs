@@ -2,6 +2,7 @@ pub mod cost;
 pub mod dashboard;
 pub mod job;
 pub mod service;
+pub mod stats;
 pub mod task;
 pub mod tree;
 pub mod webhook;
