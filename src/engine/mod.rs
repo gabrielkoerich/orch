@@ -222,14 +222,14 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
                 || err_str.contains("No GitHub token")
             {
                 auth_failures += 1;
-                tracing::warn!(
+                tracing::debug!(
                     repo = %repo,
                     error = %e,
                     "GitHub auth failed for {repo} — run `gh auth login`"
                 );
             } else {
                 network_failures += 1;
-                tracing::warn!(
+                tracing::debug!(
                     repo = %repo,
                     error = %e,
                     "GitHub unreachable for {repo} (network unavailable?)"
@@ -263,13 +263,21 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     }
 
     if engines.is_empty() {
+        // Projects are configured but all health checks failed — this is a connectivity
+        // or auth issue, not a configuration problem.  The serve() retry loop will catch
+        // this error and retry with backoff; it must NOT propagate to main() or it would
+        // write "Error: ..." to brew's stderr (orch.error.log) on every restart attempt.
         if auth_failures > 0 && network_failures == 0 {
-            anyhow::bail!("GitHub auth failed for all projects — run `gh auth login`");
+            anyhow::bail!(
+                "GitHub auth failed for all configured projects ({auth_failures} project(s)) — run `gh auth login`"
+            );
         } else if network_failures > 0 && auth_failures == 0 {
-            anyhow::bail!("GitHub unreachable for all projects — check network connectivity");
+            anyhow::bail!(
+                "GitHub unreachable for all configured projects ({network_failures} project(s)) — check network connectivity"
+            );
         } else {
             anyhow::bail!(
-                "all project backends failed ({auth_failures} auth, {network_failures} network)"
+                "all configured project backends failed health checks ({auth_failures} auth failures, {network_failures} network failures)"
             );
         }
     }
@@ -325,13 +333,28 @@ pub async fn serve() -> anyhow::Result<()> {
     // Initialize project engines — retry with backoff so a network outage at
     // startup doesn't cause a crash-loop (launchd KeepAlive would restart us
     // immediately, filling the error log with 600+ identical messages).
+    //
+    // IMPORTANT: errors from init_project_engines() must NEVER propagate past
+    // this loop to main().  If they did, anyhow would write "Error: …" to stderr,
+    // which brew routes to orch.error.log — polluting it even when projects ARE
+    // configured correctly but GitHub is temporarily unreachable.
     let mut project_engines = {
         let mut delay_secs = 5u64;
+        let mut attempt = 0u32;
         loop {
+            attempt += 1;
             match init_project_engines().await {
                 Ok(engines) => break engines,
                 Err(e) => {
-                    tracing::warn!(delay_secs, "project engine init failed, retrying: {e}");
+                    // Demote all retries to debug — brew routes stderr to
+                    // orch.error.log, so any warn!/error! here would appear as
+                    // spurious noise even when projects are configured correctly
+                    // and the service will succeed on the next attempt.
+                    tracing::debug!(
+                        delay_secs,
+                        attempt,
+                        "project backends unavailable, retrying: {e}"
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                     delay_secs = (delay_secs * 2).min(120);
                 }
