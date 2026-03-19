@@ -14,6 +14,7 @@ pub mod discord;
 pub mod discord_ws;
 pub mod github;
 pub mod notification;
+pub mod routing;
 pub mod slack;
 pub mod stream;
 pub mod telegram;

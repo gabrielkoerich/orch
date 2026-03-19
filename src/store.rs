@@ -1375,6 +1375,79 @@ impl TaskStore {
     }
 
     // ---------------------------------------------------------------
+    // Channel Subscriptions
+    // ---------------------------------------------------------------
+
+    /// Subscribe a channel/thread to notifications for a project.
+    #[allow(dead_code)]
+    pub async fn subscribe_channel(
+        &self,
+        channel: &str,
+        thread_id: &str,
+        repo: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO channel_subscriptions (channel, thread_id, repo) VALUES (?, ?, ?)",
+        )
+        .bind(channel)
+        .bind(thread_id)
+        .bind(repo)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Unsubscribe a channel/thread from a project's notifications.
+    #[allow(dead_code)]
+    pub async fn unsubscribe_channel(
+        &self,
+        channel: &str,
+        thread_id: &str,
+        repo: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "DELETE FROM channel_subscriptions WHERE channel = ? AND thread_id = ? AND repo = ?",
+        )
+        .bind(channel)
+        .bind(thread_id)
+        .bind(repo)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List repos that a channel/thread is subscribed to.
+    #[allow(dead_code)]
+    pub async fn list_channel_subscriptions(
+        &self,
+        channel: &str,
+        thread_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT repo FROM channel_subscriptions WHERE channel = ? AND thread_id = ?",
+        )
+        .bind(channel)
+        .bind(thread_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    /// List all channel/thread pairs subscribed to a repo's notifications.
+    #[allow(dead_code)]
+    pub async fn list_subscribers_for_repo(
+        &self,
+        repo: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT channel, thread_id FROM channel_subscriptions WHERE repo = ?")
+                .bind(repo)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
+    // ---------------------------------------------------------------
     // Task Metrics
     // ---------------------------------------------------------------
 
@@ -1486,6 +1559,114 @@ impl TaskStore {
             avg_duration_complex: avg_complex.map(|r| r.0),
             agent_stats,
             rate_limits_24h: rate_limit_count.0,
+        })
+    }
+
+    /// Get metrics summary for the last 24 hours, filtered by repo.
+    /// Joins task_metrics with tasks table to get repo context.
+    #[allow(dead_code)]
+    pub async fn get_metrics_summary_24h_by_repo(
+        &self,
+        repo: &str,
+    ) -> anyhow::Result<MetricsSummary> {
+        // Use COALESCE: prefer task_metrics.repo if populated, otherwise join tasks table
+        let completed: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM task_metrics m
+             LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+             WHERE m.completed_at >= datetime('now', '-24 hours')
+             AND m.outcome = 'success'
+             AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        )
+        .bind(repo)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let failed: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM task_metrics m
+             LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+             WHERE m.completed_at >= datetime('now', '-24 hours')
+             AND m.outcome != 'success'
+             AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        )
+        .bind(repo)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let avg_simple: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(m.duration_seconds) FROM task_metrics m
+             LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+             WHERE m.completed_at >= datetime('now', '-24 hours') AND m.complexity = 'simple'
+             AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        )
+        .bind(repo)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let avg_medium: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(m.duration_seconds) FROM task_metrics m
+             LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+             WHERE m.completed_at >= datetime('now', '-24 hours') AND m.complexity = 'medium'
+             AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        )
+        .bind(repo)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let avg_complex: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(m.duration_seconds) FROM task_metrics m
+             LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+             WHERE m.completed_at >= datetime('now', '-24 hours') AND m.complexity = 'complex'
+             AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        )
+        .bind(repo)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let agent_rows = sqlx::query(
+            "SELECT m.agent, COUNT(*) as total,
+                    SUM(CASE WHEN m.outcome = 'success' THEN 1 ELSE 0 END) as success_count
+             FROM task_metrics m
+             LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+             WHERE m.completed_at >= datetime('now', '-24 hours')
+             AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?
+             GROUP BY m.agent",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let agent_stats: Vec<AgentStat> = agent_rows
+            .iter()
+            .map(|row| {
+                let total: i64 = row.get("total");
+                let success: i64 = row.get("success_count");
+                AgentStat {
+                    agent: row.get("agent"),
+                    total_runs: total,
+                    success_count: success,
+                    success_rate: if total > 0 {
+                        (success as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                }
+            })
+            .collect();
+
+        let rate_limits: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM rate_limits WHERE occurred_at >= datetime('now', '-24 hours')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(MetricsSummary {
+            tasks_completed_24h: completed.0,
+            tasks_failed_24h: failed.0,
+            avg_duration_simple: avg_simple.map(|r| r.0),
+            avg_duration_medium: avg_medium.map(|r| r.0),
+            avg_duration_complex: avg_complex.map(|r| r.0),
+            agent_stats,
+            rate_limits_24h: rate_limits.0,
         })
     }
 
@@ -5985,5 +6166,80 @@ mod tests {
         assert_eq!(v1, 1);
         let v2 = store.increment(id, "attempts").await.unwrap();
         assert_eq!(v2, 2);
+    }
+
+    #[tokio::test]
+    async fn subscribe_and_list_channel_subscriptions() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .subscribe_channel("telegram", "42", "owner/orch")
+            .await
+            .unwrap();
+        store
+            .subscribe_channel("telegram", "42", "owner/bean")
+            .await
+            .unwrap();
+        let subs = store
+            .list_channel_subscriptions("telegram", "42")
+            .await
+            .unwrap();
+        assert_eq!(subs.len(), 2);
+        assert!(subs.contains(&"owner/orch".to_string()));
+        assert!(subs.contains(&"owner/bean".to_string()));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_channel() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .subscribe_channel("telegram", "42", "owner/orch")
+            .await
+            .unwrap();
+        store
+            .unsubscribe_channel("telegram", "42", "owner/orch")
+            .await
+            .unwrap();
+        let subs = store
+            .list_channel_subscriptions("telegram", "42")
+            .await
+            .unwrap();
+        assert_eq!(subs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn subscribe_idempotent() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .subscribe_channel("telegram", "42", "owner/orch")
+            .await
+            .unwrap();
+        store
+            .subscribe_channel("telegram", "42", "owner/orch")
+            .await
+            .unwrap(); // duplicate
+        let subs = store
+            .list_channel_subscriptions("telegram", "42")
+            .await
+            .unwrap();
+        assert_eq!(subs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_subscribers_for_repo() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .subscribe_channel("telegram", "42", "owner/orch")
+            .await
+            .unwrap();
+        store
+            .subscribe_channel("discord", "99", "owner/orch")
+            .await
+            .unwrap();
+        store
+            .subscribe_channel("telegram", "42", "owner/bean")
+            .await
+            .unwrap();
+        let subs = store.list_subscribers_for_repo("owner/orch").await.unwrap();
+        assert_eq!(subs.len(), 2);
     }
 }
