@@ -267,64 +267,6 @@ async fn list_from_global_store(
     Ok(())
 }
 
-/// Fallback status summary used when no project context is available.
-///
-/// Queries the global SQLite store directly and shows internal task counts only
-/// (no external GitHub tasks, since the repo cannot be determined from CWD).
-async fn status_from_global_store(json: bool) -> anyhow::Result<()> {
-    use crate::store::TaskStatus;
-
-    let store = match crate::cli::init_store().await {
-        Ok(s) => s,
-        Err(_) => {
-            println!("No tasks found.");
-            return Ok(());
-        }
-    };
-
-    let all_internal = store.list_all_internal_global().await.unwrap_or_default();
-
-    let statuses = [
-        (TaskStatus::New, "new"),
-        (TaskStatus::Routed, "routed"),
-        (TaskStatus::InProgress, "in_progress"),
-        (TaskStatus::Done, "done"),
-        (TaskStatus::Blocked, "blocked"),
-        (TaskStatus::InReview, "in_review"),
-        (TaskStatus::NeedsReview, "needs_review"),
-    ];
-
-    if json {
-        let mut map = serde_json::Map::new();
-        for (ts, key) in &statuses {
-            let count = all_internal.iter().filter(|t| t.status == *ts).count();
-            let mut entry = serde_json::Map::new();
-            entry.insert("external".to_string(), serde_json::Value::Number(0.into()));
-            entry.insert(
-                "internal".to_string(),
-                serde_json::Value::Number(count.into()),
-            );
-            map.insert(key.to_string(), serde_json::Value::Object(entry));
-        }
-        println!("{}", serde_json::to_string_pretty(&map)?);
-    } else {
-        println!("{:<20} {:>8}  {:>8}", "STATUS", "EXTERNAL", "INTERNAL");
-        println!("{}", "-".repeat(42));
-        for (ts, _key) in &statuses {
-            let count = all_internal.iter().filter(|t| t.status == *ts).count();
-            if count > 0 {
-                println!("{:<20} {:>8}  {:>8}", ts.as_str(), 0, count);
-            }
-        }
-        let total: usize = all_internal.len();
-        if total == 0 {
-            println!("No tasks found.");
-        }
-    }
-
-    Ok(())
-}
-
 /// Create a new task.
 pub async fn add(
     title: String,
@@ -517,18 +459,7 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
 pub async fn status(json: bool) -> anyhow::Result<()> {
     use crate::store::TaskStatus;
 
-    // When no project context is available (e.g. running from a worktree without
-    // .orch.yml), fall back to a store-only status summary instead of printing a
-    // fatal "no valid projects" error.
-    let task_manager = match init_task_manager().await {
-        Ok(tm) => tm,
-        Err(e) => {
-            tracing::debug!(
-                "no project context available, falling back to store-only status: {e:#}"
-            );
-            return status_from_global_store(json).await;
-        }
-    };
+    let task_manager = init_task_manager().await?;
 
     let statuses = [
         Status::New,

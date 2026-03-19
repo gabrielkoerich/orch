@@ -346,22 +346,15 @@ pub async fn serve() -> anyhow::Result<()> {
             match init_project_engines().await {
                 Ok(engines) => break engines,
                 Err(e) => {
-                    // First failure: warn so operators know startup is stalled.
-                    // Subsequent retries: demote to debug to avoid log spam when
-                    // the outage is prolonged (e.g. network down at boot).
-                    if attempt == 1 {
-                        tracing::warn!(
-                            delay_secs,
-                            attempt,
-                            "project backends unavailable, retrying: {e}"
-                        );
-                    } else {
-                        tracing::debug!(
-                            delay_secs,
-                            attempt,
-                            "project backends still unavailable, retrying: {e}"
-                        );
-                    }
+                    // Demote all retries to debug — brew routes stderr to
+                    // orch.error.log, so any warn!/error! here would appear as
+                    // spurious noise even when projects are configured correctly
+                    // and the service will succeed on the next attempt.
+                    tracing::debug!(
+                        delay_secs,
+                        attempt,
+                        "project backends unavailable, retrying: {e}"
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                     delay_secs = (delay_secs * 2).min(120);
                 }
