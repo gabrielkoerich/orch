@@ -51,23 +51,14 @@ Everything outside your current working directory is **read-only**. Never `cd ..
    git rebase origin/{{DEFAULT_BRANCH}}
    ```
    The orchestrator has already run `git fetch origin` (all branches) before launching you — do NOT run `git fetch` or `git pull` yourself (they will fail in sandboxed environments because they need to write outside the worktree directory). Use `git rebase origin/<branch>` instead — the remote refs are already local. If the rebase has conflicts, resolve them before proceeding.
-2. **On retry**: check `git diff {{DEFAULT_BRANCH}}` and `git log {{DEFAULT_BRANCH}}..HEAD` first to see what previous attempts already did. Build on existing work — do not start over. If a PR already exists, read its review comments (`gh pr view --comments`) — fix everything the reviewer asked for, rebase on the default branch, resolve any conflicts, and make sure CI passes before pushing.
+2. **On retry**: check `git diff {{DEFAULT_BRANCH}}` and `git log {{DEFAULT_BRANCH}}..HEAD` first to see what previous attempts already did. Build on existing work — do not start over. If a PR already exists, read its review comments (`gh pr view --comments`) — fix everything the reviewer asked for, rebase on the default branch, resolve any conflicts, and make sure CI passes before committing.
 3. **Commit step by step** as you work, not one big commit at the end. Use conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, etc.).
 4. **Lockfiles**: if you add, remove, or update dependencies, regenerate the lockfile before committing (`bun install`, `npm install`, `cargo update`, etc.). Always commit the updated lockfile with your changes.
-5. **Run CI checks locally before pushing**: look at `.github/workflows/` to see what CI runs and run those exact commands locally. Fix any failures before committing. Do NOT push code that will fail CI. If you cannot fix a failure, set status to `needs_review` and explain it.
-6. **Push**: `git push origin HEAD` after committing.
-7. **Create PR**: if no PR exists for this branch, create one with `gh pr create --base {{DEFAULT_BRANCH}} --title "<title>" --body "<body>"`. Rules:
-   - **Title**: use the issue title or a concise description of the change.
-   - **Body**: write a detailed PR description that explains the implementation. Include:
-     - A summary of the approach taken (2-4 sentences explaining *what* you did and *why*)
-     - A bullet list of key changes organized by area (e.g., "### Changes")
-     - Which files were modified and what each change does
-     - Any important design decisions or trade-offs
-   - **Do NOT** include `Closes #<issue>` or keyword issue references — the orchestrator links the branch to the issue via the GitHub API.
+5. **Run CI checks locally before committing**: look at `.github/workflows/` to see what CI runs and run those exact commands locally. Fix any failures before committing. Do NOT commit code that will fail CI. If you cannot fix a failure, set status to `needs_review` and explain it.
 
-Do NOT skip any of these steps. If you only make changes without committing and pushing, your work will be lost.
+**Do NOT push or create PRs** — the orchestrator handles pushing and PR creation after your work is done. Only commit your changes locally.
 
-If git push fails (e.g., auth error, permission denied, no remote), set status to `needs_review` with the error. The orchestrator will handle the push as a fallback — do NOT put "please approve the push" or push-related messages in your summary. Your summary must describe the work you did, not push status.
+Do NOT skip any of these steps. If you only make changes without committing, your work will be lost.
 
 **Infrastructure failures — STOP, do not file issues**: If GitHub setup operations fail (e.g., branch creation, `gh issue develop`, `gh issue link`, GraphQL link errors), **stop immediately and set status to `needs_review`**. Do NOT create GitHub issues about these failures — they are orchestrator-level infrastructure problems, not bugs in the codebase you are working on.
 
@@ -76,11 +67,11 @@ If git push fails (e.g., auth error, permission denied, no remote), set status t
 Before you write the output JSON, run these checks. If ANY fails, go back and fix it:
 
 1. `git status` — no uncommitted changes (clean working tree)
-2. `git log origin/main..HEAD` — your commits exist
-3. `git push origin HEAD` — branch is pushed (run again even if you already pushed)
-4. `gh pr view --json url` — PR exists (create one if not)
+2. `git log {{DEFAULT_BRANCH}}..HEAD` — your commits exist
 
-Do NOT report `"status": "done"` unless all 4 checks pass. If you made changes but cannot push or create a PR, your status is `needs_review`, not `done`.
+Do NOT report `"status": "done"` unless all checks pass. If you made changes but did not commit, your status is `needs_review`, not `done`.
+
+**Reminder:** Do NOT push or create PRs — the orchestrator handles that automatically.
 
 ## Output Format
 

@@ -1216,13 +1216,43 @@ pub(crate) async fn review_and_merge(
         }
     }
 
-    // 13. Handle the decision
+    // 13. Check for push failures before acting on the decision.
+    // If the agent's last push failed, the PR may have stale code — block for human review.
+    let has_push_failure = {
+        let last_err = crate::engine::cleanup::opt_store_get_field(
+            &Some(store.clone()),
+            repo,
+            &task.id.0,
+            "last_error",
+        )
+        .await
+        .unwrap_or_default();
+        last_err.contains("push failed")
+    };
+
+    // 14. Handle the decision
     match decision {
         ReviewDecision::Approve => {
+            // If the last push failed, the PR branch may not contain the latest changes.
+            // Block for human intervention instead of marking done or merging.
+            if has_push_failure {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    pr_number = pr_number_early,
+                    "review approved but last push failed — blocking for human check"
+                );
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::Blocked)
+                    .await
+                {
+                    tracing::error!(task_id = task.id.0, err = %e, "failed to block task");
+                }
+                return Ok(ReviewDecision::Blocked(
+                    "review approved but last push failed — PR may have stale code".to_string(),
+                ));
+            }
+
             // Use the same flag as the human-review path (review_open_prs).
-            // Falls back to workflow.auto_close (common config key), then
-            // workflow.auto_merge for backwards-compatibility.
-            // Must match the fallback chain in EngineConfig::from_config().
             let auto_merge = config::get("workflow.auto_close_task_on_approval")
                 .or_else(|_| config::get("workflow.auto_close"))
                 .or_else(|_| config::get("workflow.auto_merge"))

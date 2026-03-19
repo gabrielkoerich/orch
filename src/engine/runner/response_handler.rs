@@ -240,7 +240,54 @@ pub async fn handle_success(
     // (e.g., review/analysis jobs that create issues but no code changes).
     // If agent said "done", no PR, but has delegations — blocked on children.
     let has_delegations = !resp.delegations.is_empty();
-    let final_status = if resp.status == "done" && has_pr {
+
+    // Track push failures — block after 3 consecutive failures
+    // Check if push was attempted but failed: agent said done, tried to push, but has_pushed is still false
+    // and last_error contains a push failure.
+    let push_failed = resp.status == "done" && !has_pushed && {
+        let last_err =
+            crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "last_error")
+                .await
+                .unwrap_or_default();
+        last_err.contains("push failed")
+    };
+
+    let final_status = if push_failed {
+        let push_failures: u32 =
+            crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "pr_create_failures")
+                .await
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+                + 1;
+
+        crate::engine::cleanup::store_set(
+            store,
+            repo,
+            task_id,
+            &[
+                ("pr_create_failures", serde_json::json!(push_failures)),
+                // Clear agent so router picks a different one on reroute
+                ("agent", serde_json::json!(null)),
+            ],
+        )
+        .await;
+
+        if push_failures >= 3 {
+            tracing::error!(
+                task_id,
+                push_failures,
+                "push failed {push_failures} times — blocking for human intervention"
+            );
+            "blocked"
+        } else {
+            tracing::warn!(
+                task_id,
+                push_failures,
+                "agent done but push failed ({push_failures}/3) — rerouting to different agent"
+            );
+            "routed"
+        }
+    } else if resp.status == "done" && has_pr {
         "needs_review"
     } else if resp.status == "done" && !has_pr && has_delegations {
         tracing::info!(
