@@ -16,10 +16,10 @@ Issue → Branch + Worktree → Agent works → Push → PR → Review Agent →
 2. **Branch + Worktree** — engine creates via `gh issue develop` + `git worktree add`
 3. **Agent works** — runs inside worktree, edits files, commits changes
 4. **Push** — engine pushes the branch after agent finishes
-5. **PR** — agent creates with `gh pr create --base main` and `Closes #N`
-6. **Review** — opposite agent reviews the PR via `gh pr review` (approve / request changes / reject)
-7. **Fix + Reply** — fix review findings, reply to each comment, resolve threads
-8. **Merge** — squash merge with conventional commit prefix (`feat:` / `fix:`)
+5. **PR** — engine creates PR and links it to the issue
+6. **Review** — different agent reviews the PR (approve / request changes)
+7. **Fix + Reply** — fix review findings, commit fixes (engine pushes)
+8. **Merge** — engine merges PR after review approval and CI passes
 9. **Release** — CI auto-tags, generates changelog, creates GitHub release, updates Homebrew
 10. **Cleanup** — engine detects merged PR, removes worktree + local branch
 
@@ -93,8 +93,10 @@ The engine creates worktrees before launching agents. Agents do NOT create workt
 4. Agent runs inside the worktree directory (`PROJECT_DIR` is set to worktree)
 
 **After agent finishes:**
-- Engine pushes the branch (`git push -u origin <branch>`) if there are unpushed commits. The runner injects `GH_TOKEN` into the spawned runner environment so agents do not need to authenticate with `gh` themselves and agents should avoid calling GitHub directly.
-- Agent should NOT run `git push` itself
+- Engine pushes the branch (`git push -u origin <branch>`) if there are unpushed commits
+- Engine creates the PR and links it to the issue
+- Engine checks CI status and triggers the review agent
+- Agents should NOT push, create PRs, or call GitHub write APIs — the engine handles all git operations beyond committing
 
 ## Agent Invocation
 

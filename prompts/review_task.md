@@ -6,12 +6,13 @@ You are reviewing a PR created by an AI agent. Complete ALL steps in order.
 
 Keep the branch up to date — other PRs may have merged since this was created:
 1. Ensure the service has pre-fetched remote refs, then rebase onto the default branch:
-   - `git rebase origin/{{DEFAULT_BRANCH}}`  # service pre-fetches refs for agent worktrees
-3. If there are conflicts:
+   - `git rebase origin/{{DEFAULT_BRANCH}}`
+2. If there are conflicts:
    - Resolve each conflict by understanding both sides of the change
    - `git add <resolved files>` then `git rebase --continue`
    - If a conflict is too complex to resolve safely, set decision = `request_changes`
-4. `git push --force-with-lease`
+
+**Do NOT push** — the orchestrator handles pushing after review completes.
 
 ### Step 2: Run CI checks locally
 
@@ -23,7 +24,7 @@ If ANY check fails, try to fix it yourself:
 - Apply auto-fixers if available (e.g. formatter --fix, linter --fix)
 - Fix errors directly if straightforward
 
-Commit your fixes, push, and re-run checks. If you cannot fix a failure, decision = `request_changes`.
+Commit your fixes and re-run checks. If you cannot fix a failure, decision = `request_changes`. Do NOT push — the orchestrator handles that.
 
 ### Step 3: Check architecture alignment
 

@@ -86,7 +86,7 @@ The orchestrator creates worktrees before launching agents. Agents do NOT create
 3. `git worktree add <path> <branch>` — creates worktree
 4. Agent runs inside the worktree directory
 
-After an agent finishes, the orchestrator pushes the branch if there are unpushed commits. Note: the runner injects `GH_TOKEN` into the spawned runner environment so agents do not need to authenticate with `gh` themselves and agents are not expected to call GitHub directly. Attribution footers (for example: `Created by claude[bot] via Orch`) are added to issue and PR comments so it's clear which agent produced the content.
+After an agent finishes, the orchestrator handles all git operations: pushing the branch, creating the PR, and linking it to the issue. Agents only commit — they do not push or create PRs. The runner injects `GH_TOKEN` into the environment for read-only operations (e.g., checking CI status), but agents should not call GitHub write APIs directly. Attribution footers (for example: `Created by claude[bot] via Orch`) are added to issue and PR comments so it's clear which agent produced the content.
 
 ## Context Enrichment
 
