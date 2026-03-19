@@ -1345,12 +1345,15 @@ pub(crate) async fn auto_merge_pr(
         }
     }
 
-    // 3. Re-trigger the review gate workflow so it picks up the approve comment
-    if let Err(e) = gh.dispatch_workflow(repo, "orch-review.yml", branch).await {
+    // 3. Rerun the failed push-triggered review gate check so the commit status flips green
+    if let Err(e) = gh
+        .rerun_failed_workflow(repo, "Orch Review Gate", branch)
+        .await
+    {
         tracing::debug!(
             task_id = task.id.0,
             error = %e,
-            "failed to dispatch orch-review workflow (may not exist yet)"
+            "failed to rerun orch-review workflow (may not have a failed run)"
         );
     }
 

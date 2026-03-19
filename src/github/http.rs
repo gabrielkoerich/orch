@@ -1475,16 +1475,64 @@ impl GhHttp {
         Ok((state, total, passing, failing, pending))
     }
 
-    /// Trigger a workflow dispatch.
-    pub async fn dispatch_workflow(
+    /// Rerun the latest failed workflow run for a given workflow name and branch.
+    ///
+    /// Finds the most recent failed (or cancelled) run of `workflow_name` on
+    /// `branch` triggered by a `push` event, then calls the GitHub Actions
+    /// rerun endpoint so the **same check run** on the commit flips green.
+    pub async fn rerun_failed_workflow(
         &self,
         repo: &str,
-        workflow: &str,
+        workflow_name: &str,
         branch: &str,
     ) -> anyhow::Result<()> {
-        let url = format!("{GITHUB_API}/repos/{repo}/actions/workflows/{workflow}/dispatches");
-        let payload = serde_json::json!({ "ref": branch });
-        self.post_json_raw(&url, &payload).await?;
+        // List recent runs for this branch, filtered to push events
+        let url = format!(
+            "{GITHUB_API}/repos/{repo}/actions/runs?branch={branch}&event=push&per_page=10"
+        );
+        let resp: serde_json::Value = self.get_json(&url).await?;
+        let runs = resp["workflow_runs"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("no workflow_runs array in response"))?;
+
+        // Find the latest failed/cancelled run matching the workflow name
+        let run_id = runs
+            .iter()
+            .find(|r| {
+                r["name"].as_str() == Some(workflow_name)
+                    && matches!(
+                        r["conclusion"].as_str(),
+                        Some("failure") | Some("cancelled")
+                    )
+            })
+            .and_then(|r| r["id"].as_u64())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no failed run found for workflow '{}' on branch '{}'",
+                    workflow_name,
+                    branch
+                )
+            })?;
+
+        // POST rerun — no body needed
+        let rerun_url = format!("{GITHUB_API}/repos/{repo}/actions/runs/{run_id}/rerun");
+        let auth = self.auth_header().await?;
+        let resp = self
+            .client
+            .post(&rerun_url)
+            .header(header::AUTHORIZATION, auth)
+            .header(header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await?;
+        Self::record_response(&resp);
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            Self::maybe_record_rate_limit_from_body(status, &body);
+            anyhow::bail!("GitHub API POST rerun {rerun_url} failed ({status}): {body}");
+        }
+
         Ok(())
     }
 
