@@ -505,10 +505,21 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Spawn notification dispatcher — reads task completion notifications
-    // from transport and broadcasts to all configured channels.
+    // from transport and broadcasts to configured channels.
+    //
+    // Routing priority:
+    // 1. Dedicated channel: if the notification has a `repo` and the
+    //    ChannelRouter maps it to a topic/channel, send there with `topic_id`.
+    // 2. Subscribed channels: send to each (channel, thread_id) subscribed to
+    //    the repo, using `format_with_project()` so recipients know the source.
+    // 3. Fallback: if no repo or no dedicated channel, broadcast to all
+    //    channels without a topic_id (legacy behaviour).
     {
         let mut notification_rx = transport.subscribe_notifications();
         let channels = channel_registry.clone();
+        let notif_router = channel_router.clone();
+        // Grab a store reference for subscription lookups.
+        let notif_store: Option<Arc<TaskStore>> = project_engines.first().map(|e| e.store.clone());
         tokio::spawn(async move {
             loop {
                 match notification_rx.recv().await {
@@ -527,38 +538,119 @@ pub async fn serve() -> anyhow::Result<()> {
                         tracing::info!(
                             task_id = %notification.task_id,
                             status = %notification.status,
-                            "broadcasting notification to channels"
+                            repo = ?notification.repo,
+                            "routing notification to channels"
                         );
 
-                        for channel in channels.iter() {
-                            let (body, should_send) = match channel.name() {
-                                "telegram" => (notification.format_telegram(), true),
-                                "discord" => (notification.format_discord(), true),
-                                "slack" => (notification.format_slack(), true),
-                                // GitHub is already handled by backend.post_comment()
-                                // tmux doesn't need task completion notifications
-                                _ => (String::new(), false),
-                            };
+                        // Track whether we sent to at least one dedicated/subscribed target.
+                        let mut routed = false;
 
-                            if !should_send {
-                                continue;
+                        if let Some(repo) = notification.repo.as_deref() {
+                            // 1. Dedicated channel targets for this repo.
+                            for channel in channels.iter() {
+                                let ch_name = channel.name();
+                                if let Some(topic_id) =
+                                    notif_router.target_for_project(repo, ch_name)
+                                {
+                                    let body = match ch_name {
+                                        "telegram" => notification.format_telegram(),
+                                        "discord" => notification.format_discord(),
+                                        "slack" => notification.format_slack(),
+                                        _ => continue,
+                                    };
+                                    let msg = OutgoingMessage {
+                                        thread_id: notification.task_id.clone(),
+                                        body,
+                                        reply_to: None,
+                                        metadata: serde_json::json!({}),
+                                        topic_id: Some(topic_id.to_string()),
+                                    };
+                                    if let Err(e) = channel.send(&msg).await {
+                                        tracing::warn!(
+                                            channel = ch_name,
+                                            task_id = %notification.task_id,
+                                            ?e,
+                                            "failed to send to dedicated channel"
+                                        );
+                                    } else {
+                                        routed = true;
+                                    }
+                                }
                             }
 
-                            let msg = OutgoingMessage {
-                                thread_id: notification.task_id.clone(),
-                                body,
-                                reply_to: None,
-                                metadata: serde_json::json!({}),
-                                topic_id: None,
-                            };
+                            // 2. Subscribed channels for this repo.
+                            if let Some(store) = &notif_store {
+                                match store.list_subscribers_for_repo(repo).await {
+                                    Ok(subscribers) => {
+                                        for (ch_name, thread_id) in subscribers {
+                                            let channel =
+                                                channels.iter().find(|c| c.name() == ch_name);
+                                            let Some(channel) = channel else {
+                                                continue;
+                                            };
+                                            let body = notification.format_with_project(&ch_name);
+                                            let msg = OutgoingMessage {
+                                                thread_id: thread_id.clone(),
+                                                body,
+                                                reply_to: None,
+                                                metadata: serde_json::json!({}),
+                                                topic_id: Some(thread_id.clone()),
+                                            };
+                                            if let Err(e) = channel.send(&msg).await {
+                                                tracing::warn!(
+                                                    channel = %ch_name,
+                                                    task_id = %notification.task_id,
+                                                    ?e,
+                                                    "failed to send to subscribed channel"
+                                                );
+                                            } else {
+                                                routed = true;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            repo,
+                                            ?e,
+                                            "failed to list subscribers for repo"
+                                        );
+                                    }
+                                }
+                            }
+                        }
 
-                            if let Err(e) = channel.send(&msg).await {
-                                tracing::warn!(
-                                    channel = channel.name(),
-                                    task_id = %notification.task_id,
-                                    ?e,
-                                    "failed to send notification"
-                                );
+                        // 3. Fallback: broadcast to all channels when no routing happened.
+                        if !routed {
+                            for channel in channels.iter() {
+                                let (body, should_send) = match channel.name() {
+                                    "telegram" => (notification.format_telegram(), true),
+                                    "discord" => (notification.format_discord(), true),
+                                    "slack" => (notification.format_slack(), true),
+                                    // GitHub is already handled by backend.post_comment()
+                                    // tmux doesn't need task completion notifications
+                                    _ => (String::new(), false),
+                                };
+
+                                if !should_send {
+                                    continue;
+                                }
+
+                                let msg = OutgoingMessage {
+                                    thread_id: notification.task_id.clone(),
+                                    body,
+                                    reply_to: None,
+                                    metadata: serde_json::json!({}),
+                                    topic_id: None,
+                                };
+
+                                if let Err(e) = channel.send(&msg).await {
+                                    tracing::warn!(
+                                        channel = channel.name(),
+                                        task_id = %notification.task_id,
+                                        ?e,
+                                        "failed to send notification"
+                                    );
+                                }
                             }
                         }
                     }
