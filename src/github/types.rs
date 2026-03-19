@@ -16,6 +16,10 @@ pub struct GitHubIssue {
     pub node_id: Option<String>,
     /// Present when the item is actually a pull request (GitHub API returns PRs in /issues).
     pub pull_request: Option<serde_json::Value>,
+    /// Author's relationship to the repo: OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR,
+    /// FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, MANNEQUIN, NONE.
+    #[serde(default)]
+    pub author_association: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

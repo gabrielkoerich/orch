@@ -8,6 +8,19 @@ use crate::github::http::{status_label_color, GhHttp};
 use crate::github::projects::ProjectSync;
 use async_trait::async_trait;
 
+/// Author associations that are allowed to create tasks.
+/// Issues from other authors are silently ignored during ingestion.
+const ALLOWED_ASSOCIATIONS: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"];
+
+/// Check if an issue author is trusted (owner, member, collaborator, or contributor).
+fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
+    issue
+        .author_association
+        .as_deref()
+        .map(|a| ALLOWED_ASSOCIATIONS.contains(&a))
+        .unwrap_or(false) // missing field = untrusted
+}
+
 pub struct GitHubBackend {
     repo: String,
     gh: GhHttp,
@@ -185,6 +198,7 @@ impl ExternalBackend for GitHubBackend {
         Ok(issues
             .into_iter()
             .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
+            .filter(is_trusted_author) // Only trusted authors
             .map(|issue| ExternalTask {
                 id: ExternalId(issue.number.to_string()),
                 title: issue.title,
@@ -208,6 +222,7 @@ impl ExternalBackend for GitHubBackend {
         Ok(issues
             .into_iter()
             .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
+            .filter(is_trusted_author) // Only trusted authors
             .map(|issue| ExternalTask {
                 id: ExternalId(issue.number.to_string()),
                 title: issue.title,
@@ -228,6 +243,7 @@ impl ExternalBackend for GitHubBackend {
         Ok(issues
             .into_iter()
             .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
+            .filter(is_trusted_author) // Only trusted authors
             .filter(|issue| {
                 let labels: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
                 // Include if: has status:new, OR has no status:* label at all
