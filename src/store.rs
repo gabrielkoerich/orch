@@ -25,6 +25,7 @@ pub fn default_db_path() -> anyhow::Result<std::path::PathBuf> {
 /// Parameters for inserting a new task metric record.
 #[derive(Debug, Clone)]
 pub struct InsertTaskMetric<'a> {
+    pub repo: &'a str,
     pub task_id: &'a str,
     pub agent: &'a str,
     pub model: Option<&'a str>,
@@ -1458,12 +1459,13 @@ impl TaskStore {
             .await?;
 
         let row = sqlx::query(
-            "INSERT INTO task_metrics (task_id, agent, model, complexity, outcome, duration_seconds,
+            "INSERT INTO task_metrics (repo, task_id, agent, model, complexity, outcome, duration_seconds,
              started_at, completed_at, attempts, files_changed, error_type,
              input_tokens, output_tokens, input_cost_usd, output_cost_usd, total_cost_usd)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              RETURNING id",
         )
+        .bind(metric.repo)
         .bind(metric.task_id)
         .bind(metric.agent)
         .bind(metric.model)
@@ -2164,6 +2166,7 @@ impl TaskStore {
                 .unwrap_or_else(|_| Utc::now());
 
             let metric = InsertTaskMetric {
+                repo: "",
                 task_id: &task_id,
                 agent: &agent,
                 model: model.as_deref(),
@@ -5542,6 +5545,7 @@ mod tests {
         let now = Utc::now();
 
         let metric = InsertTaskMetric {
+            repo: "",
             task_id: "42",
             agent: "claude",
             model: Some("opus"),
@@ -5582,6 +5586,7 @@ mod tests {
         // Insert a success
         store
             .insert_task_metric(&InsertTaskMetric {
+                repo: "",
                 task_id: "1",
                 agent: "claude",
                 model: None,
@@ -5605,6 +5610,7 @@ mod tests {
         // Insert a failure
         store
             .insert_task_metric(&InsertTaskMetric {
+                repo: "",
                 task_id: "2",
                 agent: "codex",
                 model: None,
@@ -5664,6 +5670,7 @@ mod tests {
         for (agent, cost) in &[("claude", 0.10), ("codex", 0.05), ("claude", 0.20)] {
             store
                 .insert_task_metric(&InsertTaskMetric {
+                    repo: "",
                     task_id: "1",
                     agent,
                     model: None,
@@ -5702,6 +5709,7 @@ mod tests {
         for (model, cost) in &[("sonnet", 0.05), ("opus", 0.15), ("sonnet", 0.10)] {
             store
                 .insert_task_metric(&InsertTaskMetric {
+                    repo: "",
                     task_id: "1",
                     agent: "claude",
                     model: Some(model),
@@ -5804,6 +5812,7 @@ mod tests {
         for error_type in &["timeout", "timeout", "rate_limit"] {
             store
                 .insert_task_metric(&InsertTaskMetric {
+                    repo: "",
                     task_id: "1",
                     agent: "claude",
                     model: None,
@@ -5842,6 +5851,7 @@ mod tests {
         for (task_id, duration) in &[("t1", 120.0), ("t2", 300.0), ("t3", 60.0)] {
             store
                 .insert_task_metric(&InsertTaskMetric {
+                    repo: "",
                     task_id,
                     agent: "claude",
                     model: Some("sonnet"),
@@ -5916,6 +5926,7 @@ mod tests {
 
         store
             .insert_task_metric(&InsertTaskMetric {
+                repo: "",
                 task_id: "cost1",
                 agent: "claude",
                 model: Some("sonnet"),

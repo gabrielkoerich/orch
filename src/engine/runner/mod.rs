@@ -352,6 +352,7 @@ impl TaskRunner {
             };
 
             let metric = InsertTaskMetric {
+                repo: &self.repo,
                 task_id,
                 agent: agent_name,
                 model: model_name.as_deref(),
