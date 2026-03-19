@@ -922,10 +922,12 @@ impl TaskStore {
         Ok(())
     }
 
-    /// Reset transient failure/retry counters to zero, preserving `review_cycles`.
+    /// Reset transient failure/retry counters to zero, preserving `review_cycles` and `ci_merge_failures`.
     ///
     /// Use this after `RequestChanges` to clear per-attempt noise without
     /// undoing the review-cycle count that `handle_review_changes` just set.
+    /// `ci_merge_failures` is preserved here because it must accumulate across attempts
+    /// to enforce `MAX_CI_MERGE_FAILURES`, just like `review_cycles`.
     pub async fn reset_failure_counters(&self, id: i64) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE tasks SET
@@ -934,7 +936,6 @@ impl TaskStore {
                 review_agent_failures = 0,
                 merge_conflict_retries = 0,
                 pr_create_failures = 0,
-                ci_merge_failures = 0,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?",
         )
@@ -3182,17 +3183,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate counters after a review cycle: review_cycles=1, plus transient failures
+        // Simulate counters after a review cycle: review_cycles=1, ci_merge_failures=2, plus transient failures
         store.increment(id, "review_cycles").await.unwrap();
+        store.increment(id, "ci_merge_failures").await.unwrap();
+        store.increment(id, "ci_merge_failures").await.unwrap();
         store.increment(id, "attempts").await.unwrap();
         store.increment(id, "review_agent_failures").await.unwrap();
         store.increment(id, "merge_conflict_retries").await.unwrap();
 
-        // reset_failure_counters must zero transient counters but preserve review_cycles
+        // reset_failure_counters must zero transient counters but preserve review_cycles and ci_merge_failures
         store.reset_failure_counters(id).await.unwrap();
 
         let task = store.get(id).await.unwrap();
         assert_eq!(task.review_cycles, 1, "review_cycles must be preserved");
+        assert_eq!(
+            task.ci_merge_failures, 2,
+            "ci_merge_failures must be preserved"
+        );
         assert_eq!(task.attempts, 0);
         assert_eq!(task.review_agent_failures, 0);
         assert_eq!(task.merge_conflict_retries, 0);
