@@ -98,6 +98,20 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
     let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
 
+    // Preload all store tasks for this repo into a map keyed by external_id.
+    // This avoids 4 SQL queries per external task (resolve_id + get, twice for agent and attempts).
+    let store_by_ext_id: std::collections::HashMap<String, crate::store::Task> =
+        if let Some(ref s) = store {
+            s.list_all(&repo)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|t| t.external_id.clone().map(|eid| (eid, t)))
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
     println!(
         "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} TITLE",
         "ID", "TYPE", "STATUS", "AGENT", "AGE", "TRIES"
@@ -113,14 +127,21 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
                     .find(|l| l.starts_with("status:"))
                     .map(|s| s.replace("status:", ""))
                     .unwrap_or_else(|| "unknown".to_string());
-                let agent = store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "agent")
-                    .await
-                    .unwrap_or_default();
+                let store_task = store_by_ext_id.get(&ext.id.0);
+                let agent = store_task
+                    .and_then(|t| t.agent.as_deref())
+                    .unwrap_or("")
+                    .to_string();
                 let age = format_age(&ext.updated_at);
-                let tries =
-                    store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "attempts")
-                        .await
-                        .unwrap_or_default();
+                let tries = store_task
+                    .map(|t| {
+                        if t.attempts > 0 {
+                            t.attempts.to_string()
+                        } else {
+                            String::new()
+                        }
+                    })
+                    .unwrap_or_default();
                 println!(
                     "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} {}",
                     ext.id.0, "external", status, agent, age, tries, ext.title
@@ -483,27 +504,26 @@ pub async fn status(json: bool) -> anyhow::Result<()> {
         })
         .collect();
 
-    // Calculate total cost across all external tasks
+    // Calculate total cost using a single aggregate query instead of per-task lookups.
     let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
     let mut total_cost: f64 = 0.0;
 
-    for task in &all_external {
-        let usage = store_helpers::get_token_usage(&store, &repo, &task.id.0).await;
-        let cost = store_helpers::get_cost_estimate(&store, &repo, &task.id.0).await;
-        total_input_tokens += usage.input_tokens;
-        total_output_tokens += usage.output_tokens;
-        total_cost += cost.total_cost_usd;
-    }
-    for task in &all_internal {
-        let id = format!("internal:{}", task.id);
-        let usage = store_helpers::get_token_usage(&store, &repo, &id).await;
-        let cost = store_helpers::get_cost_estimate(&store, &repo, &id).await;
-        total_input_tokens += usage.input_tokens;
-        total_output_tokens += usage.output_tokens;
-        total_cost += cost.total_cost_usd;
+    if let Some(ref s) = store {
+        if let Ok((input, output, cost)) = s.cost_summary(&repo).await {
+            total_input_tokens = input as u64;
+            total_output_tokens = output as u64;
+            total_cost = cost;
+        }
+    } else {
+        // No store available: sum up internal task costs directly from already-loaded data.
+        for task in &all_internal {
+            total_input_tokens += task.input_tokens as u64;
+            total_output_tokens += task.output_tokens as u64;
+            total_cost += task.total_cost_usd;
+        }
     }
 
     if json {

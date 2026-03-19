@@ -739,7 +739,6 @@ impl TaskStore {
 
     /// Aggregate cost and token data for a repo.
     /// Returns (total_input_tokens, total_output_tokens, total_cost_usd).
-    #[allow(dead_code)]
     pub async fn cost_summary(&self, repo: &str) -> anyhow::Result<(i64, i64, f64)> {
         let row = sqlx::query(
             "SELECT
