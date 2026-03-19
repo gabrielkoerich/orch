@@ -205,4 +205,46 @@ mod tests {
         assert_eq!(router.resolve_project("telegram", "1"), None); // General is not a project
         assert_eq!(router.resolve_project("slack", "anything"), None);
     }
+
+    #[test]
+    fn project_with_custom_config_doesnt_affect_others() {
+        let global = GlobalChannelConfig {
+            telegram_general_topic_id: Some("1".into()),
+            discord_general_channel_id: None,
+        };
+        let projects = vec![
+            (
+                "owner/orch".into(),
+                ProjectChannelConfig {
+                    telegram_topic_id: Some("42".into()),
+                    telegram_bot_token: Some("custom-token".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "owner/bean".into(),
+                ProjectChannelConfig {
+                    telegram_topic_id: Some("87".into()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let router = ChannelRouter::new(&global, &projects);
+        // Custom bot_token on orch should not affect bean's routing
+        assert_eq!(router.resolve_project("telegram", "42"), Some("owner/orch"));
+        assert_eq!(router.resolve_project("telegram", "87"), Some("owner/bean"));
+        // Reverse lookup also works
+        assert_eq!(
+            router.target_for_project("owner/orch", "telegram"),
+            Some("42")
+        );
+        assert_eq!(
+            router.target_for_project("owner/bean", "telegram"),
+            Some("87")
+        );
+        // General still resolves
+        assert!(router.is_general("telegram", "1"));
+        // Projects list includes both
+        assert_eq!(router.projects().len(), 2);
+    }
 }

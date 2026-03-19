@@ -6253,4 +6253,144 @@ mod tests {
         let subs = store.list_subscribers_for_repo("owner/orch").await.unwrap();
         assert_eq!(subs.len(), 2);
     }
+
+    #[tokio::test]
+    async fn metrics_summary_by_repo_filters_correctly() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        // Create tasks in different repos
+        let id1 = store
+            .create_internal("owner/orch", "Task A", "", "test", "")
+            .await
+            .unwrap();
+        let id2 = store
+            .create_internal("owner/bean", "Task B", "", "test", "")
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        let ago = now - chrono::Duration::minutes(30);
+
+        // Insert metric for orch
+        store
+            .insert_task_metric(&InsertTaskMetric {
+                repo: "owner/orch",
+                task_id: &id1.to_string(),
+                agent: "claude",
+                model: Some("sonnet"),
+                complexity: Some("simple"),
+                outcome: "success",
+                duration_seconds: 60.0,
+                started_at: &ago,
+                completed_at: &now,
+                attempts: 1,
+                files_changed: 2,
+                error_type: None,
+                input_tokens: None,
+                output_tokens: None,
+                input_cost_usd: None,
+                output_cost_usd: None,
+                total_cost_usd: None,
+            })
+            .await
+            .unwrap();
+
+        // Insert metric for bean
+        store
+            .insert_task_metric(&InsertTaskMetric {
+                repo: "owner/bean",
+                task_id: &id2.to_string(),
+                agent: "codex",
+                model: Some("gpt-5"),
+                complexity: Some("medium"),
+                outcome: "success",
+                duration_seconds: 120.0,
+                started_at: &ago,
+                completed_at: &now,
+                attempts: 1,
+                files_changed: 1,
+                error_type: None,
+                input_tokens: None,
+                output_tokens: None,
+                input_cost_usd: None,
+                output_cost_usd: None,
+                total_cost_usd: None,
+            })
+            .await
+            .unwrap();
+
+        // Query per-repo: orch
+        let orch_stats = store
+            .get_metrics_summary_24h_by_repo("owner/orch")
+            .await
+            .unwrap();
+        assert_eq!(orch_stats.tasks_completed_24h, 1);
+        assert_eq!(orch_stats.agent_stats.len(), 1);
+        assert_eq!(orch_stats.agent_stats[0].agent, "claude");
+
+        // Query per-repo: bean
+        let bean_stats = store
+            .get_metrics_summary_24h_by_repo("owner/bean")
+            .await
+            .unwrap();
+        assert_eq!(bean_stats.tasks_completed_24h, 1);
+        assert_eq!(bean_stats.agent_stats.len(), 1);
+        assert_eq!(bean_stats.agent_stats[0].agent, "codex");
+
+        // Global should show both
+        let all_stats = store.get_metrics_summary_24h().await.unwrap();
+        assert_eq!(all_stats.tasks_completed_24h, 2);
+    }
+
+    #[tokio::test]
+    async fn subscription_round_trip_with_multiple_channels() {
+        let store = TaskStore::open_memory().await.unwrap();
+
+        // Subscribe telegram and discord to orch
+        store
+            .subscribe_channel("telegram", "42", "owner/orch")
+            .await
+            .unwrap();
+        store
+            .subscribe_channel("discord", "1111", "owner/orch")
+            .await
+            .unwrap();
+
+        // Subscribe telegram to bean too
+        store
+            .subscribe_channel("telegram", "42", "owner/bean")
+            .await
+            .unwrap();
+
+        // Check subscribers for orch
+        let orch_subs = store.list_subscribers_for_repo("owner/orch").await.unwrap();
+        assert_eq!(orch_subs.len(), 2);
+
+        // Check what telegram:42 is subscribed to
+        let tg_subs = store
+            .list_channel_subscriptions("telegram", "42")
+            .await
+            .unwrap();
+        assert_eq!(tg_subs.len(), 2);
+        assert!(tg_subs.contains(&"owner/orch".to_string()));
+        assert!(tg_subs.contains(&"owner/bean".to_string()));
+
+        // Unsubscribe orch from telegram
+        store
+            .unsubscribe_channel("telegram", "42", "owner/orch")
+            .await
+            .unwrap();
+
+        let tg_subs = store
+            .list_channel_subscriptions("telegram", "42")
+            .await
+            .unwrap();
+        assert_eq!(tg_subs.len(), 1);
+        assert_eq!(tg_subs[0], "owner/bean");
+
+        // orch should now only have discord subscriber
+        let orch_subs = store.list_subscribers_for_repo("owner/orch").await.unwrap();
+        assert_eq!(orch_subs.len(), 1);
+        assert_eq!(orch_subs[0], ("discord".to_string(), "1111".to_string()));
+    }
 }

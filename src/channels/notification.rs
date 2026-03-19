@@ -359,4 +359,62 @@ mod tests {
         assert_eq!(status_emoji("failed"), "❌");
         assert_eq!(status_emoji("unknown"), "📋");
     }
+
+    #[test]
+    fn format_with_project_includes_repo_name() {
+        let n = TaskNotification {
+            task_id: "42".into(),
+            title: "Fix bug".into(),
+            status: "done".into(),
+            agent: "claude".into(),
+            duration_seconds: 90.0,
+            summary: "Fixed it".into(),
+            repo: Some("owner/myproject".into()),
+        };
+        let formatted = n.format_with_project("telegram");
+        assert!(
+            formatted.starts_with("[myproject]"),
+            "should start with project name: {formatted}"
+        );
+        assert!(formatted.contains("Fix bug"));
+    }
+
+    #[test]
+    fn format_with_project_no_repo_still_works() {
+        let n = TaskNotification {
+            task_id: "42".into(),
+            title: "Fix bug".into(),
+            status: "done".into(),
+            agent: "claude".into(),
+            duration_seconds: 90.0,
+            summary: "Fixed it".into(),
+            repo: None,
+        };
+        let formatted = n.format_with_project("telegram");
+        assert!(
+            formatted.starts_with("[unknown]"),
+            "should fallback: {formatted}"
+        );
+    }
+
+    #[test]
+    fn format_with_project_uses_channel_format() {
+        let n = TaskNotification {
+            task_id: "5".into(),
+            title: "Deploy".into(),
+            status: "done".into(),
+            agent: "codex".into(),
+            duration_seconds: 60.0,
+            summary: "Deployed".into(),
+            repo: Some("acme/svc".into()),
+        };
+        let tg = n.format_with_project("telegram");
+        let dc = n.format_with_project("discord");
+        // Both start with project prefix
+        assert!(tg.starts_with("[svc]"));
+        assert!(dc.starts_with("[svc]"));
+        // Discord uses ** for bold, telegram uses *
+        assert!(dc.contains("**Task #5**"));
+        assert!(tg.contains("*Task #5*"));
+    }
 }
