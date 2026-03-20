@@ -247,7 +247,7 @@ pub async fn set_model_spec(store: &TaskStore, spec: &ModelSpec) -> Result<()> {
 /// summary tag stripped out.
 pub fn parse_response(raw: &str) -> (String, Option<String>) {
     if let Some(start) = raw.find("<summary>") {
-        if let Some(end) = raw.find("</summary>") {
+        if let Some(end) = raw[start..].find("</summary>").map(|e| e + start) {
             let summary = raw[start + "<summary>".len()..end].trim().to_string();
             let clean = format!(
                 "{}{}",
@@ -565,6 +565,15 @@ mod tests {
         let (clean, summary) = parse_response(response);
         assert_eq!(summary, None);
         assert_eq!(clean, "No tasks found.");
+    }
+
+    #[test]
+    fn extract_summary_closing_tag_before_opening_does_not_panic() {
+        // </summary> appears before <summary> — must not panic
+        let response = "Example: </summary> is a closing tag.\n<summary>actual summary</summary>";
+        let (clean, summary) = parse_response(response);
+        assert_eq!(summary.as_deref(), Some("actual summary"));
+        assert!(!clean.contains("<summary>"));
     }
 
     #[test]
