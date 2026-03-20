@@ -381,12 +381,14 @@ pub fn build_review_prompt(
     git_diff: &str,
     git_log: &str,
     default_branch: &str,
+    pr_number: u64,
 ) -> String {
     let mut vars = HashMap::new();
     vars.insert("TASK_ID".to_string(), task.id.0.clone());
     vars.insert("TASK_TITLE".to_string(), task.title.clone());
     vars.insert("TASK_BODY".to_string(), task.body.clone());
     vars.insert("DEFAULT_BRANCH".to_string(), default_branch.to_string());
+    vars.insert("PR_NUMBER".to_string(), pr_number.to_string());
 
     if !agent_summary.is_empty() {
         vars.insert("AGENT_SUMMARY".to_string(), agent_summary.to_string());

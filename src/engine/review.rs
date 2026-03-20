@@ -966,6 +966,7 @@ pub(crate) async fn review_and_merge(
         &git_diff,
         &git_log,
         &default_branch,
+        pr_number_early,
     );
 
     // 5. Pick review agent via round-robin, excluding the agent that did the work
