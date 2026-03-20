@@ -380,6 +380,8 @@ pub async fn serve() -> anyhow::Result<()> {
     let global_channel_config = GlobalChannelConfig {
         telegram_general_topic_id: crate::config::get("channels.telegram.general_topic_id").ok(),
         discord_general_channel_id: crate::config::get("channels.discord.general_channel_id").ok(),
+        control_telegram_topic_id: crate::config::get("control.channels.telegram.topic_id").ok(),
+        control_discord_channel_id: crate::config::get("control.channels.discord.channel_id").ok(),
     };
     let project_channel_configs: Vec<(String, ProjectChannelConfig)> = project_engines
         .iter()
@@ -1275,9 +1277,18 @@ async fn handle_channel_message(
     let topic_id = msg.topic_id.as_deref().unwrap_or(&msg.thread_id);
     let resolved_repo = channel_router.resolve_project(&msg.channel, topic_id);
     let is_general = channel_router.is_general(&msg.channel, topic_id);
+    let is_control = channel_router.is_control_channel(&msg.channel, topic_id);
     let msg_topic_id = msg.topic_id.clone();
 
-    match transport.route(&msg).await {
+    // Check control channel BEFORE task bindings so a control channel message
+    // never accidentally falls through to task session routing.
+    let route = if is_control {
+        MessageRoute::ControlSession
+    } else {
+        transport.route(&msg).await
+    };
+
+    match route {
         MessageRoute::TaskSession { task_id } => {
             let body = msg.body.trim().to_string();
             let channel = msg.channel.clone();
@@ -1425,6 +1436,57 @@ async fn handle_channel_message(
                     msg_topic_id.as_deref(),
                 )
                 .await;
+            }
+        }
+
+        MessageRoute::ControlSession => {
+            let channel = msg.channel.clone();
+            let thread_id = msg.thread_id.clone();
+            let body = msg.body.clone();
+
+            // Session ID is per channel+topic so Telegram and Discord are isolated.
+            let session_id = format!("{}:{}", channel, topic_id);
+
+            // Find a store from the first available engine reference.
+            let store = engine_refs
+                .iter()
+                .find_map(|(_, _, _, s)| s.as_ref())
+                .cloned();
+
+            if let Some(store) = store {
+                match crate::control::send_message(
+                    &store,
+                    &session_id,
+                    &channel,
+                    Some(&thread_id),
+                    &body,
+                )
+                .await
+                {
+                    Ok(reply) => {
+                        send_channel_reply(
+                            channels,
+                            &channel,
+                            &thread_id,
+                            reply,
+                            msg_topic_id.as_deref(),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "control session agent invocation failed");
+                        send_channel_reply(
+                            channels,
+                            &channel,
+                            &thread_id,
+                            format!("Control session error: {e}"),
+                            msg_topic_id.as_deref(),
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                tracing::warn!("no store available, cannot handle control session message");
             }
         }
 

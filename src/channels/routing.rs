@@ -25,6 +25,10 @@ pub struct ProjectChannelConfig {
 pub struct GlobalChannelConfig {
     pub telegram_general_topic_id: Option<String>,
     pub discord_general_channel_id: Option<String>,
+    /// Telegram topic ID for the control session (from `control.channels.telegram.topic_id`).
+    pub control_telegram_topic_id: Option<String>,
+    /// Discord channel ID for the control session (from `control.channels.discord.channel_id`).
+    pub control_discord_channel_id: Option<String>,
 }
 
 /// Maps channel targets to projects and vice versa.
@@ -36,6 +40,8 @@ pub struct ChannelRouter {
     repo_to_targets: HashMap<String, HashMap<String, String>>,
     /// General channel IDs per channel type
     general: HashMap<String, String>,
+    /// Control session channel IDs per channel type
+    control: HashMap<String, String>,
     /// All configured project repos
     project_list: Vec<String>,
 }
@@ -46,6 +52,7 @@ impl ChannelRouter {
         let mut target_to_repo = HashMap::new();
         let mut repo_to_targets: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut general = HashMap::new();
+        let mut control = HashMap::new();
         let mut project_list = Vec::new();
 
         if let Some(ref id) = global.telegram_general_topic_id {
@@ -53,6 +60,12 @@ impl ChannelRouter {
         }
         if let Some(ref id) = global.discord_general_channel_id {
             general.insert("discord".to_string(), id.clone());
+        }
+        if let Some(ref id) = global.control_telegram_topic_id {
+            control.insert("telegram".to_string(), id.clone());
+        }
+        if let Some(ref id) = global.control_discord_channel_id {
+            control.insert("discord".to_string(), id.clone());
         }
 
         for (repo, config) in projects {
@@ -76,6 +89,7 @@ impl ChannelRouter {
             target_to_repo,
             repo_to_targets,
             general,
+            control,
             project_list,
         }
     }
@@ -91,6 +105,14 @@ impl ChannelRouter {
     /// Check if a target is the General channel.
     pub fn is_general(&self, channel: &str, topic_or_channel_id: &str) -> bool {
         self.general
+            .get(channel)
+            .map(|id| id == topic_or_channel_id)
+            .unwrap_or(false)
+    }
+
+    /// Check if a target is the configured control session channel.
+    pub fn is_control_channel(&self, channel: &str, topic_or_channel_id: &str) -> bool {
+        self.control
             .get(channel)
             .map(|id| id == topic_or_channel_id)
             .unwrap_or(false)
@@ -125,6 +147,7 @@ mod tests {
         let global = GlobalChannelConfig {
             telegram_general_topic_id: Some("1".to_string()),
             discord_general_channel_id: Some("9999".to_string()),
+            ..Default::default()
         };
         let projects = vec![
             (
@@ -178,6 +201,30 @@ mod tests {
     }
 
     #[test]
+    fn is_control_channel() {
+        let global = GlobalChannelConfig {
+            telegram_general_topic_id: Some("1".to_string()),
+            discord_general_channel_id: Some("9999".to_string()),
+            control_telegram_topic_id: Some("55".to_string()),
+            control_discord_channel_id: Some("77".to_string()),
+        };
+        let router = ChannelRouter::new(&global, &[]);
+        assert!(router.is_control_channel("telegram", "55"));
+        assert!(router.is_control_channel("discord", "77"));
+        assert!(!router.is_control_channel("telegram", "1")); // general, not control
+        assert!(!router.is_control_channel("discord", "9999")); // general, not control
+        assert!(!router.is_control_channel("telegram", "42")); // project channel
+        assert!(!router.is_control_channel("slack", "55")); // unknown channel
+    }
+
+    #[test]
+    fn control_channel_unconfigured_returns_false() {
+        let router = test_router(); // no control fields set
+        assert!(!router.is_control_channel("telegram", "1"));
+        assert!(!router.is_control_channel("discord", "9999"));
+    }
+
+    #[test]
     fn target_for_project() {
         let router = test_router();
         assert_eq!(
@@ -211,6 +258,7 @@ mod tests {
         let global = GlobalChannelConfig {
             telegram_general_topic_id: Some("1".into()),
             discord_general_channel_id: None,
+            ..Default::default()
         };
         let projects = vec![
             (
