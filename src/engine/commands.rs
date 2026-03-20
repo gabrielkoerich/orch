@@ -63,17 +63,26 @@ impl std::fmt::Display for OwnerCommand {
 /// Scans each line for a `/command` at the start. Returns the first valid
 /// command found. Unknown `/something` lines are skipped. Lines inside
 /// markdown fenced code blocks (``` or ~~~) are ignored to prevent
-/// accidental command execution from code examples.
+/// accidental command execution from code examples. Per CommonMark, a
+/// backtick fence closes only a backtick fence and a tilde fence closes
+/// only a tilde fence — mismatched closers are ignored.
 pub fn parse_command(body: &str) -> Option<OwnerCommand> {
-    let mut in_code_fence = false;
+    // Track the opening fence character so mismatched closers are ignored.
+    // Per CommonMark: a backtick fence closes only a backtick fence, and a
+    // tilde fence closes only a tilde fence.
+    let mut fence_char: Option<char> = None;
     for line in body.lines() {
         let trimmed = line.trim();
-        // Toggle code fence state on ``` or ~~~ boundaries
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_code_fence = !in_code_fence;
+            let ch = trimmed.chars().next().unwrap();
+            match fence_char {
+                None => fence_char = Some(ch),
+                Some(c) if c == ch => fence_char = None,
+                Some(_) => {} // mismatched closer — ignore
+            }
             continue;
         }
-        if in_code_fence {
+        if fence_char.is_some() {
             continue;
         }
         if !trimmed.starts_with('/') {
@@ -505,6 +514,28 @@ mod tests {
     fn parse_ignores_command_in_code_fence_with_lang() {
         let body = "```markdown\n/retry\n```";
         assert_eq!(parse_command(body), None);
+    }
+
+    #[test]
+    fn parse_mixed_fence_does_not_close_backtick_with_tilde() {
+        // ~~~ should NOT close a ``` fence — /retry is still inside the fence
+        let body = "```bash\n/retry\n~~~\n/retry\n```";
+        assert_eq!(parse_command(body), None);
+    }
+
+    #[test]
+    fn parse_mixed_fence_does_not_close_tilde_with_backtick() {
+        // ``` should NOT close a ~~~ fence — /close is still inside the fence
+        let body = "~~~\n/close\n```\n/close\n~~~";
+        assert_eq!(parse_command(body), None);
+    }
+
+    #[test]
+    fn parse_command_after_mixed_fence_properly_closed() {
+        // Fence opened with ``` and closed with ``` (tilde in between is ignored)
+        // Command after the real closing fence should be found
+        let body = "```\n/retry\n~~~\n/retry\n```\n/close";
+        assert_eq!(parse_command(body), Some(OwnerCommand::Close));
     }
 
     #[test]
