@@ -63,11 +63,26 @@ checks), and merged at 14:33:10 — the first clean merge after 8 blocked tasks.
 
 ---
 
+### Additional Fixes (Evening)
+
+After the 3 PM summary, 5 more critical fixes shipped:
+
+| Issue | Commit | Fix |
+|-------|--------|-----|
+| #750 | `6570c90` | Discord gateway panics if `heartbeat_interval=0` — now validates interval > 0 |
+| #747 | `ebb4b5a` | `/status` command omits internal (channel-created) tasks — fixed list filtering |
+| #749 | `2671685` | `rsplit('/').next()` returns 0 when URL ends with `/` — handle edge case correctly |
+| #748 | `fbdd6cf` | `parse_command` treats `` ``` `` and `~~~` as shared toggle, mismatched fences execute hidden commands — per-char fence tracking now used |
+| #746 | `c092df3` | `list_opencode_models` has no timeout, hangs control session — added 10s timeout |
+
+All represent genuine reliability/safety issues. Version now **v0.17.7** (was 0.17.2).
+
 ## What Failed / Needed Retries
 
 **Nothing significant failed today.** The morning started with 8 blocked trading
 tasks — root cause traced, fixed, and deployed within the first few hours. The
-`orch chat` implementation was clean: no retries, no review cycles needed.
+`orch chat` implementation was clean: no retries, no review cycles needed. The
+evening batch of fixes all landed cleanly with no regressions.
 
 One minor observation in logs: the review agent session kill warning
 (`can't find session: orch-bean-internal-3859-review`) appeared — this is a
