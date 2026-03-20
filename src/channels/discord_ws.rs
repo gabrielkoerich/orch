@@ -147,11 +147,12 @@ impl Channel for DiscordGateway {
         let token = self.token.clone();
         let shard_id = self.shard_id;
         let shard_count = self.shard_count;
+        let client = self.client.clone();
 
         tracing::info!(shard_id, shard_count, "discord gateway starting");
 
         tokio::spawn(async move {
-            run_gateway(token, shard_id, shard_count, tx).await;
+            run_gateway(token, shard_id, shard_count, tx, client).await;
         });
 
         Ok(rx)
@@ -233,6 +234,7 @@ async fn run_gateway(
     shard_id: u64,
     shard_count: u64,
     tx: mpsc::Sender<IncomingMessage>,
+    client: Client,
 ) {
     let mut state = GatewayState::new();
     let mut backoff = Duration::from_secs(1);
@@ -246,7 +248,8 @@ async fn run_gateway(
                 backoff = Duration::from_secs(1); // reset on success
 
                 let result =
-                    handle_connection(ws, &token, shard_id, shard_count, &mut state, &tx).await;
+                    handle_connection(ws, &token, shard_id, shard_count, &mut state, &tx, &client)
+                        .await;
 
                 match result {
                     Ok(true) => {
@@ -295,6 +298,7 @@ async fn handle_connection(
     shard_count: u64,
     state: &mut GatewayState,
     tx: &mpsc::Sender<IncomingMessage>,
+    client: &Client,
 ) -> anyhow::Result<bool> {
     let (mut write, mut read) = ws.split();
 
@@ -382,6 +386,7 @@ async fn handle_connection(
                                     &mut state.session_id,
                                     &mut state.resume_url,
                                     tx,
+                                    client,
                                 )
                                 .await
                                 {
@@ -486,6 +491,7 @@ async fn handle_dispatch(
     session_id: &mut Option<String>,
     resume_url: &mut Option<String>,
     tx: &mpsc::Sender<IncomingMessage>,
+    client: &Client,
 ) -> anyhow::Result<()> {
     match event_type {
         Some("READY") => {
@@ -556,8 +562,8 @@ async fn handle_dispatch(
                     "https://discord.com/api/v10/interactions/{}/{}/callback",
                     interaction_id, interaction_token
                 );
-                let client = Client::new();
-                let _ = client
+                let http_client = client.clone();
+                let _ = http_client
                     .post(&callback_url)
                     .header("Content-Type", "application/json")
                     .json(&serde_json::json!({ "type": 6 }))
@@ -612,6 +618,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
+        let client = Client::new();
 
         handle_dispatch(
             Some("MESSAGE_CREATE"),
@@ -619,6 +626,7 @@ mod tests {
             &mut session_id,
             &mut resume_url,
             &tx,
+            &client,
         )
         .await
         .unwrap();
@@ -645,6 +653,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
+        let client = Client::new();
 
         handle_dispatch(
             Some("MESSAGE_CREATE"),
@@ -652,6 +661,7 @@ mod tests {
             &mut session_id,
             &mut resume_url,
             &tx,
+            &client,
         )
         .await
         .unwrap();
@@ -673,6 +683,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
+        let client = Client::new();
 
         handle_dispatch(
             Some("MESSAGE_CREATE"),
@@ -680,6 +691,7 @@ mod tests {
             &mut session_id,
             &mut resume_url,
             &tx,
+            &client,
         )
         .await
         .unwrap();
@@ -701,10 +713,18 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
+        let client = Client::new();
 
-        handle_dispatch(Some("READY"), &data, &mut session_id, &mut resume_url, &tx)
-            .await
-            .unwrap();
+        handle_dispatch(
+            Some("READY"),
+            &data,
+            &mut session_id,
+            &mut resume_url,
+            &tx,
+            &client,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(session_id.as_deref(), Some("abc123"));
         assert_eq!(resume_url.as_deref(), Some("wss://us-east1.discord.gg"));
@@ -723,6 +743,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
+        let client = Client::new();
 
         handle_dispatch(
             Some("MESSAGE_CREATE"),
@@ -730,6 +751,7 @@ mod tests {
             &mut session_id,
             &mut resume_url,
             &tx,
+            &client,
         )
         .await
         .unwrap();
@@ -755,6 +777,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
+        let client = Client::new();
 
         let result = handle_dispatch(
             Some("MESSAGE_CREATE"),
@@ -762,6 +785,7 @@ mod tests {
             &mut session_id,
             &mut resume_url,
             &tx,
+            &client,
         )
         .await;
 
@@ -787,6 +811,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
+        let client = Client::new();
 
         handle_dispatch(
             Some("INTERACTION_CREATE"),
@@ -794,6 +819,7 @@ mod tests {
             &mut session_id,
             &mut resume_url,
             &tx,
+            &client,
         )
         .await
         .unwrap();
@@ -831,6 +857,7 @@ mod tests {
 
         let mut session_id = None;
         let mut resume_url = None;
+        let client = Client::new();
 
         handle_dispatch(
             Some("INTERACTION_CREATE"),
@@ -838,6 +865,7 @@ mod tests {
             &mut session_id,
             &mut resume_url,
             &tx,
+            &client,
         )
         .await
         .unwrap();
