@@ -63,6 +63,20 @@ type EngineRef = (
     Option<Arc<TaskStore>>,
 );
 
+/// A pending project-pick waiting for the user to tap a button.
+struct PendingPick {
+    /// Original message body (the free-text request to create a task).
+    original_body: String,
+    /// The topic/thread that should receive follow-up messages.
+    msg_topic_id: Option<String>,
+    /// When this pick was created (used to enforce 60s timeout).
+    created_at: std::time::Instant,
+}
+
+/// Keyed by `"{channel}:{thread_id}"`.
+type PendingPicks =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingPick>>>;
+
 /// Per-project engine state.
 ///
 /// Each project has its own backend, task runner, and task manager,
@@ -1224,6 +1238,35 @@ async fn send_channel_reply(
         channel = channel_name,
         "channel not found in registry for reply"
     );
+}
+
+/// Send an inline keyboard to a specific channel.
+/// Returns the message ID of the keyboard message, or an empty string on failure.
+async fn send_channel_keyboard(
+    channels: &Arc<ChannelRegistry>,
+    channel_name: &str,
+    thread_id: &str,
+    topic_id: Option<&str>,
+    text: &str,
+    buttons: &[(String, String)],
+) -> String {
+    for ch in channels.iter() {
+        if ch.name() == channel_name {
+            match ch.send_keyboard(thread_id, topic_id, text, buttons).await {
+                Ok(msg_id) => return msg_id,
+                Err(e) => {
+                    tracing::warn!(
+                        channel = channel_name,
+                        ?e,
+                        "failed to send project picker keyboard"
+                    );
+                    return String::new();
+                }
+            }
+        }
+    }
+    tracing::debug!(channel = channel_name, "channel not found for keyboard send");
+    String::new()
 }
 
 /// Forward a text message to an agent's tmux session via send-keys.
