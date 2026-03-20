@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use crate::backends::{ExternalId, Status};
-use crate::store::TaskStatus;
 use crate::channels::capture::CaptureService;
 use crate::channels::routing::ChannelRouter;
 use crate::channels::transport::{MessageRoute, Transport};
@@ -15,6 +14,7 @@ use crate::channels::{ChannelRegistry, IncomingMessage, OutgoingMessage};
 use crate::engine::commands::{execute_command, parse_command};
 use crate::engine::tasks::{CreateTaskRequest, Task, TaskType};
 use crate::github::http::GhHttp;
+use crate::store::TaskStatus;
 use crate::tmux::TmuxManager;
 
 use super::EngineRef;
