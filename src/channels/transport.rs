@@ -208,6 +208,8 @@ pub enum MessageRoute {
     TaskSession { task_id: String },
     /// Message is a command (e.g. "/status", "orch task list")
     Command { raw: String },
+    /// Message is in the configured control session channel — route to control agent
+    ControlSession,
     /// Message is new — should create a task
     NewTask,
 }
