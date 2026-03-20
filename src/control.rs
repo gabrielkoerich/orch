@@ -188,7 +188,7 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Str
     };
 
     // 3. Live state via `orch task list` (best-effort)
-    let task_list = match tokio::process::Command::new("orch")
+    let current_state = match tokio::process::Command::new("orch")
         .args(["task", "list"])
         .output()
         .await
@@ -199,23 +199,7 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Str
         _ => "(could not fetch live state)".to_string(),
     };
 
-    // 4. Service status — check if the orch process is listening
-    //    (brew services info can lag or report stale state)
-    let service_status = match tokio::process::Command::new("pgrep")
-        .args(["-f", "orch serve"])
-        .output()
-        .await
-    {
-        Ok(output) if output.status.success() => {
-            let pids = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            format!("Service: running (PID {pids})")
-        }
-        _ => "Service: not running".to_string(),
-    };
-
-    let current_state = format!("{service_status}\n\n{task_list}");
-
-    // 5. Replace placeholders in template
+    // 4. Replace placeholders in template
     let result = SYSTEM_TEMPLATE
         .replace("{current_state}", &current_state)
         .replace("{memories}", &memories)
