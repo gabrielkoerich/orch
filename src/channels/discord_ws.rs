@@ -311,7 +311,7 @@ async fn handle_connection(
         hello.op
     );
 
-    let hb_interval_ms = hello.d["heartbeat_interval"].as_u64().unwrap_or(41_250);
+    let hb_interval_ms = parse_heartbeat_interval(&hello.d["heartbeat_interval"]);
     tracing::debug!(hb_interval_ms, "discord gateway: Hello received");
 
     // ── Step 2: Identify or Resume ───────────────────────────────────────────
@@ -598,6 +598,17 @@ async fn handle_dispatch(
     Ok(())
 }
 
+// ── Heartbeat interval parsing ───────────────────────────────────────────────
+
+/// Parse heartbeat interval from Discord gateway Hello payload.
+/// Rejects zero or invalid values and falls back to Discord's default (41.25 seconds).
+fn parse_heartbeat_interval(value: &Value) -> u64 {
+    value
+        .as_u64()
+        .filter(|&v| v > 0)
+        .unwrap_or(41_250)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -872,5 +883,40 @@ mod tests {
 
         // Should not produce a message for non-component interactions
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn parse_heartbeat_interval_rejects_zero() {
+        let zero = serde_json::json!(0);
+        assert_eq!(parse_heartbeat_interval(&zero), 41_250);
+    }
+
+    #[test]
+    fn parse_heartbeat_interval_accepts_valid() {
+        let valid = serde_json::json!(50_000);
+        assert_eq!(parse_heartbeat_interval(&valid), 50_000);
+    }
+
+    #[test]
+    fn parse_heartbeat_interval_defaults_on_null() {
+        let null = serde_json::json!(null);
+        assert_eq!(parse_heartbeat_interval(&null), 41_250);
+    }
+
+    #[test]
+    fn parse_heartbeat_interval_defaults_on_missing() {
+        let object = serde_json::json!({});
+        assert_eq!(parse_heartbeat_interval(&object["heartbeat_interval"]), 41_250);
+    }
+
+    #[test]
+    fn parse_heartbeat_interval_can_create_valid_duration() {
+        // Verify that the parsed interval can be used to create a tokio interval
+        // without panicking. This is the real-world requirement: the value must
+        // be valid for Duration::from_millis().
+        let zero = serde_json::json!(0);
+        let interval_ms = parse_heartbeat_interval(&zero);
+        let duration = std::time::Duration::from_millis(interval_ms);
+        assert!(duration.as_millis() > 0, "duration must be non-zero");
     }
 }
