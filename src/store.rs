@@ -158,6 +158,23 @@ pub struct JobState {
     pub active_task_id: Option<String>,
 }
 
+/// A message in the control session conversation history.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ControlMessage {
+    pub id: i64,
+    pub role: String,
+    pub channel: String,
+    pub channel_thread: Option<String>,
+    pub content: String,
+    pub summary: Option<String>,
+    pub model: Option<String>,
+    pub agent: Option<String>,
+    pub tokens_used: Option<i64>,
+    pub cost_usd: Option<f64>,
+    pub created_at: String,
+}
+
 // ── End types ───────────────────────────────────────────────────────
 
 /// Build the week-scoped KV key for the self-improvement counter.
@@ -2368,6 +2385,109 @@ impl TaskStore {
         let _ = self.kv_set("migration_completed", "1").await;
 
         Ok(result)
+    }
+
+    // ---------------------------------------------------------------
+    // Control Session
+    // ---------------------------------------------------------------
+
+    /// Insert a control session message.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub async fn insert_control_message(
+        &self,
+        role: &str,
+        channel: &str,
+        channel_thread: Option<&str>,
+        content: &str,
+        summary: Option<&str>,
+        model: Option<&str>,
+        agent: Option<&str>,
+        tokens_used: Option<i64>,
+        cost_usd: Option<f64>,
+    ) -> anyhow::Result<i64> {
+        let row = sqlx::query(
+            "INSERT INTO control_messages (role, channel, channel_thread, content, summary, model, agent, tokens_used, cost_usd)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(role)
+        .bind(channel)
+        .bind(channel_thread)
+        .bind(content)
+        .bind(summary)
+        .bind(model)
+        .bind(agent)
+        .bind(tokens_used)
+        .bind(cost_usd)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get("id"))
+    }
+
+    /// List recent control messages (newest last).
+    #[allow(dead_code)]
+    pub async fn list_control_messages(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<ControlMessage>> {
+        let rows = sqlx::query(
+            "SELECT * FROM control_messages ORDER BY created_at ASC LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(Self::row_to_control_message).collect())
+    }
+
+    /// Search control messages by content (LIKE match).
+    #[allow(dead_code)]
+    pub async fn search_control_messages(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ControlMessage>> {
+        let pattern = format!("%{query}%");
+        let rows = sqlx::query(
+            "SELECT * FROM control_messages WHERE content LIKE ? ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(Self::row_to_control_message).collect())
+    }
+
+    /// Get recent assistant message summaries for context assembly.
+    #[allow(dead_code)]
+    pub async fn control_recent_summaries(&self, limit: i64) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT summary FROM control_messages WHERE summary IS NOT NULL ORDER BY created_at ASC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<String, _>("summary"))
+            .collect())
+    }
+
+    fn row_to_control_message(row: &sqlx::sqlite::SqliteRow) -> ControlMessage {
+        use sqlx::Row;
+        ControlMessage {
+            id: row.get("id"),
+            role: row.get("role"),
+            channel: row.get("channel"),
+            channel_thread: row.get("channel_thread"),
+            content: row.get("content"),
+            summary: row.get("summary"),
+            model: row.get("model"),
+            agent: row.get("agent"),
+            tokens_used: row.get("tokens_used"),
+            cost_usd: row.get("cost_usd"),
+            created_at: row.get("created_at"),
+        }
     }
 }
 
@@ -6554,5 +6674,95 @@ mod tests {
             .unwrap();
         assert_eq!(cost.periods[0].task_count, 1);
         assert!((cost.periods[0].total_cost_usd - 0.0045).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn control_insert_and_list() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .insert_control_message(
+                "user", "cli", None, "what's running?", None, None, None, None, None,
+            )
+            .await
+            .unwrap();
+        store
+            .insert_control_message(
+                "assistant",
+                "cli",
+                None,
+                "3 tasks active",
+                Some("listed tasks"),
+                Some("sonnet"),
+                Some("claude"),
+                Some(500),
+                Some(0.01),
+            )
+            .await
+            .unwrap();
+
+        let messages = store.list_control_messages(10, 0).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].summary.as_deref(), Some("listed tasks"));
+    }
+
+    #[tokio::test]
+    async fn control_search_messages() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .insert_control_message(
+                "user", "cli", None, "check bean auth issue", None, None, None, None, None,
+            )
+            .await
+            .unwrap();
+        store
+            .insert_control_message(
+                "user", "cli", None, "unblock trading tasks", None, None, None, None, None,
+            )
+            .await
+            .unwrap();
+
+        let results = store.search_control_messages("bean", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("bean"));
+    }
+
+    #[tokio::test]
+    async fn control_recent_summaries() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .insert_control_message(
+                "assistant",
+                "cli",
+                None,
+                "long response",
+                Some("did X"),
+                Some("sonnet"),
+                Some("claude"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .insert_control_message(
+                "assistant",
+                "cli",
+                None,
+                "another response",
+                Some("did Y"),
+                Some("sonnet"),
+                Some("claude"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let summaries = store.control_recent_summaries(5).await.unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0], "did X");
+        assert_eq!(summaries[1], "did Y");
     }
 }
