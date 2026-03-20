@@ -431,10 +431,9 @@ pub async fn stream_all() -> anyhow::Result<()> {
             let capture = capture.clone();
             let known = known.clone();
             async move {
-                let sessions =
-                    crate::channels::tmux::list_orch_sessions()
-                        .await
-                        .unwrap_or_default();
+                let sessions = crate::channels::tmux::list_orch_sessions()
+                    .await
+                    .unwrap_or_default();
                 let mut added = Vec::new();
                 let mut known = known.lock().await;
                 for session in sessions {

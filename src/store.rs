@@ -2430,13 +2430,12 @@ impl TaskStore {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<ControlMessage>> {
-        let rows = sqlx::query(
-            "SELECT * FROM control_messages ORDER BY created_at ASC LIMIT ? OFFSET ?",
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query("SELECT * FROM control_messages ORDER BY created_at ASC LIMIT ? OFFSET ?")
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows.iter().map(Self::row_to_control_message).collect())
     }
 
@@ -2467,10 +2466,7 @@ impl TaskStore {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| r.get::<String, _>("summary"))
-            .collect())
+        Ok(rows.iter().map(|r| r.get::<String, _>("summary")).collect())
     }
 
     fn row_to_control_message(row: &sqlx::sqlite::SqliteRow) -> ControlMessage {
@@ -6681,7 +6677,15 @@ mod tests {
         let store = TaskStore::open_memory().await.unwrap();
         store
             .insert_control_message(
-                "user", "cli", None, "what's running?", None, None, None, None, None,
+                "user",
+                "cli",
+                None,
+                "what's running?",
+                None,
+                None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -6712,13 +6716,29 @@ mod tests {
         let store = TaskStore::open_memory().await.unwrap();
         store
             .insert_control_message(
-                "user", "cli", None, "check bean auth issue", None, None, None, None, None,
+                "user",
+                "cli",
+                None,
+                "check bean auth issue",
+                None,
+                None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
         store
             .insert_control_message(
-                "user", "cli", None, "unblock trading tasks", None, None, None, None, None,
+                "user",
+                "cli",
+                None,
+                "unblock trading tasks",
+                None,
+                None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
