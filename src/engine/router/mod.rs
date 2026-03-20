@@ -260,7 +260,7 @@ impl Router {
         // Log routing start (before await)
         tracing::debug!(task_id = %task.id.0, "starting LLM routing");
 
-        match self.route_with_llm(task).await {
+        match self.route_with_llm(task, repo).await {
             Ok(result) => {
                 // Reset attempts on success
                 self.set_route_attempts(&task.id.0, 0, store, repo).await;
@@ -331,13 +331,18 @@ impl Router {
     }
 
     /// Route using LLM classification. Delegates to `self.llm_router`.
-    async fn route_with_llm(&mut self, task: &ExternalTask) -> anyhow::Result<RouteResult> {
+    async fn route_with_llm(
+        &mut self,
+        task: &ExternalTask,
+        repo: &str,
+    ) -> anyhow::Result<RouteResult> {
         self.llm_router
             .route_with_llm(
                 task,
                 &self.available_agents,
                 &self.config,
                 &mut self.last_agent,
+                repo,
             )
             .await
     }

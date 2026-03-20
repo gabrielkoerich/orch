@@ -74,6 +74,7 @@ impl LlmRouter {
         available_agents: &[String],
         config: &RouterConfig,
         last_agent: &mut Option<String>,
+        repo: &str,
     ) -> anyhow::Result<RouteResult> {
         if available_agents.is_empty() {
             anyhow::bail!("no agent CLIs found in PATH");
@@ -82,11 +83,13 @@ impl LlmRouter {
         // Build the routing prompt
         let prompt = self.build_routing_prompt(task, available_agents)?;
 
-        // Save prompt to file for debugging
-        let prompt_path = self.route_prompt_path(&task.id.0);
-        if let Some(parent) = prompt_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
+        // Save prompt and response to per-task routing dir for debugging
+        let routing_dir = crate::home::task_dir(repo, &task.id.0)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/orch-routing"))
+            .join("routing");
+        let _ = tokio::fs::create_dir_all(&routing_dir).await;
+
+        let prompt_path = routing_dir.join("prompt.txt");
         let _ = tokio::fs::write(&prompt_path, &prompt).await;
 
         // Call the LLM router
@@ -99,18 +102,9 @@ impl LlmRouter {
             "LLM router raw response"
         );
 
-        // Save raw response for debugging (next to the prompt file)
-        let response_path =
-            crate::home::state_dir().map(|d| d.join(format!("route-response-{}.txt", task.id.0)));
-        if let Ok(path) = response_path {
-            let _ = std::fs::write(&path, &response);
-        }
-
-        // Prune old debug files — keep only the 50 most recent of each type
-        if let Ok(state_dir) = crate::home::state_dir() {
-            prune_route_debug_files(&state_dir, "route-prompt-", 50).await;
-            prune_route_debug_files(&state_dir, "route-response-", 50).await;
-        }
+        // Save raw response for debugging
+        let response_path = routing_dir.join("response.txt");
+        let _ = tokio::fs::write(&response_path, &response).await;
 
         // Parse the response
         let llm_response: LlmRouteResponse = self.parse_llm_response(&response)?;
@@ -497,49 +491,6 @@ impl LlmRouter {
         }
 
         None
-    }
-
-    /// Get the path for saving route prompts.
-    fn route_prompt_path(&self, task_id: &str) -> PathBuf {
-        crate::home::state_dir()
-            .unwrap_or_else(|_| PathBuf::from("/tmp").join(".orch").join(".orch"))
-            .join(format!("route-prompt-{task_id}.txt"))
-    }
-}
-
-/// Prune route debug files matching `{state_dir}/{prefix}*.txt`, keeping only the `keep` most
-/// recent (by mtime). Files that cannot be stat'd are treated as oldest and removed first.
-async fn prune_route_debug_files(state_dir: &std::path::Path, prefix: &str, keep: usize) {
-    let suffix = ".txt";
-    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
-
-    let mut read_dir = match tokio::fs::read_dir(state_dir).await {
-        Ok(rd) => rd,
-        Err(_) => return,
-    };
-
-    while let Ok(Some(entry)) = read_dir.next_entry().await {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with(prefix) && name_str.ends_with(suffix) {
-            let mtime = entry
-                .metadata()
-                .await
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            entries.push((mtime, entry.path()));
-        }
-    }
-
-    if entries.len() <= keep {
-        return;
-    }
-
-    // Sort newest-first; truncate to keep, then delete the rest
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, path) in entries.into_iter().skip(keep) {
-        let _ = tokio::fs::remove_file(&path).await;
     }
 }
 
