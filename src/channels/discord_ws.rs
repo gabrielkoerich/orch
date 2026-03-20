@@ -603,10 +603,7 @@ async fn handle_dispatch(
 /// Parse heartbeat interval from Discord gateway Hello payload.
 /// Rejects zero or invalid values and falls back to Discord's default (41.25 seconds).
 fn parse_heartbeat_interval(value: &Value) -> u64 {
-    value
-        .as_u64()
-        .filter(|&v| v > 0)
-        .unwrap_or(41_250)
+    value.as_u64().filter(|&v| v > 0).unwrap_or(41_250)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -906,7 +903,10 @@ mod tests {
     #[test]
     fn parse_heartbeat_interval_defaults_on_missing() {
         let object = serde_json::json!({});
-        assert_eq!(parse_heartbeat_interval(&object["heartbeat_interval"]), 41_250);
+        assert_eq!(
+            parse_heartbeat_interval(&object["heartbeat_interval"]),
+            41_250
+        );
     }
 
     #[test]
