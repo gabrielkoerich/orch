@@ -86,6 +86,21 @@ pub trait Channel: Send + Sync {
 
     /// Check if this channel is healthy/connected.
     async fn health_check(&self) -> anyhow::Result<()>;
+
+    /// Send a message with inline keyboard / action-row buttons.
+    /// Returns the message ID of the sent message (used to key the pending pick).
+    /// Default impl returns Err — only channels that support interactive messages
+    /// need to override this.
+    async fn send_keyboard(
+        &self,
+        thread_id: &str,
+        topic_id: Option<&str>,
+        text: &str,
+        buttons: &[(String, String)], // (label, callback_data / custom_id)
+    ) -> anyhow::Result<String> {
+        let _ = (thread_id, topic_id, text, buttons);
+        anyhow::bail!("channel does not support interactive messages")
+    }
 }
 
 /// Registry of active channels.
