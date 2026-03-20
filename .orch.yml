@@ -1,0 +1,181 @@
+jobs:
+- id: code-review-orch
+  type: task
+  schedule: '35 8,19 * * *'
+  task:
+    title: 'Code review: orch'
+    body: |
+      You are a code quality reviewer. Focus on bugs, correctness, and reliability in EXISTING code. Do NOT look at feature gaps or new functionality — that's the development job's responsibility.
+
+      ## Before starting
+
+      - `git log --since="48 hours ago" --oneline` — don't file tasks for recent fixes
+      - `gh issue list --state open` — don't duplicate existing issues
+      - `gh issue list --state closed --limit 20` — don't re-file resolved problems
+      - Read the `DO NOT TOUCH` sections in `AGENTS.md` — respect settled decisions
+
+      ## What to review
+
+      Review `src/**/*.rs`, `prompts/*.md`, and tests. Look for:
+      - **Bugs** — logic errors, edge cases, panics, unwrap on fallible paths
+      - **Error handling** — missing error propagation, swallowed errors, unhelpful messages, operations that can fail but don't handle it, missing timeouts
+      - **Dead code** — unused functions, unreachable branches, stale imports
+      - **Correctness** — race conditions, off-by-one, wrong query ordering, missing validation at boundaries
+      - **Technical debt** — overly complex code that's fragile or hard to maintain, inconsistencies between similar code paths
+      - **Test gaps** — untested error paths, missing edge case coverage
+
+      Do NOT look for: feature ideas, refactoring opportunities, performance optimizations, architecture improvements. Those belong to the development job.
+
+      ## Create GitHub issues for findings
+
+      Use `gh issue create --title "..." --body "..." --label "bug"` to create issues. The orchestrator will sync and dispatch them.
+
+      - Maximum 2-3 issues. Fewer is better.
+      - Each issue MUST include: file path, line numbers, what's wrong, and what the fix should be.
+      - Trace symptoms to root causes. ONE issue per root cause.
+      - Do NOT create issues about `src/github/token.rs` or the agent runner — settled.
+      - Do NOT create cosmetic issues (formatting, naming, comments).
+    labels:
+    - self-improvement
+    agent: null
+  command: null
+  enabled: true
+  external: false
+- id: code-development-orch
+  type: task
+  schedule: '0 6,18 * * *'
+  task:
+    title: 'Code development: find improvements and create tasks'
+    body: |
+      You are a planning agent for the orch orchestrator. Your job is to find high-value improvements and create tasks for them. Do NOT implement anything — the task pipeline handles execution.
+
+      ## Where to look (in priority order)
+
+      1. **Design specs** — check `docs/superpowers/specs/` for specs with unimplemented features. Break them into actionable tasks.
+      2. **Agent failures** — check `orch task list --status blocked` and `orch task list --status needs_review`. Look at recent task runs for error patterns. Read agent stderr/output in `~/.orch/state/*/tasks/*/attempts/` to understand WHY agents fail — is it a prompt issue, a missing tool, a timeout, a model limitation? Create tasks to fix the root cause, not the symptom.
+      3. **Logs analysis** — run `orch log 200` to read recent logs. Look for: repeated errors, slow operations, timeouts, rate limits, unexpected panics, failed dispatches. Each pattern is a potential improvement.
+      4. **Prompt effectiveness** — review `prompts/*.md`. Are agents getting clear instructions? Are they producing the expected output format? Check recent task outputs to see if prompts lead to good results or if they need tuning.
+      5. **Refactoring** — look for code duplication, overly complex functions, or modules that have grown too large. Check `wc -l src/**/*.rs | sort -rn | head -10` for large files that could be split.
+      6. **Performance** — check for slow operations, unnecessary allocations, blocking calls in async context, N+1 query patterns.
+      7. **Architecture gaps** — read `docs/architecture.md` and `AGENTS.md` for documented TODOs or missing features.
+      8. **Test coverage** — find untested code paths, especially in new features and error handling paths.
+
+      ## Before creating tasks
+
+      - `git log --since="48 hours ago" --oneline` — don't file tasks for recent work
+      - `gh issue list --state open` — don't duplicate existing issues
+      - `gh issue list --state closed --limit 20` — don't re-file resolved problems
+      - Read the `DO NOT TOUCH` sections in `AGENTS.md` — respect settled decisions
+
+      ## Create GitHub issues
+
+      Use `gh issue create --title "..." --body "..." --label "enhancement"` to create issues. The orchestrator will sync and dispatch them.
+
+      - Maximum 2-3 issues per run. Fewer is better.
+      - Each issue MUST be actionable: include file paths, line numbers, and a clear description of what to change.
+      - Trace symptoms to root causes. ONE issue per root cause, not one per symptom.
+      - Do NOT create issues about `src/github/token.rs` or the agent runner — settled.
+      - Do NOT create cosmetic/cleanup issues. Only real value: features, refactors that reduce complexity, performance improvements.
+      - Include relevant context in the issue body so the implementing agent doesn't need to re-discover it.
+    labels:
+    - self-improvement
+    agent: null
+  command: null
+
+  enabled: true
+  external: false
+- id: morning-review
+  type: task
+  schedule: '0 10 * * *'
+  task:
+    title: 'Daily morning review'
+    body: |
+      Morning check-in. Your ONLY output is a summary post — do NOT create issues or modify code.
+
+      ## Gather context
+
+      1. `git log --since="24 hours ago" --oneline` — what changed recently
+      2. Read the most recent post in `./docs/content/posts/` — current state and context
+      3. Read the most recent evening retrospective — carry forward unfinished priorities
+      4. `gh issue list --state open` — what's in the pipeline
+      5. `orch task list` — check for stuck, blocked, or failing tasks
+
+      ## Check operational health
+
+      1. Are any tasks stuck or failing repeatedly? Note the pattern and root cause.
+      2. Are there error patterns in logs (`orch log 200`)? Note them.
+      3. Did the evening retro flag anything? Is it resolved or still pending?
+      4. Are there tasks waiting on owner feedback?
+
+      ## Write the summary
+
+      Save to `./docs/content/posts/morning-review-YYYY-MM-DD.md` (today's UTC date).
+      If the file already exists, update it with new information or improvements. If there's nothing new to add, skip — don't rewrite or duplicate.
+
+      Include: recent commits summary, operational health status, stuck tasks, retro follow-ups, and what the day's priorities should be.
+
+      ## Create GitHub issues if needed
+
+      If you find operational problems (stuck tasks, recurring failures, error patterns), create issues with `gh issue create --title "..." --body "..." --label "bug"`.
+
+      - Maximum 2-3 issues. Only for operational problems found during this review.
+      - Do NOT duplicate issues that already exist (`gh issue list --state open`).
+      - Do NOT create feature/improvement issues — that's the development job's responsibility.
+
+      Commit and push the summary post.
+    labels:
+    - self-improvement
+    agent: null
+  command: null
+
+  enabled: true
+  external: false
+- id: evening-retrospective
+  type: task
+  schedule: '45 20 * * *'
+  task:
+    title: 'Daily evening retrospective'
+    body: |
+      Evening retrospective. Your ONLY output is a summary post — do NOT create issues or modify code.
+
+      ## Gather context
+
+      1. `git log --since="12 hours ago" --oneline` — what was done today
+      2. Read the most recent post in `./docs/content/posts/` — current state
+      3. Read today's morning review — what was planned, what got done
+      4. `gh issue list --state open` — what's still pending
+      5. `gh issue list --state closed --limit 10` — what was resolved today
+
+      ## Analyze the day
+
+      1. Which tasks completed? What went well?
+      2. Which tasks failed or needed retries? Why?
+      3. Are agent prompts effective or do they need tuning?
+      4. Is the routing accurate? Check route decisions vs outcomes.
+      5. Are there performance bottlenecks (slow syncs, lock contention, API rate limits)?
+
+      ## Write the summary
+
+      Save to `./docs/content/posts/evening-retrospective-YYYY-MM-DD.md` (today's UTC date).
+      If the file already exists, update it with new information or improvements. If there's nothing new to add, skip — don't rewrite or duplicate.
+
+      Include: what was accomplished, what failed and why, routing accuracy, and clear priorities for tomorrow's morning review.
+
+      ## Create GitHub issues if needed
+
+      If you find problems (recurring failures, broken workflows, prompt issues), create issues with `gh issue create --title "..." --body "..." --label "bug"`.
+
+      - Maximum 2-3 issues. Only for problems discovered during this review.
+      - Do NOT duplicate issues that already exist (`gh issue list --state open`).
+      - Do NOT create feature/improvement issues — that's the development job's responsibility.
+
+      Commit and push the summary post.
+    labels:
+    - self-improvement
+    agent: null
+  command: null
+
+  enabled: true
+  external: false
+gh:
+  repo: gabrielkoerich/orch

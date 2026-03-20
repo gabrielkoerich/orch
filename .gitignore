@@ -2,7 +2,6 @@
 .env*
 .lock
 .lock.*
-.orch.yml
 /target
 __pycache__/
 config.yml
