@@ -16,7 +16,7 @@ use crate::engine::tasks::{CreateTaskRequest, Task, TaskType};
 use crate::github::http::GhHttp;
 use crate::tmux::TmuxManager;
 
-use super::EngineRef;
+use super::{EngineRef, PendingPick, PendingPicks};
 
 /// Send a reply message to a specific channel thread.
 ///
@@ -56,6 +56,38 @@ pub(super) async fn send_channel_reply(
     );
 }
 
+/// Send an inline keyboard to a specific channel.
+/// Returns the message ID of the keyboard message, or an empty string on failure.
+pub(super) async fn send_channel_keyboard(
+    channels: &Arc<ChannelRegistry>,
+    channel_name: &str,
+    thread_id: &str,
+    topic_id: Option<&str>,
+    text: &str,
+    buttons: &[(String, String)],
+) -> String {
+    for ch in channels.iter() {
+        if ch.name() == channel_name {
+            match ch.send_keyboard(thread_id, topic_id, text, buttons).await {
+                Ok(msg_id) => return msg_id,
+                Err(e) => {
+                    tracing::warn!(
+                        channel = channel_name,
+                        ?e,
+                        "failed to send project picker keyboard"
+                    );
+                    return String::new();
+                }
+            }
+        }
+    }
+    tracing::debug!(
+        channel = channel_name,
+        "channel not found for keyboard send"
+    );
+    String::new()
+}
+
 /// Forward a text message to an agent's tmux session via send-keys.
 pub(super) async fn forward_to_tmux(transport: &Arc<Transport>, task_id: &str, text: &str) {
     if let Some(binding) = transport.get_binding(task_id).await {
@@ -86,6 +118,7 @@ pub(super) async fn forward_to_tmux(transport: &Arc<Transport>, task_id: &str, t
 ///
 /// The `channel_router` resolves which project a message targets based on
 /// its topic/channel ID. This enables per-project task creation and status views.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_channel_message(
     msg: IncomingMessage,
     transport: &Arc<Transport>,
@@ -94,6 +127,7 @@ pub(super) async fn handle_channel_message(
     channels: &Arc<ChannelRegistry>,
     engine_refs: &[EngineRef],
     channel_router: &Arc<ChannelRouter>,
+    pending_picks: &PendingPicks,
 ) {
     use crate::channels::stream::fanout_output;
 
@@ -103,6 +137,122 @@ pub(super) async fn handle_channel_message(
     let is_general = channel_router.is_general(&msg.channel, topic_id);
     let is_control = channel_router.is_control_channel(&msg.channel, topic_id);
     let msg_topic_id = msg.topic_id.clone();
+
+    // ── Picker response: user tapped a project button ────────────────────────
+    let is_picker_response = msg.body.starts_with("pick:")
+        && (msg.metadata.get("callback_query_id").is_some()
+            || msg.metadata.get("interaction_id").is_some());
+
+    if is_picker_response {
+        let repo = msg.body["pick:".len()..].to_string();
+        let pick_key = format!("{}:{}", msg.channel, msg.thread_id);
+        let pending = {
+            let mut map = pending_picks.lock().unwrap_or_else(|e| e.into_inner());
+            map.remove(&pick_key)
+        };
+
+        match pending {
+            None => {
+                send_channel_reply(
+                    channels,
+                    &msg.channel,
+                    &msg.thread_id,
+                    "No pending project selection (may have timed out).".to_string(),
+                    msg_topic_id.as_deref(),
+                )
+                .await;
+            }
+            Some(pick) if pick.created_at.elapsed().as_secs() > 60 => {
+                send_channel_reply(
+                    channels,
+                    &msg.channel,
+                    &msg.thread_id,
+                    "Project selection timed out (60s). Please send your message again."
+                        .to_string(),
+                    pick.msg_topic_id.as_deref(),
+                )
+                .await;
+            }
+            Some(pick) => {
+                // Find the target engine ref for the selected repo
+                if let Some((_, _, task_manager, _)) =
+                    engine_refs.iter().find(|(r, _, _, _)| r == &repo)
+                {
+                    let title = if pick.original_body.chars().count() > 80 {
+                        let truncated: String = pick.original_body.chars().take(80).collect();
+                        format!("{}…", truncated)
+                    } else {
+                        pick.original_body.clone()
+                    };
+                    let req = crate::engine::tasks::CreateTaskRequest {
+                        title,
+                        body: pick.original_body.clone(),
+                        task_type: crate::engine::tasks::TaskType::Internal,
+                        labels: vec!["channel-created".to_string()],
+                        source: msg.channel.clone(),
+                        source_id: msg.thread_id.clone(),
+                    };
+                    match task_manager.create_task(req).await {
+                        Ok(task) => {
+                            let task_id = match &task {
+                                Task::Internal(t) => format!("internal:{}", t.id),
+                                Task::External(t) => t.id.0.clone(),
+                            };
+                            transport
+                                .bind(
+                                    &task_id,
+                                    &format!("orch-{repo}-{task_id}"),
+                                    &msg.channel,
+                                    &msg.thread_id,
+                                )
+                                .await;
+                            capture
+                                .register_session(&task_id, &format!("orch-{repo}-{task_id}"))
+                                .await;
+                            let transport_clone = transport.clone();
+                            let channels_clone = channels.clone();
+                            let task_id_clone = task_id.clone();
+                            tokio::spawn(async move {
+                                fanout_output(task_id_clone, transport_clone, channels_clone).await;
+                            });
+                            let reply = format!(
+                                "Task created: `{task_id}` in [{repo}] — I'll start working on it now."
+                            );
+                            send_channel_reply(
+                                channels,
+                                &msg.channel,
+                                &msg.thread_id,
+                                reply,
+                                pick.msg_topic_id.as_deref(),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(repo, err = %e, "failed to create task from picker selection");
+                            send_channel_reply(
+                                channels,
+                                &msg.channel,
+                                &msg.thread_id,
+                                format!("Failed to create task: {e}"),
+                                pick.msg_topic_id.as_deref(),
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    send_channel_reply(
+                        channels,
+                        &msg.channel,
+                        &msg.thread_id,
+                        format!("Project `{repo}` not found. Please try again."),
+                        pick.msg_topic_id.as_deref(),
+                    )
+                    .await;
+                }
+            }
+        }
+        return; // Picker response fully handled — skip normal routing
+    }
 
     // Check control channel BEFORE task bindings so a control channel message
     // never accidentally falls through to task session routing.
@@ -318,7 +468,42 @@ pub(super) async fn handle_channel_message(
             let channel = msg.channel.clone();
             let thread_id = msg.thread_id.clone();
 
-            // Resolve target project: resolved_repo → specific project, else first
+            // Show interactive picker when in General with multiple projects configured
+            if is_general && resolved_repo.is_none() && engine_refs.len() > 1 {
+                let buttons: Vec<(String, String)> = engine_refs
+                    .iter()
+                    .map(|(repo, _, _, _)| {
+                        // Use the short repo name (after the slash) as button label
+                        let label = repo.rsplit('/').next().unwrap_or(repo.as_str()).to_string();
+                        (label, format!("pick:{repo}"))
+                    })
+                    .collect();
+
+                send_channel_keyboard(
+                    channels,
+                    &channel,
+                    &thread_id,
+                    msg_topic_id.as_deref(),
+                    "Which project should I create this task in?",
+                    &buttons,
+                )
+                .await;
+
+                // Store the pending pick
+                let pick_key = format!("{channel}:{thread_id}");
+                let pick = PendingPick {
+                    original_body: msg.body.clone(),
+                    msg_topic_id: msg_topic_id.clone(),
+                    created_at: std::time::Instant::now(),
+                };
+                {
+                    let mut map = pending_picks.lock().unwrap_or_else(|e| e.into_inner());
+                    map.insert(pick_key, pick);
+                }
+                return; // Wait for the user's button tap
+            }
+
+            // Single project or already resolved → create immediately
             let target_engine_ref = if let Some(repo) = resolved_repo {
                 engine_refs.iter().find(|(r, _, _, _)| r == repo)
             } else {
@@ -605,5 +790,53 @@ pub(super) async fn handle_stream_command(
         format!("Streaming output from task `{task_id}` to this channel.")
     } else {
         format!("Task `{task_id}` is not currently running or has no active session.")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pending_pick_key_format() {
+        let channel = "telegram";
+        let thread_id = "-100123456";
+        let key = format!("{channel}:{thread_id}");
+        assert_eq!(key, "telegram:-100123456");
+    }
+
+    #[test]
+    fn pick_body_prefix() {
+        let body = "pick:owner/orch";
+        assert!(body.starts_with("pick:"));
+        assert_eq!(&body[5..], "owner/orch");
+    }
+
+    #[test]
+    fn picker_triggered_when_general_and_multiple_projects() {
+        let is_general = true;
+        let resolved_repo: Option<&str> = None;
+        let project_count = 2usize;
+
+        let should_show_picker = is_general && resolved_repo.is_none() && project_count > 1;
+        assert!(should_show_picker);
+    }
+
+    #[test]
+    fn picker_not_triggered_when_single_project() {
+        let is_general = true;
+        let resolved_repo: Option<&str> = None;
+        let project_count = 1usize;
+
+        let should_show_picker = is_general && resolved_repo.is_none() && project_count > 1;
+        assert!(!should_show_picker);
+    }
+
+    #[test]
+    fn picker_not_triggered_when_repo_resolved() {
+        let is_general = true;
+        let resolved_repo: Option<&str> = Some("owner/orch");
+        let project_count = 2usize;
+
+        let should_show_picker = is_general && resolved_repo.is_none() && project_count > 1;
+        assert!(!should_show_picker);
     }
 }

@@ -64,6 +64,20 @@ type EngineRef = (
     Option<Arc<TaskStore>>,
 );
 
+/// A pending project-pick waiting for the user to tap a button.
+pub(crate) struct PendingPick {
+    /// Original message body (the free-text request to create a task).
+    pub original_body: String,
+    /// The topic/thread that should receive follow-up messages.
+    pub msg_topic_id: Option<String>,
+    /// When this pick was created (used to enforce 60s timeout).
+    pub created_at: std::time::Instant,
+}
+
+/// Keyed by `"{channel}:{thread_id}"`.
+pub(crate) type PendingPicks =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, PendingPick>>>;
+
 /// Per-project engine state.
 ///
 /// Each project has its own backend, task runner, and task manager,
@@ -505,6 +519,9 @@ pub async fn serve() -> anyhow::Result<()> {
             )
         })
         .collect();
+    // Shared map for project-picker state: (channel:thread_id) → PendingPick
+    let pending_picks: PendingPicks =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let router_for_messages = channel_router.clone();
     for mut rx in channel_receivers {
         let transport = transport_for_messages.clone();
@@ -513,6 +530,7 @@ pub async fn serve() -> anyhow::Result<()> {
         let channels = channels_for_messages.clone();
         let engine_refs = engine_refs.clone();
         let ch_router = router_for_messages.clone();
+        let pending_picks = pending_picks.clone();
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received message from channel");
@@ -524,6 +542,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     &channels,
                     &engine_refs,
                     &ch_router,
+                    &pending_picks,
                 )
                 .await;
             }

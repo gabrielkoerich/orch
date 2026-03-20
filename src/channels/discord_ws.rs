@@ -167,6 +167,17 @@ impl Channel for DiscordGateway {
         self.send_message(target_channel, &msg.body).await
     }
 
+    async fn send_keyboard(
+        &self,
+        thread_id: &str,
+        _topic_id: Option<&str>,
+        text: &str,
+        buttons: &[(String, String)],
+    ) -> anyhow::Result<String> {
+        // For Discord, thread_id == channel_id
+        self.send_with_buttons(thread_id, text, buttons).await
+    }
+
     async fn health_check(&self) -> anyhow::Result<()> {
         let resp = self
             .client
