@@ -88,7 +88,7 @@ pub async fn send_keys(session: &str, text: &str) -> anyhow::Result<()> {
 /// Capture the current content of a tmux pane.
 pub async fn capture_pane(session: &str) -> anyhow::Result<String> {
     let output = tokio::process::Command::new("tmux")
-        .args(["capture-pane", "-t", session, "-p", "-S", "-100"])
+        .args(["capture-pane", "-t", session, "-p", "-S", "-"])
         .output_with_context()
         .await?;
     if !output.status.success() {

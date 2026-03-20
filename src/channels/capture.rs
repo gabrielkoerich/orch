@@ -225,7 +225,7 @@ impl OutputBuffer {
         self.last_content = cap_content(current_content);
         self.last_capture = Utc::now();
 
-        if new_content.is_empty() {
+        if new_content.trim().is_empty() {
             None
         } else {
             Some(new_content)
