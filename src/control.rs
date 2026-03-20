@@ -17,6 +17,7 @@
 use anyhow::{Context, Result};
 use sqlx::Row;
 
+use crate::engine::router::config::DEFAULT_AGENTS;
 use crate::store::TaskStore;
 
 /// System prompt template, loaded at compile time.
@@ -24,9 +25,6 @@ const SYSTEM_TEMPLATE: &str = include_str!("../prompts/control_system.md");
 
 /// Timeout for agent invocations (2 minutes).
 const AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// All known agent names.
-const ALL_AGENTS: &[&str] = &["claude", "codex", "opencode", "kimi", "minimax"];
 
 /// Parsed model specification from `/model` command.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,33 +70,22 @@ fn infer_agent(model: &str) -> &'static str {
     }
 }
 
-/// Check if an agent binary is available in PATH.
-fn is_agent_available(agent: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(agent)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 /// Validate a model spec by running a quick test invocation.
 ///
 /// Sends "hello" to the agent with the specified model to verify
 /// the agent binary exists and the model is available.
 pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
     // 1. Check agent is known
-    if !ALL_AGENTS.contains(&spec.agent.as_str()) {
+    if !DEFAULT_AGENTS.contains(&spec.agent.as_str()) {
         anyhow::bail!(
             "unknown agent '{}'. Available: {}",
             spec.agent,
-            ALL_AGENTS.join(", ")
+            DEFAULT_AGENTS.join(", ")
         );
     }
 
     // 2. Check agent binary exists
-    if !is_agent_available(&spec.agent) {
+    if !crate::cmd_cache::command_exists(&spec.agent) {
         anyhow::bail!("agent '{}' not found in PATH. Is it installed?", spec.agent);
     }
 
