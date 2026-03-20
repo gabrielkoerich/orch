@@ -155,10 +155,10 @@ enum Commands {
         /// Config key (dot-separated path)
         key: String,
     },
-    /// Stream live output from a running task
+    /// Stream live output from running tasks (all if no ID given)
     Stream {
-        /// Task ID to stream
-        task_id: String,
+        /// Task ID to stream (omit to stream all running tasks)
+        task_id: Option<String>,
     },
     /// Render a template file with environment variables
     Template {
@@ -473,9 +473,10 @@ async fn main() -> anyhow::Result<()> {
             let val = config::get(&key)?;
             println!("{val}");
         }
-        Commands::Stream { task_id } => {
-            cli::stream_task(&task_id).await?;
-        }
+        Commands::Stream { task_id } => match task_id {
+            Some(id) => cli::stream_task(&id).await?,
+            None => cli::stream_all().await?,
+        },
         Commands::Template { path, vars } => {
             template::render_and_print(&path, &vars)?;
         }

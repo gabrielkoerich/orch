@@ -9,6 +9,7 @@ pub mod webhook;
 
 use crate::channels::capture::CaptureService;
 use crate::channels::transport::Transport;
+use crate::channels::OutputChunk;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
 use crate::engine::tasks::TaskManager;
@@ -397,6 +398,162 @@ pub async fn stream_task(task_id: &str) -> anyhow::Result<()> {
     // Clean up: unregister and stop capture
     capture.unregister_session(task_id).await;
     capture_handle.abort();
+
+    Ok(())
+}
+
+/// Stream output from all running orch tmux sessions.
+///
+/// Discovers sessions on startup and every tick, automatically picking up
+/// new sessions that appear while streaming. Prefixes each line with the
+/// session name so interleaved output is distinguishable.
+pub async fn stream_all() -> anyhow::Result<()> {
+    use std::collections::HashSet;
+    use tokio::sync::broadcast;
+
+    let transport = Arc::new(crate::channels::transport::Transport::new());
+    let capture = Arc::new(crate::channels::capture::CaptureService::new(
+        transport.clone(),
+    ));
+
+    // Track which sessions we've already registered
+    let known: Arc<tokio::sync::Mutex<HashSet<String>>> =
+        Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+
+    // Discover sessions and register any new ones. Returns list of newly added session names.
+    let discover = {
+        let transport = transport.clone();
+        let capture = capture.clone();
+        let known = known.clone();
+        move || {
+            let transport = transport.clone();
+            let capture = capture.clone();
+            let known = known.clone();
+            async move {
+                let sessions =
+                    crate::channels::tmux::list_orch_sessions()
+                        .await
+                        .unwrap_or_default();
+                let mut added = Vec::new();
+                let mut known = known.lock().await;
+                for session in sessions {
+                    if known.contains(&session) {
+                        continue;
+                    }
+                    // Use session name as the task key (unique, descriptive)
+                    transport
+                        .bind(&session, &session, "cli", "stream-all")
+                        .await;
+                    capture.register_session(&session, &session).await;
+                    known.insert(session.clone());
+                    added.push(session);
+                }
+                added
+            }
+        }
+    };
+
+    // Initial discovery
+    let initial = discover().await;
+    if initial.is_empty() {
+        println!("No running orch sessions found. Waiting for sessions...");
+    } else {
+        println!(
+            "Streaming {} session(s): {}",
+            initial.len(),
+            initial.join(", ")
+        );
+    }
+    println!("Press Ctrl+C to stop");
+    println!("---");
+
+    // Spawn capture loop (runs while sessions are registered, but we keep re-discovering)
+    let capture_handle = tokio::spawn({
+        let capture = capture.clone();
+        async move { capture.start().await }
+    });
+
+    // Spawn discovery loop — checks for new sessions every 3 seconds
+    let discover_handle = tokio::spawn({
+        let discover = discover.clone();
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                interval.tick().await;
+                let added = discover().await;
+                for s in &added {
+                    eprintln!("+ new session: {s}");
+                }
+            }
+        }
+    });
+
+    // Merge output from all sessions via a single aggregated channel.
+    // We poll transport bindings periodically and subscribe to new ones.
+    let (merged_tx, mut merged_rx) = tokio::sync::mpsc::channel::<(String, OutputChunk)>(512);
+
+    // Spawn subscriber watcher — subscribes to broadcast channels of new sessions
+    let subscriber_handle = tokio::spawn({
+        let transport = transport.clone();
+        let known_subs: Arc<tokio::sync::Mutex<HashSet<String>>> =
+            Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let merged_tx = merged_tx.clone();
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let bindings = transport.active_sessions().await;
+                for binding in bindings {
+                    let session = binding.tmux_session.clone();
+                    let mut subs = known_subs.lock().await;
+                    if subs.contains(&session) {
+                        continue;
+                    }
+                    subs.insert(session.clone());
+                    let mut rx = binding.output_tx.subscribe();
+                    let tx = merged_tx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match rx.recv().await {
+                                Ok(chunk) => {
+                                    if tx.send((session.clone(), chunk)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    // Drop our copy so the channel closes when all senders are gone
+    drop(merged_tx);
+
+    // Print merged output with session prefix
+    while let Some((session, chunk)) = merged_rx.recv().await {
+        if chunk.content.is_empty() && chunk.is_final {
+            eprintln!("- session ended: {session}");
+            continue;
+        }
+        // Prefix each line with the session name (strip the "orch-" prefix for brevity)
+        let label = session.strip_prefix("orch-").unwrap_or(&session);
+        for line in chunk.content.lines() {
+            println!("[{label}] {line}");
+        }
+        // If content didn't end with newline, don't add extra one
+        if !chunk.content.is_empty() && !chunk.content.ends_with('\n') {
+            std::io::Write::flush(&mut std::io::stdout())?;
+        }
+    }
+
+    // Clean up
+    capture_handle.abort();
+    discover_handle.abort();
+    subscriber_handle.abort();
 
     Ok(())
 }
