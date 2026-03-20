@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::backends::{ExternalId, Status};
+use crate::store::TaskStatus;
 use crate::channels::capture::CaptureService;
 use crate::channels::routing::ChannelRouter;
 use crate::channels::transport::{MessageRoute, Transport};
@@ -427,6 +428,19 @@ pub(super) async fn handle_status_command(
             }
             Err(e) => {
                 tracing::warn!(repo, err = %e, "failed to list in-progress tasks");
+            }
+        }
+        match task_manager
+            .list_internal_by_status(TaskStatus::InProgress)
+            .await
+        {
+            Ok(tasks) => {
+                for t in &tasks {
+                    lines.push(format!("- #{} [{}]: {}", t.id.0, repo, t.title));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(repo, err = %e, "failed to list in-progress internal tasks");
             }
         }
     }
