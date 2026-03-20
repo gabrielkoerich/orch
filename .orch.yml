@@ -1,7 +1,7 @@
 jobs:
 - id: code-review-orch
   type: task
-  schedule: '0 8,17,20 * * *'
+  schedule: '35 8,19 * * *'
   task:
     title: 'Code review: orch'
     body: |
@@ -43,7 +43,7 @@ jobs:
   external: false
 - id: code-development-orch
   type: task
-  schedule: '0 6,15,18 * * *'
+  schedule: '0 6,18 * * *'
   task:
     title: 'Code development: find improvements and create tasks'
     body: |
@@ -81,6 +81,7 @@ jobs:
     - self-improvement
     agent: null
   command: null
+
   enabled: true
   external: false
 - id: morning-review
@@ -126,11 +127,12 @@ jobs:
     - self-improvement
     agent: null
   command: null
+
   enabled: true
   external: false
 - id: evening-retrospective
   type: task
-  schedule: '0 23 * * *'
+  schedule: '45 20 * * *'
   task:
     title: 'Daily evening retrospective'
     body: |
@@ -172,6 +174,7 @@ jobs:
     - self-improvement
     agent: null
   command: null
+
   enabled: true
   external: false
 gh:
