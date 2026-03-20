@@ -1545,7 +1545,7 @@ pub(crate) async fn auto_merge_pr(
                     let rebase_result = tokio::process::Command::new("sh")
                         .arg("-c")
                         .arg(format!(
-                            "cd '{}' && git fetch origin && git rebase origin/{default_branch} && git push --force-with-lease",
+                            "cd '{}' && git fetch origin && git -c commit.gpgsign=false rebase origin/{default_branch} && git push --force-with-lease",
                             wt
                         ))
                         .output()
