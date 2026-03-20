@@ -71,7 +71,7 @@ Before you write the output JSON, run these checks. If ANY fails, go back and fi
 
 Do NOT report `"status": "done"` unless all checks pass. If you made changes but did not commit, your status is `needs_review`, not `done`.
 
-**Reminder:** Do NOT push or create PRs — the orchestrator handles that automatically.
+**Reminder:** Do NOT push or create PRs — the orchestrator handles that automatically. Do not ask for push approval in your summary, and do not mention pushing. Focus your summary on what you accomplished, not on the push step.
 
 ## Output Format
 
@@ -93,7 +93,7 @@ Your final output MUST be a JSON object with these fields:
 Note: `delegations` is optional — only include it when delegating subtasks.
 
 Status rules:
-- **done**: all work is committed, pushed, PR created, and tests pass. You must have produced a visible result (committed code, posted a comment, or completed the requested action). Pure research with no output is `in_progress`. **Never report done if you did not complete the task.**
+- **done**: all work is committed and tests pass. You must have produced a visible result (committed code, posted a comment, or completed the requested action). The orchestrator pushes and creates the PR automatically — do NOT mention pushing in your summary. Pure research with no output is `in_progress`. **Never report done if you did not complete the task.**
 - **in_progress**: partial work was committed but more remains.
 - **blocked**: waiting on dependencies, missing information, delegated subtasks, or **the task is unclear / you don't have enough context to proceed**. When blocked, explain what information is missing in `reason` so a human can unblock you.
 - **needs_review**: encountered errors you cannot resolve.
