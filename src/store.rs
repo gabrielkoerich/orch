@@ -160,9 +160,10 @@ pub struct JobState {
 
 /// A message in the control session conversation history.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // fields used by channel integration (Phase 2)
 pub struct ControlMessage {
     pub id: i64,
+    pub session_id: String,
     pub role: String,
     pub channel: String,
     pub channel_thread: Option<String>,
@@ -2391,10 +2392,14 @@ impl TaskStore {
     // Control Session
     // ---------------------------------------------------------------
 
+    /// Default session ID for the control session.
+    pub const DEFAULT_SESSION: &'static str = "default";
+
     /// Insert a control session message.
-    #[allow(clippy::too_many_arguments, dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_control_message(
         &self,
+        session_id: &str,
         role: &str,
         channel: &str,
         channel_thread: Option<&str>,
@@ -2406,9 +2411,10 @@ impl TaskStore {
         cost_usd: Option<f64>,
     ) -> anyhow::Result<i64> {
         let row = sqlx::query(
-            "INSERT INTO control_messages (role, channel, channel_thread, content, summary, model, agent, tokens_used, cost_usd)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO control_messages (session_id, role, channel, channel_thread, content, summary, model, agent, tokens_used, cost_usd)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
+        .bind(session_id)
         .bind(role)
         .bind(channel)
         .bind(channel_thread)
@@ -2423,33 +2429,44 @@ impl TaskStore {
         Ok(row.get("id"))
     }
 
-    /// List recent control messages (newest last).
-    #[allow(dead_code)]
+    /// List the most recent control messages for a session (chronological order).
     pub async fn list_control_messages(
         &self,
+        session_id: &str,
         limit: i64,
-        offset: i64,
     ) -> anyhow::Result<Vec<ControlMessage>> {
-        let rows =
-            sqlx::query("SELECT * FROM control_messages ORDER BY created_at ASC LIMIT ? OFFSET ?")
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await?;
+        // Subquery: get the N most recent, then re-sort chronologically
+        let rows = sqlx::query(
+            "SELECT * FROM (
+                SELECT * FROM control_messages
+                WHERE session_id = ?
+                ORDER BY created_at DESC, id DESC LIMIT ?
+            ) ORDER BY created_at ASC, id ASC",
+        )
+        .bind(session_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.iter().map(Self::row_to_control_message).collect())
     }
 
-    /// Search control messages by content (LIKE match).
-    #[allow(dead_code)]
+    /// Search control messages by content (LIKE match, most recent first).
     pub async fn search_control_messages(
         &self,
+        session_id: &str,
         query: &str,
         limit: i64,
     ) -> anyhow::Result<Vec<ControlMessage>> {
-        let pattern = format!("%{query}%");
+        // Escape LIKE wildcards in user input
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
         let rows = sqlx::query(
-            "SELECT * FROM control_messages WHERE content LIKE ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT * FROM control_messages WHERE session_id = ? AND content LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?",
         )
+        .bind(session_id)
         .bind(&pattern)
         .bind(limit)
         .fetch_all(&self.pool)
@@ -2457,12 +2474,21 @@ impl TaskStore {
         Ok(rows.iter().map(Self::row_to_control_message).collect())
     }
 
-    /// Get recent assistant message summaries for context assembly.
-    #[allow(dead_code)]
-    pub async fn control_recent_summaries(&self, limit: i64) -> anyhow::Result<Vec<String>> {
+    /// Get the N most recent assistant message summaries (chronological order).
+    pub async fn control_recent_summaries(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        // Subquery: get the N most recent, then re-sort chronologically
         let rows = sqlx::query(
-            "SELECT summary FROM control_messages WHERE summary IS NOT NULL ORDER BY created_at ASC LIMIT ?",
+            "SELECT summary FROM (
+                SELECT summary, created_at, id FROM control_messages
+                WHERE session_id = ? AND summary IS NOT NULL
+                ORDER BY created_at DESC, id DESC LIMIT ?
+            ) ORDER BY created_at ASC, id ASC",
         )
+        .bind(session_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -2473,6 +2499,7 @@ impl TaskStore {
         use sqlx::Row;
         ControlMessage {
             id: row.get("id"),
+            session_id: row.get("session_id"),
             role: row.get("role"),
             channel: row.get("channel"),
             channel_thread: row.get("channel_thread"),
@@ -6677,6 +6704,7 @@ mod tests {
         let store = TaskStore::open_memory().await.unwrap();
         store
             .insert_control_message(
+                "default",
                 "user",
                 "cli",
                 None,
@@ -6691,6 +6719,7 @@ mod tests {
             .unwrap();
         store
             .insert_control_message(
+                "default",
                 "assistant",
                 "cli",
                 None,
@@ -6704,7 +6733,7 @@ mod tests {
             .await
             .unwrap();
 
-        let messages = store.list_control_messages(10, 0).await.unwrap();
+        let messages = store.list_control_messages("default", 10).await.unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[1].role, "assistant");
@@ -6716,6 +6745,7 @@ mod tests {
         let store = TaskStore::open_memory().await.unwrap();
         store
             .insert_control_message(
+                "default",
                 "user",
                 "cli",
                 None,
@@ -6730,6 +6760,7 @@ mod tests {
             .unwrap();
         store
             .insert_control_message(
+                "default",
                 "user",
                 "cli",
                 None,
@@ -6743,7 +6774,10 @@ mod tests {
             .await
             .unwrap();
 
-        let results = store.search_control_messages("bean", 10).await.unwrap();
+        let results = store
+            .search_control_messages("default", "bean", 10)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("bean"));
     }
@@ -6753,6 +6787,7 @@ mod tests {
         let store = TaskStore::open_memory().await.unwrap();
         store
             .insert_control_message(
+                "default",
                 "assistant",
                 "cli",
                 None,
@@ -6767,6 +6802,7 @@ mod tests {
             .unwrap();
         store
             .insert_control_message(
+                "default",
                 "assistant",
                 "cli",
                 None,
@@ -6780,9 +6816,51 @@ mod tests {
             .await
             .unwrap();
 
-        let summaries = store.control_recent_summaries(5).await.unwrap();
+        let summaries = store.control_recent_summaries("default", 5).await.unwrap();
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0], "did X");
         assert_eq!(summaries[1], "did Y");
+    }
+
+    #[tokio::test]
+    async fn control_sessions_are_isolated() {
+        let store = TaskStore::open_memory().await.unwrap();
+        store
+            .insert_control_message(
+                "session-a",
+                "user",
+                "cli",
+                None,
+                "message in A",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .insert_control_message(
+                "session-b",
+                "user",
+                "cli",
+                None,
+                "message in B",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let a_msgs = store.list_control_messages("session-a", 10).await.unwrap();
+        let b_msgs = store.list_control_messages("session-b", 10).await.unwrap();
+        assert_eq!(a_msgs.len(), 1);
+        assert_eq!(b_msgs.len(), 1);
+        assert!(a_msgs[0].content.contains("in A"));
+        assert!(b_msgs[0].content.contains("in B"));
     }
 }

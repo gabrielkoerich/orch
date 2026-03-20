@@ -22,6 +22,9 @@ use crate::store::TaskStore;
 /// System prompt template, loaded at compile time.
 const SYSTEM_TEMPLATE: &str = include_str!("../prompts/control_system.md");
 
+/// Timeout for agent invocations (2 minutes).
+const AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Known agents and their runner type.
 const CLAUDE_COMPATIBLE_AGENTS: &[&str] = &["claude", "kimi", "minimax"];
 const ALL_AGENTS: &[&str] = &["claude", "codex", "opencode", "kimi", "minimax"];
@@ -153,86 +156,17 @@ async fn list_opencode_models() -> Result<Vec<String>> {
 
 /// Run a minimal test invocation to verify agent+model availability.
 async fn test_invoke(agent: &str, model: &str) -> Result<String> {
-    let dir = "/tmp/orch-control";
-    tokio::fs::create_dir_all(dir).await?;
     let msg = "Reply with just the word 'ok'.";
-
-    match agent {
-        a if CLAUDE_COMPATIBLE_AGENTS.contains(&a) => {
-            let msg_file = format!("{dir}/test-msg.txt");
-            tokio::fs::write(&msg_file, msg).await?;
-
-            let output = tokio::process::Command::new(agent)
-                .args([
-                    "-p",
-                    "--model",
-                    model,
-                    "--permission-mode",
-                    "bypassPermissions",
-                    "--output-format",
-                    "text",
-                    "--max-turns",
-                    "1",
-                ])
-                .stdin(std::process::Stdio::from(
-                    std::fs::File::open(&msg_file).context("open test message file")?,
-                ))
-                .output()
-                .await
-                .context("spawning agent for test")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("{stderr}");
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        }
-        "codex" => {
-            let msg_file = format!("{dir}/test-msg.txt");
-            tokio::fs::write(&msg_file, msg).await?;
-
-            let output = tokio::process::Command::new("codex")
-                .args(["--model", model, "--full-auto", "-q"])
-                .stdin(std::process::Stdio::from(
-                    std::fs::File::open(&msg_file).context("open test message file")?,
-                ))
-                .output()
-                .await
-                .context("spawning codex for test")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("{stderr}");
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        }
-        "opencode" => {
-            let msg_file = format!("{dir}/test-msg.txt");
-            tokio::fs::write(&msg_file, msg).await?;
-
-            let output = tokio::process::Command::new("opencode")
-                .args(["run", "--format", "text", "-m", model, "-"])
-                .stdin(std::process::Stdio::from(
-                    std::fs::File::open(&msg_file).context("open test message file")?,
-                ))
-                .output()
-                .await
-                .context("spawning opencode for test")?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("{stderr}");
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        }
-        _ => anyhow::bail!("unknown agent: {agent}"),
-    }
+    // Reuse invoke_agent — it already handles temp files, timeout, and error checking
+    invoke_agent(agent, model, "", msg).await
 }
 
 /// Assemble the full system-prompt context from SQLite state and live system info.
-pub async fn assemble_context(store: &TaskStore) -> Result<String> {
-    // 1. Gather memories from KV (keys matching control:memory:*)
-    let memory_rows = sqlx::query("SELECT key, value FROM kv WHERE key LIKE 'control:memory:%'")
+pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<String> {
+    // 1. Gather memories from KV (keys matching control:memory:{session}:*)
+    let memory_prefix = format!("control:memory:{session_id}:%");
+    let memory_rows = sqlx::query("SELECT key, value FROM kv WHERE key LIKE ?")
+        .bind(&memory_prefix)
         .fetch_all(store.pool())
         .await
         .unwrap_or_default();
@@ -252,7 +186,10 @@ pub async fn assemble_context(store: &TaskStore) -> Result<String> {
     };
 
     // 2. Recent conversation summaries
-    let summaries = store.control_recent_summaries(20).await.unwrap_or_default();
+    let summaries = store
+        .control_recent_summaries(session_id, 20)
+        .await
+        .unwrap_or_default();
     let recent_summaries = if summaries.is_empty() {
         "(no recent conversation)".to_string()
     } else {
@@ -338,82 +275,108 @@ pub fn parse_response(raw: &str) -> (String, Option<String>) {
     (raw.trim().to_string(), None)
 }
 
+/// Prepare temp directory for agent invocation files.
+///
+/// Uses `~/.orch/state/control/{pid}/` for isolation between concurrent processes.
+async fn prepare_temp_dir() -> Result<String> {
+    let home = crate::home::orch_home()?;
+    let dir = format!("{}/state/control/{}", home.display(), std::process::id());
+    tokio::fs::create_dir_all(&dir).await?;
+    Ok(dir)
+}
+
+/// Build an agent command for the given agent type.
+fn build_agent_command(
+    agent: &str,
+    model: &str,
+    sys_file: &str,
+    msg_file: &str,
+    combined_file: &str,
+) -> Result<tokio::process::Command> {
+    match agent {
+        a if CLAUDE_COMPATIBLE_AGENTS.contains(&a) => {
+            let mut cmd = tokio::process::Command::new(agent);
+            cmd.args([
+                "-p",
+                "--model",
+                model,
+                "--permission-mode",
+                "bypassPermissions",
+                "--output-format",
+                "text",
+                "--append-system-prompt",
+                sys_file,
+            ])
+            .stdin(std::process::Stdio::from(
+                std::fs::File::open(msg_file).context("opening message file for agent stdin")?,
+            ));
+            Ok(cmd)
+        }
+        "codex" => {
+            let mut cmd = tokio::process::Command::new("codex");
+            cmd.args(["--model", model, "--full-auto", "-q"])
+                .stdin(std::process::Stdio::from(
+                    std::fs::File::open(combined_file)
+                        .context("opening combined file for codex stdin")?,
+                ));
+            Ok(cmd)
+        }
+        "opencode" => {
+            let mut cmd = tokio::process::Command::new("opencode");
+            cmd.args(["run", "--format", "text", "-m", model, "-"])
+                .stdin(std::process::Stdio::from(
+                    std::fs::File::open(combined_file)
+                        .context("opening combined file for opencode stdin")?,
+                ));
+            Ok(cmd)
+        }
+        other => anyhow::bail!("unknown agent: {other}"),
+    }
+}
+
 /// Invoke an agent CLI one-shot and return its stdout.
+///
+/// Writes temp files to `~/.orch/state/control/{pid}/`, spawns the agent
+/// with a timeout, and checks exit status before returning.
 pub async fn invoke_agent(
     agent: &str,
     model: &str,
     context: &str,
     message: &str,
 ) -> Result<String> {
-    let dir = "/tmp/orch-control";
-    tokio::fs::create_dir_all(dir).await?;
-
+    let dir = prepare_temp_dir().await?;
     let sys_file = format!("{dir}/system.md");
     let msg_file = format!("{dir}/message.txt");
     let combined_file = format!("{dir}/combined.txt");
 
-    match agent {
-        // claude, kimi, minimax — all claude-compatible
-        a if CLAUDE_COMPATIBLE_AGENTS.contains(&a) => {
-            tokio::fs::write(&sys_file, context).await?;
-            tokio::fs::write(&msg_file, message).await?;
+    // Write files needed by the agent
+    tokio::fs::write(&sys_file, context).await?;
+    tokio::fs::write(&msg_file, message).await?;
+    let combined = format!("{context}\n\n---\n\nUser message:\n{message}");
+    tokio::fs::write(&combined_file, &combined).await?;
 
-            let output = tokio::process::Command::new(agent)
-                .args([
-                    "-p",
-                    "--model",
-                    model,
-                    "--permission-mode",
-                    "bypassPermissions",
-                    "--output-format",
-                    "text",
-                    "--append-system-prompt",
-                    &sys_file,
-                ])
-                .stdin(std::process::Stdio::from(
-                    std::fs::File::open(&msg_file)
-                        .context("opening message file for agent stdin")?,
-                ))
-                .output()
-                .await
-                .context("spawning agent")?;
+    let mut cmd = build_agent_command(agent, model, &sys_file, &msg_file, &combined_file)?;
+    let output = tokio::time::timeout(AGENT_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("agent timed out after {}s", AGENT_TIMEOUT.as_secs()))?
+        .context("spawning agent")?;
 
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        }
-        "codex" => {
-            let combined = format!("{context}\n\n---\n\nUser message:\n{message}");
-            tokio::fs::write(&combined_file, &combined).await?;
-
-            let output = tokio::process::Command::new("codex")
-                .args(["--model", model, "--full-auto", "-q"])
-                .stdin(std::process::Stdio::from(
-                    std::fs::File::open(&combined_file)
-                        .context("opening combined file for codex stdin")?,
-                ))
-                .output()
-                .await
-                .context("spawning codex")?;
-
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        }
-        "opencode" => {
-            let combined = format!("{context}\n\n---\n\nUser message:\n{message}");
-            tokio::fs::write(&combined_file, &combined).await?;
-
-            let output = tokio::process::Command::new("opencode")
-                .args(["run", "--format", "text", "-m", model, "-"])
-                .stdin(std::process::Stdio::from(
-                    std::fs::File::open(&combined_file)
-                        .context("opening combined file for opencode stdin")?,
-                ))
-                .output()
-                .await
-                .context("spawning opencode")?;
-
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        }
-        other => anyhow::bail!("unknown agent: {other}"),
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.is_empty() {
+            stderr.to_string()
+        } else {
+            stdout.to_string()
+        };
+        anyhow::bail!(
+            "agent {agent} exited with {}: {}",
+            output.status,
+            detail.lines().take(5).collect::<Vec<_>>().join("\n")
+        );
     }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// High-level entry point: process a user message and return the assistant response.
@@ -422,6 +385,7 @@ pub async fn invoke_agent(
 /// response for summaries, and stores both user and assistant messages.
 pub async fn send_message(
     store: &TaskStore,
+    session_id: &str,
     channel: &str,
     channel_thread: Option<&str>,
     message: &str,
@@ -445,6 +409,7 @@ pub async fn send_message(
     // Store user message
     store
         .insert_control_message(
+            session_id,
             "user",
             channel,
             channel_thread,
@@ -458,7 +423,7 @@ pub async fn send_message(
         .await?;
 
     // Assemble context
-    let context = assemble_context(store).await?;
+    let context = assemble_context(store, session_id).await?;
 
     // Resolve model and agent from KV
     let model = get_model(store).await;
@@ -473,6 +438,7 @@ pub async fn send_message(
     // Store assistant message
     store
         .insert_control_message(
+            session_id,
             "assistant",
             channel,
             channel_thread,
@@ -532,11 +498,12 @@ mod tests {
     async fn assemble_context_includes_memories_and_summaries() {
         let store = TaskStore::open_memory().await.unwrap();
         store
-            .kv_set("control:memory:tz", "User is in BRT timezone")
+            .kv_set("control:memory:default:tz", "User is in BRT timezone")
             .await
             .unwrap();
         store
             .insert_control_message(
+                "default",
                 "assistant",
                 "cli",
                 None,
@@ -550,7 +517,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ctx = assemble_context(&store).await.unwrap();
+        let ctx = assemble_context(&store, "default").await.unwrap();
         assert!(ctx.contains("BRT timezone"), "should include memories");
         assert!(ctx.contains("checked status"), "should include summaries");
     }
@@ -598,7 +565,9 @@ mod tests {
     #[tokio::test]
     async fn send_message_model_show_current() {
         let store = TaskStore::open_memory().await.unwrap();
-        let response = send_message(&store, "cli", None, "/model").await.unwrap();
+        let response = send_message(&store, "default", "cli", None, "/model")
+            .await
+            .unwrap();
         assert!(response.contains("claude"));
         assert!(response.contains("sonnet"));
     }
@@ -609,7 +578,7 @@ mod tests {
         // set directly to avoid validation in test env
         let spec = parse_model_spec("claude:haiku");
         set_model_spec(&store, &spec).await.unwrap();
-        let messages = store.list_control_messages(10, 0).await.unwrap();
+        let messages = store.list_control_messages("default", 10).await.unwrap();
         assert_eq!(messages.len(), 0);
     }
 

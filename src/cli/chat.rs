@@ -1,15 +1,22 @@
 //! CLI handlers for `orch chat` — control session interaction.
 
 use crate::control;
+use crate::store::TaskStore;
 use std::io::{self, BufRead, Write};
 
 /// Interactive REPL mode — reads from stdin, sends to control session.
-pub async fn interactive() -> anyhow::Result<()> {
+pub async fn interactive(session_id: &str) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
     let model = control::get_model(&store).await;
     let agent = control::get_agent(&store).await;
 
-    println!("orch control session ({agent}:{model})");
+    let session_label = if session_id == TaskStore::DEFAULT_SESSION {
+        String::new()
+    } else {
+        format!(" [{session_id}]")
+    };
+
+    println!("orch control session ({agent}:{model}){session_label}");
     println!("Type /model [agent:]<model> to switch, Ctrl+C to exit");
     println!("---");
 
@@ -34,7 +41,7 @@ pub async fn interactive() -> anyhow::Result<()> {
             break;
         }
 
-        match control::send_message(&store, "cli", None, message).await {
+        match control::send_message(&store, session_id, "cli", None, message).await {
             Ok(response) => {
                 println!("{response}");
                 println!();
@@ -49,21 +56,23 @@ pub async fn interactive() -> anyhow::Result<()> {
 }
 
 /// Single message mode — send one message, print response, exit.
-pub async fn single_message(message: &str) -> anyhow::Result<()> {
+pub async fn single_message(session_id: &str, message: &str) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
-    let response = control::send_message(&store, "cli", None, message).await?;
+    let response = control::send_message(&store, session_id, "cli", None, message).await?;
     println!("{response}");
     Ok(())
 }
 
 /// Show conversation history.
-pub async fn history(search: Option<String>, limit: i64) -> anyhow::Result<()> {
+pub async fn history(session_id: &str, search: Option<String>, limit: i64) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
 
     let messages = if let Some(query) = search {
-        store.search_control_messages(&query, limit).await?
+        store
+            .search_control_messages(session_id, &query, limit)
+            .await?
     } else {
-        store.list_control_messages(limit, 0).await?
+        store.list_control_messages(session_id, limit).await?
     };
 
     if messages.is_empty() {

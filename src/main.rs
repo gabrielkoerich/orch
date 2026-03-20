@@ -163,6 +163,9 @@ enum Commands {
     },
     /// Chat with the orchestrator control session
     Chat {
+        /// Session profile (default: "default")
+        #[arg(long, short, default_value = "default")]
+        session: String,
         /// Send a single message (omit for interactive mode)
         message: Vec<String>,
         #[command(subcommand)]
@@ -498,15 +501,19 @@ async fn main() -> anyhow::Result<()> {
             Some(id) => cli::stream_task(&id).await?,
             None => cli::stream_all().await?,
         },
-        Commands::Chat { action, message } => match action {
+        Commands::Chat {
+            action,
+            message,
+            session,
+        } => match action {
             Some(ChatAction::History { search, limit }) => {
-                cli::chat::history(search, limit).await?;
+                cli::chat::history(&session, search, limit).await?;
             }
             None if !message.is_empty() => {
-                cli::chat::single_message(&message.join(" ")).await?;
+                cli::chat::single_message(&session, &message.join(" ")).await?;
             }
             None => {
-                cli::chat::interactive().await?;
+                cli::chat::interactive(&session).await?;
             }
         },
         Commands::Template { path, vars } => {

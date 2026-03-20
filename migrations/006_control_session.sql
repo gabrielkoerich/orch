@@ -1,6 +1,7 @@
 -- Control session: full conversation history
 CREATE TABLE IF NOT EXISTS control_messages (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL DEFAULT 'default',  -- multi-session support (profiles)
     role            TEXT NOT NULL,       -- 'user', 'assistant'
     channel         TEXT NOT NULL,       -- 'cli', 'telegram', 'discord'
     channel_thread  TEXT,                -- thread/topic ID for reply routing
@@ -13,7 +14,7 @@ CREATE TABLE IF NOT EXISTS control_messages (
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
+CREATE INDEX IF NOT EXISTS idx_control_messages_session
+    ON control_messages(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_control_messages_created
     ON control_messages(created_at);
-CREATE INDEX IF NOT EXISTS idx_control_messages_role
-    ON control_messages(role, created_at);
