@@ -151,21 +151,21 @@ The system prompt tells the agent it's the orch control session and lists availa
 
 ## Channel Integration
 
-### Routing
+### Current Architecture
 
-Messages that don't match a running task session go to the control session. This is the **default route** — no prefix needed.
+Channels (Telegram, Discord, GitHub) route messages through `Transport::route()` which returns one of three variants:
 
-In `Transport::route()`:
-
+```rust
+pub enum MessageRoute {
+    TaskSession { task_id: String },  // bound to a running task → forward to tmux
+    Command { raw: String },          // starts with / or "orch " → handle as CLI command
+    NewTask,                          // catch-all → creates a GitHub issue
+}
 ```
-1. Check thread → task binding (existing behavior)
-2. Check if it's an orch command like /task, /model (existing behavior)
-3. → Control session (NEW — instead of NewTask)
-```
 
-Alternative: dedicated channel/topic for control (e.g., Telegram topic "Control", Discord channel `#orch`). Simpler routing, clearer separation.
+### Phase 1: CLI Only (This Implementation)
 
-### CLI
+The control session starts as a CLI-only feature. No channel changes needed.
 
 **Single message:** `orch chat "what's running?"`
 
@@ -192,9 +192,54 @@ Yesterday at 14:30 you asked about the auth middleware rewrite...
 
 **History browsing:** `orch chat history --since 1d` or `orch chat history --search "bean"`
 
-### Telegram/Discord
+### Phase 2: Telegram/Discord Integration (Future)
 
-Messages in the control channel/topic invoke the control session. Response sent back to the same thread.
+Add a 4th route variant to `MessageRoute`:
+
+```rust
+pub enum MessageRoute {
+    TaskSession { task_id: String },
+    Command { raw: String },
+    ControlSession,  // NEW — conversational message for control session
+    NewTask,
+}
+```
+
+**Routing decision — how to distinguish "chat" from "create task":**
+
+Option A: **Dedicated channel/topic** (recommended) — a Telegram topic or Discord channel configured as the control channel. All messages there go to `ControlSession`. Everything else stays as-is.
+
+```yaml
+control:
+  enabled: true
+  channels:
+    telegram:
+      topic_id: "12345"       # messages in this topic → control session
+    discord:
+      channel_id: "98765"     # messages in this channel → control session
+```
+
+Option B: **Replace NewTask** — `NewTask` becomes `ControlSession`. The control session agent decides whether to create a task or just respond conversationally. This is more flexible but adds latency to task creation.
+
+Option C: **Prefix-based** — messages starting with `@orch` or `/chat` go to control session. Simple but less natural.
+
+**Flow for channel integration:**
+
+```
+Telegram/Discord message arrives
+  → Transport::route()
+  → ControlSession variant matched (by topic/channel config)
+  → Store user message in control_messages (with channel + thread_id)
+  → Assemble context + invoke one-shot agent
+  → Store response in control_messages
+  → Send response back to same channel/thread
+```
+
+**What channels gain from control session:**
+- Today: channels can only output notifications and receive `/commands`
+- With control session: channels become conversational — users can ask questions, get status updates, request actions, all in natural language
+- The agent handles intent detection — "unblock the bean tasks" runs `orch task unblock` without the user needing to know the exact command
+- Cross-channel context: a conversation started on Telegram can be continued on Discord or CLI — all messages go to the same SQLite history
 
 ## System Prompt
 
