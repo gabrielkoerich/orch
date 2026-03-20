@@ -683,7 +683,7 @@ pub(crate) async fn review_and_merge(
                         Ok(url) => {
                             // Extract PR number from URL and update store so subsequent
                             // review cycles check the correct PR (not a stale pr_number).
-                            if let Some(pr_num) = url.rsplit('/').next() {
+                            if let Some(pr_num) = url.rsplit('/').next().filter(|s| !s.is_empty()) {
                                 let pr_num_i64 = pr_num.parse::<i64>().unwrap_or(0);
                                 store_set(
                                     &Some(Arc::clone(store)),
@@ -759,7 +759,9 @@ pub(crate) async fn review_and_merge(
                                 Ok(o) if o.status.success() => {
                                     // gh pr create prints the PR URL to stdout
                                     let stdout = String::from_utf8_lossy(&o.stdout);
-                                    if let Some(pr_num) = stdout.trim().rsplit('/').next() {
+                                    if let Some(pr_num) =
+                                        stdout.trim().rsplit('/').next().filter(|s| !s.is_empty())
+                                    {
                                         let pr_num_i64 = pr_num.parse::<i64>().unwrap_or(0);
                                         store_set(
                                             &Some(Arc::clone(store)),
