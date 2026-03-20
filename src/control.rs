@@ -211,7 +211,10 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Str
         _ => "(could not fetch live state)".to_string(),
     };
 
-    let current_state = format!("### Service\n{service_status}\n\n### Tasks\n{task_list}");
+    let version = env!("ORCH_VERSION");
+    let current_state = format!(
+        "### Version\norch {version}\n\n### Service\n{service_status}\n\n### Tasks\n{task_list}"
+    );
 
     // 5. Replace placeholders in template
     let result = SYSTEM_TEMPLATE
