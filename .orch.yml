@@ -90,7 +90,7 @@ jobs:
   task:
     title: 'Daily morning review'
     body: |
-      Morning check-in. Your ONLY output is a summary post — do NOT create issues or modify code.
+      Morning check-in. Your ONLY output is a summary post — do NOT modify code.
 
       ## Gather context
 
@@ -136,7 +136,7 @@ jobs:
   task:
     title: 'Daily evening retrospective'
     body: |
-      Evening retrospective. Your ONLY output is a summary post — do NOT create issues or modify code.
+      Evening retrospective. Your ONLY output is a summary post — do NOT modify code.
 
       ## Gather context
 
