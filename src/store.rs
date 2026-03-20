@@ -1672,6 +1672,41 @@ impl TaskStore {
         })
     }
 
+    /// Get 24-hour cost summary filtered to a specific repository.
+    ///
+    /// Uses the same `COALESCE(NULLIF(m.repo, ''), t.repo)` join pattern as
+    /// `get_metrics_summary_24h_by_repo` so older metrics rows that lack a `repo`
+    /// column value are still matched via the tasks table.
+    pub async fn get_cost_summary_24h_by_repo(&self, repo: &str) -> anyhow::Result<CostSummary> {
+        let row = sqlx::query(
+            "SELECT COALESCE(SUM(m.input_tokens), 0) as input_tokens,
+                    COALESCE(SUM(m.output_tokens), 0) as output_tokens,
+                    COALESCE(SUM(m.input_cost_usd), 0.0) as input_cost_usd,
+                    COALESCE(SUM(m.output_cost_usd), 0.0) as output_cost_usd,
+                    COALESCE(SUM(m.total_cost_usd), 0.0) as total_cost_usd,
+                    COUNT(*) as task_count
+             FROM task_metrics m
+             LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+             WHERE m.completed_at >= datetime('now', '-24 hours')
+             AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        )
+        .bind(repo)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(CostSummary {
+            periods: vec![CostPeriod {
+                label: "24h".to_string(),
+                input_tokens: row.get("input_tokens"),
+                output_tokens: row.get("output_tokens"),
+                input_cost_usd: row.get("input_cost_usd"),
+                output_cost_usd: row.get("output_cost_usd"),
+                total_cost_usd: row.get("total_cost_usd"),
+                task_count: row.get("task_count"),
+            }],
+        })
+    }
+
     /// Record a rate limit event. Prunes records older than 30 days.
     pub async fn record_rate_limit(
         &self,
@@ -6392,5 +6427,132 @@ mod tests {
         let orch_subs = store.list_subscribers_for_repo("owner/orch").await.unwrap();
         assert_eq!(orch_subs.len(), 1);
         assert_eq!(orch_subs[0], ("discord".to_string(), "1111".to_string()));
+    }
+
+    // ── get_cost_summary_24h_by_repo ────────────────────────────────
+
+    #[tokio::test]
+    async fn cost_summary_24h_by_repo_isolates_per_repo() {
+        use chrono::Utc;
+        let store = TaskStore::open_memory().await.unwrap();
+        let now = Utc::now();
+
+        // Insert a metric for owner/orch
+        store
+            .insert_task_metric(&InsertTaskMetric {
+                repo: "owner/orch",
+                task_id: "orch-1",
+                agent: "claude",
+                model: Some("sonnet"),
+                complexity: None,
+                outcome: "success",
+                duration_seconds: 10.0,
+                started_at: &now,
+                completed_at: &now,
+                attempts: 1,
+                files_changed: 1,
+                error_type: None,
+                input_tokens: Some(1000),
+                output_tokens: Some(500),
+                input_cost_usd: Some(0.003),
+                output_cost_usd: Some(0.0075),
+                total_cost_usd: Some(0.0105),
+            })
+            .await
+            .unwrap();
+
+        // Insert a metric for owner/bean
+        store
+            .insert_task_metric(&InsertTaskMetric {
+                repo: "owner/bean",
+                task_id: "bean-1",
+                agent: "codex",
+                model: Some("gpt-4"),
+                complexity: None,
+                outcome: "success",
+                duration_seconds: 20.0,
+                started_at: &now,
+                completed_at: &now,
+                attempts: 1,
+                files_changed: 2,
+                error_type: None,
+                input_tokens: Some(2000),
+                output_tokens: Some(1000),
+                input_cost_usd: Some(0.006),
+                output_cost_usd: Some(0.015),
+                total_cost_usd: Some(0.021),
+            })
+            .await
+            .unwrap();
+
+        // owner/orch should only see its own cost
+        let orch_cost = store
+            .get_cost_summary_24h_by_repo("owner/orch")
+            .await
+            .unwrap();
+        assert_eq!(orch_cost.periods.len(), 1);
+        assert_eq!(orch_cost.periods[0].label, "24h");
+        assert_eq!(orch_cost.periods[0].task_count, 1);
+        assert!((orch_cost.periods[0].total_cost_usd - 0.0105).abs() < 1e-6);
+
+        // owner/bean should only see its own cost
+        let bean_cost = store
+            .get_cost_summary_24h_by_repo("owner/bean")
+            .await
+            .unwrap();
+        assert_eq!(bean_cost.periods[0].task_count, 1);
+        assert!((bean_cost.periods[0].total_cost_usd - 0.021).abs() < 1e-6);
+
+        // Unknown repo returns zeros
+        let unknown = store
+            .get_cost_summary_24h_by_repo("unknown/repo")
+            .await
+            .unwrap();
+        assert_eq!(unknown.periods[0].task_count, 0);
+        assert_eq!(unknown.periods[0].total_cost_usd, 0.0);
+    }
+
+    #[tokio::test]
+    async fn cost_summary_24h_by_repo_falls_back_to_tasks_join() {
+        use chrono::Utc;
+        let store = TaskStore::open_memory().await.unwrap();
+        let now = Utc::now();
+
+        // Create a task with a known repo so the join can resolve it
+        let task_id = store
+            .create_internal("owner/orch", "task", "body", "manual", "")
+            .await
+            .unwrap();
+
+        // Insert metric with empty repo — repo will be resolved via tasks join
+        store
+            .insert_task_metric(&InsertTaskMetric {
+                repo: "",
+                task_id: &task_id.to_string(),
+                agent: "claude",
+                model: None,
+                complexity: None,
+                outcome: "success",
+                duration_seconds: 5.0,
+                started_at: &now,
+                completed_at: &now,
+                attempts: 1,
+                files_changed: 0,
+                error_type: None,
+                input_tokens: Some(500),
+                output_tokens: Some(200),
+                input_cost_usd: Some(0.0015),
+                output_cost_usd: Some(0.003),
+                total_cost_usd: Some(0.0045),
+            })
+            .await
+            .unwrap();
+
+        let cost = store
+            .get_cost_summary_24h_by_repo("owner/orch")
+            .await
+            .unwrap();
+        assert_eq!(cost.periods[0].task_count, 1);
+        assert!((cost.periods[0].total_cost_usd - 0.0045).abs() < 1e-6);
     }
 }

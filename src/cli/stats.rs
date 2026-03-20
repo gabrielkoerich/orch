@@ -21,8 +21,8 @@ pub async fn stats(all: bool) -> anyhow::Result<()> {
             println!();
             for repo in &repos {
                 let summary = store.get_metrics_summary_24h_by_repo(repo).await?;
-                // Per-repo cost not yet supported by the store
-                print_summary_table(repo, &summary, None);
+                let cost = store.get_cost_summary_24h_by_repo(repo).await.ok();
+                print_summary_table(repo, &summary, cost.as_ref());
             }
         }
     }
