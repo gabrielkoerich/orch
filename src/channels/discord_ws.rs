@@ -248,7 +248,8 @@ async fn run_gateway(
                 backoff = Duration::from_secs(1); // reset on success
 
                 let result =
-                    handle_connection(ws, &token, shard_id, shard_count, &mut state, &tx, &client).await;
+                    handle_connection(ws, &token, shard_id, shard_count, &mut state, &tx, &client)
+                        .await;
 
                 match result {
                     Ok(true) => {
@@ -714,9 +715,16 @@ mod tests {
         let mut resume_url = None;
         let client = Client::new();
 
-        handle_dispatch(Some("READY"), &data, &mut session_id, &mut resume_url, &tx, &client)
-            .await
-            .unwrap();
+        handle_dispatch(
+            Some("READY"),
+            &data,
+            &mut session_id,
+            &mut resume_url,
+            &tx,
+            &client,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(session_id.as_deref(), Some("abc123"));
         assert_eq!(resume_url.as_deref(), Some("wss://us-east1.discord.gg"));
