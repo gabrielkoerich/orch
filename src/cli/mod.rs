@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod cost;
 pub mod dashboard;
 pub mod job;

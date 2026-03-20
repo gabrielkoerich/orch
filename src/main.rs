@@ -4,6 +4,7 @@ mod cli;
 mod cmd;
 mod cmd_cache;
 mod config;
+mod control;
 mod cron;
 mod engine;
 mod github;
@@ -160,6 +161,13 @@ enum Commands {
         /// Task ID to stream (omit to stream all running tasks)
         task_id: Option<String>,
     },
+    /// Chat with the orchestrator control session
+    Chat {
+        /// Send a single message (omit for interactive mode)
+        message: Vec<String>,
+        #[command(subcommand)]
+        action: Option<ChatAction>,
+    },
     /// Render a template file with environment variables
     Template {
         /// Path to template file
@@ -238,6 +246,19 @@ enum Commands {
 enum WebhookAction {
     /// Show webhook server health status
     Status,
+}
+
+#[derive(Subcommand)]
+enum ChatAction {
+    /// Search conversation history
+    History {
+        /// Search term
+        #[arg(long)]
+        search: Option<String>,
+        /// Max results
+        #[arg(long, default_value = "20")]
+        limit: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -476,6 +497,17 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stream { task_id } => match task_id {
             Some(id) => cli::stream_task(&id).await?,
             None => cli::stream_all().await?,
+        },
+        Commands::Chat { action, message } => match action {
+            Some(ChatAction::History { search, limit }) => {
+                cli::chat::history(search, limit).await?;
+            }
+            None if !message.is_empty() => {
+                cli::chat::single_message(&message.join(" ")).await?;
+            }
+            None => {
+                cli::chat::interactive().await?;
+            }
         },
         Commands::Template { path, vars } => {
             template::render_and_print(&path, &vars)?;
