@@ -340,6 +340,27 @@ impl Channel for TelegramChannel {
         self.send_message(chat_id, &msg.body, topic_id).await
     }
 
+    async fn send_keyboard(
+        &self,
+        _thread_id: &str,
+        topic_id: Option<&str>,
+        text: &str,
+        buttons: &[(String, String)],
+    ) -> anyhow::Result<String> {
+        let chat_id = self
+            .chat_id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("telegram chat_id not configured"))?
+            .parse::<i64>()
+            .map_err(|_| anyhow::anyhow!("invalid chat_id"))?;
+
+        let topic_id_i64 = topic_id.and_then(|t| t.parse::<i64>().ok());
+        let msg_id = self
+            .send_inline_keyboard(chat_id, topic_id_i64, text, buttons)
+            .await?;
+        Ok(msg_id.to_string())
+    }
+
     async fn health_check(&self) -> anyhow::Result<()> {
         let url = self.api_url("getMe");
 
