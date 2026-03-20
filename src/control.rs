@@ -588,10 +588,7 @@ mod tests {
             .unwrap();
 
         let ctx = assemble_context(&store, "default").await.unwrap();
-        assert!(
-            ctx.state.contains("UTC-3"),
-            "should include memories"
-        );
+        assert!(ctx.state.contains("UTC-3"), "should include memories");
         assert!(
             ctx.state.contains("checked status"),
             "should include summaries"
