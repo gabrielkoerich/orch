@@ -516,6 +516,10 @@ pub async fn serve() -> anyhow::Result<()> {
             )
         })
         .collect();
+    // Shared map for project-picker state: (channel:thread_id) → PendingPick
+    let pending_picks: PendingPicks = std::sync::Arc::new(
+        std::sync::Mutex::new(std::collections::HashMap::new()),
+    );
     let router_for_messages = channel_router.clone();
     for mut rx in channel_receivers {
         let transport = transport_for_messages.clone();
@@ -524,6 +528,7 @@ pub async fn serve() -> anyhow::Result<()> {
         let channels = channels_for_messages.clone();
         let engine_refs = engine_refs.clone();
         let ch_router = router_for_messages.clone();
+        let pending_picks = pending_picks.clone();
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received message from channel");
@@ -535,6 +540,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     &channels,
                     &engine_refs,
                     &ch_router,
+                    &pending_picks,
                 )
                 .await;
             }
@@ -1307,6 +1313,7 @@ async fn handle_channel_message(
     channels: &Arc<ChannelRegistry>,
     engine_refs: &[EngineRef],
     channel_router: &Arc<ChannelRouter>,
+    pending_picks: &PendingPicks,
 ) {
     use crate::backends::ExternalId;
     use crate::channels::stream::fanout_output;
