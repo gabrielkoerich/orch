@@ -1440,8 +1440,9 @@ async fn handle_channel_message(
             };
 
             if let Some((repo, _, task_manager, _)) = target_engine_ref {
-                let title = if msg.body.len() > 80 {
-                    format!("{}…", &msg.body[..80])
+                let title = if msg.body.chars().count() > 80 {
+                    let truncated: String = msg.body.chars().take(80).collect();
+                    format!("{}…", truncated)
                 } else {
                     msg.body.clone()
                 };
