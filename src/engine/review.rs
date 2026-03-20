@@ -1159,60 +1159,59 @@ pub(crate) async fn review_and_merge(
     );
 
     // 12. Post automated review comment on the PR
+    // Use pr_number_early (already known before running the review agent) to avoid
+    // a redundant API call that could silently return None on transient errors and
+    // bypass the comment-verification gate in auto_merge_pr.
     let gh = GhHttp::new()?;
-    let pr_number = gh.get_pr_number(repo, &branch_name).await.ok().flatten();
-
-    if let Some(pr_num) = pr_number {
-        let pr_comment = match &decision {
-            ReviewDecision::Approve => {
-                format!(
-                    "## Automated Review \u{2014} Approve\n\n{}",
-                    review_notes_for_comment
-                )
-            }
-            ReviewDecision::RequestChanges { notes, issues } => {
-                let mut body = format!(
-                    "## Automated Review \u{2014} Changes Requested\n\n{}\n",
-                    notes
-                );
-                if !issues.is_empty() {
-                    body.push_str("\n**Issues Found:**\n");
-                    for issue in issues {
-                        body.push_str(&format!(
-                            "- `{}` line {}: {} [{}]\n",
-                            issue.file,
-                            issue
-                                .line
-                                .map(|l| l.to_string())
-                                .unwrap_or_else(|| "?".to_string()),
-                            issue.description,
-                            issue.severity
-                        ));
-                    }
-                }
-                body
-            }
-            _ => String::new(),
-        };
-
-        if !pr_comment.is_empty() {
-            // Append attribution footer with review agent and model
-            let footer = format!(
-                "\n\n---\n*Reviewed by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
-                review_agent, review_model
+    let pr_comment = match &decision {
+        ReviewDecision::Approve => {
+            format!(
+                "## Automated Review \u{2014} Approve\n\n{}",
+                review_notes_for_comment
+            )
+        }
+        ReviewDecision::RequestChanges { notes, issues } => {
+            let mut body = format!(
+                "## Automated Review \u{2014} Changes Requested\n\n{}\n",
+                notes
             );
-            let pr_comment_with_footer = format!("{}{}", pr_comment, footer);
-            if let Err(e) = gh
-                .add_comment(repo, &pr_num.to_string(), &pr_comment_with_footer)
-                .await
-            {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    pr_number = pr_num,
-                    error = %e,
-                    "failed to post automated review comment on PR"
-                );
+            if !issues.is_empty() {
+                body.push_str("\n**Issues Found:**\n");
+                for issue in issues {
+                    body.push_str(&format!(
+                        "- `{}` line {}: {} [{}]\n",
+                        issue.file,
+                        issue
+                            .line
+                            .map(|l| l.to_string())
+                            .unwrap_or_else(|| "?".to_string()),
+                        issue.description,
+                        issue.severity
+                    ));
+                }
             }
+            body
+        }
+        _ => String::new(),
+    };
+
+    if !pr_comment.is_empty() {
+        // Append attribution footer with review agent and model
+        let footer = format!(
+            "\n\n---\n*Reviewed by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
+            review_agent, review_model
+        );
+        let pr_comment_with_footer = format!("{}{}", pr_comment, footer);
+        if let Err(e) = gh
+            .add_comment(repo, &pr_number_early.to_string(), &pr_comment_with_footer)
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id.0,
+                pr_number = pr_number_early,
+                error = %e,
+                "failed to post automated review comment on PR"
+            );
         }
     }
 
