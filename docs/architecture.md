@@ -12,10 +12,12 @@ graph TB
         DC_CH["Discord Bot<br/>(gateway ws)"]
         TMUX_CH["tmux Bridge<br/>(capture/send-keys)"]
         CLI_CH["CLI<br/>(orch commands)"]
+        CHAT_CLI["CLI Chat<br/>(orch chat)"]
     end
 
     subgraph "orch (Rust binary, Tokio)"
         TRANSPORT["Transport Layer<br/>routes messages ↔ sessions<br/>broadcasts output"]
+        CONTROL["Control Session<br/>orch chat (one-shot)"]
 
         subgraph "Engine"
             TASKS["Task Manager<br/>internal + GitHub"]
@@ -61,6 +63,10 @@ graph TB
     DC_CH --> TRANSPORT
     TMUX_CH --> TRANSPORT
     CLI_CH --> TASKS
+    CHAT_CLI --> CONTROL
+    CONTROL --> CL
+    CONTROL --> CO
+    CONTROL --> OC
 
     TRANSPORT --> CH_ROUTER
     CH_ROUTER --> TASKS
@@ -209,8 +215,38 @@ new → routed → in_progress → needs_review → in_review → done
 ```
 
 - **Watch** — capture-pane diffs stream to all connected channels in real-time
+- **Watch all** — `orch stream` (no args) discovers all `orch-*` sessions, merges output with `[repo-taskid]` prefixes, auto-discovers new sessions every 3s
 - **Join** — messages from any channel route to tmux via send-keys
 - **Multi-viewer** — multiple channels watch the same session simultaneously
+
+## Control Session (`orch chat`)
+
+```
+┌────────────────────────────────────────────────┐
+│  orch chat (CLI REPL or single message)        │
+│                                                │
+│  1. Store user message in SQLite               │
+│  2. Assemble context:                          │
+│     - Live state (orch task list)              │
+│     - Memories (KV: control:memory:{session}:*)│
+│     - Recent summaries (last 20)               │
+│  3. Resolve model/agent from KV                │
+│  4. Invoke agent one-shot:                     │
+│     - get_runner(agent).build_command()         │
+│     - bash -c (120s timeout)                   │
+│     - get_runner(agent).parse_response()        │
+│     - get_runner(agent).classify_error()        │
+│  5. Extract text + tokens from response        │
+│  6. Store assistant message + tokens in SQLite  │
+│  7. Return response                            │
+└────────────────────────────────────────────────┘
+```
+
+- **One-shot invocations** — no tmux, no worktree, no long-running session
+- **Multi-session** — `--session <name>` isolates history and memories
+- **Model validation** — `/model agent:model` tests before saving (rate limits, auth, binary exists)
+- **Reuses runner** — same `build_command` / `parse_response` / `classify_error` as task runner
+- **Token tracking** — stored per message in `control_messages` table
 
 ## Channel Routing
 
@@ -285,7 +321,7 @@ graph LR
 ```
 ~/.orch/
   config.yml             # global config (credentials, engine settings)
-  orch.db                # SQLite (tasks, metrics, KV, rate limits, job state, subscriptions)
+  orch.db                # SQLite (tasks, metrics, KV, rate limits, job state, subscriptions, control_messages)
   projects/              # bare clones added via `orch project add`
   worktrees/             # agent worktrees (all projects)
     repo/branch/         # one per task

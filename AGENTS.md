@@ -38,10 +38,13 @@ The orchestrator can stream live output from running agent sessions. This allows
 ### Streaming via CLI
 
 ```bash
-orch stream <task_id>
+orch stream              # stream ALL running sessions (auto-discovers new ones)
+orch stream <task_id>    # stream a single task
 ```
 
-This connects to the running task's tmux session and prints output as it arrives. The stream updates every 2 seconds with new content from the agent's pane.
+Without arguments, `orch stream` discovers all `orch-*` tmux sessions and merges their output with `[repo-taskid]` prefixes. New sessions that start while streaming are picked up automatically (re-discovery every 3 seconds).
+
+Single-task mode connects to one task's tmux session and prints output as it arrives. The stream updates every 2 seconds with new content from the agent's pane.
 
 ### How It Works
 
@@ -314,6 +317,7 @@ The routing prompt template is at `prompts/route.md`. It includes:
   worktrees/             # agent worktrees (all projects)
     repo/branch/         #   created by the runner, one per task
   state/                 # runtime state (logs, prompts, per-task artifacts)
+    control/{pid}/       #   control session temp files (per-process isolation)
   skills/                # cloned skill repositories
 ```
 
@@ -321,10 +325,6 @@ The routing prompt template is at `prompts/route.md`. It includes:
 - **Orch-managed projects** (`orch project add owner/repo`): bare clone at `~/.orch/projects/<owner>/<repo>.git`.
 - **Worktrees**: always at `~/.orch/worktrees/<project>/<branch>/` regardless of project type.
 - `ORCH_WORKTREES` env var overrides the worktrees base directory.
-
-## Specs & Roadmap
-
-See [specs.md](specs.md) for architecture overview, what's working, what's not, and improvement ideas.
 
 ## Required checks before every commit
 
@@ -430,7 +430,84 @@ Modes:
 - `danger-full-access` — no sandbox (for tasks needing bun, solana-test-validator, etc.)
 - `none` — bypasses all Codex sandboxing (orchestrator is the sandbox)
 
+## Control Session (`orch chat`)
+
+An interactive conversational control plane. Talk to the orchestrator in natural language — ask about running tasks, create new ones, check status, unblock things.
+
+### How It Works
+
+Each message triggers a **one-shot agent invocation** with context assembled from SQLite. No long-running session — stateless process, stateful database.
+
+```
+message → store in SQLite → assemble context (live state + memories + summaries)
+  → invoke agent (build_command + parse_response from runner)
+  → parse <summary> tag → store response + tokens → return
+```
+
+### CLI Usage
+
+```bash
+orch chat                           # interactive REPL
+orch chat "what's running?"         # single message
+orch chat --session ops             # use a named session profile
+orch chat history                   # show recent messages
+orch chat history --search "bean"   # search past conversations
+```
+
+### Model Selection
+
+```bash
+/model sonnet                       # infer agent (claude)
+/model minimax:sonnet               # explicit agent:model
+/model opencode:minimax-m2.5-free   # opencode with specific model
+/model                              # show current agent:model
+```
+
+Model selection validates before saving:
+1. Agent must be in `DEFAULT_AGENTS` (from `router/config.rs`)
+2. Agent binary must exist in PATH (via `cmd_cache::command_exists`)
+3. For opencode: pre-checks against `opencode models` list
+4. **Always**: test invocation to verify model actually works (catches rate limits, missing API keys, expired credits)
+
+### Multi-Session Support
+
+Sessions isolate conversation history and memories. Default session is `"default"`.
+
+```bash
+orch chat --session ops             # ops profile
+orch chat --session dev             # dev profile
+```
+
+Each session has its own:
+- Message history in `control_messages` table (filtered by `session_id`)
+- Memories in KV store (keys: `control:memory:{session_id}:*`)
+- Model/agent selection is global (shared across sessions)
+
+### Storage
+
+All in `~/.orch/orch.db`:
+
+- `control_messages` table — full conversation history with session_id, role, content, summary, model, agent, tokens, cost
+- `kv` table — model state (`control:model`, `control:agent`) and memories (`control:memory:{session}:*`)
+
+### Architecture
+
+- `src/control.rs` — context assembly, agent invocation, response parsing
+- `src/cli/chat.rs` — CLI handlers (REPL, single-message, history)
+- `prompts/control_system.md` — system prompt template with `{current_state}`, `{memories}`, `{recent_summaries}` placeholders
+- Reuses runner infrastructure: `get_runner()`, `build_command()`, `parse_response()`, `classify_error()` from `src/engine/runner/agents/`
+- Agent invocations run via `bash -c` with timeout (120s), not tmux
+
+### Configuration
+
+```yaml
+# No config needed — works with defaults (claude:sonnet)
+# Model/agent stored in KV, changed via /model command
+```
+
 ## Landing the Plane (Session Completion)
+
+> **Task agents dispatched by orch:** If `ORCH_AGENT` or `TASK_ID` env vars are set, SKIP this section entirely. The engine handles pushing, PR creation, and cleanup. You should only commit — never push.
 
 **When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
 

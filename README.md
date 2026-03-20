@@ -11,7 +11,8 @@ An autonomous task orchestrator that delegates work to AI coding agents (Claude,
 - **GitHub Issues integration** — Two-way sync with GitHub Issues as the source of truth
 - **GitHub Projects V2** — Automatic project board column sync on status changes
 - **Isolated worktrees** — Each task runs in its own git worktree, never touching the main repo
-- **Live session streaming** — Watch agents work in real-time via `orch stream <task_id>`
+- **Live session streaming** — Watch agents work in real-time via `orch stream` (all sessions) or `orch stream <task_id>`
+- **Control session** — Conversational ops assistant via `orch chat` — ask about tasks, create new ones, check status in natural language
 - **Internal tasks** — SQLite-backed tasks for cron jobs and maintenance (no GitHub issue clutter)
 - **Job scheduler** — Cron-like scheduled tasks with native Rust cron matching
 - **Automatic PR creation** — Branches pushed, PRs created, and comments posted automatically
@@ -214,13 +215,32 @@ orch init                     # Initialize orch for current project
 orch init --repo owner/repo   # Initialize with specific repo
 orch agents                   # List installed agent CLIs
 orch metrics                  # Show task metrics summary (24h)
-orch stream <task_id>         # Stream live output from a running task
+orch stream                   # Stream ALL running agent sessions
+orch stream <task_id>         # Stream a single task
 orch log                      # Show last 50 log lines
 orch log 100                  # Show last N lines
 orch log watch                # Tail logs live
 orch version                  # Show version
 orch config <key>             # Read config value (e.g., orch config gh.repo)
 orch completions <shell>      # Generate shell completions (bash, zsh, fish)
+```
+
+### Control Session (Chat)
+
+```bash
+orch chat                           # Interactive REPL
+orch chat "what's running?"         # Single message mode
+orch chat --session ops             # Use a named session profile
+orch chat history                   # Show recent messages
+orch chat history --search "bean"   # Search past conversations
+```
+
+In the REPL, use `/model` to switch models:
+```
+orch> /model sonnet                 # Infer agent (claude)
+orch> /model minimax:sonnet         # Explicit agent:model
+orch> /model opencode:minimax-m2.5-free  # OpenCode with specific model
+orch> /model                        # Show current agent:model
 ```
 
 ## Configuration
@@ -349,6 +369,7 @@ Orch is built in Rust with a modular architecture:
 ```
 src/
 ├── main.rs              # CLI entrypoint (clap)
+├── control.rs           # Control session (orch chat) — context assembly, agent invocation
 ├── config/
 │   └── mod.rs           # Config loading, hot-reload, multi-project
 ├── store.rs             # Unified SQLite task store (tasks, metrics, KV, rate limits)
@@ -377,7 +398,8 @@ src/
 │   ├── discord.rs       # Discord registration + REST helpers
 │   └── discord_ws.rs    # Discord Gateway websocket (real-time events)
 ├── cli/                 # CLI command implementations
-│   ├── mod.rs           # Init, agents, board, project, metrics
+│   ├── mod.rs           # Init, agents, board, project, metrics, stream
+│   ├── chat.rs          # Control session (REPL, single-message, history)
 │   ├── task.rs          # Task CRUD
 │   ├── job.rs           # Job management
 │   └── service.rs       # Service lifecycle
@@ -462,8 +484,8 @@ Install nextest: `cargo binstall cargo-nextest` (requires [cargo-binstall](https
 
 ## Documentation
 
-- [PLAN.md](PLAN.md) — Architecture, migration plan, and feature roadmap
 - [AGENTS.md](AGENTS.md) — Agent and developer notes
+- [docs/architecture.md](docs/architecture.md) — System architecture and diagrams
 
 ## License
 
