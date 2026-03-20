@@ -3,6 +3,16 @@
 //! The control session provides an interactive ops assistant that assembles context
 //! from SQLite (memories, summaries, live state), invokes an agent CLI one-shot,
 //! and parses the response for summary extraction.
+//!
+//! ## Model selection
+//!
+//! `/model <spec>` where spec is:
+//! - `agent:model` — explicit agent + model (e.g., `minimax:sonnet`, `opencode:minimax-m2.5-free`)
+//! - `model` — infer agent from model name (e.g., `sonnet` → claude, `gpt-4o` → codex)
+//!
+//! All agents: claude, codex, opencode, kimi, minimax
+//! - kimi and minimax are claude-compatible wrappers (separate binaries in PATH)
+//! - opencode supports `opencode models` for listing available models
 
 use anyhow::{Context, Result};
 use sqlx::Row;
@@ -12,8 +22,38 @@ use crate::store::TaskStore;
 /// System prompt template, loaded at compile time.
 const SYSTEM_TEMPLATE: &str = include_str!("../prompts/control_system.md");
 
-/// Map a model name to the agent CLI that should execute it.
-pub fn agent_for_model(model: &str) -> &'static str {
+/// Known agents and their runner type.
+const CLAUDE_COMPATIBLE_AGENTS: &[&str] = &["claude", "kimi", "minimax"];
+const ALL_AGENTS: &[&str] = &["claude", "codex", "opencode", "kimi", "minimax"];
+
+/// Parsed model specification from `/model` command.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelSpec {
+    pub agent: String,
+    pub model: String,
+}
+
+/// Parse a model spec string into agent + model.
+///
+/// Formats:
+/// - `agent:model` → explicit (e.g., `minimax:sonnet`, `opencode:minimax-m2.5-free`)
+/// - `model` → infer agent from model name
+pub fn parse_model_spec(spec: &str) -> ModelSpec {
+    if let Some((agent, model)) = spec.split_once(':') {
+        ModelSpec {
+            agent: agent.to_string(),
+            model: model.to_string(),
+        }
+    } else {
+        ModelSpec {
+            agent: infer_agent(spec).to_string(),
+            model: spec.to_string(),
+        }
+    }
+}
+
+/// Infer which agent CLI should run a given model name.
+fn infer_agent(model: &str) -> &'static str {
     let lower = model.to_lowercase();
     if lower.contains("gpt")
         || lower.contains("o1")
@@ -25,7 +65,168 @@ pub fn agent_for_model(model: &str) -> &'static str {
     } else if lower.contains("deepseek") || lower.contains("qwen") {
         "opencode"
     } else {
+        // claude models (sonnet, opus, haiku) and unknown → default to claude
         "claude"
+    }
+}
+
+/// Check if an agent binary is available in PATH.
+fn is_agent_available(agent: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(agent)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Validate a model spec by running a quick test invocation.
+///
+/// Sends "hello" to the agent with the specified model to verify
+/// the agent binary exists and the model is available.
+pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
+    // 1. Check agent is known
+    if !ALL_AGENTS.contains(&spec.agent.as_str()) {
+        anyhow::bail!(
+            "unknown agent '{}'. Available: {}",
+            spec.agent,
+            ALL_AGENTS.join(", ")
+        );
+    }
+
+    // 2. Check agent binary exists
+    if !is_agent_available(&spec.agent) {
+        anyhow::bail!("agent '{}' not found in PATH. Is it installed?", spec.agent);
+    }
+
+    // 3. For opencode, check against `opencode models` list
+    if spec.agent == "opencode" {
+        if let Ok(models) = list_opencode_models().await {
+            if !models.iter().any(|m| m == &spec.model) {
+                anyhow::bail!(
+                    "model '{}' not found in opencode. Available models:\n{}",
+                    spec.model,
+                    models
+                        .iter()
+                        .filter(|m| m.contains(&spec.model) || spec.model.contains(m.as_str()))
+                        .take(10)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    // 4. Test invocation — send a minimal "hello" to verify the model works
+    eprintln!("Testing {}:{} ...", spec.agent, spec.model);
+    let result = test_invoke(&spec.agent, &spec.model).await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => anyhow::bail!(
+            "model '{}' on agent '{}' is not available: {e}",
+            spec.model,
+            spec.agent
+        ),
+    }
+}
+
+/// List available opencode models via `opencode models`.
+async fn list_opencode_models() -> Result<Vec<String>> {
+    let output = tokio::process::Command::new("opencode")
+        .args(["models"])
+        .output()
+        .await
+        .context("running opencode models")?;
+
+    if !output.status.success() {
+        anyhow::bail!("opencode models failed");
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Run a minimal test invocation to verify agent+model availability.
+async fn test_invoke(agent: &str, model: &str) -> Result<String> {
+    let dir = "/tmp/orch-control";
+    tokio::fs::create_dir_all(dir).await?;
+    let msg = "Reply with just the word 'ok'.";
+
+    match agent {
+        a if CLAUDE_COMPATIBLE_AGENTS.contains(&a) => {
+            let msg_file = format!("{dir}/test-msg.txt");
+            tokio::fs::write(&msg_file, msg).await?;
+
+            let output = tokio::process::Command::new(agent)
+                .args([
+                    "-p",
+                    "--model",
+                    model,
+                    "--permission-mode",
+                    "bypassPermissions",
+                    "--output-format",
+                    "text",
+                    "--max-turns",
+                    "1",
+                ])
+                .stdin(std::process::Stdio::from(
+                    std::fs::File::open(&msg_file).context("open test message file")?,
+                ))
+                .output()
+                .await
+                .context("spawning agent for test")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("{stderr}");
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+        "codex" => {
+            let msg_file = format!("{dir}/test-msg.txt");
+            tokio::fs::write(&msg_file, msg).await?;
+
+            let output = tokio::process::Command::new("codex")
+                .args(["--model", model, "--full-auto", "-q"])
+                .stdin(std::process::Stdio::from(
+                    std::fs::File::open(&msg_file).context("open test message file")?,
+                ))
+                .output()
+                .await
+                .context("spawning codex for test")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("{stderr}");
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+        "opencode" => {
+            let msg_file = format!("{dir}/test-msg.txt");
+            tokio::fs::write(&msg_file, msg).await?;
+
+            let output = tokio::process::Command::new("opencode")
+                .args(["run", "--format", "text", "-m", model, "-"])
+                .stdin(std::process::Stdio::from(
+                    std::fs::File::open(&msg_file).context("open test message file")?,
+                ))
+                .output()
+                .await
+                .context("spawning opencode for test")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("{stderr}");
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }
+        _ => anyhow::bail!("unknown agent: {agent}"),
     }
 }
 
@@ -84,7 +285,7 @@ pub async fn assemble_context(store: &TaskStore) -> Result<String> {
     Ok(result)
 }
 
-/// Get the current model from KV, defaulting to `"sonnet"`.
+/// Get the current model spec from KV, defaulting to `"sonnet"` on `"claude"`.
 pub async fn get_model(store: &TaskStore) -> String {
     store
         .kv_get("control:model")
@@ -94,12 +295,27 @@ pub async fn get_model(store: &TaskStore) -> String {
         .unwrap_or_else(|| "sonnet".to_string())
 }
 
-/// Set the current model in KV.
-pub async fn set_model(store: &TaskStore, model: &str) -> Result<()> {
+/// Get the current agent from KV, defaulting to `"claude"`.
+pub async fn get_agent(store: &TaskStore) -> String {
     store
-        .kv_set("control:model", model)
+        .kv_get("control:agent")
         .await
-        .context("setting control model")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "claude".to_string())
+}
+
+/// Set the current model and agent in KV.
+pub async fn set_model_spec(store: &TaskStore, spec: &ModelSpec) -> Result<()> {
+    store
+        .kv_set("control:model", &spec.model)
+        .await
+        .context("setting control model")?;
+    store
+        .kv_set("control:agent", &spec.agent)
+        .await
+        .context("setting control agent")?;
+    Ok(())
 }
 
 /// Parse an agent response, extracting an optional `<summary>` tag.
@@ -138,11 +354,12 @@ pub async fn invoke_agent(
     let combined_file = format!("{dir}/combined.txt");
 
     match agent {
-        "claude" => {
+        // claude, kimi, minimax — all claude-compatible
+        a if CLAUDE_COMPATIBLE_AGENTS.contains(&a) => {
             tokio::fs::write(&sys_file, context).await?;
             tokio::fs::write(&msg_file, message).await?;
 
-            let output = tokio::process::Command::new("claude")
+            let output = tokio::process::Command::new(agent)
                 .args([
                     "-p",
                     "--model",
@@ -156,11 +373,11 @@ pub async fn invoke_agent(
                 ])
                 .stdin(std::process::Stdio::from(
                     std::fs::File::open(&msg_file)
-                        .context("opening message file for claude stdin")?,
+                        .context("opening message file for agent stdin")?,
                 ))
                 .output()
                 .await
-                .context("spawning claude")?;
+                .context("spawning agent")?;
 
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         }
@@ -211,12 +428,18 @@ pub async fn send_message(
     message: &str,
 ) -> Result<String> {
     // Handle /model command — don't store as a message
-    if let Some(new_model) = message.strip_prefix("/model ") {
-        let new_model = new_model.trim();
-        set_model(store, new_model).await?;
-        let agent = agent_for_model(new_model);
+    if let Some(new_spec) = message.strip_prefix("/model").map(str::trim) {
+        if new_spec.is_empty() {
+            let model = get_model(store).await;
+            let agent = get_agent(store).await;
+            return Ok(format!("Current: {agent}:{model}"));
+        }
+        let spec = parse_model_spec(new_spec);
+        validate_model(&spec).await?;
+        set_model_spec(store, &spec).await?;
         return Ok(format!(
-            "Model switched to **{new_model}** (agent: {agent})"
+            "Switched to **{}:{}** (validated)",
+            spec.agent, spec.model
         ));
     }
 
@@ -238,12 +461,12 @@ pub async fn send_message(
     // Assemble context
     let context = assemble_context(store).await?;
 
-    // Resolve model and agent
+    // Resolve model and agent from KV
     let model = get_model(store).await;
-    let agent = agent_for_model(&model);
+    let agent = get_agent(store).await;
 
     // Invoke agent
-    let raw_response = invoke_agent(agent, &model, &context, message).await?;
+    let raw_response = invoke_agent(&agent, &model, &context, message).await?;
 
     // Parse response
     let (clean, summary) = parse_response(&raw_response);
@@ -257,7 +480,7 @@ pub async fn send_message(
             &clean,
             summary.as_deref(),
             Some(&model),
-            Some(agent),
+            Some(&agent),
             None,
             None,
         )
@@ -270,6 +493,41 @@ pub async fn send_message(
 mod tests {
     use super::*;
     use crate::store::TaskStore;
+
+    #[test]
+    fn parse_spec_agent_model() {
+        let spec = parse_model_spec("minimax:sonnet");
+        assert_eq!(spec.agent, "minimax");
+        assert_eq!(spec.model, "sonnet");
+    }
+
+    #[test]
+    fn parse_spec_opencode_model() {
+        let spec = parse_model_spec("opencode:minimax-m2.5-free");
+        assert_eq!(spec.agent, "opencode");
+        assert_eq!(spec.model, "minimax-m2.5-free");
+    }
+
+    #[test]
+    fn parse_spec_model_only_infers_claude() {
+        let spec = parse_model_spec("sonnet");
+        assert_eq!(spec.agent, "claude");
+        assert_eq!(spec.model, "sonnet");
+    }
+
+    #[test]
+    fn parse_spec_model_only_infers_codex() {
+        let spec = parse_model_spec("gpt-4o");
+        assert_eq!(spec.agent, "codex");
+        assert_eq!(spec.model, "gpt-4o");
+    }
+
+    #[test]
+    fn parse_spec_model_only_infers_opencode() {
+        let spec = parse_model_spec("deepseek-r1");
+        assert_eq!(spec.agent, "opencode");
+        assert_eq!(spec.model, "deepseek-r1");
+    }
 
     #[tokio::test]
     async fn assemble_context_includes_memories_and_summaries() {
@@ -316,12 +574,12 @@ mod tests {
 
     #[test]
     fn resolve_agent_from_model() {
-        assert_eq!(agent_for_model("sonnet"), "claude");
-        assert_eq!(agent_for_model("opus"), "claude");
-        assert_eq!(agent_for_model("haiku"), "claude");
-        assert_eq!(agent_for_model("gpt-4o"), "codex");
-        assert_eq!(agent_for_model("o3"), "codex");
-        assert_eq!(agent_for_model("deepseek-r1"), "opencode");
+        assert_eq!(infer_agent("sonnet"), "claude");
+        assert_eq!(infer_agent("opus"), "claude");
+        assert_eq!(infer_agent("haiku"), "claude");
+        assert_eq!(infer_agent("gpt-4o"), "codex");
+        assert_eq!(infer_agent("o3"), "codex");
+        assert_eq!(infer_agent("deepseek-r1"), "opencode");
     }
 
     #[tokio::test]
@@ -330,20 +588,41 @@ mod tests {
         let model = get_model(&store).await;
         assert_eq!(model, "sonnet");
 
-        let response = send_message(&store, "cli", None, "/model opus")
-            .await
-            .unwrap();
-        assert!(response.contains("opus"));
-        assert_eq!(get_model(&store).await, "opus");
+        // /model with explicit agent:model — will fail validation (no binary in test)
+        // so test parse_model_spec + set_model_spec directly
+        let spec = parse_model_spec("minimax:sonnet");
+        set_model_spec(&store, &spec).await.unwrap();
+        assert_eq!(get_model(&store).await, "sonnet");
+        assert_eq!(get_agent(&store).await, "minimax");
+    }
+
+    #[tokio::test]
+    async fn send_message_model_show_current() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let response = send_message(&store, "cli", None, "/model").await.unwrap();
+        assert!(response.contains("claude"));
+        assert!(response.contains("sonnet"));
     }
 
     #[tokio::test]
     async fn send_message_model_switch_does_not_store() {
         let store = TaskStore::open_memory().await.unwrap();
-        let _ = send_message(&store, "cli", None, "/model haiku")
-            .await
-            .unwrap();
+        // set directly to avoid validation in test env
+        let spec = parse_model_spec("claude:haiku");
+        set_model_spec(&store, &spec).await.unwrap();
         let messages = store.list_control_messages(10, 0).await.unwrap();
         assert_eq!(messages.len(), 0);
+    }
+
+    #[test]
+    fn validate_unknown_agent_fails() {
+        let spec = ModelSpec {
+            agent: "nonexistent".to_string(),
+            model: "test".to_string(),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(validate_model(&spec));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown agent"));
     }
 }

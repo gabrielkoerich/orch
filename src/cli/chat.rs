@@ -7,10 +7,10 @@ use std::io::{self, BufRead, Write};
 pub async fn interactive() -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
     let model = control::get_model(&store).await;
-    let agent = control::agent_for_model(&model);
+    let agent = control::get_agent(&store).await;
 
-    println!("orch control session ({agent}/{model})");
-    println!("Type /model <name> to switch models, Ctrl+C to exit");
+    println!("orch control session ({agent}:{model})");
+    println!("Type /model [agent:]<model> to switch, Ctrl+C to exit");
     println!("---");
 
     let stdin = io::stdin();
