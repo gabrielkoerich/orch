@@ -123,11 +123,15 @@ pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
 
 /// List available opencode models via `opencode models`.
 async fn list_opencode_models() -> Result<Vec<String>> {
-    let output = tokio::process::Command::new("opencode")
-        .args(["models"])
-        .output()
-        .await
-        .context("running opencode models")?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("opencode")
+            .args(["models"])
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("opencode models timed out after 10s"))?
+    .context("running opencode models")?;
 
     if !output.status.success() {
         anyhow::bail!("opencode models failed");
