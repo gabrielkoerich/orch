@@ -15,6 +15,7 @@ You can run commands to manage tasks, check status, and take actions. Use bash f
 - `orch cost` — show cost tracking and token usage
 - `orch stream <task_id>` — stream live output from a running task
 - `orch dashboard` — combined dashboard: tasks, sessions, recent activity
+- `orch job list` — list scheduled jobs
 - `orch service status` — check service status
 - `orch service restart` — restart the service
 - `gh pr list` — list open pull requests

@@ -148,8 +148,16 @@ async fn test_invoke(agent: &str, model: &str) -> Result<()> {
     Ok(())
 }
 
-/// Assemble the full system-prompt context from SQLite state and live system info.
-pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<String> {
+/// Assembled context for a chat invocation.
+pub struct ChatContext {
+    /// System prompt (instructions, role, commands)
+    pub system: String,
+    /// User-visible context prepended to the message (live state, memories)
+    pub state: String,
+}
+
+/// Assemble the chat context from SQLite state and live system info.
+pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<ChatContext> {
     // 1. Gather memories from KV (keys matching control:memory:{session}:*)
     let memory_prefix = format!("control:memory:{session_id}:%");
     let memory_rows = sqlx::query("SELECT key, value FROM kv WHERE key LIKE ?")
@@ -211,18 +219,30 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Str
         _ => "(could not fetch live state)".to_string(),
     };
 
+    // 5. Scheduled jobs via `orch job list` (best-effort)
+    let job_list = match tokio::process::Command::new("orch")
+        .args(["job", "list"])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => "(no jobs configured)".to_string(),
+    };
+
     let version = env!("ORCH_VERSION");
-    let current_state = format!(
-        "### Version\norch {version}\n\n### Service\n{service_status}\n\n### Tasks\n{task_list}"
+    let state = format!(
+        "## Current Live State\n### Version\norch {version}\n\n### Service\n{service_status}\n\n### Tasks\n{task_list}\n\n### Scheduled Jobs\n{job_list}\n\n### Memories\n{memories}\n\n### Recent Conversation\n{recent_summaries}"
     );
 
-    // 5. Replace placeholders in template
-    let result = SYSTEM_TEMPLATE
-        .replace("{current_state}", &current_state)
-        .replace("{memories}", &memories)
-        .replace("{recent_summaries}", &recent_summaries);
+    // 6. Build system prompt (instructions only, no live state)
+    let system = SYSTEM_TEMPLATE
+        .replace("{current_state}", "")
+        .replace("{memories}", "")
+        .replace("{recent_summaries}", "");
 
-    Ok(result)
+    Ok(ChatContext { system, state })
 }
 
 /// Get the current model spec from KV, defaulting to `"sonnet"` on `"claude"`.
@@ -366,12 +386,13 @@ pub async fn invoke_agent(
         &permissions,
     );
 
-    // Execute via shell (the command string contains pipes, redirects, etc.)
+    // Execute in temp dir to avoid picking up project CLAUDE.md files
     let output = tokio::time::timeout(
-        AGENT_TIMEOUT + std::time::Duration::from_secs(5), // extra buffer for timeout cmd
+        AGENT_TIMEOUT + std::time::Duration::from_secs(5),
         tokio::process::Command::new("bash")
             .arg("-c")
             .arg(&shell_cmd)
+            .current_dir(&dir)
             .output(),
     )
     .await
@@ -464,14 +485,17 @@ pub async fn send_message(
         .await?;
 
     // Assemble context
-    let context = assemble_context(store, session_id).await?;
+    let ctx = assemble_context(store, session_id).await?;
 
     // Resolve model and agent from KV
     let model = get_model(store).await;
     let agent = get_agent(store).await;
 
-    // Invoke agent
-    let result = invoke_agent(&agent, &model, &context, message).await?;
+    // Prepend live state to user message so the LLM sees it directly
+    let full_message = format!("{}\n\n---\n\n{}", ctx.state, message);
+
+    // Invoke agent with instructions as system prompt, live state in message
+    let result = invoke_agent(&agent, &model, &ctx.system, &full_message).await?;
 
     // Parse response for summary tag
     let (clean, summary) = parse_response(&result.text);
@@ -544,7 +568,7 @@ mod tests {
     async fn assemble_context_includes_memories_and_summaries() {
         let store = TaskStore::open_memory().await.unwrap();
         store
-            .kv_set("control:memory:default:tz", "User is in BRT timezone")
+            .kv_set("control:memory:default:tz", "User timezone is UTC-3")
             .await
             .unwrap();
         store
@@ -564,8 +588,14 @@ mod tests {
             .unwrap();
 
         let ctx = assemble_context(&store, "default").await.unwrap();
-        assert!(ctx.contains("BRT timezone"), "should include memories");
-        assert!(ctx.contains("checked status"), "should include summaries");
+        assert!(
+            ctx.state.contains("UTC-3"),
+            "should include memories"
+        );
+        assert!(
+            ctx.state.contains("checked status"),
+            "should include summaries"
+        );
     }
 
     #[test]
