@@ -258,7 +258,8 @@ pub async fn tick(
                                 | TaskStatus::Routed
                                 | TaskStatus::InProgress
                                 | TaskStatus::NeedsReview
-                                | TaskStatus::InReview => true,
+                                | TaskStatus::InReview
+                                | TaskStatus::Blocked => true,
                                 _ => false, // Terminal state
                             },
                             Err(e) => {
