@@ -1600,7 +1600,46 @@ async fn handle_channel_message(
             let channel = msg.channel.clone();
             let thread_id = msg.thread_id.clone();
 
-            // Resolve target project: resolved_repo → specific project, else first
+            // Show interactive picker when in General with multiple projects configured
+            if is_general && resolved_repo.is_none() && engine_refs.len() > 1 {
+                let buttons: Vec<(String, String)> = engine_refs
+                    .iter()
+                    .map(|(repo, _, _, _)| {
+                        // Use the short repo name (after the slash) as button label
+                        let label = repo
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(repo.as_str())
+                            .to_string();
+                        (label, format!("pick:{repo}"))
+                    })
+                    .collect();
+
+                send_channel_keyboard(
+                    channels,
+                    &channel,
+                    &thread_id,
+                    msg_topic_id.as_deref(),
+                    "Which project should I create this task in?",
+                    &buttons,
+                )
+                .await;
+
+                // Store the pending pick
+                let pick_key = format!("{channel}:{thread_id}");
+                let pick = PendingPick {
+                    original_body: msg.body.clone(),
+                    msg_topic_id: msg_topic_id.clone(),
+                    created_at: std::time::Instant::now(),
+                };
+                {
+                    let mut map = pending_picks.lock().unwrap_or_else(|e| e.into_inner());
+                    map.insert(pick_key, pick);
+                }
+                return; // Wait for the user's button tap
+            }
+
+            // Single project or already resolved → create immediately
             let target_engine_ref = if let Some(repo) = resolved_repo {
                 engine_refs.iter().find(|(r, _, _, _)| r == repo)
             } else {
