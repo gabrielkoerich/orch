@@ -313,3 +313,33 @@ control:
 5. **`/model` command** — update model in `control_state`, reflect in next invocation
 6. **History commands** — `orch chat history --search/--since`
 7. **Channel routing** — wire Telegram/Discord unmatched messages to control session
+
+## Future: Runner `run_direct()` Method
+
+The agent runner (`src/engine/runner/`) is currently coupled to tmux — `spawn_in_tmux()` writes a bash script, launches it as a tmux session, and reads output from files. The control session works around this by reusing the agent-specific parts (`get_runner`, `build_command`, `parse_response`, `classify_error`) while handling execution directly.
+
+A cleaner approach would be adding a `run_direct()` method to the runner that executes an agent without tmux:
+
+```rust
+/// Run an agent one-shot without tmux. Returns stdout + parsed response.
+pub async fn run_direct(
+    agent: &str,
+    model: &str,
+    system_prompt: &str,
+    message: &str,
+    timeout: Duration,
+) -> Result<DirectResult> { ... }
+```
+
+This would:
+- Write temp prompt files
+- Build the command via `get_runner(agent).build_command()`
+- Execute via `bash -c` with timeout
+- Parse response via `get_runner(agent).parse_response()`
+- Classify errors via `get_runner(agent).classify_error()`
+- Return text + tokens + error classification
+
+Benefits:
+- Shared by control session, router (LLM classification), and any future non-tmux invocations
+- Single place to maintain agent invocation logic
+- The router's `router_command()` could also use this instead of its own `Command` building
