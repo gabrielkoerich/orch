@@ -371,30 +371,36 @@ pub async fn invoke_agent(
         anyhow::bail!("{err}");
     }
 
-    // Try the runner's response parser for structured output + tokens.
-    // If it succeeds, use the parsed tokens. If it fails (expected for
-    // conversational text), extract tokens from the envelope directly.
-    if let Ok(parsed) = runner.parse_response(&stdout) {
-        let text = if !parsed.response.summary.is_empty() {
-            parsed.response.summary.clone()
-        } else {
-            stdout.clone()
-        };
-        return Ok(InvokeResult {
-            text,
-            input_tokens: parsed.input_tokens,
-            output_tokens: parsed.output_tokens,
-        });
+    // Use runner's response parser — handles structured output + tokens + errors.
+    use crate::engine::runner::agents::AgentError;
+    match runner.parse_response(&stdout) {
+        Ok(parsed) => {
+            let text = if !parsed.response.summary.is_empty() {
+                parsed.response.summary.clone()
+            } else {
+                stdout.clone()
+            };
+            Ok(InvokeResult {
+                text,
+                input_tokens: parsed.input_tokens,
+                output_tokens: parsed.output_tokens,
+            })
+        }
+        Err(AgentError::InvalidResponse { .. }) => {
+            // Parser couldn't parse as structured AgentResponse — normal for
+            // conversational text. Extract text + tokens from the envelope directly.
+            let (text, input_tokens, output_tokens) = extract_from_envelope(&stdout);
+            Ok(InvokeResult {
+                text,
+                input_tokens,
+                output_tokens,
+            })
+        }
+        Err(err) => {
+            // Real agent error (rate limit, auth, model unavailable, etc.)
+            anyhow::bail!("{err}")
+        }
     }
-
-    // Parser failed (normal for conversational text). Extract what we can
-    // from the JSON envelope (Claude) or return raw text (codex/opencode).
-    let (text, input_tokens, output_tokens) = extract_from_envelope(&stdout);
-    Ok(InvokeResult {
-        text,
-        input_tokens,
-        output_tokens,
-    })
 }
 
 /// High-level entry point: process a user message and return the assistant response.
