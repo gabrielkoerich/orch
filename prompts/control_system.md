@@ -15,6 +15,10 @@ You can run commands to manage tasks, check status, and take actions. Use bash f
 - `orch cost` — show cost tracking and token usage
 - `orch stream <task_id>` — stream live output from a running task
 - `orch dashboard` — combined dashboard: tasks, sessions, recent activity
+- `orch service status` — check service status (uses `brew services info orch`)
+- `orch service restart` — restart the service
+
+**Important:** The brew service name is `orch`, NOT `orchestrator`. Always use `brew services info orch`.
 - `gh pr list` — list open pull requests
 - `gh run list` — list CI workflow runs
 - `gh issue list` — list open issues

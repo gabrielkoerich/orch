@@ -187,8 +187,20 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Str
             .join("\n")
     };
 
-    // 3. Live state via `orch task list` (best-effort)
-    let current_state = match tokio::process::Command::new("orch")
+    // 3. Service status via `brew services info orch` (best-effort)
+    let service_status = match tokio::process::Command::new("brew")
+        .args(["services", "info", "orch"])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => "(could not check service status)".to_string(),
+    };
+
+    // 4. Live state via `orch task list` (best-effort)
+    let task_list = match tokio::process::Command::new("orch")
         .args(["task", "list"])
         .output()
         .await
@@ -199,7 +211,9 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Str
         _ => "(could not fetch live state)".to_string(),
     };
 
-    // 4. Replace placeholders in template
+    let current_state = format!("### Service\n{service_status}\n\n### Tasks\n{task_list}");
+
+    // 5. Replace placeholders in template
     let result = SYSTEM_TEMPLATE
         .replace("{current_state}", &current_state)
         .replace("{memories}", &memories)
