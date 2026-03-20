@@ -14,6 +14,7 @@ use crate::channels::{ChannelRegistry, IncomingMessage, OutgoingMessage};
 use crate::engine::commands::{execute_command, parse_command};
 use crate::engine::tasks::{CreateTaskRequest, Task, TaskType};
 use crate::github::http::GhHttp;
+use crate::store::TaskStatus;
 use crate::tmux::TmuxManager;
 
 use super::EngineRef;
@@ -427,6 +428,19 @@ pub(super) async fn handle_status_command(
             }
             Err(e) => {
                 tracing::warn!(repo, err = %e, "failed to list in-progress tasks");
+            }
+        }
+        match task_manager
+            .list_internal_by_status(TaskStatus::InProgress)
+            .await
+        {
+            Ok(tasks) => {
+                for t in &tasks {
+                    lines.push(format!("- #{} [{}]: {}", t.id.0, repo, t.title));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(repo, err = %e, "failed to list in-progress internal tasks");
             }
         }
     }
