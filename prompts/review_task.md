@@ -28,7 +28,7 @@ Commit your fixes and re-run checks. If you cannot fix a failure, decision = `re
 
 ### Step 3: Check architecture alignment
 
-Before reviewing the diff, read any project spec or plan (`PLAN.md`, `SPEC.md`, `ARCHITECTURE.md`, `docs/`) and `AGENTS.md`/`CLAUDE.md` if present.
+Before reviewing the diff, read any project spec, architecture or plan on `docs/` and `AGENTS.md`/`CLAUDE.md` if present.
 
 Flag `request_changes` if the PR:
 - Conflicts with settled decisions documented in `AGENTS.md`/`CLAUDE.md`
