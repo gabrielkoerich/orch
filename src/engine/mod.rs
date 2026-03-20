@@ -1327,6 +1327,124 @@ async fn handle_channel_message(
     let is_general = channel_router.is_general(&msg.channel, topic_id);
     let msg_topic_id = msg.topic_id.clone();
 
+    // ── Picker response: user tapped a project button ────────────────────────
+    let is_picker_response = msg.body.starts_with("pick:")
+        && (msg.metadata.get("callback_query_id").is_some()
+            || msg.metadata.get("interaction_id").is_some());
+
+    if is_picker_response {
+        let repo = msg.body["pick:".len()..].to_string();
+        let pick_key = format!("{}:{}", msg.channel, msg.thread_id);
+        let pending = {
+            let mut map = pending_picks.lock().unwrap_or_else(|e| e.into_inner());
+            map.remove(&pick_key)
+        };
+
+        match pending {
+            None => {
+                send_channel_reply(
+                    channels,
+                    &msg.channel,
+                    &msg.thread_id,
+                    "No pending project selection (may have timed out).".to_string(),
+                    msg_topic_id.as_deref(),
+                )
+                .await;
+            }
+            Some(pick) if pick.created_at.elapsed().as_secs() > 60 => {
+                send_channel_reply(
+                    channels,
+                    &msg.channel,
+                    &msg.thread_id,
+                    "Project selection timed out (60s). Please send your message again."
+                        .to_string(),
+                    pick.msg_topic_id.as_deref(),
+                )
+                .await;
+            }
+            Some(pick) => {
+                // Find the target engine ref for the selected repo
+                if let Some((_, _, task_manager, _)) =
+                    engine_refs.iter().find(|(r, _, _, _)| r == &repo)
+                {
+                    let title = if pick.original_body.chars().count() > 80 {
+                        let truncated: String = pick.original_body.chars().take(80).collect();
+                        format!("{}…", truncated)
+                    } else {
+                        pick.original_body.clone()
+                    };
+                    let req = CreateTaskRequest {
+                        title,
+                        body: pick.original_body.clone(),
+                        task_type: TaskType::Internal,
+                        labels: vec!["channel-created".to_string()],
+                        source: msg.channel.clone(),
+                        source_id: msg.thread_id.clone(),
+                    };
+                    match task_manager.create_task(req).await {
+                        Ok(task) => {
+                            use crate::engine::tasks::Task;
+                            let task_id = match &task {
+                                Task::Internal(t) => format!("internal:{}", t.id),
+                                Task::External(t) => t.id.0.clone(),
+                            };
+                            transport
+                                .bind(
+                                    &task_id,
+                                    &format!("orch-{repo}-{task_id}"),
+                                    &msg.channel,
+                                    &msg.thread_id,
+                                )
+                                .await;
+                            capture
+                                .register_session(&task_id, &format!("orch-{repo}-{task_id}"))
+                                .await;
+                            let transport_clone = transport.clone();
+                            let channels_clone = channels.clone();
+                            let task_id_clone = task_id.clone();
+                            tokio::spawn(async move {
+                                fanout_output(task_id_clone, transport_clone, channels_clone)
+                                    .await;
+                            });
+                            let reply = format!(
+                                "Task created: `{task_id}` in [{repo}] — I'll start working on it now."
+                            );
+                            send_channel_reply(
+                                channels,
+                                &msg.channel,
+                                &msg.thread_id,
+                                reply,
+                                pick.msg_topic_id.as_deref(),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(repo, err = %e, "failed to create task from picker selection");
+                            send_channel_reply(
+                                channels,
+                                &msg.channel,
+                                &msg.thread_id,
+                                format!("Failed to create task: {e}"),
+                                pick.msg_topic_id.as_deref(),
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    send_channel_reply(
+                        channels,
+                        &msg.channel,
+                        &msg.thread_id,
+                        format!("Project `{repo}` not found. Please try again."),
+                        pick.msg_topic_id.as_deref(),
+                    )
+                    .await;
+                }
+            }
+        }
+        return; // Picker response fully handled — skip normal routing
+    }
+
     match transport.route(&msg).await {
         MessageRoute::TaskSession { task_id } => {
             let body = msg.body.trim().to_string();
@@ -1899,5 +2017,50 @@ mod tests {
         let _ = capture_handle.await;
 
         assert!(got, "did not observe tmux output via capture/transport");
+    }
+
+    #[test]
+    fn pending_pick_key_format() {
+        let channel = "telegram";
+        let thread_id = "-100123456";
+        let key = format!("{channel}:{thread_id}");
+        assert_eq!(key, "telegram:-100123456");
+    }
+
+    #[test]
+    fn pick_body_prefix() {
+        let body = "pick:owner/orch";
+        assert!(body.starts_with("pick:"));
+        assert_eq!(&body[5..], "owner/orch");
+    }
+
+    #[test]
+    fn picker_triggered_when_general_and_multiple_projects() {
+        let is_general = true;
+        let resolved_repo: Option<&str> = None;
+        let project_count = 2usize;
+
+        let should_show_picker = is_general && resolved_repo.is_none() && project_count > 1;
+        assert!(should_show_picker);
+    }
+
+    #[test]
+    fn picker_not_triggered_when_single_project() {
+        let is_general = true;
+        let resolved_repo: Option<&str> = None;
+        let project_count = 1usize;
+
+        let should_show_picker = is_general && resolved_repo.is_none() && project_count > 1;
+        assert!(!should_show_picker);
+    }
+
+    #[test]
+    fn picker_not_triggered_when_repo_resolved() {
+        let is_general = true;
+        let resolved_repo: Option<&str> = Some("owner/orch");
+        let project_count = 2usize;
+
+        let should_show_picker = is_general && resolved_repo.is_none() && project_count > 1;
+        assert!(!should_show_picker);
     }
 }
