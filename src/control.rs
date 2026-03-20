@@ -100,7 +100,7 @@ pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
         anyhow::bail!("agent '{}' not found in PATH. Is it installed?", spec.agent);
     }
 
-    // 3. For opencode, check against `opencode models` list
+    // 3. For opencode, pre-check against `opencode models` list (fast rejection)
     if spec.agent == "opencode" {
         if let Ok(models) = list_opencode_models().await {
             if !models.iter().any(|m| m == &spec.model) {
@@ -116,11 +116,10 @@ pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
                         .join("\n")
                 );
             }
-            return Ok(());
         }
     }
 
-    // 4. Test invocation — send a minimal "hello" to verify the model works
+    // 4. Test invocation — always run to verify the model actually works
     eprintln!("Testing {}:{} ...", spec.agent, spec.model);
     let result = test_invoke(&spec.agent, &spec.model).await;
     match result {
