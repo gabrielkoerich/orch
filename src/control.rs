@@ -19,6 +19,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use sqlx::Row;
+use tokio::time::{timeout, Duration};
+
+const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::engine::router::config::DEFAULT_AGENTS;
 use crate::store::TaskStore;
@@ -209,37 +212,46 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Cha
             .join("\n")
     };
 
-    // 3. Service status via `brew services info orch` (best-effort)
-    let service_status = match tokio::process::Command::new("brew")
-        .args(["services", "info", "orch"])
-        .output()
-        .await
+    // 3. Service status via `brew services info orch` (best-effort, 10s timeout)
+    let service_status = match timeout(
+        SUBPROCESS_TIMEOUT,
+        tokio::process::Command::new("brew")
+            .args(["services", "info", "orch"])
+            .output(),
+    )
+    .await
     {
-        Ok(output) if output.status.success() => {
+        Ok(Ok(output)) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         }
         _ => "(could not check service status)".to_string(),
     };
 
-    // 4. Live state via `orch task list` (best-effort)
-    let task_list = match tokio::process::Command::new("orch")
-        .args(["task", "list"])
-        .output()
-        .await
+    // 4. Live state via `orch task list` (best-effort, 10s timeout)
+    let task_list = match timeout(
+        SUBPROCESS_TIMEOUT,
+        tokio::process::Command::new("orch")
+            .args(["task", "list"])
+            .output(),
+    )
+    .await
     {
-        Ok(output) if output.status.success() => {
+        Ok(Ok(output)) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         }
         _ => "(could not fetch live state)".to_string(),
     };
 
-    // 5. Scheduled jobs via `orch job list` (best-effort)
-    let job_list = match tokio::process::Command::new("orch")
-        .args(["job", "list"])
-        .output()
-        .await
+    // 5. Scheduled jobs via `orch job list` (best-effort, 10s timeout)
+    let job_list = match timeout(
+        SUBPROCESS_TIMEOUT,
+        tokio::process::Command::new("orch")
+            .args(["job", "list"])
+            .output(),
+    )
+    .await
     {
-        Ok(output) if output.status.success() => {
+        Ok(Ok(output)) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         }
         _ => "(no jobs configured)".to_string(),
