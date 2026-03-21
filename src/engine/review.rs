@@ -23,10 +23,33 @@ use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::engine::runner;
 use crate::github::http::GhHttp;
-use crate::github::types::{GitHubReviewComment, PullRequestReview};
+use crate::github::types::{GitHubReview, GitHubReviewComment, PullRequestReview};
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Returns `true` if any reviewer's **latest** review is `CHANGES_REQUESTED`.
+///
+/// GitHub returns reviews in chronological order. When the same reviewer
+/// submits multiple reviews (e.g. CHANGES_REQUESTED then APPROVED), only
+/// the most-recent one per reviewer counts. COMMENTED and DISMISSED reviews
+/// are ignored — they carry no approval/rejection signal.
+fn any_changes_requested_in_reviews(reviews: &[GitHubReview]) -> bool {
+    let mut by_reviewer: std::collections::HashMap<&str, &GitHubReview> =
+        std::collections::HashMap::new();
+    for review in reviews {
+        if review.state != "APPROVED" && review.state != "CHANGES_REQUESTED" {
+            continue;
+        }
+        let dominated = by_reviewer
+            .get(review.user.login.as_str())
+            .is_none_or(|prev| review.submitted_at > prev.submitted_at);
+        if dominated {
+            by_reviewer.insert(&review.user.login, review);
+        }
+    }
+    by_reviewer.values().any(|r| r.state == "CHANGES_REQUESTED")
+}
 
 use super::cleanup::{
     cleanup_task_worktree, store_increment, store_reset_counters, store_reset_failure_counters,
@@ -1494,6 +1517,19 @@ pub(crate) async fn auto_merge_pr(
         tokio::time::sleep(poll_interval).await;
     }
 
+    // 5. Re-verify no reviewer has requested changes since the CI wait started.
+    // This prevents a TOCTOU race where a human posts CHANGES_REQUESTED during
+    // the CI poll window and the merge proceeds anyway once CI passes.
+    let post_ci_reviews = gh.get_pr_reviews(repo, pr_number).await?;
+    if any_changes_requested_in_reviews(&post_ci_reviews) {
+        tracing::warn!(
+            task_id = task.id.0,
+            pr_number,
+            "a reviewer requested changes during CI wait — aborting merge"
+        );
+        anyhow::bail!("a reviewer requested changes during CI wait — aborting merge");
+    }
+
     tracing::info!(
         task_id = task.id.0,
         pr_number,
@@ -1501,7 +1537,7 @@ pub(crate) async fn auto_merge_pr(
         "merging PR"
     );
 
-    // 5. Merge via gh CLI
+    // 6. Merge via gh CLI
     if let Err(e) = gh.merge_pr(repo, pr_number, true).await {
         let err_msg = e.to_string().to_lowercase();
         let is_conflict = err_msg.contains("405")
@@ -2193,6 +2229,76 @@ mod tests {
         assert_eq!(
             updated.review_cycles, 1,
             "review_cycles must be incremented on each review change request"
+        );
+    }
+
+    fn make_review(login: &str, state: &str, submitted_at: &str) -> GitHubReview {
+        GitHubReview {
+            id: 1,
+            user: crate::github::types::GitHubUser {
+                login: login.to_string(),
+            },
+            body: None,
+            state: state.to_string(),
+            html_url: None,
+            submitted_at: submitted_at.to_string(),
+            commit_id: None,
+        }
+    }
+
+    #[test]
+    fn test_any_changes_requested_returns_true_when_latest_is_changes_requested() {
+        // alice first approved then requested changes — CHANGES_REQUESTED is latest
+        let reviews = vec![
+            make_review("alice", "APPROVED", "2026-01-01T10:00:00Z"),
+            make_review("alice", "CHANGES_REQUESTED", "2026-01-01T11:00:00Z"),
+        ];
+        assert!(
+            any_changes_requested_in_reviews(&reviews),
+            "should return true when reviewer's latest review is CHANGES_REQUESTED"
+        );
+    }
+
+    #[test]
+    fn test_any_changes_requested_returns_false_when_latest_is_approved() {
+        // alice first requested changes then approved — APPROVED is latest
+        let reviews = vec![
+            make_review("alice", "CHANGES_REQUESTED", "2026-01-01T10:00:00Z"),
+            make_review("alice", "APPROVED", "2026-01-01T11:00:00Z"),
+        ];
+        assert!(
+            !any_changes_requested_in_reviews(&reviews),
+            "should return false when reviewer's latest review is APPROVED"
+        );
+    }
+
+    #[test]
+    fn test_any_changes_requested_returns_false_for_empty_reviews() {
+        assert!(
+            !any_changes_requested_in_reviews(&[]),
+            "should return false for empty review list"
+        );
+    }
+
+    #[test]
+    fn test_any_changes_requested_ignores_commented_state() {
+        // COMMENTED reviews are not approval/rejection signals
+        let reviews = vec![make_review("alice", "COMMENTED", "2026-01-01T10:00:00Z")];
+        assert!(
+            !any_changes_requested_in_reviews(&reviews),
+            "COMMENTED state should be ignored"
+        );
+    }
+
+    #[test]
+    fn test_any_changes_requested_one_reviewer_blocks_even_if_other_approved() {
+        let reviews = vec![
+            make_review("alice", "APPROVED", "2026-01-01T10:00:00Z"),
+            make_review("bob", "CHANGES_REQUESTED", "2026-01-01T10:00:00Z"),
+        ];
+        assert!(
+            any_changes_requested_in_reviews(&reviews),
+            "should return true if any reviewer has outstanding CHANGES_REQUESTED"
         );
     }
 }
