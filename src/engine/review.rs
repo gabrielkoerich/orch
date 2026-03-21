@@ -602,7 +602,8 @@ pub(crate) async fn review_and_merge(
     // avoid GitHub's list-API cache race (~300 ms between PR creation and review).
     let stored_pr_number = super::cleanup::store_get_field(store, repo, &task.id.0, "pr_number")
         .await
-        .and_then(|s| s.parse::<u64>().ok());
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0);
     let gh_check = GhHttp::new()?;
     let pr_number_early = if let Some(n) = stored_pr_number {
         tracing::info!(
@@ -683,8 +684,13 @@ pub(crate) async fn review_and_merge(
                         Ok(url) => {
                             // Extract PR number from URL and update store so subsequent
                             // review cycles check the correct PR (not a stale pr_number).
-                            if let Some(pr_num) = url.rsplit('/').next().filter(|s| !s.is_empty()) {
-                                let pr_num_i64 = pr_num.parse::<i64>().unwrap_or(0);
+                            if let Some(pr_num_i64) = url
+                                .rsplit('/')
+                                .next()
+                                .filter(|s| !s.is_empty())
+                                .and_then(|s| s.parse::<i64>().ok())
+                                .filter(|&n| n > 0)
+                            {
                                 store_set(
                                     &Some(Arc::clone(store)),
                                     repo,
@@ -759,10 +765,14 @@ pub(crate) async fn review_and_merge(
                                 Ok(o) if o.status.success() => {
                                     // gh pr create prints the PR URL to stdout
                                     let stdout = String::from_utf8_lossy(&o.stdout);
-                                    if let Some(pr_num) =
-                                        stdout.trim().rsplit('/').next().filter(|s| !s.is_empty())
+                                    if let Some(pr_num_i64) = stdout
+                                        .trim()
+                                        .rsplit('/')
+                                        .next()
+                                        .filter(|s| !s.is_empty())
+                                        .and_then(|s| s.parse::<i64>().ok())
+                                        .filter(|&n| n > 0)
                                     {
-                                        let pr_num_i64 = pr_num.parse::<i64>().unwrap_or(0);
                                         store_set(
                                             &Some(Arc::clone(store)),
                                             repo,
