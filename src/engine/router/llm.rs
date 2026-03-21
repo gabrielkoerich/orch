@@ -12,7 +12,6 @@
 //! - Loading and caching the skills catalog from disk
 
 use crate::backends::ExternalTask;
-use crate::cmd::CommandErrorContext;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -306,63 +305,48 @@ impl LlmRouter {
 
     /// Call the router LLM to classify the task.
     async fn call_router_llm(&self, prompt: &str, config: &RouterConfig) -> anyhow::Result<String> {
+        use crate::engine::runner::direct::{run_direct_command_raw, DirectCommandError};
+
         // Skip immediately if router agent is on cooldown
         if crate::engine::runner::response::is_agent_in_cooldown(&config.router_agent) {
             anyhow::bail!("router LLM agent '{}' is on cooldown", config.router_agent);
         }
 
-        let timeout_secs = config.timeout_seconds;
-        let timeout_duration = Duration::from_secs(timeout_secs);
-
+        let timeout = Duration::from_secs(config.timeout_seconds);
         let model = if config.router_model.is_empty() {
             None
         } else {
             Some(config.router_model.as_str())
         };
+
         let mut cmd = crate::engine::runner::agents::get_runner(&config.router_agent)
             .router_command(prompt, model)?;
-        let output = tokio::time::timeout(timeout_duration, cmd.output_with_context()).await;
 
-        match output {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                tracing::debug!(
-                    exit_code = output.status.code().unwrap_or(-1),
-                    stdout_len = stdout.len(),
-                    stderr_len = stderr.len(),
-                    "router LLM command completed"
-                );
-                if !output.status.success() {
-                    // Detect rate limit from stdout (agent exits non-zero on API errors)
-                    use crate::engine::runner::agents::AgentError;
-                    let runner = crate::engine::runner::agents::get_runner(&config.router_agent);
-                    if let Err(AgentError::RateLimit { .. }) = runner.parse_response(&stdout) {
-                        tracing::warn!(
-                            agent = %config.router_agent,
-                            "router LLM rate limited — adding to cooldown"
-                        );
-                        crate::engine::runner::response::record_agent_failure(&config.router_agent);
-                        anyhow::bail!("router LLM rate limited: {}", config.router_agent);
-                    }
+        match run_direct_command_raw(&mut cmd, timeout).await {
+            Ok(stdout) => Ok(stdout),
+            Err(DirectCommandError::NonZeroExit { stdout, stderr, .. }) => {
+                // Detect rate limit from stdout (agent exits non-zero on API errors)
+                use crate::engine::runner::agents::AgentError;
+                let runner = crate::engine::runner::agents::get_runner(&config.router_agent);
+                if let Err(AgentError::RateLimit { .. }) = runner.parse_response(&stdout) {
                     tracing::warn!(
-                        stderr = %stderr,
-                        stdout = %stdout,
-                        "router LLM command failed"
+                        agent = %config.router_agent,
+                        "router LLM rate limited — adding to cooldown"
                     );
-                    anyhow::bail!("router LLM failed: {stderr}");
+                    crate::engine::runner::response::record_agent_failure(&config.router_agent);
+                    anyhow::bail!("router LLM rate limited: {}", config.router_agent);
                 }
-                if stdout.is_empty() {
-                    tracing::warn!(
-                        stderr = %stderr,
-                        "router LLM returned empty stdout"
-                    );
-                    anyhow::bail!("router LLM returned empty response");
-                }
-                Ok(stdout)
+                tracing::warn!(stderr = %stderr, stdout = %stdout, "router LLM command failed");
+                anyhow::bail!("router LLM failed: {stderr}");
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => anyhow::bail!("router LLM timed out after {timeout_secs}s"),
+            Err(DirectCommandError::Timeout { secs }) => {
+                anyhow::bail!("router LLM timed out after {secs}s");
+            }
+            Err(DirectCommandError::EmptyResponse { stderr }) => {
+                tracing::warn!(stderr = %stderr, "router LLM returned empty stdout");
+                anyhow::bail!("router LLM returned empty response");
+            }
+            Err(e) => Err(e.into()),
         }
     }
 
