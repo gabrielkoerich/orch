@@ -507,16 +507,18 @@ impl TaskStore {
 
         // Build SET clause dynamically
         let mut set_parts = Vec::new();
-        let mut values: Vec<String> = Vec::new();
+        let mut values: Vec<Option<String>> = Vec::new();
 
         for (col, val) in updates {
             set_parts.push(format!("{col} = ?"));
             match val {
-                serde_json::Value::String(s) => values.push(s.clone()),
-                serde_json::Value::Number(n) => values.push(n.to_string()),
-                serde_json::Value::Bool(b) => values.push(if *b { "1" } else { "0" }.to_string()),
-                serde_json::Value::Null => values.push(String::new()),
-                other => values.push(serde_json::to_string(other)?),
+                serde_json::Value::String(s) => values.push(Some(s.clone())),
+                serde_json::Value::Number(n) => values.push(Some(n.to_string())),
+                serde_json::Value::Bool(b) => {
+                    values.push(Some(if *b { "1" } else { "0" }.to_string()));
+                }
+                serde_json::Value::Null => values.push(None),
+                other => values.push(Some(serde_json::to_string(other)?)),
             }
         }
 
@@ -525,7 +527,7 @@ impl TaskStore {
 
         let mut query = sqlx::query(&sql);
         for v in &values {
-            query = query.bind(v);
+            query = query.bind(v.as_deref());
         }
         query = query.bind(id);
         query.execute(&self.pool).await?;
