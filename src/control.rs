@@ -437,6 +437,17 @@ pub async fn send_message(
         (Some(t), None) | (None, Some(t)) => Some(t as i64),
         _ => None,
     };
+    let cost_usd = match (result.input_tokens, result.output_tokens) {
+        (Some(input), Some(output)) => {
+            let pricing = crate::store::pricing_for_model(&model);
+            let usage = crate::store::TokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+            };
+            Some(pricing.estimate_cost_usd(usage).total_cost_usd)
+        }
+        _ => None,
+    };
     store
         .insert_control_message(
             session_id,
@@ -448,7 +459,7 @@ pub async fn send_message(
             Some(&model),
             Some(&agent),
             total_tokens,
-            None, // cost calculated separately if needed
+            cost_usd,
         )
         .await?;
 
@@ -605,5 +616,66 @@ mod tests {
         let result = rt.block_on(validate_model(&spec));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown agent"));
+    }
+
+    #[test]
+    fn cost_usd_computed_from_token_counts() {
+        use crate::store::{pricing_for_model, TokenUsage};
+
+        let model = "sonnet";
+        let input_tokens: u64 = 1_000_000;
+        let output_tokens: u64 = 1_000_000;
+        let pricing = pricing_for_model(model);
+        let usage = TokenUsage {
+            input_tokens,
+            output_tokens,
+        };
+        let cost = pricing.estimate_cost_usd(usage);
+
+        // sonnet: $3/M input, $15/M output → $18 total for 1M each
+        assert!(cost.total_cost_usd > 0.0, "cost must be non-zero");
+        assert!(
+            (cost.total_cost_usd - 18.0).abs() < 0.01,
+            "expected ~$18 for 1M+1M sonnet tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_control_message_stores_cost_usd() {
+        use crate::store::{pricing_for_model, TokenUsage};
+
+        let store = crate::store::TaskStore::open_memory().await.unwrap();
+
+        let input_tokens: u64 = 500_000;
+        let output_tokens: u64 = 100_000;
+        let pricing = pricing_for_model("sonnet");
+        let usage = TokenUsage {
+            input_tokens,
+            output_tokens,
+        };
+        let cost_usd = Some(pricing.estimate_cost_usd(usage).total_cost_usd);
+
+        store
+            .insert_control_message(
+                "default",
+                "assistant",
+                "cli",
+                None,
+                "hello",
+                Some("greeted"),
+                Some("sonnet"),
+                Some("claude"),
+                Some((input_tokens + output_tokens) as i64),
+                cost_usd,
+            )
+            .await
+            .unwrap();
+
+        let messages = store.list_control_messages("default", 10).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert!(msg.cost_usd.is_some(), "cost_usd must be stored, not NULL");
+        let stored = msg.cost_usd.unwrap();
+        assert!(stored > 0.0, "stored cost must be positive");
     }
 }
