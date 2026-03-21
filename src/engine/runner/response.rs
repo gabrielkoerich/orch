@@ -408,6 +408,15 @@ pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> 
             .map_err(|e| anyhow::anyhow!("parse failed after NDJSON extraction: {e}"));
     }
 
+    // Step 3: heuristic fallback for plain-text decisions
+    if let Some(resp) = infer_review_response_from_text(output) {
+        tracing::warn!(
+            output_len = output.len(),
+            "review response parsed via keyword fallback"
+        );
+        return Ok(resp);
+    }
+
     anyhow::bail!("failed to parse review response from output")
 }
 
@@ -470,6 +479,31 @@ pub fn parse_review_response(text: &str) -> anyhow::Result<ReviewResponse> {
     }
 
     anyhow::bail!("failed to parse review response")
+}
+
+fn infer_review_response_from_text(text: &str) -> Option<ReviewResponse> {
+    let lower = text.to_ascii_lowercase();
+    let has_changes_requested =
+        lower.contains("changes requested") || lower.contains("request_changes");
+    if has_changes_requested {
+        return Some(ReviewResponse {
+            decision: "request_changes".to_string(),
+            notes: "Inferred decision from plain-text review output.".to_string(),
+            test_results: None,
+            issues: Vec::new(),
+        });
+    }
+
+    if lower.contains("approved") {
+        return Some(ReviewResponse {
+            decision: "approve".to_string(),
+            notes: "Inferred decision from plain-text review output.".to_string(),
+            test_results: None,
+            issues: Vec::new(),
+        });
+    }
+
+    None
 }
 
 /// Extract the first valid JSON object from markdown code blocks.
@@ -776,6 +810,14 @@ That's all."#;
         let md = "Review complete.\n\n```json\n{\"decision\":\"request_changes\",\"notes\":\"Fix it\",\"issues\":[]}\n```\n";
         let resp = parse_review_from_output(md).unwrap();
         assert_eq!(resp.decision, "request_changes");
+    }
+
+    #[test]
+    fn parse_review_from_output_plain_text_fallback() {
+        let text = "The review is done — all tests passed and the PR was approved.";
+        let resp = parse_review_from_output(text).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert!(resp.issues.is_empty());
     }
 
     /// opencode NDJSON stream — text events use the `part.text` format.

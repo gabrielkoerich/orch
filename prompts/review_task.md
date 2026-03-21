@@ -74,6 +74,9 @@ Flag `request_changes` if the PR:
 {{/if}}
 ## Output Format
 
+You MUST output the JSON block below even if you already ran this review earlier.
+Do NOT respond with prose summaries.
+
 ```json
 {
   "decision": "approve|request_changes",
