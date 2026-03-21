@@ -90,7 +90,7 @@ pub(super) async fn forward_to_tmux(transport: &Arc<Transport>, task_id: &str, t
 pub(super) async fn handle_channel_message(
     msg: IncomingMessage,
     transport: &Arc<Transport>,
-    _tmux: &Arc<TmuxManager>,
+    tmux: &Arc<TmuxManager>,
     capture: &Arc<CaptureService>,
     channels: &Arc<ChannelRegistry>,
     engine_refs: &[EngineRef],
@@ -348,18 +348,12 @@ pub(super) async fn handle_channel_message(
                             Task::External(t) => t.id.0.clone(),
                         };
                         // Bind the thread to the new task
+                        let session_name = tmux.session_name(repo, &task_id);
                         transport
-                            .bind(
-                                &task_id,
-                                &format!("orch-{repo}-{task_id}"),
-                                &channel,
-                                &thread_id,
-                            )
+                            .bind(&task_id, &session_name, &channel, &thread_id)
                             .await;
                         // Register the session with CaptureService (graceful if no session yet)
-                        capture
-                            .register_session(&task_id, &format!("orch-{repo}-{task_id}"))
-                            .await;
+                        capture.register_session(&task_id, &session_name).await;
                         // Spawn output fanout for this task
                         let transport_clone = transport.clone();
                         let channels_clone = channels.clone();
@@ -619,5 +613,42 @@ pub(super) async fn handle_stream_command(
         format!("Streaming output from task `{task_id}` to this channel.")
     } else {
         format!("Task `{task_id}` is not currently running or has no active session.")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for issue #773: the session name registered in the transport
+    /// binding must match the name that TmuxManager uses for the actual tmux session.
+    ///
+    /// For internal tasks the raw task ID is "internal:42" (colon), but tmux sanitizes
+    /// it to "internal-42" (hyphen).  The old code used `format!("orch-{repo}-{task_id}")`
+    /// which embedded the unsanitized colon, so `bind()` / `register_session()` stored
+    /// "orch-repo-internal:42" while the real session was "orch-repo-internal-42".
+    ///
+    /// After the fix both call sites use `tmux.session_name(repo, &task_id)` which
+    /// applies the same sanitization, so the names match.
+    #[test]
+    fn session_name_used_for_internal_task_matches_tmux_manager() {
+        let tmux = TmuxManager::new();
+        let repo = "owner/repo";
+        let task_id = "internal:42";
+
+        // This is the name the runner/dispatch tick uses for the actual tmux session.
+        let actual_session = tmux.session_name(repo, task_id);
+
+        // Before the fix, channel_handler computed the session name as:
+        //   format!("orch-{repo}-{task_id}") = "orch-owner/repo-internal:42"
+        // which does NOT equal the sanitized name.
+        let old_buggy_name = format!("orch-{repo}-{task_id}");
+        assert_ne!(
+            old_buggy_name, actual_session,
+            "sanity check: old format should differ from sanitized name"
+        );
+
+        // After the fix, channel_handler uses tmux.session_name() — same as the runner.
+        assert_eq!(actual_session, "orch-repo-internal-42");
     }
 }
