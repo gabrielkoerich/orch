@@ -19,10 +19,20 @@ pub struct DirectResult {
 /// so callers can inspect it for rate-limit detection.
 #[derive(Debug)]
 pub enum DirectCommandError {
-    Timeout { secs: u64 },
-    Spawn { message: String },
-    NonZeroExit { exit_code: i32, stdout: String, stderr: String },
-    EmptyResponse { stderr: String },
+    Timeout {
+        secs: u64,
+    },
+    Spawn {
+        message: String,
+    },
+    NonZeroExit {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
+    EmptyResponse {
+        stderr: String,
+    },
 }
 
 impl std::fmt::Display for DirectCommandError {
@@ -30,7 +40,9 @@ impl std::fmt::Display for DirectCommandError {
         match self {
             Self::Timeout { secs } => write!(f, "agent timed out after {secs}s"),
             Self::Spawn { message } => write!(f, "spawning agent: {message}"),
-            Self::NonZeroExit { exit_code, stderr, .. } => {
+            Self::NonZeroExit {
+                exit_code, stderr, ..
+            } => {
                 write!(f, "agent failed (exit {exit_code}): {stderr}")
             }
             Self::EmptyResponse { .. } => write!(f, "agent returned empty response"),
@@ -82,15 +94,23 @@ pub async fn run_direct_command_raw(
 ) -> std::result::Result<String, DirectCommandError> {
     let output = tokio::time::timeout(timeout + Duration::from_secs(5), cmd.output())
         .await
-        .map_err(|_| DirectCommandError::Timeout { secs: timeout.as_secs() })?
-        .map_err(|e| DirectCommandError::Spawn { message: e.to_string() })?;
+        .map_err(|_| DirectCommandError::Timeout {
+            secs: timeout.as_secs(),
+        })?
+        .map_err(|e| DirectCommandError::Spawn {
+            message: e.to_string(),
+        })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = output.status.code().unwrap_or(-1);
 
     if !output.status.success() {
-        return Err(DirectCommandError::NonZeroExit { exit_code, stdout, stderr });
+        return Err(DirectCommandError::NonZeroExit {
+            exit_code,
+            stdout,
+            stderr,
+        });
     }
     if stdout.is_empty() {
         return Err(DirectCommandError::EmptyResponse { stderr });
@@ -126,7 +146,11 @@ fn finish_output(output: std::process::Output, agent: &str) -> Result<DirectResu
         }
         Err(AgentError::InvalidResponse { .. }) => {
             let (text, input_tokens, output_tokens) = extract_from_envelope(&stdout);
-            Ok(DirectResult { text, input_tokens, output_tokens })
+            Ok(DirectResult {
+                text,
+                input_tokens,
+                output_tokens,
+            })
         }
         Err(err) => anyhow::bail!("{err}"),
     }
@@ -226,7 +250,10 @@ mod tests {
             "agent timed out after 30s"
         );
         assert_eq!(
-            DirectCommandError::Spawn { message: "no binary".to_string() }.to_string(),
+            DirectCommandError::Spawn {
+                message: "no binary".to_string()
+            }
+            .to_string(),
             "spawning agent: no binary"
         );
         assert_eq!(
@@ -239,7 +266,10 @@ mod tests {
             "agent failed (exit 1): err"
         );
         assert_eq!(
-            DirectCommandError::EmptyResponse { stderr: "".to_string() }.to_string(),
+            DirectCommandError::EmptyResponse {
+                stderr: "".to_string()
+            }
+            .to_string(),
             "agent returned empty response"
         );
     }

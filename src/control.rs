@@ -313,7 +313,6 @@ pub fn parse_response(raw: &str) -> (String, Option<String>) {
     (raw.trim().to_string(), None)
 }
 
-
 /// Result of an agent invocation, including response text and token usage.
 pub struct InvokeResult {
     pub text: String,
