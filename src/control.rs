@@ -14,11 +14,21 @@
 //! - kimi and minimax are claude-compatible wrappers (separate binaries in PATH)
 //! - opencode supports `opencode models` for listing available models
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use anyhow::{Context, Result};
 use sqlx::Row;
 
 use crate::engine::router::config::DEFAULT_AGENTS;
 use crate::store::TaskStore;
+
+/// Per-session invocation locks — ensures only one agent invocation runs at a time per session.
+///
+/// Keyed by `session_id`. A new `Arc<tokio::sync::Mutex<()>>` is inserted on first use and
+/// reused for all subsequent calls with the same session_id.
+static SESSION_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// System prompt template, loaded at compile time.
 const SYSTEM_TEMPLATE: &str = include_str!("../prompts/control_system.md");
@@ -471,6 +481,17 @@ pub async fn send_message(
             spec.agent, spec.model
         ));
     }
+
+    // Acquire per-session lock — serializes concurrent invocations for the same session.
+    // Messages that arrive while an invocation is running will queue here and execute in order.
+    let session_lock = {
+        let mut map = SESSION_LOCKS.lock().expect("SESSION_LOCKS poisoned");
+        Arc::clone(
+            map.entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    let _guard = session_lock.lock().await;
 
     // Store user message
     store
