@@ -29,15 +29,6 @@ You can search past conversations in SQLite:
 sqlite3 ~/.orch/orch.db "SELECT created_at, role, content FROM control_messages WHERE content LIKE '%search_term%' ORDER BY created_at DESC LIMIT 10"
 ```
 
-## Current State (live, authoritative — do not re-check with brew or other commands)
-{current_state}
-
-## Memories
-{memories}
-
-## Recent Conversation
-{recent_summaries}
-
 ## Response Format
 
 Respond naturally and concisely. After your response, output a summary tag on its own line:

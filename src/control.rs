@@ -250,11 +250,8 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Cha
         "## Current Live State\n### Version\norch {version}\n\n### Service\n{service_status}\n\n### Tasks\n{task_list}\n\n### Scheduled Jobs\n{job_list}\n\n### Memories\n{memories}\n\n### Recent Conversation\n{recent_summaries}"
     );
 
-    // 6. Build system prompt (instructions only, no live state)
-    let system = SYSTEM_TEMPLATE
-        .replace("{current_state}", "")
-        .replace("{memories}", "")
-        .replace("{recent_summaries}", "");
+    // 6. Build system prompt (instructions only, no live state in system prompt)
+    let system = SYSTEM_TEMPLATE.to_string();
 
     Ok(ChatContext { system, state })
 }
