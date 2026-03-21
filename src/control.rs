@@ -313,37 +313,6 @@ pub fn parse_response(raw: &str) -> (String, Option<String>) {
     (raw.trim().to_string(), None)
 }
 
-/// Extract text and token usage from a Claude JSON envelope or raw output.
-///
-/// Claude's `--output-format json` wraps the response in:
-/// `{"type":"result","result":"text","usage":{"input_tokens":N,"output_tokens":N}}`
-///
-/// For non-Claude agents, returns the raw text with no token data.
-fn extract_from_envelope(raw: &str) -> (String, Option<u64>, Option<u64>) {
-    // Try to parse as Claude envelope
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
-        if let Some(obj) = value.as_object() {
-            if obj.get("type").and_then(|v| v.as_str()) == Some("result") {
-                let text = obj
-                    .get("result")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let input_tokens = obj
-                    .get("usage")
-                    .and_then(|u| u.get("input_tokens"))
-                    .and_then(|v| v.as_u64());
-                let output_tokens = obj
-                    .get("usage")
-                    .and_then(|u| u.get("output_tokens"))
-                    .and_then(|v| v.as_u64());
-                return (text, input_tokens, output_tokens);
-            }
-        }
-    }
-    // Not an envelope — return raw text
-    (raw.to_string(), None, None)
-}
 
 /// Result of an agent invocation, including response text and token usage.
 pub struct InvokeResult {
@@ -364,11 +333,8 @@ async fn prepare_temp_dir() -> Result<String> {
 
 /// Invoke an agent CLI one-shot and return structured result with token usage.
 ///
-/// Uses the same runner infrastructure as the task engine:
-/// - `get_runner(agent)` for agent-specific command building
-/// - `build_command()` for CLI flag construction
-/// - `parse_response()` for output parsing with token extraction
-/// - `classify_error()` for proper error classification
+/// Delegates to `runner::direct::run_direct()` for command building, execution,
+/// parsing, and error classification.
 ///
 /// Writes temp files to `~/.orch/state/control/{pid}/`.
 pub async fn invoke_agent(
@@ -377,82 +343,23 @@ pub async fn invoke_agent(
     context: &str,
     message: &str,
 ) -> Result<InvokeResult> {
-    use crate::engine::runner::agents::{get_runner, PermissionRules};
-
     let dir = prepare_temp_dir().await?;
-    let sys_file = format!("{dir}/system.md");
-    let msg_file = format!("{dir}/message.txt");
 
-    // Write prompt files
-    tokio::fs::write(&sys_file, context).await?;
-    tokio::fs::write(&msg_file, message).await?;
-
-    let runner = get_runner(agent);
-    let permissions = PermissionRules::default();
-
-    // Build the shell command string (same as task runner)
-    let timeout_cmd = format!("timeout {}", AGENT_TIMEOUT.as_secs());
-    let shell_cmd = runner.build_command(
+    let result = crate::engine::runner::direct::run_direct(
+        agent,
         Some(model),
-        &timeout_cmd,
-        &sys_file,
-        &msg_file,
-        &permissions,
-    );
-
-    // Execute in temp dir to avoid picking up project CLAUDE.md files
-    let output = tokio::time::timeout(
-        AGENT_TIMEOUT + std::time::Duration::from_secs(5),
-        tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg(&shell_cmd)
-            .current_dir(&dir)
-            .output(),
+        context,
+        message,
+        AGENT_TIMEOUT,
+        &dir,
     )
-    .await
-    .map_err(|_| anyhow::anyhow!("agent timed out after {}s", AGENT_TIMEOUT.as_secs()))?
-    .context("spawning agent")?;
+    .await?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
-
-    // Use runner's error classification on failure
-    if !output.status.success() {
-        let err = runner.classify_error(exit_code, &stdout, &stderr);
-        anyhow::bail!("{err}");
-    }
-
-    // Use runner's response parser — handles structured output + tokens + errors.
-    use crate::engine::runner::agents::AgentError;
-    match runner.parse_response(&stdout) {
-        Ok(parsed) => {
-            let text = if !parsed.response.summary.is_empty() {
-                parsed.response.summary.clone()
-            } else {
-                stdout.clone()
-            };
-            Ok(InvokeResult {
-                text,
-                input_tokens: parsed.input_tokens,
-                output_tokens: parsed.output_tokens,
-            })
-        }
-        Err(AgentError::InvalidResponse { .. }) => {
-            // Parser couldn't parse as structured AgentResponse — normal for
-            // conversational text. Extract text + tokens from the envelope directly.
-            let (text, input_tokens, output_tokens) = extract_from_envelope(&stdout);
-            Ok(InvokeResult {
-                text,
-                input_tokens,
-                output_tokens,
-            })
-        }
-        Err(err) => {
-            // Real agent error (rate limit, auth, model unavailable, etc.)
-            anyhow::bail!("{err}")
-        }
-    }
+    Ok(InvokeResult {
+        text: result.text,
+        input_tokens: result.input_tokens,
+        output_tokens: result.output_tokens,
+    })
 }
 
 /// High-level entry point: process a user message and return the assistant response.
