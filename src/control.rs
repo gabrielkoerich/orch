@@ -391,7 +391,7 @@ pub async fn send_message(
     // Acquire per-session lock — serializes concurrent invocations for the same session.
     // Messages that arrive while an invocation is running will queue here and execute in order.
     let session_lock = {
-        let mut map = SESSION_LOCKS.lock().expect("SESSION_LOCKS poisoned");
+        let mut map = SESSION_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(
             map.entry(session_id.to_string())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
