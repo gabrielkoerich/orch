@@ -14,6 +14,16 @@ const MAX_MERGE_CONFLICT_RETRIES: u64 = 3;
 /// the task is blocked for human intervention instead of re-entering NeedsReview.
 const MAX_CI_MERGE_FAILURES: u64 = 3;
 
+// Global semaphore limiting concurrent CI polling loops across all tasks.
+// This caps the number of simultaneous `get_combined_status` polling loops so
+// N approved PRs do not spawn N×20 uncapped GitHub API calls. 3 permits is a
+// conservative default chosen to balance latency and API usage.
+static CI_POLL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn ci_poll_semaphore() -> &'static Arc<Semaphore> {
+    CI_POLL_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(3)))
+}
+
 /// Maximum number of consecutive review agent failures before the task is blocked
 /// for human intervention. Exported so `tick` and `sync` use the same threshold
 /// without duplicating the constant.
@@ -25,8 +35,8 @@ use crate::engine::runner;
 use crate::github::http::GhHttp;
 use crate::github::types::{GitHubReview, GitHubReviewComment, PullRequestReview};
 use crate::tmux::TmuxManager;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{RwLock, Semaphore};
 
 /// Returns `true` if any reviewer's **latest** review is `CHANGES_REQUESTED`.
 ///
@@ -1426,6 +1436,12 @@ pub(crate) async fn auto_merge_pr(
     let max_wait = std::time::Duration::from_secs(300);
     let poll_interval = std::time::Duration::from_secs(15);
     let start = std::time::Instant::now();
+
+    // Acquire a global permit to limit concurrent CI polling loops across tasks.
+    // This prevents N approved PRs from generating N×20 concurrent GitHub API
+    // calls (one per 15s for up to 5 minutes). The permit is held for the
+    // duration of the polling loop and released when this function returns.
+    let _permit = ci_poll_semaphore().clone().acquire_owned().await;
 
     loop {
         let (state, total, passing, failing, pending) =
