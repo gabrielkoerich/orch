@@ -35,6 +35,7 @@ use crate::engine::runner;
 use crate::github::http::GhHttp;
 use crate::github::types::{GitHubReview, GitHubReviewComment, PullRequestReview};
 use crate::tmux::TmuxManager;
+use anyhow::Context;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{RwLock, Semaphore};
 
@@ -611,8 +612,7 @@ pub(crate) async fn review_and_merge(
     let stored_task = store
         .get_by_external_id(repo, &task.id.0)
         .await
-        .ok()
-        .flatten();
+        .with_context(|| format!("store lookup failed for task {}", task.id.0))?;
 
     let worktree_path = match stored_task.as_ref().map(|t| t.worktree.as_str()) {
         Some(w) if !w.is_empty() => std::path::PathBuf::from(w),
