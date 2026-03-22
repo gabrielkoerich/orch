@@ -608,7 +608,11 @@ pub(crate) async fn review_and_merge(
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<ReviewDecision> {
     // 2. Load worktree path, branch, summary, and pr_number from store — single DB round-trip.
-    let stored_task = store.get_by_external_id(repo, &task.id.0).await.ok().flatten();
+    let stored_task = store
+        .get_by_external_id(repo, &task.id.0)
+        .await
+        .ok()
+        .flatten();
 
     let worktree_path = match stored_task.as_ref().map(|t| t.worktree.as_str()) {
         Some(w) if !w.is_empty() => std::path::PathBuf::from(w),
