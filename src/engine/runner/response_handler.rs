@@ -132,6 +132,15 @@ pub async fn handle_success(
         {
             Ok(_) => {
                 has_pushed = true;
+                // Clear any stale push failure from a previous run so review_and_merge
+                // does not incorrectly block an approved task.
+                crate::engine::cleanup::store_set(
+                    store,
+                    repo,
+                    task_id,
+                    &[("last_error", serde_json::json!(""))],
+                )
+                .await;
                 true
             }
             Err(e) => {
