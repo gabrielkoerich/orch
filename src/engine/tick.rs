@@ -232,7 +232,8 @@ pub(crate) async fn tick_recover_stuck_tasks(
         .list_external_by_status(Status::InReview)
         .await?;
     for task in &in_review {
-        let session_name = tmux.session_name(repo, &task.id.0);
+        let review_task_id = format!("{}-review", task.id.0);
+        let session_name = tmux.session_name(repo, &review_task_id);
         let has_session = tmux.session_exists(&session_name).await;
 
         let threshold = if has_session {
@@ -300,7 +301,8 @@ pub(crate) async fn tick_recover_stuck_tasks(
         .await?;
     for task in &internal_in_review {
         let task_id = task.id.0.clone();
-        let session_name = tmux.session_name(repo, &task_id);
+        let review_task_id = format!("{}-review", task_id);
+        let session_name = tmux.session_name(repo, &review_task_id);
         let has_session = tmux.session_exists(&session_name).await;
 
         let threshold = if has_session {
