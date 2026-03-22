@@ -134,6 +134,8 @@ pub enum AgentError {
     InvalidResponse { raw: String },
     /// Agent self-reported a failure in its response.
     AgentFailed { message: String },
+    /// Transient network connectivity error — retry same agent, no failover.
+    NetworkError { message: String },
     /// Unclassified error.
     Unknown { exit_code: i32, message: String },
 }
@@ -156,6 +158,7 @@ impl std::fmt::Display for AgentError {
                 write!(f, "invalid response: {}", &raw[..end])
             }
             Self::AgentFailed { message } => write!(f, "agent failed: {message}"),
+            Self::NetworkError { message } => write!(f, "network error: {message}"),
             Self::Unknown { exit_code, message } => {
                 write!(f, "unknown error (exit {exit_code}): {message}")
             }
@@ -179,6 +182,7 @@ pub fn error_class_name(err: &AgentError) -> &'static str {
         AgentError::WaitingForInput { .. } => "WaitingForInput",
         AgentError::InvalidResponse { .. } => "InvalidResponse",
         AgentError::AgentFailed { .. } => "AgentFailed",
+        AgentError::NetworkError { .. } => "NetworkError",
         AgentError::Unknown { .. } => "Unknown",
     }
 }
@@ -370,8 +374,7 @@ pub(crate) mod patterns {
             "network unreachable",
         ];
         if patterns.iter().any(|p| lower.contains(p)) {
-            return Some(AgentError::Unknown {
-                exit_code: 1,
+            return Some(AgentError::NetworkError {
                 message: safe_tail(text, 300),
             });
         }
