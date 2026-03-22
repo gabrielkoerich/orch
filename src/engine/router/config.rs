@@ -243,4 +243,14 @@ impl RouterConfig {
             .and_then(|m| m.get(agent))
             .cloned()
     }
+
+    /// Get the model for a given agent and complexity level, falling back to built-in defaults.
+    ///
+    /// Unlike [`model_for_complexity`], this always returns a non-empty `String`.
+    /// Use this instead of hardcoding fallback model names at call sites.
+    pub fn model_for_complexity_or_default(&self, agent: &str, complexity: &str) -> String {
+        self.model_for_complexity(agent, complexity)
+            .or_else(|| Self::default().model_for_complexity(agent, complexity))
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
+    }
 }

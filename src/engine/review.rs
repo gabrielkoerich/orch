@@ -1018,17 +1018,19 @@ pub(crate) async fn review_and_merge(
     let task_agent = super::cleanup::store_get_field(store, repo, &task.id.0, "agent")
         .await
         .unwrap_or_default();
-    let review_agent = {
+    let (review_agent, review_model) = {
         let mut r = router.write().await;
         let exclude = if task_agent.is_empty() {
             None
         } else {
             Some(task_agent.as_str())
         };
-        r.next_round_robin_agent(exclude)
-            .unwrap_or_else(|| "claude".to_string())
+        let agent = r
+            .next_round_robin_agent(exclude)
+            .unwrap_or_else(|| "claude".to_string());
+        let model = r.config.model_for_complexity_or_default(&agent, "review");
+        (agent, model)
     };
-    let review_model = get_model_for_complexity("review", &review_agent);
 
     tracing::info!(
         task_id = task.id.0,
@@ -1878,36 +1880,10 @@ pub(crate) async fn handle_review_changes(
     Ok(())
 }
 
-/// Get the model for a given complexity and agent.
-pub(crate) fn get_model_for_complexity(complexity: &str, agent: &str) -> String {
-    // Read from config model_map
-    let config_key = format!("model_map.{}.{}", complexity, agent);
-    match config::get(&config_key) {
-        Ok(model) => model,
-        Err(_) => {
-            // Defaults
-            match agent {
-                "claude" => match complexity {
-                    "simple" => "haiku".to_string(),
-                    "medium" => "sonnet".to_string(),
-                    "complex" | "review" => "sonnet".to_string(),
-                    _ => "sonnet".to_string(),
-                },
-                "codex" => match complexity {
-                    "simple" => "gpt-5.1-codex-mini".to_string(),
-                    "medium" | "review" => "gpt-5.2".to_string(),
-                    "complex" => "gpt-5.3-codex".to_string(),
-                    _ => "gpt-5.2".to_string(),
-                },
-                _ => "sonnet".to_string(),
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::router::RouterConfig;
     use crate::github::types::{GitHubReview, GitHubReviewComment, GitHubUser, PullRequestReview};
 
     #[test]
@@ -2030,16 +2006,26 @@ mod tests {
     }
 
     #[test]
-    fn test_get_model_for_complexity_returns_nonempty() {
-        assert!(!get_model_for_complexity("simple", "claude").is_empty());
-        assert!(!get_model_for_complexity("medium", "claude").is_empty());
-        assert!(!get_model_for_complexity("complex", "claude").is_empty());
-        assert!(!get_model_for_complexity("review", "claude").is_empty());
+    fn test_router_config_model_for_complexity_returns_nonempty() {
+        let cfg = RouterConfig::default();
+        assert!(!cfg
+            .model_for_complexity_or_default("claude", "simple")
+            .is_empty());
+        assert!(!cfg
+            .model_for_complexity_or_default("claude", "medium")
+            .is_empty());
+        assert!(!cfg
+            .model_for_complexity_or_default("claude", "complex")
+            .is_empty());
+        assert!(!cfg
+            .model_for_complexity_or_default("claude", "review")
+            .is_empty());
     }
 
     #[test]
-    fn test_get_model_for_complexity_unknown_agent() {
-        let model = get_model_for_complexity("simple", "unknown_agent_xyz");
+    fn test_router_config_model_for_complexity_unknown_agent() {
+        let cfg = RouterConfig::default();
+        let model = cfg.model_for_complexity_or_default("unknown_agent_xyz", "simple");
         assert!(!model.is_empty());
     }
 
