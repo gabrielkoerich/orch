@@ -55,7 +55,9 @@ pub(crate) async fn tick_check_session_completions(
     Ok(())
 }
 
-/// Phase 2 of tick: detect tasks stuck in_progress without an active tmux session and reset them.
+/// Phase 2 of tick: detect tasks stuck in_progress or in_review without an active tmux session and reset them.
+/// - `in_progress` tasks → reset to `New` (clears routing state so the LLM router re-routes)
+/// - `in_review` tasks   → reset to `NeedsReview` (keeps routing state; review agent re-triggers)
 pub(crate) async fn tick_recover_stuck_tasks(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -219,6 +221,116 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 .await
             {
                 tracing::warn!(task_id, ?e, "failed to reset stuck internal task status");
+            }
+        }
+    }
+
+    // Recover external tasks stuck in in_review.
+    // Unlike in_progress recovery, we reset to NeedsReview (not New) so the review
+    // agent re-triggers without clearing the routing state.
+    let in_review = task_manager
+        .list_external_by_status(Status::InReview)
+        .await?;
+    for task in &in_review {
+        let session_name = tmux.session_name(repo, &task.id.0);
+        let has_session = tmux.session_exists(&session_name).await;
+
+        let threshold = if has_session {
+            config.stuck_timeout
+        } else {
+            config.no_session_stuck_timeout
+        };
+
+        let updated = match chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
+            Ok(dt) => dt.with_timezone(&chrono::Utc),
+            Err(e) => {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    updated_at = task.updated_at,
+                    ?e,
+                    "cannot parse updated_at, skipping stuck in_review check"
+                );
+                continue;
+            }
+        };
+        let age = chrono::Utc::now() - updated;
+
+        if age.num_seconds() > threshold as i64 {
+            tracing::warn!(
+                task_id = task.id.0,
+                age_mins = age.num_minutes(),
+                threshold_mins = threshold / 60,
+                "recovering stuck in_review task: no session found — resetting to needs_review"
+            );
+            if let Err(e) = task_manager
+                .update_task_status(&task.id, Status::NeedsReview)
+                .await
+            {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    ?e,
+                    "failed to reset stuck in_review task status"
+                );
+                continue;
+            }
+            if let Err(e) = backend
+                .post_comment(
+                    &task.id,
+                    &format!(
+                        "[{}] recovered: stuck in_review — no session found after {}m, resetting to needs_review{}",
+                        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                        age.num_minutes(),
+                        crate::engine::orch_footer()
+                    ),
+                )
+                .await
+            {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    ?e,
+                    "failed to post stuck in_review recovery comment"
+                );
+            }
+        }
+    }
+
+    // Recover internal (SQLite) tasks stuck in in_review.
+    let internal_in_review = task_manager
+        .list_internal_by_status(DbStatus::InReview)
+        .await?;
+    for task in &internal_in_review {
+        let task_id = task.id.0.clone();
+        let session_name = tmux.session_name(repo, &task_id);
+        let has_session = tmux.session_exists(&session_name).await;
+
+        let threshold = if has_session {
+            config.stuck_timeout
+        } else {
+            config.no_session_stuck_timeout
+        };
+
+        let age = if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
+            chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc)
+        } else {
+            continue;
+        };
+
+        if age.num_seconds() > threshold as i64 {
+            tracing::warn!(
+                task_id,
+                age_mins = age.num_minutes(),
+                threshold_mins = threshold / 60,
+                "recovering stuck internal in_review task: no session found — resetting to needs_review"
+            );
+            if let Err(e) = task_manager
+                .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
+                .await
+            {
+                tracing::warn!(
+                    task_id,
+                    ?e,
+                    "failed to reset stuck internal in_review task status"
+                );
             }
         }
     }
@@ -873,7 +985,7 @@ pub(crate) async fn tick_job_scheduler(
 ///
 /// Delegates to named phase functions in order:
 /// 1. `tick_check_session_completions` — poll tmux for finished sessions
-/// 2. `tick_recover_stuck_tasks`       — reset in_progress tasks with no active session
+/// 2. `tick_recover_stuck_tasks`       — reset in_progress/in_review tasks with no active session
 /// 3. `tick_route_tasks`               — route status:new tasks to an agent
 /// 4. `tick_dispatch_tasks`            — spawn agents for status:routed tasks
 /// 5. `tick_unblock_parents`           — unblock parents whose sub-issues are all done
@@ -1130,6 +1242,175 @@ mod tests {
         assert!(
             updates.is_empty(),
             "should not unblock tasks with no sub-issues"
+        );
+    }
+
+    // ── tick_recover_stuck_tasks (InReview) ──────────────────────────────────
+
+    /// Set `updated_at` to a far-past date for a task in an in-memory store.
+    #[cfg(test)]
+    async fn set_task_updated_at_past(store: &crate::store::TaskStore, task_id: i64) {
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(task_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recover_stuck_tasks_resets_external_in_review_to_needs_review() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        // Insert an external task and transition it to InReview with an old updated_at
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "99",
+                title: "Stuck InReview",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        set_task_updated_at_past(&store, id).await;
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        let updates = status_updates.lock().unwrap();
+        assert_eq!(updates.len(), 1, "stuck InReview task should be recovered");
+        assert_eq!(updates[0].0, "99");
+        assert_eq!(updates[0].1, Status::NeedsReview);
+    }
+
+    #[tokio::test]
+    async fn recover_stuck_tasks_skips_recent_in_review() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600, // 10 minutes — recent task won't trigger
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        // Insert a recently-updated InReview task (updated_at = now)
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "100",
+                title: "Recent InReview",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        // updated_at stays at now — age < 600s → should NOT be recovered
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        let updates = status_updates.lock().unwrap();
+        assert!(
+            updates.is_empty(),
+            "recent InReview task should not be recovered"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_stuck_tasks_resets_internal_in_review_to_needs_review() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        // Create an internal task in InReview with old updated_at
+        let id = store
+            .create_internal("owner/repo", "Internal InReview", "", "cron", "1")
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        set_task_updated_at_past(&store, id).await;
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::NeedsReview,
+            "stuck internal InReview task should be reset to NeedsReview"
         );
     }
 
