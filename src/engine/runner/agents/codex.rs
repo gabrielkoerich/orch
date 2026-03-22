@@ -190,8 +190,8 @@ impl CodexRunner {
         if lower.contains("unauthorized")
             || lower.contains("invalid key")
             || lower.contains("invalid api")
-            || lower.contains("401")
-            || lower.contains("403")
+            || super::patterns::contains_http_status(&lower, "401")
+            || super::patterns::contains_http_status(&lower, "403")
         {
             return AgentError::Auth {
                 message: message.to_string(),

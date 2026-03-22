@@ -313,7 +313,7 @@ pub(crate) mod patterns {
     ///   - `"http 401"` / `"http/1.1 401"`
     ///   - `"401 unauthorized"` / `"401\n"` / `"401"` at end-of-string
     ///   - `": 401"` when not immediately followed by another digit
-    fn contains_http_status(lower: &str, code: &str) -> bool {
+    pub fn contains_http_status(lower: &str, code: &str) -> bool {
         // Fast prefix checks that are inherently unambiguous.
         if lower.contains(&format!("http {code}")) || lower.contains(&format!("{code} ")) {
             return true;

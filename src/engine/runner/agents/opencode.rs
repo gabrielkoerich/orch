@@ -450,7 +450,10 @@ fn classify_opencode_message(message: &str) -> AgentError {
         };
     }
 
-    if lower.contains("unauthorized") || lower.contains("invalid key") || lower.contains("401") {
+    if lower.contains("unauthorized")
+        || lower.contains("invalid key")
+        || super::patterns::contains_http_status(&lower, "401")
+    {
         return AgentError::Auth {
             message: message.to_string(),
         };
