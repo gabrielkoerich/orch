@@ -554,14 +554,31 @@ impl TaskRunner {
 
         // If task was rerouted (status=new after run), update GitHub agent label
         // so the router doesn't re-route back to the same failed agent.
-        if status == "new" {
+        if status == "new" && !is_internal_id(task_id) {
             let new_agent = self.get_field(task_id, "agent").await.unwrap_or_default();
             if !new_agent.is_empty() && new_agent != agent_name {
-                // Remove old agent label, add new one
+                // Remove old agent label, ensure new one exists, then add it.
+                // set_labels (add_labels) fails with 422 if the label doesn't exist
+                // in the repo yet — ensure_label creates it first.
                 let old_label = format!("agent:{agent_name}");
                 backend.remove_label(&task.id, &old_label).await.ok();
                 let new_label = format!("agent:{new_agent}");
-                backend.set_labels(&task.id, &[new_label]).await.ok();
+                match crate::github::http::GhHttp::new() {
+                    Ok(gh) => {
+                        gh.ensure_label(
+                            &self.repo,
+                            &new_label,
+                            crate::github::http::status_label_color(&new_label),
+                            &format!("Agent: {new_agent}"),
+                        )
+                        .await
+                        .ok();
+                        backend.set_labels(&task.id, &[new_label]).await.ok();
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id, err = %e, "GhHttp::new() failed — agent label not updated after failover");
+                    }
+                }
                 tracing::info!(
                     task_id,
                     from = %agent_name,
