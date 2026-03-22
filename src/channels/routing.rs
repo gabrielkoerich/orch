@@ -9,14 +9,14 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Default)]
 pub struct ProjectChannelConfig {
     pub telegram_topic_id: Option<String>,
-    #[allow(dead_code)] // Used by Task 7 (notification routing)
+    #[allow(dead_code)]
     pub telegram_bot_token: Option<String>,
-    #[allow(dead_code)] // Used by Task 7 (notification routing)
+    #[allow(dead_code)]
     pub telegram_chat_id: Option<String>,
     pub discord_channel_id: Option<String>,
-    #[allow(dead_code)] // Used by Task 7 (notification routing)
+    #[allow(dead_code)]
     pub discord_bot_token: Option<String>,
-    #[allow(dead_code)] // Used by Task 7 (notification routing)
+    #[allow(dead_code)]
     pub discord_guild_id: Option<String>,
 }
 
@@ -36,7 +36,6 @@ pub struct ChannelRouter {
     /// (channel_name, topic_or_channel_id) → repo
     target_to_repo: HashMap<(String, String), String>,
     /// repo → { channel_name: topic_or_channel_id }
-    #[allow(dead_code)] // Used by Task 7 (notification routing)
     repo_to_targets: HashMap<String, HashMap<String, String>>,
     /// General channel IDs per channel type
     general: HashMap<String, String>,
@@ -119,7 +118,6 @@ impl ChannelRouter {
     }
 
     /// Get the target (topic/channel ID) for a project on a given channel.
-    #[allow(dead_code)] // Used by Task 7 (notification routing)
     pub fn target_for_project(&self, repo: &str, channel: &str) -> Option<&str> {
         self.repo_to_targets
             .get(repo)
@@ -133,7 +131,7 @@ impl ChannelRouter {
     }
 
     /// Get the General channel ID for a channel type.
-    #[allow(dead_code)] // Used by Task 7 (notification routing)
+    #[allow(dead_code)]
     pub fn general_target(&self, channel: &str) -> Option<&str> {
         self.general.get(channel).map(|s| s.as_str())
     }
