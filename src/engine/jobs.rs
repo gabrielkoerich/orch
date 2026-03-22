@@ -258,9 +258,8 @@ pub async fn tick(
                                 | TaskStatus::Routed
                                 | TaskStatus::InProgress
                                 | TaskStatus::NeedsReview
-                                | TaskStatus::InReview
-                                | TaskStatus::Blocked => true,
-                                _ => false, // Terminal state
+                                | TaskStatus::InReview => true,
+                                _ => false, // Terminal state (Done, Blocked, Cancelled)
                             },
                             Err(e) => {
                                 tracing::warn!(
