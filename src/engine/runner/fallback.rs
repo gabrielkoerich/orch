@@ -126,6 +126,20 @@ pub async fn handle_error(
             response::RetryableError::Failed,
             format!("{agent_name} failed: {message}"),
         ),
+        agents::AgentError::NetworkError { message } => {
+            // Transient connectivity failure — retry same agent, no reroute chain update.
+            let msg = format!("{agent_name} network error: {message}");
+            crate::engine::cleanup::store_set(
+                store,
+                repo,
+                task_id,
+                &[("last_error", serde_json::json!(msg))],
+            )
+            .await;
+            return Ok(ErrorHandleResult::EarlyReturn {
+                status: "new".to_string(),
+            });
+        }
         agents::AgentError::Unknown { exit_code, message } => (
             response::RetryableError::Failed,
             format!("{agent_name} exit {exit_code}: {message}"),

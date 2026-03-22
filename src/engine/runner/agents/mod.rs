@@ -134,6 +134,8 @@ pub enum AgentError {
     InvalidResponse { raw: String },
     /// Agent self-reported a failure in its response.
     AgentFailed { message: String },
+    /// Transient network connectivity error — retry same agent, no failover.
+    NetworkError { message: String },
     /// Unclassified error.
     Unknown { exit_code: i32, message: String },
 }
@@ -156,6 +158,7 @@ impl std::fmt::Display for AgentError {
                 write!(f, "invalid response: {}", &raw[..end])
             }
             Self::AgentFailed { message } => write!(f, "agent failed: {message}"),
+            Self::NetworkError { message } => write!(f, "network error: {message}"),
             Self::Unknown { exit_code, message } => {
                 write!(f, "unknown error (exit {exit_code}): {message}")
             }
@@ -179,6 +182,7 @@ pub fn error_class_name(err: &AgentError) -> &'static str {
         AgentError::WaitingForInput { .. } => "WaitingForInput",
         AgentError::InvalidResponse { .. } => "InvalidResponse",
         AgentError::AgentFailed { .. } => "AgentFailed",
+        AgentError::NetworkError { .. } => "NetworkError",
         AgentError::Unknown { .. } => "Unknown",
     }
 }
@@ -302,6 +306,34 @@ pub(crate) mod patterns {
         None
     }
 
+    /// Returns true if `lower` contains the HTTP status `code` (e.g. "401") as a
+    /// standalone number — not as part of a larger digit sequence like `4010292`.
+    ///
+    /// Matches:
+    ///   - `"http 401"` / `"http/1.1 401"`
+    ///   - `"401 unauthorized"` / `"401\n"` / `"401"` at end-of-string
+    ///   - `": 401"` when not immediately followed by another digit
+    fn contains_http_status(lower: &str, code: &str) -> bool {
+        // Fast prefix checks that are inherently unambiguous.
+        if lower.contains(&format!("http {code}")) || lower.contains(&format!("{code} ")) {
+            return true;
+        }
+        // ": NNN" — only accept when the next character is not a digit.
+        let needle = format!(": {code}");
+        let mut start = 0;
+        while let Some(rel) = lower[start..].find(needle.as_str()) {
+            let after = start + rel + needle.len();
+            match lower[after..].chars().next() {
+                Some(c) if c.is_ascii_digit() => {
+                    // Part of a longer number (e.g. ": 4010292") — skip.
+                    start = after;
+                }
+                _ => return true,
+            }
+        }
+        false
+    }
+
     /// Check for auth / billing error patterns in text.
     pub fn detect_auth_error(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
@@ -321,11 +353,28 @@ pub(crate) mod patterns {
             "credit balance too low",
             "payment required",
         ];
-        if patterns.iter().any(|p| lower.contains(p))
-            || lower.contains("401")
-            || lower.contains("403")
-        {
+        let http_401 = contains_http_status(&lower, "401");
+        let http_403 = contains_http_status(&lower, "403");
+        if patterns.iter().any(|p| lower.contains(p)) || http_401 || http_403 {
             return Some(AgentError::Auth {
+                message: safe_tail(text, 300),
+            });
+        }
+        None
+    }
+
+    /// Check for transient network connectivity errors.
+    pub fn detect_network_error(text: &str) -> Option<AgentError> {
+        let lower = text.to_lowercase();
+        let patterns = [
+            "connectionrefused",
+            "connection refused",
+            "unable to connect",
+            "econnrefused",
+            "network unreachable",
+        ];
+        if patterns.iter().any(|p| lower.contains(p)) {
+            return Some(AgentError::NetworkError {
                 message: safe_tail(text, 300),
             });
         }
@@ -481,6 +530,9 @@ pub(crate) mod patterns {
         if let Some(e) = detect_rate_limit(text) {
             return e;
         }
+        if let Some(e) = detect_network_error(text) {
+            return e;
+        }
         if let Some(e) = detect_auth_error(text) {
             return e;
         }
@@ -545,9 +597,38 @@ mod tests {
     #[test]
     fn pattern_detect_auth() {
         assert!(patterns::detect_auth_error("401 Unauthorized").is_some());
+        assert!(patterns::detect_auth_error("HTTP 401").is_some());
+        assert!(patterns::detect_auth_error("error: 401").is_some());
+        assert!(patterns::detect_auth_error("403 Forbidden").is_some());
+        assert!(patterns::detect_auth_error("HTTP 403").is_some());
         assert!(patterns::detect_auth_error("invalid api key").is_some());
         assert!(patterns::detect_auth_error("billing expired").is_some());
         assert!(patterns::detect_auth_error("task done").is_none());
+        // Bare numbers in JSON must NOT trigger auth classification.
+        assert!(patterns::detect_auth_error("duration_api_ms 4010292").is_none());
+        assert!(patterns::detect_auth_error(
+            "API Error: Unable to connect to API (ConnectionRefused) duration_api_ms 4010292"
+        )
+        .is_none());
+        // JSON field with colon: "duration_api_ms": 4010292 — contains ": 401" as substring.
+        assert!(patterns::detect_auth_error(r#""duration_api_ms": 4010292"#).is_none());
+        assert!(patterns::detect_auth_error(
+            r#"{"error":"ConnectionRefused","duration_api_ms": 4010292}"#
+        )
+        .is_none());
+        // ": 401" at end-of-string or followed by non-digit must still match.
+        assert!(patterns::detect_auth_error("status: 401").is_some());
+        assert!(patterns::detect_auth_error("error: 403").is_some());
+    }
+
+    #[test]
+    fn pattern_detect_network_error() {
+        assert!(patterns::detect_network_error("connection refused").is_some());
+        assert!(patterns::detect_network_error("ConnectionRefused").is_some());
+        assert!(patterns::detect_network_error("Unable to connect to API").is_some());
+        assert!(patterns::detect_network_error("ECONNREFUSED").is_some());
+        assert!(patterns::detect_network_error("network unreachable").is_some());
+        assert!(patterns::detect_network_error("all systems operational").is_none());
     }
 
     #[test]
