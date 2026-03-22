@@ -324,66 +324,38 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
             println!("Created: {}", ext.created_at);
             println!("Updated: {}", ext.updated_at);
 
-            // Show agent/branch info if available
-            if let Some(agent) =
-                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "agent").await
-            {
-                println!("Agent: {}", agent);
-            }
-
-            // Additional diagnostic fields (when recorded in the store)
-            if let Some(model) =
-                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "model").await
-            {
-                println!("Model: {}", model);
-            }
-            if let Some(complexity) =
-                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "complexity").await
-            {
-                if !complexity.is_empty() {
-                    println!("Complexity: {}", complexity);
-                }
-            }
-            if let Some(route_attempts) =
-                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "route_attempts").await
-            {
-                if !route_attempts.is_empty() {
-                    println!("Route attempts: {}", route_attempts);
-                }
-            }
-            if let Some(tries) =
-                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "attempts").await
-            {
-                if !tries.is_empty() {
-                    println!("Attempts: {}", tries);
-                }
-            }
-            if let Some(review_cycles) =
-                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "review_cycles").await
-            {
-                if !review_cycles.is_empty() {
-                    println!("Review cycles: {}", review_cycles);
-                }
-            }
-            if let Some(pr) =
-                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "pr_number").await
-            {
-                if !pr.is_empty() {
-                    println!("PR: #{}", pr);
-                }
-            }
-            if let Some(branch) =
-                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "branch").await
-            {
-                if !branch.is_empty() {
-                    println!("Branch: {}", branch);
-                }
-            }
-            if let Some(last_err) =
-                store_helpers::opt_store_get_field(&store, &repo, &ext.id.0, "last_error").await
-            {
-                if !last_err.is_empty() {
-                    println!("Last error: {}", truncate_err(&last_err, 200));
+            // Load all store fields in a single DB round-trip.
+            if let Some(ref s) = store {
+                if let Ok(Some(t)) = s.get_by_external_id(&repo, &ext.id.0).await {
+                    if let Some(ref agent) = t.agent {
+                        println!("Agent: {}", agent);
+                    }
+                    if let Some(ref model) = t.model {
+                        println!("Model: {}", model);
+                    }
+                    if !t.complexity.is_empty() {
+                        println!("Complexity: {}", t.complexity);
+                    }
+                    if t.route_attempts > 0 {
+                        println!("Route attempts: {}", t.route_attempts);
+                    }
+                    if t.attempts > 0 {
+                        println!("Attempts: {}", t.attempts);
+                    }
+                    if t.review_cycles > 0 {
+                        println!("Review cycles: {}", t.review_cycles);
+                    }
+                    if let Some(pr) = t.pr_number {
+                        if pr > 0 {
+                            println!("PR: #{}", pr);
+                        }
+                    }
+                    if !t.branch.is_empty() {
+                        println!("Branch: {}", t.branch);
+                    }
+                    if !t.last_error.is_empty() {
+                        println!("Last error: {}", truncate_err(&t.last_error, 200));
+                    }
                 }
             }
             // Cost summary (if any tokens recorded)
@@ -1123,23 +1095,19 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     // Task store fields
     {
         {
-            // Agent & model from store
-            if let Some(agent) =
-                store_helpers::opt_store_get_field(&store, &repo, &task_key, "agent").await
-            {
-                println!("Agent: {}", agent);
-            }
-            if let Some(model) =
-                store_helpers::opt_store_get_field(&store, &repo, &task_key, "model").await
-            {
-                println!("Model: {}", model);
-            }
-
-            // Attempts
-            if let Some(attempts) =
-                store_helpers::opt_store_get_field(&store, &repo, &task_key, "attempts").await
-            {
-                println!("Attempts: {}", attempts);
+            // Agent, model, and attempts from store — single DB round-trip.
+            if let Some(ref s) = store {
+                if let Ok(Some(t)) = s.get_by_external_id(&repo, &task_key).await {
+                    if let Some(ref agent) = t.agent {
+                        println!("Agent: {}", agent);
+                    }
+                    if let Some(ref model) = t.model {
+                        println!("Model: {}", model);
+                    }
+                    if t.attempts > 0 {
+                        println!("Attempts: {}", t.attempts);
+                    }
+                }
             }
 
             // Token & cost summary
