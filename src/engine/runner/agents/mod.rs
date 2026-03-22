@@ -321,11 +321,33 @@ pub(crate) mod patterns {
             "credit balance too low",
             "payment required",
         ];
-        if patterns.iter().any(|p| lower.contains(p))
-            || lower.contains("401")
-            || lower.contains("403")
-        {
+        let http_401 = lower.contains("401 unauthorized")
+            || lower.contains("http 401")
+            || lower.contains(": 401");
+        let http_403 = lower.contains("403 forbidden")
+            || lower.contains("http 403")
+            || lower.contains(": 403");
+        if patterns.iter().any(|p| lower.contains(p)) || http_401 || http_403 {
             return Some(AgentError::Auth {
+                message: safe_tail(text, 300),
+            });
+        }
+        None
+    }
+
+    /// Check for transient network connectivity errors.
+    pub fn detect_network_error(text: &str) -> Option<AgentError> {
+        let lower = text.to_lowercase();
+        let patterns = [
+            "connectionrefused",
+            "connection refused",
+            "unable to connect",
+            "econnrefused",
+            "network unreachable",
+        ];
+        if patterns.iter().any(|p| lower.contains(p)) {
+            return Some(AgentError::Unknown {
+                exit_code: 1,
                 message: safe_tail(text, 300),
             });
         }
@@ -481,6 +503,9 @@ pub(crate) mod patterns {
         if let Some(e) = detect_rate_limit(text) {
             return e;
         }
+        if let Some(e) = detect_network_error(text) {
+            return e;
+        }
         if let Some(e) = detect_auth_error(text) {
             return e;
         }
@@ -545,9 +570,29 @@ mod tests {
     #[test]
     fn pattern_detect_auth() {
         assert!(patterns::detect_auth_error("401 Unauthorized").is_some());
+        assert!(patterns::detect_auth_error("HTTP 401").is_some());
+        assert!(patterns::detect_auth_error("error: 401").is_some());
+        assert!(patterns::detect_auth_error("403 Forbidden").is_some());
+        assert!(patterns::detect_auth_error("HTTP 403").is_some());
         assert!(patterns::detect_auth_error("invalid api key").is_some());
         assert!(patterns::detect_auth_error("billing expired").is_some());
         assert!(patterns::detect_auth_error("task done").is_none());
+        // Bare numbers in JSON must NOT trigger auth classification.
+        assert!(patterns::detect_auth_error("duration_api_ms 4010292").is_none());
+        assert!(patterns::detect_auth_error(
+            "API Error: Unable to connect to API (ConnectionRefused) duration_api_ms 4010292"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn pattern_detect_network_error() {
+        assert!(patterns::detect_network_error("connection refused").is_some());
+        assert!(patterns::detect_network_error("ConnectionRefused").is_some());
+        assert!(patterns::detect_network_error("Unable to connect to API").is_some());
+        assert!(patterns::detect_network_error("ECONNREFUSED").is_some());
+        assert!(patterns::detect_network_error("network unreachable").is_some());
+        assert!(patterns::detect_network_error("all systems operational").is_none());
     }
 
     #[test]
