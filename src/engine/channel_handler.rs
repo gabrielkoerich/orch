@@ -342,6 +342,14 @@ pub(super) async fn handle_channel_message(
                 }
             } else {
                 tracing::warn!("no store available, cannot handle control session message");
+                send_channel_reply(
+                    channels,
+                    &channel,
+                    &thread_id,
+                    "No projects configured. Please add a project with `orch project add` before using the control channel.".to_string(),
+                    msg_topic_id.as_deref(),
+                )
+                .await;
             }
         }
 
