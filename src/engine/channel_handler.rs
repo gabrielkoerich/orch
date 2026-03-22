@@ -79,6 +79,23 @@ pub(super) async fn forward_to_tmux(transport: &Arc<Transport>, task_id: &str, t
     }
 }
 
+/// Find the index in `repos` whose computed tmux session name matches `tmux_session`.
+///
+/// This is used to route `TaskSession` slash commands to the correct project backend
+/// in a multi-project setup. Returns `0` (first project) when no match is found so
+/// that single-project deployments continue to work without change.
+fn engine_ref_idx_for_session(
+    repos: &[&str],
+    tmux: &TmuxManager,
+    task_id: &str,
+    tmux_session: &str,
+) -> usize {
+    repos
+        .iter()
+        .position(|repo| tmux.session_name(repo, task_id) == tmux_session)
+        .unwrap_or(0)
+}
+
 /// Handle an incoming channel message by routing it to the appropriate action.
 ///
 /// - `TaskSession`: slash command → execute on task; otherwise → forward to tmux
@@ -122,7 +139,20 @@ pub(super) async fn handle_channel_message(
             if body.starts_with('/') {
                 // Parse slash command and execute it on the bound task
                 if let Some(cmd) = parse_command(&body) {
-                    if let Some((repo, backend, task_manager, store)) = engine_refs.first() {
+                    // Find the engine ref that owns this task by matching the tmux session
+                    // name stored in the transport binding.  In a multi-project setup this
+                    // prevents routing the command to the wrong project's GitHub backend.
+                    // Falls back to the first project when no binding / no match is found.
+                    let repos: Vec<&str> =
+                        engine_refs.iter().map(|(r, _, _, _)| r.as_str()).collect();
+                    let idx = transport
+                        .get_binding(&task_id)
+                        .await
+                        .map(|b| {
+                            engine_ref_idx_for_session(&repos, tmux, &task_id, &b.tmux_session)
+                        })
+                        .unwrap_or(0);
+                    if let Some((repo, backend, task_manager, store)) = engine_refs.get(idx) {
                         let gh = match GhHttp::new() {
                             Ok(gh) => gh,
                             Err(e) => {
@@ -627,6 +657,41 @@ pub(super) async fn handle_stream_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for issue #780: TaskSession slash commands must use the engine_ref
+    /// that owns the task, not always the first one.
+    ///
+    /// In a two-project setup where project-b owns task "42" (its tmux session is
+    /// "orch-project-b-42"), `engine_ref_idx_for_session` must return 1 (project-b),
+    /// not 0 (project-a).
+    #[test]
+    fn engine_ref_idx_for_session_returns_owning_project() {
+        let tmux = TmuxManager::new();
+        let repos: Vec<&str> = vec!["owner/project-a", "owner/project-b"];
+        let task_id = "42";
+        let session_b = tmux.session_name("owner/project-b", task_id); // "orch-project-b-42"
+
+        let idx = engine_ref_idx_for_session(&repos, &tmux, task_id, &session_b);
+        assert_eq!(
+            idx, 1,
+            "should resolve to project-b (index 1), not project-a"
+        );
+    }
+
+    /// Regression test for issue #780: when no session name matches any project,
+    /// fall back to the first engine_ref (index 0) to preserve existing behaviour.
+    #[test]
+    fn engine_ref_idx_for_session_falls_back_to_zero_on_no_match() {
+        let tmux = TmuxManager::new();
+        let repos: Vec<&str> = vec!["owner/project-a", "owner/project-b"];
+        let task_id = "42";
+
+        let idx = engine_ref_idx_for_session(&repos, &tmux, task_id, "orch-unknown-42");
+        assert_eq!(
+            idx, 0,
+            "unknown session should fall back to first project (index 0)"
+        );
+    }
 
     /// Regression test for issue #773: the session name registered in the transport
     /// binding must match the name that TmuxManager uses for the actual tmux session.
