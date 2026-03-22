@@ -607,14 +607,10 @@ pub(crate) async fn review_and_merge(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<ReviewDecision> {
-    // 2. Load worktree path, branch, agent from store
-    let worktree = super::cleanup::store_get_field(store, repo, &task.id.0, "worktree").await;
-    let branch = super::cleanup::store_get_field(store, repo, &task.id.0, "branch").await;
-    let agent_summary = super::cleanup::store_get_field(store, repo, &task.id.0, "summary")
-        .await
-        .unwrap_or_default();
+    // 2. Load worktree path, branch, summary, and pr_number from store — single DB round-trip.
+    let stored_task = store.get_by_external_id(repo, &task.id.0).await.ok().flatten();
 
-    let worktree_path = match worktree {
+    let worktree_path = match stored_task.as_ref().map(|t| t.worktree.as_str()) {
         Some(w) if !w.is_empty() => std::path::PathBuf::from(w),
         _ => {
             tracing::warn!(task_id = task.id.0, "no worktree found for review");
@@ -622,20 +618,26 @@ pub(crate) async fn review_and_merge(
         }
     };
 
-    let branch_name = match branch {
-        Some(b) if !b.is_empty() => b,
+    let branch_name = match stored_task.as_ref().map(|t| t.branch.as_str()) {
+        Some(b) if !b.is_empty() => b.to_string(),
         _ => {
             tracing::warn!(task_id = task.id.0, "no branch found for review");
             return Ok(ReviewDecision::Failed("no branch found".to_string()));
         }
     };
 
+    let agent_summary = stored_task
+        .as_ref()
+        .map(|t| t.summary.clone())
+        .unwrap_or_default();
+
     // 2b. Verify an open PR exists before running the (expensive) review agent.
     // Check the store first (written by the runner right after PR creation) to
     // avoid GitHub's list-API cache race (~300 ms between PR creation and review).
-    let stored_pr_number = super::cleanup::store_get_field(store, repo, &task.id.0, "pr_number")
-        .await
-        .and_then(|s| s.parse::<u64>().ok())
+    let stored_pr_number = stored_task
+        .as_ref()
+        .and_then(|t| t.pr_number)
+        .map(|n| n as u64)
         .filter(|&n| n > 0);
     let gh_check = GhHttp::new()?;
     let pr_number_early = if let Some(n) = stored_pr_number {
