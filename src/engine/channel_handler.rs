@@ -393,6 +393,14 @@ pub(super) async fn handle_channel_message(
                 }
             } else {
                 tracing::warn!("no project configured, cannot create task from channel message");
+                send_channel_reply(
+                    channels,
+                    &channel,
+                    &thread_id,
+                    "No project configured. Cannot create task.".to_string(),
+                    msg_topic_id.as_deref(),
+                )
+                .await;
             }
         }
     }
