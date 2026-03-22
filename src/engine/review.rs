@@ -1690,7 +1690,8 @@ pub(crate) async fn auto_merge_pr(
                     &format!("{}{}", comment, footer),
                 )
                 .await;
-            return Err(e);
+            // Task is already Blocked — return Ok so the caller does not reset to NeedsReview.
+            return Ok(());
         }
 
         // Non-conflict merge failure (permissions, branch protection, etc.)
@@ -1710,7 +1711,8 @@ pub(crate) async fn auto_merge_pr(
                 &format!("{}{}", comment, footer),
             )
             .await;
-        return Err(e);
+        // Task is already Blocked — return Ok so the caller does not reset to NeedsReview.
+        return Ok(());
     }
 
     // 6. Update status to done (auto-closes the issue via backend)
