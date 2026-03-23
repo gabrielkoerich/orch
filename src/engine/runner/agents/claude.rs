@@ -200,7 +200,7 @@ impl AgentRunner for ClaudeRunner {
         };
 
         format!(
-            r#"{timeout_cmd} {binary} -p {model_flag} \
+            r#"{timeout_cmd} {binary} -p --verbose {model_flag} \
   --permission-mode {permission_mode} \
   --output-format stream-json \
   {tool_flag} \
@@ -245,7 +245,10 @@ impl AgentRunner for ClaudeRunner {
     ) -> anyhow::Result<tokio::process::Command> {
         let mut cmd = tokio::process::Command::new(&self.binary);
         cmd.env_remove("CLAUDECODE"); // allow nested invocation
-        cmd.arg("--output-format").arg("stream-json").arg("--print");
+        cmd.arg("--output-format")
+            .arg("stream-json")
+            .arg("--verbose")
+            .arg("--print");
         if let Some(m) = model {
             cmd.arg("--model").arg(m);
         }
