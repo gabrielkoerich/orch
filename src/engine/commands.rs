@@ -362,6 +362,11 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Block(reason) => {
+            if let Some(ref store) = store {
+                if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task_id.0).await {
+                    store.set_block_reason(store_id, reason.as_deref()).await?;
+                }
+            }
             task_manager
                 .update_task_status(task_id, Status::Blocked)
                 .await?;
@@ -372,6 +377,11 @@ pub async fn execute_command(
         }
 
         OwnerCommand::Unblock => {
+            if let Some(ref store) = store {
+                if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task_id.0).await {
+                    store.set_block_reason(store_id, None).await?;
+                }
+            }
             task_manager
                 .update_task_status(task_id, Status::New)
                 .await?;
@@ -393,6 +403,182 @@ pub async fn execute_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Mention, Status};
+    use crate::store::{NewTask, TaskStore};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct MockBackend {
+        task: ExternalTask,
+    }
+
+    impl MockBackend {
+        fn new(id: &str) -> Self {
+            Self {
+                task: ExternalTask {
+                    id: ExternalId(id.to_string()),
+                    title: "Task".to_string(),
+                    body: "".to_string(),
+                    state: "open".to_string(),
+                    labels: vec![],
+                    author: "bot".to_string(),
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    url: "".to_string(),
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExternalBackend for MockBackend {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn create_task(
+            &self,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            Ok(self.task.id.clone())
+        }
+
+        async fn get_task(&self, _id: &ExternalId) -> anyhow::Result<ExternalTask> {
+            Ok(self.task.clone())
+        }
+
+        async fn list_by_status(&self, _status: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+
+        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+
+        async fn post_comment(&self, _id: &ExternalId, _body: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn set_labels(&self, _id: &ExternalId, _labels: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_label(&self, _id: &ExternalId, _label: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+
+        async fn create_sub_task(
+            &self,
+            _parent: &ExternalId,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("child".to_string()))
+        }
+
+        async fn ensure_status_label(&self, _label: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn has_open_issue_with_title(
+            &self,
+            _title: &str,
+            _label: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn is_pr_merged(&self, _branch: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+            Ok(Some("testbot".to_string()))
+        }
+
+        async fn get_mentions(&self, _since: &str) -> anyhow::Result<Vec<Mention>> {
+            Ok(vec![])
+        }
+
+        async fn update_status(&self, _id: &ExternalId, _status: Status) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn block_command_persists_reason_and_unblock_clears_it() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let store_id = store
+            .create(&NewTask {
+                external_id: Some("42".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Task".to_string(),
+                body: "".to_string(),
+                source: "manual".to_string(),
+                source_id: "".to_string(),
+                author: "bot".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new("42"));
+        let backend_for_call = backend.clone();
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend,
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let gh = crate::github::http::GhHttp::new().unwrap();
+        let task_id = ExternalId("42".to_string());
+
+        execute_command(
+            &backend_for_call,
+            &gh,
+            "owner/repo",
+            &task_id,
+            &OwnerCommand::Block(Some("waiting on upstream fix".to_string())),
+            &Some(store.clone()),
+            &task_manager,
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(store_id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::Blocked);
+        assert_eq!(
+            task.block_reason.as_deref(),
+            Some("waiting on upstream fix")
+        );
+
+        execute_command(
+            &backend_for_call,
+            &gh,
+            "owner/repo",
+            &task_id,
+            &OwnerCommand::Unblock,
+            &Some(store.clone()),
+            &task_manager,
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(store_id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::New);
+        assert!(task.block_reason.is_none());
+    }
 
     #[test]
     fn parse_retry() {
