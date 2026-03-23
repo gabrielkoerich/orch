@@ -465,6 +465,7 @@ pub(crate) async fn tick_route_tasks(
 
 /// Phase 3b of tick: spawn agents for all status:routed tasks up to the parallel limit.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, name = "engine.tick.phase3b.dispatch")]
 pub(crate) async fn tick_dispatch_tasks(
     backend: &Arc<dyn ExternalBackend>,
     tmux: &Arc<TmuxManager>,
@@ -479,7 +480,6 @@ pub(crate) async fn tick_dispatch_tasks(
     dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
-    let _span = tracing::info_span!("engine.tick.phase3b.dispatch").entered();
     // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
     // but we keep this filter as defense-in-depth.
     let mut routed_tasks = task_manager.list_external_by_status(Status::Routed).await?;

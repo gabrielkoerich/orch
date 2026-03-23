@@ -27,7 +27,6 @@ pub struct EventBus {
     tx: broadcast::Sender<TaskEvent>,
 }
 
-#[allow(dead_code)]
 impl EventBus {
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
@@ -45,6 +44,7 @@ impl EventBus {
     }
 
     /// Publish an event. Returns number of receivers that got it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn publish(&self, event: TaskEvent) -> usize {
         self.tx.send(event).unwrap_or(0)
     }
@@ -131,7 +131,6 @@ pub fn select_available_port() -> anyhow::Result<u16> {
 }
 
 /// Remove the ws.port file on shutdown.
-#[allow(dead_code)]
 pub fn cleanup_port_file() {
     if let Ok(state_dir) = crate::home::state_dir() {
         let _ = std::fs::remove_file(state_dir.join("ws.port"));

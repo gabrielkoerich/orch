@@ -20,6 +20,7 @@ pub mod jobs;
 pub mod review;
 pub mod router;
 pub mod runner;
+pub mod subscribers;
 pub mod sync;
 pub mod tasks;
 pub mod tick;
@@ -369,12 +370,22 @@ pub async fn serve() -> anyhow::Result<()> {
         "initialized project engines"
     );
 
-    // Re-create task managers with shared store
+    // Create the event bus for task status transitions
+    let event_bus = events::EventBus::new(256);
+    if let Err(e) = event_bus.start_ws_server().await {
+        tracing::warn!(
+            ?e,
+            "failed to start event websocket server, continuing without it"
+        );
+    }
+
+    // Re-create task managers with shared store and event bus
     for engine in &mut project_engines {
-        engine.task_manager = Arc::new(TaskManager::with_store(
+        engine.task_manager = Arc::new(TaskManager::with_events(
             engine.backend.clone(),
             engine.store.clone(),
             engine.repo.clone(),
+            event_bus.sender(),
         ));
     }
 
@@ -924,6 +935,47 @@ pub async fn serve() -> anyhow::Result<()> {
         }
     }
 
+    // Spawn dispatch subscribers — react to Routed events immediately
+    for engine in &project_engines {
+        subscribers::dispatch::spawn(
+            event_bus.subscribe(),
+            engine.backend.clone(),
+            tmux.clone(),
+            engine.runner.clone(),
+            capture_for_tick.clone(),
+            semaphore.clone(),
+            engine.task_manager.clone(),
+            weight_tx.clone(),
+            transport.clone(),
+            router.clone(),
+            dispatching.clone(),
+            engine.store.clone(),
+            engine.repo.clone(),
+        );
+    }
+    tracing::info!("dispatch subscriber started");
+
+    // Spawn review subscribers — react to NeedsReview events immediately
+    for engine in &project_engines {
+        subscribers::review::spawn(
+            event_bus.subscribe(),
+            engine.backend.clone(),
+            tmux.clone(),
+            semaphore.clone(),
+            engine.task_manager.clone(),
+            router.clone(),
+            dispatching.clone(),
+            engine.store.clone(),
+            engine.repo.clone(),
+        );
+    }
+    tracing::info!("review subscriber started");
+
+    // Spawn notify subscriber — reacts to ALL events, pushes to transport.
+    // Spawned once (not per-project) since the transport handles all repos.
+    subscribers::notify::spawn(event_bus.subscribe(), transport.clone());
+    tracing::info!("notify subscriber started");
+
     // Main loop
     tracing::info!(
         tick = ?config.tick_interval,
@@ -1185,6 +1237,9 @@ pub async fn serve() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Clean up event bus port file
+    events::cleanup_port_file();
 
     // transport and channels drop here at end of scope
     let _ = transport;
