@@ -163,6 +163,116 @@ fn toggle_job(id: &str, enabled: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run a single job immediately, ignoring its cron schedule.
+///
+/// Searches all projects for the job ID. If the ID exists in multiple projects,
+/// requires `--project` to disambiguate.
+pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
+    use crate::backends::github::GitHubBackend;
+    use crate::backends::ExternalBackend;
+
+    // 1. If inside an orch project (or --project given), try that first
+    let mut resolved: Option<(String, jobs::Job)> = None;
+
+    if project.is_none() {
+        // Check if CWD is inside an orch project
+        if let Ok(cwd_repo) = config::get_current_repo() {
+            let jobs_path = jobs::resolve_jobs_path();
+            if let Ok(all_jobs) = jobs::load_jobs(&jobs_path) {
+                if let Some(job) = all_jobs.into_iter().find(|j| j.id == job_id) {
+                    resolved = Some((cwd_repo, job));
+                }
+            }
+        }
+    }
+
+    // 2. If not resolved locally, search all projects
+    if resolved.is_none() {
+        let mut matches: Vec<(String, jobs::Job)> = Vec::new();
+
+        let projects = crate::config::get_projects_with_paths().unwrap_or_default();
+        for (repo, dir) in &projects {
+            if let Some(filter) = project {
+                if !repo.contains(filter) {
+                    continue;
+                }
+            }
+            let orch_yml = dir.join(".orch.yml");
+            if let Ok(all_jobs) = jobs::load_jobs(&orch_yml) {
+                for job in all_jobs {
+                    if job.id == job_id {
+                        matches.push((repo.clone(), job));
+                    }
+                }
+            }
+        }
+
+        match matches.len() {
+            0 => anyhow::bail!("job '{}' not found in any project", job_id),
+            1 => resolved = Some(matches.into_iter().next().unwrap()),
+            _ => {
+                let repos: Vec<&str> = matches.iter().map(|(r, _)| r.as_str()).collect();
+                anyhow::bail!(
+                    "job '{}' exists in multiple projects: {}\nUse --project to specify which one, e.g.: orch job run {} --project {}",
+                    job_id,
+                    repos.join(", "),
+                    job_id,
+                    repos[0],
+                );
+            }
+        }
+    }
+
+    let (repo, job) = resolved.unwrap();
+
+    if !job.enabled {
+        println!("Warning: job '{}' is disabled, running anyway", job_id);
+    }
+
+    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
+    let store = crate::cli::init_store().await.ok().map(Arc::new);
+
+    // Load or create job state
+    let mut state = if let Some(ref s) = store {
+        s.get_job_state(&repo, job_id)
+            .await?
+            .unwrap_or_else(|| crate::store::JobState {
+                repo: repo.clone(),
+                job_id: job_id.to_string(),
+                last_run: None,
+                last_task_status: None,
+                active_task_id: None,
+            })
+    } else {
+        crate::store::JobState {
+            repo: repo.clone(),
+            job_id: job_id.to_string(),
+            last_run: None,
+            last_task_status: None,
+            active_task_id: None,
+        }
+    };
+
+    println!("Running job '{}' ({}) in {}", job_id, job.r#type, repo);
+
+    jobs::execute_job(&job, &mut state, &backend, store.as_ref(), &repo).await;
+
+    // Update last_run and persist
+    state.last_run = Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+    if let Some(ref s) = store {
+        s.upsert_job_state(&state).await?;
+    }
+
+    let status = state.last_task_status.as_deref().unwrap_or("unknown");
+    if let Some(ref task_id) = state.active_task_id {
+        println!("Done (status: {}, task: {})", status, task_id);
+    } else {
+        println!("Done (status: {})", status);
+    }
+
+    Ok(())
+}
+
 /// Run one job scheduler tick.
 pub async fn tick() -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
