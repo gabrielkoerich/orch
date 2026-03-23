@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod cost;
 pub mod dashboard;
+pub mod events;
 pub mod job;
 pub mod service;
 pub mod stats;

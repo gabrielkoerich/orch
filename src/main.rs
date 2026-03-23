@@ -236,6 +236,15 @@ enum Commands {
         /// Shell type
         shell: Shell,
     },
+    /// Stream task events in real-time
+    Events {
+        /// Filter by repo (substring match)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Filter by task ID
+        #[arg(long)]
+        task: Option<String>,
+    },
     /// Webhook server management
     Webhook {
         #[command(subcommand)]
@@ -362,6 +371,11 @@ enum TaskAction {
         /// Optional note to add as a comment on external tasks
         #[arg(short, long)]
         note: Option<String>,
+    },
+    /// Watch a task's status changes in real-time
+    Watch {
+        /// Task ID
+        id: String,
     },
 }
 
@@ -581,6 +595,9 @@ async fn main() -> anyhow::Result<()> {
             TaskAction::Close { id, note } => {
                 cli::task::close(&id, note.as_deref()).await?;
             }
+            TaskAction::Watch { id } => {
+                cli::events::stream(None, Some(&id)).await?;
+            }
         },
         Commands::Job { action } => match action {
             JobAction::List => {
@@ -688,6 +705,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(shell, &mut cmd, "orch", &mut std::io::stdout());
+        }
+        Commands::Events { repo, task } => {
+            cli::events::stream(repo.as_deref(), task.as_deref()).await?;
         }
         Commands::Webhook { action } => match action {
             WebhookAction::Status => {
