@@ -341,14 +341,25 @@ impl TaskStore {
 
     /// Update the status of a task.
     pub async fn update_status(&self, id: i64, status: TaskStatus) -> anyhow::Result<()> {
-        sqlx::query(
-        "UPDATE tasks SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
-    )
-    .bind(status.as_str())
-    .bind(id)
-    .execute(&self.pool)
-    .await?;
+        let sql = if status == TaskStatus::Blocked {
+            "UPDATE tasks SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
+        } else {
+            "UPDATE tasks SET status = ?, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
+        };
+        sqlx::query(sql)
+            .bind(status.as_str())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
+    }
+
+    /// Update the block reason for a task.
+    pub async fn set_block_reason(&self, id: i64, reason: Option<&str>) -> anyhow::Result<()> {
+        let value = reason
+            .map(|r| serde_json::Value::String(r.to_string()))
+            .unwrap_or(serde_json::Value::Null);
+        self.set_fields(id, &[("block_reason", value)]).await
     }
 
     /// List tasks by status within a repo.

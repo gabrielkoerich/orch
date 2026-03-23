@@ -345,6 +345,9 @@ impl TaskManager {
                 .resolve_task_id(&self.repo, &id.0)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("internal task {} not found in store", id.0))?;
+            if task_status != TaskStatus::Blocked {
+                store.set_block_reason(store_id, None).await?;
+            }
             store.update_status(store_id, task_status).await?;
             // Publish event to bus only after confirmed update
             self.publish_event(id, status, &pre_snapshot);
@@ -355,6 +358,9 @@ impl TaskManager {
         // SQLite is the source of truth; backend sync is best-effort.
         if let Some(ref store) = self.store {
             if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &id.0).await {
+                if task_status != TaskStatus::Blocked {
+                    store.set_block_reason(store_id, None).await?;
+                }
                 store.update_status(store_id, task_status).await?;
             }
         }
