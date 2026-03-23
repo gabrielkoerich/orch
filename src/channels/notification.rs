@@ -13,8 +13,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationLevel {
-    /// Broadcast all task completions.
+    /// Broadcast terminal/meaningful completions only: done, needs_review, blocked, failed.
+    /// Intermediate transitions (new, routed, in_progress, in_review) are suppressed.
+    /// This restores pre-event-bus behavior.
     All,
+    /// Broadcast every status transition, including intermediate states.
+    Verbose,
     /// Only broadcast errors (needs_review, blocked, failed).
     ErrorsOnly,
     /// Disable notifications entirely.
@@ -27,6 +31,7 @@ impl NotificationLevel {
         match crate::config::get("notifications.level") {
             Ok(val) => match val.as_str() {
                 "all" => Self::All,
+                "verbose" => Self::Verbose,
                 "errors_only" => Self::ErrorsOnly,
                 "none" => Self::None,
                 _ => Self::All,
@@ -38,7 +43,8 @@ impl NotificationLevel {
     /// Whether a notification with this status should be sent.
     pub fn should_notify(&self, status: &str) -> bool {
         match self {
-            Self::All => true,
+            Self::All => matches!(status, "done" | "needs_review" | "blocked" | "failed"),
+            Self::Verbose => true,
             Self::ErrorsOnly => {
                 matches!(status, "needs_review" | "blocked" | "failed")
             }
@@ -187,13 +193,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn notification_level_should_notify_all() {
+    fn notification_level_should_notify_all_terminal_only() {
         let level = NotificationLevel::All;
+        // Terminal/meaningful states — should notify
         assert!(level.should_notify("done"));
-        assert!(level.should_notify("in_progress"));
         assert!(level.should_notify("needs_review"));
         assert!(level.should_notify("blocked"));
         assert!(level.should_notify("failed"));
+        // Intermediate states — should NOT notify
+        assert!(!level.should_notify("new"));
+        assert!(!level.should_notify("routed"));
+        assert!(!level.should_notify("in_progress"));
+        assert!(!level.should_notify("in_review"));
+    }
+
+    #[test]
+    fn notification_level_should_notify_verbose_fires_for_all() {
+        let level = NotificationLevel::Verbose;
+        assert!(level.should_notify("done"));
+        assert!(level.should_notify("needs_review"));
+        assert!(level.should_notify("blocked"));
+        assert!(level.should_notify("failed"));
+        assert!(level.should_notify("new"));
+        assert!(level.should_notify("routed"));
+        assert!(level.should_notify("in_progress"));
+        assert!(level.should_notify("in_review"));
     }
 
     #[test]
