@@ -124,7 +124,8 @@ pub fn spawn(
                         guard.insert(dispatch_key.clone());
                     }
                     // RAII guard — removes dispatch_key on drop even if the spawned task panics.
-                    let dispatch_guard = DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
+                    let dispatch_guard =
+                        DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
 
                     let backend_c = backend.clone();
                     let task_manager_c = task_manager.clone();
