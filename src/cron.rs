@@ -13,7 +13,7 @@ use std::str::FromStr;
 
 /// Normalize day-of-week field: standard cron allows 0 for Sunday, but the
 /// `cron` crate only accepts 1-7 (Sun=1). Replace standalone `0` with `7`.
-fn normalize_dow(expression: &str) -> String {
+pub fn normalize_dow(expression: &str) -> String {
     let fields: Vec<&str> = expression.split_whitespace().collect();
     if fields.len() != 5 {
         return expression.to_string();
