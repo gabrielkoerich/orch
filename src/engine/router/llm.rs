@@ -352,13 +352,33 @@ impl LlmRouter {
 
     /// Parse the LLM response into a structured format.
     ///
-    /// Handles: direct JSON, Claude `--output-format json` envelopes,
-    /// markdown code blocks, and raw text with embedded JSON.
+    /// Handles: direct JSON, Claude `--output-format stream-json` NDJSON,
+    /// Claude `--output-format json` envelopes, markdown code blocks, and raw
+    /// text with embedded JSON.
     pub fn parse_llm_response(&self, response: &str) -> anyhow::Result<LlmRouteResponse> {
         let trimmed = response.trim();
         if trimmed.is_empty() {
             anyhow::bail!("empty LLM response");
         }
+
+        // Pre-step: if this is Claude NDJSON (--output-format stream-json), find the
+        // last "type":"result" line. This normalises NDJSON to the same single-line
+        // envelope that step 1 already knows how to unwrap.
+        let trimmed = trimmed
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .find(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("type")
+                            .and_then(|t| t.as_str())
+                            .map(|t| t == "result")
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(trimmed);
 
         // Step 1: Unwrap Claude JSON envelope if present.
         // Claude --output-format json returns {"type":"result","result":"...","usage":{...}}
