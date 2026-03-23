@@ -11,8 +11,6 @@
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
-use crate::channels::notification::TaskNotification;
-use crate::channels::transport::Transport;
 use crate::config;
 use crate::engine::jobs;
 use crate::engine::router::{get_route_result, Router};
@@ -476,7 +474,6 @@ pub(crate) async fn tick_dispatch_tasks(
     semaphore: &Arc<Semaphore>,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
-    transport: &Arc<Transport>,
     router_arc: &Arc<RwLock<Router>>,
     dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     store: &Arc<TaskStore>,
@@ -563,7 +560,6 @@ pub(crate) async fn tick_dispatch_tasks(
         let backend = backend.clone();
         let tmux = tmux.clone();
         let capture = capture.clone();
-        let transport = transport.clone();
         let router_clone = router_arc.clone();
         let task_id_for_cleanup = task_id.clone();
         let task_owned = task.clone();
@@ -576,10 +572,6 @@ pub(crate) async fn tick_dispatch_tasks(
 
         // Load routing result from store (stored during Phase 3a)
         let route_result = get_route_result(store, repo, &task_id).await.ok();
-        let agent_name = route_result
-            .as_ref()
-            .map(|r| r.agent.clone())
-            .unwrap_or_else(|| "claude".to_string());
 
         let repo_ctx = repo_owned.clone();
         tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
@@ -599,10 +591,6 @@ pub(crate) async fn tick_dispatch_tasks(
                 Ok(signal) => {
                     tracing::info!(task_id, "task runner completed");
 
-                    // Send task completion notification
-                    let summary = super::cleanup::store_get_field(&store_for_spawn, &repo_owned, &task_id, "summary")
-                        .await
-                        .unwrap_or_default();
                     let duration = dispatch_start.elapsed().as_secs_f64();
 
                     // Derive a display status from the weight signal.
@@ -633,16 +621,6 @@ pub(crate) async fn tick_dispatch_tasks(
                         WeightSignal::None => "needs_review",
                     };
 
-                    transport.push_notification(TaskNotification {
-                        task_id: task_id.clone(),
-                        title: task_owned.title.clone(),
-                        status: display_status.to_string(),
-                        agent: agent_name.clone(),
-                        duration_seconds: duration,
-                        summary: summary.clone(),
-                        repo: Some(repo_owned.clone()),
-                    });
-
                     // Send weight signal back to the router
                     let _ = weight_tx.send(signal).await;
 
@@ -654,8 +632,19 @@ pub(crate) async fn tick_dispatch_tasks(
                             .map(|v| v != "false")
                             .unwrap_or(true);
                         tracing::info!(task_id, enable_review, "review gate check");
-                        if enable_review {
-                            // Transition to InReview — atomic guard against duplicate reviews.
+                        // Transition to NeedsReview — emits event so notify subscriber fires
+                        // with the correct duration before the review agent starts.
+                        if let Err(e) = task_manager_for_spawn
+                            .update_task_status_with_duration(
+                                &ExternalId(task_id.clone()),
+                                Status::NeedsReview,
+                                Some(duration),
+                            )
+                            .await
+                        {
+                            tracing::error!(task_id, err = %e, "update_task_status(NeedsReview) failed — task may be stuck");
+                        } else if enable_review {
+                            // Atomic guard: transition to InReview prevents duplicate review spawns.
                             match task_manager_for_spawn
                                 .update_task_status(
                                     &ExternalId(task_id.clone()),
@@ -834,17 +823,6 @@ pub(crate) async fn tick_dispatch_tasks(
                                     }));
                                 }
                             }
-                        } else {
-                            // Review disabled: persist needs_review status.
-                            if let Err(e) = task_manager_for_spawn
-                                .update_task_status(
-                                    &ExternalId(task_id.clone()),
-                                    Status::NeedsReview,
-                                )
-                                .await
-                            {
-                                tracing::error!(task_id, err = %e, "update_task_status(NeedsReview) failed — task may be stuck");
-                            }
                         }
                     } else {
                         // done, blocked, or new (rate-limited): update status directly.
@@ -854,7 +832,11 @@ pub(crate) async fn tick_dispatch_tasks(
                             _ => Status::New,
                         };
                         if let Err(e) = task_manager_for_spawn
-                            .update_task_status(&ExternalId(task_id.clone()), final_status)
+                            .update_task_status_with_duration(
+                                &ExternalId(task_id.clone()),
+                                final_status,
+                                Some(duration),
+                            )
                             .await
                         {
                             tracing::warn!(task_id, ?e, "failed to update task status after completion");
@@ -863,10 +845,15 @@ pub(crate) async fn tick_dispatch_tasks(
                 }
                 Err(e) => {
                     tracing::error!(task_id, ?e, "task runner failed");
+                    let duration = dispatch_start.elapsed().as_secs_f64();
                     if is_internal_id(&task_id) {
                         // Internal tasks have no GitHub issue to comment on.
                         if let Err(ue) = task_manager_for_spawn
-                            .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
+                            .update_task_status_with_duration(
+                                &ExternalId(task_id.clone()),
+                                Status::NeedsReview,
+                                Some(duration),
+                            )
                             .await
                         {
                             tracing::error!(task_id, err = %ue, "update_task_status(NeedsReview) failed — task may be stuck");
@@ -892,25 +879,18 @@ pub(crate) async fn tick_dispatch_tasks(
                         }
                         // Update status immediately to NeedsReview so external tasks
                         // don't remain stuck in InProgress until the no-session timeout.
+                        // The notify subscriber will send the channel notification with duration.
                         if let Err(ue) = task_manager_for_spawn
-                            .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
+                            .update_task_status_with_duration(
+                                &ExternalId(task_id.clone()),
+                                Status::NeedsReview,
+                                Some(duration),
+                            )
                             .await
                         {
                             tracing::error!(task_id, err = %ue, "update_task_status(NeedsReview) failed — task may be stuck");
                         }
                     }
-
-                    // Send error notification
-                    let duration = dispatch_start.elapsed().as_secs_f64();
-                    transport.push_notification(TaskNotification {
-                        task_id: task_id.clone(),
-                        title: task_owned.title.clone(),
-                        status: "failed".to_string(),
-                        agent: agent_name.clone(),
-                        duration_seconds: duration,
-                        summary: format!("Task runner failed: {e}"),
-                        repo: Some(repo_owned.clone()),
-                    });
                 }
             }
 
@@ -1023,7 +1003,6 @@ pub(crate) async fn tick(
     router_arc: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
-    transport: &Arc<Transport>,
     dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
@@ -1040,7 +1019,6 @@ pub(crate) async fn tick(
         semaphore,
         task_manager,
         weight_tx,
-        transport,
         router_arc,
         dispatching,
         store,

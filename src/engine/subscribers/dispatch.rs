@@ -2,7 +2,6 @@
 
 use crate::backends::ExternalBackend;
 use crate::channels::capture::CaptureService;
-use crate::channels::transport::Transport;
 use crate::engine::events::TaskEvent;
 use crate::engine::router::Router;
 use crate::engine::runner::{TaskRunner, WeightSignal};
@@ -29,7 +28,6 @@ pub fn spawn(
     semaphore: Arc<Semaphore>,
     task_manager: Arc<TaskManager>,
     weight_tx: mpsc::Sender<WeightSignal>,
-    transport: Arc<Transport>,
     router_arc: Arc<RwLock<Router>>,
     dispatching: Arc<std::sync::Mutex<HashSet<String>>>,
     store: Arc<TaskStore>,
@@ -52,7 +50,6 @@ pub fn spawn(
                         &semaphore,
                         &task_manager,
                         &weight_tx,
-                        &transport,
                         &router_arc,
                         &dispatching,
                         &store,
