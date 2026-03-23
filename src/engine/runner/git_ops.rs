@@ -323,14 +323,29 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
         return Ok(false);
     }
 
-    // Check if there are commits to push
-    let has_unpushed = has_unpushed_commits(dir, branch_to_push, default_branch).await;
-    if !has_unpushed {
+    // Check if there are commits to push and whether the remote branch exists
+    let (remote_exists, has_unpushed) =
+        check_push_needed(dir, branch_to_push, default_branch).await;
+    if remote_exists && !has_unpushed {
+        // Remote already has this branch and it's up to date — nothing to push.
+        // Return true so callers know the branch IS on the remote and PR creation
+        // is safe to attempt (e.g. a PR may already exist or can be created).
         tracing::debug!(
             branch = branch_to_push,
-            "no unpushed commits detected, skipping push"
+            "remote branch exists and is up to date, skipping push"
         );
-        return Ok(false);
+        return Ok(true);
+    }
+    if !remote_exists && !has_unpushed {
+        // Branch doesn't exist on the remote and has no commits ahead of the
+        // default branch — push it anyway so the branch is created on the remote.
+        // PR creation will then fail with "No commits between …" (422) which is
+        // handled downstream, rather than with "head invalid" (422) which is
+        // harder to distinguish from a real error.
+        tracing::debug!(
+            branch = branch_to_push,
+            "remote branch missing with no new commits — pushing to create it on remote"
+        );
     }
 
     tracing::info!(branch = branch_to_push, "pushing branch");
@@ -593,7 +608,13 @@ pub async fn count_changed_files(dir: &Path) -> anyhow::Result<usize> {
 }
 
 /// Check if there are unpushed commits.
-async fn has_unpushed_commits(dir: &Path, branch: &str, default_branch: &str) -> bool {
+/// Returns `(remote_exists, has_unpushed_commits)`.
+///
+/// - `remote_exists` — whether `origin/<branch>` is known to the local repo.
+/// - `has_unpushed_commits` — whether there are local commits not yet on the
+///   remote.  When the remote branch doesn't exist the comparison is against
+///   `origin/<default_branch>` so we can still detect new work.
+async fn check_push_needed(dir: &Path, branch: &str, default_branch: &str) -> (bool, bool) {
     // Check if remote tracking branch exists
     let remote_exists = Command::new("git")
         .args(["rev-parse", &format!("origin/{branch}")])
@@ -624,7 +645,7 @@ async fn has_unpushed_commits(dir: &Path, branch: &str, default_branch: &str) ->
         .output_with_context()
         .await;
 
-    match output {
+    let has_unpushed = match output {
         Ok(o) if o.status.success() => {
             let out = String::from_utf8_lossy(&o.stdout);
             let has = !out.trim().is_empty();
@@ -637,7 +658,9 @@ async fn has_unpushed_commits(dir: &Path, branch: &str, default_branch: &str) ->
             // (better to attempt push and let it fail than silently skip)
             true
         }
-    }
+    };
+
+    (remote_exists, has_unpushed)
 }
 
 #[cfg(test)]
