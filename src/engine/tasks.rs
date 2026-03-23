@@ -116,7 +116,6 @@ impl TaskManager {
     }
 
     /// Create a TaskManager with event bus support.
-    #[allow(dead_code)] // Will be wired in engine init (Task 5+)
     pub fn with_events(
         backend: Arc<dyn ExternalBackend>,
         store: Arc<TaskStore>,

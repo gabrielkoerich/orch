@@ -232,6 +232,9 @@ pub fn spawn(
                         };
                         match outcome {
                             ReviewOutcome::Reset => {
+                                // Backoff before re-queuing to prevent rapid spin
+                                // if the review agent keeps failing instantly.
+                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                                 if let Err(e) = task_manager_c
                                     .update_task_status(
                                         &ExternalId(tid.clone()),
