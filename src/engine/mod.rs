@@ -971,6 +971,17 @@ pub async fn serve() -> anyhow::Result<()> {
     }
     tracing::info!("review subscriber started");
 
+    // Spawn unblock subscribers — react to Done events, unblock parent tasks immediately
+    for engine in &project_engines {
+        subscribers::unblock::spawn(
+            event_bus.subscribe(),
+            engine.backend.clone(),
+            engine.task_manager.clone(),
+            engine.repo.clone(),
+        );
+    }
+    tracing::info!("unblock subscriber started");
+
     // Spawn notify subscriber — reacts to ALL events, pushes to transport.
     // Spawned once (not per-project) since the transport handles all repos.
     subscribers::notify::spawn(event_bus.subscribe(), transport.clone());
