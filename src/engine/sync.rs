@@ -201,6 +201,81 @@ pub(crate) async fn sync_tick(
         }
     }
 
+    // 5b. Re-fire events for stale NeedsReview tasks.
+    //
+    // Two cases where the event-driven subscriber in `subscribers/review.rs` can miss
+    // a NeedsReview task:
+    // 1. All review slots are busy when the NeedsReview event fires — subscriber skips
+    //    with `try_acquire_owned()`, task stays in NeedsReview with no future trigger.
+    // 2. The broadcast receiver lagged (fell behind) — NeedsReview events were dropped.
+    //
+    // For both cases: re-publish the NeedsReview status after a short idle window so the
+    // subscriber can pick it up when a slot is free. Using `update_task_status` (re-fire)
+    // rather than spawning the review agent directly keeps this path stateless and avoids
+    // re-introducing the double-trigger race fixed in issue #857 — the subscriber is still
+    // the sole spawner and uses the InReview transition as its atomic guard.
+    if enable_review {
+        let needs_review_tasks = if store.has_tasks(repo).await {
+            store
+                .list_by_status(repo, TaskStatus::NeedsReview)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(crate::engine::tasks::store_task_to_external)
+                .collect::<Vec<_>>()
+        } else {
+            let mut tasks = backend
+                .list_by_status(Status::NeedsReview)
+                .await
+                .unwrap_or_default();
+            if let Ok(internal) = task_manager
+                .list_internal_by_status(TaskStatus::NeedsReview)
+                .await
+            {
+                tasks.extend(internal);
+            }
+            tasks
+        };
+
+        const MIN_STALE_NEEDS_REVIEW_MINUTES: i64 = 5;
+        for task in needs_review_tasks {
+            // Only retry tasks that have been in NeedsReview long enough that the
+            // subscriber should have handled them by now. Fresh tasks (just transitioned)
+            // are likely still in flight via the event bus. Unparseable timestamps are
+            // treated as stale (fall through to retry).
+            if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
+                let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
+                if age.num_minutes() < MIN_STALE_NEEDS_REVIEW_MINUTES {
+                    continue;
+                }
+            }
+
+            // Skip tasks actively being dispatched (subscriber is working on them).
+            let dispatch_key = format!("{}/{}", repo, task.id.0);
+            {
+                let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.contains(&dispatch_key) {
+                    continue;
+                }
+            }
+
+            tracing::info!(
+                task_id = task.id.0,
+                "sync catch-up: re-firing NeedsReview event for stale task"
+            );
+            if let Err(e) = task_manager
+                .update_task_status(&task.id, Status::NeedsReview)
+                .await
+            {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    err = %e,
+                    "sync catch-up: failed to re-fire NeedsReview event"
+                );
+            }
+        }
+    }
+
     // 6. Scan for owner /slash commands in issue comments
     if let Err(e) =
         super::commands::scan_commands(backend, repo, &Some(Arc::clone(store)), task_manager).await

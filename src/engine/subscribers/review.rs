@@ -103,7 +103,7 @@ pub fn spawn(
                     let permit = match semaphore.clone().try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
-                            tracing::debug!(task_id, "all parallel slots busy, sync will catch up");
+                            tracing::debug!(task_id, "all parallel slots busy; sync catch-up will re-fire when a slot opens");
                             continue;
                         }
                     };
@@ -268,7 +268,7 @@ pub fn spawn(
                 }
                 Ok(_) => {} // Not a needs_review event or different repo
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::debug!(n, "review subscriber lagged, sync will catch up");
+                    tracing::debug!(n, "review subscriber lagged; sync catch-up will re-fire missed NeedsReview tasks");
                 }
                 Err(_) => break, // Channel closed
             }
