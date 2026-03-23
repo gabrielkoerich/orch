@@ -119,12 +119,9 @@ unset CLAUDECODE  # allow nested claude invocations from orchestrator
 
 cd "{work_dir}"
 
-# Run agent
-RESPONSE=$({agent_cmd} 2>"{attempt_dir}/stderr.txt") || CMD_STATUS=$?
-CMD_STATUS=${{CMD_STATUS:-0}}
-
-# Save response
-printf '%s' "$RESPONSE" > "{output_file}"
+# Run agent — tee to both output file and terminal (tmux pane) for live streaming
+{agent_cmd} 2>"{attempt_dir}/stderr.txt" | tee "{output_file}"
+CMD_STATUS=${{PIPESTATUS[0]:-0}}
 
 # Save exit status
 echo "$CMD_STATUS" > "{status_file}"
