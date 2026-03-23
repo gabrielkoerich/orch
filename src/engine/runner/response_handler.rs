@@ -127,33 +127,47 @@ pub async fn handle_success(
             .await;
         }
 
+        // Skip push + PR if there are no commits ahead of the default branch.
+        // No-op tasks (e.g. "nothing to execute") produce no commits, so pushing
+        // and creating a PR would just waste API calls and trigger 422 errors.
+        let has_commits = git_ops::has_commits_ahead(&wt.work_dir, &wt.default_branch).await;
+        if !has_commits {
+            tracing::info!(
+                task_id,
+                "no commits ahead of default branch, skipping push + PR"
+            );
+        }
+
         // Push
-        let push_ok = match git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await
-        {
-            Ok(_) => {
-                has_pushed = true;
-                // Clear any stale push failure from a previous run so review_and_merge
-                // does not incorrectly block an approved task.
-                crate::engine::cleanup::store_set(
-                    store,
-                    repo,
-                    task_id,
-                    &[("last_error", serde_json::json!(""))],
-                )
-                .await;
-                true
-            }
-            Err(e) => {
-                tracing::error!(task_id, error = ?e, "push failed");
-                let msg = format!("push failed: {e}");
-                crate::engine::cleanup::store_set(
-                    store,
-                    repo,
-                    task_id,
-                    &[("last_error", serde_json::json!(msg))],
-                )
-                .await;
-                false
+        let push_ok = if !has_commits {
+            false
+        } else {
+            match git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await {
+                Ok(_) => {
+                    has_pushed = true;
+                    // Clear any stale push failure from a previous run so review_and_merge
+                    // does not incorrectly block an approved task.
+                    crate::engine::cleanup::store_set(
+                        store,
+                        repo,
+                        task_id,
+                        &[("last_error", serde_json::json!(""))],
+                    )
+                    .await;
+                    true
+                }
+                Err(e) => {
+                    tracing::error!(task_id, error = ?e, "push failed");
+                    let msg = format!("push failed: {e}");
+                    crate::engine::cleanup::store_set(
+                        store,
+                        repo,
+                        task_id,
+                        &[("last_error", serde_json::json!(msg))],
+                    )
+                    .await;
+                    false
+                }
             }
         };
 

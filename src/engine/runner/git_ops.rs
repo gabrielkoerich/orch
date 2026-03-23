@@ -35,6 +35,29 @@ pub enum PrCreateError {
 /// Result type for PR creation operations.
 pub type PrCreateResult<T> = Result<T, PrCreateError>;
 
+/// Check if the current branch has any commits ahead of the default branch.
+pub async fn has_commits_ahead(dir: &Path, default_branch: &str) -> bool {
+    let output = Command::new("git")
+        .args([
+            "rev-list",
+            "--count",
+            &format!("origin/{default_branch}..HEAD"),
+        ])
+        .current_dir(dir)
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            let count: u32 = String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            count > 0
+        }
+        _ => false,
+    }
+}
+
 /// Check if there are uncommitted changes in the working directory.
 pub async fn has_changes(dir: &Path) -> bool {
     // Check for staged, unstaged, and untracked files
