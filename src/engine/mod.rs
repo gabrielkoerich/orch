@@ -518,6 +518,9 @@ pub async fn serve() -> anyhow::Result<()> {
             )
         })
         .collect();
+    // Shared in-memory map for pending project picks (General channel multi-project picker).
+    let pending_picks: channel_handler::PendingPicks =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let router_for_messages = channel_router.clone();
     for mut rx in channel_receivers {
         let transport = transport_for_messages.clone();
@@ -526,6 +529,7 @@ pub async fn serve() -> anyhow::Result<()> {
         let channels = channels_for_messages.clone();
         let engine_refs = engine_refs.clone();
         let ch_router = router_for_messages.clone();
+        let picks = pending_picks.clone();
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 tracing::debug!(channel = %msg.channel, thread = %msg.thread_id, "received message from channel");
@@ -537,6 +541,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     &channels,
                     &engine_refs,
                     &ch_router,
+                    &picks,
                 )
                 .await;
             }

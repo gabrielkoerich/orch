@@ -337,7 +337,31 @@ impl Channel for TelegramChannel {
             .map_err(|_| anyhow::anyhow!("invalid chat_id"))?;
 
         let topic_id = msg.topic_id.as_ref().and_then(|t| t.parse::<i64>().ok());
+
+        // If metadata carries inline keyboard buttons, send as interactive message.
+        if let Some(buttons_val) = msg.metadata.get("buttons") {
+            if let Some(buttons_arr) = buttons_val.as_array() {
+                let buttons: Vec<(String, String)> = buttons_arr
+                    .iter()
+                    .filter_map(|b| {
+                        let text = b["text"].as_str()?.to_string();
+                        let callback_data = b["callback_data"].as_str()?.to_string();
+                        Some((text, callback_data))
+                    })
+                    .collect();
+                if !buttons.is_empty() {
+                    self.send_inline_keyboard(chat_id, topic_id, &msg.body, &buttons)
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+
         self.send_message(chat_id, &msg.body, topic_id).await
+    }
+
+    async fn ack_interaction(&self, callback_query_id: &str) -> anyhow::Result<()> {
+        self.answer_callback_query(callback_query_id, "").await
     }
 
     async fn health_check(&self) -> anyhow::Result<()> {
