@@ -4331,3 +4331,41 @@ async fn control_sessions_are_isolated() {
     assert!(a_msgs[0].content.contains("in A"));
     assert!(b_msgs[0].content.contains("in B"));
 }
+
+/// Regression test: resolve_task_id fallback must not cross repo boundaries.
+///
+/// When the primary external_id lookup fails, the numeric-suffix fallback used
+/// to query `SELECT id FROM tasks WHERE id = ?` with no repo filter.  In a
+/// multi-repo setup this could resolve a task that belongs to a different repo.
+#[tokio::test]
+async fn resolve_task_id_fallback_respects_repo() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    // Create an internal task for repo-a.  The store assigns id=1 and sets
+    // external_id = "internal:1".
+    let id_a = store
+        .create_internal("owner/repo-a", "Task A", "body", "test", "src-a")
+        .await
+        .unwrap();
+
+    // Corrupt: remove the external_id so the primary lookup fails and the
+    // code falls through to the numeric-suffix fallback path.
+    sqlx::query("UPDATE tasks SET external_id = NULL WHERE id = ?")
+        .bind(id_a)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    // repo-b should NOT resolve task "internal:{id_a}" — the numeric id
+    // belongs to repo-a, not repo-b.
+    let resolved = store
+        .resolve_task_id("owner/repo-b", &format!("internal:{id_a}"))
+        .await
+        .unwrap();
+
+    assert!(
+        resolved.is_none(),
+        "fallback must not resolve a task from a different repo (got {:?})",
+        resolved
+    );
+}
