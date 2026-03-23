@@ -340,10 +340,12 @@ impl TaskManager {
                 .store
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("store required for internal task status update"))?;
-            if let Some(store_id) = store.resolve_task_id(&self.repo, &id.0).await? {
-                store.update_status(store_id, task_status).await?;
-            }
-            // Publish event to bus
+            let store_id = store
+                .resolve_task_id(&self.repo, &id.0)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("internal task {} not found in store", id.0))?;
+            store.update_status(store_id, task_status).await?;
+            // Publish event to bus only after confirmed update
             self.publish_event(id, status, &pre_snapshot);
             return Ok(());
         }
