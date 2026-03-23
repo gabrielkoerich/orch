@@ -24,6 +24,7 @@ use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
+use super::dispatch_guard::DispatchGuard;
 use super::review::{review_and_merge, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
 use super::EngineConfig;
 
@@ -674,10 +675,15 @@ pub(crate) async fn tick_dispatch_tasks(
                                     let router_for_review = router_clone.clone();
                                     let store_for_review = store_for_spawn.clone();
                                     let task_id_for_review = task_id.clone();
-                                    let dispatching_for_review = dispatching_for_cleanup.clone();
-                                    let dispatch_key_for_review = dispatch_key_for_cleanup.clone();
+                                    // RAII guard: removes the dispatch key whether the
+                                    // spawned task completes normally or panics.
+                                    let review_dispatch_guard = DispatchGuard::new(
+                                        dispatching_for_cleanup.clone(),
+                                        dispatch_key_for_cleanup.clone(),
+                                    );
                                     let repo_ctx = repo_owned.clone();
                                     tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
+                                        let _dispatch_guard = review_dispatch_guard;
                                         match review_and_merge(
                                             &task_owned_clone,
                                             &backend_clone,
@@ -823,11 +829,8 @@ pub(crate) async fn tick_dispatch_tasks(
                                                 .await;
                                             }
                                         }
-                                        // Release the per-task lock so sync_tick can act on this task.
-                                        {
-                                            let mut guard = dispatching_for_review.lock().unwrap_or_else(|e| e.into_inner());
-                                            guard.remove(&dispatch_key_for_review);
-                                        }
+                                        // _dispatch_guard drops here, removing the key
+                                        // even if review_and_merge panicked.
                                     }));
                                 }
                             }
