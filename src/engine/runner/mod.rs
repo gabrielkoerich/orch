@@ -262,6 +262,19 @@ impl TaskRunner {
         // Kill tmux session if still alive
         session::cleanup_session(task_id, &tmux, &tmux_session).await;
 
+        // For no-op done tasks (agent finished with no code changes and no PR),
+        // clean up the worktree and branch immediately — tmux session is already
+        // dead so the tmux guard won't block removal.
+        if final_status == "done" {
+            if let Some(ref st) = self.store {
+                if let Err(e) =
+                    crate::engine::cleanup::cleanup_task_worktree(task_id, &self.repo, st).await
+                {
+                    tracing::warn!(task_id, error = ?e, "worktree cleanup failed after no-op done");
+                }
+            }
+        }
+
         // Return final status and the session exit code so callers can record it.
         Ok(Some((final_status, Some(session_output.exit_code))))
     }
