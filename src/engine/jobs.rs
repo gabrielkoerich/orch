@@ -1300,8 +1300,8 @@ mod tests {
             "bash job should succeed when relative dir resolves to an existing path"
         );
 
-        let recorded_cwd = std::fs::read_to_string(&cwd_out)
-            .expect("bash command should have written cwd.txt");
+        let recorded_cwd =
+            std::fs::read_to_string(&cwd_out).expect("bash command should have written cwd.txt");
         // Canonicalize both sides so symlinks (e.g. /var → /private/var on macOS) don't
         // cause a spurious mismatch.
         let recorded = std::fs::canonicalize(recorded_cwd.trim()).unwrap();
