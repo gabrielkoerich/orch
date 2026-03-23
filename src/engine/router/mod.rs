@@ -188,10 +188,21 @@ impl Router {
         store: &std::sync::Arc<crate::store::TaskStore>,
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
-        // 1. Check for explicit agent label
-        if let Some(agent) =
-            strategies::extract_agent_from_labels(&self.config.agents, &task.labels)
-        {
+        // 1. Check store agent field first (set by failover, authoritative over labels)
+        let store_agent = crate::engine::cleanup::opt_store_get_field(
+            &Some(store.clone()),
+            repo,
+            &task.id.0,
+            "agent",
+        )
+        .await
+        .filter(|a| !a.is_empty() && self.config.agents.contains(a));
+
+        // 2. Fall back to explicit agent label
+        let resolved_agent = store_agent
+            .or_else(|| strategies::extract_agent_from_labels(&self.config.agents, &task.labels));
+
+        if let Some(agent) = resolved_agent {
             if self.is_agent_available(&agent) {
                 let complexity = strategies::extract_complexity_from_labels(&task.labels);
                 let model = self.config.model_for_complexity(&agent, &complexity);
