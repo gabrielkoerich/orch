@@ -69,6 +69,7 @@ struct TaskSnapshot {
     error: Option<String>,
     title: Option<String>,
     summary: Option<String>,
+    duration_seconds: Option<f64>,
 }
 
 pub struct TaskManager {
@@ -386,32 +387,36 @@ impl TaskManager {
             _ => return TaskSnapshot::default(),
         };
         match store.get(store_id).await {
-            Ok(task) => TaskSnapshot {
-                old_status: Some(task.status.as_str().to_string()),
-                agent: task.agent.clone(),
-                model: task.model.clone(),
-                branch: if task.branch.is_empty() {
-                    None
-                } else {
-                    Some(task.branch.clone())
-                },
-                pr_number: task.pr_number.map(|n| n.to_string()),
-                error: if task.last_error.is_empty() {
-                    None
-                } else {
-                    Some(task.last_error.clone())
-                },
-                title: if task.title.is_empty() {
-                    None
-                } else {
-                    Some(task.title.clone())
-                },
-                summary: if task.summary.is_empty() {
-                    None
-                } else {
-                    Some(task.summary.clone())
-                },
-            },
+            Ok(task) => {
+                let duration_seconds = store.latest_task_metric_duration(task_id).await;
+                TaskSnapshot {
+                    old_status: Some(task.status.as_str().to_string()),
+                    agent: task.agent.clone(),
+                    model: task.model.clone(),
+                    branch: if task.branch.is_empty() {
+                        None
+                    } else {
+                        Some(task.branch.clone())
+                    },
+                    pr_number: task.pr_number.map(|n| n.to_string()),
+                    error: if task.last_error.is_empty() {
+                        None
+                    } else {
+                        Some(task.last_error.clone())
+                    },
+                    title: if task.title.is_empty() {
+                        None
+                    } else {
+                        Some(task.title.clone())
+                    },
+                    summary: if task.summary.is_empty() {
+                        None
+                    } else {
+                        Some(task.summary.clone())
+                    },
+                    duration_seconds,
+                }
+            }
             Err(_) => TaskSnapshot::default(),
         }
     }
@@ -433,6 +438,7 @@ impl TaskManager {
                 timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                 title: snapshot.title.clone(),
                 summary: snapshot.summary.clone(),
+                duration_seconds: snapshot.duration_seconds,
             };
             let _ = tx.send(event);
         }
