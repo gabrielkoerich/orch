@@ -350,7 +350,7 @@ impl TaskManager {
             }
             store.update_status(store_id, task_status).await?;
             // Publish event to bus only after confirmed update
-            self.publish_event(id, status, &pre_snapshot);
+            self.publish_event(id, status, &pre_snapshot, None);
             return Ok(());
         }
 
@@ -377,7 +377,54 @@ impl TaskManager {
         }
 
         // Publish event to bus
-        self.publish_event(id, status, &pre_snapshot);
+        self.publish_event(id, status, &pre_snapshot, None);
+
+        Ok(())
+    }
+
+    /// Update the status of a task and include elapsed duration in the event.
+    ///
+    /// Use this at task completion points (success or failure) so the notify
+    /// subscriber can include accurate timing in channel messages instead of 0.0.
+    pub async fn update_task_status_with_duration(
+        &self,
+        id: &ExternalId,
+        status: Status,
+        duration_seconds: Option<f64>,
+    ) -> anyhow::Result<()> {
+        let task_status = status_to_task_status(status);
+        let pre_snapshot = self.read_task_snapshot(&id.0).await;
+
+        if is_internal_id(&id.0) {
+            let store = self
+                .store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("store required for internal task status update"))?;
+            let store_id = store
+                .resolve_task_id(&self.repo, &id.0)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("internal task {} not found in store", id.0))?;
+            store.update_status(store_id, task_status).await?;
+            self.publish_event(id, status, &pre_snapshot, duration_seconds);
+            return Ok(());
+        }
+
+        if let Some(ref store) = self.store {
+            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &id.0).await {
+                store.update_status(store_id, task_status).await?;
+            }
+        }
+
+        if let Err(e) = self.backend.update_status(id, status).await {
+            tracing::warn!(
+                task_id = id.0,
+                ?status,
+                err = %e,
+                "failed to mirror status to backend — store is authoritative"
+            );
+        }
+
+        self.publish_event(id, status, &pre_snapshot, duration_seconds);
 
         Ok(())
     }
@@ -396,30 +443,30 @@ impl TaskManager {
             Ok(task) => {
                 let duration_seconds = store.latest_task_metric_duration(task_id).await;
                 TaskSnapshot {
-                    old_status: Some(task.status.as_str().to_string()),
-                    agent: task.agent.clone(),
-                    model: task.model.clone(),
-                    branch: if task.branch.is_empty() {
-                        None
-                    } else {
-                        Some(task.branch.clone())
-                    },
-                    pr_number: task.pr_number.map(|n| n.to_string()),
-                    error: if task.last_error.is_empty() {
-                        None
-                    } else {
-                        Some(task.last_error.clone())
-                    },
-                    title: if task.title.is_empty() {
-                        None
-                    } else {
-                        Some(task.title.clone())
-                    },
-                    summary: if task.summary.is_empty() {
-                        None
-                    } else {
-                        Some(task.summary.clone())
-                    },
+                old_status: Some(task.status.as_str().to_string()),
+                agent: task.agent.clone(),
+                model: task.model.clone(),
+                branch: if task.branch.is_empty() {
+                    None
+                } else {
+                    Some(task.branch.clone())
+                },
+                pr_number: task.pr_number.map(|n| n.to_string()),
+                error: if task.last_error.is_empty() {
+                    None
+                } else {
+                    Some(task.last_error.clone())
+                },
+                title: if task.title.is_empty() {
+                    None
+                } else {
+                    Some(task.title.clone())
+                },
+                summary: if task.summary.is_empty() {
+                    None
+                } else {
+                    Some(task.summary.clone())
+                },
                     duration_seconds,
                 }
             }
@@ -428,7 +475,13 @@ impl TaskManager {
     }
 
     /// Publish a TaskEvent to the event bus (if wired).
-    fn publish_event(&self, id: &ExternalId, status: Status, snapshot: &TaskSnapshot) {
+    fn publish_event(
+        &self,
+        id: &ExternalId,
+        status: Status,
+        snapshot: &TaskSnapshot,
+        duration_seconds: Option<f64>,
+    ) {
         if let Some(ref tx) = self.event_tx {
             let event = crate::engine::events::TaskEvent {
                 task_id: id.0.clone(),
@@ -444,7 +497,7 @@ impl TaskManager {
                 timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                 title: snapshot.title.clone(),
                 summary: snapshot.summary.clone(),
-                duration_seconds: snapshot.duration_seconds,
+                duration_seconds: duration_seconds.or(snapshot.duration_seconds),
             };
             let _ = tx.send(event);
         }

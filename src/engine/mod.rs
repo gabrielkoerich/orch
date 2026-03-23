@@ -952,7 +952,6 @@ pub async fn serve() -> anyhow::Result<()> {
             semaphore.clone(),
             engine.task_manager.clone(),
             weight_tx.clone(),
-            transport.clone(),
             router.clone(),
             dispatching.clone(),
             engine.store.clone(),
@@ -1061,7 +1060,6 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &router,
                                 &engine.task_manager,
                                 &weight_tx,
-                                &transport,
                                 &dispatching,
                                 &engine.store,
                             ).await {
@@ -1152,7 +1150,6 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &router,
                                 &engine.task_manager,
                                 &weight_tx,
-                                &transport,
                                 &dispatching,
                                 &engine.store,
                             ).await {
