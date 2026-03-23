@@ -1062,10 +1062,13 @@ impl TaskStore {
             if let Some(task) = self.get_by_external_id(repo, task_id).await? {
                 return Ok(Some(task.id));
             }
-            // Fallback: try the numeric suffix as a direct store ID
+            // Fallback: try the numeric suffix as a direct store ID.
+            // Must include the repo filter to avoid resolving a task that
+            // belongs to a different repository in a multi-repo setup.
             if let Ok(id) = suffix.parse::<i64>() {
-                let exists = sqlx::query("SELECT id FROM tasks WHERE id = ?")
+                let exists = sqlx::query("SELECT id FROM tasks WHERE id = ? AND repo = ?")
                     .bind(id)
+                    .bind(repo)
                     .fetch_optional(&self.pool)
                     .await?;
                 if exists.is_some() {
