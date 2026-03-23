@@ -16,9 +16,9 @@ use tokio::sync::{RwLock, Semaphore};
 
 /// Spawn a task that listens for NeedsReview events and triggers the review agent.
 ///
-/// This mirrors the catch-up logic in `sync_tick` (step 5) but triggers instantly
-/// instead of waiting for the next sync interval. The `needs_review → in_review`
-/// label transition is the atomic guard against duplicate review agents.
+/// This is the sole trigger for NeedsReview → InReview transitions. The sync tick
+/// no longer has a competing NeedsReview loop (removed in fix for issue #857 — both
+/// paths firing simultaneously caused double failure-counter increments).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     mut rx: broadcast::Receiver<TaskEvent>,
