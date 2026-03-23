@@ -602,12 +602,26 @@ pub(crate) async fn tick_dispatch_tasks(
 
                     // Derive a display status from the weight signal.
                     // When review agent is enabled, successful tasks go through
-                    // review before being marked done.
+                    // review before being marked done — UNLESS the response
+                    // handler already marked the task done (no-op tasks with
+                    // no PR and no commits should not enter the review cycle).
                     let enable_review = config::get("workflow.enable_review_agent")
                         .map(|v| v != "false")
                         .unwrap_or(true);
                     let display_status = match &signal {
-                        WeightSignal::Success { .. } if enable_review => "needs_review",
+                        WeightSignal::Success { .. } if enable_review => {
+                            // Check if response handler already set done (no-op task).
+                            // The task_manager.update_task_status() was already called
+                            // by response_handler, so read the actual status from store.
+                            let has_pr = super::cleanup::store_get_field(
+                                &store_for_spawn, &repo_owned, &task_id, "pr_number",
+                            ).await.is_some();
+                            if has_pr {
+                                "needs_review"
+                            } else {
+                                "done"
+                            }
+                        }
                         WeightSignal::Success { .. } => "done",
                         WeightSignal::RateLimited { .. } => "new",
                         WeightSignal::Blocked => "blocked",
