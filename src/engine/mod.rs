@@ -15,6 +15,7 @@
 pub mod channel_handler;
 pub mod cleanup;
 pub mod commands;
+pub mod events;
 pub mod jobs;
 pub mod review;
 pub mod router;

@@ -57,12 +57,26 @@ pub enum Task {
     Internal(store::Task),
 }
 
+/// Pre-update snapshot of a task's state, used to enrich events with
+/// the old status and context fields (agent, model, branch, etc.).
+#[derive(Debug, Clone, Default)]
+struct TaskSnapshot {
+    old_status: Option<String>,
+    agent: Option<String>,
+    model: Option<String>,
+    branch: Option<String>,
+    pr_number: Option<String>,
+    error: Option<String>,
+}
+
 pub struct TaskManager {
     backend: Arc<dyn ExternalBackend>,
     /// Unified task store (Phase 2+). Optional for backward compat with tests.
     store: Option<Arc<TaskStore>>,
     /// Repo identifier for store operations (e.g. "owner/repo").
     repo: String,
+    /// Event bus sender — publishes TaskEvent on every status change.
+    event_tx: Option<tokio::sync::broadcast::Sender<crate::engine::events::TaskEvent>>,
 }
 
 impl Clone for TaskManager {
@@ -71,6 +85,7 @@ impl Clone for TaskManager {
             backend: self.backend.clone(),
             store: self.store.clone(),
             repo: self.repo.clone(),
+            event_tx: self.event_tx.clone(),
         }
     }
 }
@@ -82,6 +97,7 @@ impl TaskManager {
             backend,
             store: None,
             repo: String::new(),
+            event_tx: None,
         }
     }
 
@@ -95,6 +111,23 @@ impl TaskManager {
             backend,
             store: Some(store),
             repo,
+            event_tx: None,
+        }
+    }
+
+    /// Create a TaskManager with event bus support.
+    #[allow(dead_code)] // Will be wired in engine init (Task 5+)
+    pub fn with_events(
+        backend: Arc<dyn ExternalBackend>,
+        store: Arc<TaskStore>,
+        repo: String,
+        event_tx: tokio::sync::broadcast::Sender<crate::engine::events::TaskEvent>,
+    ) -> Self {
+        Self {
+            backend,
+            store: Some(store),
+            repo,
+            event_tx: Some(event_tx),
         }
     }
 
@@ -295,6 +328,11 @@ impl TaskManager {
     pub async fn update_task_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
         let task_status = status_to_task_status(status);
 
+        // Read pre-update snapshot from the store (old_status + context fields).
+        // This must happen BEFORE any store.update_status() call so we capture
+        // the previous state for the event.
+        let pre_snapshot = self.read_task_snapshot(&id.0).await;
+
         if is_internal_id(&id.0) {
             // Internal tasks: store is the single source of truth
             let store = self
@@ -304,6 +342,8 @@ impl TaskManager {
             if let Some(store_id) = store.resolve_task_id(&self.repo, &id.0).await? {
                 store.update_status(store_id, task_status).await?;
             }
+            // Publish event to bus
+            self.publish_event(id, status, &pre_snapshot);
             return Ok(());
         }
 
@@ -326,7 +366,61 @@ impl TaskManager {
             );
         }
 
+        // Publish event to bus
+        self.publish_event(id, status, &pre_snapshot);
+
         Ok(())
+    }
+
+    /// Read the current task snapshot from the store for event enrichment.
+    /// Returns `None` fields gracefully when store is unavailable or task not found.
+    async fn read_task_snapshot(&self, task_id: &str) -> TaskSnapshot {
+        let Some(ref store) = self.store else {
+            return TaskSnapshot::default();
+        };
+        let store_id = match store.resolve_task_id(&self.repo, task_id).await {
+            Ok(Some(id)) => id,
+            _ => return TaskSnapshot::default(),
+        };
+        match store.get(store_id).await {
+            Ok(task) => TaskSnapshot {
+                old_status: Some(task.status.as_str().to_string()),
+                agent: task.agent.clone(),
+                model: task.model.clone(),
+                branch: if task.branch.is_empty() {
+                    None
+                } else {
+                    Some(task.branch.clone())
+                },
+                pr_number: task.pr_number.map(|n| n.to_string()),
+                error: if task.last_error.is_empty() {
+                    None
+                } else {
+                    Some(task.last_error.clone())
+                },
+            },
+            Err(_) => TaskSnapshot::default(),
+        }
+    }
+
+    /// Publish a TaskEvent to the event bus (if wired).
+    fn publish_event(&self, id: &ExternalId, status: Status, snapshot: &TaskSnapshot) {
+        if let Some(ref tx) = self.event_tx {
+            let event = crate::engine::events::TaskEvent {
+                task_id: id.0.clone(),
+                repo: self.repo.clone(),
+                old_status: snapshot.old_status.clone().unwrap_or_default(),
+                new_status: status.as_label().trim_start_matches("status:").to_string(),
+                agent: snapshot.agent.clone(),
+                model: snapshot.model.clone(),
+                pr_number: snapshot.pr_number.clone(),
+                branch: snapshot.branch.clone(),
+                review_context: None,
+                error: snapshot.error.clone(),
+                timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            };
+            let _ = tx.send(event);
+        }
     }
 
     /// List internal tasks by status from the store.
@@ -1014,5 +1108,116 @@ mod tests {
 
         let task = store.get(store_id).await.unwrap();
         assert_eq!(task.status, TaskStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn update_task_status_publishes_event() {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<crate::engine::events::TaskEvent>(16);
+        let tm = TaskManager {
+            backend,
+            store: None,
+            repo: "owner/repo".to_string(),
+            event_tx: Some(tx),
+        };
+        // External task — backend mock accepts any status update
+        let id = ExternalId("42".to_string());
+        tm.update_task_status(&id, Status::Routed).await.unwrap();
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.task_id, "42");
+        assert_eq!(event.new_status, "routed");
+        assert_eq!(event.repo, "owner/repo");
+    }
+
+    #[tokio::test]
+    async fn event_includes_old_status_and_context() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<crate::engine::events::TaskEvent>(16);
+
+        // Upsert an external task (starts as New)
+        let store_id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "77",
+                title: "Context test",
+                body: "",
+                author: "user",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+
+        // Set some context fields on the task
+        store
+            .set_fields(
+                store_id,
+                &[
+                    ("agent", serde_json::Value::String("claude".to_string())),
+                    ("model", serde_json::Value::String("sonnet".to_string())),
+                    ("branch", serde_json::Value::String("feat-77".to_string())),
+                    ("pr_number", serde_json::Value::Number(42.into())),
+                    (
+                        "last_error",
+                        serde_json::Value::String("timeout".to_string()),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let tm = TaskManager::with_events(backend, store.clone(), "owner/repo".to_string(), tx);
+
+        // Update New → Routed
+        let ext_id = ExternalId("77".to_string());
+        tm.update_task_status(&ext_id, Status::Routed)
+            .await
+            .unwrap();
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.task_id, "77");
+        assert_eq!(event.old_status, "new");
+        assert_eq!(event.new_status, "routed");
+        assert_eq!(event.agent.as_deref(), Some("claude"));
+        assert_eq!(event.model.as_deref(), Some("sonnet"));
+        assert_eq!(event.branch.as_deref(), Some("feat-77"));
+        assert_eq!(event.pr_number.as_deref(), Some("42"));
+        assert_eq!(event.error.as_deref(), Some("timeout"));
+    }
+
+    #[tokio::test]
+    async fn event_includes_old_status_for_internal_task() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<crate::engine::events::TaskEvent>(16);
+
+        // Create an internal task (starts as New)
+        let store_id = store
+            .create_internal("owner/repo", "internal ctx test", "body", "manual", "")
+            .await
+            .unwrap();
+
+        let tm = TaskManager::with_events(backend, store.clone(), "owner/repo".to_string(), tx);
+
+        // Update New → Routed
+        let internal_id = ExternalId(format!("internal:{}", store_id));
+        tm.update_task_status(&internal_id, Status::Routed)
+            .await
+            .unwrap();
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.old_status, "new");
+        assert_eq!(event.new_status, "routed");
+
+        // Update Routed → InProgress
+        tm.update_task_status(&internal_id, Status::InProgress)
+            .await
+            .unwrap();
+
+        let event2 = rx.try_recv().unwrap();
+        assert_eq!(event2.old_status, "routed");
+        assert_eq!(event2.new_status, "in_progress");
     }
 }
