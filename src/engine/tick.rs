@@ -734,6 +734,13 @@ pub(crate) async fn tick_dispatch_tasks(
                                                         failures,
                                                         "review agent failed — resetting to NeedsReview for retry"
                                                     );
+                                                    // Kill any stale review session so the
+                                                    // next retry can create a fresh one.
+                                                    let stale = tmux_clone.session_name(
+                                                        &repo_owned,
+                                                        &format!("{}-review", task_id_for_review),
+                                                    );
+                                                    tmux_clone.kill_session(&stale).await.ok();
                                                     if let Err(e) = task_manager_for_review
                                                         .update_task_status(
                                                             &ExternalId(
@@ -781,6 +788,13 @@ pub(crate) async fn tick_dispatch_tasks(
                                                         failures,
                                                         "review_and_merge failed — resetting to NeedsReview for retry"
                                                     );
+                                                    // Kill any stale review session so the
+                                                    // next retry can create a fresh one.
+                                                    let stale = tmux_clone.session_name(
+                                                        &repo_owned,
+                                                        &format!("{}-review", task_id_for_review),
+                                                    );
+                                                    tmux_clone.kill_session(&stale).await.ok();
                                                     if let Err(ue) = task_manager_for_review
                                                         .update_task_status(
                                                             &ExternalId(
