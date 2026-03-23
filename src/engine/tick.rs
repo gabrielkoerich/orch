@@ -509,8 +509,8 @@ pub(crate) async fn tick_dispatch_tasks(
         // session_exists check alone is insufficient.
         let dispatch_key = format!("{}/{}", repo, task.id.0);
         {
-            let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.contains(&dispatch_key) {
+            let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
+            if !guard.insert(dispatch_key.clone()) {
                 tracing::debug!(
                     task_id = task.id.0,
                     "task already dispatching, skipping duplicate"
@@ -541,16 +541,12 @@ pub(crate) async fn tick_dispatch_tasks(
             .await;
         if let Err(e) = set_in_progress_result {
             tracing::error!(task_id, ?e, "failed to set in_progress, skipping dispatch");
+            // Remove from dispatching set since we won't actually dispatch
+            let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
+            guard.remove(&dispatch_key);
+            drop(guard);
             drop(permit);
             continue;
-        }
-
-        // Insert into dispatching set after successful status update.
-        // This prevents the webhook-triggered tick (fired by label removal during
-        // update_status) from re-dispatching the same task.
-        {
-            let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-            guard.insert(dispatch_key.clone());
         }
 
         // Register session for capture
