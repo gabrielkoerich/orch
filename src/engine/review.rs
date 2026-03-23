@@ -1816,7 +1816,9 @@ pub(crate) async fn handle_review_changes(
         return Ok(());
     }
 
-    // 2. Post review feedback as comment on the PR
+    // 2. Build review context for the re-dispatched agent's prompt.
+    //    The "## Automated Review — Changes Requested" comment was already posted in
+    //    review_and_merge() before calling this function — do not post a second comment here.
     let mut comment = format!(
         "🔍 Review agent requested changes (cycle {} of {}):\n\n{}",
         review_cycles + 1,
@@ -1838,17 +1840,6 @@ pub(crate) async fn handle_review_changes(
                 issue.severity
             ));
         }
-    }
-
-    let footer = format!(
-        "\n\n---\n*Reviewed by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
-        review_agent, review_model
-    );
-    if let Err(e) = gh
-        .add_comment(repo, &pr_num_str, &format!("{}{}", comment, footer))
-        .await
-    {
-        tracing::warn!(task_id = task.id.0, pr_number, err = %e, "failed to post review comment on PR");
     }
 
     // 3. Store review context.
