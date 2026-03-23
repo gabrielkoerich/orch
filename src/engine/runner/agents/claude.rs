@@ -8,26 +8,26 @@
 //! ```bash
 //! claude -p --model {model} \
 //!   --permission-mode bypassPermissions \
-//!   --output-format json \
+//!   --output-format stream-json \
 //!   --disallowedTools '...' \
 //!   --append-system-prompt "{sys_file}" \
 //!   < "{msg_file}"
 //! ```
 //!
-//! ## Output format (`--output-format json`)
+//! ## Output format (`--output-format stream-json`)
 //!
-//! Single JSON object:
-//! ```json
-//! {
-//!   "type": "result",
-//!   "subtype": "success",
-//!   "is_error": false,
-//!   "duration_ms": 2006,
-//!   "result": "```json\n{\"status\": \"done\", ...}\n```",
-//!   "usage": {"input_tokens": 10, "output_tokens": 78},
-//!   "modelUsage": {"claude-haiku-4-5-20251001": {"inputTokens": 10, ...}}
-//! }
+//! NDJSON event stream; the final event is always `"type": "result"`:
+//! ```jsonl
+//! {"type":"system","subtype":"init",...}
+//! {"type":"assistant","message":{...}}
+//! {"type":"tool_use","tool":{...}}
+//! {"type":"tool_result","result":{...}}
+//! {"type":"result","subtype":"success","is_error":false,"duration_ms":2006,"result":"...","usage":{"input_tokens":10,"output_tokens":78},"modelUsage":{...}}
 //! ```
+//!
+//! Backward compatible with `--output-format json` (single JSON blob) — the
+//! parser finds the last `"type":"result"` line whether it is NDJSON or a
+//! pretty-printed single object.
 //!
 //! ## Kimi/MiniMax wrappers
 //!
@@ -202,7 +202,7 @@ impl AgentRunner for ClaudeRunner {
         format!(
             r#"{timeout_cmd} {binary} -p {model_flag} \
   --permission-mode {permission_mode} \
-  --output-format json \
+  --output-format stream-json \
   {tool_flag} \
   --append-system-prompt "{sys_file}" \
   < "{msg_file}""#,
@@ -222,6 +222,14 @@ impl AgentRunner for ClaudeRunner {
             return Err(AgentError::InvalidResponse { raw: String::new() });
         }
 
+        // For NDJSON (--output-format stream-json): find the last line whose JSON
+        // has "type":"result" — that is the final envelope. For a single-line JSON
+        // blob (--output-format json backward compat) this also finds it correctly.
+        if let Some(result_line) = find_ndjson_result_line(trimmed) {
+            return self.parse_envelope(result_line);
+        }
+
+        // Fallback: treat the whole string as the envelope (e.g. pretty-printed JSON)
         self.parse_envelope(trimmed)
     }
 
@@ -237,7 +245,7 @@ impl AgentRunner for ClaudeRunner {
     ) -> anyhow::Result<tokio::process::Command> {
         let mut cmd = tokio::process::Command::new(&self.binary);
         cmd.env_remove("CLAUDECODE"); // allow nested invocation
-        cmd.arg("--output-format").arg("json").arg("--print");
+        cmd.arg("--output-format").arg("stream-json").arg("--print");
         if let Some(m) = model {
             cmd.arg("--model").arg(m);
         }
@@ -292,6 +300,26 @@ fn translate_allowed_tools(
         }
     }
     tools
+}
+
+/// Find the last NDJSON line whose JSON contains `"type": "result"`.
+///
+/// Used to extract the final result event from Claude `--output-format stream-json`
+/// output. Returns `None` if no such line is found (e.g. pretty-printed single JSON).
+fn find_ndjson_result_line(text: &str) -> Option<&str> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .find(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| {
+                    v.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "result")
+                })
+                .unwrap_or(false)
+        })
 }
 
 /// Extract input/output tokens from the Claude envelope's usage objects.
@@ -480,7 +508,7 @@ mod tests {
         );
         assert!(cmd.contains("--model opus"));
         assert!(cmd.contains("claude -p"));
-        assert!(cmd.contains("--output-format json"));
+        assert!(cmd.contains("--output-format stream-json"));
         assert!(cmd.contains("--permission-mode bypassPermissions"));
         assert!(cmd.contains("--disallowedTools 'Bash(rm *)'"));
     }
@@ -562,6 +590,80 @@ mod tests {
         let raw = include_str!("../../../../tests/fixtures/claude_error_rate_limit.json");
         let err = runner().parse_response(raw).unwrap_err();
         assert!(matches!(err, AgentError::RateLimit { .. }), "got: {err:?}");
+    }
+
+    // ── NDJSON / stream-json fixtures ────────────────────────────
+
+    #[test]
+    fn fixture_claude_stream_success() {
+        let raw = include_str!("../../../../tests/fixtures/claude_stream_success.jsonl");
+        let parsed = runner().parse_response(raw).unwrap();
+        assert_eq!(parsed.response.status, "done");
+        assert!(parsed.response.summary.contains("Implemented"));
+        assert_eq!(parsed.response.accomplished.len(), 2);
+        assert_eq!(parsed.input_tokens, Some(15000));
+        assert_eq!(parsed.output_tokens, Some(3500));
+        assert_eq!(parsed.duration_ms, Some(45000));
+    }
+
+    #[test]
+    fn fixture_claude_stream_error() {
+        let raw = include_str!("../../../../tests/fixtures/claude_stream_error.jsonl");
+        let err = runner().parse_response(raw).unwrap_err();
+        assert!(matches!(err, AgentError::Auth { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn fixture_claude_stream_rate_limit() {
+        let raw = include_str!("../../../../tests/fixtures/claude_stream_rate_limit.jsonl");
+        let err = runner().parse_response(raw).unwrap_err();
+        assert!(matches!(err, AgentError::RateLimit { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn parse_ndjson_with_intermediate_events() {
+        // Parser must ignore intermediate events and only look at the result line
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[]}}"#,
+            "\n",
+            r#"{"type":"tool_use","tool":{"name":"Read","input":{}}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1000,"result":"{\"status\":\"done\",\"summary\":\"streamed\",\"accomplished\":[],\"remaining\":[],\"files\":[]}","usage":{"input_tokens":5,"output_tokens":10}}"#,
+            "\n"
+        );
+        let parsed = runner().parse_response(raw).unwrap();
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(parsed.response.summary, "streamed");
+        assert_eq!(parsed.input_tokens, Some(5));
+        assert_eq!(parsed.output_tokens, Some(10));
+    }
+
+    #[test]
+    fn parse_ndjson_skips_malformed_lines() {
+        // Malformed intermediate lines should be ignored; result line still parsed
+        let raw = concat!(
+            "not valid json\n",
+            r#"{"type":"partial_update","data":"something"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":500,"result":"{\"status\":\"done\",\"summary\":\"ok\",\"accomplished\":[],\"remaining\":[],\"files\":[]}","usage":{"input_tokens":1,"output_tokens":2}}"#,
+            "\n"
+        );
+        let parsed = runner().parse_response(raw).unwrap();
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(parsed.response.summary, "ok");
+    }
+
+    #[test]
+    fn parse_single_line_json_backward_compat() {
+        // Single-line JSON (--output-format json) still works
+        let raw = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":2000,"result":"{\"status\":\"done\",\"summary\":\"backward compat\",\"accomplished\":[],\"remaining\":[],\"files\":[]}","usage":{"input_tokens":50,"output_tokens":25}}"#;
+        let parsed = runner().parse_response(raw).unwrap();
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(parsed.response.summary, "backward compat");
+        assert_eq!(parsed.input_tokens, Some(50));
+        assert_eq!(parsed.output_tokens, Some(25));
     }
 
     // ── Kimi / MiniMax (Claude-compatible wrappers) ───────────────

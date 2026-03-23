@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","apiKeySource":"environment","cwd":"/tmp/work","model":"claude-sonnet-4-6","permissionMode":"bypassPermissions","tools":["Read","Write","Edit","Bash"]}
+{"type":"assistant","message":{"id":"msg_01","type":"message","role":"assistant","content":[{"type":"text","text":"I'll implement this feature now."}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":100,"output_tokens":20}}}
+{"type":"tool_use","tool":{"name":"Read","input":{"file_path":"/tmp/file.rs"}}}
+{"type":"tool_result","result":{"content":"fn main() {}"}}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":45000,"result":"```json\n{\"status\": \"done\", \"summary\": \"Implemented the feature\", \"accomplished\": [\"Added new function\", \"Updated tests\"], \"remaining\": [], \"files\": [\"src/main.rs\", \"tests/test.rs\"]}\n```","usage":{"input_tokens":15000,"output_tokens":3500},"modelUsage":{"claude-sonnet-4-6":{"inputTokens":15000,"outputTokens":3500}},"permission_denials":[]}

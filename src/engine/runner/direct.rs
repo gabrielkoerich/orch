@@ -178,8 +178,28 @@ async fn run_shell_command(
 }
 
 /// Extract text and token usage from a Claude JSON envelope or raw output.
+///
+/// Handles both single JSON blobs (`--output-format json`) and NDJSON streams
+/// (`--output-format stream-json`): finds the last line with `"type":"result"`.
 pub(crate) fn extract_from_envelope(raw: &str) -> (String, Option<u64>, Option<u64>) {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+    // Find the result line: last NDJSON line with "type":"result", or the full string
+    let candidate = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .find(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| {
+                    v.get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "result")
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(raw);
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
         if let Some(obj) = value.as_object() {
             if obj.get("type").and_then(|v| v.as_str()) == Some("result") {
                 let text = obj
@@ -213,6 +233,22 @@ mod tests {
         assert_eq!(text, "Hello world");
         assert_eq!(input, Some(10));
         assert_eq!(output, Some(5));
+    }
+
+    #[test]
+    fn test_extract_from_envelope_ndjson_stream() {
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{}}"#,
+            "\n",
+            r#"{"type":"result","result":"streamed result","usage":{"input_tokens":20,"output_tokens":8}}"#,
+            "\n"
+        );
+        let (text, input, output) = extract_from_envelope(raw);
+        assert_eq!(text, "streamed result");
+        assert_eq!(input, Some(20));
+        assert_eq!(output, Some(8));
     }
 
     #[test]
