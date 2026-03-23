@@ -797,6 +797,36 @@ mod tests {
         assert!(result.is_err(), "should fail without store");
     }
 
+    /// Regression test for the phantom-event bug: when an internal task ID is not found
+    /// in the store, update_task_status must return Err and must NOT publish any event.
+    #[tokio::test]
+    async fn update_status_internal_task_not_found_returns_err_and_no_event() {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let (event_tx, mut event_rx) =
+            tokio::sync::broadcast::channel::<crate::engine::events::TaskEvent>(16);
+
+        let tm =
+            TaskManager::with_events(backend, store.clone(), "owner/repo".to_string(), event_tx);
+
+        // "internal:999" does not exist in the (empty) store
+        let result = tm
+            .update_task_status(&ExternalId("internal:999".to_string()), Status::Done)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "should return Err when internal task is not found in store"
+        );
+
+        // No event must have been published
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no event should be published for a not-found internal task"
+        );
+    }
+
     #[tokio::test]
     async fn get_task_returns_internal_from_store() {
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
