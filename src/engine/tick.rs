@@ -632,13 +632,23 @@ pub(crate) async fn tick_dispatch_tasks(
                             .map(|v| v != "false")
                             .unwrap_or(true);
                         tracing::info!(task_id, enable_review, "review gate check");
-                        if enable_review {
-                            // Transition to InReview — atomic guard against duplicate reviews.
+                        // Transition to NeedsReview — emits event so notify subscriber fires
+                        // with the correct duration before the review agent starts.
+                        if let Err(e) = task_manager_for_spawn
+                            .update_task_status_with_duration(
+                                &ExternalId(task_id.clone()),
+                                Status::NeedsReview,
+                                Some(duration),
+                            )
+                            .await
+                        {
+                            tracing::error!(task_id, err = %e, "update_task_status(NeedsReview) failed — task may be stuck");
+                        } else if enable_review {
+                            // Atomic guard: transition to InReview prevents duplicate review spawns.
                             match task_manager_for_spawn
-                                .update_task_status_with_duration(
+                                .update_task_status(
                                     &ExternalId(task_id.clone()),
                                     Status::InReview,
-                                    Some(duration),
                                 )
                                 .await
                             {
@@ -812,18 +822,6 @@ pub(crate) async fn tick_dispatch_tasks(
                                         // even if review_and_merge panicked.
                                     }));
                                 }
-                            }
-                        } else {
-                            // Review disabled: persist needs_review status.
-                            if let Err(e) = task_manager_for_spawn
-                                .update_task_status_with_duration(
-                                    &ExternalId(task_id.clone()),
-                                    Status::NeedsReview,
-                                    Some(duration),
-                                )
-                                .await
-                            {
-                                tracing::error!(task_id, err = %e, "update_task_status(NeedsReview) failed — task may be stuck");
                             }
                         }
                     } else {
