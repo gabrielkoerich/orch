@@ -235,6 +235,15 @@ pub fn spawn(
                         };
                         match outcome {
                             ReviewOutcome::Reset => {
+                                // Kill any stale tmux review session before resetting — the
+                                // session may still be alive if the agent hit a rate limit,
+                                // if two concurrent reviewers raced and the loser's spawn
+                                // failed with "duplicate session", or if review_and_merge
+                                // returned an error before reaching its own cleanup.
+                                // Killing a non-existent session is a harmless no-op.
+                                let stale_session =
+                                    tmux_c.session_name(&repo_s, &format!("{}-review", tid));
+                                tmux_c.kill_session(&stale_session).await.ok();
                                 // Backoff before re-queuing to prevent rapid spin
                                 // if the review agent keeps failing instantly.
                                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
