@@ -85,8 +85,27 @@ successfully still appeared broken in `orch task show`. Now cleared on success.
 - **Open GitHub issues**: 0 — clean pipeline
 - **Active tasks**: 4 internal jobs running (morning-review, evening-retro, code-review, code-development)
 - **Stuck/failing tasks**: None
-- **Error logs**: Historical shell-era SIGTERM entries only. No new errors from the Rust binary.
 - **Rate limits**: None observed.
+
+### Log Errors
+
+**11:34:41Z — Transient GitHub API outage (3 warnings, same tick):**
+
+```
+WARN orch::engine::sync      failed to get current user, skipping mentions
+WARN orch::engine::commands  failed to fetch comments for command scanning
+WARN orch::engine::cleanup   failed to list all tasks for closed-issue reconciliation
+```
+
+All three hit `error sending request for url (https://api.github.com/...)` simultaneously —
+consistent with a brief network blip, not a GitHub auth failure. The engine recovered
+automatically on the next sync tick. No follow-up required.
+
+**Recurring `create PR failed (422 Unprocessable Entity)`** — Multiple internal bean and orch
+tasks hit this throughout the day (`internal:6884`, `6892`, `6896`, `6899`, `6898`). Root
+cause: the branch was created in the worktree but not pushed before `create PR` was called, so
+GitHub rejects with `"head": "invalid"`. This is a pre-existing issue — not a regression from
+today's commits. Worth tracking as a separate bug.
 
 ---
 
