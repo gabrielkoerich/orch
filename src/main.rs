@@ -402,6 +402,14 @@ enum JobAction {
     },
     /// Run one job scheduler tick
     Tick,
+    /// Run a single job immediately (ignoring schedule)
+    Run {
+        /// Job ID
+        id: String,
+        /// Project filter (repo slug substring) to disambiguate jobs with the same ID
+        #[arg(short, long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -604,6 +612,9 @@ async fn main() -> anyhow::Result<()> {
             }
             JobAction::Tick => {
                 cli::job::tick().await?;
+            }
+            JobAction::Run { id, project } => {
+                cli::job::run(&id, project.as_deref()).await?;
             }
         },
         Commands::Service { action } => match action {
