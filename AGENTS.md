@@ -397,6 +397,12 @@ The auth flow is: `GH_TOKEN` env → `GITHUB_TOKEN` env → `gh.auth.token` conf
 
 The agent runner uses tmux as the PTY (tmux already provides a PTY to whatever runs inside it). There is no `portable_pty` crate and no external PTY process. Do not reintroduce PTY-based runners that spawn the agent outside tmux and forward output via `send-keys`. Issue #416 explains why this was removed.
 
+### No external endpoints
+
+Orch is an internal tool running on a local machine with no external network access. There are no publicly reachable HTTP/webhook endpoints. The webhook receiver in the config exists but only works when the machine happens to be reachable (rare). GitHub polling fallback is the default mode.
+
+External consumers (CLI, local debugging tools) connect via **localhost-only websocket** (`127.0.0.1`). Do not add externally-reachable servers, do not assume inbound connections from GitHub or other services will work, and do not design features that depend on webhook delivery.
+
 ## Preferred tools
 
 - Use `rg` instead of `grep` — faster, installed as a brew dependency

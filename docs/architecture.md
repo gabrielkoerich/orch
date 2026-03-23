@@ -334,3 +334,4 @@ graph LR
 - **`src/github/token.rs`** — Token resolution uses `std::process::Command` (blocking, cached 1h). Intentional.
 - **`src/engine/runner/`** — Tmux IS the PTY. No external PTY runners.
 - **`src/github/auth.rs`** — Deleted (dead code). Do not recreate.
+- **No external endpoints** — Orch is an internal tool with no external network access. No public HTTP/webhook endpoints. The webhook receiver exists but only works when the machine is reachable (rarely). External consumers (CLI, local tools) connect via localhost-only websocket. Do not add externally-reachable servers or rely on inbound connections from GitHub/other services.
