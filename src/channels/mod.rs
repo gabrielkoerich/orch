@@ -84,6 +84,15 @@ pub trait Channel: Send + Sync {
     /// Send a message to a thread/conversation.
     async fn send(&self, msg: &OutgoingMessage) -> anyhow::Result<()>;
 
+    /// Acknowledge an interactive callback to dismiss the loading indicator.
+    ///
+    /// Telegram requires `answerCallbackQuery` to dismiss the spinner after a button press.
+    /// Discord buttons are already acknowledged in the websocket handler — no-op here.
+    /// Default implementation is a no-op so non-interactive channels need not implement it.
+    async fn ack_interaction(&self, _callback_query_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Check if this channel is healthy/connected.
     async fn health_check(&self) -> anyhow::Result<()>;
 }

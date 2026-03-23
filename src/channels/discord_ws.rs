@@ -164,6 +164,26 @@ impl Channel for DiscordGateway {
             .as_deref()
             .or(self.channel_id.as_deref())
             .ok_or_else(|| anyhow::anyhow!("no target channel for discord message"))?;
+
+        // If metadata carries buttons, send as an interactive message with an ActionRow.
+        if let Some(buttons_val) = msg.metadata.get("buttons") {
+            if let Some(buttons_arr) = buttons_val.as_array() {
+                let buttons: Vec<(String, String)> = buttons_arr
+                    .iter()
+                    .filter_map(|b| {
+                        let text = b["text"].as_str()?.to_string();
+                        let custom_id = b["callback_data"].as_str()?.to_string();
+                        Some((text, custom_id))
+                    })
+                    .collect();
+                if !buttons.is_empty() {
+                    self.send_with_buttons(target_channel, &msg.body, &buttons)
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+
         self.send_message(target_channel, &msg.body).await
     }
 
