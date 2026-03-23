@@ -1074,7 +1074,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         for engine in &project_engines {
                             let repo = engine.repo.clone();
                             REPO_CONTEXT.scope(repo, async {
-                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &config, &semaphore, &router, &engine.task_manager, &engine.store, &dispatching).await {
+                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &config, &router, &engine.task_manager, &engine.store, &dispatching).await {
                                     tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
                                 }
                             }).await;
