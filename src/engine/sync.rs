@@ -43,6 +43,7 @@ async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: 
 }
 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
+use super::dispatch_guard::DispatchGuard;
 use super::review::{review_and_merge, review_open_prs, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
 use super::EngineConfig;
 
@@ -169,6 +170,8 @@ pub(crate) async fn sync_tick(
                 let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
                 guard.insert(dispatch_key.clone());
             }
+            // RAII guard — removes dispatch_key on drop even if the spawned task panics.
+            let dispatch_guard = DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
             let backend_c = backend.clone();
             let task_manager_c = task_manager.clone();
             let tmux_c = tmux.clone();
@@ -177,9 +180,8 @@ pub(crate) async fn sync_tick(
             let router_c = router.clone();
             let store_c = store.clone();
             let repo_ctx = repo_s.clone();
-            let dispatching_c = dispatching.clone();
-            let dispatch_key_c = dispatch_key.clone();
             tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
+                let _dispatch_guard = dispatch_guard; // released on drop (normal or panic)
                 let tid = task_c.id.0.clone();
                 enum ReviewOutcome {
                     Reset,
@@ -293,13 +295,9 @@ pub(crate) async fn sync_tick(
                     }
                     ReviewOutcome::Ok => {}
                 }
-
-                // Release the per-task lock so step 4 (review_open_prs) can act on this task.
-                {
-                    let mut guard = dispatching_c.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.remove(&dispatch_key_c);
-                }
                 drop(permit);
+                // _dispatch_guard dropped here — releases the per-task lock so
+                // step 4 (review_open_prs) can act on this task.
             }));
         }
 
@@ -1105,6 +1103,57 @@ mod tests {
                  review agent completes so subsequent sync ticks can process the task"
             );
         }
+    }
+
+    /// Regression test for issue #833.
+    ///
+    /// Before the fix, `dispatch_key` was inserted into the `dispatching` HashSet
+    /// *outside* the spawned task but removed *inside* it.  When the spawned async
+    /// block panicked (e.g. an `unwrap()` inside `review_and_merge`), Tokio caught
+    /// the panic and terminated the task without running the cleanup code, leaving
+    /// the key in the set permanently.  Subsequent stuck-task recovery would reset
+    /// the task to `NeedsReview`, but the subscriber/sync would see the key still
+    /// present and skip it forever — a permanent review loop until service restart.
+    ///
+    /// The fix introduces `DispatchGuard`, a RAII wrapper whose `Drop` impl removes
+    /// the key unconditionally, even when the task unwinds via panic.
+    #[tokio::test]
+    async fn dispatch_guard_releases_key_on_panic() {
+        use crate::engine::dispatch_guard::DispatchGuard;
+        use std::collections::HashSet;
+
+        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let key = "owner/repo/42".to_string();
+
+        // Insert key before spawn — mirrors the production invariant established
+        // by the a6d8b9a fix (key must be visible before the spawn so concurrent
+        // review_open_prs callers see it and skip the task).
+        {
+            let mut g = dispatching.lock().unwrap();
+            g.insert(key.clone());
+        }
+
+        // Create the guard (takes ownership of the removal obligation).
+        let guard = DispatchGuard::new(Arc::clone(&dispatching), key.clone());
+
+        // Spawn a task that panics before the normal completion path.
+        let handle = tokio::spawn(async move {
+            let _guard = guard; // moved in; Drop removes key whether we panic or not
+            panic!("simulated panic inside review_and_merge");
+        });
+
+        // Absorb the JoinError — the panic is expected.
+        let _ = handle.await;
+
+        // Key MUST be gone even though the task panicked.
+        let g = dispatching.lock().unwrap();
+        assert!(
+            !g.contains(&key),
+            "dispatch key must be removed from the dispatching set even when the \
+             spawned review task panics — without DispatchGuard the key leaks and \
+             the task gets stuck in a permanent review loop"
+        );
     }
 
     #[test]

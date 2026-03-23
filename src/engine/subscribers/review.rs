@@ -1,6 +1,7 @@
 //! Reacts to NeedsReview events — spawns review agent immediately.
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
+use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::events::TaskEvent;
 use crate::engine::review::{review_and_merge, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
 use crate::engine::router::Router;
@@ -122,6 +123,8 @@ pub fn spawn(
                         let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
                         guard.insert(dispatch_key.clone());
                     }
+                    // RAII guard — removes dispatch_key on drop even if the spawned task panics.
+                    let dispatch_guard = DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
 
                     let backend_c = backend.clone();
                     let task_manager_c = task_manager.clone();
@@ -129,9 +132,8 @@ pub fn spawn(
                     let router_c = router.clone();
                     let store_c = store.clone();
                     let repo_s = repo.clone();
-                    let dispatching_c = dispatching.clone();
-                    let dispatch_key_c = dispatch_key.clone();
                     tokio::spawn(REPO_CONTEXT.scope(repo_s.clone(), async move {
+                        let _dispatch_guard = dispatch_guard; // released on drop (normal or panic)
                         let tid = task.id.0.clone();
                         enum ReviewOutcome {
                             Reset,
@@ -259,13 +261,8 @@ pub fn spawn(
                             ReviewOutcome::Ok => {}
                         }
 
-                        // Release the per-task lock.
-                        {
-                            let mut guard =
-                                dispatching_c.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.remove(&dispatch_key_c);
-                        }
                         drop(permit);
+                        // _dispatch_guard dropped here — releases the per-task lock.
                     }));
                 }
                 Ok(_) => {} // Not a needs_review event or different repo
