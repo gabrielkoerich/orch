@@ -379,13 +379,24 @@ pub async fn tick(
             }
             "bash" => {
                 if let Some(ref cmd) = job.command {
-                    let dir = job.dir.as_deref().unwrap_or(".");
-                    tracing::info!(job_id = job.id, cmd, dir, "running bash command");
+                    let raw_dir = job.dir.as_deref().unwrap_or(".");
+                    let resolved_dir = {
+                        let p = std::path::Path::new(raw_dir);
+                        if p.is_absolute() {
+                            p.to_path_buf()
+                        } else {
+                            jobs_path
+                                .parent()
+                                .map(|parent| parent.join(raw_dir))
+                                .unwrap_or_else(|| p.to_path_buf())
+                        }
+                    };
+                    tracing::info!(job_id = job.id, cmd, dir = raw_dir, "running bash command");
 
                     let output = tokio::process::Command::new("bash")
                         .arg("-c")
                         .arg(cmd)
-                        .current_dir(dir)
+                        .current_dir(&resolved_dir)
                         .output_with_context()
                         .await;
 
@@ -1200,5 +1211,71 @@ mod tests {
 
         let issue = detect_slow_tasks(&slow_tasks, &summary);
         assert!(issue.is_none());
+    }
+
+    /// Bash job `dir` with a relative path must resolve against the config file's
+    /// directory, not against the process CWD (which is `/` under the brew service).
+    #[tokio::test]
+    async fn bash_job_dir_resolves_relative_to_config_file() {
+        let base = tempfile::tempdir().unwrap();
+        // Create a sub-directory that the job should run in.
+        let scripts_dir = base.path().join("scripts");
+        std::fs::create_dir(&scripts_dir).unwrap();
+
+        // Output file the bash command will write the CWD into.
+        let cwd_out = base.path().join("cwd.txt");
+
+        let jobs_path = base.path().join("jobs.yml");
+        std::fs::write(
+            &jobs_path,
+            format!(
+                r#"jobs:
+  - id: bash-dir-test
+    type: bash
+    schedule: "* * * * *"
+    command: "pwd > {}"
+    dir: "scripts"
+"#,
+                cwd_out.display()
+            ),
+        )
+        .unwrap();
+
+        let store = test_store().await;
+        let backend = Arc::new(ErrorBackend {
+            error_msg: "unused".into(),
+            created_ids: Arc::new(Mutex::new(vec![])),
+        });
+
+        tick(
+            &jobs_path,
+            &(backend as Arc<dyn ExternalBackend>),
+            Some(&store),
+            "test/repo",
+        )
+        .await
+        .unwrap();
+
+        let state = store
+            .get_job_state("test/repo", "bash-dir-test")
+            .await
+            .unwrap()
+            .expect("state should exist");
+        assert_eq!(
+            state.last_task_status,
+            Some("done".to_string()),
+            "bash job should succeed when relative dir resolves to an existing path"
+        );
+
+        let recorded_cwd = std::fs::read_to_string(&cwd_out)
+            .expect("bash command should have written cwd.txt");
+        // Canonicalize both sides so symlinks (e.g. /var → /private/var on macOS) don't
+        // cause a spurious mismatch.
+        let recorded = std::fs::canonicalize(recorded_cwd.trim()).unwrap();
+        let expected = std::fs::canonicalize(&scripts_dir).unwrap();
+        assert_eq!(
+            recorded, expected,
+            "bash job ran in wrong directory; relative `dir` must resolve against config file parent"
+        );
     }
 }
