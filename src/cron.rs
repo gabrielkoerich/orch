@@ -26,7 +26,7 @@ pub fn normalize_dow(expression: &str) -> String {
             if part == "0" {
                 "7".to_string()
             } else if let Some(rest) = part.strip_prefix("0-") {
-                format!("7-{rest}")
+                format!("1-{rest}")
             } else {
                 part.to_string()
             }
@@ -184,6 +184,20 @@ mod tests {
             result.is_ok(),
             "DOW=0 in list should be accepted: {result:?}"
         );
+    }
+
+    #[test]
+    fn dow_range_starting_at_zero_parses() {
+        // "0-5" = Sunday through Friday in standard cron
+        let result = check("0 9 * * 0-5", None);
+        assert!(result.is_ok(), "DOW range 0-5 should parse: {result:?}");
+    }
+
+    #[test]
+    fn dow_range_zero_to_four_parses() {
+        // "0-4" = Sunday through Thursday in standard cron
+        let result = check("0 9 * * 0-4", None);
+        assert!(result.is_ok(), "DOW range 0-4 should parse: {result:?}");
     }
 
     #[test]
