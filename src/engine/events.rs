@@ -22,6 +22,7 @@ pub struct TaskEvent {
     pub timestamp: String,
     pub title: Option<String>,
     pub summary: Option<String>,
+    pub duration_seconds: Option<f64>,
 }
 
 /// The event bus — wraps a tokio broadcast channel.
@@ -161,6 +162,7 @@ mod tests {
             timestamp: "2026-03-23T12:00:00Z".to_string(),
             title: None,
             summary: None,
+            duration_seconds: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"task_id\":\"123\""));
@@ -185,6 +187,7 @@ mod tests {
             timestamp: "2026-03-23T12:00:00Z".to_string(),
             title: None,
             summary: None,
+            duration_seconds: None,
         };
         bus.publish(event.clone());
         let received = rx.try_recv().unwrap();
@@ -229,6 +232,7 @@ mod tests {
             timestamp: "2026-03-23T12:00:00Z".to_string(),
             title: None,
             summary: None,
+            duration_seconds: None,
         };
         bus.publish(event);
 

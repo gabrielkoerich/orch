@@ -581,6 +581,19 @@ impl TaskStore {
             .collect())
     }
 
+    /// Get the duration_seconds from the most recent metric row for a task.
+    /// Returns `None` when no metric has been recorded yet.
+    pub async fn latest_task_metric_duration(&self, task_id: &str) -> Option<f64> {
+        sqlx::query_scalar(
+            "SELECT duration_seconds FROM task_metrics WHERE task_id = ? ORDER BY completed_at DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Get count of self-improvement issues created this week.
     pub async fn count_self_improvement_issues_7d(&self) -> anyhow::Result<i64> {
         let key = self_improvement_key();

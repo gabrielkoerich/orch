@@ -22,7 +22,7 @@ pub fn spawn(mut rx: broadcast::Receiver<TaskEvent>, transport: Arc<Transport>) 
                         title: event.title.unwrap_or_default(),
                         status: event.new_status.clone(),
                         agent: event.agent.unwrap_or_default(),
-                        duration_seconds: 0.0,
+                        duration_seconds: event.duration_seconds.unwrap_or(0.0),
                         summary: event.summary.unwrap_or_default(),
                         repo: Some(event.repo.clone()),
                     };
