@@ -522,6 +522,8 @@ pub(crate) async fn tick_dispatch_tasks(
         // Check if already running (has active session)
         let session_name = tmux.session_name(repo, &task.id.0);
         if tmux.session_exists(&session_name).await {
+            let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
+            guard.remove(&dispatch_key);
             continue;
         }
 
@@ -530,6 +532,8 @@ pub(crate) async fn tick_dispatch_tasks(
             Ok(p) => p,
             Err(_) => {
                 tracing::debug!("all parallel slots busy, skipping remaining tasks");
+                let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
+                guard.remove(&dispatch_key);
                 break;
             }
         };
