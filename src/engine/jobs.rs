@@ -171,15 +171,20 @@ pub async fn tick(
 
         // Load runtime state from SQLite
         let mut state = if let Some(s) = store {
-            s.get_job_state(repo, &job.id)
-                .await?
-                .unwrap_or_else(|| JobState {
+            match s.get_job_state(repo, &job.id).await {
+                Ok(Some(st)) => st,
+                Ok(None) => JobState {
                     repo: repo.to_string(),
                     job_id: job.id.clone(),
                     last_run: None,
                     last_task_status: None,
                     active_task_id: None,
-                })
+                },
+                Err(e) => {
+                    tracing::error!(job_id = job.id, ?e, "failed to load job state, skipping");
+                    continue;
+                }
+            }
         } else {
             JobState {
                 repo: repo.to_string(),
@@ -192,8 +197,30 @@ pub async fn tick(
 
         // Check if schedule matches
         let is_due = match &state.last_run {
-            Some(last) => crate::cron::check(&job.schedule, Some(last))?,
-            None => crate::cron::check(&job.schedule, None)?,
+            Some(last) => match crate::cron::check(&job.schedule, Some(last)) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(
+                        job_id = job.id,
+                        schedule = job.schedule,
+                        ?e,
+                        "invalid cron expression, skipping"
+                    );
+                    continue;
+                }
+            },
+            None => match crate::cron::check(&job.schedule, None) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(
+                        job_id = job.id,
+                        schedule = job.schedule,
+                        ?e,
+                        "invalid cron expression, skipping"
+                    );
+                    continue;
+                }
+            },
         };
 
         if !is_due {
@@ -312,122 +339,7 @@ pub async fn tick(
         // Set last_run BEFORE execution (prevents catch-up loops on restart)
         state.last_run = Some(now.format("%Y-%m-%dT%H:%M:%SZ").to_string());
 
-        match job.r#type.as_str() {
-            "task" => {
-                if let Some(ref template) = job.task {
-                    if job.external {
-                        let mut labels = template.labels.clone();
-                        labels.push("scheduled".to_string());
-                        labels.push(format!("job:{}", job.id));
-
-                        if let Some(ref agent) = template.agent {
-                            if !agent.is_empty() {
-                                labels.push(format!("agent:{agent}"));
-                            }
-                        }
-
-                        match backend
-                            .create_task(&template.title, &template.body, &labels)
-                            .await
-                        {
-                            Ok(ext_id) => {
-                                tracing::info!(
-                                    job_id = job.id,
-                                    task_id = ext_id.0,
-                                    "created external task"
-                                );
-                                state.active_task_id = Some(ext_id.0);
-                                state.last_task_status = Some("new".to_string());
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    job_id = job.id,
-                                    ?e,
-                                    "failed to create external task"
-                                );
-                                state.last_task_status = Some("failed".to_string());
-                            }
-                        }
-                    } else if let Some(s) = store {
-                        match s
-                            .create_internal(repo, &template.title, &template.body, "cron", &job.id)
-                            .await
-                        {
-                            Ok(internal_id) => {
-                                let task_id = format!("internal:{}", internal_id);
-                                tracing::info!(job_id = job.id, task_id, "created internal task");
-                                state.active_task_id = Some(task_id);
-                                state.last_task_status = Some("new".to_string());
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    job_id = job.id,
-                                    ?e,
-                                    "failed to create internal task"
-                                );
-                                state.last_task_status = Some("failed".to_string());
-                            }
-                        }
-                    } else {
-                        tracing::error!(
-                            job_id = job.id,
-                            "no store available for internal task creation"
-                        );
-                        state.last_task_status = Some("failed".to_string());
-                    }
-                }
-            }
-            "bash" => {
-                if let Some(ref cmd) = job.command {
-                    let dir = job.dir.as_deref().unwrap_or(".");
-                    tracing::info!(job_id = job.id, cmd, dir, "running bash command");
-
-                    let output = tokio::process::Command::new("bash")
-                        .arg("-c")
-                        .arg(cmd)
-                        .current_dir(dir)
-                        .output_with_context()
-                        .await;
-
-                    match output {
-                        Ok(o) if o.status.success() => {
-                            state.last_task_status = Some("done".to_string());
-                        }
-                        Ok(o) => {
-                            let stderr = String::from_utf8_lossy(&o.stderr);
-                            tracing::warn!(
-                                job_id = job.id,
-                                code = o.status.code(),
-                                %stderr,
-                                "bash command failed"
-                            );
-                            state.last_task_status = Some("failed".to_string());
-                        }
-                        Err(e) => {
-                            tracing::error!(job_id = job.id, ?e, "bash command error");
-                            state.last_task_status = Some("failed".to_string());
-                        }
-                    }
-                }
-            }
-            "self-review" => match run_self_review(backend, store).await {
-                Ok(issues_created) => {
-                    tracing::info!(job_id = job.id, issues_created, "self-review completed");
-                    state.last_task_status = Some(if issues_created > 0 {
-                        "done".to_string()
-                    } else {
-                        "no_issues".to_string()
-                    });
-                }
-                Err(e) => {
-                    tracing::error!(job_id = job.id, ?e, "self-review failed");
-                    state.last_task_status = Some("failed".to_string());
-                }
-            },
-            other => {
-                tracing::warn!(job_id = job.id, r#type = other, "unknown job type");
-            }
-        }
+        execute_job(job, &mut state, backend, store, repo).await;
 
         // Persist state to SQLite
         if let Some(s) = store {
@@ -438,6 +350,127 @@ pub async fn tick(
     }
 
     Ok(())
+}
+
+/// Execute a single job immediately (ignoring schedule and active-task guard).
+///
+/// Updates `state` with the result but does NOT persist to SQLite — caller is
+/// responsible for that.
+pub async fn execute_job(
+    job: &Job,
+    state: &mut JobState,
+    backend: &Arc<dyn ExternalBackend>,
+    store: Option<&Arc<crate::store::TaskStore>>,
+    repo: &str,
+) {
+    match job.r#type.as_str() {
+        "task" => {
+            if let Some(ref template) = job.task {
+                if job.external {
+                    let mut labels = template.labels.clone();
+                    labels.push("scheduled".to_string());
+                    labels.push(format!("job:{}", job.id));
+
+                    if let Some(ref agent) = template.agent {
+                        if !agent.is_empty() {
+                            labels.push(format!("agent:{agent}"));
+                        }
+                    }
+
+                    match backend
+                        .create_task(&template.title, &template.body, &labels)
+                        .await
+                    {
+                        Ok(ext_id) => {
+                            tracing::info!(
+                                job_id = job.id,
+                                task_id = ext_id.0,
+                                "created external task"
+                            );
+                            state.active_task_id = Some(ext_id.0);
+                            state.last_task_status = Some("new".to_string());
+                        }
+                        Err(e) => {
+                            tracing::error!(job_id = job.id, ?e, "failed to create external task");
+                            state.last_task_status = Some("failed".to_string());
+                        }
+                    }
+                } else if let Some(s) = store {
+                    match s
+                        .create_internal(repo, &template.title, &template.body, "cron", &job.id)
+                        .await
+                    {
+                        Ok(internal_id) => {
+                            let task_id = format!("internal:{}", internal_id);
+                            tracing::info!(job_id = job.id, task_id, "created internal task");
+                            state.active_task_id = Some(task_id);
+                            state.last_task_status = Some("new".to_string());
+                        }
+                        Err(e) => {
+                            tracing::error!(job_id = job.id, ?e, "failed to create internal task");
+                            state.last_task_status = Some("failed".to_string());
+                        }
+                    }
+                } else {
+                    tracing::error!(
+                        job_id = job.id,
+                        "no store available for internal task creation"
+                    );
+                    state.last_task_status = Some("failed".to_string());
+                }
+            }
+        }
+        "bash" => {
+            if let Some(ref cmd) = job.command {
+                let dir = job.dir.as_deref().unwrap_or(".");
+                tracing::info!(job_id = job.id, cmd, dir, "running bash command");
+
+                let output = tokio::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(cmd)
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await;
+
+                match output {
+                    Ok(o) if o.status.success() => {
+                        state.last_task_status = Some("done".to_string());
+                    }
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        tracing::warn!(
+                            job_id = job.id,
+                            code = o.status.code(),
+                            %stderr,
+                            "bash command failed"
+                        );
+                        state.last_task_status = Some("failed".to_string());
+                    }
+                    Err(e) => {
+                        tracing::error!(job_id = job.id, ?e, "bash command error");
+                        state.last_task_status = Some("failed".to_string());
+                    }
+                }
+            }
+        }
+        "self-review" => match run_self_review(backend, store).await {
+            Ok(issues_created) => {
+                tracing::info!(job_id = job.id, issues_created, "self-review completed");
+                state.last_task_status = Some(if issues_created > 0 {
+                    "done".to_string()
+                } else {
+                    "no_issues".to_string()
+                });
+            }
+            Err(e) => {
+                tracing::error!(job_id = job.id, ?e, "self-review failed");
+                state.last_task_status = Some("failed".to_string());
+            }
+        },
+        other => {
+            tracing::warn!(job_id = job.id, r#type = other, "unknown job type");
+        }
+    }
 }
 
 /// Run the self-review job: analyze metrics and create improvement issues.
