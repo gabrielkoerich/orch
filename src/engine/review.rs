@@ -772,9 +772,10 @@ pub(crate) async fn review_and_merge(
                                         &[("pr_number", serde_json::json!(n as i64))],
                                     )
                                     .await;
-                                    return Ok(ReviewDecision::Failed(
-                                        "found existing PR after 422, retry".to_string(),
-                                    ));
+                                    // PR creation recovered successfully, so do not count this as a
+                                    // review-agent failure. The next review pass can use the stored
+                                    // PR number immediately.
+                                    return Ok(ReviewDecision::Skipped);
                                 }
                             }
                             tracing::warn!(
@@ -858,9 +859,10 @@ pub(crate) async fn review_and_merge(
                                                 pr_url = %pr_url,
                                                 "PR already exists (from CLI stderr) — retrying review"
                                             );
-                                            return Ok(ReviewDecision::Failed(
-                                                "PR already exists, retry".to_string(),
-                                            ));
+                                            // PR creation recovered successfully, so skip the failure
+                                            // path and let the next review pass continue from the
+                                            // resolved PR number.
+                                            return Ok(ReviewDecision::Skipped);
                                         }
                                     }
                                     tracing::error!(
