@@ -136,3 +136,7 @@ effective — no tasks lingering in `routed` or `in_review` after this morning's
 
 5. **File tasks for any found improvements** — The `code-development` internal job is running —
    let it surface candidates. Review its output before creating duplicate issues.
+
+---
+
+*Updated: CI all-green confirmed (test, secrets pass). Review cycle complete.*
