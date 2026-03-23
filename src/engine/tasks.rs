@@ -67,6 +67,8 @@ struct TaskSnapshot {
     branch: Option<String>,
     pr_number: Option<String>,
     error: Option<String>,
+    title: Option<String>,
+    summary: Option<String>,
 }
 
 pub struct TaskManager {
@@ -397,6 +399,16 @@ impl TaskManager {
                 } else {
                     Some(task.last_error.clone())
                 },
+                title: if task.title.is_empty() {
+                    None
+                } else {
+                    Some(task.title.clone())
+                },
+                summary: if task.summary.is_empty() {
+                    None
+                } else {
+                    Some(task.summary.clone())
+                },
             },
             Err(_) => TaskSnapshot::default(),
         }
@@ -417,6 +429,8 @@ impl TaskManager {
                 review_context: None,
                 error: snapshot.error.clone(),
                 timestamp: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                title: snapshot.title.clone(),
+                summary: snapshot.summary.clone(),
             };
             let _ = tx.send(event);
         }
