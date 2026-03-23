@@ -17,8 +17,10 @@ use crate::backends::{ExternalBackend, ExternalId};
 use crate::cmd::CommandErrorContext;
 use crate::store::{ErrorStat, JobState, MetricsSummary, SlowTaskInfo, TaskStatus};
 use anyhow::Context;
+use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// Maximum self-improvement issues that can be created per week.
@@ -116,6 +118,13 @@ pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let file: ConfigFile =
         serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+    for job in &file.jobs {
+        let normalized = crate::cron::normalize_dow(&job.schedule);
+        let full_expr = format!("0 {normalized} *");
+        Schedule::from_str(&full_expr).with_context(|| {
+            format!("job '{}': invalid cron schedule '{}'", job.id, job.schedule)
+        })?;
+    }
     Ok(file.jobs)
 }
 
@@ -895,6 +904,30 @@ mod tests {
 
         let network_err = anyhow::anyhow!("connection refused");
         assert!(!is_not_found_error(&network_err));
+    }
+
+    #[test]
+    fn load_jobs_rejects_invalid_cron_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.yml");
+        std::fs::write(
+            &path,
+            r#"jobs:
+  - id: bad-job
+    schedule: "not-a-cron"
+    task:
+      title: Bad job
+      body: ""
+"#,
+        )
+        .unwrap();
+        let result = load_jobs(&path);
+        assert!(result.is_err(), "invalid cron schedule should return Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("bad-job") && msg.contains("not-a-cron"),
+            "error should mention job id and schedule: {msg}"
+        );
     }
 
     #[test]
