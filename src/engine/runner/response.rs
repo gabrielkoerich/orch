@@ -120,6 +120,22 @@ pub fn pick_fallback_agent(
     None
 }
 
+/// Pick a fallback agent for a timeout, ignoring the reroute chain.
+///
+/// Timeouts are a stronger signal that the current agent is a bad fit for the
+/// task, so we prefer any other healthy agent even if it has been tried before.
+pub fn pick_timeout_fallback_agent(
+    current_agent: &str,
+    available_agents: &[String],
+) -> Option<String> {
+    clear_expired_cooldowns();
+
+    available_agents
+        .iter()
+        .find(|agent| agent.as_str() != current_agent && !is_agent_in_cooldown(agent))
+        .cloned()
+}
+
 /// Retryable error types that should trigger agent failover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryableError {
@@ -198,8 +214,16 @@ pub async fn handle_failover(
         return "needs_review".to_string();
     }
 
+    // Timeouts are a stronger signal than other retryable failures: prefer
+    // any other healthy agent, even if it was already tried earlier for the task.
+    let next_agent = if matches!(error_type, RetryableError::Timeout) {
+        pick_timeout_fallback_agent(agent_name, &available)
+    } else {
+        pick_fallback_agent(agent_name, &chain, &available)
+    };
+
     // Pick a fallback agent
-    if let Some(next) = pick_fallback_agent(agent_name, &chain, &available) {
+    if let Some(next) = next_agent {
         tracing::info!(
             task_id,
             from = agent_name,
@@ -660,6 +684,17 @@ mod tests {
     fn pick_fallback_skips_current_agent() {
         let available = vec!["test_agent_a".to_string(), "test_agent_b".to_string()];
         let result = pick_fallback_agent("test_agent_a", "", &available);
+        assert_eq!(result, Some("test_agent_b".to_string()));
+    }
+
+    #[test]
+    fn pick_timeout_fallback_ignores_chain() {
+        let available = vec![
+            "test_agent_a".to_string(),
+            "test_agent_b".to_string(),
+            "test_agent_c".to_string(),
+        ];
+        let result = pick_timeout_fallback_agent("test_agent_a", &available);
         assert_eq!(result, Some("test_agent_b".to_string()));
     }
 
