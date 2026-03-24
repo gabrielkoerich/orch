@@ -92,6 +92,8 @@ Your final output MUST be a JSON object with these fields:
 
 Note: `delegations` is optional — only include it when delegating subtasks.
 
+Any malformed, partial, or non-JSON final output is treated as an invalid agent response and will not be recorded as a successful completion.
+
 Status rules:
 - **done**: all work is committed and tests pass. You must have produced a visible result (committed code, posted a comment, or completed the requested action). The orchestrator pushes and creates the PR automatically — do NOT mention pushing in your summary. Pure research with no output is `in_progress`. **Never report done if you did not complete the task. Asking a clarifying question is NOT done — it is blocked.**
 - **in_progress**: partial work was committed but more remains.
