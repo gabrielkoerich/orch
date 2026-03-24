@@ -1171,7 +1171,7 @@ pub(crate) async fn review_and_merge(
                 agent = %review_agent,
                 "review agent hit rate limit — adding to cooldown"
             );
-            runner::response::record_agent_failure(&review_agent);
+            runner::response::record_agent_failure_with_message(&review_agent, &err_str);
         }
         tracing::error!(task_id = task.id.0, error = %err, "review agent failed");
         return Ok(ReviewDecision::Failed(format!("agent error: {err}")));

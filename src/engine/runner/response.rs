@@ -88,8 +88,8 @@ pub fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> Strin
 
 // Cooldown tracking is implemented in `crate::engine::cooldown` (shared with the router).
 pub use crate::engine::cooldown::{
-    clear_expired_cooldowns, is_agent_in_cooldown, is_model_in_cooldown, record_agent_failure,
-    record_model_failure,
+    clear_expired_cooldowns, is_agent_in_cooldown, is_model_in_cooldown,
+    record_agent_failure_with_message, record_model_failure,
 };
 
 /// Pick a fallback agent, avoiding agents already in the reroute chain and agents in cooldown.
@@ -210,7 +210,7 @@ pub async fn handle_failover(
         // Record agent failure for cooldown tracking
         // Skip cooldown for MissingTooling — it's permanent, not transient
         if !matches!(error_type, RetryableError::MissingTooling) {
-            record_agent_failure(agent_name);
+            record_agent_failure_with_message(agent_name, error_message);
         }
 
         let msg = format!("{error_message}, rerouted to {next}");
@@ -629,7 +629,7 @@ mod tests {
         // Use unique names to avoid interference from other tests
         let agent = "test_cooldown_agent_1";
         assert!(!is_agent_in_cooldown(agent));
-        record_agent_failure(agent);
+        record_agent_failure_with_message(agent, "");
         assert!(is_agent_in_cooldown(agent));
     }
 
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn clear_expired_does_not_remove_fresh_entries() {
         let agent = "test_cooldown_agent_3";
-        record_agent_failure(agent);
+        record_agent_failure_with_message(agent, "");
         clear_expired_cooldowns();
         // Should still be in cooldown (just recorded)
         assert!(is_agent_in_cooldown(agent));
