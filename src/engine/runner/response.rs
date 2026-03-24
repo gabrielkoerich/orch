@@ -436,11 +436,16 @@ fn extract_json_block(text: &str) -> Option<String> {
     while let Some(start) = text[search_from..].find("```json") {
         let abs_start = search_from + start;
         let after_tag = abs_start + "```json".len();
-        let newline_pos = text[after_tag..].find('\n')?;
-        let content_start = after_tag + newline_pos + 1;
-        let end = text[content_start..]
-            .find("```")
-            .map(|e| content_start + e)?;
+        let Some(rest) = text[after_tag..].strip_prefix('\n') else {
+            search_from = after_tag;
+            continue;
+        };
+        let content_start = text.len() - rest.len();
+        let Some(end_offset) = rest.find("```") else {
+            search_from = content_start;
+            continue;
+        };
+        let end = content_start + end_offset;
         let content = text[content_start..end].trim();
         if content.starts_with('{') {
             return Some(content.to_string());
@@ -715,6 +720,20 @@ That's all."#;
     #[test]
     fn extract_json_block_none_when_missing() {
         assert!(extract_json_block("no code blocks here").is_none());
+    }
+
+    #[test]
+    fn extract_json_block_skips_malformed_intermediate_blocks() {
+        let md = "prefix ```json{\"broken\": true}\n\n```json\n{\"real\": true}\n```";
+        let result = extract_json_block(md);
+        assert_eq!(result.as_deref(), Some("{\"real\": true}"));
+    }
+
+    #[test]
+    fn extract_json_block_skips_multiple_malformed_intermediate_blocks() {
+        let md = "prefix ```json{\"broken\": true}\nmid ```json[1, 2, 3]\n\n```json\n{\"real\": true}\n```";
+        let result = extract_json_block(md);
+        assert_eq!(result.as_deref(), Some("{\"real\": true}"));
     }
 
     // ── parse_review_from_output ─────────────────────────────────
