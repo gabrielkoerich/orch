@@ -318,8 +318,7 @@ impl TaskStore {
             title = excluded.title,
             body = excluded.body,
             labels = excluded.labels,
-            url = excluded.url,
-            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            url = excluded.url
          RETURNING id",
         )
         .bind(ext.ext_id)
