@@ -784,6 +784,8 @@ pub(crate) async fn review_and_merge(
         if err_str.contains("rate limit")
             || err_str.contains("usage limit")
             || err_str.contains("rate_limit")
+            || err_str.contains("auth error")
+            || err_str.contains("Auth")
         {
             tracing::warn!(
                 task_id = task.id.0,
