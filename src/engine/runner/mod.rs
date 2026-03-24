@@ -96,6 +96,36 @@ fn classify_run_outcome(
     }
 }
 
+fn classify_run_error_type(last_error: &str) -> &'static str {
+    if last_error.is_empty() {
+        // No error: agent completed successfully and created a PR waiting for review
+        "success"
+    } else if last_error.contains("timeout") {
+        "timeout"
+    } else if last_error.contains("rate limit") || last_error.contains("usage") {
+        "rate_limit"
+    } else if last_error.contains("auth") || last_error.contains("billing") {
+        "auth_error"
+    } else if last_error.contains("push failed") {
+        "push_failed"
+    } else if last_error.contains("No commits between") || last_error.contains("no commits") {
+        "no_commits"
+    } else if last_error.contains("create PR failed") || last_error.contains("pull request") {
+        "pr_failed"
+    } else if last_error.contains("invalid response") || last_error.contains("parse") {
+        "parse_error"
+    } else if last_error.contains("exceeded max attempts") {
+        "max_attempts"
+    } else if last_error.contains("cargo")
+        || last_error.contains("clippy")
+        || last_error.contains("test")
+    {
+        "ci_failure"
+    } else {
+        "failed"
+    }
+}
+
 fn extract_run_tokens(
     parse_result: &Result<agents::ParsedResponse, agents::AgentError>,
 ) -> (i64, i64) {
@@ -529,21 +559,7 @@ impl TaskRunner {
         let outcome = match final_status {
             "done" | "in_progress" | "in_review" => "success",
             "new" => "rerouted",
-            "needs_review" => {
-                let last_error = error_type.unwrap_or("");
-                if last_error.is_empty() {
-                    // No error: agent completed successfully and created a PR waiting for review
-                    "success"
-                } else if last_error.contains("timeout") {
-                    "timeout"
-                } else if last_error.contains("rate limit") || last_error.contains("usage") {
-                    "rate_limit"
-                } else if last_error.contains("auth") || last_error.contains("billing") {
-                    "auth_error"
-                } else {
-                    "failed"
-                }
-            }
+            "needs_review" => classify_run_error_type(error_type.unwrap_or("")),
             _ => "unknown",
         };
 
@@ -1180,6 +1196,30 @@ mod tests {
         let err = parse_success_output("123", "claude", &*runner, "").unwrap_err();
 
         assert!(matches!(err, agents::AgentError::InvalidResponse { .. }));
+    }
+
+    #[test]
+    fn classify_run_error_type_recognizes_specific_patterns() {
+        let cases = [
+            ("push failed: remote rejected", "push_failed"),
+            ("No commits between main and branch", "no_commits"),
+            ("create PR failed: 422", "pr_failed"),
+            ("invalid response from agent", "parse_error"),
+            ("parse error: missing json", "parse_error"),
+            ("exceeded max attempts while rerouting", "max_attempts"),
+            ("cargo test failed", "ci_failure"),
+            ("clippy failed on warning", "ci_failure"),
+            ("test command exited 1", "ci_failure"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(classify_run_error_type(input), expected, "input={input}");
+        }
+    }
+
+    #[test]
+    fn classify_run_error_type_falls_back_for_unknown_errors() {
+        assert_eq!(classify_run_error_type("something unexpected"), "failed");
     }
 
     // ── resolve_project_dir ──────────────────────────────────────────────────
