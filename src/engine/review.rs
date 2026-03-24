@@ -24,6 +24,7 @@ fn review_started_comment(review_agent: &str, review_model: &str) -> String {
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::engine::auto_merge::{attribution_footer, auto_merge_pr, handle_review_changes};
 use crate::engine::runner;
+use crate::engine::runner::worktree;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::store::store_set;
@@ -61,6 +62,40 @@ enum EnsurePrResult {
     Ready(u64),
     /// No PR and status already updated — return this decision to the caller.
     EarlyReturn(ReviewDecision),
+}
+
+async fn recover_missing_review_worktree(
+    task: &ExternalTask,
+    repo: &str,
+    store: &Arc<TaskStore>,
+) -> anyhow::Result<worktree::WorktreeSetup> {
+    let project_dir = crate::config::get_projects_with_paths()?
+        .into_iter()
+        .find(|(candidate_repo, _)| candidate_repo == repo)
+        .map(|(_, project_dir)| project_dir)
+        .ok_or_else(|| anyhow::anyhow!("no project directory configured for repo {repo}"))?;
+
+    tracing::warn!(
+        task_id = task.id.0,
+        repo,
+        project_dir = %project_dir.display(),
+        "review worktree missing, recreating via normal setup"
+    );
+
+    let store_ref = Some(Arc::clone(store));
+    let wt = worktree::setup_worktree(&task.id.0, &task.title, &project_dir, &store_ref, repo)
+        .await
+        .context("recreating missing review worktree")?;
+
+    if !wt.work_dir.exists() {
+        anyhow::bail!(
+            "recreated review worktree at {} for task {} is still missing",
+            wt.work_dir.display(),
+            task.id.0
+        );
+    }
+
+    Ok(wt)
 }
 
 /// Ensure an open PR exists for the task branch before running the review agent.
@@ -454,7 +489,7 @@ pub(crate) async fn review_and_merge(
         .map(|t| (t.review_cycles + 1) as u32)
         .unwrap_or(1);
 
-    let worktree_path = match stored_task.as_ref().map(|t| t.worktree.as_str()) {
+    let mut worktree_path = match stored_task.as_ref().map(|t| t.worktree.as_str()) {
         Some(w) if !w.is_empty() => std::path::PathBuf::from(w),
         _ => {
             tracing::warn!(task_id = task.id.0, "no worktree found for review");
@@ -462,13 +497,46 @@ pub(crate) async fn review_and_merge(
         }
     };
 
-    let branch_name = match stored_task.as_ref().map(|t| t.branch.as_str()) {
+    let mut branch_name = match stored_task.as_ref().map(|t| t.branch.as_str()) {
         Some(b) if !b.is_empty() => b.to_string(),
         _ => {
             tracing::warn!(task_id = task.id.0, "no branch found for review");
             return Ok(ReviewDecision::Failed("no branch found".to_string()));
         }
     };
+
+    let mut missing_worktree_recovered = false;
+    if !worktree_path.exists() {
+        match recover_missing_review_worktree(task, repo, store).await {
+            Ok(recovered) => {
+                branch_name = recovered.branch;
+                worktree_path = recovered.work_dir;
+                missing_worktree_recovered = true;
+            }
+            Err(e) => {
+                let reason = format!("missing review worktree recovery failed: {e}");
+                tracing::error!(task_id = task.id.0, error = %reason, "cannot recover review worktree");
+                store_set(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    &[("last_error", serde_json::json!(reason.clone()))],
+                )
+                .await;
+                return Ok(ReviewDecision::Blocked(reason));
+            }
+        }
+    }
+
+    if missing_worktree_recovered {
+        store_set(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            &[("last_error", serde_json::json!(""))],
+        )
+        .await;
+    }
 
     let agent_summary = stored_task
         .as_ref()
@@ -1008,8 +1076,20 @@ pub(crate) async fn review_and_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::ExternalTask;
     use crate::engine::router::RouterConfig;
     use crate::github::types::{GitHubReview, GitHubReviewComment, GitHubUser, PullRequestReview};
+    use crate::store::TaskStore;
+    use tempfile::TempDir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    }
 
     #[test]
     fn test_pull_request_review_requests_changes() {
@@ -1160,5 +1240,62 @@ mod tests {
             review_started_comment("kimi", "opus"),
             "🔍 Automated review started (agent: kimi, model: opus)"
         );
+    }
+
+    #[tokio::test]
+    async fn recover_missing_review_worktree_recreates_worktree() {
+        let temp_home = TempDir::new().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp_home.path());
+
+        let project_dir = temp_home.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        git(&project_dir, &["init", "-b", "main"]);
+        git(&project_dir, &["config", "user.name", "Test User"]);
+        git(&project_dir, &["config", "user.email", "test@example.com"]);
+        std::fs::write(project_dir.join("README.md"), "hello").unwrap();
+        git(&project_dir, &["add", "README.md"]);
+        git(&project_dir, &["commit", "-m", "init"]);
+
+        let orch_dir = temp_home.path().join(".orch");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        std::fs::write(
+            orch_dir.join("config.yml"),
+            format!("projects:\n  - {}\n", project_dir.display()),
+        )
+        .unwrap();
+        std::fs::write(project_dir.join(".orch.yml"), "gh:\n  repo: owner/repo\n").unwrap();
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+        store
+            .create_internal(repo, "Fix review recovery", "", "review", "review-1")
+            .await
+            .unwrap();
+        let ext = ExternalTask {
+            id: crate::backends::ExternalId("1".to_string()),
+            title: "Fix review recovery".to_string(),
+            body: "".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "tester".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "https://example.com/issues/1".to_string(),
+        };
+        store.ensure_external_task(repo, &ext).await.unwrap();
+
+        let recovered = recover_missing_review_worktree(&ext, repo, &store)
+            .await
+            .unwrap();
+
+        assert!(recovered.work_dir.exists());
+        assert!(recovered.branch.starts_with("gh-issue-1-"));
+
+        if let Some(home) = old_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 }
