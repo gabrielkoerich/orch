@@ -1594,6 +1594,39 @@ async fn set_fields_persists_review_session_expected() {
     assert!(task.review_session_expected);
 }
 
+#[tokio::test]
+async fn set_fields_persists_last_response() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id = store
+        .create(&NewTask {
+            external_id: Some("42".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Issue 42".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    store
+        .set_fields(
+            id,
+            &[(
+                "last_response",
+                serde_json::json!("**Summary:** No open positions, no trades executed."),
+            )],
+        )
+        .await
+        .unwrap();
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(
+        task.last_response,
+        "**Summary:** No open positions, no trades executed."
+    );
+}
+
 // ── prune_old_runs ──────────────────────────────────────────────────────
 
 #[tokio::test]

@@ -48,6 +48,9 @@ pub(crate) async fn store_get_field(
                 "worktree" if !task.worktree.is_empty() => Some(task.worktree.clone()),
                 "branch" if !task.branch.is_empty() => Some(task.branch.clone()),
                 "summary" if !task.summary.is_empty() => Some(task.summary.clone()),
+                "last_response" if !task.last_response.is_empty() => {
+                    Some(task.last_response.clone())
+                }
                 "agent" => task.agent.clone(),
                 "model" => task.model.clone(),
                 "last_error" if !task.last_error.is_empty() => Some(task.last_error.clone()),

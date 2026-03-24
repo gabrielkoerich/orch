@@ -76,14 +76,15 @@ impl TaskRunner {
     /// Run a task through the full execution pipeline.
     ///
     /// Returns `Ok(None)` if the runner guard skipped the task (caller should not
-    /// post stale results). Returns `Ok(Some(status))` with the final task status.
+    /// post stale results). Returns `Ok(Some((status, exit_code, raw_stdout)))` with
+    /// the final task status, agent exit code, and raw agent output for the audit trail.
     pub async fn run(
         &self,
         task_id: &str,
         agent: Option<&str>,
         model: Option<&str>,
         backend: Option<&dyn ExternalBackend>,
-    ) -> anyhow::Result<Option<(String, Option<i32>)>> {
+    ) -> anyhow::Result<Option<(String, Option<i32>, String)>> {
         tracing::info!(
             task_id,
             agent = agent.unwrap_or("default"),
@@ -121,7 +122,7 @@ impl TaskRunner {
                         }
                     }
                 }
-                return Ok(Some(("needs_review".to_string(), None)));
+                return Ok(Some(("needs_review".to_string(), None, String::new())));
             }
             Err(e) => return Err(e),
         };
@@ -182,11 +183,29 @@ impl TaskRunner {
             "agent raw output"
         );
 
+        // Capture raw stdout for audit trail before any consuming operations.
+        // Truncated to 100 KB — enough for debugging while keeping the DB lean.
+        let raw_stdout_for_audit =
+            response_handler::safe_utf8_tail(&session_output.raw_stdout, 100_000).to_string();
+        crate::engine::cleanup::store_set(
+            &self.store,
+            &self.repo,
+            task_id,
+            &[(
+                "last_response",
+                serde_json::json!(raw_stdout_for_audit.clone()),
+            )],
+        )
+        .await;
+
         // Use agent-specific parsing when exit code is 0, fall back to classify_error
         let agent_runner = agents::get_runner(&init.agent_name);
         let parse_result = if session_output.exit_code == 0 && !session_output.raw_stdout.is_empty()
         {
-            agent_runner.parse_response(&session_output.raw_stdout)
+            agents::apply_plaintext_fallback(
+                agent_runner.parse_response(&session_output.raw_stdout),
+                task_id,
+            )
         } else if session_output.exit_code != 0 {
             Err(agent_runner.classify_error(
                 session_output.exit_code,
@@ -233,7 +252,11 @@ impl TaskRunner {
                 if budget_exceeded {
                     // Token budget exceeded — store already updated, return without
                     // tmux cleanup or metrics (preserves original behavior)
-                    return Ok(Some((status, Some(session_output.exit_code))));
+                    return Ok(Some((
+                        status,
+                        Some(session_output.exit_code),
+                        raw_stdout_for_audit,
+                    )));
                 }
                 status
             }
@@ -252,7 +275,11 @@ impl TaskRunner {
                 {
                     fallback::ErrorHandleResult::EarlyReturn { status } => {
                         // Task rerouted — return (metrics recorded in run_with_context)
-                        return Ok(Some((status, Some(session_output.exit_code))));
+                        return Ok(Some((
+                            status,
+                            Some(session_output.exit_code),
+                            raw_stdout_for_audit,
+                        )));
                     }
                     fallback::ErrorHandleResult::Continue { status } => status,
                 }
@@ -275,8 +302,12 @@ impl TaskRunner {
             }
         }
 
-        // Return final status and the session exit code so callers can record it.
-        Ok(Some((final_status, Some(session_output.exit_code))))
+        // Return final status, session exit code, and raw stdout for the audit trail.
+        Ok(Some((
+            final_status,
+            Some(session_output.exit_code),
+            raw_stdout_for_audit,
+        )))
     }
 
     /// Record task execution metrics to the database.
@@ -451,7 +482,7 @@ impl TaskRunner {
         let run_result = self.run(task_id, agent, model, Some(&**backend)).await?;
 
         // If the runner guard skipped the task, do not re-post stale data as a new comment.
-        let (status, exit_code_opt) = match run_result {
+        let (status, exit_code_opt, raw_stdout) = match run_result {
             Some(result) => result,
             None => {
                 tracing::info!(task_id, "guard skipped task — not posting stale result");
@@ -549,9 +580,9 @@ impl TaskRunner {
                     .complete_run(&crate::store::CompleteRun {
                         run_id,
                         exit_code: exit_code_opt,
-                        stdout: &summary,
+                        stdout: &raw_stdout,
                         stderr: "",
-                        parsed: "",
+                        parsed: &summary,
                         outcome,
                         error: &last_error,
                         tokens: crate::store::RunTokenUsage {

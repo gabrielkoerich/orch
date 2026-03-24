@@ -168,6 +168,80 @@ impl std::fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
+/// Convert non-empty plain-text output into a synthetic task response.
+///
+/// Some agent/model combinations occasionally skip the required JSON envelope
+/// and emit a short human-readable summary instead. Preserve that output and map
+/// it to a best-effort status so the runner can finish cleanly instead of
+/// exhausting failover options in a loop.
+pub fn apply_plaintext_fallback(
+    result: Result<ParsedResponse, AgentError>,
+    task_id: &str,
+) -> Result<ParsedResponse, AgentError> {
+    let raw = match result {
+        Err(AgentError::InvalidResponse { raw }) => raw,
+        other => return other,
+    };
+
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err(AgentError::InvalidResponse { raw });
+    }
+
+    let lower = text.to_lowercase();
+    let looks_like_error = lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("exception")
+        || lower.contains("cannot")
+        || lower.contains("can't")
+        || lower.contains("unable to")
+        || lower.contains("?");
+    let looks_like_done = !looks_like_error
+        && (lower.contains("no changes")
+            || lower.contains("nothing to")
+            || lower.contains("no open")
+            || lower.contains("no position")
+            || lower.contains("no trade")
+            || lower.contains("complete")
+            || lower.contains("completed")
+            || lower.contains("summary")
+            || lower.contains("done"));
+
+    let status = if looks_like_error {
+        "needs_review"
+    } else if looks_like_done {
+        "done"
+    } else {
+        "needs_review"
+    };
+
+    let summary = truncate_with_ellipsis(text, 500);
+
+    tracing::warn!(
+        task_id,
+        status,
+        "agent returned plain text (non-JSON) - applying fallback synthesis"
+    );
+
+    Ok(ParsedResponse {
+        response: AgentResponse {
+            status: status.to_string(),
+            summary,
+            accomplished: vec![],
+            remaining: vec![],
+            files: vec![],
+            error: None,
+            input_tokens: None,
+            output_tokens: None,
+            learnings: vec![],
+            delegations: vec![],
+        },
+        input_tokens: None,
+        output_tokens: None,
+        duration_ms: None,
+    })
+}
+
 /// Return the variant name of an `AgentError` as a static string,
 /// for structured logging and `result.json` output.
 pub fn error_class_name(err: &AgentError) -> &'static str {
@@ -199,6 +273,19 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    let end = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len());
+    if end == s.len() {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..end])
+    }
 }
 
 /// Per-agent runner trait.
@@ -703,6 +790,90 @@ mod tests {
         // Missing tool takes priority over rate limit patterns
         let err = patterns::classify_from_text(1, "bun: command not found rate limit");
         assert!(matches!(err, AgentError::MissingTool { .. }));
+    }
+
+    #[test]
+    fn plaintext_fallback_passthrough_on_ok() {
+        let ok = Ok(ParsedResponse {
+            response: AgentResponse {
+                status: "done".to_string(),
+                summary: "all good".to_string(),
+                accomplished: vec![],
+                remaining: vec![],
+                files: vec![],
+                error: None,
+                input_tokens: None,
+                output_tokens: None,
+                learnings: vec![],
+                delegations: vec![],
+            },
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+        });
+
+        let result = apply_plaintext_fallback(ok, "test-task").unwrap();
+        assert_eq!(result.response.status, "done");
+    }
+
+    #[test]
+    fn plaintext_fallback_empty_raw_stays_invalid() {
+        let err = Err(AgentError::InvalidResponse {
+            raw: "  ".to_string(),
+        });
+
+        assert!(matches!(
+            apply_plaintext_fallback(err, "test-task"),
+            Err(AgentError::InvalidResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn plaintext_fallback_done_keywords_map_to_done() {
+        for keyword in [
+            "no open positions",
+            "no changes",
+            "summary:",
+            "task complete",
+        ] {
+            let err = Err(AgentError::InvalidResponse {
+                raw: format!("**Summary:** {keyword}"),
+            });
+
+            let result = apply_plaintext_fallback(err, "test-task").unwrap();
+            assert_eq!(result.response.status, "done", "keyword '{keyword}'");
+        }
+    }
+
+    #[test]
+    fn plaintext_fallback_error_keywords_map_to_needs_review() {
+        for keyword in [
+            "error occurred",
+            "failed to connect",
+            "exception thrown",
+            "can't continue?",
+        ] {
+            let err = Err(AgentError::InvalidResponse {
+                raw: format!("Something {keyword}"),
+            });
+
+            let result = apply_plaintext_fallback(err, "test-task").unwrap();
+            assert_eq!(
+                result.response.status, "needs_review",
+                "keyword '{keyword}'"
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_fallback_summary_truncated_at_500_chars() {
+        let err = Err(AgentError::InvalidResponse {
+            raw: "x".repeat(1000),
+        });
+
+        let result = apply_plaintext_fallback(err, "test-task").unwrap();
+        assert!(result.response.summary.len() <= 503);
+        assert!(result.response.summary.ends_with("..."));
     }
 
     #[test]
