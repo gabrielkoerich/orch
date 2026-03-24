@@ -151,8 +151,8 @@ pub(crate) async fn sync_tick(
             }
             // Skip tasks that just transitioned to InReview — allow time for the
             // review agent to start its tmux session before treating it as stale.
-            // A task is only considered stale if it has been in InReview for > 5 minutes.
-            const MIN_STALE_MINUTES: i64 = 5;
+            // A task is only considered stale if it has been in InReview for > 1 minute.
+            const MIN_STALE_MINUTES: i64 = 1;
             match chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
                 Ok(updated_at) => {
                     let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
@@ -257,7 +257,7 @@ pub(crate) async fn sync_tick(
             tasks
         };
 
-        const MIN_STALE_NEEDS_REVIEW_MINUTES: i64 = 5;
+        const MIN_STALE_NEEDS_REVIEW_MINUTES: i64 = 1;
         tracing::info!(
             count = needs_review_tasks.len(),
             "sync catch-up: checking stale NeedsReview tasks"
