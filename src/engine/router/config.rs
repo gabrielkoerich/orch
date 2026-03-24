@@ -31,8 +31,10 @@ pub struct RouterConfig {
     pub allowed_tools: Vec<String>,
     /// Default skills to always include
     pub default_skills: Vec<String>,
-    /// Model map for complexity levels
-    pub model_map: HashMap<String, HashMap<String, String>>,
+    /// Model map for complexity levels.
+    /// Each entry is a pool of models; one is selected randomly (skipping cooled ones) per dispatch.
+    /// A single-model pool `vec!["model"]` behaves identically to the old string format.
+    pub model_map: HashMap<String, HashMap<String, Vec<String>>>,
     /// Enable weighted round-robin routing based on rate limit capacity.
     /// When true, agents that hit rate limits get fewer tasks.
     pub weighted_round_robin: bool,
@@ -69,51 +71,57 @@ impl Default for RouterConfig {
         let mut simple = HashMap::new();
         simple.insert(
             "claude".to_string(),
-            "claude-haiku-4-5-20251001".to_string(),
+            vec!["claude-haiku-4-5-20251001".to_string()],
         );
-        simple.insert("codex".to_string(), "o4-mini".to_string());
-        simple.insert("opencode".to_string(), "openai/gpt-4.1-mini".to_string());
-        simple.insert("kimi".to_string(), "claude-haiku-4-5-20251001".to_string());
+        simple.insert("codex".to_string(), vec!["o4-mini".to_string()]);
+        simple.insert(
+            "opencode".to_string(),
+            vec!["openai/gpt-4.1-mini".to_string()],
+        );
+        simple.insert(
+            "kimi".to_string(),
+            vec!["claude-haiku-4-5-20251001".to_string()],
+        );
         simple.insert(
             "minimax".to_string(),
-            "claude-haiku-4-5-20251001".to_string(),
+            vec!["claude-haiku-4-5-20251001".to_string()],
         );
         model_map.insert("simple".to_string(), simple);
 
         // Medium tasks — balanced cost/capability
         let mut medium = HashMap::new();
-        medium.insert("claude".to_string(), "claude-sonnet-4-6".to_string());
-        medium.insert("codex".to_string(), "gpt-4.1".to_string());
+        medium.insert("claude".to_string(), vec!["claude-sonnet-4-6".to_string()]);
+        medium.insert("codex".to_string(), vec!["gpt-4.1".to_string()]);
         medium.insert(
             "opencode".to_string(),
-            "anthropic/claude-sonnet-4-6".to_string(),
+            vec!["anthropic/claude-sonnet-4-6".to_string()],
         );
-        medium.insert("kimi".to_string(), "claude-sonnet-4-6".to_string());
-        medium.insert("minimax".to_string(), "claude-sonnet-4-6".to_string());
+        medium.insert("kimi".to_string(), vec!["claude-sonnet-4-6".to_string()]);
+        medium.insert("minimax".to_string(), vec!["claude-sonnet-4-6".to_string()]);
         model_map.insert("medium".to_string(), medium);
 
         // Complex tasks — most capable models
         let mut complex = HashMap::new();
-        complex.insert("claude".to_string(), "claude-opus-4-6".to_string());
-        complex.insert("codex".to_string(), "o3".to_string());
+        complex.insert("claude".to_string(), vec!["claude-opus-4-6".to_string()]);
+        complex.insert("codex".to_string(), vec!["o3".to_string()]);
         complex.insert(
             "opencode".to_string(),
-            "anthropic/claude-opus-4-6".to_string(),
+            vec!["anthropic/claude-opus-4-6".to_string()],
         );
-        complex.insert("kimi".to_string(), "claude-opus-4-6".to_string());
-        complex.insert("minimax".to_string(), "claude-opus-4-6".to_string());
+        complex.insert("kimi".to_string(), vec!["claude-opus-4-6".to_string()]);
+        complex.insert("minimax".to_string(), vec!["claude-opus-4-6".to_string()]);
         model_map.insert("complex".to_string(), complex);
 
         // Review tasks — strong reasoning, moderate cost
         let mut review = HashMap::new();
-        review.insert("claude".to_string(), "claude-sonnet-4-6".to_string());
-        review.insert("codex".to_string(), "gpt-4.1".to_string());
+        review.insert("claude".to_string(), vec!["claude-sonnet-4-6".to_string()]);
+        review.insert("codex".to_string(), vec!["gpt-4.1".to_string()]);
         review.insert(
             "opencode".to_string(),
-            "anthropic/claude-sonnet-4-6".to_string(),
+            vec!["anthropic/claude-sonnet-4-6".to_string()],
         );
-        review.insert("kimi".to_string(), "claude-sonnet-4-6".to_string());
-        review.insert("minimax".to_string(), "claude-sonnet-4-6".to_string());
+        review.insert("kimi".to_string(), vec!["claude-sonnet-4-6".to_string()]);
+        review.insert("minimax".to_string(), vec!["claude-sonnet-4-6".to_string()]);
         model_map.insert("review".to_string(), review);
 
         Self {
@@ -249,17 +257,23 @@ impl RouterConfig {
         }
 
         // Load model_map overrides from config (model_map.{complexity}.{agent})
+        // Value may be a single string ("model-name") or a JSON array (["m1","m2"]).
         let known_agents = ["claude", "codex", "opencode", "kimi", "minimax"];
         for complexity in config.model_map.keys().cloned().collect::<Vec<_>>() {
             for agent in &known_agents {
                 let key = format!("model_map.{complexity}.{agent}");
-                if let Ok(model) = crate::config::get(&key) {
-                    if !model.is_empty() {
+                if let Ok(val) = crate::config::get(&key) {
+                    if !val.is_empty() {
+                        let pool: Vec<String> = if val.trim_start().starts_with('[') {
+                            serde_json::from_str(&val).unwrap_or_else(|_| vec![val.clone()])
+                        } else {
+                            vec![val]
+                        };
                         config
                             .model_map
                             .entry(complexity.clone())
                             .or_default()
-                            .insert(agent.to_string(), model);
+                            .insert(agent.to_string(), pool);
                     }
                 }
             }
@@ -302,20 +316,50 @@ impl RouterConfig {
     }
 
     /// Get the model for a given agent and complexity level.
-    pub fn model_for_complexity(&self, agent: &str, complexity: &str) -> Option<String> {
-        self.model_map
-            .get(complexity)
-            .and_then(|m| m.get(agent))
-            .cloned()
+    ///
+    /// When the complexity tier has a pool of models, selects randomly using
+    /// `task_id` as an entropy source and skips models currently in cooldown.
+    /// Falls back to `pool[0]` if all models are cooled.
+    ///
+    /// Backward-compatible: a single-model pool always returns that model.
+    pub fn model_for_complexity(
+        &self,
+        agent: &str,
+        complexity: &str,
+        task_id: &str,
+    ) -> Option<String> {
+        let pool = self.model_map.get(complexity)?.get(agent)?;
+        if pool.is_empty() {
+            return None;
+        }
+        if pool.len() == 1 {
+            return Some(pool[0].clone());
+        }
+        // Random starting index — varies per task_id to distribute across the pool
+        let start = crate::engine::router::selection::simple_hash_index_for(pool.len(), task_id);
+        // Walk the pool from start, skipping cooled models
+        for i in 0..pool.len() {
+            let model = &pool[(start + i) % pool.len()];
+            if !crate::engine::cooldown::is_model_in_cooldown(agent, model) {
+                return Some(model.clone());
+            }
+        }
+        // All models cooled — deterministic fallback to first entry
+        Some(pool[0].clone())
     }
 
     /// Get the model for a given agent and complexity level, falling back to built-in defaults.
     ///
     /// Unlike [`model_for_complexity`], this always returns a non-empty `String`.
     /// Use this instead of hardcoding fallback model names at call sites.
-    pub fn model_for_complexity_or_default(&self, agent: &str, complexity: &str) -> String {
-        self.model_for_complexity(agent, complexity)
-            .or_else(|| Self::default().model_for_complexity(agent, complexity))
+    pub fn model_for_complexity_or_default(
+        &self,
+        agent: &str,
+        complexity: &str,
+        task_id: &str,
+    ) -> String {
+        self.model_for_complexity(agent, complexity, task_id)
+            .or_else(|| Self::default().model_for_complexity(agent, complexity, task_id))
             .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
     }
 }
