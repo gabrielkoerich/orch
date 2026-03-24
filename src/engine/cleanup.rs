@@ -145,6 +145,36 @@ pub(crate) async fn store_set(
     }
 }
 
+pub(crate) async fn review_session_expected(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+) -> bool {
+    match store.resolve_task_id(repo, task_id).await {
+        Ok(Some(store_id)) => store
+            .get(store_id)
+            .await
+            .map(|task| task.review_session_expected)
+            .unwrap_or(false),
+        Ok(None) | Err(_) => false,
+    }
+}
+
+pub(crate) async fn set_review_session_expected(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    expected: bool,
+) {
+    store_set(
+        &Some(Arc::clone(store)),
+        repo,
+        task_id,
+        &[("review_session_expected", serde_json::json!(expected))],
+    )
+    .await;
+}
+
 /// Increment a counter in the task store.
 ///
 /// Uses `store.increment()` for an atomic SQL `field + 1`.

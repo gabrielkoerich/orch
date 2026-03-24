@@ -88,6 +88,7 @@ pub struct Task {
     pub pr_create_failures: i32,
     pub review_agent_failures: i32,
     pub review_cycles: i32,
+    pub review_session_expected: bool,
 
     // Tokens & Cost
     pub input_tokens: i64,
@@ -493,6 +494,7 @@ impl TaskStore {
             "pr_create_failures",
             "review_agent_failures",
             "review_cycles",
+            "review_session_expected",
             "input_tokens",
             "output_tokens",
             "input_cost_usd",
@@ -583,6 +585,7 @@ impl TaskStore {
             pr_create_failures = 0,
             ci_merge_failures = 0,
             review_cycles = 0,
+            review_session_expected = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
@@ -606,6 +609,7 @@ impl TaskStore {
             review_agent_failures = 0,
             merge_conflict_retries = 0,
             pr_create_failures = 0,
+            review_session_expected = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
@@ -930,6 +934,7 @@ impl TaskStore {
             pr_create_failures: row.get("pr_create_failures"),
             review_agent_failures: row.get("review_agent_failures"),
             review_cycles: row.get("review_cycles"),
+            review_session_expected: row.get::<i32, _>("review_session_expected") != 0,
             input_tokens: row.get("input_tokens"),
             output_tokens: row.get("output_tokens"),
             input_cost_usd: row.get("input_cost_usd"),

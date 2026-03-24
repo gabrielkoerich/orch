@@ -70,8 +70,8 @@ fn any_changes_requested_in_reviews(reviews: &[GitHubReview]) -> bool {
 }
 
 use super::cleanup::{
-    cleanup_task_worktree, store_increment, store_reset_counters, store_reset_failure_counters,
-    store_set,
+    cleanup_task_worktree, set_review_session_expected, store_increment, store_reset_counters,
+    store_reset_failure_counters, store_set,
 };
 use super::router::Router;
 use super::tasks::TaskManager;
@@ -615,6 +615,8 @@ pub(crate) async fn review_and_merge(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<ReviewDecision> {
+    set_review_session_expected(store, repo, &task.id.0, true).await;
+
     // 2. Load worktree path, branch, summary, and pr_number from store — single DB round-trip.
     let stored_task = store
         .get_by_external_id(repo, &task.id.0)

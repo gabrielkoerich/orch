@@ -22,6 +22,7 @@ use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
+use super::cleanup::{review_session_expected, set_review_session_expected};
 use super::dispatch_guard::DispatchGuard;
 use super::review::{review_and_merge, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
 use super::EngineConfig;
@@ -231,6 +232,14 @@ pub(crate) async fn tick_recover_stuck_tasks(
         .list_external_by_status(Status::InReview)
         .await?;
     for task in &in_review {
+        if !review_session_expected(store, repo, &task.id.0).await {
+            tracing::debug!(
+                task_id = task.id.0,
+                "in_review task is waiting on PR review, skipping stuck-session recovery"
+            );
+            continue;
+        }
+
         let review_task_id = format!("{}-review", task.id.0);
         let session_name = tmux.session_name(repo, &review_task_id);
         let has_session = tmux.session_exists(&session_name).await;
@@ -272,6 +281,8 @@ pub(crate) async fn tick_recover_stuck_tasks(
                     "failed to reset stuck in_review task status"
                 );
                 continue;
+            } else {
+                set_review_session_expected(store, repo, &task.id.0, false).await;
             }
             if let Err(e) = backend
                 .post_comment(
@@ -300,6 +311,14 @@ pub(crate) async fn tick_recover_stuck_tasks(
         .await?;
     for task in &internal_in_review {
         let task_id = task.id.0.clone();
+        if !review_session_expected(store, repo, &task_id).await {
+            tracing::debug!(
+                task_id,
+                "internal in_review task is waiting on PR review, skipping stuck-session recovery"
+            );
+            continue;
+        }
+
         let review_task_id = format!("{}-review", task_id);
         let session_name = tmux.session_name(repo, &review_task_id);
         let has_session = tmux.session_exists(&session_name).await;
@@ -332,6 +351,8 @@ pub(crate) async fn tick_recover_stuck_tasks(
                     ?e,
                     "failed to reset stuck internal in_review task status"
                 );
+            } else {
+                set_review_session_expected(store, repo, &task_id, false).await;
             }
         }
     }
@@ -656,6 +677,13 @@ pub(crate) async fn tick_dispatch_tasks(
                                     tracing::warn!(task_id, err = %e, "failed to transition to InReview");
                                 }
                                 Ok(_) => {
+                                    set_review_session_expected(
+                                        &store_for_spawn,
+                                        &repo_owned,
+                                        &task_id,
+                                        true,
+                                    )
+                                    .await;
                                     review_spawned = true;
                                     let backend_clone = backend.clone();
                                     let task_manager_for_review = task_manager_for_spawn.clone();
@@ -832,6 +860,13 @@ pub(crate) async fn tick_dispatch_tasks(
                                                 .await;
                                             }
                                         }
+                                        set_review_session_expected(
+                                            &store_for_review,
+                                            &repo_owned,
+                                            &task_id_for_review,
+                                            false,
+                                        )
+                                        .await;
                                         // _dispatch_guard drops here, removing the key
                                         // even if review_and_merge panicked.
                                     }));
@@ -1304,6 +1339,7 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
+        crate::engine::cleanup::set_review_session_expected(&store, "owner/repo", "99", true).await;
         set_task_updated_at_past(&store, id).await;
 
         tick_recover_stuck_tasks(
@@ -1404,6 +1440,13 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
+        crate::engine::cleanup::set_review_session_expected(
+            &store,
+            "owner/repo",
+            "internal:1",
+            true,
+        )
+        .await;
         set_task_updated_at_past(&store, id).await;
 
         tick_recover_stuck_tasks(
@@ -1422,6 +1465,61 @@ mod tests {
             task.status,
             crate::store::TaskStatus::NeedsReview,
             "stuck internal InReview task should be reset to NeedsReview"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_stuck_tasks_skips_external_in_review_waiting_for_human_review() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let status_updates = mock.status_updates.clone();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "101",
+                title: "Waiting For Human Review",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        set_task_updated_at_past(&store, id).await;
+
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        let updates = status_updates.lock().unwrap();
+        assert!(
+            updates.is_empty(),
+            "InReview task waiting for human review should not be reset"
         );
     }
 

@@ -1570,6 +1570,30 @@ async fn resolve_task_id_internal_returns_none() {
     );
 }
 
+#[tokio::test]
+async fn set_fields_persists_review_session_expected() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id = store
+        .create(&NewTask {
+            external_id: Some("42".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Issue 42".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    store
+        .set_fields(id, &[("review_session_expected", serde_json::json!(true))])
+        .await
+        .unwrap();
+
+    let task = store.get(id).await.unwrap();
+    assert!(task.review_session_expected);
+}
+
 // ── prune_old_runs ──────────────────────────────────────────────────────
 
 #[tokio::test]

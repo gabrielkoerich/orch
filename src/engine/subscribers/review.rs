@@ -118,6 +118,11 @@ pub fn spawn(
                         continue;
                     }
 
+                    super::super::cleanup::set_review_session_expected(
+                        &store, &repo, &task.id.0, true,
+                    )
+                    .await;
+
                     // Insert into dispatching set.
                     {
                         let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
@@ -233,6 +238,13 @@ pub fn spawn(
                                 ReviewOutcome::Ok
                             }
                         };
+                        super::super::cleanup::set_review_session_expected(
+                            &store_c,
+                            &repo_s,
+                            &tid,
+                            false,
+                        )
+                        .await;
                         match outcome {
                             ReviewOutcome::Reset => {
                                 // Kill any stale tmux review session before resetting — the
