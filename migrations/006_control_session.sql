@@ -18,10 +18,3 @@ CREATE INDEX IF NOT EXISTS idx_control_messages_session
     ON control_messages(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_control_messages_created
     ON control_messages(created_at);
-
--- Persistent key-value state for control session
-CREATE TABLE IF NOT EXISTS control_state (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
