@@ -41,7 +41,7 @@ async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: 
 }
 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees, review_session_expected};
-use super::review::review_open_prs;
+use super::review_poll::review_open_prs;
 use super::EngineConfig;
 
 /// Sync tick — runs every 45s.

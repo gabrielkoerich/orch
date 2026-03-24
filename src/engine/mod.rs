@@ -12,6 +12,7 @@
 //! This file contains struct definitions, project initialization, and the
 //! main event loop (`serve()`).
 
+pub mod auto_merge;
 pub mod channel_handler;
 pub mod cleanup;
 pub mod commands;
@@ -20,6 +21,7 @@ pub mod dispatch_guard;
 pub mod events;
 pub mod jobs;
 pub mod review;
+pub mod review_poll;
 pub mod router;
 pub mod runner;
 pub mod subscribers;
