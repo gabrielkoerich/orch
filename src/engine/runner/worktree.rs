@@ -322,26 +322,38 @@ pub async fn setup_worktree(
 
             let mut retry_stdout = String::new();
             let mut retry_stderr = String::new();
-            if let Ok(output) = retry_output {
-                retry_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                retry_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                tracing::warn!(
-                    task_id,
-                    stdout = %retry_stdout,
-                    stderr = %retry_stderr,
-                    "worktree creation retry failed"
-                );
+            let mut retry_error = String::new();
+            match retry_output {
+                Ok(output) => {
+                    retry_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    retry_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    tracing::warn!(
+                        task_id,
+                        stdout = %retry_stdout,
+                        stderr = %retry_stderr,
+                        "worktree creation retry failed"
+                    );
+                }
+                Err(err) => {
+                    retry_error = err.to_string();
+                    tracing::warn!(
+                        task_id,
+                        error = %retry_error,
+                        "worktree creation retry failed to run"
+                    );
+                }
             }
 
             if !worktree_dir.exists() {
                 anyhow::bail!(
-                    "failed to create worktree at {} for task {} (stdout: {}, stderr: {}, retry stdout: {}, retry stderr: {})",
+                    "failed to create worktree at {} for task {} (stdout: {}, stderr: {}, retry stdout: {}, retry stderr: {}, retry error: {})",
                     worktree_dir.display(),
                     task_id,
                     stdout,
                     stderr,
                     retry_stdout,
-                    retry_stderr
+                    retry_stderr,
+                    retry_error
                 );
             }
         }
