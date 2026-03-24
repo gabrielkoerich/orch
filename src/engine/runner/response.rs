@@ -267,6 +267,54 @@ pub async fn handle_failover(
 }
 
 /// Get the reroute chain from store.
+pub async fn handle_timeout_failover(
+    task_id: &str,
+    agent_name: &str,
+    error_message: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> String {
+    // Get all available agents that are not in cooldown
+    let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
+        .iter()
+        .filter(|a| crate::cmd_cache::command_exists(a))
+        .map(|s| s.to_string())
+        .collect();
+
+    // Find the next available agent that is not the current agent
+    let next_agent = pick_timeout_fallback_agent(agent_name, &available);
+
+    if let Some(next) = next_agent {
+        tracing::info!(
+            task_id,
+            from = agent_name,
+            to = next,
+            "timeout failover: switching to fallback agent"
+        );
+        let msg = format!("{error_message}, rerouted to {next}");
+        store::store_set(
+            store,
+            repo,
+            task_id,
+            &[
+                ("agent", serde_json::json!(next)),
+                ("model", serde_json::json!("")),
+                ("last_error", serde_json::json!(msg)),
+            ],
+        )
+        .await;
+        "new".to_string()
+    } else {
+        tracing::warn!(
+            task_id,
+            agent = agent_name,
+            "no fallback agents available for timeout"
+        );
+        "needs_review".to_string()
+    }
+}
+
+/// Get the reroute chain from store.
 pub async fn get_reroute_chain(
     task_id: &str,
     store: &Option<Arc<TaskStore>>,
