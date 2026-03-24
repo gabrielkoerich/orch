@@ -160,6 +160,9 @@ enum Commands {
     Stream {
         /// Task ID to stream (omit to stream all running tasks)
         task_id: Option<String>,
+        /// Print raw NDJSON instead of human-readable output
+        #[arg(long)]
+        raw: bool,
     },
     /// Chat with the orchestrator control session
     Chat {
@@ -519,9 +522,9 @@ async fn main() -> anyhow::Result<()> {
             let val = config::get(&key)?;
             println!("{val}");
         }
-        Commands::Stream { task_id } => match task_id {
-            Some(id) => cli::stream_task(&id).await?,
-            None => cli::stream_all().await?,
+        Commands::Stream { task_id, raw } => match task_id {
+            Some(id) => cli::stream_task(&id, raw).await?,
+            None => cli::stream_all(raw).await?,
         },
         Commands::Chat {
             action,
