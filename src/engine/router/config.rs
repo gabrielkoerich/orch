@@ -254,18 +254,22 @@ impl RouterConfig {
         for complexity in config.model_map.keys().cloned().collect::<Vec<_>>() {
             for agent in &known_agents {
                 let key = format!("model_map.{complexity}.{agent}");
-                if let Ok(val) = crate::config::get(&key) {
-                    if !val.is_empty() {
-                        let pool: Vec<String> = if val.trim_start().starts_with('[') {
-                            serde_json::from_str(&val).unwrap_or_else(|_| vec![val.clone()])
-                        } else {
-                            vec![val]
-                        };
+                // Try as list first (YAML arrays), fall back to single string
+                if let Ok(list) = crate::config::get_list(&key) {
+                    if !list.is_empty() {
                         config
                             .model_map
                             .entry(complexity.clone())
                             .or_default()
-                            .insert(agent.to_string(), pool);
+                            .insert(agent.to_string(), list);
+                    }
+                } else if let Ok(val) = crate::config::get(&key) {
+                    if !val.is_empty() {
+                        config
+                            .model_map
+                            .entry(complexity.clone())
+                            .or_default()
+                            .insert(agent.to_string(), vec![val]);
                     }
                 }
             }
