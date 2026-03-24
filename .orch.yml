@@ -174,5 +174,66 @@ jobs:
   command: null
   enabled: true
   external: false
+- id: agent-debugger
+  type: task
+  schedule: '0 9,21 * * *'
+  task:
+    title: 'Self-improvement: debug agent errors and fix root causes'
+    body: |
+      You are a self-improvement agent. Your job is to analyze recent agent failures, find root causes, and either fix them directly or file detailed issues.
+
+      ## Step 1: Gather failure data
+
+      1. Check recent task run logs for failures:
+         ```
+         sqlite3 ~/.orch/orch.db "SELECT id, external_id, status, agent, last_error, last_response FROM tasks WHERE status IN ('blocked', 'needs_review') AND updated_at > datetime('now', '-12 hours') ORDER BY updated_at DESC LIMIT 20;"
+         ```
+      2. Check recent task run audit trails:
+         ```
+         sqlite3 ~/.orch/orch.db "SELECT task_id, agent, model, outcome, error, started_at FROM task_runs WHERE started_at > datetime('now', '-12 hours') AND outcome != 'success' ORDER BY started_at DESC LIMIT 30;"
+         ```
+      3. Read the service log for errors:
+         ```
+         tail -500 /opt/homebrew/var/log/orch.log | grep -i 'error\|warn' | grep -v 'error sending request\|kill-session failed' | tail -30
+         ```
+      4. Check recent attempt directories for raw outputs:
+         ```
+         find ~/.orch/state -name 'output.json' -newer ~/.orch/state -mmin -720 | head -10
+         ```
+
+      ## Step 2: Classify failures
+
+      For each failure, determine the category:
+      - **Parser failure** — agent returned valid work but in wrong format (plain text, malformed JSON)
+      - **Rate limit** — agent hit usage limits (should have been cooled down)
+      - **Push/auth failure** — git operations failed (SSH keys, token issues)
+      - **Timeout** — agent took too long
+      - **Review loop** — task stuck cycling between statuses
+      - **State drift** — task status doesn't match reality (merged PR but task still blocked)
+
+      ## Step 3: Fix or file
+
+      For each root cause:
+      - If it's a code fix you can make (parser improvement, error handling, config change) → **fix it directly**, commit, and explain the fix
+      - If it requires architectural changes or you're unsure → **file a GitHub issue** with full root cause analysis, logs, and suggested fix
+
+      ## Before starting
+
+      - `gh issue list --state open` — don't duplicate existing issues
+      - `gh issue list --state closed --limit 20` — don't re-file resolved problems
+      - `git log --since="24 hours ago" --oneline` — check what was already fixed
+      - Read `AGENTS.md` DO NOT TOUCH sections
+
+      ## Rules
+
+      - Focus on ROOT CAUSES, not symptoms
+      - Always include the actual error message and task ID in issues
+      - Max 3 issues per run — prioritize by impact (looping tasks > one-off failures)
+      - If a task is stuck looping, fix the loop first, then the underlying issue
+    labels:
+    - self-improvement
+    agent: null
+  enabled: true
+  external: false
 gh:
   repo: gabrielkoerich/orch
