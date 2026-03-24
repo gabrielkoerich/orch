@@ -884,12 +884,16 @@ pub async fn serve() -> anyhow::Result<()> {
     // Channel for weight signals from task runners back to the router
     let (weight_tx, mut weight_rx) = mpsc::channel::<WeightSignal>(64);
 
-    // Reset stale InReview tasks on startup — if a review agent was running when
-    // the engine restarted, the tmux session is gone. Move back to NeedsReview
-    // so the next tick re-triggers the review agent.
+    // Reset only InReview tasks that still expected a live review session when
+    // the engine restarted. Tasks that are merely waiting on a human response on
+    // an open PR should remain InReview.
     for engine in &project_engines {
         if let Ok(in_review) = engine.backend.list_by_status(Status::InReview).await {
             for task in &in_review {
+                if !cleanup::review_session_expected(&engine.store, &engine.repo, &task.id.0).await
+                {
+                    continue;
+                }
                 if let Err(e) = engine
                     .backend
                     .update_status(&task.id, Status::NeedsReview)
@@ -900,6 +904,14 @@ pub async fn serve() -> anyhow::Result<()> {
                         err = %e,
                         "failed to reset stale InReview task on startup"
                     );
+                } else {
+                    cleanup::set_review_session_expected(
+                        &engine.store,
+                        &engine.repo,
+                        &task.id.0,
+                        false,
+                    )
+                    .await;
                 }
             }
             if !in_review.is_empty() {
@@ -920,6 +932,9 @@ pub async fn serve() -> anyhow::Result<()> {
         {
             for task in &internal_in_review {
                 let task_id = task.id.0.clone();
+                if !cleanup::review_session_expected(&engine.store, &engine.repo, &task_id).await {
+                    continue;
+                }
                 if let Err(e) = engine
                     .task_manager
                     .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
@@ -930,6 +945,14 @@ pub async fn serve() -> anyhow::Result<()> {
                         err = %e,
                         "failed to reset stale internal InReview task on startup"
                     );
+                } else {
+                    cleanup::set_review_session_expected(
+                        &engine.store,
+                        &engine.repo,
+                        &task_id,
+                        false,
+                    )
+                    .await;
                 }
             }
             if !internal_in_review.is_empty() {

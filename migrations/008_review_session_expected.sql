@@ -1,0 +1,1 @@
+ALTER TABLE tasks ADD COLUMN review_session_expected INTEGER NOT NULL DEFAULT 0;

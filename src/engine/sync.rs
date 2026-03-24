@@ -40,7 +40,7 @@ async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: 
     }
 }
 
-use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
+use super::cleanup::{check_merged_prs, cleanup_done_worktrees, review_session_expected};
 use super::review::review_open_prs;
 use super::EngineConfig;
 
@@ -172,6 +172,14 @@ pub(crate) async fn sync_tick(
                 }
             }
 
+            if !review_session_expected(store, repo, &task.id.0).await {
+                tracing::debug!(
+                    task_id = task.id.0,
+                    "InReview task is waiting on PR review, skipping stale review-session recovery"
+                );
+                continue;
+            }
+
             let review_task_id = format!("{}-review", task.id.0);
             let review_session = tmux.session_name(repo, &review_task_id);
             let has_session = tmux.session_exists(&review_session).await;
@@ -196,6 +204,9 @@ pub(crate) async fn sync_tick(
                     .await
                 {
                     tracing::error!(task_id = %task.id.0, err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
+                } else {
+                    super::cleanup::set_review_session_expected(store, repo, &task.id.0, false)
+                        .await;
                 }
             }
         }
@@ -1036,6 +1047,64 @@ mod tests {
              spawned review task panics — without DispatchGuard the key leaks and \
              the task gets stuck in a permanent review loop"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_in_review_recovery_skips_tasks_waiting_for_human_review() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "55",
+                title: "Waiting for human review",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        store
+            .set_fields(id, &[("branch", serde_json::json!("feature/55"))])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        sync_tick(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &EngineConfig::default(),
+            &router,
+            &task_manager,
+            &store,
+            &dispatching,
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::InReview);
     }
 
     #[test]
