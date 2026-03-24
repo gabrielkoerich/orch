@@ -91,7 +91,14 @@ fn classify_run_outcome(
         Err(agents::AgentError::RateLimit { .. }) => "rate_limit",
         Err(agents::AgentError::InvalidResponse { .. }) => "parse_error",
         Err(_) => "failed",
-        Ok(_) if matches!(status, "done" | "in_progress" | "in_review" | "blocked") => "success",
+        Ok(_)
+            if matches!(
+                status,
+                "done" | "in_progress" | "in_review" | "blocked" | "needs_review"
+            ) =>
+        {
+            "success"
+        }
         Ok(_) => "failed",
     }
 }
