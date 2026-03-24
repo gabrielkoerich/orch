@@ -192,15 +192,18 @@ jobs:
          ```
       2. Check recent task run audit trails:
          ```
-         sqlite3 ~/.orch/orch.db "SELECT task_id, agent, model, outcome, error, started_at FROM task_runs WHERE started_at > datetime('now', '-12 hours') AND outcome != 'success' ORDER BY started_at DESC LIMIT 30;"
+         sqlite3 ~/.orch/orch.db "SELECT agent, model, outcome, COUNT(*) AS count FROM task_runs WHERE started_at > datetime('now', '-12 hours') AND outcome != 'success' GROUP BY agent, model, outcome ORDER BY count DESC;"
+         sqlite3 ~/.orch/orch.db "SELECT agent, started_at, error FROM task_runs WHERE outcome = 'rate_limit' AND started_at > datetime('now', '-24 hours') ORDER BY started_at;"
+         sqlite3 ~/.orch/orch.db "SELECT agent, outcome, SUM(total_cost_usd) AS total_cost, COUNT(*) AS runs FROM task_runs WHERE started_at > datetime('now', '-24 hours') GROUP BY agent, outcome;"
          ```
       3. Read the service log for errors:
          ```
          tail -500 /opt/homebrew/var/log/orch.log | grep -i 'error\|warn' | grep -v 'error sending request\|kill-session failed' | tail -30
          ```
-      4. Check recent attempt directories for raw outputs:
+      4. Inspect task-specific run history when a task needs more context:
          ```
-         find ~/.orch/state -name 'output.json' -newer ~/.orch/state -mmin -720 | head -10
+         orch task runs <id>
+         orch task runs <id> --verbose
          ```
 
       ## Step 2: Classify failures

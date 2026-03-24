@@ -44,9 +44,35 @@ fn format_age(updated_at: &str) -> String {
 /// Truncate an error message to a maximum length, appending an ellipsis when truncated.
 fn truncate_err(err: &str, max: usize) -> String {
     if err.len() > max {
-        format!("{}…", &err[..max])
+        format!("{}...", &err[..max])
     } else {
         err.to_string()
+    }
+}
+
+fn format_run_duration(duration_secs: f64) -> String {
+    if duration_secs < 60.0 {
+        format!("{duration_secs:.0}s")
+    } else {
+        format!("{:.1}m", duration_secs / 60.0)
+    }
+}
+
+fn format_run_cost(cost: f64) -> String {
+    if cost <= 0.0 {
+        "-".to_string()
+    } else {
+        format!("${cost:.2}")
+    }
+}
+
+fn format_run_text(text: &str, verbose: bool, max: usize) -> String {
+    if verbose {
+        text.to_string()
+    } else if text.is_empty() {
+        String::new()
+    } else {
+        truncate_err(text, max)
     }
 }
 
@@ -650,6 +676,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 
     // Mark in progress
     let ext_id = ExternalId(task_id.clone());
+    let started_at = Utc::now();
     update_status_store_first(
         &Some(store.clone()),
         &backend,
@@ -667,6 +694,7 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
             agent.as_deref(),
             model.as_deref(),
             Some(&*backend),
+            &started_at,
         )
         .await?;
 
@@ -1261,6 +1289,61 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
             Err(e) => {
                 println!("(tmux capture failed: {})", e);
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Show run history for a task.
+pub async fn runs(id: &str, verbose: bool) -> anyhow::Result<()> {
+    let store = crate::cli::init_store().await?;
+    let repo = config::get_current_repo().unwrap_or_default();
+    let Some(task_id) = store.resolve_task_id(&repo, id).await? else {
+        anyhow::bail!("task not found: {id}");
+    };
+
+    let runs = store.get_runs(task_id).await?;
+    if runs.is_empty() {
+        println!("No runs found for task {id}.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<4} {:<8} {:<18} {:<12} {:<8} {:<8} ERROR",
+        "RUN", "AGENT", "MODEL", "OUTCOME", "DURATION", "COST"
+    );
+    println!("{}", "-".repeat(90));
+
+    for run in runs {
+        let model = if run.model.is_empty() {
+            "-"
+        } else {
+            &run.model
+        };
+        let error = format_run_text(&run.error, verbose, 48);
+        println!(
+            "{:<4} {:<8} {:<18} {:<12} {:<8} {:<8} {}",
+            run.attempt,
+            run.agent,
+            model,
+            run.outcome,
+            format_run_duration(run.duration_secs),
+            format_run_cost(run.total_cost_usd),
+            error,
+        );
+
+        if verbose {
+            if !run.stdout.is_empty() {
+                println!("  stdout:\n{}", run.stdout);
+            }
+            if !run.stderr.is_empty() {
+                println!("  stderr:\n{}", run.stderr);
+            }
+            if !run.parsed_response.is_empty() {
+                println!("  parsed_response:\n{}", run.parsed_response);
+            }
+            println!();
         }
     }
 
