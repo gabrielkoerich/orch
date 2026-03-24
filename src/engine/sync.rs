@@ -257,17 +257,25 @@ pub(crate) async fn sync_tick(
         };
 
         const MIN_STALE_NEEDS_REVIEW_MINUTES: i64 = 5;
+        tracing::info!(
+            count = needs_review_tasks.len(),
+            "sync catch-up: checking stale NeedsReview tasks"
+        );
         for task in needs_review_tasks {
             // Only retry tasks that have been in NeedsReview long enough that the
             // subscriber should have handled them by now. Fresh tasks (just transitioned)
             // are likely still in flight via the event bus. Unparseable timestamps are
             // treated as stale (fall through to retry).
-            if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
-                let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
-                if age.num_minutes() < MIN_STALE_NEEDS_REVIEW_MINUTES {
-                    continue;
-                }
-            }
+            let age_minutes =
+                if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
+                    let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
+                    if age.num_minutes() < MIN_STALE_NEEDS_REVIEW_MINUTES {
+                        continue;
+                    }
+                    Some(age.num_minutes())
+                } else {
+                    None
+                };
 
             // Skip tasks actively being dispatched (subscriber is working on them).
             let dispatch_key = format!("{}/{}", repo, task.id.0);
@@ -280,6 +288,7 @@ pub(crate) async fn sync_tick(
 
             tracing::info!(
                 task_id = task.id.0,
+                age_minutes,
                 "sync catch-up: re-firing NeedsReview event for stale task"
             );
             if let Err(e) = task_manager
