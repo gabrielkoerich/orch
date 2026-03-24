@@ -271,8 +271,15 @@ pub async fn setup_worktree(
             .await?;
 
         if !output.status.success() && !worktree_dir.exists() {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             // Retry: prune and recreate
-            tracing::warn!(task_id, "worktree creation failed, retrying after prune");
+            tracing::warn!(
+                task_id,
+                stdout = %stdout,
+                stderr = %stderr,
+                "worktree creation failed, retrying after prune"
+            );
 
             let _ = Command::new("git")
                 .args(["-C", &main_dir.to_string_lossy(), "worktree", "prune"])
@@ -301,7 +308,7 @@ pub async fn setup_worktree(
                 .output_with_context()
                 .await;
 
-            let _ = Command::new("git")
+            let retry_output = Command::new("git")
                 .args([
                     "-C",
                     &main_dir.to_string_lossy(),
@@ -313,11 +320,28 @@ pub async fn setup_worktree(
                 .output_with_context()
                 .await;
 
+            let mut retry_stdout = String::new();
+            let mut retry_stderr = String::new();
+            if let Ok(output) = retry_output {
+                retry_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                retry_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                tracing::warn!(
+                    task_id,
+                    stdout = %retry_stdout,
+                    stderr = %retry_stderr,
+                    "worktree creation retry failed"
+                );
+            }
+
             if !worktree_dir.exists() {
                 anyhow::bail!(
-                    "failed to create worktree at {} for task {}",
+                    "failed to create worktree at {} for task {} (stdout: {}, stderr: {}, retry stdout: {}, retry stderr: {})",
                     worktree_dir.display(),
-                    task_id
+                    task_id,
+                    stdout,
+                    stderr,
+                    retry_stdout,
+                    retry_stderr
                 );
             }
         }
