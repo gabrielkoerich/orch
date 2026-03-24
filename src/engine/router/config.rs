@@ -235,17 +235,9 @@ impl RouterConfig {
         }
 
         // Parse pool: list of "agent:model" entries
-        if let Ok(pool_str) = crate::config::get("router.pool") {
-            if !pool_str.is_empty() && pool_str != "[]" {
-                if let Ok(pool_arr) = serde_json::from_str::<Vec<String>>(&pool_str) {
-                    config.pool = pool_arr;
-                } else {
-                    config.pool = pool_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                }
+        if let Ok(pool_list) = crate::config::get_list("router.pool") {
+            if !pool_list.is_empty() {
+                config.pool = pool_list;
             }
         }
 
@@ -361,5 +353,58 @@ impl RouterConfig {
         self.model_for_complexity(agent, complexity, task_id)
             .or_else(|| Self::default().model_for_complexity(agent, complexity, task_id))
             .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RouterConfig;
+    use std::sync::{Mutex, OnceLock};
+
+    struct CurrentDirGuard {
+        original: std::path::PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original).unwrap();
+        }
+    }
+
+    fn cwd_mutex() -> &'static Mutex<()> {
+        static CWD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        CWD_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn from_config_reads_router_pool_yaml_array() {
+        let _lock = cwd_mutex().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".orch.yml"),
+            "router:\n  pool:\n    - opencode:free\n    - opencode:github-copilot/gpt-5-mini\n    - kimi:k2p5\n    - claude:haiku\n",
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::set(dir.path());
+
+        let config = RouterConfig::from_config();
+
+        assert_eq!(
+            config.pool,
+            vec![
+                "opencode:free",
+                "opencode:github-copilot/gpt-5-mini",
+                "kimi:k2p5",
+                "claude:haiku",
+            ]
+        );
     }
 }
