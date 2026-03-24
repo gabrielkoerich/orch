@@ -247,6 +247,10 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         // Initialize unified task store (sqlx)
         let store = Arc::new(TaskStore::open(&crate::store::default_db_path()?).await?);
 
+        // Load persisted model cooldowns and register store for future writes.
+        // Only needs to run once — all engines share the same SQLite file.
+        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+
         // Initialize task manager (with unified store)
         let task_manager = Arc::new(TaskManager::with_store(
             backend.clone(),
