@@ -111,27 +111,28 @@ pub(crate) async fn sync_tick(
         // Detect stale InReview tasks (review agent crashed, no active tmux session).
         // Read from the store (includes both external and internal tasks).
         let in_review_tasks = {
-            if store.has_tasks(repo).await {
+            let mut tasks = if store.has_external_tasks(repo).await {
                 store
-                    .list_by_status(repo, TaskStatus::InReview)
+                    .list_external_by_status(repo, TaskStatus::InReview)
                     .await
                     .unwrap_or_default()
                     .iter()
                     .map(crate::engine::tasks::store_task_to_external)
                     .collect::<Vec<_>>()
             } else {
-                let mut tasks = backend
+                let tasks = backend
                     .list_by_status(Status::InReview)
                     .await
                     .unwrap_or_default();
-                if let Ok(internal_in_review) = task_manager
-                    .list_internal_by_status(TaskStatus::InReview)
-                    .await
-                {
-                    tasks.extend(internal_in_review);
-                }
                 tasks
+            };
+            if let Ok(internal_in_review) = task_manager
+                .list_internal_by_status(TaskStatus::InReview)
+                .await
+            {
+                tasks.extend(internal_in_review);
             }
+            tasks
         };
         for task in in_review_tasks {
             // Skip tasks currently being processed by the main tick (dispatch + review flow).
@@ -226,14 +227,21 @@ pub(crate) async fn sync_tick(
     // re-introducing the double-trigger race fixed in issue #857 — the subscriber is still
     // the sole spawner and uses the InReview transition as its atomic guard.
     if enable_review {
-        let needs_review_tasks = if store.has_tasks(repo).await {
-            store
-                .list_by_status(repo, TaskStatus::NeedsReview)
+        let needs_review_tasks = if store.has_external_tasks(repo).await {
+            let mut tasks = store
+                .list_external_by_status(repo, TaskStatus::NeedsReview)
                 .await
                 .unwrap_or_default()
                 .iter()
                 .map(crate::engine::tasks::store_task_to_external)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            if let Ok(internal) = task_manager
+                .list_internal_by_status(TaskStatus::NeedsReview)
+                .await
+            {
+                tasks.extend(internal);
+            }
+            tasks
         } else {
             let mut tasks = backend
                 .list_by_status(Status::NeedsReview)

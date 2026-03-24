@@ -3629,24 +3629,103 @@ async fn cost_summary_returns_three_periods() {
     }
 }
 
-// ── has_tasks ────────────────────────────────────────────────────
+// ── has_external_tasks ───────────────────────────────────────────
 
 #[tokio::test]
-async fn has_tasks_returns_false_for_empty_repo() {
+async fn has_external_tasks_returns_false_for_empty_repo() {
     let store = TaskStore::open_memory().await.unwrap();
-    assert!(!store.has_tasks("owner/repo").await);
+    assert!(!store.has_external_tasks("owner/repo").await);
 }
 
 #[tokio::test]
-async fn has_tasks_returns_true_after_insert() {
+async fn has_external_tasks_returns_true_after_external_insert() {
+    let store = TaskStore::open_memory().await.unwrap();
+    store
+        .upsert_external(&UpsertExternal {
+            repo: "owner/repo",
+            ext_id: "1",
+            title: "task",
+            body: "body",
+            author: "user",
+            url: "",
+            labels: &[],
+            origin: "github",
+        })
+        .await
+        .unwrap();
+    assert!(store.has_external_tasks("owner/repo").await);
+    // Different repo should still be false
+    assert!(!store.has_external_tasks("other/repo").await);
+}
+
+#[tokio::test]
+async fn has_external_tasks_ignores_internal_rows() {
     let store = TaskStore::open_memory().await.unwrap();
     store
         .create_internal("owner/repo", "task", "body", "manual", "")
         .await
         .unwrap();
-    assert!(store.has_tasks("owner/repo").await);
-    // Different repo should still be false
-    assert!(!store.has_tasks("other/repo").await);
+
+    assert!(!store.has_external_tasks("owner/repo").await);
+
+    store
+        .upsert_external(&UpsertExternal {
+            repo: "owner/repo",
+            ext_id: "42",
+            title: "External",
+            body: "",
+            author: "user",
+            url: "",
+            labels: &[],
+            origin: "github",
+        })
+        .await
+        .unwrap();
+
+    assert!(store.has_external_tasks("owner/repo").await);
+}
+
+#[tokio::test]
+async fn list_external_scopes_ignore_internal_rows() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let internal_id = store
+        .create_internal("owner/repo", "internal", "", "manual", "")
+        .await
+        .unwrap();
+    store
+        .update_status(internal_id, TaskStatus::Routed)
+        .await
+        .unwrap();
+
+    let external_id = store
+        .upsert_external(&UpsertExternal {
+            repo: "owner/repo",
+            ext_id: "99",
+            title: "external",
+            body: "",
+            author: "user",
+            url: "",
+            labels: &[],
+            origin: "github",
+        })
+        .await
+        .unwrap();
+    store
+        .update_status(external_id, TaskStatus::Routed)
+        .await
+        .unwrap();
+
+    let routed = store
+        .list_external_by_status("owner/repo", TaskStatus::Routed)
+        .await
+        .unwrap();
+    let all = store.list_all_external("owner/repo").await.unwrap();
+
+    assert_eq!(routed.len(), 1);
+    assert_eq!(routed[0].external_id.as_deref(), Some("99"));
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].external_id.as_deref(), Some("99"));
 }
 
 // ── list_cleanable ──────────────────────────────────────────────

@@ -62,7 +62,9 @@ pub fn spawn(
 
                     // Look up the task from the store to get an ExternalTask.
                     let task = {
-                        if store.has_tasks(&repo).await {
+                        if crate::engine::tasks::is_internal_id(task_id)
+                            || store.has_external_tasks(&repo).await
+                        {
                             match store.list_by_status(&repo, TaskStatus::NeedsReview).await {
                                 Ok(tasks) => tasks
                                     .iter()

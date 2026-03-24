@@ -380,6 +380,23 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
+    /// List external tasks by status within a repo (origin != 'internal').
+    pub async fn list_external_by_status(
+        &self,
+        repo: &str,
+        status: TaskStatus,
+    ) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(
+            "SELECT * FROM tasks WHERE repo = ? AND origin != 'internal' AND status = ? ORDER BY created_at DESC",
+        )
+        .bind(repo)
+        .bind(status.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
     /// List routable tasks (status = 'new') within a repo.
     pub async fn list_routable(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         self.list_by_status(repo, TaskStatus::New).await
@@ -414,15 +431,29 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
-    /// Check whether the store has any tasks for a repo (cheap existence check).
-    pub async fn has_tasks(&self, repo: &str) -> bool {
-        sqlx::query_scalar::<_, i32>("SELECT 1 FROM tasks WHERE repo = ? LIMIT 1")
-            .bind(repo)
-            .fetch_optional(&self.pool)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
+    /// List all external tasks for a repo (origin != 'internal').
+    pub async fn list_all_external(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(
+            "SELECT * FROM tasks WHERE repo = ? AND origin != 'internal' ORDER BY created_at DESC",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
+    /// Check whether the store has any external tasks for a repo.
+    pub async fn has_external_tasks(&self, repo: &str) -> bool {
+        sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM tasks WHERE repo = ? AND origin != 'internal' LIMIT 1",
+        )
+        .bind(repo)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
     }
 
     /// List all tasks for a repo, ordered by creation time descending.
