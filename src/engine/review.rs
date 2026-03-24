@@ -1036,7 +1036,9 @@ pub(crate) async fn review_and_merge(
         let agent = r
             .next_round_robin_agent(exclude)
             .unwrap_or_else(|| "claude".to_string());
-        let model = r.config.model_for_complexity_or_default(&agent, "review");
+        let model = r
+            .config
+            .model_for_complexity_or_default(&agent, "review", &task.id.0);
         (agent, model)
     };
 
@@ -2010,23 +2012,23 @@ mod tests {
     fn test_router_config_model_for_complexity_returns_nonempty() {
         let cfg = RouterConfig::default();
         assert!(!cfg
-            .model_for_complexity_or_default("claude", "simple")
+            .model_for_complexity_or_default("claude", "simple", "")
             .is_empty());
         assert!(!cfg
-            .model_for_complexity_or_default("claude", "medium")
+            .model_for_complexity_or_default("claude", "medium", "")
             .is_empty());
         assert!(!cfg
-            .model_for_complexity_or_default("claude", "complex")
+            .model_for_complexity_or_default("claude", "complex", "")
             .is_empty());
         assert!(!cfg
-            .model_for_complexity_or_default("claude", "review")
+            .model_for_complexity_or_default("claude", "review", "")
             .is_empty());
     }
 
     #[test]
     fn test_router_config_model_for_complexity_unknown_agent() {
         let cfg = RouterConfig::default();
-        let model = cfg.model_for_complexity_or_default("unknown_agent_xyz", "simple");
+        let model = cfg.model_for_complexity_or_default("unknown_agent_xyz", "simple", "");
         assert!(!model.is_empty());
     }
 

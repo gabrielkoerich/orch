@@ -42,3 +42,10 @@ Complexity controls model tier:
 - The selected complexity directly determines the model tier via `config.yml` `model_map` (resolved per executor).
 - Choose complexity carefully because this is not just a label; it affects capability/cost.
 - If uncertain between `simple` and `medium`, prefer `medium`.
+
+Executor selection guidance:
+- Distribute load across ALL available executors. Do NOT default to `claude` or `codex` for every task.
+- `opencode` has access to many capable models via GitHub Copilot (gpt-5, gemini-2.5-pro, claude-sonnet-4-6) AND free models (minimax-m2.5-free, nemotron-3-super-free, mimo-v2-pro-free). Prefer opencode for simple and medium tasks to leverage free-tier availability and reduce rate-limit pressure on claude/codex.
+- `kimi` and `minimax` are capable for coding tasks. Use them for variety.
+- Use `claude` or `codex` when you have specific reason to prefer their capabilities (e.g., complex Rust, architecture design), not as the default choice.
+- Rate limits: claude and codex have strict rate limits. opencode/kimi/minimax tend to have more generous limits. Spreading load reduces overall queue wait times.

@@ -147,7 +147,7 @@ impl LlmRouter {
         };
 
         // Get model for complexity
-        let model = config.model_for_complexity(&agent, &complexity);
+        let model = config.model_for_complexity(&agent, &complexity, &task.id.0);
 
         // Build selected skills list
         let mut selected_skills = llm_response.selected_skills;

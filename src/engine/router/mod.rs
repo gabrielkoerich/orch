@@ -212,7 +212,9 @@ impl Router {
         if let Some(agent) = resolved_agent {
             if self.is_agent_available(&agent) {
                 let complexity = strategies::extract_complexity_from_labels(&task.labels);
-                let model = self.config.model_for_complexity(&agent, &complexity);
+                let model = self
+                    .config
+                    .model_for_complexity(&agent, &complexity, &task.id.0);
                 let profile = AgentProfile {
                     role: format!("{} specialist", agent),
                     skills: vec![],
@@ -622,38 +624,91 @@ mod tests {
         let config = RouterConfig::default();
 
         assert_eq!(
-            config.model_for_complexity("claude", "simple"),
+            config.model_for_complexity("claude", "simple", ""),
             Some("claude-haiku-4-5-20251001".to_string())
         );
         assert_eq!(
-            config.model_for_complexity("claude", "medium"),
+            config.model_for_complexity("claude", "medium", ""),
             Some("claude-sonnet-4-6".to_string())
         );
         assert_eq!(
-            config.model_for_complexity("claude", "complex"),
+            config.model_for_complexity("claude", "complex", ""),
             Some("claude-opus-4-6".to_string())
         );
         assert_eq!(
-            config.model_for_complexity("codex", "simple"),
+            config.model_for_complexity("codex", "simple", ""),
             Some("o4-mini".to_string())
         );
         // Verify kimi and minimax use same models as claude
         assert_eq!(
-            config.model_for_complexity("kimi", "simple"),
+            config.model_for_complexity("kimi", "simple", ""),
             Some("claude-haiku-4-5-20251001".to_string())
         );
         assert_eq!(
-            config.model_for_complexity("kimi", "complex"),
+            config.model_for_complexity("kimi", "complex", ""),
             Some("claude-opus-4-6".to_string())
         );
         assert_eq!(
-            config.model_for_complexity("minimax", "medium"),
+            config.model_for_complexity("minimax", "medium", ""),
             Some("claude-sonnet-4-6".to_string())
         );
         assert_eq!(
-            config.model_for_complexity("minimax", "complex"),
+            config.model_for_complexity("minimax", "complex", ""),
             Some("claude-opus-4-6".to_string())
         );
+    }
+
+    #[test]
+    fn model_pool_selection_skips_cooled() {
+        use crate::engine::cooldown::{is_model_in_cooldown, record_model_failure};
+        use std::collections::HashMap;
+
+        let mut config = RouterConfig::default();
+        // Set up a two-model pool for opencode/simple
+        config
+            .model_map
+            .entry("simple".to_string())
+            .or_default()
+            .insert(
+                "opencode".to_string(),
+                vec!["model-a".to_string(), "model-b".to_string()],
+            );
+
+        // Before any cooldown, both models are candidates
+        let m = config.model_for_complexity("opencode", "simple", "task-1");
+        assert!(m == Some("model-a".to_string()) || m == Some("model-b".to_string()));
+
+        // Cool model-a
+        record_model_failure("opencode", "model-a");
+        assert!(is_model_in_cooldown("opencode", "model-a"));
+
+        // Now only model-b should be returned
+        // (try many task_ids to rule out hash coincidence)
+        for i in 0..20 {
+            let result = config.model_for_complexity("opencode", "simple", &i.to_string());
+            assert_eq!(
+                result,
+                Some("model-b".to_string()),
+                "expected model-b when model-a is cooled, got {result:?} for task_id={i}"
+            );
+        }
+
+        // Drop the cooldown by removing from map isn't exposed; instead verify all-cooled fallback
+        // Cool model-b too
+        record_model_failure("opencode", "model-b");
+        // All cooled → deterministic fallback to pool[0] = model-a
+        let fallback = config.model_for_complexity("opencode", "simple", "task-fallback");
+        assert_eq!(fallback, Some("model-a".to_string()));
+        let _ = HashMap::<(), ()>::new(); // suppress unused import lint
+    }
+
+    #[test]
+    fn model_pool_single_string_backward_compat() {
+        // Single-item pools behave identically to the old string format
+        let config = RouterConfig::default();
+        // All default entries are single-item pools
+        let m = config.model_for_complexity("claude", "simple", "any-task");
+        assert_eq!(m, Some("claude-haiku-4-5-20251001".to_string()));
     }
 
     #[test]

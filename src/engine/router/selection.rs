@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Global sequence counter to decorrelate hash inputs across rapid calls.
-pub(super) static HASH_COUNTER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HASH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Simple deterministic-ish fraction [0.0, 1.0) based on time + task data.
 /// Not cryptographic, but sufficient for load distribution.
@@ -32,7 +32,7 @@ pub(super) fn simple_hash_fraction_for(task_id: &str) -> f64 {
 }
 
 /// Simple index selection using instant-based hash.
-pub(super) fn simple_hash_index_for(len: usize, task_id: &str) -> usize {
+pub(crate) fn simple_hash_index_for(len: usize, task_id: &str) -> usize {
     if len == 0 {
         return 0;
     }
