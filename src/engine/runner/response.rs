@@ -343,10 +343,12 @@ pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> 
 
 /// Extract the concatenated text content from an NDJSON event stream.
 ///
-/// Handles text event formats from opencode and codex:
+/// Handles text event formats from all agents:
 /// - opencode Format 1: `{"type":"text","part":{"type":"text","text":"..."}}`
 /// - opencode Format 2: `{"type":"text","text":"..."}`
 /// - codex Format:      `{"type":"item.completed","item":{"type":"agent_message","text":"..."}}`
+/// - claude stream-json: `{"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}`
+/// - claude result:      `{"type":"result","result":"..."}`
 fn ndjson_extract_text(ndjson: &str) -> String {
     ndjson
         .lines()
@@ -374,6 +376,28 @@ fn ndjson_extract_text(ndjson: &str) -> String {
                     .and_then(|item| item.get("text"))
                     .and_then(|t| t.as_str())
                     .map(str::to_string),
+                // claude stream-json: assistant message with content array
+                "assistant" => e
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| {
+                                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                    item.get("text")
+                                        .and_then(|t| t.as_str())
+                                        .map(str::to_string)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .filter(|s| !s.is_empty()),
+                // claude stream-json: final result event
+                "result" => e.get("result").and_then(|r| r.as_str()).map(str::to_string),
                 _ => None,
             }
         })
