@@ -4,6 +4,7 @@
 //! Worktrees are stored at `~/.orch/worktrees/<project>/<branch>/`.
 
 use crate::cmd::CommandErrorContext;
+use crate::store;
 use crate::store::TaskStore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -165,10 +166,10 @@ pub async fn setup_worktree(
     std::fs::create_dir_all(&worktrees_base)?;
 
     // Check if we have a saved branch/worktree in store
-    let saved_branch =
-        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "branch").await;
-    let saved_worktree =
-        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "worktree").await;
+    let (saved_branch, saved_worktree) = store::opt_store_get_task(store, repo, task_id)
+        .await
+        .map(|t| (Some(t.branch), Some(t.worktree)))
+        .unwrap_or((None, None));
 
     let (branch_name_str, worktree_dir) = if let Some(ref saved) = saved_branch {
         if !saved.is_empty() {
@@ -344,7 +345,7 @@ pub async fn setup_worktree(
     }
 
     // Save worktree info to store
-    crate::engine::cleanup::store_set(
+    store::store_set(
         store,
         repo,
         task_id,

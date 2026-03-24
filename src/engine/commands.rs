@@ -6,6 +6,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::github::http::GhHttp;
+use crate::store;
 use crate::store::TaskStore;
 use std::sync::Arc;
 
@@ -318,7 +319,7 @@ pub async fn execute_command(
                 }
             }
             // Reset store state (attempts + all failure counters) so the task starts fresh
-            crate::engine::cleanup::store_reset_counters(store, repo, &task_id.0).await;
+            store::store_reset_counters(store, repo, &task_id.0).await;
             task_manager
                 .update_task_status(task_id, Status::New)
                 .await?;
@@ -334,7 +335,7 @@ pub async fn execute_command(
                 }
             }
             // Reset store state (attempts + all failure counters) so the task starts fresh
-            crate::engine::cleanup::store_reset_counters(store, repo, &task_id.0).await;
+            store::store_reset_counters(store, repo, &task_id.0).await;
             // Optionally set new agent
             if let Some(agent_name) = agent {
                 let label = format!("agent:{agent_name}");

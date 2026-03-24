@@ -8,14 +8,13 @@
 //! - [`attribution_footer`]: standard "Commented/Reviewed by bot" footer for GitHub comments
 
 use crate::backends::{ExternalBackend, ExternalTask, Status};
-use crate::engine::cleanup::{
-    cleanup_task_worktree, store_increment, store_reset_failure_counters, store_set,
-};
+use crate::config;
+use crate::engine::cleanup::cleanup_task_worktree;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubReview;
 use crate::store::TaskStore;
-use crate::{config, engine};
+use crate::store::{opt_store_get_task, store_increment, store_reset_failure_counters, store_set};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
@@ -259,11 +258,10 @@ pub(crate) async fn auto_merge_pr(
             || err_msg.contains("merge conflict");
 
         if is_conflict {
-            let retries =
-                engine::cleanup::store_get_field(store, repo, &task.id.0, "merge_conflict_retries")
-                    .await
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
+            let retries = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
+                .await
+                .map(|t| t.merge_conflict_retries as u64)
+                .unwrap_or(0);
             if retries >= MAX_MERGE_CONFLICT_RETRIES {
                 tracing::error!(
                     task_id = task.id.0,
@@ -286,8 +284,10 @@ pub(crate) async fn auto_merge_pr(
             }
 
             // Try rebase in the worktree
-            let worktree_path =
-                engine::cleanup::store_get_field(store, repo, &task.id.0, "worktree").await;
+            let worktree_path = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
+                .await
+                .map(|t| t.worktree)
+                .filter(|wt| !wt.is_empty());
             if let Some(wt) = worktree_path {
                 let wt_path = std::path::PathBuf::from(&wt);
                 if wt_path.exists() {
@@ -447,11 +447,10 @@ pub(crate) async fn handle_review_changes(
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     // 1. Check review cycle count (max 2 review rounds)
-    let review_cycles: u32 =
-        engine::cleanup::store_get_field(store, repo, &task.id.0, "review_cycles")
-            .await
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+    let review_cycles: u32 = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
+        .await
+        .map(|t| t.review_cycles.max(0) as u32)
+        .unwrap_or(0);
 
     let max_cycles: u32 = config::get("workflow.max_review_cycles")
         .ok()

@@ -23,11 +23,12 @@ fn review_started_comment(review_agent: &str, review_model: &str) -> String {
 
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::engine::auto_merge::{attribution_footer, auto_merge_pr, handle_review_changes};
-use crate::engine::cleanup::{set_review_session_expected, store_set};
 use crate::engine::runner;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
+use crate::store::store_set;
 use crate::store::TaskStore;
+use crate::store::{opt_store_get_task, set_review_session_expected, store_increment};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use std::sync::Arc;
@@ -287,7 +288,7 @@ async fn ensure_pr_exists(
                                     stderr = %stderr,
                                     "failed to create missing PR — work may be stuck"
                                 );
-                                let failures = crate::engine::cleanup::store_increment(
+                                let failures = store_increment(
                                     &Some(Arc::clone(store)),
                                     repo,
                                     &task.id.0,
@@ -311,7 +312,7 @@ async fn ensure_pr_exists(
                                     error = %e,
                                     "failed to run gh pr create"
                                 );
-                                let failures = crate::engine::cleanup::store_increment(
+                                let failures = store_increment(
                                     &Some(Arc::clone(store)),
                                     repo,
                                     &task.id.0,
@@ -358,10 +359,10 @@ async fn ensure_pr_exists(
                     return Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Skipped));
                 }
 
-                let last_error =
-                    crate::engine::cleanup::store_get_field(store, repo, &task.id.0, "last_error")
-                        .await
-                        .unwrap_or_default();
+                let last_error = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
+                    .await
+                    .map(|t| t.last_error)
+                    .unwrap_or_default();
                 let reason = if !agent_summary.is_empty() {
                     agent_summary.to_string()
                 } else {
@@ -507,8 +508,9 @@ pub(crate) async fn review_and_merge(
     );
 
     // 5. Pick review agent via round-robin, excluding the agent that did the work
-    let task_agent = crate::engine::cleanup::store_get_field(store, repo, &task.id.0, "agent")
+    let task_agent = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
         .await
+        .and_then(|t| t.agent)
         .unwrap_or_default();
     let (review_agent, review_model) = {
         let mut r = router.write().await;
@@ -761,17 +763,11 @@ pub(crate) async fn review_and_merge(
     }
 
     // 13. Check for push failures before acting on the decision.
-    let has_push_failure = {
-        let last_err = crate::engine::cleanup::opt_store_get_field(
-            &Some(store.clone()),
-            repo,
-            &task.id.0,
-            "last_error",
-        )
+    let has_push_failure = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
         .await
-        .unwrap_or_default();
-        last_err.contains("push failed")
-    };
+        .map(|t| t.last_error)
+        .unwrap_or_default()
+        .contains("push failed");
 
     // 14. Handle the decision
     match decision {

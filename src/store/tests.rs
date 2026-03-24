@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn create_and_get_task() {
@@ -216,6 +217,316 @@ async fn increment_and_reset_counters() {
     store.reset_counters(id).await.unwrap();
     let task = store.get(id).await.unwrap();
     assert_eq!(task.attempts, 0);
+}
+
+#[tokio::test]
+async fn helper_get_token_usage_from_store() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("70".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Token test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    store
+        .set_fields(
+            id,
+            &[
+                ("input_tokens", serde_json::json!(1500)),
+                ("output_tokens", serde_json::json!(800)),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let opt_store = Some(store);
+    let usage = get_token_usage(&opt_store, "owner/repo", "70").await;
+    assert_eq!(usage.input_tokens, 1500);
+    assert_eq!(usage.output_tokens, 800);
+    assert_eq!(usage.total_tokens(), 2300);
+}
+
+#[tokio::test]
+async fn helper_get_cost_estimate_from_store() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("71".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Cost test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    store
+        .set_fields(
+            id,
+            &[
+                ("input_cost_usd", serde_json::json!(0.05)),
+                ("output_cost_usd", serde_json::json!(0.10)),
+                ("total_cost_usd", serde_json::json!(0.15)),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let opt_store = Some(store);
+    let cost = get_cost_estimate(&opt_store, "owner/repo", "71").await;
+    assert!((cost.input_cost_usd - 0.05).abs() < f64::EPSILON);
+    assert!((cost.output_cost_usd - 0.10).abs() < f64::EPSILON);
+    assert!((cost.total_cost_usd - 0.15).abs() < f64::EPSILON);
+}
+
+#[tokio::test]
+async fn helper_get_recent_memory_from_store() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("72".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Memory test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let entry1 = MemoryEntry {
+        attempt: 1,
+        agent: "claude".to_string(),
+        model: Some("opus".to_string()),
+        learnings: vec!["learned A".to_string()],
+        error: None,
+        files_modified: vec!["src/main.rs".to_string()],
+        approach: "first try".to_string(),
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+    };
+    let entry2 = MemoryEntry {
+        attempt: 2,
+        agent: "codex".to_string(),
+        model: Some("gpt-5".to_string()),
+        learnings: vec!["learned B".to_string()],
+        error: Some("timeout".to_string()),
+        files_modified: vec![],
+        approach: "second try".to_string(),
+        timestamp: "2026-01-01T01:00:00Z".to_string(),
+    };
+
+    store.append_memory(id, &entry1).await.unwrap();
+    store.append_memory(id, &entry2).await.unwrap();
+
+    let opt_store = Some(store);
+    let memory = get_recent_memory(&opt_store, "owner/repo", "72", 10).await;
+    assert_eq!(memory.len(), 2);
+    assert_eq!(memory[0].attempt, 1);
+    assert_eq!(memory[1].attempt, 2);
+    assert_eq!(memory[0].agent, "claude");
+    assert_eq!(memory[1].agent, "codex");
+}
+
+#[tokio::test]
+async fn helper_store_increment_returns_new_value() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("73".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Increment test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let opt_store = Some(store);
+    let v1 = store_increment(&opt_store, "owner/repo", "73", "attempts").await;
+    assert_eq!(v1, 1);
+
+    let v2 = store_increment(&opt_store, "owner/repo", "73", "attempts").await;
+    assert_eq!(v2, 2);
+
+    let v3 = store_increment(&opt_store, "owner/repo", "73", "attempts").await;
+    assert_eq!(v3, 3);
+
+    let task = opt_store.as_ref().unwrap().get(id).await.unwrap();
+    assert_eq!(task.attempts, 3);
+}
+
+#[tokio::test]
+async fn helper_store_increment_without_store_returns_zero() {
+    let store: Option<Arc<TaskStore>> = None;
+    let v = store_increment(&store, "owner/repo", "no-store-task", "attempts").await;
+    assert_eq!(v, 0);
+}
+
+#[tokio::test]
+async fn helper_store_set_with_none_store() {
+    let store: Option<Arc<TaskStore>> = None;
+    store_set(
+        &store,
+        "owner/repo",
+        "42",
+        &[("branch", serde_json::json!("main"))],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn helper_store_set_writes_fields() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("90".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Store set test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let opt_store = Some(store.clone());
+    store_set(
+        &opt_store,
+        "owner/repo",
+        "90",
+        &[
+            ("branch", serde_json::json!("fix-bug")),
+            ("worktree", serde_json::json!("/tmp/wt")),
+        ],
+    )
+    .await;
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.branch, "fix-bug");
+    assert_eq!(task.worktree, "/tmp/wt");
+}
+
+#[tokio::test]
+async fn helper_store_set_ignores_unknown_task() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let opt_store = Some(store);
+    store_set(
+        &opt_store,
+        "owner/repo",
+        "nonexistent-999",
+        &[("branch", serde_json::json!("main"))],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn helper_store_reset_counters_zeroes_counters() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("91".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Reset test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let opt_store = Some(store.clone());
+    store_increment(&opt_store, "owner/repo", "91", "attempts").await;
+    store_increment(&opt_store, "owner/repo", "91", "attempts").await;
+    store_increment(&opt_store, "owner/repo", "91", "merge_conflict_retries").await;
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.attempts, 2);
+    assert_eq!(task.merge_conflict_retries, 1);
+
+    store_reset_counters(&opt_store, "owner/repo", "91").await;
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.attempts, 0);
+    assert_eq!(task.merge_conflict_retries, 0);
+}
+
+#[tokio::test]
+async fn helper_store_reset_counters_noop_without_store() {
+    let store: Option<Arc<TaskStore>> = None;
+    store_reset_counters(&store, "owner/repo", "no-task").await;
+}
+
+#[tokio::test]
+async fn helper_store_reset_failure_counters_preserves_review_cycles() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("93".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Failure counter test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let opt_store = Some(store.clone());
+    store_increment(&opt_store, "owner/repo", "93", "review_cycles").await;
+    store_increment(&opt_store, "owner/repo", "93", "attempts").await;
+    store_increment(&opt_store, "owner/repo", "93", "merge_conflict_retries").await;
+
+    store_reset_failure_counters(&opt_store, "owner/repo", "93").await;
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.review_cycles, 1);
+    assert_eq!(task.attempts, 0);
+    assert_eq!(task.merge_conflict_retries, 0);
+}
+
+#[tokio::test]
+async fn helper_get_total_tokens_sums_input_and_output() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    store
+        .create(&NewTask {
+            external_id: Some("92".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Tokens test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    store
+        .set_fields(
+            1,
+            &[
+                ("input_tokens", serde_json::json!(5000)),
+                ("output_tokens", serde_json::json!(3000)),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let opt_store = Some(store);
+    let total = get_total_tokens(&opt_store, "owner/repo", "92").await;
+    assert_eq!(total, 8000);
+}
+
+#[tokio::test]
+async fn helper_get_total_tokens_returns_zero_without_store() {
+    let store: Option<Arc<TaskStore>> = None;
+    let total = get_total_tokens(&store, "owner/repo", "any").await;
+    assert_eq!(total, 0);
+}
+
+#[tokio::test]
+async fn helper_get_recent_memory_returns_empty_without_store() {
+    let store: Option<Arc<TaskStore>> = None;
+    let memory = get_recent_memory(&store, "owner/repo", "any", 10).await;
+    assert!(memory.is_empty());
 }
 
 #[tokio::test]

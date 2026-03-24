@@ -6,6 +6,7 @@
 //! 3. Classifies errors (timeout, usage limit, auth, tooling)
 //! 4. Determines next action (success, reroute, needs_review)
 
+use crate::store;
 use crate::store::TaskStore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -187,7 +188,7 @@ pub async fn handle_failover(
             "all agents exhausted, marking needs_review"
         );
         let msg = format!("{error_message} (all agents exhausted)");
-        crate::engine::cleanup::store_set(
+        store::store_set(
             store,
             repo,
             task_id,
@@ -214,7 +215,7 @@ pub async fn handle_failover(
         }
 
         let msg = format!("{error_message}, rerouted to {next}");
-        crate::engine::cleanup::store_set(
+        store::store_set(
             store,
             repo,
             task_id,
@@ -231,7 +232,7 @@ pub async fn handle_failover(
     // No fallback available
     tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
     let msg = format!("{error_message}, no fallback agents");
-    crate::engine::cleanup::store_set(
+    store::store_set(
         store,
         repo,
         task_id,
@@ -247,8 +248,9 @@ pub async fn get_reroute_chain(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> String {
-    crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "limit_reroute_chain")
+    store::opt_store_get_task(store, repo, task_id)
         .await
+        .map(|t| t.limit_reroute_chain)
         .unwrap_or_default()
         .trim()
         .to_string()
@@ -269,7 +271,7 @@ pub async fn update_reroute_chain(
         chain = format!("{chain},{current_agent}");
     }
 
-    crate::engine::cleanup::store_set(
+    store::store_set(
         store,
         repo,
         task_id,

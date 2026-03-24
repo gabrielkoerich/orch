@@ -54,6 +54,7 @@ use crate::engine::tasks::TaskManager;
 use crate::github::http::{rate_limit_metrics, GhHttp};
 use crate::repo_context::REPO_CONTEXT;
 use crate::store::TaskStore;
+use crate::store::{review_session_expected, set_review_session_expected};
 use crate::tmux::TmuxManager;
 use runner::WeightSignal;
 // AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
@@ -896,8 +897,7 @@ pub async fn serve() -> anyhow::Result<()> {
     for engine in &project_engines {
         if let Ok(in_review) = engine.backend.list_by_status(Status::InReview).await {
             for task in &in_review {
-                if !cleanup::review_session_expected(&engine.store, &engine.repo, &task.id.0).await
-                {
+                if !review_session_expected(&engine.store, &engine.repo, &task.id.0).await {
                     continue;
                 }
                 if let Err(e) = engine
@@ -911,13 +911,8 @@ pub async fn serve() -> anyhow::Result<()> {
                         "failed to reset stale InReview task on startup"
                     );
                 } else {
-                    cleanup::set_review_session_expected(
-                        &engine.store,
-                        &engine.repo,
-                        &task.id.0,
-                        false,
-                    )
-                    .await;
+                    set_review_session_expected(&engine.store, &engine.repo, &task.id.0, false)
+                        .await;
                 }
             }
             if !in_review.is_empty() {
@@ -938,7 +933,7 @@ pub async fn serve() -> anyhow::Result<()> {
         {
             for task in &internal_in_review {
                 let task_id = task.id.0.clone();
-                if !cleanup::review_session_expected(&engine.store, &engine.repo, &task_id).await {
+                if !review_session_expected(&engine.store, &engine.repo, &task_id).await {
                     continue;
                 }
                 if let Err(e) = engine
@@ -952,13 +947,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         "failed to reset stale internal InReview task on startup"
                     );
                 } else {
-                    cleanup::set_review_session_expected(
-                        &engine.store,
-                        &engine.repo,
-                        &task_id,
-                        false,
-                    )
-                    .await;
+                    set_review_session_expected(&engine.store, &engine.repo, &task_id, false).await;
                 }
             }
             if !internal_in_review.is_empty() {

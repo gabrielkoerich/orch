@@ -120,10 +120,8 @@ pub fn spawn(
                         continue;
                     }
 
-                    super::super::cleanup::set_review_session_expected(
-                        &store, &repo, &task.id.0, true,
-                    )
-                    .await;
+                    crate::store::set_review_session_expected(&store, &repo, &task.id.0, true)
+                        .await;
 
                     // Insert into dispatching set.
                     {
@@ -168,7 +166,7 @@ pub fn spawn(
                                 ReviewOutcome::Block
                             }
                             Ok(ReviewDecision::Failed(reason)) => {
-                                let failures = super::super::cleanup::store_increment(
+                                let failures = crate::store::store_increment(
                                     &Some(store_c.clone()),
                                     &repo_s,
                                     &tid,
@@ -194,7 +192,7 @@ pub fn spawn(
                                 }
                             }
                             Err(e) => {
-                                let failures = super::super::cleanup::store_increment(
+                                let failures = crate::store::store_increment(
                                     &Some(store_c.clone()),
                                     &repo_s,
                                     &tid,
@@ -220,7 +218,7 @@ pub fn spawn(
                                 }
                             }
                             Ok(ReviewDecision::Approve) | Ok(ReviewDecision::Skipped) => {
-                                super::super::cleanup::store_reset_counters(
+                                crate::store::store_reset_counters(
                                     &Some(store_c.clone()),
                                     &repo_s,
                                     &tid,
@@ -231,7 +229,7 @@ pub fn spawn(
                             Ok(ReviewDecision::RequestChanges { .. }) => {
                                 // handle_review_changes already incremented review_cycles —
                                 // only reset transient per-attempt counters.
-                                super::super::cleanup::store_reset_failure_counters(
+                                crate::store::store_reset_failure_counters(
                                     &Some(store_c.clone()),
                                     &repo_s,
                                     &tid,
@@ -240,7 +238,7 @@ pub fn spawn(
                                 ReviewOutcome::Ok
                             }
                         };
-                        super::super::cleanup::set_review_session_expected(
+                        crate::store::set_review_session_expected(
                             &store_c,
                             &repo_s,
                             &tid,

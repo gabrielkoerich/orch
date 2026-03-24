@@ -5,6 +5,7 @@
 //! Also owns `write_result_json` and the `safe_utf8_tail` utility.
 
 use crate::config;
+use crate::store;
 use crate::store::TaskStore;
 use std::path::Path;
 use std::sync::Arc;
@@ -118,7 +119,7 @@ pub async fn handle_success(
         {
             tracing::error!(task_id, error = ?e, "auto commit failed");
             let msg = format!("auto commit failed: {e}");
-            crate::engine::cleanup::store_set(
+            store::store_set(
                 store,
                 repo,
                 task_id,
@@ -147,7 +148,7 @@ pub async fn handle_success(
                     has_pushed = true;
                     // Clear any stale push failure from a previous run so review_and_merge
                     // does not incorrectly block an approved task.
-                    crate::engine::cleanup::store_set(
+                    store::store_set(
                         store,
                         repo,
                         task_id,
@@ -159,7 +160,7 @@ pub async fn handle_success(
                 Err(e) => {
                     tracing::error!(task_id, error = ?e, "push failed");
                     let msg = format!("push failed: {e}");
-                    crate::engine::cleanup::store_set(
+                    store::store_set(
                         store,
                         repo,
                         task_id,
@@ -202,7 +203,7 @@ pub async fn handle_success(
                     // immediately without racing GitHub's list-API cache (~300 ms lag).
                     if let Some(pr_num) = url.rsplit('/').next().and_then(|n| n.parse::<i64>().ok())
                     {
-                        crate::engine::cleanup::store_set(
+                        store::store_set(
                             store,
                             repo,
                             task_id,
@@ -219,7 +220,7 @@ pub async fn handle_success(
                     let err_str = format!("{e}");
                     tracing::error!(task_id, error = ?e, "create PR failed");
                     let msg = format!("create PR failed: {e}");
-                    crate::engine::cleanup::store_set(
+                    store::store_set(
                         store,
                         repo,
                         task_id,
@@ -247,7 +248,7 @@ pub async fn handle_success(
 
     // Store delegations in store if present (processed by run_with_context)
     if !resp.delegations.is_empty() {
-        crate::engine::cleanup::store_set(
+        store::store_set(
             store,
             repo,
             task_id,
@@ -268,22 +269,21 @@ pub async fn handle_success(
     // Check if push was attempted but failed: agent said done, tried to push, but has_pushed is still false
     // and last_error contains a push failure.
     let push_failed = resp.status == "done" && !has_pushed && {
-        let last_err =
-            crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "last_error")
-                .await
-                .unwrap_or_default();
+        let last_err = store::opt_store_get_task(store, repo, task_id)
+            .await
+            .map(|t| t.last_error)
+            .unwrap_or_default();
         last_err.contains("push failed")
     };
 
     let final_status = if push_failed {
-        let push_failures: u32 =
-            crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "pr_create_failures")
-                .await
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0)
-                + 1;
+        let push_failures: u32 = store::opt_store_get_task(store, repo, task_id)
+            .await
+            .map(|t| t.pr_create_failures)
+            .unwrap_or(0) as u32
+            + 1;
 
-        crate::engine::cleanup::store_set(
+        store::store_set(
             store,
             repo,
             task_id,
@@ -334,7 +334,7 @@ pub async fn handle_success(
     } else {
         &resp.status
     };
-    crate::engine::cleanup::store_set(
+    store::store_set(
         store,
         repo,
         task_id,
@@ -378,8 +378,8 @@ pub async fn handle_success(
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000);
 
-    let total_tokens = crate::engine::cleanup::get_total_tokens(store, repo, task_id).await;
-    let cost = crate::engine::cleanup::get_cost_estimate(store, repo, task_id).await;
+    let total_tokens = store::get_total_tokens(store, repo, task_id).await;
+    let cost = store::get_cost_estimate(store, repo, task_id).await;
     let warning_threshold = (max_tokens as f64 * 0.8) as u64;
 
     if total_tokens > max_tokens {
@@ -392,7 +392,7 @@ pub async fn handle_success(
             "token budget exceeded: {}/{} tokens (${:.4})",
             total_tokens, max_tokens, cost.total_cost_usd
         );
-        crate::engine::cleanup::store_set(
+        store::store_set(
             store,
             repo,
             task_id,
@@ -416,7 +416,7 @@ pub async fn handle_success(
             "{}% of budget used ({}/{} tokens, ${:.4})",
             pct, total_tokens, max_tokens, cost.total_cost_usd
         );
-        crate::engine::cleanup::store_set(
+        store::store_set(
             store,
             repo,
             task_id,
