@@ -142,6 +142,11 @@ impl Router {
         self.llm_router.invalidate_skills_catalog();
     }
 
+    fn advance_pool_index_after_attempt(&mut self, idx: usize, pool_len: usize) {
+        debug_assert!(pool_len > 0, "router pool must not be empty");
+        self.pool_index = (idx + 1) % pool_len;
+    }
+
     /// Discover available agent CLIs in PATH.
     /// Checks all agents from the configured list.
     fn discover_agents(configured_agents: &[String]) -> Vec<String> {
@@ -489,7 +494,7 @@ impl Router {
             {
                 Ok(result) => {
                     // Advance index so the next call starts at the next pool entry
-                    self.pool_index = (idx + 1) % n;
+                    self.advance_pool_index_after_attempt(idx, n);
                     tracing::debug!(
                         agent,
                         model = model_str,
@@ -507,6 +512,7 @@ impl Router {
                     );
                     crate::engine::runner::response::record_model_failure(agent, model_str);
                     last_err = Some(e);
+                    self.advance_pool_index_after_attempt(idx, n);
                 }
             }
         }
@@ -1786,6 +1792,42 @@ Hope that helps!"#;
         let mut router = Router::new(config);
         router.pool_index = 5;
         router.reload();
+        assert_eq!(router.pool_index, 0);
+    }
+
+    #[test]
+    fn pool_index_advances_after_failed_attempt() {
+        let mut router = Router::new(RouterConfig::default());
+        router.router_pool = vec![
+            ("claude".to_string(), "haiku".to_string()),
+            ("codex".to_string(), "gpt-5.2".to_string()),
+            (
+                "opencode".to_string(),
+                "github-copilot/gpt-5-mini".to_string(),
+            ),
+        ];
+        router.pool_index = 0;
+
+        router.advance_pool_index_after_attempt(0, router.router_pool.len());
+
+        assert_eq!(router.pool_index, 1);
+    }
+
+    #[test]
+    fn pool_index_wraps_after_last_attempt() {
+        let mut router = Router::new(RouterConfig::default());
+        router.router_pool = vec![
+            ("claude".to_string(), "haiku".to_string()),
+            ("codex".to_string(), "gpt-5.2".to_string()),
+            (
+                "opencode".to_string(),
+                "github-copilot/gpt-5-mini".to_string(),
+            ),
+        ];
+        router.pool_index = 2;
+
+        router.advance_pool_index_after_attempt(2, router.router_pool.len());
+
         assert_eq!(router.pool_index, 0);
     }
 }
