@@ -70,6 +70,59 @@ async fn upsert_external_task() {
     assert_eq!(task.external_id, Some("42".to_string()));
 }
 
+/// Re-ingesting an existing external task must NOT reset updated_at.
+///
+/// The sync catch-up path in sync.rs uses `updated_at` as a proxy for
+/// "time since last status change". If upsert_external resets it on every
+/// periodic re-ingest (every 45s), NeedsReview tasks never appear stale
+/// and the catch-up event is never re-fired (issue #892).
+#[tokio::test]
+async fn upsert_external_does_not_reset_updated_at_on_reingest() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id = store
+        .upsert_external(&UpsertExternal {
+            repo: "owner/repo",
+            ext_id: "99",
+            title: "Original",
+            body: "body",
+            author: "user",
+            url: "https://github.com/owner/repo/issues/99",
+            labels: &[],
+            origin: "github",
+        })
+        .await
+        .unwrap();
+
+    // Backdate updated_at to simulate a task that entered NeedsReview 10 minutes ago.
+    sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+        .bind(id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    // Re-ingest the same external task (simulates periodic ingest_external_tasks).
+    store
+        .upsert_external(&UpsertExternal {
+            repo: "owner/repo",
+            ext_id: "99",
+            title: "Original",
+            body: "body",
+            author: "user",
+            url: "https://github.com/owner/repo/issues/99",
+            labels: &[],
+            origin: "github",
+        })
+        .await
+        .unwrap();
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(
+        task.updated_at, "2020-01-01T00:00:00Z",
+        "upsert_external must not reset updated_at on re-ingest — staleness checks rely on it"
+    );
+}
+
 #[tokio::test]
 async fn update_status() {
     let store = TaskStore::open_memory().await.unwrap();
