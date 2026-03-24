@@ -12,6 +12,7 @@
 //! - Loading and caching the skills catalog from disk
 
 use crate::backends::ExternalTask;
+use crate::engine::runner::agents::{claude, opencode, AgentError};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -118,7 +119,7 @@ impl LlmRouter {
         let _ = tokio::fs::write(&response_path, &response).await;
 
         // Parse the response
-        let llm_response: LlmRouteResponse = self.parse_llm_response(&response)?;
+        let llm_response: LlmRouteResponse = self.parse_llm_response(router_agent, &response)?;
 
         // Validate the selected agent
         let mut agent = llm_response.executor.to_lowercase();
@@ -371,65 +372,17 @@ impl LlmRouter {
     /// Handles: direct JSON, Claude `--output-format stream-json` NDJSON,
     /// Claude `--output-format json` envelopes, markdown code blocks, and raw
     /// text with embedded JSON.
-    pub fn parse_llm_response(&self, response: &str) -> anyhow::Result<LlmRouteResponse> {
+    pub fn parse_llm_response(
+        &self,
+        agent: &str,
+        response: &str,
+    ) -> anyhow::Result<LlmRouteResponse> {
         let trimmed = response.trim();
         if trimmed.is_empty() {
             anyhow::bail!("empty LLM response");
         }
 
-        // Pre-step: if this is Claude NDJSON (--output-format stream-json), find the
-        // last "type":"result" line. This normalises NDJSON to the same single-line
-        // envelope that step 1 already knows how to unwrap.
-        let trimmed = trimmed
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .rev()
-            .find(|line| {
-                serde_json::from_str::<serde_json::Value>(line)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("type")
-                            .and_then(|t| t.as_str())
-                            .map(|t| t == "result")
-                    })
-                    .unwrap_or(false)
-            })
-            .unwrap_or(trimmed);
-
-        // Step 1: Unwrap Claude JSON envelope if present.
-        // Claude --output-format json returns {"type":"result","result":"...","usage":{...}}
-        // The inner "result" field contains the actual LLM text.
-        let inner = if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if val.get("type").and_then(|v| v.as_str()) == Some("result") {
-                if let Some(is_error) = val.get("is_error").and_then(|v| v.as_bool()) {
-                    if is_error {
-                        let msg = val
-                            .get("result")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown error");
-                        anyhow::bail!("router LLM returned error: {msg}");
-                    }
-                }
-                if let Some(r) = val.get("result").and_then(|v| v.as_str()) {
-                    // result is a string — unwrap it
-                    tracing::debug!(
-                        result_len = r.len(),
-                        "unwrapped Claude JSON envelope (string)"
-                    );
-                    r.to_string()
-                } else if let Some(obj) = val.get("result").filter(|v| v.is_object()) {
-                    // result is a JSON object — serialize it back for parsing
-                    tracing::debug!("unwrapped Claude JSON envelope (object)");
-                    obj.to_string()
-                } else {
-                    trimmed.to_string()
-                }
-            } else {
-                trimmed.to_string()
-            }
-        } else {
-            trimmed.to_string()
-        };
+        let inner = self.extract_agent_text(agent, trimmed)?;
 
         let text = inner.trim();
 
@@ -474,6 +427,21 @@ impl LlmRouter {
             "could not parse LLM response as JSON: {}",
             &text[..text.len().min(200)]
         )
+    }
+
+    fn extract_agent_text(&self, agent: &str, raw: &str) -> anyhow::Result<String> {
+        match agent {
+            "opencode" => Ok(opencode::extract_router_text(raw).unwrap_or_else(|| raw.to_string())),
+            "claude" | "kimi" | "minimax" => match claude::extract_stream_json_result_text(raw) {
+                Ok(text) => Ok(text),
+                Err(AgentError::AgentFailed { message }) => {
+                    anyhow::bail!("router LLM returned error: {message}")
+                }
+                Err(AgentError::InvalidResponse { .. }) => Ok(raw.to_string()),
+                Err(err) => anyhow::bail!("router LLM returned error: {err}"),
+            },
+            _ => Ok(raw.to_string()),
+        }
     }
 
     /// Run sanity checks on routing decision.
@@ -553,7 +521,7 @@ mod tests {
     fn parse_direct_json_executor_field() {
         let router = make_router();
         let json = r#"{"executor":"claude","complexity":"medium","reason":"good fit"}"#;
-        let resp = router.parse_llm_response(json).unwrap();
+        let resp = router.parse_llm_response("claude", json).unwrap();
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "medium");
     }
@@ -563,7 +531,7 @@ mod tests {
         // LLM sometimes returns "agent" instead of "executor"
         let router = make_router();
         let json = r#"{"agent":"codex","complexity":"simple","reason":"straightforward"}"#;
-        let resp = router.parse_llm_response(json).unwrap();
+        let resp = router.parse_llm_response("claude", json).unwrap();
         assert_eq!(resp.executor, "codex");
     }
 
@@ -582,7 +550,7 @@ mod tests {
             },
             "selected_skills": ["gh"]
         }"#;
-        let resp = router.parse_llm_response(json).unwrap();
+        let resp = router.parse_llm_response("opencode", json).unwrap();
         assert_eq!(resp.executor, "opencode");
         assert_eq!(resp.complexity, "complex");
         assert_eq!(resp.profile.role, "architect");
@@ -599,7 +567,7 @@ mod tests {
             r#"{{"type":"result","subtype":"text","is_error":false,"result":"{}","usage":{{"input":10,"output":5}}}}"#,
             inner.replace('"', "\\\"")
         );
-        let resp = router.parse_llm_response(&envelope).unwrap();
+        let resp = router.parse_llm_response("claude", &envelope).unwrap();
         assert_eq!(resp.executor, "claude");
     }
 
@@ -608,7 +576,7 @@ mod tests {
         // When result is already a JSON object (not a string)
         let router = make_router();
         let envelope = r#"{"type":"result","is_error":false,"result":{"executor":"kimi","complexity":"simple","reason":"fast"}}"#;
-        let resp = router.parse_llm_response(envelope).unwrap();
+        let resp = router.parse_llm_response("claude", envelope).unwrap();
         assert_eq!(resp.executor, "kimi");
     }
 
@@ -616,7 +584,7 @@ mod tests {
     fn parse_claude_error_envelope() {
         let router = make_router();
         let envelope = r#"{"type":"result","is_error":true,"result":"auth error: invalid key"}"#;
-        let err = router.parse_llm_response(envelope).unwrap_err();
+        let err = router.parse_llm_response("claude", envelope).unwrap_err();
         assert!(
             err.to_string().contains("error"),
             "should surface the error"
@@ -627,7 +595,7 @@ mod tests {
     fn parse_markdown_json_fenced_block() {
         let router = make_router();
         let md = "Here is my routing decision:\n\n```json\n{\"executor\":\"codex\",\"complexity\":\"simple\",\"reason\":\"easy\"}\n```\n\nDone.";
-        let resp = router.parse_llm_response(md).unwrap();
+        let resp = router.parse_llm_response("claude", md).unwrap();
         assert_eq!(resp.executor, "codex");
     }
 
@@ -635,7 +603,7 @@ mod tests {
     fn parse_markdown_plain_fenced_block() {
         let router = make_router();
         let md = "```\n{\"executor\":\"minimax\",\"complexity\":\"medium\",\"reason\":\"ok\"}\n```";
-        let resp = router.parse_llm_response(md).unwrap();
+        let resp = router.parse_llm_response("claude", md).unwrap();
         assert_eq!(resp.executor, "minimax");
     }
 
@@ -643,7 +611,7 @@ mod tests {
     fn parse_embedded_json_in_prose() {
         let router = make_router();
         let text = r#"I analyzed the task. My decision is {"executor":"claude","complexity":"complex","reason":"hard task"}. Please proceed."#;
-        let resp = router.parse_llm_response(text).unwrap();
+        let resp = router.parse_llm_response("claude", text).unwrap();
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "complex");
     }
@@ -651,15 +619,19 @@ mod tests {
     #[test]
     fn parse_empty_response_fails() {
         let router = make_router();
-        assert!(router.parse_llm_response("").is_err());
-        assert!(router.parse_llm_response("   ").is_err());
+        assert!(router.parse_llm_response("claude", "").is_err());
+        assert!(router.parse_llm_response("claude", "   ").is_err());
     }
 
     #[test]
     fn parse_invalid_response_fails() {
         let router = make_router();
-        assert!(router.parse_llm_response("not json at all").is_err());
-        assert!(router.parse_llm_response("{ invalid json }").is_err());
+        assert!(router
+            .parse_llm_response("claude", "not json at all")
+            .is_err());
+        assert!(router
+            .parse_llm_response("claude", "{ invalid json }")
+            .is_err());
     }
 
     #[test]
@@ -667,7 +639,7 @@ mod tests {
         // Only "executor" is required — other fields should default
         let router = make_router();
         let json = r#"{"executor":"claude"}"#;
-        let resp = router.parse_llm_response(json).unwrap();
+        let resp = router.parse_llm_response("claude", json).unwrap();
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "");
         assert_eq!(resp.reason, "");
@@ -678,7 +650,7 @@ mod tests {
     fn parse_fixture_route_response_string() {
         let router = make_router();
         let response = include_str!("../../../tests/fixtures/route-response-string.json");
-        let resp = router.parse_llm_response(response).unwrap();
+        let resp = router.parse_llm_response("claude", response).unwrap();
         // Fixture should parse without error and produce a valid agent name
         assert!(!resp.executor.is_empty(), "executor must not be empty");
     }
@@ -687,7 +659,7 @@ mod tests {
     fn parse_fixture_route_response_object() {
         let router = make_router();
         let response = include_str!("../../../tests/fixtures/route-response-object.json");
-        let resp = router.parse_llm_response(response).unwrap();
+        let resp = router.parse_llm_response("claude", response).unwrap();
         assert!(!resp.executor.is_empty(), "executor must not be empty");
     }
 
@@ -695,8 +667,40 @@ mod tests {
     fn parse_fixture_route_response_markdown() {
         let router = make_router();
         let response = include_str!("../../../tests/fixtures/route-response-markdown.json");
-        let resp = router.parse_llm_response(response).unwrap();
+        let resp = router.parse_llm_response("claude", response).unwrap();
         assert!(!resp.executor.is_empty(), "executor must not be empty");
+    }
+
+    #[test]
+    fn parse_opencode_ndjson_text_event() {
+        let router = make_router();
+        let raw = r#"{"type":"step_start","timestamp":1}
+{"type":"text","timestamp":2,"part":{"type":"text","text":"progress update"}}
+{"type":"text","timestamp":3,"part":{"type":"text","text":"```json\n{\"executor\":\"opencode\",\"complexity\":\"medium\",\"reason\":\"ndjson\"}\n```"}}
+{"type":"step_finish","timestamp":4,"part":{"type":"step-finish","reason":"stop"}}"#;
+        let resp = router.parse_llm_response("opencode", raw).unwrap();
+        assert_eq!(resp.executor, "opencode");
+        assert_eq!(resp.complexity, "medium");
+    }
+
+    #[test]
+    fn parse_opencode_ndjson_direct_text_field() {
+        let router = make_router();
+        let raw = r#"{"type":"step_start","timestamp":1}
+{"type":"text","timestamp":2,"text":"{\"executor\":\"claude\",\"complexity\":\"simple\",\"reason\":\"direct text\"}"}
+{"type":"step_finish","timestamp":3,"part":{"type":"step-finish","reason":"stop"}}"#;
+        let resp = router.parse_llm_response("opencode", raw).unwrap();
+        assert_eq!(resp.executor, "claude");
+        assert_eq!(resp.complexity, "simple");
+    }
+
+    #[test]
+    fn parse_kimi_stream_json_result() {
+        let router = make_router();
+        let raw = r#"{"type":"system","subtype":"init"}
+{"type":"result","subtype":"success","is_error":false,"result":"{\"executor\":\"kimi\",\"complexity\":\"medium\",\"reason\":\"wrapper\"}"}"#;
+        let resp = router.parse_llm_response("kimi", raw).unwrap();
+        assert_eq!(resp.executor, "kimi");
     }
 
     // ── check_routing_sanity ─────────────────────────────────────────────────

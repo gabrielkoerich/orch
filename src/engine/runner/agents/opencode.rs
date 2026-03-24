@@ -38,6 +38,65 @@ pub struct OpenCodeRunner {
     free_models_cache: Mutex<Option<(Vec<String>, std::time::Instant)>>,
 }
 
+pub(crate) fn parse_ndjson_events(raw: &str) -> Vec<serde_json::Value> {
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| match serde_json::from_str(line) {
+            Ok(val) => Some(val),
+            Err(e) => {
+                tracing::debug!(line, error = %e, "opencode: skipping unparseable NDJSON line");
+                None
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String> {
+    let mut texts = Vec::new();
+
+    for event in events {
+        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if event_type == "text" {
+            if let Some(part) = event.get("part") {
+                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                    texts.push(text.to_string());
+                    continue;
+                }
+            }
+            if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
+                texts.push(text.to_string());
+            }
+        }
+    }
+
+    if texts.is_empty() {
+        return None;
+    }
+
+    let full = texts.join("");
+    if full.trim().starts_with('{') || full.contains("```json") {
+        return Some(full);
+    }
+
+    for text in texts.iter().rev() {
+        let trimmed = text.trim();
+        if trimmed.contains('{') && (trimmed.contains("status") || trimmed.contains("executor")) {
+            return Some(text.clone());
+        }
+    }
+
+    Some(full)
+}
+
+pub(crate) fn extract_router_text(raw: &str) -> Option<String> {
+    let events = parse_ndjson_events(raw.trim());
+    if events.is_empty() {
+        return None;
+    }
+    extract_ndjson_text(&events)
+}
+
 impl OpenCodeRunner {
     pub fn new() -> Self {
         Self {
@@ -47,16 +106,7 @@ impl OpenCodeRunner {
 
     /// Parse NDJSON stream into events.
     fn parse_ndjson(&self, raw: &str) -> Vec<serde_json::Value> {
-        raw.lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| match serde_json::from_str(line) {
-                Ok(val) => Some(val),
-                Err(e) => {
-                    tracing::debug!(line, error = %e, "opencode: skipping unparseable NDJSON line");
-                    None
-                }
-            })
-            .collect()
+        parse_ndjson_events(raw)
     }
 
     /// Extract text from `text` events.
@@ -70,46 +120,7 @@ impl OpenCodeRunner {
     /// - Format 1 (current): `{"type":"text","part":{"type":"text","text":"..."}}`
     /// - Format 2 (newer):   `{"type":"text","text":"..."}`
     fn extract_text(&self, events: &[serde_json::Value]) -> Option<String> {
-        let mut texts = Vec::new();
-
-        for event in events {
-            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-            if event_type == "text" {
-                // Format 1: text nested in part object
-                if let Some(part) = event.get("part") {
-                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                        texts.push(text.to_string());
-                        continue;
-                    }
-                }
-                // Format 2: text directly in event (newer opencode versions)
-                if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
-                    texts.push(text.to_string());
-                }
-            }
-        }
-
-        if texts.is_empty() {
-            return None;
-        }
-
-        // Try full concatenation first (most complete)
-        let full = texts.join("");
-        if full.trim().starts_with('{') || full.contains("```json") {
-            return Some(full);
-        }
-
-        // Fall back: find the last text event that looks like JSON
-        for text in texts.iter().rev() {
-            let trimmed = text.trim();
-            if trimmed.contains('{') && trimmed.contains("status") {
-                return Some(text.clone());
-            }
-        }
-
-        // Last resort: full concatenation
-        Some(full)
+        extract_ndjson_text(events)
     }
 
     /// Extract token usage from `step_finish` events.
