@@ -162,14 +162,8 @@ pub async fn handle_error(
     }
 
     if retryable == response::RetryableError::Timeout {
-        let status = response::handle_timeout_failover(
-            task_id,
-            agent_name,
-            &error_msg,
-            store,
-            repo,
-        )
-        .await;
+        let status =
+            response::handle_timeout_failover(task_id, agent_name, &error_msg, store, repo).await;
         if status == "new" {
             // A new agent was found, so we can return early.
             return Ok(ErrorHandleResult::EarlyReturn { status });
