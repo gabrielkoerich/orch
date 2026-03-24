@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use sqlx::Row;
 use tokio::time::{timeout, Duration};
 
@@ -301,25 +302,64 @@ pub async fn set_model_spec(store: &TaskStore, spec: &ModelSpec) -> Result<()> {
     Ok(())
 }
 
-/// Parse an agent response, extracting an optional `<summary>` tag.
-///
-/// Returns `(clean_text, optional_summary)` where `clean_text` has the
-/// summary tag stripped out.
-pub fn parse_response(raw: &str) -> (String, Option<String>) {
-    if let Some(start) = raw.find("<summary>") {
-        if let Some(end) = raw[start..].find("</summary>").map(|e| e + start) {
-            let summary = raw[start + "<summary>".len()..end].trim().to_string();
-            let clean = format!(
-                "{}{}",
-                raw[..start].trim_end(),
-                raw[end + "</summary>".len()..].trim_start()
-            )
-            .trim()
-            .to_string();
-            return (clean, Some(summary));
-        }
+/// Memory entry parsed from an agent response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryEntry {
+    pub key: String,
+    pub value: String,
+}
+
+/// Parsed agent response metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedResponse {
+    pub clean_text: String,
+    pub summary: Option<String>,
+    pub memories: Vec<MemoryEntry>,
+}
+
+/// Parse an agent response, extracting optional `<summary>` and `<memory>` tags.
+pub fn parse_response(raw: &str) -> ParsedResponse {
+    let memory_re =
+        Regex::new(r#"(?s)<memory\s+key="([^"]+)">(.+?)</memory>"#).expect("valid memory regex");
+
+    let mut clean = raw.to_string();
+    let memories = memory_re
+        .captures_iter(raw)
+        .map(|caps| MemoryEntry {
+            key: caps[1].trim().to_string(),
+            value: caps[2].trim().to_string(),
+        })
+        .collect::<Vec<_>>();
+    clean = memory_re.replace_all(&clean, "").to_string();
+
+    let summary_re = Regex::new(r#"(?s)<summary>(.+?)</summary>"#).expect("valid summary regex");
+    let summary = summary_re
+        .captures(raw)
+        .map(|caps| caps[1].trim().to_string());
+    clean = summary_re.replace_all(&clean, "").to_string();
+
+    ParsedResponse {
+        clean_text: clean.trim().to_string(),
+        summary,
+        memories,
     }
-    (raw.trim().to_string(), None)
+}
+
+async fn persist_memories(
+    store: &TaskStore,
+    session_id: &str,
+    memories: &[MemoryEntry],
+) -> Result<()> {
+    for memory in memories {
+        store
+            .kv_set(
+                &format!("control:memory:{session_id}:{}", memory.key),
+                &memory.value,
+            )
+            .await
+            .with_context(|| format!("storing control memory {}", memory.key))?;
+    }
+    Ok(())
 }
 
 /// Result of an agent invocation, including response text and token usage.
@@ -437,8 +477,10 @@ pub async fn send_message(
     // Invoke agent with instructions as system prompt, live state in message
     let result = invoke_agent(&agent, &model, &ctx.system, &full_message).await?;
 
-    // Parse response for summary tag
-    let (clean, summary) = parse_response(&result.text);
+    // Parse response for summary and memory tags
+    let parsed = parse_response(&result.text);
+
+    persist_memories(store, session_id, &parsed.memories).await?;
 
     // Store assistant message with token usage
     let total_tokens = match (result.input_tokens, result.output_tokens) {
@@ -463,8 +505,8 @@ pub async fn send_message(
             "assistant",
             channel,
             channel_thread,
-            &clean,
-            summary.as_deref(),
+            &parsed.clean_text,
+            parsed.summary.as_deref(),
             Some(&model),
             Some(&agent),
             total_tokens,
@@ -472,7 +514,7 @@ pub async fn send_message(
         )
         .await?;
 
-    Ok(clean)
+    Ok(parsed.clean_text)
 }
 
 #[cfg(test)]
@@ -549,26 +591,66 @@ mod tests {
     #[test]
     fn extract_summary_from_response() {
         let response = "Here are your tasks.\n\n<summary>listed 3 active tasks</summary>";
-        let (clean, summary) = parse_response(response);
-        assert_eq!(summary.as_deref(), Some("listed 3 active tasks"));
-        assert!(!clean.contains("<summary>"));
+        let parsed = parse_response(response);
+        assert_eq!(parsed.summary.as_deref(), Some("listed 3 active tasks"));
+        assert!(!parsed.clean_text.contains("<summary>"));
     }
 
     #[test]
     fn extract_summary_missing() {
         let response = "No tasks found.";
-        let (clean, summary) = parse_response(response);
-        assert_eq!(summary, None);
-        assert_eq!(clean, "No tasks found.");
+        let parsed = parse_response(response);
+        assert_eq!(parsed.summary, None);
+        assert_eq!(parsed.clean_text, "No tasks found.");
     }
 
     #[test]
     fn extract_summary_closing_tag_before_opening_does_not_panic() {
         // </summary> appears before <summary> — must not panic
         let response = "Example: </summary> is a closing tag.\n<summary>actual summary</summary>";
-        let (clean, summary) = parse_response(response);
-        assert_eq!(summary.as_deref(), Some("actual summary"));
-        assert!(!clean.contains("<summary>"));
+        let parsed = parse_response(response);
+        assert_eq!(parsed.summary.as_deref(), Some("actual summary"));
+        assert!(!parsed.clean_text.contains("<summary>"));
+    }
+
+    #[test]
+    fn extract_memory_tags() {
+        let response = r#"Remember these.
+
+<memory key="tz">User timezone is UTC-3</memory>
+<memory key="theme">Prefer concise answers</memory>
+
+<summary>stored two memories</summary>"#;
+        let parsed = parse_response(response);
+        assert_eq!(parsed.memories.len(), 2);
+        assert_eq!(parsed.memories[0].key, "tz");
+        assert_eq!(parsed.memories[0].value, "User timezone is UTC-3");
+        assert_eq!(parsed.memories[1].key, "theme");
+        assert_eq!(parsed.memories[1].value, "Prefer concise answers");
+        assert_eq!(parsed.summary.as_deref(), Some("stored two memories"));
+        assert!(!parsed.clean_text.contains("<memory"));
+    }
+
+    #[tokio::test]
+    async fn persist_memories_writes_to_kv() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let memories = vec![MemoryEntry {
+            key: "tz".to_string(),
+            value: "User timezone is UTC-3".to_string(),
+        }];
+
+        persist_memories(&store, "default", &memories)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .kv_get("control:memory:default:tz")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("User timezone is UTC-3")
+        );
     }
 
     #[test]
