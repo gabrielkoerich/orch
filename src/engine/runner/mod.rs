@@ -224,6 +224,18 @@ impl TaskRunner {
             "agent raw output"
         );
 
+        // Store raw response in SQLite BEFORE parsing (for debugging parse failures)
+        crate::engine::cleanup::store_set(
+            &self.store,
+            &self.repo,
+            task_id,
+            &[(
+                "last_response",
+                serde_json::json!(session_output.raw_stdout),
+            )],
+        )
+        .await;
+
         // Use agent-specific parsing when exit code is 0, fall back to classify_error
         let agent_runner = agents::get_runner(&init.agent_name);
         let parse_result = if session_output.exit_code == 0 && !session_output.raw_stdout.is_empty()

@@ -75,6 +75,7 @@ pub struct Task {
     pub worktree_cleaned: bool,
     pub summary: String,
     pub last_error: String,
+    pub last_response: String,
     pub parent_id: Option<i64>,
     pub block_reason: Option<String>,
 
@@ -513,6 +514,7 @@ impl TaskStore {
             "worktree_cleaned",
             "summary",
             "last_error",
+            "last_response",
             "parent_id",
             "block_reason",
             "pr_number",
@@ -953,6 +955,7 @@ impl TaskStore {
             worktree_cleaned: row.get::<i32, _>("worktree_cleaned") != 0,
             summary: row.get("summary"),
             last_error: row.get("last_error"),
+            last_response: row.get("last_response"),
             parent_id: row.get("parent_id"),
             block_reason: row.get("block_reason"),
             pr_number: row.get("pr_number"),
