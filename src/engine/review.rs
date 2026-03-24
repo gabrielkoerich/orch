@@ -29,6 +29,7 @@ use crate::github::http::GhHttp;
 use crate::store::store_set;
 use crate::store::TaskStore;
 use crate::store::{opt_store_get_task, set_review_session_expected, store_increment};
+use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use std::sync::Arc;
@@ -447,6 +448,12 @@ pub(crate) async fn review_and_merge(
         .await
         .with_context(|| format!("store lookup failed for task {}", task.id.0))?;
 
+    let store_id: Option<i64> = stored_task.as_ref().map(|t| t.id);
+    let review_attempt: u32 = stored_task
+        .as_ref()
+        .map(|t| (t.review_cycles + 1) as u32)
+        .unwrap_or(1);
+
     let worktree_path = match stored_task.as_ref().map(|t| t.worktree.as_str()) {
         Some(w) if !w.is_empty() => std::path::PathBuf::from(w),
         _ => {
@@ -537,7 +544,7 @@ pub(crate) async fn review_and_merge(
 
     // 6. Build agent invocation for review
     let review_task_id = format!("{}-review", task.id.0);
-    let review_attempt_dir = crate::home::task_attempt_dir(repo, &review_task_id, 1)?;
+    let review_attempt_dir = crate::home::task_attempt_dir(repo, &review_task_id, review_attempt)?;
     let output_file = review_attempt_dir.join("output.json");
 
     let git_name =
@@ -560,10 +567,28 @@ pub(crate) async fn review_and_merge(
         output_file: output_file.clone(),
         timeout_seconds: 600,
         repo: repo.to_string(),
-        attempt: 1,
+        attempt: review_attempt,
     };
 
-    // 7. Spawn review agent in tmux
+    // 7. Start run tracking before spawning review agent
+    let run_id = if let Some(sid) = store_id {
+        store
+            .start_run(&StartRun {
+                task_id: sid,
+                attempt: review_attempt as i32,
+                run_type: "review",
+                agent: &review_agent,
+                model: &review_model,
+                command: "",
+                prompt: "",
+            })
+            .await
+            .ok()
+    } else {
+        None
+    };
+
+    // 8. Spawn review agent in tmux
     let session = match runner::agent::spawn_in_tmux(tmux, &invocation).await {
         Ok(s) => s,
         Err(e) => {
@@ -615,11 +640,39 @@ pub(crate) async fn review_and_merge(
         Ok(Err(e)) => {
             tracing::error!(task_id = task.id.0, error = %e, "review agent error");
             let _ = tmux.kill_session(&session).await;
+            if let Some(rid) = run_id {
+                let _ = store
+                    .complete_run(&CompleteRun {
+                        run_id: rid,
+                        exit_code: Some(-1),
+                        stdout: "",
+                        stderr: &e.to_string(),
+                        parsed: "",
+                        outcome: "failed",
+                        error: &format!("agent error: {e}"),
+                        tokens: RunTokenUsage::default(),
+                    })
+                    .await;
+            }
             return Ok(ReviewDecision::Failed(format!("agent error: {e}")));
         }
         Err(_) => {
             tracing::error!(task_id = task.id.0, "review agent timed out");
             let _ = tmux.kill_session(&session).await;
+            if let Some(rid) = run_id {
+                let _ = store
+                    .complete_run(&CompleteRun {
+                        run_id: rid,
+                        exit_code: Some(-1),
+                        stdout: "",
+                        stderr: "timeout",
+                        parsed: "",
+                        outcome: "failed",
+                        error: "timeout",
+                        tokens: RunTokenUsage::default(),
+                    })
+                    .await;
+            }
             return Ok(ReviewDecision::Failed("timeout".to_string()));
         }
     }
@@ -673,6 +726,20 @@ pub(crate) async fn review_and_merge(
             runner::response::record_agent_failure_with_message(&review_agent, &err_str);
         }
         tracing::error!(task_id = task.id.0, error = %err, "review agent failed");
+        if let Some(rid) = run_id {
+            let _ = store
+                .complete_run(&CompleteRun {
+                    run_id: rid,
+                    exit_code: Some(exit_code),
+                    stdout: &raw_output,
+                    stderr: &stderr,
+                    parsed: "",
+                    outcome: "failed",
+                    error: &err.to_string(),
+                    tokens: RunTokenUsage::default(),
+                })
+                .await;
+        }
         return Ok(ReviewDecision::Failed(format!("agent error: {err}")));
     }
 
@@ -697,6 +764,20 @@ pub(crate) async fn review_and_merge(
         }
         Err(e) => {
             tracing::error!(task_id = task.id.0, error = %e, "review agent error");
+            if let Some(rid) = run_id {
+                let _ = store
+                    .complete_run(&CompleteRun {
+                        run_id: rid,
+                        exit_code: Some(exit_code),
+                        stdout: &raw_output,
+                        stderr: &stderr,
+                        parsed: "",
+                        outcome: "failed",
+                        error: &format!("agent error: {e}"),
+                        tokens: RunTokenUsage::default(),
+                    })
+                    .await;
+            }
             return Ok(ReviewDecision::Failed(format!("agent error: {e}")));
         }
     };
@@ -711,6 +792,20 @@ pub(crate) async fn review_and_merge(
                 output = %text_for_review.chars().take(300).collect::<String>(),
                 "failed to parse review response"
             );
+            if let Some(rid) = run_id {
+                let _ = store
+                    .complete_run(&CompleteRun {
+                        run_id: rid,
+                        exit_code: Some(exit_code),
+                        stdout: &raw_output,
+                        stderr: &stderr,
+                        parsed: &text_for_review,
+                        outcome: "failed",
+                        error: &format!("parse error: {e}"),
+                        tokens: RunTokenUsage::default(),
+                    })
+                    .await;
+            }
             return Ok(ReviewDecision::Failed(format!("parse error: {e}")));
         }
     };
@@ -785,14 +880,42 @@ pub(crate) async fn review_and_merge(
         }
     }
 
-    // 13. Check for push failures before acting on the decision.
+    // 13. Complete run tracking
+    if let Some(run_id) = run_id {
+        let outcome = match &decision {
+            ReviewDecision::Approve => "success",
+            ReviewDecision::RequestChanges { .. } => "success",
+            ReviewDecision::Failed(_) => "failed",
+            ReviewDecision::Blocked(_) => "success",
+            ReviewDecision::Skipped => "success",
+        };
+        let error = match &decision {
+            ReviewDecision::Failed(e) => e.as_str(),
+            ReviewDecision::Blocked(e) => e.as_str(),
+            _ => "",
+        };
+        let _ = store
+            .complete_run(&CompleteRun {
+                run_id,
+                exit_code: Some(exit_code),
+                stdout: &raw_output,
+                stderr: &stderr,
+                parsed: &text_for_review,
+                outcome,
+                error,
+                tokens: RunTokenUsage::default(),
+            })
+            .await;
+    }
+
+    // 14. Check for push failures before acting on the decision.
     let has_push_failure = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
         .await
         .map(|t| t.last_error)
         .unwrap_or_default()
         .contains("push failed");
 
-    // 14. Handle the decision
+    // 15. Handle the decision
     match decision {
         ReviewDecision::Approve => {
             if has_push_failure {
