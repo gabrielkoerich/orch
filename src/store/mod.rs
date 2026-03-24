@@ -32,8 +32,8 @@ pub use helpers::{
 pub use jobs::JobState;
 #[allow(unused_imports)]
 pub use metrics::{
-    AgentStat, CostByGroup, CostPeriod, CostSummary, ErrorStat, InsertTaskMetric, MetricsSummary,
-    SlowTaskInfo,
+    AgentStat, CostByGroup, CostPeriod, CostSummary, ErrorStat, HighReviewCycleTask,
+    InsertTaskMetric, MetricsSummary, SlowTaskInfo,
 };
 #[allow(unused_imports)]
 pub use pricing::{pricing_for_model, CostEstimate, ModelPricing, TokenUsage};

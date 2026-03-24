@@ -3838,6 +3838,83 @@ async fn error_distribution_empty() {
 }
 
 #[tokio::test]
+async fn high_review_cycle_tasks_empty() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let tasks = store.get_high_review_cycle_tasks_7d().await.unwrap();
+    assert!(tasks.is_empty());
+}
+
+#[tokio::test]
+async fn high_review_cycle_tasks_filters_by_threshold() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    // Create tasks with different review_cycles values
+    let id_low = store
+        .create_internal("owner/repo", "Low cycles", "", "manual", "")
+        .await
+        .unwrap();
+    let id_high = store
+        .create_internal("owner/repo", "High cycles", "", "manual", "")
+        .await
+        .unwrap();
+    let id_boundary = store
+        .create_internal("owner/repo", "At boundary", "", "manual", "")
+        .await
+        .unwrap();
+
+    // Set review_cycles: 0, 2, 3
+    store.increment(id_low, "review_cycles").await.unwrap();
+    // id_low has review_cycles=1, should be excluded
+
+    store.increment(id_high, "review_cycles").await.unwrap();
+    store.increment(id_high, "review_cycles").await.unwrap();
+    store.increment(id_high, "review_cycles").await.unwrap();
+    // id_high has review_cycles=3, should be included
+
+    store.increment(id_boundary, "review_cycles").await.unwrap();
+    store.increment(id_boundary, "review_cycles").await.unwrap();
+    // id_boundary has review_cycles=2, should be included (>=2)
+
+    let tasks = store.get_high_review_cycle_tasks_7d().await.unwrap();
+    assert_eq!(tasks.len(), 2);
+    // Should be sorted by review_cycles DESC
+    assert_eq!(tasks[0].title, "High cycles");
+    assert_eq!(tasks[0].review_cycles, 3);
+    assert_eq!(tasks[1].title, "At boundary");
+    assert_eq!(tasks[1].review_cycles, 2);
+}
+
+#[tokio::test]
+async fn high_review_cycle_tasks_excludes_old_tasks() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id_old = store
+        .create_internal("owner/repo", "Old task", "", "manual", "")
+        .await
+        .unwrap();
+    store.increment(id_old, "review_cycles").await.unwrap();
+    store.increment(id_old, "review_cycles").await.unwrap();
+
+    // Backdate to 10 days ago (outside 7d window)
+    sqlx::query("UPDATE tasks SET updated_at = datetime('now', '-10 days') WHERE id = ?")
+        .bind(id_old)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    let id_recent = store
+        .create_internal("owner/repo", "Recent task", "", "manual", "")
+        .await
+        .unwrap();
+    store.increment(id_recent, "review_cycles").await.unwrap();
+    store.increment(id_recent, "review_cycles").await.unwrap();
+
+    let tasks = store.get_high_review_cycle_tasks_7d().await.unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].title, "Recent task");
+}
+
+#[tokio::test]
 async fn error_distribution_groups_by_type() {
     use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
