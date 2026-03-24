@@ -45,12 +45,17 @@ fn ensure_path() {
                     .strip_prefix("export PATH=\"")
                     .and_then(|s| s.strip_suffix('"'))
                 {
-                    // Extract the new directory (everything before :$PATH or $PATH)
-                    let dir = value
-                        .replace("$PATH", "")
-                        .replace("$HOME", &home)
-                        .trim_end_matches(':')
-                        .to_string();
+                    // Extract the new directory (only the part before the first $PATH)
+                    // Use strip_prefix to handle $PATH only at the end, preserving any
+                    // additional path components that come before it
+                    let dir = if let Some((before, _)) = value.split_once("$PATH") {
+                        before
+                    } else {
+                        value
+                    }
+                    .replace("$HOME", &home)
+                    .trim_end_matches(':')
+                    .to_string();
                     if !dir.is_empty()
                         && !path.split(':').any(|d| d == dir)
                         && std::path::Path::new(&dir).is_dir()
