@@ -380,7 +380,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 
     for attempt in 1..=max_attempts {
         if attempt == 1 && needs_pre_push_rebase {
-            if let Err(e) = rebase_branch_on_remote(dir, branch_to_push).await {
+            if let Err(e) = rebase_branch_on_remote(dir, branch_to_push, &auth_args).await {
                 tracing::warn!(branch = branch_to_push, error = %e, "pre-push rebase failed");
                 return Err(e);
             }
@@ -418,7 +418,7 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
                 attempt,
                 "push rejected, rebasing and retrying"
             );
-            if let Err(e) = rebase_branch_on_remote(dir, branch_to_push).await {
+            if let Err(e) = rebase_branch_on_remote(dir, branch_to_push, &auth_args).await {
                 tracing::warn!(branch = branch_to_push, error = %e, "rebase after push rejection failed");
                 return Err(e);
             }
@@ -468,8 +468,17 @@ fn push_retry_delay(attempt: u32) -> Duration {
     Duration::from_secs(base_secs.min(8))
 }
 
-async fn rebase_branch_on_remote(dir: &Path, branch: &str) -> anyhow::Result<()> {
+async fn rebase_branch_on_remote(
+    dir: &Path,
+    branch: &str,
+    auth_args: &[String],
+) -> anyhow::Result<()> {
+    // Use the same HTTPS auth args as the push so that SSH remotes are rewritten
+    // to HTTPS+token. Without this, `git fetch` uses raw SSH, which fails when
+    // the SSH agent is unavailable even though the push itself would succeed via
+    // HTTPS token auth.
     let fetch = Command::new("git")
+        .args(auth_args)
         .args(["fetch", "origin", "--prune"])
         .current_dir(dir)
         .output_with_context()
@@ -481,6 +490,7 @@ async fn rebase_branch_on_remote(dir: &Path, branch: &str) -> anyhow::Result<()>
     }
 
     let output = Command::new("git")
+        .args(auth_args)
         .args(["pull", "--rebase", "origin", branch])
         .current_dir(dir)
         .output_with_context()
