@@ -41,6 +41,93 @@ pub use response::WeightSignal;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Fully materialized task-run audit data.
+#[derive(Debug, Clone)]
+pub struct RunAudit {
+    pub stdout: String,
+    pub stderr: String,
+    pub parsed_response: String,
+    pub outcome: String,
+    pub error: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_cost_usd: f64,
+    pub duration_secs: f64,
+}
+
+/// Result returned by `run()` so callers can persist the audit trail.
+#[derive(Debug, Clone)]
+pub struct RunExecution {
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub audit: RunAudit,
+}
+
+fn serialize_parsed_response(
+    parse_result: &Result<agents::ParsedResponse, agents::AgentError>,
+    raw_stdout: &str,
+) -> String {
+    match parse_result {
+        Ok(parsed) => serde_json::json!({
+            "response": parsed.response,
+            "input_tokens": parsed.input_tokens,
+            "output_tokens": parsed.output_tokens,
+            "duration_ms": parsed.duration_ms,
+        })
+        .to_string(),
+        Err(agents::AgentError::InvalidResponse { raw }) => {
+            serde_json::json!({"raw": raw}).to_string()
+        }
+        Err(_) => serde_json::json!({"raw": raw_stdout}).to_string(),
+    }
+}
+
+fn classify_run_outcome(
+    status: &str,
+    parse_result: &Result<agents::ParsedResponse, agents::AgentError>,
+) -> &'static str {
+    match parse_result {
+        Err(agents::AgentError::Timeout { .. }) => "timeout",
+        Err(agents::AgentError::RateLimit { .. }) => "rate_limit",
+        Err(agents::AgentError::InvalidResponse { .. }) => "parse_error",
+        Err(_) => "failed",
+        Ok(_) if matches!(status, "done" | "in_progress" | "in_review" | "blocked") => "success",
+        Ok(_) => "failed",
+    }
+}
+
+fn extract_run_tokens(
+    parse_result: &Result<agents::ParsedResponse, agents::AgentError>,
+) -> (i64, i64) {
+    match parse_result {
+        Ok(parsed) => (
+            parsed
+                .input_tokens
+                .or(parsed.response.input_tokens)
+                .unwrap_or(0) as i64,
+            parsed
+                .output_tokens
+                .or(parsed.response.output_tokens)
+                .unwrap_or(0) as i64,
+        ),
+        Err(_) => (0, 0),
+    }
+}
+
+fn run_duration_secs(started_at: &chrono::DateTime<Utc>) -> f64 {
+    (Utc::now() - *started_at).num_milliseconds() as f64 / 1000.0
+}
+
+struct RunAuditInput<'a> {
+    task_id: &'a str,
+    status: &'a str,
+    parse_result: &'a Result<agents::ParsedResponse, agents::AgentError>,
+    raw_stdout: &'a str,
+    raw_stderr: &'a str,
+    started_at: &'a chrono::DateTime<Utc>,
+    error_override: Option<String>,
+}
+
 fn parse_success_output(
     task_id: &str,
     agent_name: &str,
@@ -115,6 +202,41 @@ impl TaskRunner {
         }
     }
 
+    async fn build_run_audit(&self, input: RunAuditInput<'_>) -> RunAudit {
+        let last_error = self.get_field(input.task_id, "last_error").await;
+        let error =
+            input
+                .error_override
+                .or(last_error)
+                .unwrap_or_else(|| match input.parse_result {
+                    Ok(parsed) => parsed.response.error.clone().unwrap_or_default(),
+                    Err(err) => err.to_string(),
+                });
+
+        let total_cost_usd = match &self.store {
+            Some(_) => {
+                store::get_cost_estimate(&self.store, &self.repo, input.task_id)
+                    .await
+                    .total_cost_usd
+            }
+            None => 0.0,
+        };
+
+        let (input_tokens, output_tokens) = extract_run_tokens(input.parse_result);
+
+        RunAudit {
+            stdout: input.raw_stdout.to_string(),
+            stderr: input.raw_stderr.to_string(),
+            parsed_response: serialize_parsed_response(input.parse_result, input.raw_stdout),
+            outcome: classify_run_outcome(input.status, input.parse_result).to_string(),
+            error,
+            input_tokens,
+            output_tokens,
+            total_cost_usd,
+            duration_secs: run_duration_secs(input.started_at),
+        }
+    }
+
     /// Run a task through the full execution pipeline.
     ///
     /// Returns `Ok(None)` if the runner guard skipped the task (caller should not
@@ -125,7 +247,8 @@ impl TaskRunner {
         agent: Option<&str>,
         model: Option<&str>,
         backend: Option<&dyn ExternalBackend>,
-    ) -> anyhow::Result<Option<(String, Option<i32>)>> {
+        started_at: &chrono::DateTime<Utc>,
+    ) -> anyhow::Result<Option<RunExecution>> {
         tracing::info!(
             task_id,
             agent = agent.unwrap_or("default"),
@@ -163,7 +286,21 @@ impl TaskRunner {
                         }
                     }
                 }
-                return Ok(Some(("needs_review".to_string(), None)));
+                return Ok(Some(RunExecution {
+                    status: "needs_review".to_string(),
+                    exit_code: None,
+                    audit: RunAudit {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        parsed_response: String::new(),
+                        outcome: "failed".to_string(),
+                        error: "max attempts reached".to_string(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_cost_usd: 0.0,
+                        duration_secs: 0.0,
+                    },
+                }));
             }
             Err(e) => return Err(e),
         };
@@ -264,10 +401,10 @@ impl TaskRunner {
 
         // Handle outcome: success or error recovery
         let final_status = match parse_result {
-            Ok(parsed) => {
+            Ok(ref parsed) => {
                 let (status, budget_exceeded) = response_handler::handle_success(
                     task_id,
-                    parsed,
+                    parsed.clone(),
                     &init.wt,
                     &init.task_title,
                     &init.agent_name,
@@ -280,14 +417,29 @@ impl TaskRunner {
                 if budget_exceeded {
                     // Token budget exceeded — store already updated, return without
                     // tmux cleanup or metrics (preserves original behavior)
-                    return Ok(Some((status, Some(session_output.exit_code))));
+                    let audit = self
+                        .build_run_audit(RunAuditInput {
+                            task_id,
+                            status: &status,
+                            parse_result: &parse_result,
+                            raw_stdout: &session_output.raw_stdout,
+                            raw_stderr: &session_output.raw_stderr,
+                            started_at,
+                            error_override: None,
+                        })
+                        .await;
+                    return Ok(Some(RunExecution {
+                        status,
+                        exit_code: Some(session_output.exit_code),
+                        audit,
+                    }));
                 }
                 status
             }
-            Err(agent_err) => {
+            Err(ref agent_err) => {
                 match fallback::handle_error(
                     task_id,
-                    &agent_err,
+                    agent_err,
                     &init.agent_name,
                     &*agent_runner,
                     init.model_name.as_deref(),
@@ -299,7 +451,22 @@ impl TaskRunner {
                 {
                     fallback::ErrorHandleResult::EarlyReturn { status } => {
                         // Task rerouted — return (metrics recorded in run_with_context)
-                        return Ok(Some((status, Some(session_output.exit_code))));
+                        let audit = self
+                            .build_run_audit(RunAuditInput {
+                                task_id,
+                                status: &status,
+                                parse_result: &parse_result,
+                                raw_stdout: &session_output.raw_stdout,
+                                raw_stderr: &session_output.raw_stderr,
+                                started_at,
+                                error_override: Some(agent_err.to_string()),
+                            })
+                            .await;
+                        return Ok(Some(RunExecution {
+                            status,
+                            exit_code: Some(session_output.exit_code),
+                            audit,
+                        }));
                     }
                     fallback::ErrorHandleResult::Continue { status } => status,
                 }
@@ -323,7 +490,23 @@ impl TaskRunner {
         }
 
         // Return final status and the session exit code so callers can record it.
-        Ok(Some((final_status, Some(session_output.exit_code))))
+        let audit = self
+            .build_run_audit(RunAuditInput {
+                task_id,
+                status: &final_status,
+                parse_result: &parse_result,
+                raw_stdout: &session_output.raw_stdout,
+                raw_stderr: &session_output.raw_stderr,
+                started_at,
+                error_override: None,
+            })
+            .await;
+
+        Ok(Some(RunExecution {
+            status: final_status,
+            exit_code: Some(session_output.exit_code),
+            audit,
+        }))
     }
 
     /// Record task execution metrics to the database.
@@ -493,11 +676,13 @@ impl TaskRunner {
         };
 
         // Run the task
-        let run_result = self.run(task_id, agent, model, Some(&**backend)).await?;
+        let run_result = self
+            .run(task_id, agent, model, Some(&**backend), &started_at)
+            .await?;
 
         // If the runner guard skipped the task, do not re-post stale data as a new comment.
-        let (status, exit_code_opt) = match run_result {
-            Some(result) => result,
+        let (status, exit_code_opt, run_audit) = match run_result {
+            Some(result) => (result.status, result.exit_code, result.audit),
             None => {
                 tracing::info!(task_id, "guard skipped task — not posting stale result");
                 return Ok(WeightSignal::None);
@@ -580,29 +765,20 @@ impl TaskRunner {
         // Complete run in task_runs audit trail (include exit code from runner when available)
         if let Some(run_id) = run_audit_id {
             if let Some(ref store) = self.store {
-                let duration = (Utc::now() - started_at).num_milliseconds() as f64 / 1000.0;
-                let usage = store::get_token_usage(&self.store, &self.repo, task_id).await;
-                let outcome = if status == "done" || status == "in_progress" {
-                    "success"
-                } else if is_rate_limited {
-                    "rate_limit"
-                } else {
-                    "failed"
-                };
                 let _ = store
                     .complete_run(&crate::store::CompleteRun {
                         run_id,
                         exit_code: exit_code_opt,
-                        stdout: &summary,
-                        stderr: "",
-                        parsed: "",
-                        outcome,
-                        error: &last_error,
+                        stdout: &run_audit.stdout,
+                        stderr: &run_audit.stderr,
+                        parsed: &run_audit.parsed_response,
+                        outcome: &run_audit.outcome,
+                        error: &run_audit.error,
                         tokens: crate::store::RunTokenUsage {
-                            input_tokens: usage.input_tokens as i64,
-                            output_tokens: usage.output_tokens as i64,
-                            total_cost_usd: 0.0, // computed by store
-                            duration_secs: duration,
+                            input_tokens: run_audit.input_tokens,
+                            output_tokens: run_audit.output_tokens,
+                            total_cost_usd: run_audit.total_cost_usd,
+                            duration_secs: run_audit.duration_secs,
                         },
                     })
                     .await;

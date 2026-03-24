@@ -454,6 +454,14 @@ enum TaskAction {
         /// Task ID (e.g. "internal:8" or issue number)
         id: String,
     },
+    /// Show task run history and audit details
+    Runs {
+        /// Task ID (e.g. "internal:8" or issue number)
+        id: String,
+        /// Show full stdout/stderr/parsed response for each run
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Mark a task as done (without running an agent)
     Close {
         /// Task ID (e.g. "internal:8" or issue number)
@@ -685,6 +693,9 @@ async fn main() -> anyhow::Result<()> {
             }
             TaskAction::Logs { id } => {
                 cli::task::logs(&id).await?;
+            }
+            TaskAction::Runs { id, verbose } => {
+                cli::task::runs(&id, verbose).await?;
             }
             TaskAction::Close { id, note } => {
                 cli::task::close(&id, note.as_deref()).await?;
