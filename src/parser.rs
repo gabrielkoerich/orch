@@ -81,19 +81,10 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
         return map_generic_response(&val);
     }
 
-    // Fallback: treat entire content as summary
-    Ok(AgentResponse {
-        status: "done".to_string(),
-        summary: raw.trim().to_string(),
-        accomplished: vec![],
-        remaining: vec![],
-        files: vec![],
-        error: None,
-        input_tokens: None,
-        output_tokens: None,
-        learnings: vec![],
-        delegations: vec![],
-    })
+    anyhow::bail!(
+        "agent output is not valid JSON or a supported JSON wrapper: {}",
+        raw.trim()
+    )
 }
 
 /// Extract the first JSON code block from markdown.
@@ -107,6 +98,27 @@ fn extract_json_block(text: &str) -> Option<String> {
 /// Map a generic JSON object to AgentResponse.
 fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse> {
     let obj = val.as_object().context("expected JSON object")?;
+
+    let has_supported_fields = [
+        "status",
+        "result",
+        "summary",
+        "message",
+        "output",
+        "accomplished",
+        "remaining",
+        "files",
+        "files_changed",
+        "error",
+        "learnings",
+        "delegations",
+    ]
+    .iter()
+    .any(|key| obj.contains_key(*key));
+
+    if !has_supported_fields {
+        anyhow::bail!("JSON object does not contain any supported agent response fields");
+    }
 
     let status = obj
         .get("status")
@@ -240,10 +252,24 @@ Done.
     #[test]
     fn parse_fallback_raw_text() {
         let input = "This is just plain text output from the agent.";
-        let resp = parse(input).unwrap();
-        assert_eq!(resp.status, "done");
-        assert_eq!(resp.summary, input);
-        assert!(resp.accomplished.is_empty());
+        let err = parse(input).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("agent output is not valid JSON or a supported JSON wrapper"));
+    }
+
+    #[test]
+    fn parse_malformed_json_block_returns_error() {
+        let input = r#"Here is the result:
+
+```json
+{"status":"done","summary":"missing brace"
+```
+"#;
+        let err = parse(input).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("agent output is not valid JSON or a supported JSON wrapper"));
     }
 
     #[test]
@@ -274,9 +300,10 @@ Done.
     #[test]
     fn parse_empty_object() {
         let input = "{}";
-        let resp = parse(input).unwrap();
-        assert_eq!(resp.status, "done");
-        assert_eq!(resp.summary, "");
+        let err = parse(input).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("JSON object does not contain any supported agent response fields"));
     }
 
     #[test]
