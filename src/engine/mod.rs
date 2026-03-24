@@ -891,13 +891,20 @@ pub async fn serve() -> anyhow::Result<()> {
     // Channel for weight signals from task runners back to the router
     let (weight_tx, mut weight_rx) = mpsc::channel::<WeightSignal>(64);
 
-    // Reset only InReview tasks that still expected a live review session when
-    // the engine restarted. Tasks that are merely waiting on a human response on
-    // an open PR should remain InReview.
+    // Reset InReview tasks on startup. A task is reset to NeedsReview if:
+    // 1. It was expecting a live review session (review_session_expected=true), OR
+    // 2. It has been in InReview for >10 minutes (catches cases where the flag
+    //    was never set due to crash-loops or lost events).
+    // Tasks with a recent review comment on their PR are left alone.
     for engine in &project_engines {
         if let Ok(in_review) = engine.backend.list_by_status(Status::InReview).await {
             for task in &in_review {
-                if !review_session_expected(&engine.store, &engine.repo, &task.id.0).await {
+                let session_expected =
+                    review_session_expected(&engine.store, &engine.repo, &task.id.0).await;
+                let age_minutes = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
+                    .map(|dt| (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_minutes())
+                    .unwrap_or(0);
+                if !session_expected && age_minutes < 10 {
                     continue;
                 }
                 if let Err(e) = engine
