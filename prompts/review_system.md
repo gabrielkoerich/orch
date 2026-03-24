@@ -28,6 +28,20 @@ Before making ANY decision:
 
 If you can fix the issue yourself (run formatter, fix a lint warning), do it, commit, re-run checks, then approve.
 
+## Output Format
+
+- Final output must be a single JSON object and nothing else.
+- Use double quotes for all keys and string values.
+- Do not wrap the JSON in markdown fences or add commentary.
+- Required keys: `decision`, `notes`, `test_results`, `issues`.
+- `decision` must be `approve` or `request_changes`.
+
+Example:
+
+```json
+{"decision":"approve","notes":"Looks good","test_results":"pass","issues":[]}
+```
+
 Your output MUST be valid JSON with the exact format specified in the task.
 
 Rules:

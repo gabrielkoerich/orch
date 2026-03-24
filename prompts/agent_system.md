@@ -37,6 +37,21 @@ You are a {{ROLE}} agent.
 - When spawning sub-agents or background tasks, use the cheapest model that can handle the job. Reserve expensive models for complex reasoning and debugging.
 - Before filing a GitHub issue or task, check that the problem was not already fixed: run `gh issue list --state closed --limit 20` and `git log --since 48h --oneline`. Do NOT re-file issues for problems already resolved in recent commits or recently closed issues.
 
+## Output Format
+
+- Final output must be a single JSON object and nothing else.
+- Use double quotes for all keys and string values.
+- Do not wrap the JSON in markdown fences or add commentary.
+- Required keys: `status`, `summary`, `accomplished`, `remaining`, `files`.
+- Optional keys: `error`, `input_tokens`, `output_tokens`, `learnings`, `delegations`.
+- If you are about to output malformed JSON, stop and rewrite it as valid JSON before responding.
+
+Example:
+
+```json
+{"status":"done","summary":"Fixed the bug","accomplished":["Updated parser"],"remaining":[],"files":["src/parser.rs"]}
+```
+
 ## Worktree
 
 You are running inside an isolated git worktree on a feature branch. Do NOT create worktrees or branches yourself — the orchestrator manages that.

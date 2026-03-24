@@ -5,8 +5,12 @@
 //! Replaces `scripts/parse_response.sh` + `jq` pipelines.
 
 use anyhow::Context;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
+
+static TRAILING_COMMA_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r",(\s*[}\]])").unwrap());
 
 /// Normalized agent response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,21 +68,28 @@ pub fn parse_and_print(path: &str) -> anyhow::Result<()> {
 
 /// Parse raw agent output into a normalized response.
 pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
-    // Try direct JSON parse first (Claude structured output)
-    if let Ok(resp) = serde_json::from_str::<AgentResponse>(raw) {
-        return Ok(resp);
-    }
-
-    // Try extracting JSON from markdown code blocks
-    if let Some(json_str) = extract_json_block(raw) {
-        if let Ok(resp) = serde_json::from_str::<AgentResponse>(&json_str) {
-            return Ok(resp);
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut saw_jsonish_candidate = false;
+    for candidate in json_candidates(raw) {
+        match parse_candidate(&candidate) {
+            Ok(resp) => return Ok(resp),
+            Err(err) => {
+                if err.to_string() != "invalid agent response candidate" {
+                    saw_jsonish_candidate = true;
+                    last_err = Some(err);
+                }
+            }
         }
     }
 
-    // Try parsing as a generic JSON value and mapping fields
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
-        return map_generic_response(&val);
+    if saw_jsonish_candidate {
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+    }
+
+    if let Some(err) = last_err {
+        return Err(err);
     }
 
     anyhow::bail!(
@@ -93,6 +104,144 @@ fn extract_json_block(text: &str) -> Option<String> {
     let content_start = text[start..].find('\n')? + start + 1;
     let end = text[content_start..].find("```")? + content_start;
     Some(text[content_start..end].to_string())
+}
+
+fn json_candidates(raw: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    if let Some(block) = extract_json_block(raw) {
+        candidates.push(block);
+    }
+
+    if let Some(candidate) = extract_balanced_json(raw) {
+        if !candidates.iter().any(|existing| existing == &candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates.push(raw.to_string());
+    candidates
+}
+
+fn parse_candidate(candidate: &str) -> anyhow::Result<AgentResponse> {
+    if let Ok(resp) = serde_json::from_str::<AgentResponse>(candidate) {
+        return Ok(resp);
+    }
+
+    let repaired = repair_json_like(candidate);
+    if repaired != candidate {
+        if let Ok(resp) = serde_json::from_str::<AgentResponse>(&repaired) {
+            return Ok(resp);
+        }
+    }
+
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
+        return map_generic_response(&val);
+    }
+
+    if repaired != candidate {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&repaired) {
+            return map_generic_response(&val);
+        }
+    }
+
+    anyhow::bail!("invalid agent response candidate")
+}
+
+fn extract_balanced_json(text: &str) -> Option<String> {
+    let start = text
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '{' | '['))
+        .map(|(idx, _)| idx)?;
+
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (idx, ch) in text[start..].char_indices() {
+        let abs = start + idx;
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => stack.push(ch),
+            '}' => {
+                if stack.pop() != Some('{') {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(text[start..=abs].to_string());
+                }
+            }
+            ']' => {
+                if stack.pop() != Some('[') {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(text[start..=abs].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn repair_json_like(text: &str) -> String {
+    let mut repaired = text.trim().replace(['“', '”'], "\"");
+    repaired = repaired.replace(['‘', '’'], "'");
+    repaired = TRAILING_COMMA_RE.replace_all(&repaired, "$1").into_owned();
+
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+
+    for ch in repaired.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if let Some(expected) = stack.last().copied() {
+                    if expected == ch {
+                        stack.pop();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    while let Some(ch) = stack.pop() {
+        repaired.push(ch);
+    }
+
+    repaired
 }
 
 /// Map a generic JSON object to AgentResponse.
@@ -266,10 +415,28 @@ Done.
 {"status":"done","summary":"missing brace"
 ```
 "#;
-        let err = parse(input).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("agent output is not valid JSON or a supported JSON wrapper"));
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+        assert_eq!(resp.summary, "missing brace");
+    }
+
+    #[test]
+    fn parse_json_with_trailing_comma() {
+        let input =
+            r#"{"status":"done","summary":"Fixed","accomplished":[],"remaining":[],"files":[],}"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+        assert_eq!(resp.summary, "Fixed");
+    }
+
+    #[test]
+    fn parse_json_embedded_in_commentary() {
+        let input = r#"Done:
+{"status":"in_progress","summary":"working","accomplished":[],"remaining":["tests"],"files":[]}
+Thanks"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "in_progress");
+        assert_eq!(resp.remaining, vec!["tests"]);
     }
 
     #[test]
