@@ -161,6 +161,22 @@ pub async fn handle_error(
         }
     }
 
+    if retryable == response::RetryableError::Timeout {
+        let status = response::handle_timeout_failover(
+            task_id,
+            agent_name,
+            &error_msg,
+            store,
+            repo,
+        )
+        .await;
+        if status == "new" {
+            // A new agent was found, so we can return early.
+            return Ok(ErrorHandleResult::EarlyReturn { status });
+        }
+        // If no new agent was found, we fall through to the normal error handling.
+    }
+
     // Try free models as last resort before giving up
     let chain = response::get_reroute_chain(task_id, store, repo).await;
     let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
