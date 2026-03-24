@@ -1338,6 +1338,64 @@ impl GhHttp {
         Ok(())
     }
 
+    /// Enable auto-merge on a PR via GraphQL.
+    ///
+    /// GitHub will automatically merge the PR once all required checks pass.
+    pub async fn enable_auto_merge(&self, repo: &str, pr_number: u64) -> anyhow::Result<()> {
+        let parts: Vec<&str> = repo.split('/').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("invalid repo format: {repo}");
+        }
+        let (owner, repo_name) = (parts[0], parts[1]);
+
+        // First get the PR node ID
+        let query = format!(
+            r#"{{"query":"query {{ repository(owner:\"{owner}\", name:\"{repo_name}\") {{ pullRequest(number:{pr_number}) {{ id }} }} }}"}}"#
+        );
+        let auth = self.auth_header().await?;
+        let resp = self
+            .client
+            .post(format!("{GITHUB_API}/graphql"))
+            .body(query)
+            .header(header::AUTHORIZATION, &auth)
+            .header(header::ACCEPT, "application/vnd.github+json")
+            .send()
+            .await?;
+        Self::record_response(&resp);
+        let body: serde_json::Value = resp.json().await?;
+        let pr_id = body
+            .pointer("/data/repository/pullRequest/id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("could not get PR node ID"))?
+            .to_string();
+
+        // Enable auto-merge with squash
+        let mutation = format!(
+            r#"{{"query":"mutation {{ enablePullRequestAutoMerge(input: {{pullRequestId: \"{pr_id}\", mergeMethod: SQUASH}}) {{ pullRequest {{ autoMergeRequest {{ enabledAt }} }} }} }}"}}"#
+        );
+        let resp = self
+            .client
+            .post(format!("{GITHUB_API}/graphql"))
+            .body(mutation)
+            .header(header::AUTHORIZATION, &auth)
+            .header(header::ACCEPT, "application/vnd.github+json")
+            .send()
+            .await?;
+        Self::record_response(&resp);
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("enable auto-merge failed ({status}): {body}");
+        }
+        let body: serde_json::Value = resp.json().await?;
+        if let Some(errors) = body.get("errors") {
+            anyhow::bail!("enable auto-merge GraphQL error: {errors}");
+        }
+
+        tracing::info!(repo, pr_number, "auto-merge enabled on PR");
+        Ok(())
+    }
+
     /// Get sub-issues via GraphQL (paginated).
     pub async fn get_sub_issues(&self, repo: &str, number: &str) -> anyhow::Result<Vec<u64>> {
         let parts: Vec<&str> = repo.split('/').collect();

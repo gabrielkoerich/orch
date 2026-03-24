@@ -320,12 +320,30 @@ pub(crate) async fn auto_merge_pr(
                                 "merge_conflict_retries",
                             )
                             .await;
-                            // After rebase + force-push, CI must re-run on the new HEAD.
-                            // Reset to NeedsReview so the full review cycle runs again
-                            // (review agent verifies rebase, CI poll, then merge).
-                            task_manager
-                                .update_task_status(&task.id, Status::NeedsReview)
-                                .await?;
+                            // Enable auto-merge — GitHub merges once CI passes.
+                            // If auto-merge isn't available, keep task in InReview
+                            // so the sync tick retries merge on the next cycle.
+                            match gh.enable_auto_merge(repo, pr_number).await {
+                                Ok(_) => {
+                                    task_manager
+                                        .update_task_status(&task.id, Status::Done)
+                                        .await?;
+                                    if let Err(ce) =
+                                        cleanup_task_worktree(&task.id.0, repo, store).await
+                                    {
+                                        tracing::warn!(task_id = task.id.0, err = %ce, "post-rebase cleanup failed");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        task_id = task.id.0,
+                                        error = %e,
+                                        "auto-merge unavailable — task stays in InReview for sync retry"
+                                    );
+                                    // Don't change status — sync tick will poll CI
+                                    // and retry merge when checks pass.
+                                }
+                            }
                             return Ok(());
                         }
                         Ok(out) => {
