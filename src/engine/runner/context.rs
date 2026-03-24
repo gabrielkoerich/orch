@@ -11,6 +11,7 @@
 
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::cmd::CommandErrorContext;
+use crate::store;
 use crate::store::TaskStore;
 use std::path::Path;
 use std::sync::Arc;
@@ -54,13 +55,13 @@ pub async fn build_parent_context(
     repo: &str,
 ) -> String {
     // Check if task has a parent via store
-    let parent_id =
-        match crate::engine::cleanup::opt_store_get_field(store, repo, &task.id.0, "parent_id")
-            .await
-        {
-            Some(id) if !id.is_empty() => id,
-            _ => return String::new(),
-        };
+    let parent_id = match store::opt_store_get_task(store, repo, &task.id.0)
+        .await
+        .and_then(|t| t.parent_id)
+    {
+        Some(id) => id.to_string(),
+        None => return String::new(),
+    };
 
     let mut ctx = String::new();
 
@@ -93,10 +94,9 @@ pub async fn build_parent_context(
                     ctx.push_str(&format!("- #{} [{}]: {}\n", sib.id.0, status, sib.title));
 
                     // Include summary if available
-                    if let Some(summary) = crate::engine::cleanup::opt_store_get_field(
-                        store, repo, &sib.id.0, "summary",
-                    )
-                    .await
+                    if let Some(summary) = store::opt_store_get_task(store, repo, &sib.id.0)
+                        .await
+                        .map(|t| t.summary)
                     {
                         if !summary.is_empty() {
                             ctx.push_str(&format!("  Summary: {}\n", summary));
@@ -280,8 +280,7 @@ pub async fn build_memory_context(
 ) -> (String, Vec<crate::store::MemoryEntry>) {
     const MAX_MEMORY_ENTRIES: usize = 3;
 
-    let memory =
-        crate::engine::cleanup::get_recent_memory(store, repo, task_id, MAX_MEMORY_ENTRIES).await;
+    let memory = store::get_recent_memory(store, repo, task_id, MAX_MEMORY_ENTRIES).await;
 
     if memory.is_empty() {
         return (String::new(), vec![]);
@@ -336,8 +335,9 @@ pub async fn load_pr_review_context(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> String {
-    crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "pr_review_context")
+    store::opt_store_get_task(store, repo, task_id)
         .await
+        .map(|t| t.pr_review_context)
         .unwrap_or_default()
 }
 

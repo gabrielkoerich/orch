@@ -17,15 +17,16 @@ use crate::engine::router::{get_route_result, Router};
 use crate::engine::runner::{TaskRunner, WeightSignal};
 use crate::engine::tasks::{is_internal_id, TaskManager};
 use crate::repo_context::REPO_CONTEXT;
+use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
-use super::cleanup::{review_session_expected, set_review_session_expected};
 use super::dispatch_guard::DispatchGuard;
 use super::review::{review_and_merge, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
 use super::EngineConfig;
+use crate::store::{review_session_expected, set_review_session_expected};
 
 /// Phase 1 of tick: poll tmux for finished sessions and clean them up.
 pub(crate) async fn tick_check_session_completions(
@@ -116,7 +117,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
                     backend.remove_label(&task.id, label).await.ok();
                 }
             }
-            super::cleanup::store_set(
+            store::store_set(
                 &Some(Arc::clone(store)),
                 repo,
                 &task.id.0,
@@ -205,7 +206,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
             }
             // Reset routing state so the LLM router is used on the next attempt
             // (same reset that external tasks perform).
-            super::cleanup::store_set(
+            store::store_set(
                 &Some(Arc::clone(store)),
                 repo,
                 &task_id,
@@ -627,9 +628,18 @@ pub(crate) async fn tick_dispatch_tasks(
                             // Check if response handler already set done (no-op task).
                             // The task_manager.update_task_status() was already called
                             // by response_handler, so read the actual status from store.
-                            let has_pr = super::cleanup::store_get_field(
-                                &store_for_spawn, &repo_owned, &task_id, "pr_number",
-                            ).await.is_some();
+                            let has_pr = match store_for_spawn
+                                .resolve_task_id(&repo_owned, &task_id)
+                                .await
+                            {
+                                Ok(Some(store_id)) => store_for_spawn
+                                    .get(store_id)
+                                    .await
+                                    .ok()
+                                    .and_then(|t| t.pr_number)
+                                    .is_some(),
+                                _ => false,
+                            };
                             if has_pr {
                                 "needs_review"
                             } else {
@@ -729,14 +739,13 @@ pub(crate) async fn tick_dispatch_tasks(
                                                 }
                                             }
                                             Ok(ReviewDecision::Failed(reason)) => {
-                                                let failures =
-                                                    super::cleanup::store_increment(
-                                                        &Some(store_for_review.clone()),
-                                                        &repo_owned,
-                                                        &task_id_for_review,
-                                                        "review_agent_failures",
-                                                    )
-                                                    .await;
+                                                let failures = store::store_increment(
+                                                    &Some(store_for_review.clone()),
+                                                    &repo_owned,
+                                                    &task_id_for_review,
+                                                    "review_agent_failures",
+                                                )
+                                                .await;
                                                 if failures >= MAX_REVIEW_AGENT_FAILURES {
                                                     tracing::error!(
                                                         task_id = task_id_for_review,
@@ -783,14 +792,13 @@ pub(crate) async fn tick_dispatch_tasks(
                                                 }
                                             }
                                             Err(e) => {
-                                                let failures =
-                                                    super::cleanup::store_increment(
-                                                        &Some(store_for_review.clone()),
-                                                        &repo_owned,
-                                                        &task_id_for_review,
-                                                        "review_agent_failures",
-                                                    )
-                                                    .await;
+                                                let failures = store::store_increment(
+                                                    &Some(store_for_review.clone()),
+                                                    &repo_owned,
+                                                    &task_id_for_review,
+                                                    "review_agent_failures",
+                                                )
+                                                .await;
                                                 if failures >= MAX_REVIEW_AGENT_FAILURES {
                                                     tracing::error!(
                                                         task_id = task_id_for_review,
@@ -839,7 +847,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                             Ok(super::review::ReviewDecision::Approve)
                                             | Ok(super::review::ReviewDecision::Skipped) => {
                                                 // Full reset: task is done with the review cycle.
-                                                super::cleanup::store_reset_counters(
+                                                store::store_reset_counters(
                                                     &Some(store_for_review.clone()),
                                                     &repo_owned,
                                                     &task_id_for_review,
@@ -852,7 +860,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                                 // handle_review_changes already incremented
                                                 // review_cycles — only reset transient per-attempt
                                                 // counters so the cycle count is preserved.
-                                                super::cleanup::store_reset_failure_counters(
+                                                store::store_reset_failure_counters(
                                                     &Some(store_for_review.clone()),
                                                     &repo_owned,
                                                     &task_id_for_review,
@@ -860,7 +868,7 @@ pub(crate) async fn tick_dispatch_tasks(
                                                 .await;
                                             }
                                         }
-                                        set_review_session_expected(
+                                        store::set_review_session_expected(
                                             &store_for_review,
                                             &repo_owned,
                                             &task_id_for_review,
@@ -1339,7 +1347,7 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
-        crate::engine::cleanup::set_review_session_expected(&store, "owner/repo", "99", true).await;
+        store::set_review_session_expected(&store, "owner/repo", "99", true).await;
         set_task_updated_at_past(&store, id).await;
 
         tick_recover_stuck_tasks(
@@ -1440,13 +1448,7 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
-        crate::engine::cleanup::set_review_session_expected(
-            &store,
-            "owner/repo",
-            "internal:1",
-            true,
-        )
-        .await;
+        store::set_review_session_expected(&store, "owner/repo", "internal:1", true).await;
         set_task_updated_at_past(&store, id).await;
 
         tick_recover_stuck_tasks(

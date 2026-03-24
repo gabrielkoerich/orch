@@ -2,13 +2,13 @@ use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cli::init_task_manager;
 use crate::cmd::SyncCommandErrorContext;
 use crate::config;
-use crate::engine::cleanup as store_helpers;
 use crate::engine::router::Router;
 use crate::engine::runner::TaskRunner;
 use crate::engine::tasks::{
     parse_internal_id, status_to_task_status, CreateTaskRequest, Task, TaskFilter, TaskType,
 };
 use crate::home;
+use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
@@ -359,8 +359,8 @@ pub async fn get(id: i64) -> anyhow::Result<()> {
                 }
             }
             // Cost summary (if any tokens recorded)
-            let usage = store_helpers::get_token_usage(&store, &repo, &ext.id.0).await;
-            let cost = store_helpers::get_cost_estimate(&store, &repo, &ext.id.0).await;
+            let usage = store::get_token_usage(&store, &repo, &ext.id.0).await;
+            let cost = store::get_cost_estimate(&store, &repo, &ext.id.0).await;
             if usage.total_tokens() > 0 || cost.total_cost_usd > 0.0 {
                 println!(
                     "Tokens: {} in / {} out — ${:.6}",
@@ -691,7 +691,7 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
                     .external_id
                     .unwrap_or_else(|| format!("internal:{}", task.id));
                 // Reset store counters
-                crate::engine::cleanup::store_reset_counters(&store, &repo, &internal_id).await;
+                store::store_reset_counters(&store, &repo, &internal_id).await;
                 // Reset status to New
                 s.update_status(id, TaskStatus::New).await?;
                 println!(
@@ -716,7 +716,7 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
     }
 
     // Reset store state (attempts + all failure counters)
-    crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id.0).await;
+    store::store_reset_counters(&store, &repo, &ext_id.0).await;
 
     // Reset to new
     update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
@@ -734,7 +734,7 @@ async fn reset_counters(
     repo: &str,
 ) {
     let internal_id = format!("internal:{}", id);
-    crate::engine::cleanup::store_reset_counters(store, repo, &internal_id).await;
+    store::store_reset_counters(store, repo, &internal_id).await;
 }
 
 /// Unblock a task or all blocked tasks.
@@ -754,7 +754,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
 
         let mut external_count = 0;
         for task in blocked.iter().chain(needs_review.iter()) {
-            crate::engine::cleanup::store_reset_counters(&store, &repo, &task.id.0).await;
+            store::store_reset_counters(&store, &repo, &task.id.0).await;
             update_status_store_first(&store, &backend, &repo, &task.id, Status::New).await?;
             external_count += 1;
         }
@@ -774,7 +774,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
                     .external_id
                     .clone()
                     .unwrap_or_else(|| format!("internal:{}", task.id));
-                crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id).await;
+                store::store_reset_counters(&store, &repo, &ext_id).await;
                 s.update_status(task.id, TaskStatus::New).await?;
                 internal_count += 1;
             }
@@ -821,7 +821,7 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     }
 
     let ext_id = ExternalId(id.to_string());
-    crate::engine::cleanup::store_reset_counters(&store, &repo, &ext_id.0).await;
+    store::store_reset_counters(&store, &repo, &ext_id.0).await;
     update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
     println!("Unblocked task #{} (attempts reset)", id);
 
@@ -914,8 +914,9 @@ pub async fn live() -> anyhow::Result<()> {
 
     for session in &sessions {
         let active = tmux.is_session_active(&session.name).await;
-        let agent = store_helpers::opt_store_get_field(&store, &repo, &session.task_id, "agent")
+        let agent = store::opt_store_get_task(&store, &repo, &session.task_id)
             .await
+            .and_then(|t| t.agent)
             .unwrap_or_default();
         println!(
             "{:<30} {:<15} {:<10} {}",
@@ -1111,8 +1112,8 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
             }
 
             // Token & cost summary
-            let usage = store_helpers::get_token_usage(&store, &repo, &task_key).await;
-            let cost = store_helpers::get_cost_estimate(&store, &repo, &task_key).await;
+            let usage = store::get_token_usage(&store, &repo, &task_key).await;
+            let cost = store::get_cost_estimate(&store, &repo, &task_key).await;
             let total_tokens = usage.total_tokens();
             if total_tokens > 0 || cost.total_cost_usd > 0.0 {
                 println!("\nCost summary:");
@@ -1124,7 +1125,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
 
             // Memory (recent attempts)
             {
-                let mem = store_helpers::get_recent_memory(&store, &repo, &task_key, 10).await;
+                let mem = store::get_recent_memory(&store, &repo, &task_key, 10).await;
                 if !mem.is_empty() {
                     println!("\nMemory (recent attempts):");
                     for m in mem {
@@ -1157,45 +1158,42 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
     }
 
     // Show agent output from last attempt if available
-    if let Some(attempts_str) =
-        store_helpers::opt_store_get_field(&store, &repo, &task_key, "attempts").await
-    {
-        if let Ok(attempt_n) = attempts_str.parse::<u32>() {
-            if attempt_n > 0 {
-                match home::task_attempt_dir(&repo, &task_key, attempt_n) {
-                    Ok(attempt_dir) => {
-                        let output_file = attempt_dir.join("output.json");
-                        let exit_file = attempt_dir.join("exit.txt");
+    let attempt_n: u32 = store::opt_store_get_task(&store, &repo, &task_key)
+        .await
+        .map(|t| t.attempts)
+        .unwrap_or(0) as u32;
+    if attempt_n > 0 {
+        match home::task_attempt_dir(&repo, &task_key, attempt_n) {
+            Ok(attempt_dir) => {
+                let output_file = attempt_dir.join("output.json");
+                let exit_file = attempt_dir.join("exit.txt");
 
-                        if output_file.exists() {
-                            if let Ok(content) = std::fs::read_to_string(&output_file) {
-                                let tail = crate::engine::runner::response_handler::safe_utf8_tail(
-                                    &content, 2000,
-                                );
-                                let truncated = if content.len() > 2000 {
-                                    format!(
-                                        "...({} chars truncated)...\n{}",
-                                        content.len() - tail.len(),
-                                        tail
-                                    )
-                                } else {
-                                    content.clone()
-                                };
-                                println!("\n--- Last attempt output (attempt {}) ---", attempt_n);
-                                println!("{}", truncated);
-                            }
-                        }
-
-                        if exit_file.exists() {
-                            if let Ok(exit_code) = std::fs::read_to_string(&exit_file) {
-                                println!("Exit code: {}", exit_code.trim());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("(could not resolve attempt dir: {})", e);
+                if output_file.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&output_file) {
+                        let tail =
+                            crate::engine::runner::response_handler::safe_utf8_tail(&content, 2000);
+                        let truncated = if content.len() > 2000 {
+                            format!(
+                                "...({} chars truncated)...\n{}",
+                                content.len() - tail.len(),
+                                tail
+                            )
+                        } else {
+                            content.clone()
+                        };
+                        println!("\n--- Last attempt output (attempt {}) ---", attempt_n);
+                        println!("{}", truncated);
                     }
                 }
+
+                if exit_file.exists() {
+                    if let Ok(exit_code) = std::fs::read_to_string(&exit_file) {
+                        println!("Exit code: {}", exit_code.trim());
+                    }
+                }
+            }
+            Err(e) => {
+                println!("(could not resolve attempt dir: {})", e);
             }
         }
     }

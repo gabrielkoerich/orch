@@ -4,6 +4,7 @@
 //! parse result: error classification, model failover, free-model fallback,
 //! and agent rerouting.
 
+use crate::store;
 use crate::store::TaskStore;
 use std::sync::Arc;
 
@@ -73,7 +74,7 @@ pub async fn handle_error(
             if let Some(next) = next_model {
                 tracing::info!(task_id, model = %next, "retrying with different model");
                 let msg = format!("model {model} unavailable, trying {next}");
-                crate::engine::cleanup::store_set(
+                store::store_set(
                     store,
                     repo,
                     task_id,
@@ -103,7 +104,7 @@ pub async fn handle_error(
         agents::AgentError::WaitingForInput { message } => {
             // Requires human — skip failover, go straight to needs_review
             let msg = format!("waiting for input: {message}");
-            crate::engine::cleanup::store_set(
+            store::store_set(
                 store,
                 repo,
                 task_id,
@@ -129,7 +130,7 @@ pub async fn handle_error(
         agents::AgentError::NetworkError { message } => {
             // Transient connectivity failure — retry same agent, no reroute chain update.
             let msg = format!("{agent_name} network error: {message}");
-            crate::engine::cleanup::store_set(
+            store::store_set(
                 store,
                 repo,
                 task_id,
@@ -183,14 +184,10 @@ pub async fn handle_error(
         // All agents exhausted — try free models via opencode
         let free = agent_runner.free_models();
         if !free.is_empty() {
-            let tried_models: String = crate::engine::cleanup::opt_store_get_field(
-                store,
-                repo,
-                task_id,
-                "model_reroute_chain",
-            )
-            .await
-            .unwrap_or_default();
+            let tried_models: String = store::opt_store_get_task(store, repo, task_id)
+                .await
+                .map(|t| t.model_reroute_chain)
+                .unwrap_or_default();
             let tried_set: std::collections::HashSet<&str> =
                 tried_models.split(',').filter(|s| !s.is_empty()).collect();
 
@@ -202,7 +199,7 @@ pub async fn handle_error(
                     format!("{tried_models},{free_model}")
                 };
                 let msg = format!("all agents exhausted, trying free model {free_model}");
-                crate::engine::cleanup::store_set(
+                store::store_set(
                     store,
                     repo,
                     task_id,

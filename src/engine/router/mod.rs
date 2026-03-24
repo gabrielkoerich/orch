@@ -293,14 +293,15 @@ impl Router {
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
         // 1. Check store agent field first (set by failover, authoritative over labels)
-        let store_agent = crate::engine::cleanup::opt_store_get_field(
-            &Some(store.clone()),
-            repo,
-            &task.id.0,
-            "agent",
-        )
-        .await
-        .filter(|a| !a.is_empty() && self.config.agents.contains(a));
+        let store_agent = match store.resolve_task_id(repo, &task.id.0).await {
+            Ok(Some(store_id)) => match store.get(store_id).await {
+                Ok(t) => t
+                    .agent
+                    .filter(|a| !a.is_empty() && self.config.agents.iter().any(|cfg| cfg == a)),
+                Err(_) => None,
+            },
+            _ => None,
+        };
 
         // 2. Fall back to explicit agent label
         let resolved_agent = store_agent
@@ -424,10 +425,14 @@ impl Router {
         store: &std::sync::Arc<crate::store::TaskStore>,
         repo: &str,
     ) -> u32 {
-        crate::engine::cleanup::store_get_field(store, repo, task_id, "route_attempts")
-            .await
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
+        match store.resolve_task_id(repo, task_id).await {
+            Ok(Some(store_id)) => store
+                .get(store_id)
+                .await
+                .map(|t| t.route_attempts as u32)
+                .unwrap_or(0),
+            _ => 0,
+        }
     }
 
     /// Set the number of LLM routing attempts for a task in the store.
@@ -438,13 +443,14 @@ impl Router {
         store: &std::sync::Arc<crate::store::TaskStore>,
         repo: &str,
     ) {
-        crate::engine::cleanup::store_set(
-            &Some(std::sync::Arc::clone(store)),
-            repo,
-            task_id,
-            &[("route_attempts", serde_json::json!(attempts))],
-        )
-        .await;
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            if let Err(e) = store
+                .set_fields(store_id, &[("route_attempts", serde_json::json!(attempts))])
+                .await
+            {
+                tracing::warn!(task_id, error = %e, "failed to store route_attempts");
+            }
+        }
     }
 
     /// Route using LLM classification with pool round-robin.
@@ -622,39 +628,26 @@ pub async fn get_route_result(
     repo: &str,
     task_id: &str,
 ) -> anyhow::Result<RouteResult> {
-    let read = |field: &str| {
-        let store = store.clone();
-        let repo = repo.to_string();
-        let task_id = task_id.to_string();
-        let field = field.to_string();
-        async move {
-            crate::engine::cleanup::store_get_field(&store, &repo, &task_id, &field)
-                .await
-                .unwrap_or_default()
-        }
+    let store_id = store
+        .resolve_task_id(repo, task_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("task {task_id} not found in store"))?;
+    let task = store.get(store_id).await?;
+
+    let agent = task
+        .agent
+        .clone()
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("no agent field found for task {task_id}"))?;
+
+    let complexity = if task.complexity.is_empty() {
+        "medium".to_string()
+    } else {
+        task.complexity.clone()
     };
 
-    let agent = read("agent").await;
-    if agent.is_empty() {
-        anyhow::bail!("no agent field found for task {task_id}");
-    }
-    let complexity = {
-        let v = read("complexity").await;
-        if v.is_empty() {
-            "medium".to_string()
-        } else {
-            v
-        }
-    };
-    let reason = read("route_reason").await;
-    let model = {
-        let v = read("model").await;
-        if v.is_empty() {
-            None
-        } else {
-            Some(v)
-        }
-    };
+    let reason = task.route_reason.clone();
+    let model = task.model.clone().filter(|m| !m.is_empty());
 
     Ok(RouteResult {
         agent,

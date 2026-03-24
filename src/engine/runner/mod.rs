@@ -32,6 +32,7 @@ use crate::config;
 use crate::engine::router::RouteResult;
 use crate::engine::tasks::is_internal_id;
 use crate::security;
+use crate::store;
 use crate::store::InsertTaskMetric;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
@@ -99,7 +100,19 @@ impl TaskRunner {
 
     /// Read a field from the task store.
     async fn get_field(&self, task_id: &str, field: &str) -> Option<String> {
-        crate::engine::cleanup::opt_store_get_field(&self.store, &self.repo, task_id, field).await
+        let task = store::opt_store_get_task(&self.store, &self.repo, task_id).await?;
+        match field {
+            "route_reason" => Some(task.route_reason),
+            "worktree" => Some(task.worktree),
+            "attempts" => Some(task.attempts.to_string()),
+            "delegations" => serde_json::to_string(&task.delegations).ok(),
+            "summary" => Some(task.summary),
+            "last_error" => Some(task.last_error),
+            "agent" => task.agent,
+            "budget_warning" => Some(task.budget_warning),
+            "budget_exceeded" => Some(task.budget_exceeded.to_string()),
+            _ => None,
+        }
     }
 
     /// Run a task through the full execution pipeline.
@@ -369,10 +382,8 @@ impl TaskRunner {
             };
 
             // Read cost data from store
-            let usage =
-                crate::engine::cleanup::get_token_usage(&self.store, &self.repo, task_id).await;
-            let cost =
-                crate::engine::cleanup::get_cost_estimate(&self.store, &self.repo, task_id).await;
+            let usage = store::get_token_usage(&self.store, &self.repo, task_id).await;
+            let cost = store::get_cost_estimate(&self.store, &self.repo, task_id).await;
             let input_tokens = if usage.input_tokens > 0 {
                 Some(usage.input_tokens as i64)
             } else {
@@ -445,7 +456,7 @@ impl TaskRunner {
         let started_at = Utc::now();
 
         // Store task info for prompt building
-        crate::engine::cleanup::store_set(
+        store::store_set(
             &self.store,
             &self.repo,
             task_id,
@@ -506,7 +517,7 @@ impl TaskRunner {
                     self.process_delegations(task, &delegations, backend)
                         .await?;
                     // Clear delegations after processing
-                    crate::engine::cleanup::store_set(
+                    store::store_set(
                         &self.store,
                         &self.repo,
                         task_id,
@@ -570,8 +581,7 @@ impl TaskRunner {
         if let Some(run_id) = run_audit_id {
             if let Some(ref store) = self.store {
                 let duration = (Utc::now() - started_at).num_milliseconds() as f64 / 1000.0;
-                let usage =
-                    crate::engine::cleanup::get_token_usage(&self.store, &self.repo, task_id).await;
+                let usage = store::get_token_usage(&self.store, &self.repo, task_id).await;
                 let outcome = if status == "done" || status == "in_progress" {
                     "success"
                 } else if is_rate_limited {
@@ -693,10 +703,8 @@ impl TaskRunner {
 
         // Append budget warnings to the GitHub comment
         if budget_exceeded == "true" {
-            let cost =
-                crate::engine::cleanup::get_cost_estimate(&self.store, &self.repo, task_id).await;
-            let total_tokens =
-                crate::engine::cleanup::get_total_tokens(&self.store, &self.repo, task_id).await;
+            let cost = store::get_cost_estimate(&self.store, &self.repo, task_id).await;
+            let total_tokens = store::get_total_tokens(&self.store, &self.repo, task_id).await;
             raw_comment.push_str(&format!(
                 "\n\n> **Budget exceeded**: {} tokens used (${:.4}). Task paused for review.",
                 total_tokens, cost.total_cost_usd

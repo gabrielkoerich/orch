@@ -6,14 +6,15 @@
 
 use crate::backends::{ExternalBackend, Status};
 use crate::engine::auto_merge::{dedup_reviews, MAX_MERGE_CONFLICT_RETRIES};
-use crate::engine::cleanup::{
-    store_increment, store_reset_counters, store_reset_failure_counters, store_set,
-};
 use crate::engine::tasks::TaskManager;
 use crate::engine::EngineConfig;
 use crate::github::http::GhHttp;
 use crate::github::types::{GitHubReviewComment, PullRequestReview};
 use crate::store::TaskStore;
+use crate::store::{
+    opt_store_get_task, store_increment, store_reset_counters, store_reset_failure_counters,
+    store_set,
+};
 use std::sync::Arc;
 
 /// Review open PRs - re-dispatch agent to address review feedback.
@@ -82,24 +83,39 @@ pub(crate) async fn review_open_prs(
             }
         }
 
-        // Get branch from store
-        let branch =
-            match crate::engine::cleanup::store_get_field(store, repo, task_id, "branch").await {
-                Some(b) if !b.is_empty() => b,
-                _ => {
-                    tracing::warn!(
-                        task_id,
-                        "in_review task has no branch info — setting needs_review"
-                    );
-                    if let Err(e) = task_manager
-                        .update_task_status(&task.id, Status::NeedsReview)
-                        .await
-                    {
-                        tracing::warn!(task_id, err = %e, "failed to update status");
-                    }
-                    continue;
+        let stored_task = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id).await;
+        let stored_task = match stored_task {
+            Some(t) => t,
+            None => {
+                tracing::warn!(
+                    task_id,
+                    "in_review task missing from store — setting needs_review"
+                );
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::NeedsReview)
+                    .await
+                {
+                    tracing::warn!(task_id, err = %e, "failed to update status");
                 }
-            };
+                continue;
+            }
+        };
+
+        let branch = if stored_task.branch.is_empty() {
+            tracing::warn!(
+                task_id,
+                "in_review task has no branch info — setting needs_review"
+            );
+            if let Err(e) = task_manager
+                .update_task_status(&task.id, Status::NeedsReview)
+                .await
+            {
+                tracing::warn!(task_id, err = %e, "failed to update status");
+            }
+            continue;
+        } else {
+            stored_task.branch.clone()
+        };
 
         // Get PR number from branch
         let pr_number = match gh.get_pr_number(repo, &branch).await {
@@ -149,10 +165,7 @@ pub(crate) async fn review_open_prs(
         .await;
 
         // Get the last processed review timestamp to avoid re-processing the same reviews
-        let last_review_ts =
-            crate::engine::cleanup::store_get_field(store, repo, task_id, "last_review_ts")
-                .await
-                .unwrap_or_default();
+        let last_review_ts = stored_task.last_review_ts.clone();
 
         // Fetch PR reviews
         let reviews = match gh.get_pr_reviews(repo, pr_number).await {
@@ -224,15 +237,7 @@ pub(crate) async fn review_open_prs(
                     .unwrap_or(false);
 
                 if is_conflicting {
-                    let retries = crate::engine::cleanup::store_get_field(
-                        store,
-                        repo,
-                        task_id,
-                        "merge_conflict_retries",
-                    )
-                    .await
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
+                    let retries = stored_task.merge_conflict_retries as u64;
                     if retries >= MAX_MERGE_CONFLICT_RETRIES {
                         tracing::error!(
                             task_id,
@@ -276,14 +281,14 @@ pub(crate) async fn review_open_prs(
                     comment_approved,
                     "PR approved but not yet merged — attempting auto-merge"
                 );
-                let task_agent =
-                    crate::engine::cleanup::store_get_field(store, repo, &task.id.0, "agent")
-                        .await
-                        .unwrap_or_else(|| "orch".to_string());
-                let task_model =
-                    crate::engine::cleanup::store_get_field(store, repo, &task.id.0, "model")
-                        .await
-                        .unwrap_or_else(|| "unknown".to_string());
+                let task_agent = stored_task
+                    .agent
+                    .clone()
+                    .unwrap_or_else(|| "orch".to_string());
+                let task_model = stored_task
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
                 if let Err(e) = crate::engine::auto_merge::auto_merge_pr(
                     &task,
                     &branch,
@@ -375,14 +380,7 @@ pub(crate) async fn review_open_prs(
 
         // Also include comment-based review feedback
         if comment_changes_requested && review_context.is_empty() {
-            let last_comment_ts = crate::engine::cleanup::store_get_field(
-                store,
-                repo,
-                task_id,
-                "last_comment_review_ts",
-            )
-            .await
-            .unwrap_or_default();
+            let last_comment_ts = stored_task.last_comment_review_ts.clone();
             if let Ok(comments) = gh.list_comments(repo, &pr_number.to_string()).await {
                 for c in comments.iter().rev() {
                     if c.body

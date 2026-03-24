@@ -14,6 +14,8 @@ use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
+use crate::store;
+use crate::store::review_session_expected;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
@@ -40,7 +42,7 @@ async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: 
     }
 }
 
-use super::cleanup::{check_merged_prs, cleanup_done_worktrees, review_session_expected};
+use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
 use super::review_poll::review_open_prs;
 use super::EngineConfig;
 
@@ -193,7 +195,7 @@ pub(crate) async fn sync_tick(
                 // Reset the failure counter: stale-session recovery is an infrastructure
                 // event (tmux crash, service restart) not a genuine agent parse failure.
                 // Keeping the counter would unfairly consume the budget for the next cycle.
-                super::cleanup::store_set(
+                store::store_set(
                     &Some(Arc::clone(store)),
                     repo,
                     &task.id.0,
@@ -206,8 +208,7 @@ pub(crate) async fn sync_tick(
                 {
                     tracing::error!(task_id = %task.id.0, err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
                 } else {
-                    super::cleanup::set_review_session_expected(store, repo, &task.id.0, false)
-                        .await;
+                    store::set_review_session_expected(store, repo, &task.id.0, false).await;
                 }
             }
         }

@@ -6,6 +6,7 @@
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::config;
 use crate::engine::router::get_route_result;
+use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::path::{Path, PathBuf};
@@ -42,11 +43,10 @@ pub async fn check_guards(
     repo: &str,
     store: &Option<Arc<TaskStore>>,
 ) -> anyhow::Result<GuardOutcome> {
-    let attempts: u32 =
-        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "attempts")
-            .await
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+    let attempts: u32 = store::opt_store_get_task(store, repo, task_id)
+        .await
+        .map(|t| t.attempts)
+        .unwrap_or(0) as u32;
 
     // Guard: check if tmux session already exists (prevents duplicate dispatch)
     let tmux = TmuxManager::new();
@@ -70,7 +70,7 @@ pub async fn check_guards(
         tracing::warn!(task_id, attempts, max_attempts, "exceeded max attempts");
         let msg =
             format!("exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset.");
-        crate::engine::cleanup::store_set(
+        store::store_set(
             store,
             repo,
             task_id,
@@ -89,12 +89,10 @@ pub async fn build_pseudo_task(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> ExternalTask {
-    let task_title = crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "title")
+    let (task_title, task_body) = store::opt_store_get_task(store, repo, task_id)
         .await
-        .unwrap_or_else(|| format!("Task #{task_id}"));
-    let task_body = crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "body")
-        .await
-        .unwrap_or_default();
+        .map(|t| (t.title, t.body))
+        .unwrap_or_else(|| (format!("Task #{task_id}"), String::new()));
     ExternalTask {
         id: ExternalId(task_id.to_string()),
         title: task_title,
@@ -121,10 +119,10 @@ pub async fn prepare_task(
     store: &Option<Arc<TaskStore>>,
 ) -> anyhow::Result<TaskInitResult> {
     // Load title from store for branch naming (set by run_with_context before run())
-    let title_for_branch =
-        crate::engine::cleanup::opt_store_get_field(store, repo, task_id, "title")
-            .await
-            .unwrap_or_default();
+    let title_for_branch = store::opt_store_get_task(store, repo, task_id)
+        .await
+        .map(|t| t.title)
+        .unwrap_or_default();
 
     // Set up worktree
     let wt = worktree::setup_worktree(task_id, &title_for_branch, project_dir, store, repo).await?;
@@ -228,7 +226,7 @@ pub async fn prepare_task(
     };
 
     // Increment attempts counter
-    crate::engine::cleanup::store_set(
+    store::store_set(
         store,
         repo,
         task_id,

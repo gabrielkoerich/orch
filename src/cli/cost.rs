@@ -1,5 +1,4 @@
 use crate::config;
-use crate::engine::cleanup as store_helpers;
 use crate::store::{self, TaskStore};
 use std::sync::Arc;
 
@@ -8,10 +7,11 @@ pub async fn show_task(id: &str) -> anyhow::Result<()> {
     let store: Option<Arc<TaskStore>> = crate::cli::init_store().await.ok().map(Arc::new);
     let repo = config::get_current_repo().unwrap_or_default();
 
-    let usage = store_helpers::get_token_usage(&store, &repo, id).await;
-    let cost_estimate = store_helpers::get_cost_estimate(&store, &repo, id).await;
-    let model = store_helpers::opt_store_get_field(&store, &repo, id, "model")
+    let usage = store::get_token_usage(&store, &repo, id).await;
+    let cost_estimate = store::get_cost_estimate(&store, &repo, id).await;
+    let model = store::opt_store_get_task(&store, &repo, id)
         .await
+        .and_then(|t| t.model)
         .unwrap_or_default();
 
     if usage.total_tokens() == 0 {
