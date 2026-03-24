@@ -29,6 +29,13 @@ fn ci_poll_semaphore() -> &'static Arc<Semaphore> {
 /// without duplicating the constant.
 pub(crate) const MAX_REVIEW_AGENT_FAILURES: u64 = 3;
 
+fn review_started_comment(review_agent: &str, review_model: &str) -> String {
+    format!(
+        "🔍 Automated review started (agent: {}, model: {})",
+        review_agent, review_model
+    )
+}
+
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::engine::runner;
@@ -1084,6 +1091,31 @@ pub(crate) async fn review_and_merge(
             return Ok(ReviewDecision::Failed(format!("spawn failed: {e}")));
         }
     };
+
+    let start_comment = review_started_comment(&review_agent, &review_model);
+    match GhHttp::new() {
+        Ok(gh) => {
+            if let Err(e) = gh
+                .add_comment(repo, &pr_number_early.to_string(), &start_comment)
+                .await
+            {
+                tracing::debug!(
+                    task_id = task.id.0,
+                    pr_number = pr_number_early,
+                    error = %e,
+                    "failed to post review-started comment"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                task_id = task.id.0,
+                pr_number = pr_number_early,
+                error = %e,
+                "failed to create GitHub client for review-started comment"
+            );
+        }
+    }
 
     // 8. Wait for completion
     let poll_interval = std::time::Duration::from_secs(5);
@@ -2249,6 +2281,14 @@ mod tests {
             submitted_at: submitted_at.to_string(),
             commit_id: None,
         }
+    }
+
+    #[test]
+    fn review_started_comment_includes_agent_and_model() {
+        assert_eq!(
+            review_started_comment("kimi", "opus"),
+            "🔍 Automated review started (agent: kimi, model: opus)"
+        );
     }
 
     #[test]
