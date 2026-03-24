@@ -10,6 +10,7 @@
 use crate::cmd::CommandErrorContext;
 use crate::github::http::GhHttp;
 use std::path::Path;
+use std::time::Duration;
 use tokio::process::Command;
 
 /// Format a task ID for display in PR/issue footers.
@@ -374,79 +375,133 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     tracing::info!(branch = branch_to_push, "pushing branch");
 
     let auth_args = build_git_auth_args();
-    let push_args: Vec<&str> = auth_args
+    let max_attempts = 3;
+    let needs_pre_push_rebase = remote_exists && has_unpushed;
+
+    for attempt in 1..=max_attempts {
+        if attempt == 1 && needs_pre_push_rebase {
+            if let Err(e) = rebase_branch_on_remote(dir, branch_to_push).await {
+                tracing::warn!(branch = branch_to_push, error = %e, "pre-push rebase failed");
+                return Err(e);
+            }
+        }
+
+        let push_args = build_push_args(&auth_args, branch_to_push);
+        let output = Command::new("git")
+            .args(&push_args)
+            .current_dir(dir)
+            .output_with_context()
+            .await?;
+
+        if output.status.success() {
+            tracing::info!(branch = branch_to_push, attempt, "push succeeded");
+            return Ok(true);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        tracing::warn!(
+            branch = branch_to_push,
+            attempt,
+            stdout = %stdout,
+            stderr = %stderr,
+            "push attempt failed"
+        );
+
+        if attempt == max_attempts {
+            anyhow::bail!("push failed after {max_attempts} attempts: {stderr}");
+        }
+
+        if push_needs_rebase(&stderr) && remote_exists {
+            tracing::info!(
+                branch = branch_to_push,
+                attempt,
+                "push rejected, rebasing and retrying"
+            );
+            if let Err(e) = rebase_branch_on_remote(dir, branch_to_push).await {
+                tracing::warn!(branch = branch_to_push, error = %e, "rebase after push rejection failed");
+                return Err(e);
+            }
+        } else if push_needs_rebase(&stderr) {
+            tracing::warn!(
+                branch = branch_to_push,
+                "push rejected but remote branch does not exist; will retry without rebase"
+            );
+        }
+
+        let delay = push_retry_delay(attempt);
+        tracing::info!(
+            branch = branch_to_push,
+            attempt,
+            delay_secs = delay.as_secs(),
+            "retrying push after backoff"
+        );
+        tokio::time::sleep(delay).await;
+    }
+
+    anyhow::bail!("push failed unexpectedly")
+}
+
+fn build_push_args(auth_args: &[String], branch: &str) -> Vec<String> {
+    auth_args
         .iter()
-        .map(String::as_str)
-        .chain(["push", "-u", "origin", branch_to_push])
-        .collect();
+        .cloned()
+        .chain([
+            "push".to_string(),
+            "-u".to_string(),
+            "origin".to_string(),
+            branch.to_string(),
+        ])
+        .collect()
+}
+
+fn push_needs_rebase(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("non-fast-forward")
+        || lower.contains("rejected")
+        || lower.contains("fetch first")
+        || lower.contains("behind")
+}
+
+fn push_retry_delay(attempt: u32) -> Duration {
+    let base_secs = 1u64 << (attempt.saturating_sub(1).min(3));
+    Duration::from_secs(base_secs.min(8))
+}
+
+async fn rebase_branch_on_remote(dir: &Path, branch: &str) -> anyhow::Result<()> {
+    let fetch = Command::new("git")
+        .args(["fetch", "origin", "--prune"])
+        .current_dir(dir)
+        .output_with_context()
+        .await?;
+
+    if !fetch.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch.stderr);
+        anyhow::bail!("git fetch failed before push rebase: {stderr}");
+    }
 
     let output = Command::new("git")
-        .args(&push_args)
+        .args(["pull", "--rebase", "origin", branch])
         .current_dir(dir)
         .output_with_context()
         .await?;
 
     if output.status.success() {
-        tracing::info!(branch = branch_to_push, "push succeeded");
-        return Ok(true);
+        tracing::info!(branch, "rebased local branch on remote before push");
+        return Ok(());
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    tracing::warn!(branch, stdout = %stdout, stderr = %stderr, "pre-push rebase failed");
 
-    // If push failed due to non-fast-forward, try pull --rebase and retry once
-    if stderr.contains("non-fast-forward") || stderr.contains("rejected") {
-        tracing::warn!(
-            branch = branch_to_push,
-            "push rejected (non-fast-forward), pulling with rebase and retrying"
-        );
+    let _ = Command::new("git")
+        .args(["rebase", "--abort"])
+        .current_dir(dir)
+        .output_with_context()
+        .await;
 
-        let pull = Command::new("git")
-            .args(["pull", "--rebase", "origin", branch_to_push])
-            .current_dir(dir)
-            .output_with_context()
-            .await;
-
-        match pull {
-            Ok(p) if p.status.success() => {
-                // Retry push after rebase with the same auth args
-                let retry_push_args: Vec<&str> = auth_args
-                    .iter()
-                    .map(String::as_str)
-                    .chain(["push", "-u", "origin", branch_to_push])
-                    .collect();
-                let retry = Command::new("git")
-                    .args(&retry_push_args)
-                    .current_dir(dir)
-                    .output_with_context()
-                    .await?;
-
-                if retry.status.success() {
-                    tracing::info!(branch = branch_to_push, "push succeeded after rebase");
-                    return Ok(true);
-                }
-                let retry_err = String::from_utf8_lossy(&retry.stderr);
-                tracing::warn!(branch = branch_to_push, err = %retry_err, "push still failed after rebase");
-                anyhow::bail!("push failed after rebase: {retry_err}")
-            }
-            Ok(p) => {
-                let pull_err = String::from_utf8_lossy(&p.stderr);
-                tracing::warn!(branch = branch_to_push, err = %pull_err, "pull --rebase failed (conflicts?)");
-                // Abort the rebase so worktree is clean
-                let _ = Command::new("git")
-                    .args(["rebase", "--abort"])
-                    .current_dir(dir)
-                    .output_with_context()
-                    .await;
-                anyhow::bail!("push failed: {stderr} (rebase also failed: {pull_err})")
-            }
-            Err(e) => {
-                anyhow::bail!("push failed: {stderr} (pull --rebase error: {e})")
-            }
-        }
-    }
-
-    tracing::warn!(branch = branch_to_push, err = %stderr, "push failed");
-    anyhow::bail!("push failed: {stderr}")
+    anyhow::bail!("git pull --rebase origin {branch} failed: {stderr}");
 }
 
 /// Create a PR if one doesn't already exist.
@@ -760,5 +815,24 @@ mod tests {
             joined.contains("insteadOf=git@github.com:"),
             "expected SSH insteadOf rule, got: {joined}"
         );
+    }
+
+    #[test]
+    fn push_needs_rebase_detects_common_rejections() {
+        assert!(push_needs_rebase(
+            "! [rejected] branch -> branch (fetch first)"
+        ));
+        assert!(push_needs_rebase("non-fast-forward update was rejected"));
+        assert!(push_needs_rebase(
+            "push rejected because the remote contains work"
+        ));
+    }
+
+    #[test]
+    fn push_retry_delay_exponentially_backs_off() {
+        assert_eq!(push_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(push_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(push_retry_delay(3), Duration::from_secs(4));
+        assert_eq!(push_retry_delay(8), Duration::from_secs(8));
     }
 }
