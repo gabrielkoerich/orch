@@ -179,5 +179,12 @@ pub async fn handle_error(
     )
     .await;
 
-    Ok(ErrorHandleResult::Continue { status })
+    let should_early_return = status == "new";
+
+    if should_early_return {
+        // This is a re-route, so we should return to the main loop
+        Ok(ErrorHandleResult::EarlyReturn { status })
+    } else {
+        Ok(ErrorHandleResult::Continue { status })
+    }
 }
