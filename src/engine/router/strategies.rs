@@ -76,7 +76,7 @@ pub(super) fn route_via_round_robin(
 
     Ok(RouteResult {
         agent: agent.clone(),
-        model: config.model_for_complexity(&agent, "medium"),
+        model: config.model_for_complexity(&agent, "medium", &task.id.0),
         complexity: "medium".to_string(),
         reason: format!("round_robin (task {} % {} agents)", task.id.0, agents.len()),
         profile,
@@ -113,7 +113,7 @@ pub(super) fn route_via_round_robin_stateful(
     *last_agent = Some(agent.clone());
 
     let complexity = extract_complexity_from_labels(&task.labels);
-    let model = config.model_for_complexity(&agent, &complexity);
+    let model = config.model_for_complexity(&agent, &complexity, &task.id.0);
 
     let profile = AgentProfile {
         role: "general".to_string(),
@@ -158,7 +158,7 @@ pub(super) fn route_via_weighted_round_robin(
 
     let weight = weights.get_weight(&agent);
     let complexity = extract_complexity_from_labels(&task.labels);
-    let model = config.model_for_complexity(&agent, &complexity);
+    let model = config.model_for_complexity(&agent, &complexity, &task.id.0);
 
     let weight_summary: Vec<String> = weights
         .snapshot()
@@ -225,7 +225,7 @@ pub(super) fn route_via_fallback(
     };
 
     let complexity = extract_complexity_from_labels(&task.labels);
-    let model = config.model_for_complexity(&agent, &complexity);
+    let model = config.model_for_complexity(&agent, &complexity, &task.id.0);
 
     let profile = AgentProfile {
         role: "general".to_string(),
