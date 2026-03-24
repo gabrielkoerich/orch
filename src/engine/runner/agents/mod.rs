@@ -187,6 +187,70 @@ pub fn error_class_name(err: &AgentError) -> &'static str {
     }
 }
 
+/// Build a synthetic agent response from plain text when structured parsing fails.
+///
+/// Returns `None` for empty/whitespace-only text so callers can preserve the
+/// original `InvalidResponse` behavior.
+pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_lowercase();
+    let looks_done = [
+        "no changes",
+        "nothing to",
+        "nothing to do",
+        "nothing to execute",
+        "no positions",
+        "no open positions",
+        "no trades",
+        "no trade",
+        "no action needed",
+        "complete",
+        "done",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    let looks_error = [
+        "error:",
+        "failed to",
+        "cannot",
+        "permission denied",
+        "unable to",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    let status = if looks_error {
+        "needs_review"
+    } else if looks_done {
+        "done"
+    } else {
+        "needs_review"
+    };
+
+    let summary_end = truncate_at_char_boundary(trimmed, 500);
+    let summary = trimmed[..summary_end].to_string();
+    let error =
+        (status == "needs_review").then(|| "agent returned plain text instead of JSON".to_string());
+
+    Some(AgentResponse {
+        status: status.to_string(),
+        summary,
+        accomplished: vec![],
+        remaining: vec![],
+        files: vec![],
+        error,
+        input_tokens: None,
+        output_tokens: None,
+        learnings: vec![],
+        delegations: vec![],
+    })
+}
+
 /// Find the largest byte index <= `max_bytes` that lies on a UTF-8 char
 /// boundary.  Used for safe string truncation in error messages.
 fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
@@ -709,6 +773,38 @@ mod tests {
     fn classify_from_text_worktree_missing() {
         let err = patterns::classify_from_text(1, "worktree directory does not exist: /tmp/wt");
         assert!(matches!(err, AgentError::AgentFailed { .. }));
+    }
+
+    #[test]
+    fn synthesize_response_marks_done_for_plain_text_no_op() {
+        let response = synthesize_response_from_text(
+            "No open positions, no trade executions, no conditions change. Full cash, holding.",
+        )
+        .unwrap();
+
+        assert_eq!(response.status, "done");
+        assert_eq!(
+            response.summary,
+            "No open positions, no trade executions, no conditions change. Full cash, holding."
+        );
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn synthesize_response_marks_needs_review_for_plain_text_error() {
+        let response =
+            synthesize_response_from_text("Failed to update branch: permission denied").unwrap();
+
+        assert_eq!(response.status, "needs_review");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("agent returned plain text instead of JSON")
+        );
+    }
+
+    #[test]
+    fn synthesize_response_rejects_empty_text() {
+        assert!(synthesize_response_from_text("   \n\t  ").is_none());
     }
 
     // ── PermissionRules defaults ────────────────────────────────

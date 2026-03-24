@@ -40,6 +40,35 @@ pub use response::WeightSignal;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+fn parse_success_output(
+    task_id: &str,
+    agent_name: &str,
+    agent_runner: &dyn agents::AgentRunner,
+    raw_stdout: &str,
+) -> Result<agents::ParsedResponse, agents::AgentError> {
+    match agent_runner.parse_response(raw_stdout) {
+        Ok(parsed) => Ok(parsed),
+        Err(agents::AgentError::InvalidResponse { raw }) => {
+            if let Some(response) = agents::synthesize_response_from_text(&raw) {
+                tracing::warn!(
+                    task_id,
+                    agent = agent_name,
+                    "parse failed, synthesizing response from plain text"
+                );
+                Ok(agents::ParsedResponse {
+                    response,
+                    input_tokens: None,
+                    output_tokens: None,
+                    duration_ms: None,
+                })
+            } else {
+                Err(agents::AgentError::InvalidResponse { raw })
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Task runner configuration.
 pub struct TaskRunner {
     /// Repository slug (owner/repo)
@@ -186,7 +215,12 @@ impl TaskRunner {
         let agent_runner = agents::get_runner(&init.agent_name);
         let parse_result = if session_output.exit_code == 0 && !session_output.raw_stdout.is_empty()
         {
-            agent_runner.parse_response(&session_output.raw_stdout)
+            parse_success_output(
+                task_id,
+                &init.agent_name,
+                &*agent_runner,
+                &session_output.raw_stdout,
+            )
         } else if session_output.exit_code != 0 {
             Err(agent_runner.classify_error(
                 session_output.exit_code,
@@ -923,6 +957,45 @@ mod tests {
         let s = "abcdef"; // 6 bytes
         assert_eq!(safe_utf8_tail(s, 6), "abcdef"); // exactly fits
         assert_eq!(safe_utf8_tail(s, 0), ""); // empty tail
+    }
+
+    #[test]
+    fn parse_success_output_synthesizes_done_from_plain_text() {
+        let runner = agents::get_runner("claude");
+        let parsed = parse_success_output(
+            "123",
+            "claude",
+            &*runner,
+            "No open positions, no trade executions, no conditions change.",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(
+            parsed.response.summary,
+            "No open positions, no trade executions, no conditions change."
+        );
+    }
+
+    #[test]
+    fn parse_success_output_synthesizes_needs_review_from_error_text() {
+        let runner = agents::get_runner("claude");
+        let parsed =
+            parse_success_output("123", "claude", &*runner, "Failed to update branch").unwrap();
+
+        assert_eq!(parsed.response.status, "needs_review");
+        assert_eq!(
+            parsed.response.error.as_deref(),
+            Some("agent returned plain text instead of JSON")
+        );
+    }
+
+    #[test]
+    fn parse_success_output_keeps_empty_text_invalid() {
+        let runner = agents::get_runner("claude");
+        let err = parse_success_output("123", "claude", &*runner, "").unwrap_err();
+
+        assert!(matches!(err, agents::AgentError::InvalidResponse { .. }));
     }
 
     // ── resolve_project_dir ──────────────────────────────────────────────────
