@@ -15,7 +15,9 @@
 
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::cmd::CommandErrorContext;
-use crate::store::{ErrorStat, JobState, MetricsSummary, SlowTaskInfo, TaskStatus};
+use crate::store::{
+    ErrorStat, HighReviewCycleTask, JobState, MetricsSummary, SlowTaskInfo, TaskStatus,
+};
 use anyhow::Context;
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
@@ -503,10 +505,11 @@ async fn run_self_review(
     }
 
     // Gather metrics data
-    let (summary, slow_tasks, error_distribution) = (
+    let (summary, slow_tasks, error_distribution, high_cycle_tasks) = (
         s.get_metrics_summary_24h().await?,
         s.get_slow_tasks_7d().await?,
         s.get_error_distribution_7d().await?,
+        s.get_high_review_cycle_tasks_7d().await?,
     );
 
     // Analyze and create issues for each pattern
@@ -541,6 +544,19 @@ async fn run_self_review(
     // Issue 3: Slow tasks pattern
     if issues_created < remaining_slots {
         if let Some(issue) = detect_slow_tasks(&slow_tasks, &summary) {
+            if create_self_improvement_issue(backend, &issue.title, &issue.body)
+                .await
+                .is_ok()
+            {
+                s.increment_self_improvement_counter().await?;
+                issues_created += 1;
+            }
+        }
+    }
+
+    // Issue 4: Persistent review loops
+    if issues_created < remaining_slots {
+        if let Some(issue) = detect_review_loops(&high_cycle_tasks) {
             if create_self_improvement_issue(backend, &issue.title, &issue.body)
                 .await
                 .is_ok()
@@ -715,6 +731,57 @@ fn detect_slow_tasks(
 
     Some(ImprovementIssue {
         title: "[Self-Improvement] Slow task execution patterns detected".to_string(),
+        body,
+    })
+}
+
+/// Detect persistent review loop patterns (tasks cycling through review repeatedly).
+fn detect_review_loops(high_cycle_tasks: &[HighReviewCycleTask]) -> Option<ImprovementIssue> {
+    if high_cycle_tasks.is_empty() {
+        return None;
+    }
+
+    // Only flag if there are 3+ tasks with review cycles >= 2 (avoids noise)
+    if high_cycle_tasks.len() < 3 {
+        return None;
+    }
+
+    let mut body = String::from("## Persistent Review Loops Detected (Last 7 Days)\n\n");
+    body.push_str(
+        "Multiple tasks have been sent back for rework 2+ times, indicating a systematic issue.\n\n",
+    );
+    body.push_str("| External ID | Agent | Review Cycles | Title |\n");
+    body.push_str("|-------------|-------|---------------|-------|\n");
+    for task in high_cycle_tasks.iter().take(10) {
+        body.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            task.external_id.as_deref().unwrap_or("internal"),
+            task.agent.as_deref().unwrap_or("unknown"),
+            task.review_cycles,
+            task.title,
+        ));
+    }
+
+    body.push_str("\n## Recommendation\n\n");
+    body.push_str("Review loops suggest the agent isn't addressing review feedback effectively:\n");
+    body.push_str(
+        "- Check if the agent is reading and incorporating review comments before retrying\n",
+    );
+    body.push_str(
+        "- Consider if the review agent has overly strict criteria for specific task types\n",
+    );
+    body.push_str(
+        "- Investigate whether a specific agent or task pattern consistently fails quality checks\n",
+    );
+    body.push_str(
+        "- Review the agent memory system — are learnings from failed attempts being persisted?\n",
+    );
+    body.push_str(
+        "\n## Evidence\n\nThis issue was automatically created by the orchestrator's self-review job.\n",
+    );
+
+    Some(ImprovementIssue {
+        title: "[Self-Improvement] Persistent review loop patterns detected".to_string(),
         body,
     })
 }
@@ -1265,6 +1332,67 @@ mod tests {
         };
 
         let issue = detect_slow_tasks(&slow_tasks, &summary);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_review_loops_with_enough_tasks() {
+        let tasks = vec![
+            HighReviewCycleTask {
+                external_id: Some("101".to_string()),
+                agent: Some("claude".to_string()),
+                review_cycles: 3,
+                title: "Fix auth".to_string(),
+            },
+            HighReviewCycleTask {
+                external_id: Some("102".to_string()),
+                agent: Some("codex".to_string()),
+                review_cycles: 2,
+                title: "Add tests".to_string(),
+            },
+            HighReviewCycleTask {
+                external_id: None,
+                agent: Some("claude".to_string()),
+                review_cycles: 2,
+                title: "Internal review".to_string(),
+            },
+        ];
+
+        let issue = detect_review_loops(&tasks);
+        assert!(issue.is_some());
+        let issue = issue.unwrap();
+        assert!(issue.title.contains("review loop"));
+        assert!(issue.body.contains("101"));
+        assert!(issue.body.contains("3"));
+        assert!(issue.body.contains("internal")); // None external_id renders as "internal"
+    }
+
+    #[test]
+    fn detect_review_loops_ignores_fewer_than_three() {
+        let tasks = vec![
+            HighReviewCycleTask {
+                external_id: Some("101".to_string()),
+                agent: Some("claude".to_string()),
+                review_cycles: 5,
+                title: "Fix auth".to_string(),
+            },
+            HighReviewCycleTask {
+                external_id: Some("102".to_string()),
+                agent: Some("codex".to_string()),
+                review_cycles: 2,
+                title: "Add tests".to_string(),
+            },
+        ];
+
+        // Only 2 tasks — below threshold of 3
+        let issue = detect_review_loops(&tasks);
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn detect_review_loops_empty() {
+        let tasks: Vec<HighReviewCycleTask> = vec![];
+        let issue = detect_review_loops(&tasks);
         assert!(issue.is_none());
     }
 }

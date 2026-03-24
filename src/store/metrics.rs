@@ -62,6 +62,15 @@ pub struct ErrorStat {
     pub count: i64,
 }
 
+/// Task with high review cycle count (persistent review loop).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighReviewCycleTask {
+    pub external_id: Option<String>,
+    pub agent: Option<String>,
+    pub review_cycles: i64,
+    pub title: String,
+}
+
 /// Cost summary across multiple time periods.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostSummary {
@@ -599,6 +608,30 @@ impl TaskStore {
         let key = self_improvement_key();
         let count = self.kv_get(&key).await?;
         Ok(count.and_then(|c| c.parse().ok()).unwrap_or(0))
+    }
+
+    /// Get tasks with high review cycle counts (persistent review loops) from the last 7 days.
+    pub async fn get_high_review_cycle_tasks_7d(&self) -> anyhow::Result<Vec<HighReviewCycleTask>> {
+        let rows = sqlx::query(
+            "SELECT external_id, agent, review_cycles, title
+         FROM tasks
+         WHERE review_cycles >= 2
+           AND updated_at >= datetime('now', '-7 days')
+         ORDER BY review_cycles DESC
+         LIMIT 10",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| HighReviewCycleTask {
+                external_id: row.get("external_id"),
+                agent: row.get("agent"),
+                review_cycles: row.get("review_cycles"),
+                title: row.get("title"),
+            })
+            .collect())
     }
 
     /// Increment the self-improvement issue counter for the current week.
