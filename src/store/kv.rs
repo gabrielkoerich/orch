@@ -21,4 +21,15 @@ impl TaskStore {
     .await?;
         Ok(())
     }
+
+    /// List all (key, value) pairs where the key starts with `prefix`.
+    pub async fn kv_list_prefix(&self, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let pattern = format!("{prefix}%");
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM kv WHERE key LIKE ?")
+                .bind(&pattern)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
 }
