@@ -1421,4 +1421,50 @@ mod tests {
 
         assert!(got, "did not observe tmux output via capture/transport");
     }
+
+    // ── read_project_channel_config tests ─────────────────────────────────
+
+    #[test]
+    fn read_project_channel_config_returns_defaults_when_no_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = read_project_channel_config(dir.path());
+        assert!(cfg.telegram_topic_id.is_none());
+        assert!(cfg.discord_channel_id.is_none());
+    }
+
+    #[test]
+    fn read_project_channel_config_parses_telegram_and_discord() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orch_yml = dir.path().join(".orch.yml");
+        std::fs::write(
+            &orch_yml,
+            "channels:\n  telegram:\n    topic_id: \"42\"\n  discord:\n    channel_id: \"9999\"\n",
+        )
+        .expect("write .orch.yml");
+        let cfg = read_project_channel_config(dir.path());
+        assert_eq!(cfg.telegram_topic_id.as_deref(), Some("42"));
+        assert_eq!(cfg.discord_channel_id.as_deref(), Some("9999"));
+    }
+
+    #[test]
+    fn read_project_channel_config_handles_partial_channels() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orch_yml = dir.path().join(".orch.yml");
+        std::fs::write(&orch_yml, "channels:\n  telegram:\n    topic_id: \"7\"\n")
+            .expect("write .orch.yml");
+        let cfg = read_project_channel_config(dir.path());
+        assert_eq!(cfg.telegram_topic_id.as_deref(), Some("7"));
+        assert!(cfg.discord_channel_id.is_none());
+    }
+
+    #[test]
+    fn read_project_channel_config_handles_malformed_yaml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orch_yml = dir.path().join(".orch.yml");
+        std::fs::write(&orch_yml, "channels: [\nbad yaml").expect("write .orch.yml");
+        let cfg = read_project_channel_config(dir.path());
+        // Should silently return defaults rather than panic.
+        assert!(cfg.telegram_topic_id.is_none());
+        assert!(cfg.discord_channel_id.is_none());
+    }
 }
