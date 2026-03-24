@@ -103,9 +103,14 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         attempt_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
         let status_file = attempt_dir.join("exit.txt");
+        let stderr_file = attempt_dir.join("stderr.txt");
         Ok(format!(
             r#"#!/usr/bin/env bash
 set -euo pipefail
+
+status_file="{status_file}"
+stderr_file="{stderr_file}"
+trap 'status=$?; printf "%s\n" "$status" > "$status_file"' EXIT
 
 # Environment — ~/.path and ~/.private are loaded by orch at startup into the process env
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -117,14 +122,16 @@ export TASK_ID="{task_id}"
 export OUTPUT_FILE="{output_file}"
 unset CLAUDECODE  # allow nested claude invocations from orchestrator
 
-cd "{work_dir}"
+cd "{work_dir}" || {{
+    printf '%s\n' "worktree directory does not exist: {work_dir}" > "$stderr_file"
+    exit 1
+}}
 
 # Run agent — tee to both output file and terminal (tmux pane) for live streaming
-{agent_cmd} 2>"{attempt_dir}/stderr.txt" | tee "{output_file}"
+set +e
+{agent_cmd} 2>"$stderr_file" | tee "{output_file}"
 CMD_STATUS=${{PIPESTATUS[0]:-0}}
-
-# Save exit status
-echo "$CMD_STATUS" > "{status_file}"
+set -e
 
 exit $CMD_STATUS
 "#,
@@ -134,8 +141,8 @@ exit $CMD_STATUS
             output_file = inv.output_file.display(),
             work_dir = inv.work_dir.display(),
             agent_cmd = agent_cmd,
-            attempt_dir = attempt_dir.display(),
             status_file = status_file.display(),
+            stderr_file = stderr_file.display(),
         ))
     }
 
@@ -448,7 +455,7 @@ pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
     let stderr_file = attempt_dir.join("stderr.txt");
 
     let script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nunset CLAUDECODE\ncd '{work_dir}'\nRESPONSE=$({agent_cmd} 2> '{stderr}')\nCMD_STATUS=$?\nprintf '%s' \"$RESPONSE\" > '{out}'\necho \"$CMD_STATUS\" > '{status}'\nexit $CMD_STATUS\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\nstatus_file='{status}'\nstderr_file='{stderr}'\ntrap 'status=$?; printf \"%s\\n\" \"$status\" > \"$status_file\"' EXIT\nunset CLAUDECODE\ncd '{work_dir}' || {{\n  printf '%s\\n' 'worktree directory does not exist: {work_dir}' > \"$stderr_file\"\n  exit 1\n}}\nset +e\nRESPONSE=$({agent_cmd} 2> \"$stderr_file\")\nCMD_STATUS=$?\nset -e\nprintf '%s' \"$RESPONSE\" > '{out}'\nexit $CMD_STATUS\n",
         agent_cmd = agent_cmd,
         stderr = stderr_file.display(),
         out = inv.output_file.display(),
@@ -526,5 +533,30 @@ mod tests {
         // Just verify the invocation can be created without panicking
         assert_eq!(inv.task_id, "env-test");
         cleanup_test_state("env-test");
+    }
+
+    #[test]
+    fn build_runner_script_persists_exit_status_on_failure() {
+        let task_id = "runner-status-test";
+        let inv = test_invocation(task_id);
+        let script = build_runner_script(&inv).expect("runner script should build");
+
+        assert!(script
+            .contains("trap 'status=$?; printf \"%s\\n\" \"$status\" > \"$status_file\"' EXIT"));
+        assert!(script.contains("set +e"));
+
+        cleanup_test_state(task_id);
+    }
+
+    #[test]
+    fn build_runner_script_reports_missing_worktree() {
+        let task_id = "runner-missing-worktree-test";
+        let inv = test_invocation(task_id);
+        let script = build_runner_script(&inv).expect("runner script should build");
+
+        assert!(script.contains("worktree directory does not exist: /tmp"));
+        assert!(script.contains("stderr_file='"));
+
+        cleanup_test_state(task_id);
     }
 }
