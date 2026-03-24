@@ -336,12 +336,11 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
 ) -> anyhow::Result<()> {
     // Read done tasks from the store first; fall back to backend before first sync.
     let done_tasks = {
-        if store.has_tasks(repo).await {
+        if store.has_external_tasks(repo).await {
             store
-                .list_by_status(repo, crate::store::TaskStatus::Done)
+                .list_external_by_status(repo, crate::store::TaskStatus::Done)
                 .await?
                 .iter()
-                .filter(|t| t.origin != "internal")
                 .map(crate::engine::tasks::store_task_to_external)
                 .collect()
         } else {
@@ -829,23 +828,21 @@ pub(crate) async fn check_merged_prs(
     task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
     // Read from the store first; fall back to backend if the store has no data.
-    let in_review_tasks = if store.has_tasks(repo).await {
+    let in_review_tasks = if store.has_external_tasks(repo).await {
         store
-            .list_by_status(repo, crate::store::TaskStatus::InReview)
+            .list_external_by_status(repo, crate::store::TaskStatus::InReview)
             .await?
             .iter()
-            .filter(|t| t.origin != "internal")
             .map(crate::engine::tasks::store_task_to_external)
             .collect()
     } else {
         backend.list_by_status(Status::InReview).await?
     };
-    let needs_review_tasks = if store.has_tasks(repo).await {
+    let needs_review_tasks = if store.has_external_tasks(repo).await {
         store
-            .list_by_status(repo, crate::store::TaskStatus::NeedsReview)
+            .list_external_by_status(repo, crate::store::TaskStatus::NeedsReview)
             .await?
             .iter()
-            .filter(|t| t.origin != "internal")
             .map(crate::engine::tasks::store_task_to_external)
             .collect()
     } else {

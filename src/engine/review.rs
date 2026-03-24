@@ -116,15 +116,13 @@ pub(crate) async fn review_open_prs(
     // Read from the store first; fall back to backend if the store is empty.
     let mut in_review_tasks = {
         let store_tasks = store
-            .list_by_status(repo, crate::store::TaskStatus::InReview)
+            .list_external_by_status(repo, crate::store::TaskStatus::InReview)
             .await?;
-        let external: Vec<_> = store_tasks
-            .iter()
-            .filter(|t| t.origin != "internal")
-            .map(crate::engine::tasks::store_task_to_external)
-            .collect();
-        if store.has_tasks(repo).await {
-            external
+        if store.has_external_tasks(repo).await {
+            store_tasks
+                .iter()
+                .map(crate::engine::tasks::store_task_to_external)
+                .collect()
         } else {
             backend.list_by_status(Status::InReview).await?
         }
