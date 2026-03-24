@@ -625,6 +625,17 @@ pub(crate) async fn review_and_merge(
     }
 
     // 9. Read and parse response
+    let file_exists = output_file.exists();
+    let file_size = std::fs::metadata(&output_file)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    tracing::info!(
+        task_id = task.id.0,
+        path = %output_file.display(),
+        file_exists,
+        file_size,
+        "reading review agent output"
+    );
     let raw_output = runner::response::read_output_file(&review_task_id, &output_file, repo);
     let agent_runner = runner::agents::get_runner(&review_agent);
 
@@ -636,6 +647,13 @@ pub(crate) async fn review_and_merge(
     let stderr = std::fs::read_to_string(review_attempt_dir.join("stderr.txt")).unwrap_or_default();
 
     if exit_code != 0 || raw_output.is_empty() {
+        tracing::warn!(
+            task_id = task.id.0,
+            exit_code,
+            raw_output_len = raw_output.len(),
+            stderr_len = stderr.len(),
+            "review agent: entering error path (exit_code != 0 or empty output)"
+        );
         let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
         let err_str = err.to_string();
         if err_str.contains("rate limit")
