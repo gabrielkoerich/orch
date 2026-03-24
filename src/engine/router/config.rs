@@ -38,6 +38,29 @@ pub struct RouterConfig {
     /// Enable weighted round-robin routing based on rate limit capacity.
     /// When true, agents that hit rate limits get fewer tasks.
     pub weighted_round_robin: bool,
+    /// Pool of `agent:model` entries to round-robin the router LLM call.
+    /// When empty, a single-entry pool is derived from `router_agent:router_model`.
+    /// Special value `opencode:free` is expanded at startup via `opencode models`.
+    pub pool: Vec<String>,
+    /// Fallback `agent:model` when all pool entries are cooled or fail.
+    /// When empty, defaults to `router_agent:router_model`.
+    pub fallback: String,
+}
+
+/// Parse an `agent:model` pool entry string, splitting on the first colon.
+///
+/// Examples:
+/// - `"claude:haiku"` → `("claude", "haiku")`
+/// - `"opencode:github-copilot/gpt-5-mini"` → `("opencode", "github-copilot/gpt-5-mini")`
+/// - `"claude"` → `("claude", "")`
+pub fn parse_pool_entry(entry: &str) -> (String, String) {
+    if let Some(colon_pos) = entry.find(':') {
+        let agent = entry[..colon_pos].to_string();
+        let model = entry[colon_pos + 1..].to_string();
+        (agent, model)
+    } else {
+        (entry.to_string(), String::new())
+    }
 }
 
 impl Default for RouterConfig {
@@ -109,6 +132,8 @@ impl Default for RouterConfig {
             fallback_executor: "codex".to_string(),
             agents: DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect(),
             max_route_attempts: 3,
+            pool: vec![],
+            fallback: String::new(),
             allowed_tools: vec![
                 "yq".to_string(),
                 "jq".to_string(),
@@ -209,6 +234,28 @@ impl RouterConfig {
             config.weighted_round_robin = val == "true" || val == "1";
         }
 
+        // Parse pool: list of "agent:model" entries
+        if let Ok(pool_str) = crate::config::get("router.pool") {
+            if !pool_str.is_empty() && pool_str != "[]" {
+                if let Ok(pool_arr) = serde_json::from_str::<Vec<String>>(&pool_str) {
+                    config.pool = pool_arr;
+                } else {
+                    config.pool = pool_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+            }
+        }
+
+        // Parse fallback: single "agent:model" entry
+        if let Ok(fallback) = crate::config::get("router.fallback") {
+            if !fallback.is_empty() {
+                config.fallback = fallback;
+            }
+        }
+
         // Load model_map overrides from config (model_map.{complexity}.{agent})
         // Value may be a single string ("model-name") or a JSON array (["m1","m2"]).
         let known_agents = ["claude", "codex", "opencode", "kimi", "minimax"];
@@ -248,6 +295,24 @@ impl RouterConfig {
         }
 
         config
+    }
+
+    /// Return the effective pool — the configured pool, or a single-entry pool from `router_agent:router_model`.
+    pub fn effective_pool(&self) -> Vec<String> {
+        if !self.pool.is_empty() {
+            self.pool.clone()
+        } else {
+            vec![format!("{}:{}", self.router_agent, self.router_model)]
+        }
+    }
+
+    /// Return the effective fallback entry — the configured fallback, or `router_agent:router_model`.
+    pub fn effective_fallback(&self) -> String {
+        if !self.fallback.is_empty() {
+            self.fallback.clone()
+        } else {
+            format!("{}:{}", self.router_agent, self.router_model)
+        }
     }
 
     /// Get the model for a given agent and complexity level.

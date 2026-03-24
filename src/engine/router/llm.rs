@@ -66,14 +66,21 @@ impl LlmRouter {
         }
     }
 
-    /// Route using LLM classification.
-    pub async fn route_with_llm(
+    /// Route using LLM classification with an explicit router agent and model.
+    ///
+    /// This is the core routing method. The `router_agent` and `router_model` parameters
+    /// identify which LLM to use for classification (distinct from the task's target agent).
+    /// The `Router` drives pool selection and calls this method for each pool entry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn route_with_llm_using(
         &self,
         task: &ExternalTask,
         available_agents: &[String],
         config: &RouterConfig,
         last_agent: &mut Option<String>,
         repo: &str,
+        router_agent: &str,
+        router_model: Option<&str>,
     ) -> anyhow::Result<RouteResult> {
         if available_agents.is_empty() {
             anyhow::bail!("no agent CLIs found in PATH");
@@ -91,11 +98,16 @@ impl LlmRouter {
         let prompt_path = routing_dir.join("prompt.txt");
         let _ = tokio::fs::write(&prompt_path, &prompt).await;
 
-        // Call the LLM router
-        let response = self.call_router_llm(&prompt, config).await?;
+        // Call the LLM router with the specified agent+model
+        let timeout = Duration::from_secs(config.timeout_seconds);
+        let response = self
+            .call_router_llm(&prompt, router_agent, router_model, timeout)
+            .await?;
 
         tracing::info!(
             task_id = task.id.0,
+            router_agent,
+            router_model = router_model.unwrap_or("default"),
             response_len = response.len(),
             response_preview = %if response.len() > 500 { &response[..500] } else { &response },
             "LLM router raw response"
@@ -303,38 +315,42 @@ impl LlmRouter {
         Ok(serde_json::to_string(&skills)?)
     }
 
-    /// Call the router LLM to classify the task.
-    async fn call_router_llm(&self, prompt: &str, config: &RouterConfig) -> anyhow::Result<String> {
+    /// Call the specified router LLM to classify the task.
+    ///
+    /// `agent` is the CLI name (`claude`, `opencode`, etc.) and `model` is the
+    /// optional model string to pass. On rate-limit, records a model-level cooldown.
+    pub(super) async fn call_router_llm(
+        &self,
+        prompt: &str,
+        agent: &str,
+        model: Option<&str>,
+        timeout: Duration,
+    ) -> anyhow::Result<String> {
         use crate::engine::runner::direct::{run_direct_command_raw, DirectCommandError};
 
-        // Skip immediately if router agent is on cooldown
-        if crate::engine::runner::response::is_agent_in_cooldown(&config.router_agent) {
-            anyhow::bail!("router LLM agent '{}' is on cooldown", config.router_agent);
+        // Skip immediately if this specific agent+model is on cooldown
+        let model_str = model.unwrap_or("");
+        if crate::engine::runner::response::is_model_in_cooldown(agent, model_str) {
+            anyhow::bail!("router LLM {agent}:{model_str} is on cooldown");
         }
 
-        let timeout = Duration::from_secs(config.timeout_seconds);
-        let model = if config.router_model.is_empty() {
-            None
-        } else {
-            Some(config.router_model.as_str())
-        };
-
-        let mut cmd = crate::engine::runner::agents::get_runner(&config.router_agent)
-            .router_command(prompt, model)?;
+        let mut cmd =
+            crate::engine::runner::agents::get_runner(agent).router_command(prompt, model)?;
 
         match run_direct_command_raw(&mut cmd, timeout).await {
             Ok(stdout) => Ok(stdout),
             Err(DirectCommandError::NonZeroExit { stdout, stderr, .. }) => {
                 // Detect rate limit from stdout (agent exits non-zero on API errors)
                 use crate::engine::runner::agents::AgentError;
-                let runner = crate::engine::runner::agents::get_runner(&config.router_agent);
+                let runner = crate::engine::runner::agents::get_runner(agent);
                 if let Err(AgentError::RateLimit { .. }) = runner.parse_response(&stdout) {
                     tracing::warn!(
-                        agent = %config.router_agent,
+                        agent,
+                        model = model.unwrap_or("default"),
                         "router LLM rate limited — adding to cooldown"
                     );
-                    crate::engine::runner::response::record_agent_failure(&config.router_agent);
-                    anyhow::bail!("router LLM rate limited: {}", config.router_agent);
+                    crate::engine::runner::response::record_model_failure(agent, model_str);
+                    anyhow::bail!("router LLM rate limited: {agent}:{model_str}");
                 }
                 tracing::warn!(stderr = %stderr, stdout = %stdout, "router LLM command failed");
                 anyhow::bail!("router LLM failed: {stderr}");

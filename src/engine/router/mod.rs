@@ -18,7 +18,7 @@ mod selection;
 mod strategies;
 pub mod weights;
 
-pub use config::RouterConfig;
+pub use config::{parse_pool_entry, RouterConfig};
 pub use weights::AgentWeights;
 
 use crate::backends::ExternalTask;
@@ -74,6 +74,11 @@ pub struct Router {
     pub(crate) last_agent: Option<String>,
     /// Round-robin index for review agent selection
     pub(crate) review_rr_index: usize,
+    /// Expanded pool of (agent, model) pairs for router LLM round-robin.
+    /// `opencode:free` entries are expanded at construction time.
+    pub(crate) router_pool: Vec<(String, String)>,
+    /// Current round-robin index into router_pool
+    pub(crate) pool_index: usize,
 }
 
 impl Router {
@@ -82,6 +87,12 @@ impl Router {
         let available_agents = Self::discover_agents(&config.agents);
         let mut weights = AgentWeights::default();
         weights.ensure_agents(&available_agents);
+        let router_pool = Self::expand_pool(&config);
+        tracing::info!(
+            pool = ?router_pool,
+            fallback = %config.effective_fallback(),
+            "router LLM pool initialized"
+        );
         Self {
             config,
             available_agents,
@@ -90,6 +101,8 @@ impl Router {
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
+            router_pool,
+            pool_index: 0,
         }
     }
 
@@ -105,17 +118,21 @@ impl Router {
     pub fn reload(&mut self) {
         let new_config = RouterConfig::from_config();
         let new_agents = Self::discover_agents(&new_config.agents);
+        let new_pool = Self::expand_pool(&new_config);
         tracing::info!(
             mode = %new_config.mode,
             agents = ?new_agents,
             fallback = %new_config.fallback_executor,
             weighted_rr = new_config.weighted_round_robin,
+            pool = ?new_pool,
             "router reloaded"
         );
         self.config = new_config;
         self.available_agents = new_agents.clone();
         // Ensure new agents have weight entries (preserves existing weights)
         self.weights.ensure_agents(&new_agents);
+        self.router_pool = new_pool;
+        self.pool_index = 0;
     }
 
     /// Invalidate the skills catalog cache so the next routing call reloads from disk.
@@ -135,6 +152,81 @@ impl Router {
             }
         }
         agents
+    }
+
+    /// Expand the router LLM pool, resolving `opencode:free` to discovered free models.
+    ///
+    /// - Entries other than `opencode:free` are parsed as `agent:model` and added as-is.
+    /// - `opencode:free` is expanded by running `opencode models | grep free` at startup.
+    /// - If `opencode` is not installed or the command fails, the entry is skipped.
+    /// - If the expanded pool is empty, falls back to a single entry from `effective_fallback()`.
+    fn expand_pool(config: &RouterConfig) -> Vec<(String, String)> {
+        let raw_pool = config.effective_pool();
+        let mut expanded: Vec<(String, String)> = Vec::new();
+
+        for entry in &raw_pool {
+            if entry == "opencode:free" {
+                let free_models = Self::discover_free_opencode_models();
+                if free_models.is_empty() {
+                    tracing::debug!("opencode:free expanded to nothing — skipping");
+                } else {
+                    tracing::debug!(models = ?free_models, "opencode:free expanded");
+                    for model in free_models {
+                        expanded.push(("opencode".to_string(), model));
+                    }
+                }
+            } else {
+                let (agent, model) = parse_pool_entry(entry);
+                expanded.push((agent, model));
+            }
+        }
+
+        if expanded.is_empty() {
+            // All entries were opencode:free and opencode isn't installed — use fallback
+            let (agent, model) = parse_pool_entry(&config.effective_fallback());
+            tracing::debug!(
+                agent = %agent, model = %model,
+                "pool empty after expansion, using fallback as sole pool entry"
+            );
+            expanded.push((agent, model));
+        }
+
+        expanded
+    }
+
+    /// Run `opencode models` and return lines containing "free".
+    ///
+    /// This is a synchronous blocking call, intentionally used only at startup
+    /// (called once from `Router::new()` and `Router::reload()`). The result is
+    /// stored in `router_pool` and not re-queried until the next reload.
+    fn discover_free_opencode_models() -> Vec<String> {
+        if !crate::cmd_cache::command_exists("opencode") {
+            tracing::debug!("opencode not in PATH — skipping free model discovery");
+            return vec![];
+        }
+
+        match std::process::Command::new("opencode")
+            .args(["models"])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout
+                    .lines()
+                    .filter(|l| l.contains("free"))
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect()
+            }
+            Ok(output) => {
+                tracing::debug!(status = ?output.status, "opencode models command failed");
+                vec![]
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to run opencode models");
+                vec![]
+            }
+        }
     }
 
     /// Check if an agent is available.
@@ -350,21 +442,124 @@ impl Router {
         .await;
     }
 
-    /// Route using LLM classification. Delegates to `self.llm_router`.
+    /// Route using LLM classification with pool round-robin.
+    ///
+    /// Iterates through `router_pool` (skipping cooled entries) until one succeeds.
+    /// On full exhaustion, tries the configured fallback. If the fallback also fails,
+    /// returns the last error (the caller falls back to round-robin agent selection).
     async fn route_with_llm(
         &mut self,
         task: &ExternalTask,
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
-        self.llm_router
-            .route_with_llm(
-                task,
-                &self.available_agents,
-                &self.config,
-                &mut self.last_agent,
-                repo,
-            )
-            .await
+        let pool = self.router_pool.clone();
+        let n = pool.len();
+        let start = self.pool_index;
+        let mut last_err: Option<anyhow::Error> = None;
+
+        // Try pool entries in round-robin order, skipping cooled ones
+        for i in 0..n {
+            let idx = (start + i) % n;
+            let (agent, model) = &pool[idx];
+            let model_str = model.as_str();
+
+            if crate::engine::runner::response::is_model_in_cooldown(agent, model_str) {
+                tracing::debug!(agent, model = model_str, "pool entry on cooldown, skipping");
+                continue;
+            }
+
+            let model_opt = if model_str.is_empty() {
+                None
+            } else {
+                Some(model_str)
+            };
+
+            match self
+                .llm_router
+                .route_with_llm_using(
+                    task,
+                    &self.available_agents,
+                    &self.config,
+                    &mut self.last_agent,
+                    repo,
+                    agent,
+                    model_opt,
+                )
+                .await
+            {
+                Ok(result) => {
+                    // Advance index so the next call starts at the next pool entry
+                    self.pool_index = (idx + 1) % n;
+                    tracing::debug!(
+                        agent,
+                        model = model_str,
+                        pool_idx = idx,
+                        "router LLM pool entry succeeded"
+                    );
+                    return Ok(result);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent,
+                        model = model_str,
+                        error = %e,
+                        "pool entry failed, recording cooldown and trying next"
+                    );
+                    crate::engine::runner::response::record_model_failure(agent, model_str);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        // All pool entries failed or were cooled — try the configured fallback
+        let fallback = self.config.effective_fallback();
+        let (fb_agent, fb_model) = parse_pool_entry(&fallback);
+        let fb_model_str = fb_model.as_str();
+
+        // Only try fallback if it wasn't already in the pool (avoid double-try)
+        let fallback_already_tried = pool.iter().any(|(a, m)| a == &fb_agent && m == &fb_model);
+
+        if !fallback_already_tried
+            && !crate::engine::runner::response::is_model_in_cooldown(&fb_agent, fb_model_str)
+        {
+            tracing::info!(
+                agent = %fb_agent,
+                model = %fb_model_str,
+                "all pool entries exhausted — trying fallback router LLM"
+            );
+            let fb_model_opt = if fb_model_str.is_empty() {
+                None
+            } else {
+                Some(fb_model_str)
+            };
+            match self
+                .llm_router
+                .route_with_llm_using(
+                    task,
+                    &self.available_agents,
+                    &self.config,
+                    &mut self.last_agent,
+                    repo,
+                    &fb_agent,
+                    fb_model_opt,
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %fb_agent,
+                        model = %fb_model_str,
+                        error = %e,
+                        "fallback router LLM also failed"
+                    );
+                    crate::engine::runner::response::record_model_failure(&fb_agent, fb_model_str);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all router LLM pool entries exhausted")))
     }
 
     /// Record a rate limit event for an agent, reducing its routing weight.
@@ -957,6 +1152,8 @@ Hope that helps!"#;
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
+            router_pool: vec![],
+            pool_index: 0,
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -983,6 +1180,8 @@ Hope that helps!"#;
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
+            router_pool: vec![],
+            pool_index: 0,
         };
 
         let task = create_test_task("1", "Test", vec!["agent:claude".to_string()]);
@@ -1037,6 +1236,8 @@ Hope that helps!"#;
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
+            router_pool: vec![],
+            pool_index: 0,
         };
 
         // Reload — should re-read config and remain valid
@@ -1319,6 +1520,8 @@ Hope that helps!"#;
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
+            router_pool: vec![],
+            pool_index: 0,
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -1352,6 +1555,8 @@ Hope that helps!"#;
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
+            router_pool: vec![],
+            pool_index: 0,
         };
 
         // Label override should take precedence over weighted routing
@@ -1408,6 +1613,8 @@ Hope that helps!"#;
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
+            router_pool: vec![],
+            pool_index: 0,
         };
 
         let a1 = router.next_round_robin_agent(None).unwrap();
@@ -1437,6 +1644,8 @@ Hope that helps!"#;
             rr_index: 0,
             last_agent: None,
             review_rr_index: 0,
+            router_pool: vec![],
+            pool_index: 0,
         };
 
         assert!(router.last_agent.is_none());
@@ -1447,5 +1656,136 @@ Hope that helps!"#;
 
         assert!(router.last_agent.is_some());
         assert_eq!(router.last_agent.as_deref(), Some(result.agent.as_str()));
+    }
+
+    // ── pool config ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_pool_entry_splits_on_first_colon() {
+        let (agent, model) = super::parse_pool_entry("claude:haiku");
+        assert_eq!(agent, "claude");
+        assert_eq!(model, "haiku");
+    }
+
+    #[test]
+    fn parse_pool_entry_model_with_slash() {
+        // Models like "github-copilot/gpt-5-mini" must not be split on the slash
+        let (agent, model) = super::parse_pool_entry("opencode:github-copilot/gpt-5-mini");
+        assert_eq!(agent, "opencode");
+        assert_eq!(model, "github-copilot/gpt-5-mini");
+    }
+
+    #[test]
+    fn parse_pool_entry_no_colon() {
+        let (agent, model) = super::parse_pool_entry("claude");
+        assert_eq!(agent, "claude");
+        assert_eq!(model, "");
+    }
+
+    #[test]
+    fn effective_pool_uses_configured_pool() {
+        let config = RouterConfig {
+            pool: vec!["kimi:k2p5".to_string(), "claude:haiku".to_string()],
+            ..RouterConfig::default()
+        };
+        let pool = config.effective_pool();
+        assert_eq!(pool, vec!["kimi:k2p5", "claude:haiku"]);
+    }
+
+    #[test]
+    fn effective_pool_falls_back_to_router_agent_model() {
+        let config = RouterConfig::default();
+        // Default has no pool → derives from router_agent:router_model
+        let pool = config.effective_pool();
+        assert_eq!(pool.len(), 1);
+        assert!(pool[0].starts_with(&config.router_agent));
+        assert!(pool[0].contains(&config.router_model));
+    }
+
+    #[test]
+    fn effective_fallback_uses_configured_fallback() {
+        let config = RouterConfig {
+            fallback: "claude:haiku".to_string(),
+            ..RouterConfig::default()
+        };
+        assert_eq!(config.effective_fallback(), "claude:haiku");
+    }
+
+    #[test]
+    fn effective_fallback_derives_from_router_agent_model() {
+        let config = RouterConfig::default();
+        let fallback = config.effective_fallback();
+        assert!(fallback.starts_with(&config.router_agent));
+        assert!(fallback.contains(&config.router_model));
+    }
+
+    // ── pool expansion ────────────────────────────────────────────────────────
+
+    #[test]
+    fn expand_pool_basic_entries() {
+        let config = RouterConfig {
+            pool: vec!["claude:haiku".to_string(), "kimi:k2p5".to_string()],
+            ..RouterConfig::default()
+        };
+        let expanded = Router::expand_pool(&config);
+        assert_eq!(expanded.len(), 2);
+        assert_eq!(expanded[0], ("claude".to_string(), "haiku".to_string()));
+        assert_eq!(expanded[1], ("kimi".to_string(), "k2p5".to_string()));
+    }
+
+    #[test]
+    fn expand_pool_opencode_free_skipped_when_not_installed() {
+        // `opencode` is unlikely to be in the test environment's PATH.
+        // If it's absent the entry should be silently skipped and the pool
+        // should fall back to the effective_fallback entry.
+        if crate::cmd_cache::command_exists("opencode") {
+            // If opencode IS installed we can't control what it returns, so skip
+            return;
+        }
+        let config = RouterConfig {
+            pool: vec!["opencode:free".to_string()],
+            fallback: "claude:haiku".to_string(),
+            ..RouterConfig::default()
+        };
+        let expanded = Router::expand_pool(&config);
+        // Should fall back to the fallback entry since all pool entries were skipped
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].0, "claude");
+        assert_eq!(expanded[0].1, "haiku");
+    }
+
+    #[test]
+    fn expand_pool_single_entry_from_default() {
+        let config = RouterConfig::default();
+        let expanded = Router::expand_pool(&config);
+        assert!(
+            !expanded.is_empty(),
+            "pool must never be empty after expansion"
+        );
+    }
+
+    // ── pool round-robin index ────────────────────────────────────────────────
+
+    #[test]
+    fn pool_index_initializes_to_zero() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+        assert_eq!(router.pool_index, 0);
+    }
+
+    #[test]
+    fn router_pool_non_empty_after_construction() {
+        let config = RouterConfig::default();
+        let router = Router::new(config);
+        assert!(!router.router_pool.is_empty());
+    }
+
+    #[test]
+    fn reload_resets_pool_index() {
+        let config = RouterConfig::default();
+        let mut router = Router::new(config);
+        router.pool_index = 5;
+        router.reload();
+        assert_eq!(router.pool_index, 0);
     }
 }
