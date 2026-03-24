@@ -3,6 +3,7 @@ pub mod cost;
 pub mod dashboard;
 pub mod events;
 pub mod job;
+pub mod ndjson;
 pub mod service;
 pub mod stats;
 pub mod task;
@@ -341,8 +342,25 @@ pub async fn metrics(details: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Print a content chunk in human-readable form, formatting each NDJSON line.
+///
+/// Multi-line chunks are split and each line is formatted independently.
+/// Lines that `ndjson::format_line` maps to `None` are suppressed.
+fn print_formatted(content: &str) {
+    for line in content.lines() {
+        if let Some(formatted) = ndjson::format_line(line) {
+            println!("{formatted}");
+        }
+    }
+    // If the content doesn't end with a newline, `lines()` already handles that,
+    // but we may need to flush for non-newline-terminated partial lines.
+}
+
 /// Stream live output from a running task.
-pub async fn stream_task(task_id: &str) -> anyhow::Result<()> {
+///
+/// When `raw` is false (default), NDJSON lines are parsed and formatted into
+/// human-readable output. Pass `raw: true` to print unformatted NDJSON.
+pub async fn stream_task(task_id: &str, raw: bool) -> anyhow::Result<()> {
     let transport = Arc::new(Transport::new());
 
     let tmux = crate::tmux::TmuxManager::new();
@@ -379,7 +397,11 @@ pub async fn stream_task(task_id: &str) -> anyhow::Result<()> {
     loop {
         match rx.recv().await {
             Ok(chunk) => {
-                print!("{}", chunk.content);
+                if raw {
+                    print!("{}", chunk.content);
+                } else {
+                    print_formatted(&chunk.content);
+                }
                 std::io::Write::flush(&mut std::io::stdout())?;
 
                 if chunk.is_final {
@@ -409,7 +431,10 @@ pub async fn stream_task(task_id: &str) -> anyhow::Result<()> {
 /// Discovers sessions on startup and every tick, automatically picking up
 /// new sessions that appear while streaming. Prefixes each line with the
 /// session name so interleaved output is distinguishable.
-pub async fn stream_all() -> anyhow::Result<()> {
+///
+/// When `raw` is false (default), NDJSON lines are formatted into human-readable
+/// output. Pass `raw: true` to print unformatted NDJSON.
+pub async fn stream_all(raw: bool) -> anyhow::Result<()> {
     use std::collections::HashSet;
     use tokio::sync::broadcast;
 
@@ -542,8 +567,18 @@ pub async fn stream_all() -> anyhow::Result<()> {
         }
         // Prefix each line with the session name (strip the "orch-" prefix for brevity)
         let label = session.strip_prefix("orch-").unwrap_or(&session);
-        for line in chunk.content.lines() {
-            println!("[{label}] {line}");
+        if raw {
+            for line in chunk.content.lines() {
+                println!("[{label}] {line}");
+            }
+        } else {
+            for line in chunk.content.lines() {
+                if let Some(formatted) = ndjson::format_line(line) {
+                    for fline in formatted.lines() {
+                        println!("[{label}] {fline}");
+                    }
+                }
+            }
         }
         // If content didn't end with newline, don't add extra one
         if !chunk.content.is_empty() && !chunk.content.ends_with('\n') {
