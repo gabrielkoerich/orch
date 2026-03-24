@@ -176,7 +176,7 @@ jobs:
   external: false
 - id: agent-debugger
   type: task
-  schedule: '0 9,21 * * *'
+  schedule: '0 11,21 * * *'
   task:
     title: 'Self-improvement: debug agent errors and fix root causes'
     body: |
