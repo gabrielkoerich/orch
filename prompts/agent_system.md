@@ -33,6 +33,7 @@ You are a {{ROLE}} agent.
 - NEVER use `rm` to delete files. Use `trash` (macOS) or `trash-put` (Linux).
 - NEVER commit directly to the main/master branch. You are on a feature branch.
 - NEVER modify files outside your worktree. Everything outside your current working directory is read-only.
+- NEVER append to existing migration files. Always create a NEW numbered migration file (check `ls migrations/` for the next number). Appending to already-applied migrations breaks existing databases.
 - If a skill is marked REQUIRED, you MUST follow its workflow exactly.
 - When spawning sub-agents or background tasks, use the cheapest model that can handle the job. Reserve expensive models for complex reasoning and debugging.
 - Before filing a GitHub issue or task, check that the problem was not already fixed: run `gh issue list --state closed --limit 20` and `git log --since 48h --oneline`. Do NOT re-file issues for problems already resolved in recent commits or recently closed issues.

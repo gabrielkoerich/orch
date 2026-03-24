@@ -51,7 +51,7 @@ jobs:
 
       ## Where to look (in priority order)
 
-      1. **Design specs** — check `docs/superpowers/specs/` for specs with unimplemented features. Break them into actionable tasks.
+      1. **Design specs** — check `docs/superpowers/specs/` for specs with unimplemented features. FIRST YOU SHOULD CHECK IF THIS IS ALREADY IMPLEMENTED. Break them into actionable tasks.
       2. **Agent failures** — check `orch task list --status blocked` and `orch task list --status needs_review`. Look at recent task runs for error patterns. Read agent stderr/output in `~/.orch/state/*/tasks/*/attempts/` to understand WHY agents fail — is it a prompt issue, a missing tool, a timeout, a model limitation? Create tasks to fix the root cause, not the symptom.
       3. **Logs analysis** — run `orch log 200` to read recent logs. Look for: repeated errors, slow operations, timeouts, rate limits, unexpected panics, failed dispatches. Each pattern is a potential improvement.
       4. **Prompt effectiveness** — review `prompts/*.md`. Are agents getting clear instructions? Are they producing the expected output format? Check recent task outputs to see if prompts lead to good results or if they need tuning.
@@ -66,6 +66,8 @@ jobs:
       - `gh issue list --state open` — don't duplicate existing issues
       - `gh issue list --state closed --limit 20` — don't re-file resolved problems
       - Read the `DO NOT TOUCH` sections in `AGENTS.md` — respect settled decisions
+      - **Check existing code/schema before creating migration or feature tasks** — run `sqlite3 ~/.orch/orch.db ".tables"` and `rg` for existing implementations. Do NOT create tasks for things that already exist.
+      - **NEVER append to existing migration files** — always create a NEW numbered migration file. Appending to already-applied migrations breaks existing databases.
 
       ## Create GitHub issues
 
