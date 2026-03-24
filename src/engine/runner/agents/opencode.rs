@@ -27,16 +27,10 @@
 //! - `opencode/trinity-large-preview-free`
 
 use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
-use crate::cmd::SyncCommandErrorContext;
 use crate::parser;
 
-use std::sync::Mutex;
-
 /// Runner for OpenCode agent.
-pub struct OpenCodeRunner {
-    /// Cached free models (model list + timestamp).
-    free_models_cache: Mutex<Option<(Vec<String>, std::time::Instant)>>,
-}
+pub struct OpenCodeRunner {}
 
 pub(crate) fn parse_ndjson_events(raw: &str) -> Vec<serde_json::Value> {
     raw.lines()
@@ -99,9 +93,7 @@ pub(crate) fn extract_router_text(raw: &str) -> Option<String> {
 
 impl OpenCodeRunner {
     pub fn new() -> Self {
-        Self {
-            free_models_cache: Mutex::new(None),
-        }
+        Self {}
     }
 
     /// Parse NDJSON stream into events.
@@ -191,27 +183,6 @@ impl OpenCodeRunner {
         }
 
         None
-    }
-
-    /// Discover free models via `opencode models | grep free`.
-    /// Results are cached for 1 hour.
-    fn discover_free_models_cached(&self) -> Vec<String> {
-        let mut cache = self
-            .free_models_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        // Check cache freshness (1 hour)
-        if let Some((ref models, ref ts)) = *cache {
-            if ts.elapsed() < std::time::Duration::from_secs(3600) {
-                return models.clone();
-            }
-        }
-
-        // Discover fresh using async-aware process invocation
-        let models = discover_free_models();
-        *cache = Some((models.clone(), std::time::Instant::now()));
-        models
     }
 }
 
@@ -329,10 +300,6 @@ printf '%s\n' '{permission_json}' > .orch-opencode/opencode/opencode.json || {{ 
 
         let combined = format!("{stdout}\n{stderr}");
         super::patterns::classify_from_text(exit_code, &combined)
-    }
-
-    fn free_models(&self) -> Vec<String> {
-        self.discover_free_models_cached()
     }
 
     fn available_models(&self) -> Vec<String> {
@@ -495,40 +462,6 @@ fn classify_opencode_message(message: &str) -> AgentError {
 
     AgentError::AgentFailed {
         message: message.to_string(),
-    }
-}
-
-/// Discover free models by running `opencode models` and filtering.
-fn discover_free_models() -> Vec<String> {
-    // Known free models as fallback
-    let known = vec![
-        "opencode/minimax-m2.5-free".to_string(),
-        "opencode/trinity-large-preview-free".to_string(),
-    ];
-
-    // Try to discover dynamically using blocking I/O.
-    // Note: this function is sync; callers in async contexts should wrap with
-    // tokio::task::spawn_blocking() at the call site.
-    let stdout = match std::process::Command::new("opencode")
-        .args(["models"])
-        .output_with_context()
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).to_string()
-        }
-        _ => return known,
-    };
-    let discovered: Vec<String> = stdout
-        .lines()
-        .filter(|line| line.to_lowercase().contains("free"))
-        .map(|line| line.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if discovered.is_empty() {
-        known
-    } else {
-        discovered
     }
 }
 
@@ -759,15 +692,6 @@ mod tests {
             matches!(err, AgentError::PermissionDenied { .. }),
             "expected PermissionDenied, got: {err:?}"
         );
-    }
-
-    #[test]
-    fn free_models_returns_known_defaults() {
-        // When opencode isn't installed, should return known defaults
-        let models = discover_free_models();
-        assert!(!models.is_empty());
-        // Should at least have the known free models
-        assert!(models.iter().any(|m| m.contains("free")));
     }
 
     // ── Fixture-based tests ─────────────────────────────────────

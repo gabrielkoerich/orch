@@ -149,8 +149,6 @@ pub enum RetryableError {
     Failed,
     /// Missing tooling - fallback might help if another agent has the tool.
     MissingTooling,
-    /// Content safety violation detected in prompt.
-    ContentSafety,
 }
 
 impl RetryableError {
@@ -163,7 +161,6 @@ impl RetryableError {
             RetryableError::UsageLimit => "rate_limit",
             RetryableError::AuthError => "auth_error",
             RetryableError::Failed | RetryableError::MissingTooling => "failed",
-            RetryableError::ContentSafety => "content_safety",
         }
     }
 }

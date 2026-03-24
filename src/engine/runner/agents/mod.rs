@@ -305,11 +305,6 @@ pub trait AgentRunner: Send + Sync {
         vec![]
     }
 
-    /// Free/fallback models for last-resort failover.
-    fn free_models(&self) -> Vec<String> {
-        vec![]
-    }
-
     /// Build a minimal CLI command for LLM-based routing.
     ///
     /// The command should run the agent with `prompt` as the sole task and
