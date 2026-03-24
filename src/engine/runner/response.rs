@@ -609,8 +609,8 @@ mod tests {
         assert!(is_agent_in_cooldown(agent));
     }
 
-    #[test]
-    fn record_and_check_model_cooldown() {
+    #[tokio::test]
+    async fn record_and_check_model_cooldown() {
         let agent = "test_cooldown_agent_2";
         let model = "test_model_x";
         assert!(!is_model_in_cooldown(agent, model));
