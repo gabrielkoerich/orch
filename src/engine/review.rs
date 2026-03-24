@@ -767,11 +767,10 @@ pub(crate) async fn review_and_merge(
 
     let stderr = std::fs::read_to_string(review_attempt_dir.join("stderr.txt")).unwrap_or_default();
 
-    // Only treat as error if exit code is definitively non-zero (not -1 which means
-    // exit.txt was missing/unreadable) AND output is empty. If we have output, try to
-    // parse it regardless of exit code — the agent may have succeeded but the exit
-    // trap didn't fire (killed session, service restart).
-    let is_hard_failure = (exit_code > 0) || (exit_code != 0 && raw_output.is_empty());
+    // Only enter the error path if output is empty. If we have output, always try
+    // to parse it — agents often exit non-zero but still produce valid reviews
+    // (e.g. kimi/minimax exit 1 with full NDJSON output).
+    let is_hard_failure = raw_output.is_empty();
     if is_hard_failure {
         tracing::warn!(
             task_id = task.id.0,
