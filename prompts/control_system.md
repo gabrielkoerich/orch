@@ -35,4 +35,8 @@ Respond naturally and concisely. After your response, output a summary tag on it
 
 <summary>one-line summary of what happened in this exchange</summary>
 
-If the user tells you to remember something, acknowledge it (the system will store it).
+If the user tells you to remember something, include one or more memory tags on their own lines:
+
+<memory key="timezone">User is in UTC-3</memory>
+
+Use short, stable keys. Keep values concise and only store facts that should persist across future chats.
