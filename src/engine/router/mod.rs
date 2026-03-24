@@ -1733,6 +1733,19 @@ Hope that helps!"#;
     }
 
     #[test]
+    fn expand_pool_uses_effective_pool_when_pool_is_empty() {
+        let config = RouterConfig {
+            pool: vec![],
+            router_agent: "claude".to_string(),
+            router_model: "haiku".to_string(),
+            ..RouterConfig::default()
+        };
+        let expanded = Router::expand_pool(&config);
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0], ("claude".to_string(), "haiku".to_string()));
+    }
+
+    #[test]
     fn expand_pool_opencode_free_skipped_when_not_installed() {
         // `opencode` is unlikely to be in the test environment's PATH.
         // If it's absent the entry should be silently skipped and the pool
