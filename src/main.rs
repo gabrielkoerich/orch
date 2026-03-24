@@ -20,6 +20,9 @@ mod webhook_status;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 
+const MAX_SERVICE_LOG_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_ROTATED_SERVICE_LOGS: usize = 3;
+
 /// Ensure common tool directories are on PATH.
 ///
 /// Sources `$HOME/.path` if it exists (user-managed PATH exports), then adds
@@ -108,6 +111,85 @@ fn load_private_env() {
         if !key.is_empty() && std::env::var(key).is_err() {
             std::env::set_var(key, val);
         }
+    }
+}
+
+fn rotate_log_if_needed(path: &std::path::Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+
+    if meta.len() <= MAX_SERVICE_LOG_BYTES {
+        return;
+    }
+
+    let oldest = rotated_log_path(path, MAX_ROTATED_SERVICE_LOGS);
+    let _ = std::fs::remove_file(&oldest);
+
+    for suffix in (1..MAX_ROTATED_SERVICE_LOGS).rev() {
+        let from = rotated_log_path(path, suffix);
+        let to = rotated_log_path(path, suffix + 1);
+        let _ = std::fs::rename(from, to);
+    }
+
+    let _ = std::fs::rename(path, rotated_log_path(path, 1));
+}
+
+fn rotate_service_logs_if_needed() {
+    let brew_prefix = std::env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".into());
+    rotate_log_if_needed(&std::path::PathBuf::from(&brew_prefix).join("var/log/orch.log"));
+
+    if let Ok(state_dir) = home::state_dir() {
+        rotate_log_if_needed(&state_dir.join("orch.log"));
+    }
+}
+
+fn rotated_log_path(path: &std::path::Path, suffix: usize) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{suffix}"));
+    std::path::PathBuf::from(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rotate_log_if_needed, rotated_log_path, MAX_SERVICE_LOG_BYTES};
+
+    #[test]
+    fn rotated_log_path_appends_suffix() {
+        let path = std::path::Path::new("/opt/homebrew/var/log/orch.log");
+        assert_eq!(
+            rotated_log_path(path, 2),
+            std::path::PathBuf::from("/opt/homebrew/var/log/orch.log.2")
+        );
+    }
+
+    #[test]
+    fn rotate_log_if_needed_keeps_three_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orch.log");
+
+        std::fs::write(&path, vec![b'a'; (MAX_SERVICE_LOG_BYTES + 1) as usize]).unwrap();
+        std::fs::write(path.with_file_name("orch.log.1"), b"one").unwrap();
+        std::fs::write(path.with_file_name("orch.log.2"), b"two").unwrap();
+        std::fs::write(path.with_file_name("orch.log.3"), b"three").unwrap();
+
+        rotate_log_if_needed(&path);
+
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(path.with_file_name("orch.log.1"))
+                .unwrap()
+                .len() as u64,
+            MAX_SERVICE_LOG_BYTES + 1
+        );
+        assert_eq!(
+            std::fs::read(path.with_file_name("orch.log.2")).unwrap(),
+            b"one"
+        );
+        assert_eq!(
+            std::fs::read(path.with_file_name("orch.log.3")).unwrap(),
+            b"two"
+        );
     }
 }
 
@@ -485,13 +567,17 @@ async fn main() -> anyhow::Result<()> {
     // (router, agents) without requiring the shell to source the file first.
     load_private_env();
 
+    let cli = Cli::parse();
+
+    if matches!(cli.command, Commands::Serve) {
+        rotate_service_logs_if_needed();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("orch=info".parse()?),
         )
         .init();
-
-    let cli = Cli::parse();
 
     match cli.command {
         Commands::Serve => {
