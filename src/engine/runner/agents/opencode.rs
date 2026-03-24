@@ -241,7 +241,8 @@ impl AgentRunner for OpenCodeRunner {
         let config_setup = if permissions.autonomous {
             let permission_json = translate_permissions_to_opencode(&permissions.allowed_tools);
             format!(
-                r#"mkdir -p .orch-opencode/opencode && echo '{permission_json}' > .orch-opencode/opencode/opencode.json
+                r#"mkdir -p .orch-opencode/opencode || {{ printf '%s\n' 'failed to create opencode config directory: .orch-opencode/opencode' >&2; exit 1; }}
+printf '%s\n' '{permission_json}' > .orch-opencode/opencode/opencode.json || {{ printf '%s\n' 'failed to write opencode config: .orch-opencode/opencode/opencode.json' >&2; exit 1; }}
 "#
             )
         } else {

@@ -381,6 +381,22 @@ pub(crate) mod patterns {
         None
     }
 
+    /// Check for missing worktree / working directory setup failures.
+    pub fn detect_worktree_missing(text: &str) -> Option<AgentError> {
+        let lower = text.to_lowercase();
+        let patterns = [
+            "worktree directory does not exist",
+            "failed to create opencode config directory",
+            "failed to write opencode config",
+        ];
+        if patterns.iter().any(|p| lower.contains(p)) {
+            return Some(AgentError::AgentFailed {
+                message: safe_tail(text, 300),
+            });
+        }
+        None
+    }
+
     /// Check for context overflow patterns.
     pub fn detect_context_overflow(text: &str) -> Option<AgentError> {
         let lower = text.to_lowercase();
@@ -524,6 +540,9 @@ pub(crate) mod patterns {
         if let Some(e) = detect_permission_denied(text) {
             return e;
         }
+        if let Some(e) = detect_worktree_missing(text) {
+            return e;
+        }
         if let Some(e) = detect_context_overflow(text) {
             return e;
         }
@@ -639,6 +658,19 @@ mod tests {
     }
 
     #[test]
+    fn pattern_detect_worktree_missing() {
+        assert!(
+            patterns::detect_worktree_missing("worktree directory does not exist: /tmp/wt")
+                .is_some()
+        );
+        assert!(patterns::detect_worktree_missing(
+            "failed to create opencode config directory: .orch-opencode/opencode"
+        )
+        .is_some());
+        assert!(patterns::detect_worktree_missing("all good").is_none());
+    }
+
+    #[test]
     fn pattern_detect_missing_tool() {
         assert!(patterns::detect_missing_tool("bun: command not found").is_some());
         assert!(patterns::detect_missing_tool("env: anchor: no such file").is_some());
@@ -671,6 +703,12 @@ mod tests {
         // Missing tool takes priority over rate limit patterns
         let err = patterns::classify_from_text(1, "bun: command not found rate limit");
         assert!(matches!(err, AgentError::MissingTool { .. }));
+    }
+
+    #[test]
+    fn classify_from_text_worktree_missing() {
+        let err = patterns::classify_from_text(1, "worktree directory does not exist: /tmp/wt");
+        assert!(matches!(err, AgentError::AgentFailed { .. }));
     }
 
     // ── PermissionRules defaults ────────────────────────────────
