@@ -252,6 +252,10 @@ enum Commands {
         raw: bool,
     },
     /// Chat with the orchestrator control session
+    #[command(
+        subcommand_precedence_over_arg = true,
+        args_conflicts_with_subcommands = true
+    )]
     Chat {
         /// Session profile (default: "default")
         #[arg(long, short, default_value = "default")]
