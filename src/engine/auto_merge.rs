@@ -311,7 +311,7 @@ pub(crate) async fn auto_merge_pr(
                         Ok(out) if out.status.success() => {
                             tracing::info!(
                                 task_id = task.id.0,
-                                "rebase succeeded — retrying merge"
+                                "rebase succeeded — resetting to NeedsReview for CI + merge"
                             );
                             store_increment(
                                 &Some(Arc::clone(store)),
@@ -320,28 +320,12 @@ pub(crate) async fn auto_merge_pr(
                                 "merge_conflict_retries",
                             )
                             .await;
-                            if let Err(merge_err) = gh.merge_pr(repo, pr_number, true).await {
-                                tracing::error!(
-                                    task_id = task.id.0,
-                                    error = %merge_err,
-                                    "merge still failed after rebase — blocking"
-                                );
-                                task_manager
-                                    .update_task_status(&task.id, Status::Blocked)
-                                    .await?;
-                                return Ok(());
-                            }
-                            // Merge succeeded after rebase — fall through to done
+                            // After rebase + force-push, CI must re-run on the new HEAD.
+                            // Reset to NeedsReview so the full review cycle runs again
+                            // (review agent verifies rebase, CI poll, then merge).
                             task_manager
-                                .update_task_status(&task.id, Status::Done)
+                                .update_task_status(&task.id, Status::NeedsReview)
                                 .await?;
-                            if let Err(ce) = cleanup_task_worktree(&task.id.0, repo, store).await {
-                                tracing::warn!(
-                                    task_id = task.id.0,
-                                    err = %ce,
-                                    "post-merge cleanup failed"
-                                );
-                            }
                             return Ok(());
                         }
                         Ok(out) => {
