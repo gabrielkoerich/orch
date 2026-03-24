@@ -158,6 +158,54 @@ impl ClaudeRunner {
     }
 }
 
+pub(crate) fn extract_stream_json_result_text(raw: &str) -> Result<String, AgentError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AgentError::InvalidResponse { raw: String::new() });
+    }
+
+    let envelope_text = find_ndjson_result_line(trimmed).unwrap_or(trimmed);
+    let parsed_json: serde_json::Value =
+        serde_json::from_str(envelope_text).map_err(|_| AgentError::InvalidResponse {
+            raw: envelope_text.to_string(),
+        })?;
+
+    let envelope = parsed_json
+        .as_object()
+        .ok_or_else(|| AgentError::InvalidResponse {
+            raw: envelope_text.to_string(),
+        })?;
+
+    if envelope.get("type").and_then(|v| v.as_str()) != Some("result") {
+        return Ok(trimmed.to_string());
+    }
+
+    if envelope
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let msg = envelope
+            .get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(AgentError::AgentFailed {
+            message: msg.to_string(),
+        });
+    }
+
+    if let Some(result) = envelope.get("result") {
+        if let Some(text) = result.as_str() {
+            return Ok(text.to_string());
+        }
+        if result.is_object() || result.is_array() {
+            return Ok(result.to_string());
+        }
+    }
+
+    Ok(trimmed.to_string())
+}
+
 impl AgentRunner for ClaudeRunner {
     #[cfg(test)]
     fn name(&self) -> &str {
@@ -309,7 +357,7 @@ fn translate_allowed_tools(
 ///
 /// Used to extract the final result event from Claude `--output-format stream-json`
 /// output. Returns `None` if no such line is found (e.g. pretty-printed single JSON).
-fn find_ndjson_result_line(text: &str) -> Option<&str> {
+pub(crate) fn find_ndjson_result_line(text: &str) -> Option<&str> {
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .rev()

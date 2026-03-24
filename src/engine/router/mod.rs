@@ -677,7 +677,7 @@ mod tests {
     // router.check_routing_sanity() directly without referencing llm_router.
     impl Router {
         fn parse_llm_response(&self, response: &str) -> anyhow::Result<LlmRouteResponse> {
-            self.llm_router.parse_llm_response(response)
+            self.llm_router.parse_llm_response("claude", response)
         }
 
         fn check_routing_sanity(
