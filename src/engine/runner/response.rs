@@ -159,7 +159,9 @@ impl RetryableError {
         match self {
             RetryableError::UsageLimit => "rate_limit",
             RetryableError::AuthError => "auth_error",
-            RetryableError::Failed | RetryableError::MissingTooling | RetryableError::Timeout => "failed",
+            RetryableError::Failed | RetryableError::MissingTooling | RetryableError::Timeout => {
+                "failed"
+            }
         }
     }
 }
@@ -310,7 +312,11 @@ pub async fn handle_timeout_failover(
     }
 
     // No fallback available
-    tracing::warn!(task_id, agent = agent_name, "no fallback agents available for timeout");
+    tracing::warn!(
+        task_id,
+        agent = agent_name,
+        "no fallback agents available for timeout"
+    );
     let msg = format!("{error_message}, no fallback agents");
     store::store_set(
         store,

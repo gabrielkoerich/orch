@@ -17,9 +17,6 @@
 //! cargo test --test integration_agents minimax -- --ignored --nocapture
 //! cargo test --test integration_agents router -- --ignored --nocapture
 //! ```
-use std::process::Command;
-use std::sync::Arc;
-use std::time::Duration;
 use orch::{
     db::testing::TestStore,
     engine::runner::{
@@ -28,7 +25,9 @@ use orch::{
     },
     store,
 };
-
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::test]
 #[allow(unreachable_patterns)]
@@ -86,7 +85,7 @@ struct MockAgentRunner {
     models: Vec<String>,
 }
 
- impl AgentRunner for MockAgentRunner {
+impl AgentRunner for MockAgentRunner {
     fn name(&self) -> &str {
         "mock"
     }

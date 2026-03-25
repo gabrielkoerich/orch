@@ -41,18 +41,13 @@ pub async fn handle_error(
         "agent error, attempting recovery"
     );
 
-    // Handle timeout separately with a more aggressive fallback
+    // Handle timeout separately with a more aggressive fallback.
+    // Timeouts should ignore the normal reroute chain and pick a different
+    // healthy agent immediately so the task can make forward progress.
     if let agents::AgentError::Timeout { elapsed } = agent_err {
         let error_msg = format!("{agent_name} timed out after {}s", elapsed.as_secs());
-        let status = response::handle_failover(
-            task_id,
-            agent_name,
-            response::RetryableError::Timeout,
-            &error_msg,
-            store,
-            repo,
-        )
-        .await;
+        let status =
+            response::handle_timeout_failover(task_id, agent_name, &error_msg, store, repo).await;
         response::store_failure_memory(
             task_id,
             new_attempts,
