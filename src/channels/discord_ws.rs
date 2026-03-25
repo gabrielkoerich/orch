@@ -452,8 +452,19 @@ async fn handle_connection(
                         }
                     }
                     Message::Close(frame) => {
-                        tracing::info!(?frame, "discord gateway: close frame received");
-                        return Ok(true);
+                        let code = frame.as_ref().map(|f| u16::from(f.code)).unwrap_or(0);
+                        // Non-resumable Discord Gateway close codes per Discord docs
+                        let resumable = !matches!(code, 4004 | 4010 | 4011 | 4013 | 4014);
+                        if !resumable {
+                            state.clear();
+                            tracing::error!(
+                                code,
+                                "discord gateway: non-resumable close code — check bot token and intent configuration"
+                            );
+                        } else {
+                            tracing::info!(code, ?frame, "discord gateway: close frame, will attempt resume");
+                        }
+                        return Ok(resumable);
                     }
                     Message::Ping(data) => {
                         write
