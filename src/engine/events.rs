@@ -47,7 +47,7 @@ impl EventFilter {
             }
         }
         if let Some(ref repo) = self.repo {
-            if !event.repo.contains(repo) {
+            if event.repo != *repo {
                 return false;
             }
         }
@@ -312,13 +312,13 @@ mod tests {
     }
 
     #[test]
-    fn event_filter_repo_substring() {
+    fn event_filter_repo_exact_match() {
         let filter = EventFilter {
             task_id: None,
             repo: Some("owner".to_string()),
         };
-        assert!(filter.matches(&make_event("1", "owner/repo")));
-        assert!(filter.matches(&make_event("1", "owner/other")));
+        assert!(filter.matches(&make_event("1", "owner")));
+        assert!(!filter.matches(&make_event("1", "owner/repo")));
         assert!(!filter.matches(&make_event("1", "someone/else")));
     }
 
