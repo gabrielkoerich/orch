@@ -75,18 +75,45 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
     }
 
     let full = texts.join("");
-    if full.trim().starts_with('{') || full.contains("```json") {
-        return Some(full);
+    if let Some(json) = extract_json_object(&full) {
+        return Some(json);
     }
 
     for text in texts.iter().rev() {
         let trimmed = text.trim();
-        if trimmed.contains('{') && (trimmed.contains("status") || trimmed.contains("executor")) {
+        if let Some(json) = extract_json_object(trimmed) {
+            if json.contains("status") || json.contains("executor") {
+                return Some(json);
+            }
+        }
+        if trimmed.contains('{')
+            && (trimmed.contains("status")
+                || trimmed.contains("executor")
+                || trimmed.contains("complexity"))
+        {
             return Some(text.clone());
         }
     }
 
     Some(full)
+}
+
+fn extract_json_object(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return Some(trimmed.to_string());
+    }
+
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+
+    let candidate = trimmed[start..=end].trim();
+    serde_json::from_str::<serde_json::Value>(candidate)
+        .ok()
+        .map(|_| candidate.to_string())
 }
 
 pub(crate) fn extract_router_text(raw: &str) -> Option<String> {
@@ -582,6 +609,16 @@ mod tests {
         assert_eq!(parsed.response.status, "done");
         assert_eq!(parsed.input_tokens, Some(100));
         assert_eq!(parsed.output_tokens, Some(50));
+    }
+
+    #[test]
+    fn extract_router_text_prefers_json_payload() {
+        let raw = r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"Thinking..."}}
+{"type":"text","timestamp":1002,"part":{"type":"text","text":"{\"executor\":\"claude\",\"complexity\":\"medium\",\"reason\":\"fit\"}"}}"#;
+
+        let text = extract_router_text(raw).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["executor"], "claude");
     }
 
     #[test]
