@@ -1,4 +1,5 @@
 use super::*;
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
@@ -79,31 +80,56 @@ impl TaskStore {
     }
 
     /// List the most recent control messages for a session (chronological order).
+    ///
+    /// If `since` is provided, only messages created at or after that RFC3339/ISO8601
+    /// timestamp are returned. Use [`parse_since_duration`] to convert human-readable
+    /// durations like `"7d"` or `"24h"` into a timestamp string.
     pub async fn list_control_messages(
         &self,
         session_id: &str,
+        since: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<ControlMessage>> {
         // Subquery: get the N most recent, then re-sort chronologically
-        let rows = sqlx::query(
-            "SELECT * FROM (
-            SELECT * FROM control_messages
-            WHERE session_id = ?
-            ORDER BY created_at DESC, id DESC LIMIT ?
-        ) ORDER BY created_at ASC, id ASC",
-        )
-        .bind(session_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = if let Some(ts) = since {
+            sqlx::query(
+                "SELECT * FROM (
+                SELECT * FROM control_messages
+                WHERE session_id = ? AND created_at >= ?
+                ORDER BY created_at DESC, id DESC LIMIT ?
+            ) ORDER BY created_at ASC, id ASC",
+            )
+            .bind(session_id)
+            .bind(ts)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT * FROM (
+                SELECT * FROM control_messages
+                WHERE session_id = ?
+                ORDER BY created_at DESC, id DESC LIMIT ?
+            ) ORDER BY created_at ASC, id ASC",
+            )
+            .bind(session_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
         Ok(rows.iter().map(Self::row_to_control_message).collect())
     }
 
     /// Search control messages by content (LIKE match, most recent first).
+    ///
+    /// If `since` is provided, only messages created at or after that RFC3339/ISO8601
+    /// timestamp are returned. Use [`parse_since_duration`] to convert human-readable
+    /// durations like `"7d"` or `"24h"` into a timestamp string.
     pub async fn search_control_messages(
         &self,
         session_id: &str,
         query: &str,
+        since: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<ControlMessage>> {
         // Escape LIKE wildcards in user input
@@ -112,14 +138,30 @@ impl TaskStore {
             .replace('%', "\\%")
             .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
-        let rows = sqlx::query(
-        "SELECT * FROM control_messages WHERE session_id = ? AND content LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?",
-    )
-    .bind(session_id)
-    .bind(&pattern)
-    .bind(limit)
-    .fetch_all(&self.pool)
-    .await?;
+        let rows = if let Some(ts) = since {
+            sqlx::query(
+                "SELECT * FROM control_messages \
+                 WHERE session_id = ? AND content LIKE ? ESCAPE '\\' AND created_at >= ? \
+                 ORDER BY created_at DESC LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(&pattern)
+            .bind(ts)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT * FROM control_messages \
+                 WHERE session_id = ? AND content LIKE ? ESCAPE '\\' \
+                 ORDER BY created_at DESC LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(&pattern)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
         Ok(rows.iter().map(Self::row_to_control_message).collect())
     }
 
@@ -161,4 +203,54 @@ impl TaskStore {
             created_at: row.get("created_at"),
         }
     }
+}
+
+/// Parse a human-readable duration string into an RFC3339 timestamp representing
+/// `now - duration`.
+///
+/// Supported suffixes:
+/// - `d` — days (e.g. `"7d"`)
+/// - `h` — hours (e.g. `"24h"`)
+/// - `m` — minutes (e.g. `"30m"`)
+///
+/// Returns an ISO8601/RFC3339 string suitable for comparison against
+/// `control_messages.created_at` (stored as UTC RFC3339).
+///
+/// Returns `Err` if the format is unrecognised or the number overflows.
+pub fn parse_since_duration(s: &str) -> anyhow::Result<String> {
+    let s = s.trim();
+    let (num_str, unit) = if let Some(n) = s.strip_suffix('d') {
+        (n, 'd')
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 'h')
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 'm')
+    } else {
+        anyhow::bail!(
+            "unrecognised --since format {:?}; expected a number followed by d, h, or m (e.g. 7d, 24h, 30m)",
+            s
+        );
+    };
+
+    let n: u64 = num_str.trim().parse().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid number in --since {:?}; expected a positive integer followed by d, h, or m",
+            s
+        )
+    })?;
+    if n == 0 {
+        anyhow::bail!("--since value must be greater than zero");
+    }
+
+    let secs: i64 = match unit {
+        'd' => n.checked_mul(86_400),
+        'h' => n.checked_mul(3_600),
+        'm' => n.checked_mul(60),
+        _ => unreachable!(),
+    }
+    .ok_or_else(|| anyhow::anyhow!("--since value is too large"))?
+    .try_into()
+    .map_err(|_| anyhow::anyhow!("--since value is too large"))?;
+
+    Ok((Utc::now() - Duration::seconds(secs)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }

@@ -840,7 +840,10 @@ mod tests {
         // set directly to avoid validation in test env
         let spec = parse_model_spec("claude:haiku");
         set_model_spec(&store, &spec).await.unwrap();
-        let messages = store.list_control_messages("default", 10).await.unwrap();
+        let messages = store
+            .list_control_messages("default", None, 10)
+            .await
+            .unwrap();
         assert_eq!(messages.len(), 0);
     }
 
@@ -909,7 +912,10 @@ mod tests {
             .await
             .unwrap();
 
-        let messages = store.list_control_messages("default", 10).await.unwrap();
+        let messages = store
+            .list_control_messages("default", None, 10)
+            .await
+            .unwrap();
         assert_eq!(messages.len(), 1);
         let msg = &messages[0];
         assert!(msg.cost_usd.is_some(), "cost_usd must be stored, not NULL");

@@ -361,6 +361,9 @@ enum ChatAction {
         /// Search term
         #[arg(long)]
         search: Option<String>,
+        /// Only show messages from the last N duration (e.g. 7d, 24h, 30m)
+        #[arg(long)]
+        since: Option<String>,
         /// Max results
         #[arg(long, default_value = "20")]
         limit: i64,
@@ -634,8 +637,12 @@ async fn main() -> anyhow::Result<()> {
             message,
             session,
         } => match action {
-            Some(ChatAction::History { search, limit }) => {
-                cli::chat::history(&session, search, limit).await?;
+            Some(ChatAction::History {
+                search,
+                since,
+                limit,
+            }) => {
+                cli::chat::history(&session, search, since, limit).await?;
             }
             None if !message.is_empty() => {
                 cli::chat::single_message(&session, &message.join(" ")).await?;
