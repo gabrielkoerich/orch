@@ -220,7 +220,9 @@ impl AgentRunner for ClaudeRunner {
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
-        let model_flag = model.map(|m| format!("--model {m}")).unwrap_or_default();
+        let model_flag = model
+            .map(|m| format!("--model {}", super::shell_single_quote(m)))
+            .unwrap_or_default();
 
         // Claude permission mode: autonomous → bypassPermissions, supervised → acceptEdits
         let permission_mode = if permissions.autonomous {

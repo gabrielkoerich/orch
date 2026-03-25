@@ -251,6 +251,11 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
     })
 }
 
+/// Quote a string for safe insertion into a POSIX shell command.
+pub(crate) fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Find the largest byte index <= `max_bytes` that lies on a UTF-8 char
 /// boundary.  Used for safe string truncation in error messages.
 fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
