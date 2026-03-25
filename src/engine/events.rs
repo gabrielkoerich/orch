@@ -120,15 +120,14 @@ impl EventBus {
                         let mut rx = tx.subscribe();
                         tokio::spawn(async move {
                             let mut filter = EventFilter::default();
-                            let Ok(ws) = tokio_tungstenite::accept_hdr_async(
-                                stream,
-                                |req: &Request, resp| {
-                                    filter = EventFilter::from_request(req);
-                                    tracing::debug!(?filter, "ws client connected with filter");
-                                    Ok(resp)
-                                },
-                            )
-                            .await
+                            #[allow(clippy::result_large_err)]
+                            let callback = |req: &Request, resp| {
+                                filter = EventFilter::from_request(req);
+                                tracing::debug!(?filter, "ws client connected with filter");
+                                Ok(resp)
+                            };
+                            let Ok(ws) =
+                                tokio_tungstenite::accept_hdr_async(stream, callback).await
                             else {
                                 return;
                             };
