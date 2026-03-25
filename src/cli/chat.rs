@@ -1,7 +1,7 @@
 //! CLI handlers for `orch chat` — control session interaction.
 
 use crate::control;
-use crate::store::TaskStore;
+use crate::store::{parse_since_duration, TaskStore};
 use std::io::{self, BufRead, Write};
 
 /// Interactive REPL mode — reads from stdin, sends to control session.
@@ -64,15 +64,29 @@ pub async fn single_message(session_id: &str, message: &str) -> anyhow::Result<(
 }
 
 /// Show conversation history.
-pub async fn history(session_id: &str, search: Option<String>, limit: i64) -> anyhow::Result<()> {
+pub async fn history(
+    session_id: &str,
+    search: Option<String>,
+    since: Option<String>,
+    limit: i64,
+) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
+
+    // Parse --since into an ISO8601 cutoff timestamp if provided.
+    let since_ts: Option<String> = since
+        .as_deref()
+        .map(parse_since_duration)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let messages = if let Some(query) = search {
         store
-            .search_control_messages(session_id, &query, limit)
+            .search_control_messages(session_id, &query, since_ts.as_deref(), limit)
             .await?
     } else {
-        store.list_control_messages(session_id, limit).await?
+        store
+            .list_control_messages(session_id, since_ts.as_deref(), limit)
+            .await?
     };
 
     if messages.is_empty() {

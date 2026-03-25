@@ -4745,7 +4745,10 @@ async fn control_insert_and_list() {
         .await
         .unwrap();
 
-    let messages = store.list_control_messages("default", 10).await.unwrap();
+    let messages = store
+        .list_control_messages("default", None, 10)
+        .await
+        .unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "user");
     assert_eq!(messages[1].role, "assistant");
@@ -4787,7 +4790,7 @@ async fn control_search_messages() {
         .unwrap();
 
     let results = store
-        .search_control_messages("default", "bean", 10)
+        .search_control_messages("default", "bean", None, 10)
         .await
         .unwrap();
     assert_eq!(results.len(), 1);
@@ -4868,8 +4871,14 @@ async fn control_sessions_are_isolated() {
         .await
         .unwrap();
 
-    let a_msgs = store.list_control_messages("session-a", 10).await.unwrap();
-    let b_msgs = store.list_control_messages("session-b", 10).await.unwrap();
+    let a_msgs = store
+        .list_control_messages("session-a", None, 10)
+        .await
+        .unwrap();
+    let b_msgs = store
+        .list_control_messages("session-b", None, 10)
+        .await
+        .unwrap();
     assert_eq!(a_msgs.len(), 1);
     assert_eq!(b_msgs.len(), 1);
     assert!(a_msgs[0].content.contains("in A"));
@@ -4912,4 +4921,171 @@ async fn resolve_task_id_fallback_respects_repo() {
         "fallback must not resolve a task from a different repo (got {:?})",
         resolved
     );
+}
+
+// ── parse_since_duration ──────────────────────────────────────────────────────
+
+#[test]
+fn parse_since_duration_days() {
+    use crate::store::control::parse_since_duration;
+    let ts = parse_since_duration("7d").unwrap();
+    // The timestamp must be a well-formed SQLite datetime string.
+    assert!(ts.len() == 19, "unexpected length: {ts:?}");
+    // Must start with a 4-digit year.
+    assert!(ts.starts_with("20"), "unexpected prefix: {ts:?}");
+    // Must be in the past (less than now).
+    let now_ts = parse_since_duration("0d");
+    assert!(now_ts.is_err(), "0d should be rejected");
+}
+
+#[test]
+fn parse_since_duration_hours() {
+    use crate::store::control::parse_since_duration;
+    let ts = parse_since_duration("24h").unwrap();
+    assert_eq!(ts.len(), 19);
+}
+
+#[test]
+fn parse_since_duration_minutes() {
+    use crate::store::control::parse_since_duration;
+    let ts = parse_since_duration("30m").unwrap();
+    assert_eq!(ts.len(), 19);
+}
+
+#[test]
+fn parse_since_duration_invalid() {
+    use crate::store::control::parse_since_duration;
+    assert!(parse_since_duration("abc").is_err());
+    assert!(parse_since_duration("7").is_err());
+    assert!(parse_since_duration("").is_err());
+    assert!(parse_since_duration("0h").is_err());
+}
+
+// ── list_control_messages with since ─────────────────────────────────────────
+
+#[tokio::test]
+async fn control_list_messages_since_filters_old() {
+    use crate::store::control::parse_since_duration;
+
+    let store = TaskStore::open_memory().await.unwrap();
+
+    // Insert a message with a timestamp far in the past.
+    sqlx::query(
+        "INSERT INTO control_messages
+         (session_id, role, channel, content, created_at)
+         VALUES ('default', 'user', 'cli', 'old message', '2020-01-01 00:00:00')",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    // Insert a recent message using the normal API (created_at defaults to NOW).
+    store
+        .insert_control_message(
+            "default",
+            "user",
+            "cli",
+            None,
+            "recent message",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Without a since filter: both messages returned.
+    let all = store
+        .list_control_messages("default", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2, "expected 2 messages without filter");
+
+    // With a since filter (7 days ago): only the recent one should appear.
+    let since_ts = parse_since_duration("7d").unwrap();
+    let filtered = store
+        .list_control_messages("default", Some(&since_ts), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        filtered.len(),
+        1,
+        "expected 1 message after filtering, got: {filtered:?}"
+    );
+    assert!(filtered[0].content.contains("recent"));
+}
+
+// ── search_control_messages with since ───────────────────────────────────────
+
+#[tokio::test]
+async fn control_search_messages_since_filters_old() {
+    use crate::store::control::parse_since_duration;
+
+    let store = TaskStore::open_memory().await.unwrap();
+
+    // Insert an old matching message.
+    sqlx::query(
+        "INSERT INTO control_messages
+         (session_id, role, channel, content, created_at)
+         VALUES ('default', 'user', 'cli', 'bean auth old', '2020-01-01 00:00:00')",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    // Insert a recent matching message.
+    store
+        .insert_control_message(
+            "default",
+            "user",
+            "cli",
+            None,
+            "bean auth recent",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Insert a recent non-matching message.
+    store
+        .insert_control_message(
+            "default",
+            "user",
+            "cli",
+            None,
+            "unrelated recent",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Search without since: both bean messages returned.
+    let all_bean = store
+        .search_control_messages("default", "bean", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(all_bean.len(), 2, "expected 2 bean matches without filter");
+
+    // Search with since: only the recent bean message returned.
+    let since_ts = parse_since_duration("7d").unwrap();
+    let recent_bean = store
+        .search_control_messages("default", "bean", Some(&since_ts), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        recent_bean.len(),
+        1,
+        "expected 1 bean match after since filter, got: {recent_bean:?}"
+    );
+    assert!(recent_bean[0].content.contains("recent"));
 }
