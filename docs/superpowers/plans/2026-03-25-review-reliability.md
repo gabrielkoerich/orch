@@ -32,6 +32,14 @@
 - Startup reset skips tasks with `review_session_expected = false` and age < 10min
 - **Fix**: Set the flag BEFORE spawning, not after
 
+### 6. Startup worktree reconciliation
+- On restart, iterate all worktrees in `~/.orch/worktrees/{project}/`
+- For each worktree, find the corresponding task in SQLite
+- If task is done/cancelled → delete worktree + local branch + remote branch
+- If task is active → try `git rebase origin/main`
+- If rebase fails (conflicts) → delete worktree + branches, reset task to `new` for fresh start
+- This prevents stale worktrees accumulating and conflicting branches blocking agents
+
 ## Implementation Tasks
 
 ### Task 1: Read SQLite for startup InReview reset (CRITICAL)
