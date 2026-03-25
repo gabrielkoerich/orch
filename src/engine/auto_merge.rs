@@ -205,8 +205,6 @@ pub(crate) async fn auto_merge_pr(
     let poll_interval = std::time::Duration::from_secs(15);
     let start = std::time::Instant::now();
 
-    // Acquire a global permit to limit concurrent CI polling loops across tasks.
-    let _permit = ci_poll_semaphore().clone().acquire_owned().await;
     let pr = gh.get_pr(repo, pr_number).await?;
     if pr.mergeable == Some(false) {
         anyhow::bail!("PR is not mergeable (merge conflicts present)");
@@ -218,19 +216,25 @@ pub(crate) async fn auto_merge_pr(
         .unwrap_or_default();
 
     loop {
-        let (state, total, passing, failing, pending) = if required_contexts.is_empty() {
-            gh.get_combined_status(repo, &head_sha).await?
-        } else {
-            let check_runs = gh.get_check_runs(repo, &head_sha).await.unwrap_or_default();
-            let statuses = gh
-                .get_commit_status_contexts(repo, &head_sha)
-                .await
-                .unwrap_or_default();
-            let check_runs = check_runs
-                .into_iter()
-                .map(|run| (run.name, run.status, run.conclusion))
-                .collect::<Vec<_>>();
-            required_checks_state(&required_contexts, &check_runs, &statuses)
+        let (state, total, passing, failing, pending) = {
+            // Acquire a global permit to limit concurrent CI polling loops across tasks.
+            // Released automatically when _permit goes out of scope at the end of this block.
+            let _permit = ci_poll_semaphore().clone().acquire_owned().await;
+
+            if required_contexts.is_empty() {
+                gh.get_combined_status(repo, &head_sha).await?
+            } else {
+                let check_runs = gh.get_check_runs(repo, &head_sha).await.unwrap_or_default();
+                let statuses = gh
+                    .get_commit_status_contexts(repo, &head_sha)
+                    .await
+                    .unwrap_or_default();
+                let check_runs = check_runs
+                    .into_iter()
+                    .map(|run| (run.name, run.status, run.conclusion))
+                    .collect::<Vec<_>>();
+                required_checks_state(&required_contexts, &check_runs, &statuses)
+            }
         };
 
         tracing::info!(
