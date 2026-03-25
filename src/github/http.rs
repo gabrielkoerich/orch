@@ -11,7 +11,8 @@
 
 use super::token;
 use super::types::{
-    GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview, GitHubReviewComment,
+    GitHubCheckRun, GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview,
+    GitHubReviewComment,
 };
 use reqwest::{header, Client, Response, StatusCode};
 use serde::Serialize;
@@ -1011,6 +1012,77 @@ impl GhHttp {
     pub async fn get_pr(&self, repo: &str, pr_number: u64) -> anyhow::Result<GitHubPullRequest> {
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}");
         self.get_json(&url).await
+    }
+
+    /// Get the required status check contexts for a branch.
+    pub async fn get_required_status_check_contexts(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let branch = urlencoding::encode(branch);
+        let url = format!("{GITHUB_API}/repos/{repo}/branches/{branch}/protection");
+        let resp = self.get_json::<serde_json::Value>(&url).await;
+        match resp {
+            Ok(value) => Ok(value
+                .pointer("/required_status_checks/contexts")
+                .and_then(|v| v.as_array())
+                .map(|contexts| {
+                    contexts
+                        .iter()
+                        .filter_map(|context| context.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()),
+            Err(e) => {
+                let err = e.to_string();
+                if err.contains("404") {
+                    Ok(vec![])
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Get commit status contexts for a SHA.
+    pub async fn get_commit_status_contexts(
+        &self,
+        repo: &str,
+        sha: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}/status");
+        let resp = self.get_json::<serde_json::Value>(&url).await?;
+        Ok(resp
+            .get("statuses")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|status| {
+                let context = status.get("context").and_then(|v| v.as_str())?;
+                let state = status.get("state").and_then(|v| v.as_str())?;
+                Some((context.to_string(), state.to_string()))
+            })
+            .collect())
+    }
+
+    /// Get check runs for a PR head SHA.
+    pub async fn get_check_runs(
+        &self,
+        repo: &str,
+        sha: &str,
+    ) -> anyhow::Result<Vec<GitHubCheckRun>> {
+        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}/check-runs");
+        let resp: serde_json::Value = self.get_json(&url).await?;
+        Ok(resp
+            .get("check_runs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|run| serde_json::from_value(run).ok())
+            .collect())
     }
 
     /// Get reviews for a PR.
