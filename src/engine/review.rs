@@ -767,10 +767,14 @@ pub(crate) async fn review_and_merge(
 
     let stderr = std::fs::read_to_string(review_attempt_dir.join("stderr.txt")).unwrap_or_default();
 
-    // Only enter the error path if output is empty. If we have output, always try
-    // to parse it — agents often exit non-zero but still produce valid reviews
-    // (e.g. kimi/minimax exit 1 with full NDJSON output).
-    let is_hard_failure = raw_output.is_empty();
+    // Check if output contains an explicit error (is_error:true, usage limit, auth).
+    // Agents like kimi return exit 0 with non-empty NDJSON but is_error:true.
+    let output_has_error = raw_output.contains("\"is_error\":true")
+        || raw_output.contains("\"is_error\": true")
+        || raw_output.contains("usage limit")
+        || raw_output.contains("quota")
+        || raw_output.contains("authentication_failed");
+    let is_hard_failure = raw_output.is_empty() || output_has_error;
     if is_hard_failure {
         tracing::warn!(
             task_id = task.id.0,
