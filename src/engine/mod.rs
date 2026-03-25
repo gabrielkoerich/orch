@@ -49,12 +49,17 @@ use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
 use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
 use crate::config;
+use crate::engine::cleanup::remove_worktree_and_branch;
 use crate::engine::router::Router;
+use crate::engine::runner::worktree::{
+    abort_worktree_rebase, list_project_worktrees, rebase_worktree_on_origin_main,
+    task_id_from_worktree_name,
+};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{rate_limit_metrics, GhHttp};
 use crate::repo_context::REPO_CONTEXT;
-use crate::store::TaskStore;
 use crate::store::{review_session_expected, set_review_session_expected};
+use crate::store::{TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
 use runner::WeightSignal;
 // AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
@@ -297,6 +302,88 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     Ok(engines)
 }
 
+async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyhow::Result<()> {
+    for engine in project_engines {
+        let repo_root =
+            crate::engine::runner::worktree::resolve_main_repo(&engine.project_dir).await;
+        let repo_root_path = std::path::PathBuf::from(&repo_root);
+        let worktrees = list_project_worktrees(&repo_root_path)?;
+
+        for worktree_dir in worktrees {
+            let Some(name) = worktree_dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            let Some(task_id) = task_id_from_worktree_name(name) else {
+                tracing::info!(repo = %engine.repo, worktree = %worktree_dir.display(), "orphan worktree without task id, removing");
+                remove_worktree_and_branch(name, &worktree_dir, Some(name), &repo_root_path).await;
+                continue;
+            };
+
+            let Some(store_id) = engine.store.resolve_task_id(&engine.repo, &task_id).await? else {
+                tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), "worktree has no matching task, removing");
+                remove_worktree_and_branch(&task_id, &worktree_dir, Some(name), &repo_root_path)
+                    .await;
+                continue;
+            };
+
+            let task = engine.store.get(store_id).await?;
+            let branch_name = if task.branch.is_empty() {
+                name
+            } else {
+                task.branch.as_str()
+            };
+
+            match task.status {
+                TaskStatus::New
+                | TaskStatus::Routed
+                | TaskStatus::InProgress
+                | TaskStatus::NeedsReview
+                | TaskStatus::InReview => {
+                    tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), "rebasing startup worktree");
+                    if let Err(e) =
+                        rebase_worktree_on_origin_main(&worktree_dir, &repo_root_path).await
+                    {
+                        tracing::warn!(repo = %engine.repo, task_id = %task_id, err = %e, "startup rebase failed, resetting task");
+                        abort_worktree_rebase(&worktree_dir).await;
+                        remove_worktree_and_branch(
+                            &task_id,
+                            &worktree_dir,
+                            Some(branch_name),
+                            &repo_root_path,
+                        )
+                        .await;
+                        if let Ok(Some(reset_id)) =
+                            engine.store.resolve_task_id(&engine.repo, &task_id).await
+                        {
+                            let _ = engine.store.reset_to_new(reset_id).await;
+                        }
+                        let _ = engine
+                            .task_manager
+                            .update_task_status(
+                                &ExternalId(task_id.clone()),
+                                crate::backends::Status::New,
+                            )
+                            .await;
+                    }
+                }
+                _ => {
+                    tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), status = ?task.status, "terminal task worktree, removing");
+                    remove_worktree_and_branch(
+                        &task_id,
+                        &worktree_dir,
+                        Some(branch_name),
+                        &repo_root_path,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Read per-project channel configuration from `.orch.yml`.
 fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelConfig {
     let config_path = project_dir.join(".orch.yml");
@@ -396,6 +483,10 @@ pub async fn serve() -> anyhow::Result<()> {
             engine.repo.clone(),
             event_bus.sender(),
         ));
+    }
+
+    if let Err(e) = reconcile_startup_worktrees(&project_engines).await {
+        tracing::warn!(err = %e, "startup worktree reconciliation failed");
     }
 
     // Build ChannelRouter from global config + per-project configs
