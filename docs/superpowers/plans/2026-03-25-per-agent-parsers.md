@@ -126,3 +126,54 @@ For each agent, test:
 | `src/engine/runner/response.rs` | `ndjson_extract_text` → delegate to per-agent |
 | `tests/integration_review.rs` | Per-agent integration tests |
 | `tests/fixtures/` | Add fixtures for each agent's error/success formats |
+
+## Phase 6: Human-readable `orch stream` using per-agent parsers
+
+Once per-agent parsers exist, `orch stream` can render NDJSON as readable output:
+
+### Per-agent rendering
+
+| Agent | Event | Render as |
+|-------|-------|-----------|
+| claude/kimi/minimax | `type:assistant` content `type:text` | Print text |
+| claude/kimi/minimax | `type:assistant` content `type:tool_use` | `→ {tool} {input_summary}` |
+| claude/kimi/minimax | `type:result` | `✓ Done ({tokens} tokens, ${cost})` |
+| claude/kimi/minimax | `type:system` | Skip (hooks, init) |
+| opencode | `type:text` | Print text |
+| opencode | `type:tool_use` | `→ {tool} {command}` / `→ {tool} {file}` |
+| opencode | `type:step_finish` | `✓ Step done ({tokens} tokens)` |
+| opencode | `type:step_start` | Skip |
+| codex | `item.completed` `type:agent_message` | Print text |
+| codex | `item.completed` `type:command_execution` | `$ {command}` |
+| codex | `item.completed` `type:reasoning` | Skip |
+| codex | `turn.failed` | `✗ {error}` |
+
+### Implementation
+
+In `src/cli/events.rs` or `src/cli/stream.rs`:
+
+```rust
+fn format_ndjson_line(agent: &str, line: &str) -> Option<String> {
+    let event: serde_json::Value = serde_json::from_str(line).ok()?;
+    match agent {
+        "claude" | "kimi" | "minimax" => format_claude_event(&event),
+        "opencode" => format_opencode_event(&event),
+        "codex" => format_codex_event(&event),
+        _ => format_claude_event(&event),
+    }
+}
+```
+
+Each formatter returns `Some(line)` for events to show, `None` for events to skip.
+
+### Flags
+
+- `orch stream` — formatted, per-agent rendering (default)
+- `orch stream --raw` — raw NDJSON (for debugging)
+
+### Files
+
+| File | Change |
+|------|--------|
+| `src/cli/stream.rs` or `src/cli/events.rs` | Per-agent NDJSON formatters |
+| `src/engine/runner/agents/mod.rs` | Reuse agent detection logic |
