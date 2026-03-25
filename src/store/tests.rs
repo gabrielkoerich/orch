@@ -4929,10 +4929,13 @@ async fn resolve_task_id_fallback_respects_repo() {
 fn parse_since_duration_days() {
     use crate::store::control::parse_since_duration;
     let ts = parse_since_duration("7d").unwrap();
-    // The timestamp must be a well-formed SQLite datetime string.
-    assert!(ts.len() == 19, "unexpected length: {ts:?}");
-    // Must start with a 4-digit year.
-    assert!(ts.starts_with("20"), "unexpected prefix: {ts:?}");
+    // The timestamp must be a well-formed RFC3339 string (e.g. 2026-03-18T09:56:02Z).
+    assert_eq!(ts.len(), 20, "unexpected length: {ts:?}");
+    // Must be in RFC3339 format: starts with year, contains 'T', ends with 'Z'.
+    assert!(
+        ts.starts_with("20") && ts.contains('T') && ts.ends_with('Z'),
+        "expected RFC3339 format: {ts:?}"
+    );
     // Must be in the past (less than now).
     let now_ts = parse_since_duration("0d");
     assert!(now_ts.is_err(), "0d should be rejected");
@@ -4942,14 +4945,14 @@ fn parse_since_duration_days() {
 fn parse_since_duration_hours() {
     use crate::store::control::parse_since_duration;
     let ts = parse_since_duration("24h").unwrap();
-    assert_eq!(ts.len(), 19);
+    assert_eq!(ts.len(), 20);
 }
 
 #[test]
 fn parse_since_duration_minutes() {
     use crate::store::control::parse_since_duration;
     let ts = parse_since_duration("30m").unwrap();
-    assert_eq!(ts.len(), 19);
+    assert_eq!(ts.len(), 20);
 }
 
 #[test]
