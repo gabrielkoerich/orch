@@ -56,6 +56,113 @@ pub(crate) async fn tick_check_session_completions(
     Ok(())
 }
 
+/// Result of checking whether a task is stuck.
+struct StuckCheck {
+    age_minutes: i64,
+    has_session: bool,
+}
+
+/// Parameters for recovering a single stuck task.
+struct RecoveryParams<'a> {
+    task_id: &'a ExternalId,
+    task_id_str: &'a str,
+    info: &'a StuckCheck,
+    target_status: Status,
+    status_label: &'a str,
+    post_comment: bool,
+}
+
+/// Check if a task is stuck by comparing its age against the configured threshold.
+fn check_stuck(updated_at: &str, has_session: bool, config: &EngineConfig) -> Option<StuckCheck> {
+    let updated = chrono::DateTime::parse_from_rfc3339(updated_at)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let age = chrono::Utc::now() - updated;
+    let threshold = if has_session {
+        config.stuck_timeout
+    } else {
+        config.no_session_stuck_timeout
+    };
+    if age.num_seconds() > threshold as i64 {
+        Some(StuckCheck {
+            age_minutes: age.num_minutes(),
+            has_session,
+        })
+    } else {
+        None
+    }
+}
+
+/// Recover a single stuck task: clear review session, reset status, optionally post comment.
+async fn recover_stuck_task(
+    backend: &Arc<dyn ExternalBackend>,
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+    repo: &str,
+    p: &RecoveryParams<'_>,
+) {
+    tracing::warn!(
+        task_id = p.task_id_str,
+        age_mins = p.info.age_minutes,
+        "recovering stuck {} task: {}",
+        p.status_label,
+        if p.info.has_session {
+            "timed out with active session"
+        } else {
+            "no session found"
+        }
+    );
+
+    if matches!(p.target_status, Status::NeedsReview) {
+        set_review_session_expected(store, repo, p.task_id_str, false).await;
+    }
+
+    if let Err(e) = task_manager
+        .update_task_status(p.task_id, p.target_status)
+        .await
+    {
+        tracing::warn!(
+            task_id = p.task_id_str,
+            ?e,
+            "failed to reset stuck task status"
+        );
+        return;
+    }
+
+    if p.post_comment {
+        let reason = if p.info.has_session {
+            format!(
+                "timed out after {}m with active session (cleared agent for re-routing)",
+                p.info.age_minutes
+            )
+        } else {
+            format!(
+                "no session found — reclaiming early after {}m (cleared agent for re-routing)",
+                p.info.age_minutes
+            )
+        };
+        if let Err(e) = backend
+            .post_comment(
+                p.task_id,
+                &format!(
+                    "[{}] recovered: stuck {} — {}{}",
+                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                    p.status_label,
+                    reason,
+                    crate::engine::orch_footer()
+                ),
+            )
+            .await
+        {
+            tracing::warn!(
+                task_id = p.task_id_str,
+                ?e,
+                "failed to post stuck-task recovery comment"
+            );
+        }
+    }
+}
+
 /// Phase 2 of tick: detect tasks stuck in_progress or in_review without an active tmux session and reset them.
 /// - `in_progress` tasks → reset to `New` (clears routing state so the LLM router re-routes)
 /// - `in_review` tasks   → reset to `NeedsReview` (keeps routing state; review agent re-triggers)
@@ -68,6 +175,8 @@ pub(crate) async fn tick_recover_stuck_tasks(
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
+
+    // ── Recover external tasks stuck in in_progress ─────────────────────────
     let in_progress = task_manager
         .list_external_by_status(Status::InProgress)
         .await?;
@@ -75,97 +184,47 @@ pub(crate) async fn tick_recover_stuck_tasks(
         let session_name = tmux.session_name(repo, &task.id.0);
         let has_session = tmux.session_exists(&session_name).await;
 
-        let threshold = if has_session {
-            config.stuck_timeout
-        } else {
-            config.no_session_stuck_timeout
+        let Some(info) = check_stuck(&task.updated_at, has_session, config) else {
+            continue;
         };
 
-        let updated = match chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
-            Ok(dt) => dt.with_timezone(&chrono::Utc),
-            Err(e) => {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    updated_at = task.updated_at,
-                    ?e,
-                    "cannot parse updated_at, skipping stuck-task check"
-                );
-                continue;
-            }
-        };
-        let age = chrono::Utc::now() - updated;
-
-        if age.num_seconds() > threshold as i64 {
-            if has_session {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    age_mins = age.num_minutes(),
-                    threshold_mins = threshold / 60,
-                    "recovering stuck task: timed out with active session → new"
-                );
-            } else {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    age_mins = age.num_minutes(),
-                    threshold_mins = threshold / 60,
-                    "recovering stuck task: no session found — reclaiming early → new"
-                );
-            }
-            // Remove stale agent label so the LLM router re-routes properly
-            for label in &task.labels {
-                if label.starts_with("agent:") {
-                    backend.remove_label(&task.id, label).await.ok();
-                }
-            }
-            store::store_set(
-                &Some(Arc::clone(store)),
-                repo,
-                &task.id.0,
-                &[
-                    ("agent", serde_json::Value::Null),
-                    ("model", serde_json::Value::Null),
-                    ("route_attempts", serde_json::json!(0)),
-                ],
-            )
-            .await;
-            if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
-                tracing::warn!(task_id = task.id.0, ?e, "failed to reset stuck task status");
-                continue;
-            }
-            let reason = if has_session {
-                format!(
-                    "timed out after {}m with active session (cleared agent for re-routing)",
-                    age.num_minutes()
-                )
-            } else {
-                format!(
-                    "no session found — reclaiming early after {}m (cleared agent for re-routing)",
-                    age.num_minutes()
-                )
-            };
-            if let Err(e) = backend
-                .post_comment(
-                    &task.id,
-                    &format!(
-                        "[{}] recovered: stuck in_progress — {}{}",
-                        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                        reason,
-                        crate::engine::orch_footer()
-                    ),
-                )
-                .await
-            {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    ?e,
-                    "failed to post stuck-task recovery comment"
-                );
-                continue;
+        // Remove stale agent label so the LLM router re-routes properly
+        for label in &task.labels {
+            if label.starts_with("agent:") {
+                backend.remove_label(&task.id, label).await.ok();
             }
         }
+        // Clear routing state so the LLM router re-routes on next attempt
+        store::store_set(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            &[
+                ("agent", serde_json::Value::Null),
+                ("model", serde_json::Value::Null),
+                ("route_attempts", serde_json::json!(0)),
+            ],
+        )
+        .await;
+
+        recover_stuck_task(
+            backend,
+            task_manager,
+            store,
+            repo,
+            &RecoveryParams {
+                task_id: &task.id,
+                task_id_str: &task.id.0,
+                info: &info,
+                target_status: Status::New,
+                status_label: "in_progress",
+                post_comment: true,
+            },
+        )
+        .await;
     }
 
-    // Recover internal (SQLite) tasks stuck in in_progress.
+    // ── Recover internal (SQLite) tasks stuck in in_progress ────────────────
     // These have no GitHub labels or comments — just reset the DB status to New.
     use crate::store::TaskStatus as DbStatus;
     let internal_in_progress = task_manager
@@ -176,57 +235,41 @@ pub(crate) async fn tick_recover_stuck_tasks(
         let session_name = tmux.session_name(repo, &task_id);
         let has_session = tmux.session_exists(&session_name).await;
 
-        let threshold = if has_session {
-            config.stuck_timeout
-        } else {
-            config.no_session_stuck_timeout
-        };
-
-        let age = if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
-            chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc)
-        } else {
+        let Some(info) = check_stuck(&task.updated_at, has_session, config) else {
             continue;
         };
 
-        if age.num_seconds() > threshold as i64 {
-            if has_session {
-                tracing::warn!(
-                    task_id,
-                    age_mins = age.num_minutes(),
-                    threshold_mins = threshold / 60,
-                    "recovering stuck internal task: timed out with active session → new"
-                );
-            } else {
-                tracing::warn!(
-                    task_id,
-                    age_mins = age.num_minutes(),
-                    threshold_mins = threshold / 60,
-                    "recovering stuck internal task: no session found — reclaiming early → new"
-                );
-            }
-            // Reset routing state so the LLM router is used on the next attempt
-            // (same reset that external tasks perform).
-            store::store_set(
-                &Some(Arc::clone(store)),
-                repo,
-                &task_id,
-                &[
-                    ("agent", serde_json::Value::Null),
-                    ("model", serde_json::Value::Null),
-                    ("route_attempts", serde_json::json!(0)),
-                ],
-            )
-            .await;
-            if let Err(e) = task_manager
-                .update_task_status(&ExternalId(task_id.clone()), Status::New)
-                .await
-            {
-                tracing::warn!(task_id, ?e, "failed to reset stuck internal task status");
-            }
-        }
+        // Reset routing state so the LLM router is used on the next attempt
+        store::store_set(
+            &Some(Arc::clone(store)),
+            repo,
+            &task_id,
+            &[
+                ("agent", serde_json::Value::Null),
+                ("model", serde_json::Value::Null),
+                ("route_attempts", serde_json::json!(0)),
+            ],
+        )
+        .await;
+
+        recover_stuck_task(
+            backend,
+            task_manager,
+            store,
+            repo,
+            &RecoveryParams {
+                task_id: &ExternalId(task_id.clone()),
+                task_id_str: &task_id,
+                info: &info,
+                target_status: Status::New,
+                status_label: "in_progress",
+                post_comment: false,
+            },
+        )
+        .await;
     }
 
-    // Recover external tasks stuck in in_review.
+    // ── Recover external tasks stuck in in_review ───────────────────────────
     // Unlike in_progress recovery, we reset to NeedsReview (not New) so the review
     // agent re-triggers without clearing the routing state.
     let in_review = task_manager
@@ -245,68 +288,28 @@ pub(crate) async fn tick_recover_stuck_tasks(
         let session_name = tmux.session_name(repo, &review_task_id);
         let has_session = tmux.session_exists(&session_name).await;
 
-        let threshold = if has_session {
-            config.stuck_timeout
-        } else {
-            config.no_session_stuck_timeout
+        let Some(info) = check_stuck(&task.updated_at, has_session, config) else {
+            continue;
         };
 
-        let updated = match chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
-            Ok(dt) => dt.with_timezone(&chrono::Utc),
-            Err(e) => {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    updated_at = task.updated_at,
-                    ?e,
-                    "cannot parse updated_at, skipping stuck in_review check"
-                );
-                continue;
-            }
-        };
-        let age = chrono::Utc::now() - updated;
-
-        if age.num_seconds() > threshold as i64 {
-            tracing::warn!(
-                task_id = task.id.0,
-                age_mins = age.num_minutes(),
-                threshold_mins = threshold / 60,
-                "recovering stuck in_review task: no session found — resetting to needs_review"
-            );
-            if let Err(e) = task_manager
-                .update_task_status(&task.id, Status::NeedsReview)
-                .await
-            {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    ?e,
-                    "failed to reset stuck in_review task status"
-                );
-                continue;
-            } else {
-                set_review_session_expected(store, repo, &task.id.0, false).await;
-            }
-            if let Err(e) = backend
-                .post_comment(
-                    &task.id,
-                    &format!(
-                        "[{}] recovered: stuck in_review — no session found after {}m, resetting to needs_review{}",
-                        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                        age.num_minutes(),
-                        crate::engine::orch_footer()
-                    ),
-                )
-                .await
-            {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    ?e,
-                    "failed to post stuck in_review recovery comment"
-                );
-            }
-        }
+        recover_stuck_task(
+            backend,
+            task_manager,
+            store,
+            repo,
+            &RecoveryParams {
+                task_id: &task.id,
+                task_id_str: &task.id.0,
+                info: &info,
+                target_status: Status::NeedsReview,
+                status_label: "in_review",
+                post_comment: true,
+            },
+        )
+        .await;
     }
 
-    // Recover internal (SQLite) tasks stuck in in_review.
+    // ── Recover internal (SQLite) tasks stuck in in_review ──────────────────
     let internal_in_review = task_manager
         .list_internal_by_status(DbStatus::InReview)
         .await?;
@@ -324,38 +327,25 @@ pub(crate) async fn tick_recover_stuck_tasks(
         let session_name = tmux.session_name(repo, &review_task_id);
         let has_session = tmux.session_exists(&session_name).await;
 
-        let threshold = if has_session {
-            config.stuck_timeout
-        } else {
-            config.no_session_stuck_timeout
-        };
-
-        let age = if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
-            chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc)
-        } else {
+        let Some(info) = check_stuck(&task.updated_at, has_session, config) else {
             continue;
         };
 
-        if age.num_seconds() > threshold as i64 {
-            tracing::warn!(
-                task_id,
-                age_mins = age.num_minutes(),
-                threshold_mins = threshold / 60,
-                "recovering stuck internal in_review task: no session found — resetting to needs_review"
-            );
-            if let Err(e) = task_manager
-                .update_task_status(&ExternalId(task_id.clone()), Status::NeedsReview)
-                .await
-            {
-                tracing::warn!(
-                    task_id,
-                    ?e,
-                    "failed to reset stuck internal in_review task status"
-                );
-            } else {
-                set_review_session_expected(store, repo, &task_id, false).await;
-            }
-        }
+        recover_stuck_task(
+            backend,
+            task_manager,
+            store,
+            repo,
+            &RecoveryParams {
+                task_id: &ExternalId(task_id.clone()),
+                task_id_str: &task_id,
+                info: &info,
+                target_status: Status::NeedsReview,
+                status_label: "in_review",
+                post_comment: false,
+            },
+        )
+        .await;
     }
 
     Ok(())
