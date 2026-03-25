@@ -147,6 +147,22 @@ pub async fn handle_error(
         ),
     };
 
+    // If this was a timeout, clear the stored agent so the router can
+    // pick a different executor on re-dispatch. Without this the same
+    // slow agent can be picked again and will timeout repeatedly.
+    if retryable == response::RetryableError::Timeout {
+        store::store_set(
+            store,
+            repo,
+            task_id,
+            &[
+                ("agent", serde_json::json!("")),
+                ("last_error", serde_json::json!(error_msg.clone())),
+            ],
+        )
+        .await;
+    }
+
     // Record rate limit in store (sqlx)
     {
         let error_type_str = match retryable {
