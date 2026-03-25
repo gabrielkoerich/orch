@@ -140,10 +140,16 @@ async fn ensure_pr_exists(
             // No open PR — check if branch has commits ahead of default branch.
             let default_branch =
                 crate::config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+            let worktree_str = worktree_path.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "worktree path contains non-UTF-8 characters: {:?}",
+                    worktree_path
+                )
+            })?;
             let has_commits = tokio::process::Command::new("git")
                 .args([
                     "-C",
-                    worktree_path.to_str().unwrap_or("."),
+                    worktree_str,
                     "rev-list",
                     "--count",
                     &format!("origin/{default_branch}..HEAD"),
@@ -169,14 +175,7 @@ async fn ensure_pr_exists(
                 );
                 // Push first in case agent forgot
                 let _ = tokio::process::Command::new("git")
-                    .args([
-                        "-C",
-                        worktree_path.to_str().unwrap_or("."),
-                        "push",
-                        "-u",
-                        "origin",
-                        branch_name,
-                    ])
+                    .args(["-C", worktree_str, "push", "-u", "origin", branch_name])
                     .output()
                     .await;
 
