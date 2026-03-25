@@ -437,7 +437,12 @@ impl LlmRouter {
                 Err(AgentError::AgentFailed { message }) => {
                     anyhow::bail!("router LLM returned error: {message}")
                 }
-                Err(AgentError::InvalidResponse { .. }) => Ok(raw.to_string()),
+                Err(AgentError::InvalidResponse { raw }) => {
+                    if let Some(text) = opencode::extract_router_text(&raw) {
+                        return Ok(text);
+                    }
+                    Ok(raw)
+                }
                 Err(err) => anyhow::bail!("router LLM returned error: {err}"),
             },
             _ => Ok(raw.to_string()),

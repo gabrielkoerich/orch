@@ -352,7 +352,7 @@ pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> 
 /// - claude stream-json: `{"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}`
 /// - claude result:      `{"type":"result","result":"..."}`
 fn ndjson_extract_text(ndjson: &str) -> String {
-    ndjson
+    let texts: Vec<String> = ndjson
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -403,8 +403,21 @@ fn ndjson_extract_text(ndjson: &str) -> String {
                 _ => None,
             }
         })
-        .collect::<Vec<_>>()
-        .join("")
+        .collect();
+
+    let joined = texts.join("");
+    if parse_review_response(&joined).is_ok() {
+        return joined;
+    }
+
+    for text in texts.iter().rev() {
+        let trimmed = text.trim();
+        if trimmed.contains('{') && trimmed.contains("decision") {
+            return text.clone();
+        }
+    }
+
+    joined
 }
 
 /// Parse a review response from already-unwrapped text.
@@ -828,6 +841,18 @@ That's all."#;
         );
         let resp = parse_review_from_output(ndjson).unwrap();
         assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn parse_review_from_output_ndjson_prefers_final_json_text_event() {
+        let ndjson = concat!(
+            r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"Working on it..."}}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1002,"part":{"type":"text","text":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}"}}"#,
+        );
+        let resp = parse_review_from_output(ndjson).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert_eq!(resp.notes, "LGTM");
     }
 
     /// Concatenated text events produce a valid ReviewResponse.

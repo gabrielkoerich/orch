@@ -238,7 +238,9 @@ impl AgentRunner for CodexRunner {
         msg_file: &str,
         permissions: &PermissionRules,
     ) -> String {
-        let model_flag = model.map(|m| format!("--model {m}")).unwrap_or_default();
+        let model_flag = model
+            .map(|m| format!("--model {}", super::shell_single_quote(m)))
+            .unwrap_or_default();
 
         // Codex permission mode:
         // - autonomous → --full-auto (auto-approval + workspace-write sandbox)
@@ -459,7 +461,7 @@ mod tests {
             &perms,
         );
         assert!(cmd.contains("codex"));
-        assert!(cmd.contains("--model gpt-4o"));
+        assert!(cmd.contains("--model 'gpt-4o'"));
         assert!(cmd.contains("exec --json -"));
         assert!(
             cmd.contains("--full-auto"),
