@@ -354,6 +354,17 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Reset a task back to `new`.
+    pub async fn reset_to_new(&self, id: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE tasks SET status = 'new', branch = '', worktree = '', worktree_cleaned = 0, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Update the block reason for a task.
     pub async fn set_block_reason(&self, id: i64, reason: Option<&str>) -> anyhow::Result<()> {
         let value = reason

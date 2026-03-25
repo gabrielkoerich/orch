@@ -383,7 +383,13 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             );
         } else {
             tracing::info!(task_id, worktree = %wt.display(), "removing worktree");
-            remove_worktree_and_branch(task_id, &wt, branch.as_deref(), &repo_root).await;
+            remove_worktree_and_branch(
+                task_id,
+                &wt,
+                branch.as_deref(),
+                std::path::Path::new(&repo_root),
+            )
+            .await;
             did_clean = true;
         }
     } else if let Some(ref br) = branch {
@@ -391,7 +397,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
         // on the remote. Delete it to avoid orphaned branches.
         if !opts.dry_run {
             tracing::debug!(task_id, branch = %br, "no worktree on disk, cleaning up branch only");
-            delete_branches(task_id, br, &repo_root).await;
+            delete_branches(task_id, br, std::path::Path::new(&repo_root)).await;
             did_clean = true;
         }
     }
@@ -407,18 +413,26 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
 }
 
 /// Remove a git worktree directory and its local + remote branches.
-async fn remove_worktree_and_branch(
+pub(crate) async fn remove_worktree_and_branch(
     task_id: &str,
     wt: &std::path::Path,
     branch: Option<&str>,
-    repo_root: &str,
+    repo_root: &std::path::Path,
 ) {
     let wt_str = wt.to_string_lossy().to_string();
+    let repo_root_str = repo_root.to_string_lossy();
 
     // Remove worktree FIRST, then delete the branch.
     // Git refuses to remove a worktree if its branch is already deleted.
     let remove_result = Command::new("git")
-        .args(["-C", repo_root, "worktree", "remove", &wt_str, "--force"])
+        .args([
+            "-C",
+            repo_root_str.as_ref(),
+            "worktree",
+            "remove",
+            &wt_str,
+            "--force",
+        ])
         .output_with_context()
         .await;
 
@@ -442,9 +456,10 @@ async fn remove_worktree_and_branch(
 }
 
 /// Delete local and remote branches for a task.
-async fn delete_branches(task_id: &str, br: &str, repo_root: &str) {
+pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::path::Path) {
+    let repo_root_str = repo_root.to_string_lossy();
     let branch_delete_result = Command::new("git")
-        .args(["-C", repo_root, "branch", "-D", br])
+        .args(["-C", repo_root_str.as_ref(), "branch", "-D", br])
         .output_with_context()
         .await;
 
@@ -467,7 +482,14 @@ async fn delete_branches(task_id: &str, br: &str, repo_root: &str) {
 
     // Delete remote branch
     let remote_delete = Command::new("git")
-        .args(["-C", repo_root, "push", "origin", "--delete", br])
+        .args([
+            "-C",
+            repo_root_str.as_ref(),
+            "push",
+            "origin",
+            "--delete",
+            br,
+        ])
         .output_with_context()
         .await;
 

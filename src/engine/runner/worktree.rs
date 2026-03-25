@@ -22,6 +22,108 @@ pub struct WorktreeSetup {
     pub main_project_dir: PathBuf,
 }
 
+/// Canonical project name used under `~/.orch/worktrees/`.
+pub fn project_name(project_dir: &Path) -> String {
+    project_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string())
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+/// Base worktrees directory for a project.
+pub fn project_worktrees_dir(project_dir: &Path) -> PathBuf {
+    crate::home::worktrees_dir()
+        .unwrap_or_default()
+        .join(project_name(project_dir))
+}
+
+/// List all worktree directories for a project.
+pub fn list_project_worktrees(project_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let base = project_worktrees_dir(project_dir);
+    let mut worktrees = Vec::new();
+
+    if !base.exists() {
+        return Ok(worktrees);
+    }
+
+    for entry in std::fs::read_dir(&base)? {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            worktrees.push(entry.path());
+        }
+    }
+
+    Ok(worktrees)
+}
+
+/// Extract a task ID from a worktree directory name.
+pub fn task_id_from_worktree_name(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("internal-") {
+        let num = rest.split('-').next()?;
+        return num.parse::<u64>().ok().map(|n| format!("internal:{n}"));
+    }
+
+    for prefix in ["gh-issue-", "gh-task-"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            let task_part = rest.split('-').next()?;
+            if task_part == "internal" {
+                let num = rest.split('-').nth(1)?;
+                return num.parse::<u64>().ok().map(|n| format!("internal:{n}"));
+            }
+            return Some(task_part.to_string());
+        }
+    }
+
+    None
+}
+
+/// Abort any rebase in progress for a worktree.
+pub async fn abort_worktree_rebase(worktree_dir: &Path) {
+    let _ = Command::new("git")
+        .args(["rebase", "--abort"])
+        .current_dir(worktree_dir)
+        .output_with_context()
+        .await;
+}
+
+/// Rebase a worktree on top of `origin/main`.
+pub async fn rebase_worktree_on_origin_main(
+    worktree_dir: &Path,
+    repo_root: &Path,
+) -> anyhow::Result<()> {
+    let repo_root_str = repo_root.to_string_lossy();
+    let fetch = Command::new("git")
+        .args(["-C", repo_root_str.as_ref(), "fetch", "origin"])
+        .output_with_context()
+        .await?;
+    if !fetch.status.success() {
+        anyhow::bail!(
+            "git fetch origin failed: {}",
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        );
+    }
+
+    let rebase = Command::new("git")
+        .args([
+            "-C",
+            &worktree_dir.to_string_lossy(),
+            "rebase",
+            "origin/main",
+        ])
+        .output_with_context()
+        .await?;
+    if !rebase.status.success() {
+        anyhow::bail!(
+            "git rebase origin/main failed: {}",
+            String::from_utf8_lossy(&rebase.stderr).trim()
+        );
+    }
+
+    Ok(())
+}
+
 /// Generate a branch name from task ID and title.
 ///
 /// Format: `internal-{id}-{slug}` for internal tasks, `gh-issue-{id}-{slug}` for external.
@@ -153,16 +255,7 @@ pub async fn setup_worktree(
     let main_dir = resolve_main_repo(project_dir).await;
     let default_branch = detect_default_branch(&main_dir).await;
 
-    let project_name = main_dir
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "project".to_string())
-        .trim_end_matches(".git")
-        .to_string();
-
-    let worktrees_base = crate::home::worktrees_dir()
-        .unwrap_or_default()
-        .join(&project_name);
+    let worktrees_base = project_worktrees_dir(&main_dir);
     std::fs::create_dir_all(&worktrees_base)?;
 
     // Check if we have a saved branch/worktree in store
@@ -510,6 +603,35 @@ mod tests {
         let slug = name.strip_prefix("gh-issue-265-").unwrap();
         assert!(slug.len() <= 40, "slug too long: {}", slug.len());
         assert!(slug.is_ascii(), "slug contains non-ASCII: {slug}");
+    }
+
+    #[test]
+    fn task_id_from_worktree_name_parses_issue_branches() {
+        assert_eq!(
+            task_id_from_worktree_name("gh-issue-42-fix-login"),
+            Some("42".to_string())
+        );
+        assert_eq!(
+            task_id_from_worktree_name("gh-task-42-fix-login"),
+            Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn task_id_from_worktree_name_parses_internal_branches() {
+        assert_eq!(
+            task_id_from_worktree_name("internal-8-fix-login"),
+            Some("internal:8".to_string())
+        );
+        assert_eq!(
+            task_id_from_worktree_name("gh-issue-internal-8-fix-login"),
+            Some("internal:8".to_string())
+        );
+    }
+
+    #[test]
+    fn task_id_from_worktree_name_returns_none_for_unknown_names() {
+        assert!(task_id_from_worktree_name("random-worktree").is_none());
     }
 
     #[test]
