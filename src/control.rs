@@ -47,6 +47,40 @@ pub struct ModelSpec {
     pub model: String,
 }
 
+/// Parsed control command from the chat session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlCommand {
+    Model(Option<String>),
+    Agent(Option<String>),
+}
+
+fn default_model_for_agent(agent: &str) -> &'static str {
+    match agent {
+        "codex" => "gpt-4o",
+        "opencode" => "deepseek-r1",
+        _ => "sonnet",
+    }
+}
+
+/// Parse a control-session command.
+pub fn parse_control_command(message: &str) -> Option<ControlCommand> {
+    let trimmed = message.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    let (command, args) = rest
+        .split_once(' ')
+        .map_or((rest, ""), |(cmd, tail)| (cmd, tail.trim()));
+
+    match command {
+        "model" => Some(ControlCommand::Model(
+            (!args.is_empty()).then(|| args.to_string()),
+        )),
+        "agent" => Some(ControlCommand::Agent(
+            (!args.is_empty()).then(|| args.to_string()),
+        )),
+        _ => None,
+    }
+}
+
 /// Parse a model spec string into agent + model.
 ///
 /// Formats:
@@ -289,17 +323,87 @@ pub async fn get_agent(store: &TaskStore) -> String {
         .unwrap_or_else(|| "claude".to_string())
 }
 
-/// Set the current model and agent in KV.
-pub async fn set_model_spec(store: &TaskStore, spec: &ModelSpec) -> Result<()> {
+/// Get the current control session spec from KV.
+pub async fn get_current_spec(store: &TaskStore) -> ModelSpec {
+    ModelSpec {
+        agent: get_agent(store).await,
+        model: get_model(store).await,
+    }
+}
+
+/// Set the current model in KV.
+pub async fn set_model(store: &TaskStore, model: &str) -> Result<()> {
     store
-        .kv_set("control:model", &spec.model)
+        .kv_set("control:model", model)
         .await
         .context("setting control model")?;
+    Ok(())
+}
+
+/// Set the current agent in KV.
+pub async fn set_agent(store: &TaskStore, agent: &str) -> Result<()> {
     store
-        .kv_set("control:agent", &spec.agent)
+        .kv_set("control:agent", agent)
         .await
         .context("setting control agent")?;
     Ok(())
+}
+
+/// Set the current model and agent in KV.
+pub async fn set_model_spec(store: &TaskStore, spec: &ModelSpec) -> Result<()> {
+    set_model(store, &spec.model).await?;
+    set_agent(store, &spec.agent).await?;
+    Ok(())
+}
+
+/// Set the current agent and its default model in KV.
+pub async fn set_agent_spec(store: &TaskStore, agent: &str) -> Result<ModelSpec> {
+    let spec = ModelSpec {
+        agent: agent.to_string(),
+        model: default_model_for_agent(agent).to_string(),
+    };
+    set_model_spec(store, &spec).await?;
+    Ok(spec)
+}
+
+fn format_current_spec(spec: &ModelSpec) -> String {
+    format!("Current: {}:{}", spec.agent, spec.model)
+}
+
+fn format_switched_spec(spec: &ModelSpec) -> String {
+    format!("Switched to **{}:{}** (validated)", spec.agent, spec.model)
+}
+
+fn format_switched_agent(spec: &ModelSpec) -> String {
+    format!("Switched to **{}:{}**", spec.agent, spec.model)
+}
+
+async fn handle_control_command(store: &TaskStore, command: ControlCommand) -> Result<String> {
+    match command {
+        ControlCommand::Model(None) => Ok(format_current_spec(&get_current_spec(store).await)),
+        ControlCommand::Model(Some(new_spec)) => {
+            let spec = parse_model_spec(&new_spec);
+            validate_model(&spec).await?;
+            set_model_spec(store, &spec).await?;
+            Ok(format_switched_spec(&spec))
+        }
+        ControlCommand::Agent(None) => Ok(format_current_spec(&get_current_spec(store).await)),
+        ControlCommand::Agent(Some(agent)) => {
+            let spec = set_agent_spec(store, &agent).await?;
+            Ok(format_switched_agent(&spec))
+        }
+    }
+}
+
+/// Handle a control-session command if present.
+pub async fn maybe_handle_control_command(
+    store: &TaskStore,
+    message: &str,
+) -> Result<Option<String>> {
+    Ok(match parse_control_command(message) {
+        Some(command) => Some(handle_control_command(store, command).await?),
+        None => None,
+    })
 }
 
 /// Memory entry parsed from an agent response.
@@ -412,8 +516,8 @@ pub async fn invoke_agent(
 
 /// High-level entry point: process a user message and return the assistant response.
 ///
-/// Handles `/model` commands, assembles context, invokes the agent, parses the
-/// response for summaries, and stores both user and assistant messages.
+/// Handles `/model` and `/agent` commands, assembles context, invokes the agent,
+/// parses the response for summaries, and stores both user and assistant messages.
 pub async fn send_message(
     store: &TaskStore,
     session_id: &str,
@@ -421,20 +525,9 @@ pub async fn send_message(
     channel_thread: Option<&str>,
     message: &str,
 ) -> Result<String> {
-    // Handle /model command — don't store as a message
-    if let Some(new_spec) = message.strip_prefix("/model").map(str::trim) {
-        if new_spec.is_empty() {
-            let model = get_model(store).await;
-            let agent = get_agent(store).await;
-            return Ok(format!("Current: {agent}:{model}"));
-        }
-        let spec = parse_model_spec(new_spec);
-        validate_model(&spec).await?;
-        set_model_spec(store, &spec).await?;
-        return Ok(format!(
-            "Switched to **{}:{}** (validated)",
-            spec.agent, spec.model
-        ));
+    // Handle control commands — don't store as messages.
+    if let Some(response) = maybe_handle_control_command(store, message).await? {
+        return Ok(response);
     }
 
     // Acquire per-session lock — serializes concurrent invocations for the same session.
@@ -685,6 +778,60 @@ mod tests {
             .unwrap();
         assert!(response.contains("claude"));
         assert!(response.contains("sonnet"));
+    }
+
+    #[tokio::test]
+    async fn send_message_agent_show_current() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let response = send_message(&store, "default", "cli", None, "/agent")
+            .await
+            .unwrap();
+        assert!(response.contains("claude"));
+        assert!(response.contains("sonnet"));
+    }
+
+    #[tokio::test]
+    async fn send_message_agent_switches_with_default_model() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let response = maybe_handle_control_command(&store, "/agent codex")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.contains("codex:gpt-4o"));
+        assert_eq!(get_agent(&store).await, "codex");
+        assert_eq!(get_model(&store).await, "gpt-4o");
+    }
+
+    #[test]
+    fn parse_control_command_model_and_agent() {
+        assert_eq!(
+            parse_control_command("/model"),
+            Some(ControlCommand::Model(None))
+        );
+        assert_eq!(
+            parse_control_command("/agent"),
+            Some(ControlCommand::Agent(None))
+        );
+        assert_eq!(
+            parse_control_command("/agent codex"),
+            Some(ControlCommand::Agent(Some("codex".to_string())))
+        );
+        assert_eq!(
+            parse_control_command("/model opencode:deepseek-r1"),
+            Some(ControlCommand::Model(Some(
+                "opencode:deepseek-r1".to_string()
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn set_agent_spec_persists_default_model() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let spec = set_agent_spec(&store, "codex").await.unwrap();
+        assert_eq!(spec.agent, "codex");
+        assert_eq!(spec.model, "gpt-4o");
+        assert_eq!(get_agent(&store).await, "codex");
+        assert_eq!(get_model(&store).await, "gpt-4o");
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ pub async fn interactive(session_id: &str) -> anyhow::Result<()> {
     };
 
     println!("orch control session ({agent}:{model}){session_label}");
-    println!("Type /model [agent:]<model> to switch, Ctrl+C to exit");
+    println!("Type /model [agent:]<model> or /agent <name> to switch, Ctrl+C to exit");
     println!("---");
 
     let stdin = io::stdin();
@@ -41,14 +41,20 @@ pub async fn interactive(session_id: &str) -> anyhow::Result<()> {
             break;
         }
 
-        match control::send_message(&store, session_id, "cli", None, message).await {
-            Ok(response) => {
+        match control::maybe_handle_control_command(&store, message).await? {
+            Some(response) => {
                 println!("{response}");
                 println!();
             }
-            Err(e) => {
-                eprintln!("error: {e}");
-            }
+            None => match control::send_message(&store, session_id, "cli", None, message).await {
+                Ok(response) => {
+                    println!("{response}");
+                    println!();
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                }
+            },
         }
     }
 
@@ -58,6 +64,11 @@ pub async fn interactive(session_id: &str) -> anyhow::Result<()> {
 /// Single message mode — send one message, print response, exit.
 pub async fn single_message(session_id: &str, message: &str) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
+    if let Some(response) = control::maybe_handle_control_command(&store, message).await? {
+        println!("{response}");
+        return Ok(());
+    }
+
     let response = control::send_message(&store, session_id, "cli", None, message).await?;
     println!("{response}");
     Ok(())
