@@ -256,6 +256,23 @@ pub(crate) async fn auto_merge_pr(
         let is_conflict = err_msg.contains("405")
             || err_msg.contains("not mergeable")
             || err_msg.contains("merge conflict");
+        let is_transient = err_msg.contains("502")
+            || err_msg.contains("503")
+            || err_msg.contains("504")
+            || err_msg.contains("server error")
+            || err_msg.contains("bad gateway")
+            || err_msg.contains("service unavailable");
+
+        if is_transient {
+            tracing::warn!(
+                task_id = task.id.0,
+                pr_number,
+                error = %e,
+                "transient GitHub error on merge — will retry next sync"
+            );
+            // Don't change status — task stays in InReview, sync tick retries
+            return Ok(());
+        }
 
         if is_conflict {
             let retries = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
