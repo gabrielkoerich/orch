@@ -10,7 +10,7 @@
 use crate::cmd::CommandErrorContext;
 use crate::github::http::GhHttp;
 use std::path::Path;
-use std::time::Duration;
+
 use tokio::process::Command;
 
 /// Format a task ID for display in PR/issue footers.
@@ -375,84 +375,60 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     tracing::info!(branch = branch_to_push, "pushing branch");
 
     let auth_args = build_git_auth_args();
-    let max_attempts = 3;
-    let needs_pre_push_rebase = remote_exists && has_unpushed;
 
-    for attempt in 1..=max_attempts {
-        if attempt == 1 && needs_pre_push_rebase {
-            if let Err(e) = rebase_branch_on_remote(dir, branch_to_push, &auth_args).await {
-                tracing::warn!(branch = branch_to_push, error = %e, "pre-push rebase failed");
-                return Err(e);
-            }
-        }
+    // First attempt: normal push (no force).
+    let push_args = build_push_args(&auth_args, branch_to_push, false);
+    let output = Command::new("git")
+        .args(&push_args)
+        .current_dir(dir)
+        .output_with_context()
+        .await?;
 
-        let push_args = build_push_args(&auth_args, branch_to_push);
+    if output.status.success() {
+        tracing::info!(branch = branch_to_push, "push succeeded");
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    // If non-fast-forward, the branch was likely rebased on the default branch
+    // by `rebase_on_default()` before the agent started — the local history is
+    // correct but diverges from the remote. Force-push with lease to update it
+    // without pulling (which would duplicate commits from main).
+    if push_needs_rebase(&stderr) && remote_exists {
+        tracing::info!(
+            branch = branch_to_push,
+            "push rejected (non-fast-forward), force-pushing with lease"
+        );
+        let force_args = build_push_args(&auth_args, branch_to_push, true);
         let output = Command::new("git")
-            .args(&push_args)
+            .args(&force_args)
             .current_dir(dir)
             .output_with_context()
             .await?;
 
         if output.status.success() {
-            tracing::info!(branch = branch_to_push, attempt, "push succeeded");
+            tracing::info!(branch = branch_to_push, "force push succeeded");
             return Ok(true);
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        tracing::warn!(
-            branch = branch_to_push,
-            attempt,
-            stdout = %stdout,
-            stderr = %stderr,
-            "push attempt failed"
-        );
-
-        if attempt == max_attempts {
-            anyhow::bail!("push failed after {max_attempts} attempts: {stderr}");
-        }
-
-        if push_needs_rebase(&stderr) && remote_exists {
-            tracing::info!(
-                branch = branch_to_push,
-                attempt,
-                "push rejected, rebasing and retrying"
-            );
-            if let Err(e) = rebase_branch_on_remote(dir, branch_to_push, &auth_args).await {
-                tracing::warn!(branch = branch_to_push, error = %e, "rebase after push rejection failed");
-                return Err(e);
-            }
-        } else if push_needs_rebase(&stderr) {
-            tracing::warn!(
-                branch = branch_to_push,
-                "push rejected but remote branch does not exist; will retry without rebase"
-            );
-        }
-
-        let delay = push_retry_delay(attempt);
-        tracing::info!(
-            branch = branch_to_push,
-            attempt,
-            delay_secs = delay.as_secs(),
-            "retrying push after backoff"
-        );
-        tokio::time::sleep(delay).await;
+        anyhow::bail!("force push failed: {stderr}");
     }
 
-    anyhow::bail!("push failed unexpectedly")
+    anyhow::bail!("push failed: {stderr}")
 }
 
-fn build_push_args(auth_args: &[String], branch: &str) -> Vec<String> {
-    auth_args
-        .iter()
-        .cloned()
-        .chain([
-            "push".to_string(),
-            "-u".to_string(),
-            "origin".to_string(),
-            branch.to_string(),
-        ])
-        .collect()
+fn build_push_args(auth_args: &[String], branch: &str, force: bool) -> Vec<String> {
+    let mut args: Vec<String> = auth_args.to_vec();
+    args.push("push".to_string());
+    if force {
+        args.push("--force-with-lease".to_string());
+    }
+    args.push("-u".to_string());
+    args.push("origin".to_string());
+    args.push(branch.to_string());
+    args
 }
 
 fn push_needs_rebase(stderr: &str) -> bool {
@@ -461,57 +437,6 @@ fn push_needs_rebase(stderr: &str) -> bool {
         || lower.contains("rejected")
         || lower.contains("fetch first")
         || lower.contains("behind")
-}
-
-fn push_retry_delay(attempt: u32) -> Duration {
-    let base_secs = 1u64 << (attempt.saturating_sub(1).min(3));
-    Duration::from_secs(base_secs.min(8))
-}
-
-async fn rebase_branch_on_remote(
-    dir: &Path,
-    branch: &str,
-    auth_args: &[String],
-) -> anyhow::Result<()> {
-    // Use the same HTTPS auth args as the push so that SSH remotes are rewritten
-    // to HTTPS+token. Without this, `git fetch` uses raw SSH, which fails when
-    // the SSH agent is unavailable even though the push itself would succeed via
-    // HTTPS token auth.
-    let fetch = Command::new("git")
-        .args(auth_args)
-        .args(["fetch", "origin", "--prune"])
-        .current_dir(dir)
-        .output_with_context()
-        .await?;
-
-    if !fetch.status.success() {
-        let stderr = String::from_utf8_lossy(&fetch.stderr);
-        anyhow::bail!("git fetch failed before push rebase: {stderr}");
-    }
-
-    let output = Command::new("git")
-        .args(auth_args)
-        .args(["pull", "--rebase", "origin", branch])
-        .current_dir(dir)
-        .output_with_context()
-        .await?;
-
-    if output.status.success() {
-        tracing::info!(branch, "rebased local branch on remote before push");
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    tracing::warn!(branch, stdout = %stdout, stderr = %stderr, "pre-push rebase failed");
-
-    let _ = Command::new("git")
-        .args(["rebase", "--abort"])
-        .current_dir(dir)
-        .output_with_context()
-        .await;
-
-    anyhow::bail!("git pull --rebase origin {branch} failed: {stderr}");
 }
 
 /// Create a PR if one doesn't already exist.
@@ -836,13 +761,5 @@ mod tests {
         assert!(push_needs_rebase(
             "push rejected because the remote contains work"
         ));
-    }
-
-    #[test]
-    fn push_retry_delay_exponentially_backs_off() {
-        assert_eq!(push_retry_delay(1), Duration::from_secs(1));
-        assert_eq!(push_retry_delay(2), Duration::from_secs(2));
-        assert_eq!(push_retry_delay(3), Duration::from_secs(4));
-        assert_eq!(push_retry_delay(8), Duration::from_secs(8));
     }
 }
