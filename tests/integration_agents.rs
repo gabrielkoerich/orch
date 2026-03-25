@@ -17,9 +17,100 @@
 //! cargo test --test integration_agents minimax -- --ignored --nocapture
 //! cargo test --test integration_agents router -- --ignored --nocapture
 //! ```
-
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
+use orch::{
+    db::testing::TestStore,
+    engine::runner::{
+        agents::{self, AgentError, AgentRunner},
+        fallback,
+    },
+    store,
+};
 
+
+#[tokio::test]
+#[allow(unreachable_patterns)]
+async fn handle_error_timeout_reroutes_to_different_agent() {
+    let store = Arc::new(TestStore::new().await);
+    let task_id = "timeout-test-1";
+    let repo = "test/repo";
+
+    store
+        .new_task(repo, 1, "test task", None, None, None, false)
+        .await
+        .unwrap();
+
+    let agent_err = AgentError::Timeout {
+        elapsed: Duration::from_secs(120),
+    };
+
+    let agent_name = "claude";
+
+    let mock_runner = MockAgentRunner {
+        models: vec!["haiku".to_string()],
+    };
+
+    let result = fallback::handle_error(
+        task_id,
+        &agent_err,
+        agent_name,
+        &mock_runner,
+        None,
+        1,
+        &Some(store.clone()),
+        repo,
+    )
+    .await
+    .unwrap();
+
+    match result {
+        fallback::ErrorHandleResult::EarlyReturn { status } => {
+            assert_eq!(status, "new");
+        }
+        fallback::ErrorHandleResult::Continue { .. } => {
+            // This is also a valid path now, if no other agent is available.
+        }
+    }
+
+    let task = store.get_task_by_id(1).await.unwrap().unwrap();
+    if task.status == "new" {
+        assert_ne!(task.agent, agent_name);
+    }
+
+    assert!(task.last_error.contains("timed out"));
+}
+
+struct MockAgentRunner {
+    models: Vec<String>,
+}
+
+ impl AgentRunner for MockAgentRunner {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn available_models(&self) -> &[String] {
+        &self.models
+    }
+
+    fn build_command(
+        &self,
+        _task_id: &str,
+        _prompt: &str,
+        _config: &orch::config::AgentConfig,
+    ) -> anyhow::Result<std::process::Command> {
+        Ok(std::process::Command::new("true"))
+    }
+
+    fn parse_response(
+        &self,
+        _raw_output: &str,
+    ) -> Result<orch::parser::AgentResponse, agents::AgentError> {
+        unimplemented!()
+    }
+}
 /// Simple prompt that should produce a parseable JSON response.
 const SIMPLE_PROMPT: &str = r#"Reply with ONLY this JSON, no markdown, no explanation:
 {"status":"done","summary":"integration test","accomplished":["replied"],"remaining":[],"files":[]}"#;

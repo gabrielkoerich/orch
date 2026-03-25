@@ -41,6 +41,38 @@ pub async fn handle_error(
         "agent error, attempting recovery"
     );
 
+    // Handle timeout separately with a more aggressive fallback
+    if let agents::AgentError::Timeout { elapsed } = agent_err {
+        let error_msg = format!("{agent_name} timed out after {}s", elapsed.as_secs());
+        let status = response::handle_failover(
+            task_id,
+            agent_name,
+            response::RetryableError::Timeout,
+            &error_msg,
+            store,
+            repo,
+        )
+        .await;
+        response::store_failure_memory(
+            task_id,
+            new_attempts,
+            agent_name,
+            model_name,
+            &error_msg,
+            store,
+            repo,
+        )
+        .await;
+
+        if status == "new" {
+            // Rerouted, so return early.
+            return Ok(ErrorHandleResult::EarlyReturn { status });
+        } else {
+            // No reroute, so continue to normal cleanup.
+            return Ok(ErrorHandleResult::Continue { status });
+        }
+    }
+
     // Map AgentError to RetryableError for the existing handle_failover()
     let (retryable, error_msg) = match agent_err {
         agents::AgentError::RateLimit { message, .. } => (
@@ -50,10 +82,6 @@ pub async fn handle_error(
         agents::AgentError::Auth { message } => (
             response::RetryableError::AuthError,
             format!("{agent_name} auth error: {message}"),
-        ),
-        agents::AgentError::Timeout { elapsed } => (
-            response::RetryableError::Timeout,
-            format!("{agent_name} timed out after {}s", elapsed.as_secs()),
         ),
         agents::AgentError::MissingTool { tool } => (
             response::RetryableError::MissingTooling,
@@ -145,6 +173,8 @@ pub async fn handle_error(
             response::RetryableError::Failed,
             format!("{agent_name} exit {exit_code}: {message}"),
         ),
+        // Timeout is handled above, this is just to satisfy the borrow checker
+        agents::AgentError::Timeout { .. } => unreachable!(),
     };
 
     // Record rate limit in store (sqlx)

@@ -139,8 +139,6 @@ pub fn pick_timeout_fallback_agent(
 /// Retryable error types that should trigger agent failover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryableError {
-    /// Agent timed out.
-    Timeout,
     /// Usage/rate limit hit.
     UsageLimit,
     /// Auth/billing error.
@@ -149,6 +147,8 @@ pub enum RetryableError {
     Failed,
     /// Missing tooling - fallback might help if another agent has the tool.
     MissingTooling,
+    /// Agent timed out.
+    Timeout,
 }
 
 impl RetryableError {
@@ -157,10 +157,9 @@ impl RetryableError {
     #[allow(dead_code)]
     pub fn type_str(self) -> &'static str {
         match self {
-            RetryableError::Timeout => "timeout",
             RetryableError::UsageLimit => "rate_limit",
             RetryableError::AuthError => "auth_error",
-            RetryableError::Failed | RetryableError::MissingTooling => "failed",
+            RetryableError::Failed | RetryableError::MissingTooling | RetryableError::Timeout => "failed",
         }
     }
 }
@@ -214,13 +213,7 @@ pub async fn handle_failover(
         return "needs_review".to_string();
     }
 
-    // Timeouts are a stronger signal than other retryable failures: prefer
-    // any other healthy agent, even if it was already tried earlier for the task.
-    let next_agent = if matches!(error_type, RetryableError::Timeout) {
-        pick_timeout_fallback_agent(agent_name, &available)
-    } else {
-        pick_fallback_agent(agent_name, &chain, &available)
-    };
+    let next_agent = pick_fallback_agent(agent_name, &chain, &available);
 
     // Pick a fallback agent
     if let Some(next) = next_agent {
@@ -234,7 +227,10 @@ pub async fn handle_failover(
 
         // Record agent failure for cooldown tracking
         // Skip cooldown for MissingTooling — it's permanent, not transient
-        if !matches!(error_type, RetryableError::MissingTooling) {
+        if !matches!(
+            error_type,
+            RetryableError::MissingTooling | RetryableError::Timeout
+        ) {
             record_agent_failure_with_message(agent_name, error_message);
         }
 
@@ -255,6 +251,66 @@ pub async fn handle_failover(
 
     // No fallback available
     tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
+    let msg = format!("{error_message}, no fallback agents");
+    store::store_set(
+        store,
+        repo,
+        task_id,
+        &[("last_error", serde_json::json!(msg))],
+    )
+    .await;
+    "needs_review".to_string()
+}
+
+/// Handle failover specifically for timeouts. This is more aggressive: it ignores
+/// the reroute chain and picks any healthy agent that is not the current one.
+pub async fn handle_timeout_failover(
+    task_id: &str,
+    agent_name: &str,
+    error_message: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> String {
+    // Get all available agents
+    let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
+        .iter()
+        .filter(|a| crate::cmd_cache::command_exists(a))
+        .map(|s| s.to_string())
+        .collect();
+
+    // Pick a fallback agent for the timeout
+    if let Some(next) = pick_timeout_fallback_agent(agent_name, &available) {
+        tracing::info!(
+            task_id,
+            from = agent_name,
+            to = next,
+            "failover: switching to fallback agent due to timeout"
+        );
+
+        // Record agent failure for cooldown tracking
+        record_agent_failure_with_message(agent_name, error_message);
+
+        // Update the reroute chain
+        let chain = get_reroute_chain(task_id, store, repo).await;
+        update_reroute_chain(task_id, agent_name, &chain, store, repo).await;
+
+        let msg = format!("{error_message}, rerouted to {next}");
+        store::store_set(
+            store,
+            repo,
+            task_id,
+            &[
+                ("agent", serde_json::json!(next)),
+                ("model", serde_json::json!("")),
+                ("last_error", serde_json::json!(msg)),
+            ],
+        )
+        .await;
+        return "new".to_string();
+    }
+
+    // No fallback available
+    tracing::warn!(task_id, agent = agent_name, "no fallback agents available for timeout");
     let msg = format!("{error_message}, no fallback agents");
     store::store_set(
         store,
@@ -579,7 +635,6 @@ mod tests {
 
     #[test]
     fn retryable_type_str_returns_correct_labels() {
-        assert_eq!(RetryableError::Timeout.type_str(), "timeout");
         assert_eq!(RetryableError::UsageLimit.type_str(), "rate_limit");
         assert_eq!(RetryableError::AuthError.type_str(), "auth_error");
         assert_eq!(RetryableError::Failed.type_str(), "failed");
