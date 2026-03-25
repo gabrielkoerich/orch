@@ -195,6 +195,11 @@ pub async fn handle_failover(
             &[("last_error", serde_json::json!(msg))],
         )
         .await;
+        // If this was a timeout, ensure the agent is placed into cooldown
+        // so the router's round-robin avoids it for a while.
+        if matches!(error_type, RetryableError::Timeout) {
+            record_agent_failure_with_message(agent_name, error_message);
+        }
         return "needs_review".to_string();
     }
 
