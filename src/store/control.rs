@@ -1,4 +1,5 @@
 use super::*;
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
@@ -213,7 +214,7 @@ impl TaskStore {
 /// - `m` — minutes (e.g. `"30m"`)
 ///
 /// Returns an ISO8601/RFC3339 string suitable for comparison against
-/// `control_messages.created_at` (stored as `YYYY-MM-DD HH:MM:SS` UTC).
+/// `control_messages.created_at` (stored as UTC RFC3339).
 ///
 /// Returns `Err` if the format is unrecognised or the number overflows.
 pub fn parse_since_duration(s: &str) -> anyhow::Result<String> {
@@ -241,71 +242,15 @@ pub fn parse_since_duration(s: &str) -> anyhow::Result<String> {
         anyhow::bail!("--since value must be greater than zero");
     }
 
-    let secs: u64 = match unit {
-        'd' => n * 86_400,
-        'h' => n * 3_600,
-        'm' => n * 60,
+    let secs: i64 = match unit {
+        'd' => n.checked_mul(86_400),
+        'h' => n.checked_mul(3_600),
+        'm' => n.checked_mul(60),
         _ => unreachable!(),
-    };
-
-    // Use std::time to get the current UTC time and subtract the duration.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| anyhow::anyhow!("system clock error: {e}"))?
-        .as_secs();
-    let cutoff = now.saturating_sub(secs);
-
-    // Format as SQLite-compatible ISO8601: "YYYY-MM-DD HH:MM:SS"
-    let ts = format_unix_as_sqlite(cutoff);
-    Ok(ts)
-}
-
-/// Format a Unix timestamp (seconds) as `"YYYY-MM-DD HH:MM:SS"` (UTC),
-/// matching the format SQLite uses for `datetime('now')`.
-fn format_unix_as_sqlite(secs: u64) -> String {
-    // Manual conversion — avoids pulling in chrono just for this.
-    let s = secs as i64;
-    let (mut days, rem) = (s / 86_400, s % 86_400);
-    let (hour, rem) = (rem / 3_600, rem % 3_600);
-    let (minute, second) = (rem / 60, rem % 60);
-
-    // Days since Unix epoch (1970-01-01)
-    let mut year = 1970i32;
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if days < days_in_year {
-            break;
-        }
-        days -= days_in_year;
-        year += 1;
     }
-    let months = [
-        31,
-        if is_leap_year(year) { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 1u32;
-    for &m in &months {
-        if days < m {
-            break;
-        }
-        days -= m;
-        month += 1;
-    }
-    let day = days + 1;
+    .ok_or_else(|| anyhow::anyhow!("--since value is too large"))?
+    .try_into()
+    .map_err(|_| anyhow::anyhow!("--since value is too large"))?;
 
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}",)
-}
-
-fn is_leap_year(y: i32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    Ok((Utc::now() - Duration::seconds(secs)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
