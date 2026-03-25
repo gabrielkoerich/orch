@@ -766,14 +766,16 @@ pub(crate) async fn review_and_merge(
 
     let stderr = std::fs::read_to_string(review_attempt_dir.join("stderr.txt")).unwrap_or_default();
 
-    // Check if output contains an explicit error (is_error:true, usage limit, auth).
-    // Agents like kimi return exit 0 with non-empty NDJSON but is_error:true.
-    let output_has_error = raw_output.contains("\"is_error\":true")
-        || raw_output.contains("\"is_error\": true")
-        || raw_output.contains("usage limit")
-        || raw_output.contains("quota")
-        || raw_output.contains("authentication_failed");
-    let is_hard_failure = raw_output.is_empty() || output_has_error;
+    // Check the NDJSON result event for is_error flag.
+    // Agents like kimi return exit 0 but is_error:true in the result event.
+    let result_is_error = raw_output
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))
+        .and_then(|v| v.get("is_error").and_then(|e| e.as_bool()))
+        .unwrap_or(false);
+    let is_hard_failure = raw_output.is_empty() || result_is_error;
     if is_hard_failure {
         tracing::warn!(
             task_id = task.id.0,

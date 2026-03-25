@@ -897,8 +897,18 @@ pub async fn serve() -> anyhow::Result<()> {
     //    was never set due to crash-loops or lost events).
     // Tasks with a recent review comment on their PR are left alone.
     for engine in &project_engines {
-        if let Ok(in_review) = engine.backend.list_by_status(Status::InReview).await {
-            for task in &in_review {
+        // Read from SQLite (source of truth) — GitHub labels may be out of sync.
+        let in_review_from_store = engine
+            .store
+            .list_by_status(&engine.repo, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(crate::engine::tasks::store_task_to_external)
+            .collect::<Vec<_>>();
+        if !in_review_from_store.is_empty() {
+            let in_review = &in_review_from_store;
+            for task in in_review {
                 let session_expected =
                     review_session_expected(&engine.store, &engine.repo, &task.id.0).await;
                 let age_minutes = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
@@ -932,6 +942,8 @@ pub async fn serve() -> anyhow::Result<()> {
         }
 
         // Also reset internal (SQLite) InReview tasks on startup.
+        // Note: the block above already covers internal tasks from the store,
+        // but this second pass catches any that were only in the old internal_tasks table.
         use crate::store::TaskStatus as DbStatus;
         if let Ok(internal_in_review) = engine
             .task_manager
