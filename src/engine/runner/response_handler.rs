@@ -302,14 +302,14 @@ pub async fn handle_success(
                 "push failed {push_failures} times — blocking for human intervention"
             );
             "blocked"
-        } else {
-            tracing::warn!(
-                task_id,
-                push_failures,
-                "agent done but push failed ({push_failures}/3) — rerouting to different agent"
-            );
-            "routed"
-        }
+            } else {
+                tracing::warn!(
+                    task_id,
+                    push_failures,
+                    "agent done but push failed ({push_failures}/3) — rerouting to different agent"
+                );
+                "new"
+            }
     } else if resp.status == "done" && has_pr {
         "needs_review"
     } else if resp.status == "done" && !has_pr && has_delegations {
