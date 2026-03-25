@@ -159,7 +159,38 @@ pub(crate) async fn auto_merge_pr(
     let pr_number = match gh.get_pr_number(repo, branch).await? {
         Some(n) => n,
         None => {
-            anyhow::bail!("no open PR found for branch {}", branch);
+            // No open PR — check if it was already merged (idempotent success path).
+            // This happens when the PR was merged by a concurrent sync tick, a human,
+            // or a previous auto-merge attempt that completed but failed to update the
+            // task status.  Treating this as a failure would incorrectly increment the
+            // review-failure counter and eventually block the task even though the work
+            // is already done.
+            let already_merged = gh.is_pr_merged(repo, branch).await.unwrap_or(false);
+            if already_merged {
+                tracing::info!(
+                    task_id = task.id.0,
+                    branch = %branch,
+                    "auto_merge_pr: PR already merged — marking task done (idempotent)"
+                );
+                task_manager
+                    .update_task_status(&task.id, Status::Done)
+                    .await?;
+                if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+                    tracing::warn!(task_id = task.id.0, err = %e, "post-merge cleanup failed");
+                }
+                return Ok(());
+            }
+            // PR is closed but not merged — this is an unexpected state that needs
+            // human attention (e.g. PR was closed without merging).
+            tracing::warn!(
+                task_id = task.id.0,
+                branch = %branch,
+                "auto_merge_pr: PR is closed but not merged — blocking for human review"
+            );
+            task_manager
+                .update_task_status(&task.id, Status::Blocked)
+                .await?;
+            return Ok(());
         }
     };
 
