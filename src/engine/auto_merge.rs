@@ -36,6 +36,71 @@ fn ci_poll_semaphore() -> &'static Arc<Semaphore> {
     CI_POLL_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(3)))
 }
 
+fn required_checks_state(
+    required_contexts: &[String],
+    check_runs: &[(String, String, Option<String>)],
+    statuses: &[(String, String)],
+) -> (String, u64, u64, u64, u64) {
+    if required_contexts.is_empty() {
+        return ("success".to_string(), 0, 0, 0, 0);
+    }
+
+    let mut passing = 0u64;
+    let mut failing = 0u64;
+    let mut pending = 0u64;
+
+    for context in required_contexts {
+        let mut matched = false;
+
+        let mut check_run_match = None;
+        for (name, status, conclusion) in check_runs {
+            if name == context {
+                check_run_match = Some((status.as_str(), conclusion.as_deref()));
+                break;
+            }
+        }
+
+        if let Some((status, conclusion)) = check_run_match {
+            matched = true;
+            if status != "completed" {
+                pending += 1;
+            } else if matches!(conclusion, Some("success" | "neutral" | "skipped")) {
+                passing += 1;
+            } else {
+                failing += 1;
+            }
+        } else {
+            for (name, state) in statuses {
+                if name != context {
+                    continue;
+                }
+                matched = true;
+                match state.as_str() {
+                    "success" | "neutral" | "skipped" => passing += 1,
+                    "failure" | "error" => failing += 1,
+                    _ => pending += 1,
+                }
+                break;
+            }
+        }
+
+        if !matched {
+            pending += 1;
+        }
+    }
+
+    let total = required_contexts.len() as u64;
+    let state = if failing > 0 {
+        "failure".to_string()
+    } else if pending > 0 {
+        "pending".to_string()
+    } else {
+        "success".to_string()
+    };
+
+    (state, total, passing, failing, pending)
+}
+
 /// Build a standard attribution footer for GitHub comments posted by orch bots.
 ///
 /// `verb` is "Reviewed" or "Commented" depending on context.
@@ -142,10 +207,31 @@ pub(crate) async fn auto_merge_pr(
 
     // Acquire a global permit to limit concurrent CI polling loops across tasks.
     let _permit = ci_poll_semaphore().clone().acquire_owned().await;
+    let pr = gh.get_pr(repo, pr_number).await?;
+    if pr.mergeable == Some(false) {
+        anyhow::bail!("PR is not mergeable (merge conflicts present)");
+    }
+    let head_sha = pr.head.sha.clone();
+    let required_contexts = gh
+        .get_required_status_check_contexts(repo, branch)
+        .await
+        .unwrap_or_default();
 
     loop {
-        let (state, total, passing, failing, pending) =
-            gh.get_combined_status(repo, branch).await?;
+        let (state, total, passing, failing, pending) = if required_contexts.is_empty() {
+            gh.get_combined_status(repo, &head_sha).await?
+        } else {
+            let check_runs = gh.get_check_runs(repo, &head_sha).await.unwrap_or_default();
+            let statuses = gh
+                .get_commit_status_contexts(repo, &head_sha)
+                .await
+                .unwrap_or_default();
+            let check_runs = check_runs
+                .into_iter()
+                .map(|run| (run.name, run.status, run.conclusion))
+                .collect::<Vec<_>>();
+            required_checks_state(&required_contexts, &check_runs, &statuses)
+        };
 
         tracing::info!(
             task_id = task.id.0,
@@ -575,6 +661,33 @@ mod tests {
             submitted_at: submitted_at.to_string(),
             commit_id: None,
         }
+    }
+
+    #[test]
+    fn required_checks_state_uses_required_contexts() {
+        let required = vec!["ci".to_string(), "lint".to_string()];
+        let check_runs = vec![
+            (
+                "ci".to_string(),
+                "completed".to_string(),
+                Some("success".to_string()),
+            ),
+            (
+                "lint".to_string(),
+                "completed".to_string(),
+                Some("failure".to_string()),
+            ),
+        ];
+        let statuses = vec![("unused".to_string(), "success".to_string())];
+
+        let (state, total, passing, failing, pending) =
+            required_checks_state(&required, &check_runs, &statuses);
+
+        assert_eq!(state, "failure");
+        assert_eq!(total, 2);
+        assert_eq!(passing, 1);
+        assert_eq!(failing, 1);
+        assert_eq!(pending, 0);
     }
 
     #[test]

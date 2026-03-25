@@ -47,12 +47,21 @@ pub struct GitHubPullRequest {
     pub head: GitHubBranchRef,
     pub base: GitHubBranchRef,
     pub mergeable: Option<bool>,
+    pub mergeable_state: Option<String>,
     pub merged: Option<bool>,
     pub html_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubCheckRun {
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubBranchRef {
+    #[serde(rename = "ref")]
     pub ref_field: String,
     pub sha: String,
 }
