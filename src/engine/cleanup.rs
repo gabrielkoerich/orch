@@ -708,14 +708,21 @@ mod tests {
             .args([
                 "init",
                 "--initial-branch=main",
-                repo_dir.to_str().unwrap_or("."),
+                repo_dir
+                    .to_str()
+                    .expect("test repo path contains non-UTF-8 characters"),
             ])
             .output()
             .ok()?;
         if !init.status.success() {
             // Older git may not have --initial-branch; fall back.
             let _ = std::process::Command::new("git")
-                .args(["init", repo_dir.to_str().unwrap_or(".")])
+                .args([
+                    "init",
+                    repo_dir
+                        .to_str()
+                        .expect("test repo path contains non-UTF-8 characters"),
+                ])
                 .output()
                 .ok()?;
         }
