@@ -642,7 +642,7 @@ mod tests {
             &perms,
         );
         assert!(cmd.contains("opencode run"));
-        assert!(cmd.contains("--model anthropic/claude-sonnet-4-20250514"));
+        assert!(cmd.contains("--model 'anthropic/claude-sonnet-4-20250514'"));
         assert!(cmd.contains("--format json"));
         // Autonomous mode should write permission config and set XDG_CONFIG_HOME
         assert!(

@@ -461,7 +461,7 @@ mod tests {
             &perms,
         );
         assert!(cmd.contains("codex"));
-        assert!(cmd.contains("--model gpt-4o"));
+        assert!(cmd.contains("--model 'gpt-4o'"));
         assert!(cmd.contains("exec --json -"));
         assert!(
             cmd.contains("--full-auto"),

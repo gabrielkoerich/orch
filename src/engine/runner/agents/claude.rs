@@ -559,7 +559,7 @@ mod tests {
             "/tmp/msg.txt",
             &perms,
         );
-        assert!(cmd.contains("--model opus"));
+        assert!(cmd.contains("--model 'opus'"));
         assert!(cmd.contains("claude -p"));
         assert!(cmd.contains("--output-format stream-json"));
         assert!(cmd.contains("--permission-mode bypassPermissions"));
@@ -772,7 +772,7 @@ mod tests {
             &perms,
         );
         assert!(cmd.contains("kimi -p"), "expected kimi binary, got: {cmd}");
-        assert!(cmd.contains("--model sonnet"));
+        assert!(cmd.contains("--model 'sonnet'"));
     }
 
     #[test]
