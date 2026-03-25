@@ -59,7 +59,18 @@ pub async fn stream(repo: Option<&str>, task: Option<&str>) -> anyhow::Result<()
 
 /// Connect to the event bus websocket and stream events.
 async fn stream_from_ws(port: u16, repo: Option<&str>, task: Option<&str>) -> anyhow::Result<()> {
-    let url = format!("ws://127.0.0.1:{port}/events");
+    let mut url = format!("ws://127.0.0.1:{port}/events");
+    let mut params = Vec::new();
+    if let Some(r) = repo {
+        params.push(format!("repo={}", urlencoding::encode(r)));
+    }
+    if let Some(t) = task {
+        params.push(format!("task_id={}", urlencoding::encode(t)));
+    }
+    if !params.is_empty() {
+        url.push('?');
+        url.push_str(&params.join("&"));
+    }
 
     let (ws, _) = connect_async(&url)
         .await
@@ -75,18 +86,6 @@ async fn stream_from_ws(port: u16, repo: Option<&str>, task: Option<&str>) -> an
             let Ok(event) = serde_json::from_str::<crate::engine::events::TaskEvent>(&text) else {
                 continue;
             };
-
-            // Apply filters
-            if let Some(repo_filter) = repo {
-                if !event.repo.contains(repo_filter) {
-                    continue;
-                }
-            }
-            if let Some(task_filter) = task {
-                if event.task_id != task_filter {
-                    continue;
-                }
-            }
 
             print_event(&event);
         }
