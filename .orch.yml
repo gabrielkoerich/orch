@@ -3,7 +3,7 @@ jobs:
   type: task
   schedule: '0 8,17,20 * * *'
   task:
-    title: 'Code review: orch'
+    title: 'Code review'
     body: |
       You are a code quality reviewer. Focus on bugs, correctness, and reliability in EXISTING code. Do NOT look at feature gaps or new functionality — that's the development job's responsibility.
 
@@ -17,14 +17,19 @@ jobs:
       ## What to review
 
       Review `src/**/*.rs`, `prompts/*.md`, and tests. Look for:
-      - **Bugs** — logic errors, edge cases, panics, unwrap on fallible paths
-      - **Error handling** — missing error propagation, swallowed errors, unhelpful messages, operations that can fail but don't handle it, missing timeouts
-      - **Dead code** — unused functions, unreachable branches, stale imports
-      - **Correctness** — race conditions, off-by-one, wrong query ordering, missing validation at boundaries
-      - **Technical debt** — overly complex code that's fragile or hard to maintain, inconsistencies between similar code paths
-      - **Test gaps** — untested error paths, missing edge case coverage
+      - **Bugs** - logic errors, edge cases, panics, `unwrap`/`expect` on fallible paths, incorrect assumptions
+      - **Error handling** - missing propagation, swallowed errors, vague messages, missing context, fallible operations without retries/timeouts where needed
+      - **Dead code** - unused functions, stale branches, unreachable code, unused imports, outdated prompts/tests
+      - **Correctness** - race conditions, ordering bugs, off-by-one errors, invalid state transitions, missing boundary validation
+      - **Async safety** - blocking work in async contexts, holding locks across `.await`, missing cancellation handling, overly broad lock scope
+      - **API/contracts** - mismatches between code, prompts, CLI behavior, and tests; broken invariants; missing validation of external inputs
+      - **Observability** - missing logs or trace context on failure paths that make debugging reliability issues hard
+      - **Security** - unsafe shell usage, secret leakage in logs/errors, unchecked external input, path handling bugs
+      - **Technical debt** - fragile abstractions, duplicated logic in similar paths, inconsistencies that increase bug risk
+      - **Test gaps** - untested error paths, regressions, concurrency behavior, prompt behavior, and boundary conditions
+      - **Code quality** - prefer `use` imports for functions, types, and traits instead of fully qualified module paths, even for a single call, unless module context or a name collision makes that worse; keep idiomatic Rust, consistent formatting, and clear variable names
 
-      Do NOT look for: feature ideas, refactoring opportunities, performance optimizations, architecture improvements. Those belong to the development job.
+      Do NOT look for: feature ideas, pure cleanup, speculative performance work, or large architecture redesigns. Those belong to the development job unless they directly cause a correctness, reliability, or maintainability problem.
 
       ## Create GitHub issues for findings
 
