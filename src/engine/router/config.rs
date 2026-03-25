@@ -156,6 +156,39 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    /// Run `opencode models` and return lines containing "free".
+    ///
+    /// This is a synchronous blocking call.
+    fn discover_free_opencode_models() -> Vec<String> {
+        if !crate::cmd_cache::command_exists("opencode") {
+            tracing::debug!("opencode not in PATH — skipping free model discovery");
+            return vec![];
+        }
+
+        match std::process::Command::new("opencode")
+            .args(["models"])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout
+                    .lines()
+                    .filter(|l| l.contains("free"))
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect()
+            }
+            Ok(output) => {
+                tracing::debug!(status = ?output.status, "opencode models command failed");
+                vec![]
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to run opencode models");
+                vec![]
+            }
+        }
+    }
+
     /// Load configuration from config files.
     pub fn from_config() -> Self {
         let mut config = Self::default();
@@ -328,20 +361,40 @@ impl RouterConfig {
         if pool.is_empty() {
             return None;
         }
-        if pool.len() == 1 {
-            return Some(pool[0].clone());
+
+        let mut expanded_pool = Vec::new();
+        let mut has_free = false;
+
+        for model in pool {
+            if model == "opencode:free" {
+                has_free = true;
+            } else {
+                expanded_pool.push(model.clone());
+            }
+        }
+
+        if has_free {
+            expanded_pool.extend(Self::discover_free_opencode_models());
+        }
+
+        if expanded_pool.is_empty() {
+            return None;
+        }
+        if expanded_pool.len() == 1 {
+            return Some(expanded_pool[0].clone());
         }
         // Random starting index — varies per task_id to distribute across the pool
-        let start = crate::engine::router::selection::simple_hash_index_for(pool.len(), task_id);
+        let start =
+            crate::engine::router::selection::simple_hash_index_for(expanded_pool.len(), task_id);
         // Walk the pool from start, skipping cooled models
-        for i in 0..pool.len() {
-            let model = &pool[(start + i) % pool.len()];
+        for i in 0..expanded_pool.len() {
+            let model = &expanded_pool[(start + i) % expanded_pool.len()];
             if !crate::engine::cooldown::is_model_in_cooldown(agent, model) {
                 return Some(model.clone());
             }
         }
         // All models cooled — deterministic fallback to first entry
-        Some(pool[0].clone())
+        Some(expanded_pool[0].clone())
     }
 
     /// Get the model for a given agent and complexity level, falling back to built-in defaults.
