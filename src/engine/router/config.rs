@@ -356,7 +356,11 @@ impl RouterConfig {
     ) -> String {
         self.model_for_complexity(agent, complexity, task_id)
             .or_else(|| Self::default().model_for_complexity(agent, complexity, task_id))
-            .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
+            .unwrap_or_else(|| match agent {
+                "codex" => "o3".to_string(),
+                "opencode" => "anthropic/claude-sonnet-4-6".to_string(),
+                _ => "claude-sonnet-4-6".to_string(),
+            })
     }
 }
 
