@@ -211,7 +211,9 @@ impl OutputBuffer {
         }
 
         let new_content = if self.last_len >= current_len {
-            cap_content(current_content)
+            // Content shrank (terminal cleared / overwritten) — no incremental diff available.
+            // Emitting full current_content would duplicate already-broadcast output.
+            String::new()
         } else {
             let mut offset = self.last_len.min(current_len);
             while offset < current_len && !current_content.is_char_boundary(offset) {
@@ -249,4 +251,80 @@ fn cap_content(content: &str) -> String {
         start += 1;
     }
     content[start..].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_buffer() -> OutputBuffer {
+        OutputBuffer {
+            session: "test-session".to_string(),
+            task_id: "task-1".to_string(),
+            last_content: String::new(),
+            last_len: 0,
+            last_hash: None,
+            last_capture: Utc::now(),
+            seen_alive: false,
+        }
+    }
+
+    #[test]
+    fn normal_append_returns_new_suffix() {
+        let mut buf = make_buffer();
+        // First capture
+        let result = buf.diff_and_update("hello");
+        assert_eq!(result.as_deref(), Some("hello"));
+        // Append more
+        let result = buf.diff_and_update("hello world");
+        assert_eq!(result.as_deref(), Some(" world"));
+    }
+
+    #[test]
+    fn no_change_returns_none() {
+        let mut buf = make_buffer();
+        buf.diff_and_update("hello");
+        // Same content → no diff
+        let result = buf.diff_and_update("hello");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn terminal_clear_shrink_returns_none_not_full_content() {
+        let mut buf = make_buffer();
+        // Simulate some prior output
+        buf.diff_and_update("line1\nline2\nline3\n");
+        // Terminal clears: pane now contains less content (e.g. after \033[2J)
+        let result = buf.diff_and_update("prompt$ ");
+        // Must NOT return the full current content as "new" — that would duplicate output.
+        assert_eq!(
+            result, None,
+            "shrinking pane content should produce no output, not a duplicate of visible screen"
+        );
+    }
+
+    #[test]
+    fn terminal_clear_to_empty_returns_none() {
+        let mut buf = make_buffer();
+        buf.diff_and_update("lots of output here\nmore output\n");
+        // Pane cleared to empty
+        let result = buf.diff_and_update("");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn empty_initial_capture_returns_none() {
+        let mut buf = make_buffer();
+        let result = buf.diff_and_update("");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn whitespace_only_new_content_returns_none() {
+        let mut buf = make_buffer();
+        buf.diff_and_update("hello");
+        // New suffix is only whitespace
+        let result = buf.diff_and_update("hello   \n");
+        assert_eq!(result, None);
+    }
 }

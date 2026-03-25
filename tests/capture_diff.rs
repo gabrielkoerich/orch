@@ -64,9 +64,11 @@ fn repeated_capture_no_duplicate_output() {
 fn pane_clear_resets_offset() {
     let mut buf = buffer();
     let _ = buf.diff_and_update("line1\nline2\nline3");
+    // Terminal clear shrinks the pane — must not replay visible content as "new" output.
     let cleared = buf.diff_and_update("line1\n");
 
-    assert_eq!(cleared.as_deref(), Some("line1\n"));
+    assert_eq!(cleared, None);
+    // last_len must be updated so subsequent appends diff from the new position.
     assert_eq!(buf.last_len, "line1\n".len());
 }
 
