@@ -1,0 +1,4 @@
+{"type":"step_start","timestamp":1706300000,"part":{"type":"step-start","snapshot":"Starting review..."}}
+{"type":"text","timestamp":1706300001,"part":{"type":"text","text":"Checking the diff carefully..."}}
+{"type":"text","timestamp":1706300002,"part":{"type":"text","text":"```json\n{\"decision\":\"request_changes\",\"notes\":\"Error handling is incomplete in the new function.\",\"test_results\":\"fail\",\"issues\":[{\"file\":\"src/api.rs\",\"line\":88,\"severity\":\"error\",\"description\":\"Missing error propagation for network call\"}]}\n```"}}
+{"type":"step_finish","timestamp":1706300010,"part":{"type":"step-finish","reason":"stop","cost":0.015,"tokens":{"total":15000,"input":14500,"output":500}}}

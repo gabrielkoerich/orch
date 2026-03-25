@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","apiKeySource":"environment","cwd":"/tmp/work","model":"claude-sonnet-4-6","permissionMode":"bypassPermissions"}
+{"type":"result","subtype":"error","is_error":true,"duration_ms":500,"result":"credit balance too low","usage":{},"permission_denials":[]}

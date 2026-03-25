@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","apiKeySource":"environment","cwd":"/tmp/work","model":"claude-sonnet-4-6","permissionMode":"bypassPermissions"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll review this PR now."}]}}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":30000,"result":"```json\n{\"decision\":\"approve\",\"notes\":\"All checks pass. Code is well-structured and tests are comprehensive.\",\"test_results\":\"pass\",\"issues\":[]}\n```","usage":{"input_tokens":12000,"output_tokens":2500},"modelUsage":{"claude-sonnet-4-6":{"inputTokens":12000,"outputTokens":2500}},"permission_denials":[]}

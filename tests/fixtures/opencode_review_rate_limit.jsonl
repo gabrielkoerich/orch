@@ -1,0 +1,2 @@
+{"type":"step_start","timestamp":1706300000,"part":{"type":"step-start"}}
+{"type":"error","timestamp":1706300001,"message":"rate limit exceeded for this model"}

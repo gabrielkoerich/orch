@@ -317,26 +317,35 @@ pub struct ReviewIssue {
 /// This is the primary entry point for review response parsing. It handles:
 /// 1. Direct JSON (`ReviewResponse` object)
 /// 2. Markdown with ` ```json ` code blocks containing a `ReviewResponse`
-/// 3. NDJSON streams (opencode `run --format json` output) — extracts text
-///    from `type:"text"` events and then applies steps 1 & 2
-///
-/// Use this in the review pipeline instead of `parse_review_response` so that
-/// raw opencode NDJSON output is handled even when the normal agent-envelope
-/// parsing chain fails (e.g. format change, empty summary).
+/// 3. Per-agent NDJSON extraction (agent-aware result event parsing)
+/// 4. Generic NDJSON fallback (legacy monolithic extraction)
+/// 5. Heuristic fallback for plain-text decisions
 pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> {
     // Step 1: direct JSON / markdown parse
     if let Ok(r) = parse_review_response(output) {
         return Ok(r);
     }
 
-    // Step 2: NDJSON — extract text events and parse the concatenated text
+    // Step 2: per-agent NDJSON extraction — tries each known agent format
+    let agent_names = ["claude", "opencode", "codex"];
+    for agent in &agent_names {
+        if let Some(result) = super::agents::find_agent_result(agent, output) {
+            if !result.is_error && !result.result_text.is_empty() {
+                if let Ok(r) = parse_review_response(&result.result_text) {
+                    return Ok(r);
+                }
+            }
+        }
+    }
+
+    // Step 3: generic NDJSON fallback (legacy extraction for backwards compat)
     let extracted = ndjson_extract_text(output);
     if !extracted.is_empty() {
         return parse_review_response(&extracted)
             .map_err(|e| anyhow::anyhow!("parse failed after NDJSON extraction: {e}"));
     }
 
-    // Step 3: heuristic fallback for plain-text decisions
+    // Step 4: heuristic fallback for plain-text decisions
     if let Some(resp) = infer_review_response_from_text(output) {
         tracing::warn!(
             output_len = output.len(),
@@ -350,13 +359,28 @@ pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> 
 
 /// Extract the concatenated text content from an NDJSON event stream.
 ///
-/// Handles text event formats from all agents:
-/// - opencode Format 1: `{"type":"text","part":{"type":"text","text":"..."}}`
-/// - opencode Format 2: `{"type":"text","text":"..."}`
-/// - codex Format:      `{"type":"item.completed","item":{"type":"agent_message","text":"..."}}`
-/// - claude stream-json: `{"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}`
-/// - claude result:      `{"type":"result","result":"..."}`
+/// Delegates to per-agent extractors for agent-specific NDJSON formats,
+/// then falls back to the generic monolithic parser for unknown formats.
 fn ndjson_extract_text(ndjson: &str) -> String {
+    // Try per-agent extractors in priority order.
+    // Each returns Some(AgentResult) if it finds a recognizable result event.
+    let agent_names = ["claude", "opencode", "codex"];
+    for agent in &agent_names {
+        if let Some(result) = super::agents::find_agent_result(agent, ndjson) {
+            if !result.is_error && !result.result_text.is_empty() {
+                return result.result_text;
+            }
+        }
+    }
+
+    // Fallback: legacy monolithic extraction for backwards compatibility.
+    ndjson_extract_text_legacy(ndjson)
+}
+
+/// Legacy monolithic NDJSON text extraction (fallback).
+///
+/// Handles text event formats from all agents in a single pass.
+fn ndjson_extract_text_legacy(ndjson: &str) -> String {
     let texts: Vec<String> = ndjson
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -926,5 +950,112 @@ That's all."#;
         let extracted = ndjson_extract_text(ndjson);
         assert_eq!(extracted, "actual output");
         assert!(!extracted.contains("internal thoughts"));
+    }
+
+    // ── Per-agent review fixture tests ─────────────────────────
+
+    /// Claude NDJSON stream — review approve via fixture.
+    #[test]
+    fn parse_review_from_output_claude_review_approve() {
+        let raw = include_str!("../../../tests/fixtures/claude_review_approve.jsonl");
+        let resp = parse_review_from_output(raw).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert!(resp.notes.contains("All checks pass"));
+        assert_eq!(resp.test_results.as_deref(), Some("pass"));
+        assert!(resp.issues.is_empty());
+    }
+
+    /// Claude NDJSON stream — review request_changes via fixture.
+    #[test]
+    fn parse_review_from_output_claude_review_request_changes() {
+        let raw = include_str!("../../../tests/fixtures/claude_review_request_changes.jsonl");
+        let resp = parse_review_from_output(raw).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+        assert_eq!(resp.issues.len(), 1);
+        assert_eq!(resp.issues[0].file, "src/main.rs");
+        assert_eq!(resp.issues[0].severity, "error");
+    }
+
+    /// Claude NDJSON stream — auth error must NOT parse as review.
+    #[test]
+    fn parse_review_from_output_claude_review_auth_error() {
+        let raw = include_str!("../../../tests/fixtures/claude_review_auth_error.jsonl");
+        let result = parse_review_from_output(raw);
+        // Auth error NDJSON should fail to produce a valid review response
+        // because the result is an error envelope, not a review decision.
+        assert!(result.is_err());
+    }
+
+    /// Claude NDJSON stream — rate limit must NOT parse as review.
+    #[test]
+    fn parse_review_from_output_claude_review_rate_limit() {
+        let raw = include_str!("../../../tests/fixtures/claude_review_rate_limit.jsonl");
+        let result = parse_review_from_output(raw);
+        assert!(result.is_err());
+    }
+
+    /// OpenCode NDJSON stream — review approve via fixture.
+    #[test]
+    fn parse_review_from_output_opencode_review_approve() {
+        let raw = include_str!("../../../tests/fixtures/opencode_review_approve.jsonl");
+        let resp = parse_review_from_output(raw).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert!(resp.notes.contains("solid"));
+        assert_eq!(resp.test_results.as_deref(), Some("pass"));
+    }
+
+    /// OpenCode NDJSON stream — review request_changes via fixture.
+    #[test]
+    fn parse_review_from_output_opencode_review_request_changes() {
+        let raw = include_str!("../../../tests/fixtures/opencode_review_request_changes.jsonl");
+        let resp = parse_review_from_output(raw).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+        assert_eq!(resp.issues.len(), 1);
+        assert_eq!(resp.issues[0].file, "src/api.rs");
+    }
+
+    /// OpenCode NDJSON — rate limit error must NOT parse as review.
+    #[test]
+    fn parse_review_from_output_opencode_review_rate_limit() {
+        let raw = include_str!("../../../tests/fixtures/opencode_review_rate_limit.jsonl");
+        let result = parse_review_from_output(raw);
+        assert!(result.is_err());
+    }
+
+    /// Codex NDJSON stream — review approve via fixture.
+    #[test]
+    fn parse_review_from_output_codex_review_approve() {
+        let raw = include_str!("../../../tests/fixtures/codex_review_approve.jsonl");
+        let resp = parse_review_from_output(raw).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert!(resp.notes.contains("Clean implementation"));
+        assert_eq!(resp.test_results.as_deref(), Some("pass"));
+    }
+
+    /// Codex NDJSON stream — review request_changes via fixture.
+    #[test]
+    fn parse_review_from_output_codex_review_request_changes() {
+        let raw = include_str!("../../../tests/fixtures/codex_review_request_changes.jsonl");
+        let resp = parse_review_from_output(raw).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+        assert_eq!(resp.issues.len(), 1);
+        assert_eq!(resp.issues[0].file, "src/handler.rs");
+        assert_eq!(resp.issues[0].severity, "error");
+    }
+
+    /// Codex NDJSON — rate limit error must NOT parse as review.
+    #[test]
+    fn parse_review_from_output_codex_review_rate_limit() {
+        let raw = include_str!("../../../tests/fixtures/codex_review_rate_limit.jsonl");
+        let result = parse_review_from_output(raw);
+        assert!(result.is_err());
+    }
+
+    /// Codex NDJSON — empty output (no agent_message) must fail.
+    #[test]
+    fn parse_review_from_output_codex_review_empty() {
+        let raw = include_str!("../../../tests/fixtures/codex_review_empty.jsonl");
+        let result = parse_review_from_output(raw);
+        assert!(result.is_err());
     }
 }

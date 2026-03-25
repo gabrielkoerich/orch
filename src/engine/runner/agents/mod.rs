@@ -97,6 +97,36 @@ impl PermissionRules {
     }
 }
 
+/// Uniform result extracted from an agent's NDJSON output envelope.
+///
+/// Each agent has a different NDJSON structure. Per-agent `find_*_result()`
+/// functions extract this struct so the review pipeline and task response
+/// pipeline can share a single code path.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // input_tokens/output_tokens used by task response pipeline (Phase 3)
+pub struct AgentResult {
+    /// Whether the agent reported an error (e.g. `is_error: true` for claude).
+    pub is_error: bool,
+    /// The extracted result text (inner content, not the full envelope).
+    pub result_text: String,
+    /// Input tokens consumed (if reported).
+    pub input_tokens: Option<u64>,
+    /// Output tokens consumed (if reported).
+    pub output_tokens: Option<u64>,
+}
+
+/// Find the final result from agent NDJSON output, dispatching per agent.
+///
+/// Returns `None` if no result event is found (truly empty output).
+pub fn find_agent_result(agent_name: &str, ndjson: &str) -> Option<AgentResult> {
+    match agent_name {
+        "claude" | "kimi" | "minimax" => claude::find_claude_result(ndjson),
+        "opencode" => opencode::find_opencode_result(ndjson),
+        "codex" => codex::find_codex_result(ndjson),
+        _ => claude::find_claude_result(ndjson),
+    }
+}
+
 /// Parsed response from an agent, including metadata extracted from the
 /// agent-specific output envelope.
 #[derive(Debug, Clone)]
@@ -659,6 +689,113 @@ mod tests {
         assert_eq!(get_runner("opencode").name(), "opencode");
         // Unknown falls back to claude-compatible
         assert_eq!(get_runner("unknown-agent").name(), "unknown-agent");
+    }
+
+    // ── find_agent_result per-agent tests ──────────────────────
+
+    #[test]
+    fn find_agent_result_claude_success() {
+        let ndjson = concat!(
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":5000,"result":"{\"status\":\"done\",\"summary\":\"ok\"}","usage":{"input_tokens":100,"output_tokens":50}}"#,
+        );
+        let r = find_agent_result("claude", ndjson).unwrap();
+        assert!(!r.is_error);
+        assert!(r.result_text.contains("done"));
+        assert_eq!(r.input_tokens, Some(100));
+        assert_eq!(r.output_tokens, Some(50));
+    }
+
+    #[test]
+    fn find_agent_result_claude_auth_error() {
+        let ndjson = r#"{"type":"result","subtype":"error","is_error":true,"result":"credit balance too low","usage":{}}"#;
+        let r = find_agent_result("claude", ndjson).unwrap();
+        assert!(r.is_error);
+        assert!(r.result_text.contains("credit balance"));
+    }
+
+    #[test]
+    fn find_agent_result_kimi_uses_claude_extractor() {
+        let ndjson = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let r = find_agent_result("kimi", ndjson).unwrap();
+        assert!(!r.is_error);
+        assert_eq!(r.result_text, "ok");
+    }
+
+    #[test]
+    fn find_agent_result_minimax_uses_claude_extractor() {
+        let ndjson =
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{}}"#;
+        let r = find_agent_result("minimax", ndjson).unwrap();
+        assert!(!r.is_error);
+    }
+
+    #[test]
+    fn find_agent_result_opencode_success() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"{\"status\":\"done\",\"summary\":\"fixed\"}}"}}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"stop","tokens":{"input":200,"output":10}}}"#,
+        );
+        let r = find_agent_result("opencode", ndjson).unwrap();
+        assert!(!r.is_error);
+        assert!(r.result_text.contains("done"));
+        assert_eq!(r.input_tokens, Some(200));
+        assert_eq!(r.output_tokens, Some(10));
+    }
+
+    #[test]
+    fn find_agent_result_opencode_error() {
+        let ndjson = r#"{"type":"error","message":"rate limit exceeded for this model"}"#;
+        let r = find_agent_result("opencode", ndjson).unwrap();
+        assert!(r.is_error);
+        assert!(r.result_text.contains("rate limit"));
+    }
+
+    #[test]
+    fn find_agent_result_codex_success() {
+        let ndjson = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"ok\"}}"}}"#,
+            "\n",
+            r#"{"type":"turn.completed"}"#,
+        );
+        let r = find_agent_result("codex", ndjson).unwrap();
+        assert!(!r.is_error);
+        assert!(r.result_text.contains("done"));
+    }
+
+    #[test]
+    fn find_agent_result_codex_rate_limit() {
+        let ndjson = concat!(
+            r#"{"type":"error","message":"You've hit your usage limit"}"#,
+            "\n",
+            r#"{"type":"turn.failed","error":{"message":"You've hit your usage limit"}}"#,
+        );
+        let r = find_agent_result("codex", ndjson).unwrap();
+        assert!(r.is_error);
+        assert!(r.result_text.contains("usage limit"));
+    }
+
+    #[test]
+    fn find_agent_result_empty_ndjson() {
+        assert!(find_agent_result("claude", "").is_none());
+        assert!(find_agent_result("opencode", "").is_none());
+        assert!(find_agent_result("codex", "").is_none());
+    }
+
+    #[test]
+    fn find_agent_result_unknown_agent_falls_back_to_claude() {
+        let ndjson = r#"{"type":"result","is_error":false,"result":"ok","usage":{}}"#;
+        let r = find_agent_result("some-new-agent", ndjson).unwrap();
+        assert!(!r.is_error);
+        assert_eq!(r.result_text, "ok");
     }
 
     #[test]

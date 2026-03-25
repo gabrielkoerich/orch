@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"thread_review_1"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"reasoning","text":"I need to review the code changes carefully."}}
+{"type":"item.completed","item":{"type":"agent_message","text":"```json\n{\"decision\":\"approve\",\"notes\":\"Clean implementation with good test coverage.\",\"test_results\":\"pass\",\"issues\":[]}\n```"}}
+{"type":"turn.completed"}

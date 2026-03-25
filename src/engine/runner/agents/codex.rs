@@ -350,6 +350,96 @@ impl AgentRunner for CodexRunner {
     }
 }
 
+/// Find the final result from Codex NDJSON output.
+///
+/// Looks for `item.completed` events with `item.type == "agent_message"`,
+/// and checks for error events (`turn.failed`, `error`, `item.error`).
+pub fn find_codex_result(ndjson: &str) -> Option<super::AgentResult> {
+    let events: Vec<serde_json::Value> = ndjson
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+
+    if events.is_empty() {
+        return None;
+    }
+
+    // Check for errors first
+    for event in &events {
+        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if event_type == "turn.failed" || event_type == "error" {
+            let message = if event_type == "turn.failed" {
+                event
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("turn failed")
+            } else {
+                event
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
+            };
+            return Some(super::AgentResult {
+                is_error: true,
+                result_text: message.to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            });
+        }
+        if event_type == "item.completed" {
+            if let Some(item) = event.get("item") {
+                if item.get("type").and_then(|v| v.as_str()) == Some("error") {
+                    let message = item
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("item error");
+                    return Some(super::AgentResult {
+                        is_error: true,
+                        result_text: message.to_string(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Extract agent message text (prefer last JSON-looking one)
+    let mut texts = Vec::new();
+    for event in &events {
+        if event.get("type").and_then(|v| v.as_str()) == Some("item.completed") {
+            if let Some(item) = event.get("item") {
+                if item.get("type").and_then(|v| v.as_str()) == Some("agent_message") {
+                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                        texts.push(text.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if texts.is_empty() {
+        return None;
+    }
+
+    // Prefer last JSON-looking message
+    let result_text = texts
+        .iter()
+        .rev()
+        .find(|t| t.contains('{') && t.contains("status"))
+        .cloned()
+        .unwrap_or_else(|| texts.pop().unwrap_or_default());
+
+    Some(super::AgentResult {
+        is_error: false,
+        result_text,
+        input_tokens: None,
+        output_tokens: None,
+    })
+}
+
 /// Try to extract a model name from an error message.
 ///
 /// Looks for text quoted with backticks or single quotes:

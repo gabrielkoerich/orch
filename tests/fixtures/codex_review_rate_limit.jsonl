@@ -1,0 +1,2 @@
+{"type":"error","message":"You've hit your usage limit for this billing period"}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit"}}

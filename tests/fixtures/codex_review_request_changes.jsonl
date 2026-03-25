@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"thread_review_2"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"reasoning","text":"Let me check each file for potential issues."}}
+{"type":"item.completed","item":{"type":"agent_message","text":"```json\n{\"decision\":\"request_changes\",\"notes\":\"Race condition detected in the concurrent handler.\",\"test_results\":\"fail\",\"issues\":[{\"file\":\"src/handler.rs\",\"line\":155,\"severity\":\"error\",\"description\":\"Unprotected shared state access\"}]}\n```"}}
+{"type":"turn.completed"}

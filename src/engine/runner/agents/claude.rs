@@ -158,6 +158,39 @@ impl ClaudeRunner {
     }
 }
 
+/// Find the final `type:result` event in Claude NDJSON output and extract
+/// a uniform `AgentResult`. Handles claude, kimi, and minimax (all use the
+/// claude binary with `--output-format stream-json`).
+pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
+    let line = find_ndjson_result_line(ndjson)?;
+    let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
+    let envelope = parsed.as_object()?;
+
+    if envelope.get("type").and_then(|v| v.as_str()) != Some("result") {
+        return None;
+    }
+
+    let is_error = envelope
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let result_text = envelope
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let (input_tokens, output_tokens) = extract_usage(envelope);
+
+    Some(super::AgentResult {
+        is_error,
+        result_text,
+        input_tokens,
+        output_tokens,
+    })
+}
+
 pub(crate) fn extract_stream_json_result_text(raw: &str) -> Result<String, AgentError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {

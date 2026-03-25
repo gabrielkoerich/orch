@@ -116,6 +116,85 @@ fn extract_json_object(text: &str) -> Option<String> {
         .map(|_| candidate.to_string())
 }
 
+/// Find the final result from OpenCode NDJSON output.
+///
+/// Concatenates all `type:text` events, extracts tokens from `step_finish`,
+/// and checks for `type:error` events.
+pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
+    let events = parse_ndjson_events(ndjson.trim());
+    if events.is_empty() {
+        return None;
+    }
+
+    // Check for errors first
+    for event in &events {
+        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if event_type == "error" {
+            let message = event
+                .get("message")
+                .and_then(|v| v.as_str())
+                .or_else(|| event.get("error").and_then(|v| v.as_str()))
+                .or_else(|| {
+                    event
+                        .get("error")
+                        .and_then(|e| e.get("data"))
+                        .and_then(|d| d.get("message"))
+                        .and_then(|m| m.as_str())
+                })
+                .unwrap_or("unknown error");
+            return Some(super::AgentResult {
+                is_error: true,
+                result_text: message.to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            });
+        }
+        // Check step_finish for error reasons
+        if event_type == "step_finish" {
+            if let Some(part) = event.get("part") {
+                let reason = part.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                if reason == "error" || reason == "failed" {
+                    let msg = part
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("step failed");
+                    return Some(super::AgentResult {
+                        is_error: true,
+                        result_text: msg.to_string(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Extract text from text events
+    let text = extract_ndjson_text(&events)?;
+
+    // Extract tokens from step_finish
+    let mut input_tokens = None;
+    let mut output_tokens = None;
+    for event in events.iter().rev() {
+        if event.get("type").and_then(|v| v.as_str()) == Some("step_finish") {
+            if let Some(part) = event.get("part") {
+                if let Some(tokens) = part.get("tokens").and_then(|v| v.as_object()) {
+                    input_tokens = tokens.get("input").and_then(|v| v.as_u64());
+                    output_tokens = tokens.get("output").and_then(|v| v.as_u64());
+                    break;
+                }
+            }
+        }
+    }
+
+    Some(super::AgentResult {
+        is_error: false,
+        result_text: text,
+        input_tokens,
+        output_tokens,
+    })
+}
+
 pub(crate) fn extract_router_text(raw: &str) -> Option<String> {
     let events = parse_ndjson_events(raw.trim());
     if events.is_empty() {
