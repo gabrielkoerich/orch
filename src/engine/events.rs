@@ -348,9 +348,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Publish an event
-        let event = make_event("test-1", "owner/repo");
-        event.clone().agent = Some("claude".to_string());
-        let mut event_with_agent = event.clone();
+        let mut event_with_agent = make_event("test-1", "owner/repo");
         event_with_agent.agent = Some("claude".to_string());
         bus.publish(event_with_agent);
 
