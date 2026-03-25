@@ -785,19 +785,20 @@ pub(crate) async fn review_and_merge(
             "review agent: entering error path"
         );
         let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
-        let err_str = err.to_string();
-        if err_str.contains("rate limit")
-            || err_str.contains("usage limit")
-            || err_str.contains("rate_limit")
-            || err_str.contains("auth error")
-            || err_str.contains("Auth")
-        {
-            tracing::warn!(
-                task_id = task.id.0,
-                agent = %review_agent,
-                "review agent hit rate limit — adding to cooldown"
-            );
-            runner::response::record_agent_failure_with_message(&review_agent, &err_str);
+        match &err {
+            runner::agents::AgentError::RateLimit { .. }
+            | runner::agents::AgentError::Auth { .. } => {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    agent = %review_agent,
+                    "review agent hit rate limit — adding to cooldown"
+                );
+                runner::response::record_agent_failure_with_message(
+                    &review_agent,
+                    &err.to_string(),
+                );
+            }
+            _ => {}
         }
         tracing::error!(task_id = task.id.0, error = %err, "review agent failed");
         if let Some(rid) = run_id {
@@ -838,6 +839,21 @@ pub(crate) async fn review_and_merge(
         }
         Err(e) => {
             tracing::error!(task_id = task.id.0, error = %e, "review agent error");
+            match &e {
+                runner::agents::AgentError::RateLimit { .. }
+                | runner::agents::AgentError::Auth { .. } => {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        agent = %review_agent,
+                        "review agent hit rate limit — adding to cooldown"
+                    );
+                    runner::response::record_agent_failure_with_message(
+                        &review_agent,
+                        &e.to_string(),
+                    );
+                }
+                _ => {}
+            }
             if let Some(rid) = run_id {
                 let _ = store
                     .complete_run(&CompleteRun {
