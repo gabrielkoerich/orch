@@ -207,6 +207,16 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
         tracing::debug!(raw = date_str, "could not parse retry-at date");
     }
 
+    // "billing cycle" / "next cycle" / "quota" without a specific date → cooldown 5 hours
+    if lower.contains("billing cycle")
+        || lower.contains("next cycle")
+        || lower.contains("quota will be refreshed")
+    {
+        let five_hours = chrono::Utc::now().timestamp() + 5 * 60 * 60;
+        tracing::info!("detected billing cycle limit — cooldown for 5 hours");
+        return Some(five_hours);
+    }
+
     None
 }
 
