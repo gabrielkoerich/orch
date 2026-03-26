@@ -615,7 +615,7 @@ pub(crate) async fn review_and_merge(
             exclude_list.push(task_agent.clone());
         }
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task.id.0).await {
-            if let Ok(failed) = store.failed_review_agents(store_id).await {
+            if let Ok(failed) = store.previous_review_agents(store_id).await {
                 for agent in failed {
                     if !exclude_list.contains(&agent) {
                         exclude_list.push(agent);

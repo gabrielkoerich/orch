@@ -911,12 +911,13 @@ impl TaskStore {
         }
     }
 
-    /// List distinct agents that have failed review runs for a given task.
-    /// Used to exclude them when picking the next review agent.
-    pub async fn failed_review_agents(&self, task_id: i64) -> anyhow::Result<Vec<String>> {
+    /// List distinct agents that have previously reviewed this task.
+    /// Used to exclude them when picking the next review agent, so a different
+    /// agent reviews each cycle (avoids the same agent hitting the same issues).
+    pub async fn previous_review_agents(&self, task_id: i64) -> anyhow::Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT DISTINCT agent FROM task_runs \
-             WHERE task_id = ? AND run_type = 'review' AND outcome IN ('failed', 'timeout') \
+             WHERE task_id = ? AND run_type = 'review' \
              ORDER BY agent",
         )
         .bind(task_id)
