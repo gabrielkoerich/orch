@@ -23,8 +23,6 @@ use crate::tmux::TmuxManager;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
-use super::dispatch_guard::DispatchGuard;
-use super::review::{review_and_merge, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
 use super::EngineConfig;
 use crate::store::{review_session_expected, set_review_session_expected};
 
@@ -518,7 +516,7 @@ pub(crate) async fn tick_dispatch_tasks(
     semaphore: &Arc<Semaphore>,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
-    router_arc: &Arc<RwLock<Router>>,
+    _router_arc: &Arc<RwLock<Router>>,
     dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
@@ -604,7 +602,6 @@ pub(crate) async fn tick_dispatch_tasks(
         let backend = backend.clone();
         let tmux = tmux.clone();
         let capture = capture.clone();
-        let router_clone = router_arc.clone();
         let task_id_for_cleanup = task_id.clone();
         let task_owned = task.clone();
         let weight_tx = weight_tx.clone();
@@ -624,10 +621,6 @@ pub(crate) async fn tick_dispatch_tasks(
             tracing::info!(task_id, "dispatching task");
 
             let dispatch_start = std::time::Instant::now();
-            // Track whether the review agent was spawned for this task.
-            // When true, the review spawn owns the dispatching lock removal.
-            let mut review_spawned = false;
-
             match runner
                 .run_with_context(&task_owned, &backend, &tmux, route_result.as_ref())
                 .await
@@ -697,211 +690,10 @@ pub(crate) async fn tick_dispatch_tasks(
                         {
                             tracing::error!(task_id, err = %e, "update_task_status(NeedsReview) failed — task may be stuck");
                         } else if enable_review {
-                            // Atomic guard: transition to InReview prevents duplicate review spawns.
-                            match task_manager_for_spawn
-                                .update_task_status(
-                                    &ExternalId(task_id.clone()),
-                                    Status::InReview,
-                                )
-                                .await
-                            {
-                                Err(e) => {
-                                    tracing::warn!(task_id, err = %e, "failed to transition to InReview");
-                                }
-                                Ok(_) => {
-                                    set_review_session_expected(
-                                        &store_for_spawn,
-                                        &repo_owned,
-                                        &task_id,
-                                        true,
-                                    )
-                                    .await;
-                                    review_spawned = true;
-                                    let backend_clone = backend.clone();
-                                    let task_manager_for_review = task_manager_for_spawn.clone();
-                                    let tmux_clone = tmux.clone();
-                                    let task_owned_clone = task_owned.clone();
-                                    let router_for_review = router_clone.clone();
-                                    let store_for_review = store_for_spawn.clone();
-                                    let task_id_for_review = task_id.clone();
-                                    // RAII guard: removes the dispatch key whether the
-                                    // spawned task completes normally or panics.
-                                    let review_dispatch_guard = DispatchGuard::new(
-                                        dispatching_for_cleanup.clone(),
-                                        dispatch_key_for_cleanup.clone(),
-                                    );
-                                    let repo_ctx = repo_owned.clone();
-                                    tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
-                                        let _dispatch_guard = review_dispatch_guard;
-                                        match review_and_merge(
-                                            &task_owned_clone,
-                                            &backend_clone,
-                                            &tmux_clone,
-                                            &repo_owned,
-                                            &router_for_review,
-                                            &task_manager_for_review,
-                                            &store_for_review,
-                                        )
-                                        .await
-                                        {
-                                            Ok(ReviewDecision::Blocked(reason)) => {
-                                                tracing::error!(
-                                                    task_id = task_id_for_review,
-                                                    reason,
-                                                    "review gate blocked after repeated failures — marking task blocked"
-                                                );
-                                                if let Err(e) = task_manager_for_review
-                                                    .update_task_status(
-                                                        &ExternalId(task_id_for_review.clone()),
-                                                        Status::Blocked,
-                                                    )
-                                                    .await
-                                                {
-                                                    tracing::error!(task_id = task_id_for_review, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
-                                                }
-                                            }
-                                            Ok(ReviewDecision::Failed(reason)) => {
-                                                let failures = store::store_increment(
-                                                    &Some(store_for_review.clone()),
-                                                    &repo_owned,
-                                                    &task_id_for_review,
-                                                    "review_agent_failures",
-                                                )
-                                                .await;
-                                                if failures >= MAX_REVIEW_AGENT_FAILURES {
-                                                    tracing::error!(
-                                                        task_id = task_id_for_review,
-                                                        reason,
-                                                        failures,
-                                                        "review agent failed too many times — blocking task"
-                                                    );
-                                                    if let Err(e) = task_manager_for_review
-                                                        .update_task_status(
-                                                            &ExternalId(
-                                                                task_id_for_review.clone(),
-                                                            ),
-                                                            Status::Blocked,
-                                                        )
-                                                        .await
-                                                    {
-                                                        tracing::error!(task_id = task_id_for_review, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
-                                                    }
-                                                } else {
-                                                    tracing::error!(
-                                                        task_id = task_id_for_review,
-                                                        reason,
-                                                        failures,
-                                                        "review agent failed — resetting to NeedsReview for retry"
-                                                    );
-                                                    // Kill any stale review session so the
-                                                    // next retry can create a fresh one.
-                                                    let stale = tmux_clone.session_name(
-                                                        &repo_owned,
-                                                        &format!("{}-review", task_id_for_review),
-                                                    );
-                                                    tmux_clone.kill_session(&stale).await.ok();
-                                                    if let Err(e) = task_manager_for_review
-                                                        .update_task_status(
-                                                            &ExternalId(
-                                                                task_id_for_review.clone(),
-                                                            ),
-                                                            Status::NeedsReview,
-                                                        )
-                                                        .await
-                                                    {
-                                                        tracing::error!(task_id = task_id_for_review, err = %e, "update_task_status(NeedsReview) failed — task may be stuck in InReview");
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                let failures = store::store_increment(
-                                                    &Some(store_for_review.clone()),
-                                                    &repo_owned,
-                                                    &task_id_for_review,
-                                                    "review_agent_failures",
-                                                )
-                                                .await;
-                                                if failures >= MAX_REVIEW_AGENT_FAILURES {
-                                                    tracing::error!(
-                                                        task_id = task_id_for_review,
-                                                        error = %e,
-                                                        failures,
-                                                        "review_and_merge failed too many times — blocking task"
-                                                    );
-                                                    if let Err(ue) = task_manager_for_review
-                                                        .update_task_status(
-                                                            &ExternalId(
-                                                                task_id_for_review.clone(),
-                                                            ),
-                                                            Status::Blocked,
-                                                        )
-                                                        .await
-                                                    {
-                                                        tracing::error!(task_id = task_id_for_review, err = %ue, "update_task_status(Blocked) failed — task may be stuck in InReview");
-                                                    }
-                                                } else {
-                                                    tracing::error!(
-                                                        task_id = task_id_for_review,
-                                                        error = %e,
-                                                        failures,
-                                                        "review_and_merge failed — resetting to NeedsReview for retry"
-                                                    );
-                                                    // Kill any stale review session so the
-                                                    // next retry can create a fresh one.
-                                                    let stale = tmux_clone.session_name(
-                                                        &repo_owned,
-                                                        &format!("{}-review", task_id_for_review),
-                                                    );
-                                                    tmux_clone.kill_session(&stale).await.ok();
-                                                    if let Err(ue) = task_manager_for_review
-                                                        .update_task_status(
-                                                            &ExternalId(
-                                                                task_id_for_review.clone(),
-                                                            ),
-                                                            Status::NeedsReview,
-                                                        )
-                                                        .await
-                                                    {
-                                                        tracing::error!(task_id = task_id_for_review, err = %ue, "update_task_status(NeedsReview) failed — task may be stuck in InReview");
-                                                    }
-                                                }
-                                            }
-                                            Ok(super::review::ReviewDecision::Approve)
-                                            | Ok(super::review::ReviewDecision::Skipped) => {
-                                                // Full reset: task is done with the review cycle.
-                                                store::store_reset_counters(
-                                                    &Some(store_for_review.clone()),
-                                                    &repo_owned,
-                                                    &task_id_for_review,
-                                                )
-                                                .await;
-                                            }
-                                            Ok(super::review::ReviewDecision::RequestChanges {
-                                                ..
-                                            }) => {
-                                                // handle_review_changes already incremented
-                                                // review_cycles — only reset transient per-attempt
-                                                // counters so the cycle count is preserved.
-                                                store::store_reset_failure_counters(
-                                                    &Some(store_for_review.clone()),
-                                                    &repo_owned,
-                                                    &task_id_for_review,
-                                                )
-                                                .await;
-                                            }
-                                        }
-                                        store::set_review_session_expected(
-                                            &store_for_review,
-                                            &repo_owned,
-                                            &task_id_for_review,
-                                            false,
-                                        )
-                                        .await;
-                                        // _dispatch_guard drops here, removing the key
-                                        // even if review_and_merge panicked.
-                                    }));
-                                }
-                            }
+                            // The review agent is spawned by the event-driven subscriber.
+                            // This path only emits the NeedsReview event and leaves the
+                            // in_review transition to that single entry point.
+                            tracing::debug!(task_id, "review dispatch will be handled by subscriber");
                         }
                     } else {
                         // done, blocked, or new (rate-limited): update status directly.
@@ -977,11 +769,8 @@ pub(crate) async fn tick_dispatch_tasks(
             capture.unregister_session(&task_id_for_cleanup).await;
 
             // Remove from dispatching set so the task can be re-dispatched if needed.
-            // If a review was spawned, the review task owns the lock and removes it on completion.
-            if !review_spawned {
-                let mut guard = dispatching_for_cleanup.lock().unwrap_or_else(|e| e.into_inner());
-                guard.remove(&dispatch_key_for_cleanup);
-            }
+            let mut guard = dispatching_for_cleanup.lock().unwrap_or_else(|e| e.into_inner());
+            guard.remove(&dispatch_key_for_cleanup);
 
             // Release the semaphore permit
             drop(permit);
