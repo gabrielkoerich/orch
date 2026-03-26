@@ -220,9 +220,27 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         }
     }
 
-    // Pull main after worktrees are cleaned so the repo stays current.
+    // Prune stale worktree metadata and pull main after cleanup.
     if cleaned_any && !opts.dry_run {
         if let Ok(repo_root) = resolve_repo_root(repo).await {
+            // Prune stale .git/worktrees/ entries whose directories no longer exist.
+            let prune_result = Command::new("git")
+                .args(["-C", &repo_root, "worktree", "prune"])
+                .output_with_context()
+                .await;
+            match prune_result {
+                Ok(output) if output.status.success() => {
+                    tracing::debug!(%repo, "pruned stale worktree metadata");
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(%repo, err = %stderr, "git worktree prune failed");
+                }
+                Err(e) => {
+                    tracing::warn!(%repo, err = %e, "git worktree prune failed");
+                }
+            }
+
             let pull_result = Command::new("git")
                 .args(["-C", &repo_root, "pull", "--ff-only"])
                 .output_with_context()
@@ -464,6 +482,12 @@ pub(crate) async fn remove_worktree_and_branch(
             tracing::warn!(task_id, err = %e, "failed to remove worktree");
         }
     }
+
+    // Prune stale .git/worktrees/ entries left behind after removal.
+    let _ = Command::new("git")
+        .args(["-C", repo_root_str.as_ref(), "worktree", "prune"])
+        .output_with_context()
+        .await;
 
     // Delete local and remote branch from the main repo root (worktree is already gone)
     if let Some(br) = branch {
