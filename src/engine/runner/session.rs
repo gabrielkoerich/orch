@@ -3,6 +3,7 @@
 //! Extracted from `runner/mod.rs`. Handles the tmux session lifecycle:
 //! spawning the agent, waiting for completion, reading output files, and cleanup.
 
+use crate::config;
 use crate::tmux::TmuxManager;
 use std::path::{Path, PathBuf};
 use tokio::time::{timeout, Duration};
@@ -26,7 +27,14 @@ pub async fn run_agent_session(
     attempt_dir: &Path,
     orch_home: &Path,
 ) -> (TmuxManager, String, SessionOutput) {
-    const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+    // Read workflow.timeout_seconds from config with default of 1800 (30 minutes)
+    let task_timeout_secs: u64 = config::get("workflow.timeout_seconds")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1800);
+
+    // Add 120s grace so the shell timeout (in runner.sh) fires before Tokio kills the session.
+    let task_timeout = Duration::from_secs(task_timeout_secs + 120);
 
     let tmux = TmuxManager::new();
 
@@ -49,7 +57,7 @@ pub async fn run_agent_session(
     // Wait for completion with timeout
     let poll_interval = Duration::from_secs(5);
     let wait_result = timeout(
-        TASK_TIMEOUT,
+        task_timeout,
         tmux.wait_for_completion(&session, poll_interval),
     )
     .await;
@@ -62,7 +70,11 @@ pub async fn run_agent_session(
             tracing::error!(task_id, ?e, "error waiting for session");
         }
         Err(_) => {
-            tracing::error!(task_id, "agent timed out after 30 minutes");
+            tracing::error!(
+                task_id,
+                "agent timed out after {} minutes",
+                task_timeout_secs / 60
+            );
             let _ = tmux.kill_session(&session).await;
         }
     }
