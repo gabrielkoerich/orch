@@ -28,6 +28,7 @@ jobs:
       - **Technical debt** - fragile abstractions, duplicated logic in similar paths, inconsistencies that increase bug risk
       - **Test gaps** - untested error paths, regressions, concurrency behavior, prompt behavior, and boundary conditions
       - **Code quality** - prefer `use` imports for functions, types, and traits instead of fully qualified module paths, even for a single call, unless module context or a name collision makes that worse; keep idiomatic Rust, consistent formatting, and clear variable names
+      - **Unnecessary complexity** - over-engineered abstractions, redundant indirection layers, features that duplicate existing functionality, overly clever code that could be simpler, multiple code paths that could be unified. The system is already complex — every review should ask "can this be simpler?"
 
       Do NOT look for: feature ideas, pure cleanup, speculative performance work, or large architecture redesigns. Those belong to the development job unless they directly cause a correctness, reliability, or maintainability problem.
 
@@ -61,7 +62,7 @@ jobs:
       3. **Logs and operations** - run `orch log 200` and look for recurring failures, noisy warnings, retries, rate limits, slow paths, webhook/polling confusion, and dispatch loops. Create tasks that remove the underlying cause, not just the visible symptom.
       4. **Prompt effectiveness** - review `prompts/*.md` and compare them with recent task behavior. Look for unclear instructions, conflicting constraints, brittle output requirements, missing examples, or prompts that encourage duplicated/repeated work.
       5. **Workflow and UX gaps** - inspect CLI flows, issue/PR automation, task routing, review loops, and status transitions. Look for missing affordances, confusing behavior, or repeated manual steps that should be automated.
-      6. **Refactoring opportunities** - look for duplicated logic, oversized modules, fragile conditionals, and code paths that should share helpers or clearer abstractions. Favor tasks that reduce future bug risk or make the system easier to extend safely.
+      6. **Simplification and complexity reduction** - the system is already complex. Prioritize tasks that REMOVE code, merge duplicate paths, eliminate unnecessary abstractions, or simplify state machines. Three similar lines of code is better than a premature abstraction. Flag over-engineered areas where simpler approaches would work.
       7. **Performance** - look for measurable slow paths: repeated expensive work, unnecessary allocations/cloning, blocking work in async contexts, inefficient queries, or polling intervals that create needless churn.
       8. **Architecture/documentation gaps** - read `docs/architecture.md`, `AGENTS.md`, and related docs for documented TODOs, drift between docs and implementation, or missing glue between components.
       9. **Test coverage** - find missing tests for new features, key workflows, regressions, and important failure paths where better coverage would unlock safer development.
@@ -75,6 +76,7 @@ jobs:
       - **Check existing code/schema before creating migration or feature tasks** - run `sqlite3 ~/.orch/orch.db ".tables"` and search with `rg` for existing implementations. Do NOT create tasks for things that already exist or are partially implemented unless the remaining gap is clear.
       - **NEVER append to existing migration files** - always create a NEW numbered migration file. Appending to already-applied migrations breaks existing databases.
       - Prefer a small number of high-signal tasks over a long list of weak ideas. If you cannot name the root cause and the concrete files likely involved, do not file it.
+      - **Favor simplification over new features.** Tasks that remove code or reduce complexity are more valuable than tasks that add new capabilities. The system is already complex enough.
 
       ## Create GitHub issues
 
