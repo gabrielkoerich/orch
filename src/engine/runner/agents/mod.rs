@@ -227,7 +227,9 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
         "not done",
         "not yet done",
         "not complete",
+        "not yet complete",
         "not completed",
+        "not yet completed",
         "incomplete",
         "undone",
     ]
@@ -905,6 +907,15 @@ mod tests {
         assert_eq!(
             response.status, "needs_review",
             "\"not complete\" should not match \"complete\""
+        );
+    }
+
+    #[test]
+    fn synthesize_response_does_not_mark_done_for_not_yet_completed() {
+        let response = synthesize_response_from_text("The task is not yet completed").unwrap();
+        assert_eq!(
+            response.status, "needs_review",
+            "\"not yet completed\" should not match \"completed\""
         );
     }
 
