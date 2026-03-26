@@ -72,6 +72,8 @@ Before you write the output JSON, run these checks. If ANY fails, go back and fi
 
 Do NOT report `"status": "done"` unless all checks pass. If you made changes but did not commit, your status is `needs_review`, not `done`.
 
+**Note:** If your task produced no code changes (e.g., you only created GitHub issues, posted comments, performed read-only research, or ran operational scripts), skip check #2. A visible non-code result counts as a completed task.
+
 **Reminder:** Do NOT push or create PRs — the orchestrator handles that automatically. Do not ask for push approval in your summary, and do not mention pushing. Focus your summary on what you accomplished, not on the push step.
 
 ## Output Format
