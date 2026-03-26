@@ -217,26 +217,25 @@ pub(crate) async fn auto_merge_pr(
         .unwrap_or_default();
 
     loop {
-        // Acquire a global permit for the duration of the HTTP polling batch only.
-        // Released before sleep so other tasks can acquire permits while we wait.
-        let _permit = ci_poll_semaphore().clone().acquire_owned().await;
-
-        let (state, total, passing, failing, pending) = if required_contexts.is_empty() {
-            gh.get_combined_status(repo, &head_sha).await?
-        } else {
-            let check_runs = gh.get_check_runs(repo, &head_sha).await.unwrap_or_default();
-            let statuses = gh
-                .get_commit_status_contexts(repo, &head_sha)
-                .await
-                .unwrap_or_default();
-            let check_runs = check_runs
-                .into_iter()
-                .map(|run| (run.name, run.status, run.conclusion))
-                .collect::<Vec<_>>();
-            required_checks_state(&required_contexts, &check_runs, &statuses)
-        };
-
-        // Permit dropped here (end of scope) before we check state and potentially sleep.
+        // Acquire a global permit only for the HTTP polling batch.
+        // The inner block ensures the permit drops before the match/sleep.
+        let (state, total, passing, failing, pending) = {
+            let _permit = ci_poll_semaphore().clone().acquire_owned().await;
+            if required_contexts.is_empty() {
+                gh.get_combined_status(repo, &head_sha).await?
+            } else {
+                let check_runs = gh.get_check_runs(repo, &head_sha).await.unwrap_or_default();
+                let statuses = gh
+                    .get_commit_status_contexts(repo, &head_sha)
+                    .await
+                    .unwrap_or_default();
+                let check_runs = check_runs
+                    .into_iter()
+                    .map(|run| (run.name, run.status, run.conclusion))
+                    .collect::<Vec<_>>();
+                required_checks_state(&required_contexts, &check_runs, &statuses)
+            }
+        }; // _permit dropped here — released before logging, match, and sleep.
 
         tracing::info!(
             task_id = task.id.0,
@@ -320,7 +319,6 @@ pub(crate) async fn auto_merge_pr(
             }
         }
 
-        // Permit is already dropped above — sleep without holding it.
         tokio::time::sleep(poll_interval).await;
     }
 
