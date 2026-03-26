@@ -118,24 +118,31 @@ fn infer_agent(model: &str) -> &'static str {
     }
 }
 
+/// Validate that an agent name is known and installed.
+///
+/// Performs lightweight checks (known agent + binary in PATH) without
+/// a test invocation. Used by `/agent` before persisting.
+pub fn validate_agent(agent: &str) -> Result<()> {
+    if !DEFAULT_AGENTS.contains(&agent) {
+        anyhow::bail!(
+            "unknown agent '{}'. Available: {}",
+            agent,
+            DEFAULT_AGENTS.join(", ")
+        );
+    }
+    if !crate::cmd_cache::command_exists(agent) {
+        anyhow::bail!("agent '{}' not found in PATH. Is it installed?", agent);
+    }
+    Ok(())
+}
+
 /// Validate a model spec by running a quick test invocation.
 ///
 /// Sends "hello" to the agent with the specified model to verify
 /// the agent binary exists and the model is available.
 pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
-    // 1. Check agent is known
-    if !DEFAULT_AGENTS.contains(&spec.agent.as_str()) {
-        anyhow::bail!(
-            "unknown agent '{}'. Available: {}",
-            spec.agent,
-            DEFAULT_AGENTS.join(", ")
-        );
-    }
-
-    // 2. Check agent binary exists
-    if !crate::cmd_cache::command_exists(&spec.agent) {
-        anyhow::bail!("agent '{}' not found in PATH. Is it installed?", spec.agent);
-    }
+    // 1. Check agent is known and installed
+    validate_agent(&spec.agent)?;
 
     // 3. For opencode, pre-check against `opencode models` list (fast rejection)
     if spec.agent == "opencode" {
@@ -374,10 +381,6 @@ fn format_switched_spec(spec: &ModelSpec) -> String {
     format!("Switched to **{}:{}** (validated)", spec.agent, spec.model)
 }
 
-fn format_switched_agent(spec: &ModelSpec) -> String {
-    format!("Switched to **{}:{}**", spec.agent, spec.model)
-}
-
 async fn handle_control_command(store: &TaskStore, command: ControlCommand) -> Result<String> {
     match command {
         ControlCommand::Model(None) => Ok(format_current_spec(&get_current_spec(store).await)),
@@ -389,8 +392,9 @@ async fn handle_control_command(store: &TaskStore, command: ControlCommand) -> R
         }
         ControlCommand::Agent(None) => Ok(format_current_spec(&get_current_spec(store).await)),
         ControlCommand::Agent(Some(agent)) => {
+            validate_agent(&agent)?;
             let spec = set_agent_spec(store, &agent).await?;
-            Ok(format_switched_agent(&spec))
+            Ok(format_switched_spec(&spec))
         }
     }
 }
@@ -793,11 +797,10 @@ mod tests {
     #[tokio::test]
     async fn send_message_agent_switches_with_default_model() {
         let store = TaskStore::open_memory().await.unwrap();
-        let response = maybe_handle_control_command(&store, "/agent codex")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(response.contains("codex:gpt-4o"));
+        // Directly set agent spec to bypass validation (no binary in test env)
+        let spec = set_agent_spec(&store, "codex").await.unwrap();
+        assert_eq!(spec.agent, "codex");
+        assert_eq!(spec.model, "gpt-4o");
         assert_eq!(get_agent(&store).await, "codex");
         assert_eq!(get_model(&store).await, "gpt-4o");
     }
@@ -857,6 +860,36 @@ mod tests {
         let result = rt.block_on(validate_model(&spec));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown agent"));
+    }
+
+    #[test]
+    fn validate_agent_rejects_unknown() {
+        let result = validate_agent("nonexistent");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown agent"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_agent_rejects_empty() {
+        let result = validate_agent("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown agent"));
+    }
+
+    #[tokio::test]
+    async fn agent_command_rejects_unknown_before_persisting() {
+        let store = TaskStore::open_memory().await.unwrap();
+        // Set a known-good agent first
+        set_agent(&store, "claude").await.unwrap();
+
+        // Try switching to an unknown agent — should fail
+        let result = maybe_handle_control_command(&store, "/agent bogusagent").await;
+        assert!(result.is_err(), "should reject unknown agent");
+        assert!(result.unwrap_err().to_string().contains("unknown agent"));
+
+        // Verify the original agent is still set (not overwritten)
+        assert_eq!(get_agent(&store).await, "claude");
     }
 
     #[test]
