@@ -152,7 +152,10 @@ pub async fn handle_success(
                         store,
                         repo,
                         task_id,
-                        &[("last_error", serde_json::json!(""))],
+                        &[
+                            ("last_error", serde_json::json!("")),
+                            ("push_failures", serde_json::json!(0)),
+                        ],
                     )
                     .await;
                     true
@@ -279,7 +282,7 @@ pub async fn handle_success(
     let final_status = if push_failed {
         let push_failures: u32 = store::opt_store_get_task(store, repo, task_id)
             .await
-            .map(|t| t.pr_create_failures)
+            .map(|t| t.push_failures)
             .unwrap_or(0) as u32
             + 1;
 
@@ -288,7 +291,7 @@ pub async fn handle_success(
             repo,
             task_id,
             &[
-                ("pr_create_failures", serde_json::json!(push_failures)),
+                ("push_failures", serde_json::json!(push_failures)),
                 // Clear agent so router picks a different one on reroute
                 ("agent", serde_json::json!(null)),
             ],

@@ -1666,6 +1666,7 @@ async fn default_values_are_correct() {
     assert_eq!(task.merge_conflict_retries, 0);
     assert_eq!(task.ci_merge_failures, 0);
     assert_eq!(task.pr_create_failures, 0);
+    assert_eq!(task.push_failures, 0);
     assert_eq!(task.review_agent_failures, 0);
     assert_eq!(task.review_cycles, 0);
     assert_eq!(task.input_tokens, 0);
