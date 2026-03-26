@@ -232,7 +232,7 @@ async fn ensure_pr_exists(
                                     &[("pr_number", serde_json::json!(n as i64))],
                                 )
                                 .await;
-                                return Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Skipped));
+                                return Ok(EnsurePrResult::Ready(n));
                             }
                         }
                         tracing::warn!(
@@ -293,28 +293,26 @@ async fn ensure_pr_exists(
                                         stderr.lines().find(|l| l.trim().starts_with("https://"))
                                     {
                                         let pr_url = pr_url.trim();
-                                        if let Some(pr_num) = pr_url
+                                        let pr_num = pr_url
                                             .rsplit('/')
                                             .next()
-                                            .and_then(|n| n.parse::<i64>().ok())
-                                        {
+                                            .and_then(|n| n.parse::<u64>().ok());
+                                        if let Some(pr_num) = pr_num {
                                             store_set(
                                                 &Some(Arc::clone(store)),
                                                 repo,
                                                 &task.id.0,
-                                                &[("pr_number", serde_json::json!(pr_num))],
+                                                &[("pr_number", serde_json::json!(pr_num as i64))],
                                             )
                                             .await;
+                                            tracing::info!(
+                                                task_id = task.id.0,
+                                                branch = %branch_name,
+                                                pr_url = %pr_url,
+                                                "PR already exists (from CLI stderr) — retrying review"
+                                            );
+                                            return Ok(EnsurePrResult::Ready(pr_num));
                                         }
-                                        tracing::info!(
-                                            task_id = task.id.0,
-                                            branch = %branch_name,
-                                            pr_url = %pr_url,
-                                            "PR already exists (from CLI stderr) — retrying review"
-                                        );
-                                        return Ok(EnsurePrResult::EarlyReturn(
-                                            ReviewDecision::Skipped,
-                                        ));
                                     }
                                 }
                                 tracing::error!(
