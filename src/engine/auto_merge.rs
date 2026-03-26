@@ -655,9 +655,20 @@ pub(crate) async fn handle_review_changes(
             max_cycles,
             "max review cycles exceeded, blocking for human review"
         );
-        task_manager
+        // A transient store failure here must not be counted as a review-agent
+        // crash.  Log and return Ok — the next tick will re-check the task and
+        // can retry the status transition.
+        if let Err(e) = task_manager
             .update_task_status(&task.id, Status::Blocked)
-            .await?;
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id.0,
+                err = %e,
+                "failed to set Blocked after max review cycles — will retry on next tick"
+            );
+            return Ok(());
+        }
         let escalation = format!(
             "🔍 Review agent requested changes after {} cycles. Escalating to human.\n\n**Review Notes:**\n{}",
             review_cycles, notes
@@ -712,9 +723,24 @@ pub(crate) async fn handle_review_changes(
     .await;
 
     // 4. Set Routed to bypass LLM re-classification, reusing existing agent/model.
-    task_manager
+    //
+    // A transient store failure here must NOT be treated as a review-agent crash:
+    // the review context was already persisted in step 3, so the decision itself
+    // succeeded.  Log and return Ok — the next tick will see `pr_review_context`
+    // set and can retry the Routed transition without consuming the
+    // `review_agent_failures` budget.
+    if let Err(e) = task_manager
         .update_task_status(&task.id, Status::Routed)
-        .await?;
+        .await
+    {
+        tracing::warn!(
+            task_id = task.id.0,
+            err = %e,
+            review_cycles = review_cycles + 1,
+            "review context saved but Routed transition failed — will retry on next tick"
+        );
+        return Ok(());
+    }
 
     tracing::info!(
         task_id = task.id.0,
@@ -999,6 +1025,186 @@ mod tests {
         assert_eq!(
             updated.review_cycles, 1,
             "review_cycles must be incremented on each review change request"
+        );
+    }
+
+    /// Regression: a transient `update_task_status(Routed)` failure must NOT
+    /// cause `handle_review_changes` to return `Err`.  Returning `Err` would
+    /// propagate to the review subscriber which increments
+    /// `review_agent_failures` — incorrectly consuming the retry budget even
+    /// though the review decision itself was already persisted.
+    ///
+    /// We simulate the failure by giving the `TaskManager` a different repo
+    /// than the one the task was created in, so `resolve_task_id` returns
+    /// `None` and `update_task_status` returns `Err` for that internal task.
+    #[tokio::test]
+    async fn handle_review_changes_routed_transition_failure_returns_ok() {
+        use crate::engine::tasks::TaskManager;
+        use crate::store::{TaskStatus, TaskStore};
+        use async_trait::async_trait;
+
+        struct NoopBackend;
+        #[async_trait]
+        impl crate::backends::ExternalBackend for NoopBackend {
+            fn name(&self) -> &str {
+                "noop"
+            }
+            async fn create_task(
+                &self,
+                _t: &str,
+                _b: &str,
+                _l: &[String],
+            ) -> anyhow::Result<ExternalId> {
+                Ok(ExternalId("new".into()))
+            }
+            async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask> {
+                Ok(ExternalTask {
+                    id: id.clone(),
+                    title: "t".into(),
+                    body: "".into(),
+                    state: "open".into(),
+                    labels: vec![],
+                    author: "bot".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    url: "".into(),
+                })
+            }
+            async fn list_by_status(&self, _s: Status) -> anyhow::Result<Vec<ExternalTask>> {
+                Ok(vec![])
+            }
+            async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+                Ok(vec![])
+            }
+            async fn post_comment(&self, _id: &ExternalId, _b: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn set_labels(&self, _id: &ExternalId, _l: &[String]) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn remove_label(&self, _id: &ExternalId, _l: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+                Ok(vec![])
+            }
+            async fn create_sub_task(
+                &self,
+                _p: &ExternalId,
+                _t: &str,
+                _b: &str,
+                _l: &[String],
+            ) -> anyhow::Result<ExternalId> {
+                Ok(ExternalId("child".into()))
+            }
+            async fn ensure_status_label(&self, _l: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn has_open_issue_with_title(&self, _t: &str, _l: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn health_check(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn is_pr_merged(&self, _b: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+                Ok(Some("bot".into()))
+            }
+            async fn get_mentions(&self, _s: &str) -> anyhow::Result<Vec<Mention>> {
+                Ok(vec![])
+            }
+            async fn update_status(&self, _id: &ExternalId, _s: Status) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_repo = "owner/repo";
+
+        let task_id_num = store
+            .create(&crate::store::NewTask {
+                external_id: None,
+                repo: task_repo.to_string(),
+                origin: "internal".to_string(),
+                title: "Fix bug".to_string(),
+                body: "body".to_string(),
+                source: "cron".to_string(),
+                source_id: "daily".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(task_id_num, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+
+        let task_id_str = format!("internal:{task_id_num}");
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(NoopBackend);
+
+        // Intentionally wrong repo — causes resolve_task_id to return None,
+        // which makes update_task_status(Routed) return Err for the internal task.
+        let wrong_repo = "other/repo";
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            wrong_repo.to_string(),
+        ));
+
+        let task = ExternalTask {
+            id: ExternalId(task_id_str.clone()),
+            title: "Fix bug".to_string(),
+            body: "body".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "".to_string(),
+        };
+
+        // The status transition will fail (wrong repo), but handle_review_changes
+        // must still return Ok — review context was persisted before the failure.
+        let result = handle_review_changes(
+            &task,
+            "Fix the null pointer on line 10",
+            &[],
+            &backend,
+            task_repo,
+            202,
+            "claude",
+            "sonnet",
+            &task_manager,
+            &store,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "handle_review_changes must return Ok even when Routed transition fails: {result:?}"
+        );
+
+        // Review context must have been persisted despite the status failure.
+        let stored = store.get(task_id_num).await.unwrap();
+        assert!(
+            stored
+                .pr_review_context
+                .contains("Fix the null pointer on line 10"),
+            "pr_review_context must be persisted even when status transition fails"
+        );
+        assert_eq!(
+            stored.review_cycles, 1,
+            "review_cycles must be incremented even when status transition fails"
+        );
+        // Status stays InReview (not Routed) because the transition failed.
+        assert_eq!(
+            stored.status,
+            TaskStatus::InReview,
+            "status should remain InReview when Routed transition failed"
         );
     }
 }
