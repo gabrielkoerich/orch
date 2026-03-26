@@ -1429,8 +1429,9 @@ pub async fn serve() -> anyhow::Result<()> {
         }
     }
 
-    // Clean up event bus port file
+    // Clean up event bus port file and service version file
     events::cleanup_port_file();
+    events::cleanup_version_file();
 
     // transport and channels drop here at end of scope
     let _ = transport;

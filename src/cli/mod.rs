@@ -21,8 +21,29 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Print version information.
+///
+/// Shows CLI version and, if the service is running, the service version.
+/// Warns when they differ so operators can detect CLI/service drift.
 pub fn version() {
-    println!("orch {}", env!("ORCH_VERSION"));
+    let cli_version = env!("ORCH_VERSION");
+    println!("CLI:     {cli_version}");
+
+    match crate::home::service_version_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+    {
+        Some(svc) => {
+            let svc = svc.trim();
+            if svc == cli_version {
+                println!("Service: {svc}  ✓ in sync");
+            } else {
+                println!("Service: {svc}  ✗ mismatch — run: brew upgrade orch && brew services restart orch");
+            }
+        }
+        None => {
+            println!("Service: not running (no service.version file)");
+        }
+    }
 }
 
 /// Initialize orchestrator for a project.

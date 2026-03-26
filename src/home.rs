@@ -93,6 +93,14 @@ pub fn db_path() -> anyhow::Result<PathBuf> {
     Ok(new_path)
 }
 
+/// Get the path to the service version file (~/.orch/state/service.version).
+///
+/// Written by the engine at startup, deleted on graceful shutdown.
+/// Used by `orch version` to detect CLI/service drift.
+pub fn service_version_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(state_dir()?.join("service.version"))
+}
+
 /// Get the path to the worktrees directory (~/.orch/worktrees/).
 pub fn worktrees_dir() -> anyhow::Result<PathBuf> {
     let dir = orch_home()?.join("worktrees");
