@@ -62,7 +62,7 @@ pub struct GitHubCheckRun {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubBranchRef {
     #[serde(rename = "ref")]
-    pub ref_field: String,
+    pub ref_: String,
     pub sha: String,
 }
 
@@ -186,6 +186,18 @@ mod tests {
         assert_eq!(comment.commit_id, "abc123");
         assert_eq!(comment.in_reply_to_id, None);
         assert!(comment.diff_hunk.is_some());
+    }
+
+    #[test]
+    fn test_github_branch_ref_deserialization() {
+        let json = r#"{
+            "ref": "main",
+            "sha": "abc123"
+        }"#;
+
+        let branch_ref: GitHubBranchRef = serde_json::from_str(json).unwrap();
+        assert_eq!(branch_ref.ref_, "main");
+        assert_eq!(branch_ref.sha, "abc123");
     }
 
     #[test]
