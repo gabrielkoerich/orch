@@ -31,7 +31,7 @@ Commit your fixes and re-run checks. If you cannot fix a failure, decision = `re
 Local checks can diverge from CI (e.g. different toolchain versions). After local checks pass, also verify GitHub CI:
 
 ```bash
-gh pr checks {{PR_NUMBER}} --watch --fail-fast
+timeout 300 gh pr checks {{PR_NUMBER}} --watch --fail-fast || true
 ```
 
 If GitHub CI has failures that your local checks missed, fix them, commit, and re-run. If CI is still pending after 5 minutes, proceed with local results but note it in your review.
