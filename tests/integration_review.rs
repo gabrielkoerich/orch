@@ -1,114 +1,36 @@
 //! Integration tests for the full review agent flow.
 //!
 //! Calls REAL agents with a review prompt, captures stdout/stderr,
-//! and verifies the output can be parsed as a review response.
-//! Reproduces the exact flow from review.rs.
+//! and verifies the output can be parsed using the SAME code path as review.rs:
+//!   1. `get_runner(agent).extract_text(stdout)` — per-agent envelope extraction
+//!   2. `parse_review_from_output(&text)` — JSON/plain-text review parse
 //!
 //! `#[ignore]`d — needs API keys and installed CLIs. Run locally:
 //! ```bash
 //! cargo test --test integration_review -- --ignored --nocapture
 //! ```
 
+use orch::engine::runner::agents::get_runner;
+use orch::engine::runner::response::parse_review_from_output;
 use std::process::Command;
 
-const REVIEW_PROMPT: &str = "Say hello in one sentence.";
+const REVIEW_PROMPT: &str = r#"You are a code review agent. Review this trivial change and respond with ONLY this JSON (no markdown, no explanation):
+{"decision":"approve","summary":"looks good","concerns":[]}"#;
 
 fn is_available(binary: &str) -> bool {
     which::which(binary).is_ok()
 }
 
-/// Extract text from NDJSON — same logic as ndjson_extract_text in response.rs
-fn extract_text_from_ndjson(ndjson: &str) -> String {
-    ndjson
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|e| {
-            let event_type = e.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match event_type {
-                // opencode: text event
-                "text" => e
-                    .get("part")
-                    .and_then(|p| p.get("text"))
-                    .and_then(|t| t.as_str())
-                    .map(str::to_string)
-                    .or_else(|| e.get("text").and_then(|t| t.as_str()).map(str::to_string)),
-                // codex: item.completed with agent_message
-                "item.completed" => e
-                    .get("item")
-                    .filter(|item| {
-                        item.get("type").and_then(|v| v.as_str()) == Some("agent_message")
-                    })
-                    .and_then(|item| item.get("text"))
-                    .and_then(|t| t.as_str())
-                    .map(str::to_string),
-                // claude stream-json: assistant message
-                "assistant" => e
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|item| {
-                                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                    item.get("text")
-                                        .and_then(|t| t.as_str())
-                                        .map(str::to_string)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("")
-                    })
-                    .filter(|s| !s.is_empty()),
-                // claude stream-json: final result
-                "result" => e.get("result").and_then(|r| r.as_str()).map(str::to_string),
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-/// Extract JSON block from text (like extract_json_block in response.rs)
-#[allow(dead_code)]
-fn extract_json_from_text(text: &str) -> Option<String> {
-    // Try direct JSON parse
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-        if v.get("decision").is_some() {
-            return Some(text.trim().to_string());
-        }
-    }
-
-    // Try markdown code block
-    if let Some(start) = text.find("```json") {
-        let after = &text[start + 7..];
-        if let Some(end) = after.find("```") {
-            let block = after[..end].trim();
-            if serde_json::from_str::<serde_json::Value>(block).is_ok() {
-                return Some(block.to_string());
-            }
-        }
-    }
-
-    // Try finding a JSON object with "decision"
-    if let Some(start) = text.find("{\"decision\"") {
-        if let Some(end) = text[start..].find('}') {
-            let candidate = &text[start..=start + end];
-            if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
-                return Some(candidate.to_string());
-            }
-        }
-    }
-
-    None
-}
-
 /// Run the full review parsing flow on agent output.
-/// This mirrors exactly what review.rs does.
-fn verify_review_output(agent: &str, exit_code: i32, stdout: &str, stderr: &str) {
-    eprintln!("\n=== {agent} ===");
+/// Uses the same code path as review.rs: extract_text → parse_review_from_output.
+fn verify_review_output(
+    agent_binary: &str,
+    label: &str,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) {
+    eprintln!("\n=== {label} ===");
     eprintln!("exit_code: {exit_code}");
     eprintln!("stdout length: {}", stdout.len());
     eprintln!("stderr length: {}", stderr.len());
@@ -125,38 +47,52 @@ fn verify_review_output(agent: &str, exit_code: i32, stdout: &str, stderr: &str)
         );
     }
 
-    // Step 1: review.rs line 638 — abort on error or empty
+    // Step 1: abort on non-zero exit or empty output (mirrors review.rs line 638)
     assert!(
         exit_code == 0,
-        "{agent}: non-zero exit code {exit_code}\nstderr: {}",
+        "{label}: non-zero exit code {exit_code}\nstderr: {}",
         &stderr[..stderr.len().min(500)]
     );
     assert!(
         !stdout.is_empty(),
-        "{agent}: stdout is empty! exit_code={exit_code}, stderr: {}",
+        "{label}: stdout is empty! exit_code={exit_code}, stderr: {}",
         &stderr[..stderr.len().min(500)]
     );
 
-    // Step 2: extract text from NDJSON
-    let extracted = extract_text_from_ndjson(stdout);
-    eprintln!("extracted text length: {}", extracted.len());
-    if !extracted.is_empty() {
-        eprintln!(
-            "extracted first 300 chars:\n{}",
-            &extracted[..extracted.len().min(300)]
-        );
-    }
+    // Step 2: per-agent envelope extraction — same as review.rs stage 1
+    let runner = get_runner(agent_binary);
+    let text = match runner.extract_text(stdout) {
+        Ok(t) if !t.is_empty() => {
+            eprintln!("extracted text length: {}", t.len());
+            eprintln!("extracted first 300 chars:\n{}", &t[..t.len().min(300)]);
+            t
+        }
+        Ok(_) => {
+            eprintln!("extract_text returned empty, falling back to raw stdout");
+            stdout.to_string()
+        }
+        Err(e) => panic!("{label}: extract_text returned terminal error: {e}"),
+    };
 
-    // Step 3: verify text was extracted
     assert!(
-        !extracted.is_empty(),
-        "{agent}: NDJSON extraction returned empty! The review parser would fail.\nstdout first 500:\n{}",
+        !text.is_empty(),
+        "{label}: text is empty after extraction! The review parser would fail.\nstdout first 500:\n{}",
         &stdout[..stdout.len().min(500)]
     );
 
+    // Step 3: parse as ReviewResponse — same as review.rs stage 2
+    let review = parse_review_from_output(&text);
+    assert!(
+        review.is_ok(),
+        "{label}: parse_review_from_output failed: {}\nextracted text:\n{}",
+        review.unwrap_err(),
+        &text[..text.len().min(500)]
+    );
+
     eprintln!(
-        "=== {agent} PASSED: NDJSON extraction works, {} chars extracted ===\n",
-        extracted.len()
+        "=== {label} PASSED: extracted {} chars, parsed review decision={:?} ===\n",
+        text.len(),
+        review.unwrap().decision
     );
 }
 
@@ -208,7 +144,7 @@ fn review_flow_claude_haiku() {
         return;
     }
     let (exit, stdout, stderr) = run_claude_agent("claude", "haiku");
-    verify_review_output("claude:haiku", exit, &stdout, &stderr);
+    verify_review_output("claude", "claude:haiku", exit, &stdout, &stderr);
 }
 
 #[test]
@@ -219,7 +155,7 @@ fn review_flow_kimi() {
         return;
     }
     let (exit, stdout, stderr) = run_claude_agent("kimi", "sonnet");
-    verify_review_output("kimi:sonnet", exit, &stdout, &stderr);
+    verify_review_output("kimi", "kimi:sonnet", exit, &stdout, &stderr);
 }
 
 #[test]
@@ -230,5 +166,5 @@ fn review_flow_minimax() {
         return;
     }
     let (exit, stdout, stderr) = run_claude_agent("minimax", "sonnet");
-    verify_review_output("minimax:sonnet", exit, &stdout, &stderr);
+    verify_review_output("minimax", "minimax:sonnet", exit, &stdout, &stderr);
 }
