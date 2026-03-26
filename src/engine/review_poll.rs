@@ -378,7 +378,11 @@ pub(crate) async fn review_open_prs(
             }
         }
 
-        // Also include comment-based review feedback
+        // Also include comment-based review feedback.
+        // Collect the new comment timestamp but do NOT persist it yet — we only
+        // save it after handle_review_changes() succeeds so that a transient
+        // failure does not silently drop the review on the next poll.
+        let mut new_comment_review_ts: Option<String> = None;
         if comment_changes_requested && review_context.is_empty() {
             let last_comment_ts = stored_task.last_comment_review_ts.clone();
             if let Ok(comments) = gh.list_comments(repo, &pr_number.to_string()).await {
@@ -394,16 +398,8 @@ pub(crate) async fn review_open_prs(
                         review_context.push_str(&body);
                         review_context.push('\n');
 
-                        store_set(
-                            &Some(Arc::clone(store)),
-                            repo,
-                            task_id,
-                            &[(
-                                "last_comment_review_ts",
-                                serde_json::json!(c.created_at.clone()),
-                            )],
-                        )
-                        .await;
+                        // Capture the timestamp; persist only on success below.
+                        new_comment_review_ts = Some(c.created_at.clone());
                         break;
                     }
                 }
@@ -425,19 +421,11 @@ pub(crate) async fn review_open_prs(
             review_context.push_str("\n... (review context truncated)");
         }
 
-        // If we have new review feedback, store it and re-dispatch the task
+        // If we have new review feedback, re-dispatch the task.
+        // Timestamps are only persisted after handle_review_changes() succeeds
+        // so that a transient failure does not permanently skip this review on
+        // the next poll tick.
         if !review_context.is_empty() {
-            store_set(
-                &Some(Arc::clone(store)),
-                repo,
-                task_id,
-                &[(
-                    "last_review_ts",
-                    serde_json::json!(latest_review_ts.clone()),
-                )],
-            )
-            .await;
-
             let task_agent = stored_task
                 .agent
                 .clone()
@@ -467,9 +455,36 @@ pub(crate) async fn review_open_prs(
             .await
             {
                 tracing::warn!(task_id, err = %e, "failed to handle review feedback");
-            } else if review_cycles < max_cycles {
-                tracing::info!(task_id, "re-dispatching task to address review feedback");
-                store_reset_failure_counters(&Some(Arc::clone(store)), repo, task_id).await;
+                // Do NOT update timestamps — leave them unchanged so the same
+                // review is retried on the next poll tick.
+            } else {
+                // Success: advance the watermark timestamps so we don't
+                // re-process the same reviews on the next tick.
+                store_set(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    task_id,
+                    &[(
+                        "last_review_ts",
+                        serde_json::json!(latest_review_ts.clone()),
+                    )],
+                )
+                .await;
+
+                if let Some(ts) = new_comment_review_ts {
+                    store_set(
+                        &Some(Arc::clone(store)),
+                        repo,
+                        task_id,
+                        &[("last_comment_review_ts", serde_json::json!(ts))],
+                    )
+                    .await;
+                }
+
+                if review_cycles < max_cycles {
+                    tracing::info!(task_id, "re-dispatching task to address review feedback");
+                    store_reset_failure_counters(&Some(Arc::clone(store)), repo, task_id).await;
+                }
             }
         }
     }
