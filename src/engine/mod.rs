@@ -1424,6 +1424,22 @@ pub async fn serve() -> anyhow::Result<()> {
                 if review_reset_count > 0 {
                     tracing::info!(review_reset_count, "reset in_review tasks to needs_review for re-dispatch");
                 }
+
+                // Kill all orch-managed tmux sessions so stale sessions don't
+                // block dispatch after restart (session_exists check).
+                if let Ok(sessions) = tmux.list_sessions().await {
+                    let mut killed = 0u32;
+                    for session in &sessions {
+                        if session.name.starts_with("orch-") {
+                            tmux.kill_session(&session.name).await.ok();
+                            killed += 1;
+                        }
+                    }
+                    if killed > 0 {
+                        tracing::info!(killed, "killed orch tmux sessions on shutdown");
+                    }
+                }
+
                 break;
             }
         }
