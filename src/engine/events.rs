@@ -128,6 +128,11 @@ impl EventBus {
         // Write port file
         std::fs::write(ws_port_path()?, port.to_string())?;
 
+        // Write service version file so `orch version` can detect CLI/service drift
+        if let Ok(path) = crate::home::service_version_path() {
+            let _ = std::fs::write(path, env!("ORCH_VERSION"));
+        }
+
         let tx = self.tx.clone();
         tokio::spawn(async move {
             loop {
@@ -233,6 +238,13 @@ pub fn select_available_listener() -> anyhow::Result<(std::net::TcpListener, u16
 /// Remove the ws.port file on shutdown.
 pub fn cleanup_port_file() {
     if let Ok(path) = ws_port_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Remove the service.version file on shutdown.
+pub fn cleanup_version_file() {
+    if let Ok(path) = crate::home::service_version_path() {
         let _ = std::fs::remove_file(path);
     }
 }
