@@ -307,6 +307,8 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
         let repo_root =
             crate::engine::runner::worktree::resolve_main_repo(&engine.project_dir).await;
         let repo_root_path = std::path::PathBuf::from(&repo_root);
+        let default_branch =
+            crate::engine::runner::worktree::detect_default_branch(&repo_root_path).await;
         let worktrees = list_project_worktrees(&repo_root_path)?;
 
         for worktree_dir in worktrees {
@@ -341,8 +343,12 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                 | TaskStatus::NeedsReview
                 | TaskStatus::InReview => {
                     tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), "rebasing startup worktree");
-                    if let Err(e) =
-                        rebase_worktree_on_origin_main(&worktree_dir, &repo_root_path).await
+                    if let Err(e) = rebase_worktree_on_origin_main(
+                        &worktree_dir,
+                        &repo_root_path,
+                        &default_branch,
+                    )
+                    .await
                     {
                         tracing::warn!(repo = %engine.repo, task_id = %task_id, err = %e, "startup rebase failed, resetting task");
                         abort_worktree_rebase(&worktree_dir).await;
