@@ -380,6 +380,12 @@ enum TaskAction {
         /// Filter by source
         #[arg(long)]
         source: Option<String>,
+        /// Show tasks across all configured projects
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+        /// Filter to a specific project repo slug or name
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Create a task
     Add {
@@ -655,8 +661,13 @@ async fn main() -> anyhow::Result<()> {
             template::render_and_print(&path, &vars)?;
         }
         Commands::Task { action } => match action {
-            TaskAction::List { status, source } => {
-                cli::task::list(status, source).await?;
+            TaskAction::List {
+                status,
+                source,
+                global,
+                project,
+            } => {
+                cli::task::list(status, source, global, project).await?;
             }
             TaskAction::Add {
                 title,

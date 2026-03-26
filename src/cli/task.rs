@@ -101,16 +101,30 @@ async fn update_status_store_first(
     Ok(())
 }
 
+fn matches_project_filter(repo: &str, project: &str) -> bool {
+    let repo_name = repo.rsplit('/').next().unwrap_or(repo);
+    repo == project || repo_name == project || repo.ends_with(&format!("/{project}"))
+}
+
 /// List tasks with optional filters.
-pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Result<()> {
+pub async fn list(
+    status: Option<String>,
+    source: Option<String>,
+    global: bool,
+    project: Option<String>,
+) -> anyhow::Result<()> {
     // When no project context is available (e.g. running from a worktree without
     // .orch.yml), fall back to a store-only listing across all configured projects
     // instead of printing a fatal error.
+    if global || project.is_some() {
+        return list_from_global_store(status, source, project.as_deref()).await;
+    }
+
     let task_manager = match init_task_manager().await {
         Ok(tm) => tm,
         Err(e) => {
             tracing::debug!("no project context available, falling back to global store: {e:#}");
-            return list_from_global_store(status, source).await;
+            return list_from_global_store(status, source, project.as_deref()).await;
         }
     };
     let filter = TaskFilter { status, source };
@@ -139,10 +153,10 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
         };
 
     println!(
-        "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} TITLE",
-        "ID", "TYPE", "STATUS", "AGENT", "AGE", "TRIES"
+        "{:<15} {:<12} {:<20} {:<24} {:<10} {:<6} {:<5} TITLE",
+        "ID", "TYPE", "STATUS", "PROJECT", "AGENT", "AGE", "TRIES"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(125));
 
     for task in tasks {
         match task {
@@ -159,6 +173,7 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
                     .unwrap_or("")
                     .to_string();
                 let age = format_age(&ext.updated_at);
+                let project = store_task.map(|t| t.repo.as_str()).unwrap_or(&repo);
                 let tries = store_task
                     .map(|t| {
                         if t.attempts > 0 {
@@ -169,13 +184,14 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
                     })
                     .unwrap_or_default();
                 println!(
-                    "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} {}",
-                    ext.id.0, "external", status, agent, age, tries, ext.title
+                    "{:<15} {:<12} {:<20} {:<24} {:<10} {:<6} {:<5} {}",
+                    ext.id.0, "external", status, project, agent, age, tries, ext.title
                 );
             }
             Task::Internal(int) => {
                 let agent = int.agent.as_deref().unwrap_or("-");
                 let age = format_age(&int.updated_at);
+                let project = &int.repo;
                 let tries = if int.attempts > 0 {
                     int.attempts.to_string()
                 } else {
@@ -191,10 +207,11 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
                     int.title.clone()
                 };
                 println!(
-                    "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} {}",
+                    "{:<15} {:<12} {:<20} {:<24} {:<10} {:<6} {:<5} {}",
                     format!("internal:{}", int.id),
                     "internal",
                     int.status.as_str(),
+                    project,
                     agent,
                     age,
                     tries,
@@ -215,6 +232,7 @@ pub async fn list(status: Option<String>, source: Option<String>) -> anyhow::Res
 async fn list_from_global_store(
     status: Option<String>,
     source: Option<String>,
+    project: Option<&str>,
 ) -> anyhow::Result<()> {
     let store = match crate::cli::init_store().await {
         Ok(s) => s,
@@ -236,6 +254,11 @@ async fn list_from_global_store(
     let tasks: Vec<_> = tasks
         .into_iter()
         .filter(|t| source.as_ref().map(|s| &t.source == s).unwrap_or(true))
+        .filter(|t| {
+            project
+                .map(|p| matches_project_filter(&t.repo, p))
+                .unwrap_or(true)
+        })
         .collect();
 
     if tasks.is_empty() {
@@ -244,10 +267,10 @@ async fn list_from_global_store(
     }
 
     println!(
-        "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} TITLE",
-        "ID", "TYPE", "STATUS", "AGENT", "AGE", "TRIES"
+        "{:<15} {:<12} {:<20} {:<24} {:<10} {:<6} {:<5} TITLE",
+        "ID", "TYPE", "STATUS", "PROJECT", "AGENT", "AGE", "TRIES"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(125));
 
     for task in tasks {
         let type_str = if task.origin == "internal" {
@@ -255,6 +278,7 @@ async fn list_from_global_store(
         } else {
             "external"
         };
+        let project = task.repo.as_str();
         let id_str = if task.origin == "internal" {
             format!("internal:{}", task.id)
         } else {
@@ -279,10 +303,11 @@ async fn list_from_global_store(
             task.title.clone()
         };
         println!(
-            "{:<15} {:<12} {:<20} {:<10} {:<6} {:<5} {}",
+            "{:<15} {:<12} {:<20} {:<24} {:<10} {:<6} {:<5} {}",
             id_str,
             type_str,
             task.status.as_str(),
+            project,
             agent,
             age,
             tries,
@@ -1386,5 +1411,23 @@ mod tests {
     fn format_age_invalid_returns_dash() {
         let age = format_age("not-a-timestamp");
         assert_eq!(age, "-");
+    }
+
+    #[test]
+    fn matches_project_filter_accepts_exact_repo_slug() {
+        assert!(matches_project_filter(
+            "gabrielkoerich/orch",
+            "gabrielkoerich/orch"
+        ));
+    }
+
+    #[test]
+    fn matches_project_filter_accepts_repo_name_suffix() {
+        assert!(matches_project_filter("gabrielkoerich/orch", "orch"));
+    }
+
+    #[test]
+    fn matches_project_filter_rejects_non_matching_repo() {
+        assert!(!matches_project_filter("gabrielkoerich/orch", "bean"));
     }
 }
