@@ -6,8 +6,9 @@ use crate::engine::events::TaskEvent;
 use crate::engine::review::{review_and_merge, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
+use crate::github::http::GhHttp;
 use crate::repo_context::REPO_CONTEXT;
-use crate::store::{TaskStatus, TaskStore};
+use crate::store::{opt_store_get_task, TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -173,7 +174,12 @@ pub fn spawn(
                                     "review_agent_failures",
                                 )
                                 .await;
-                                if failures >= MAX_REVIEW_AGENT_FAILURES {
+                                let blocking = failures >= MAX_REVIEW_AGENT_FAILURES;
+                                // Post failure comment to the PR so the history is visible.
+                                post_review_failure_comment(
+                                    &store_c, &repo_s, &tid, &reason, failures, blocking,
+                                ).await;
+                                if blocking {
                                     tracing::error!(
                                         task_id = tid,
                                         reason,
@@ -199,7 +205,12 @@ pub fn spawn(
                                     "review_agent_failures",
                                 )
                                 .await;
-                                if failures >= MAX_REVIEW_AGENT_FAILURES {
+                                let reason = format!("{e:#}");
+                                let blocking = failures >= MAX_REVIEW_AGENT_FAILURES;
+                                post_review_failure_comment(
+                                    &store_c, &repo_s, &tid, &reason, failures, blocking,
+                                ).await;
+                                if blocking {
                                     tracing::error!(
                                         task_id = tid,
                                         error = %e,
@@ -295,4 +306,44 @@ pub fn spawn(
             }
         }
     });
+}
+
+/// Post a comment on the PR explaining why the review agent failed.
+/// Best-effort — if the PR number is missing or the API call fails, we just log.
+async fn post_review_failure_comment(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    reason: &str,
+    failures: u64,
+    blocking: bool,
+) {
+    let pr_number = match opt_store_get_task(&Some(store.clone()), repo, task_id).await {
+        Some(t) if t.pr_number.is_some() => t.pr_number.unwrap(),
+        _ => return, // No PR to comment on
+    };
+
+    let status = if blocking {
+        "Task blocked for human review."
+    } else {
+        "Retrying with a different agent."
+    };
+
+    let comment = format!(
+        "⚠️ Review agent failed (attempt {}/{})\n\n**Reason:** {}\n\n{}",
+        failures, MAX_REVIEW_AGENT_FAILURES, reason, status,
+    );
+
+    let gh = match GhHttp::new() {
+        Ok(gh) => gh,
+        Err(_) => return,
+    };
+    if let Err(e) = gh.add_comment(repo, &pr_number.to_string(), &comment).await {
+        tracing::debug!(
+            task_id,
+            pr_number,
+            error = %e,
+            "failed to post review failure comment"
+        );
+    }
 }
