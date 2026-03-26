@@ -106,12 +106,12 @@ impl EventBus {
     pub async fn start_ws_server(&self) -> anyhow::Result<u16> {
         // Select a deterministic port in the ephemeral range (49152-65535),
         // starting from a hostname-based offset to be stable across restarts.
-        let port = select_available_port()?;
-        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        let (listener, port) = select_available_listener()?;
+        listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(listener)?;
 
         // Write port file
-        let state_dir = crate::home::state_dir()?;
-        std::fs::write(state_dir.join("ws.port"), port.to_string())?;
+        std::fs::write(ws_port_path()?, port.to_string())?;
 
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -177,7 +177,7 @@ impl EventBus {
 /// Find an available port in the ephemeral range (49152-65535).
 /// Starts from a deterministic offset based on hostname hash, then increments.
 /// This gives stable first-attempt ports across restarts on the same machine.
-pub fn select_available_port() -> anyhow::Result<u16> {
+pub fn select_available_listener() -> anyhow::Result<(std::net::TcpListener, u16)> {
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "orch".to_string());
     let hash = hostname
         .bytes()
@@ -190,8 +190,8 @@ pub fn select_available_port() -> anyhow::Result<u16> {
         if port < 49152 {
             continue;
         }
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return Ok(port);
+        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            return Ok((listener, port));
         }
     }
     anyhow::bail!("no available port found in range 49152-65535")
@@ -199,8 +199,18 @@ pub fn select_available_port() -> anyhow::Result<u16> {
 
 /// Remove the ws.port file on shutdown.
 pub fn cleanup_port_file() {
-    if let Ok(state_dir) = crate::home::state_dir() {
-        let _ = std::fs::remove_file(state_dir.join("ws.port"));
+    if let Ok(path) = ws_port_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn ws_port_path() -> anyhow::Result<std::path::PathBuf> {
+    if cfg!(test) {
+        let dir = std::env::temp_dir().join("orch-test-state");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir.join("ws.port"))
+    } else {
+        Ok(crate::home::state_dir()?.join("ws.port"))
     }
 }
 
@@ -259,11 +269,12 @@ mod tests {
 
     #[test]
     fn select_port_finds_available_port() {
-        let port = select_available_port().unwrap();
+        let (listener, port) = select_available_listener().unwrap();
         assert!(port >= 49152);
-        // Verify the port is actually available by binding to it
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port));
-        assert!(listener.is_ok());
+        // Verify the port is reserved while the listener is alive.
+        let second_bind = std::net::TcpListener::bind(("127.0.0.1", port));
+        assert!(second_bind.is_err());
+        drop(listener);
     }
 
     fn make_event(task_id: &str, repo: &str) -> TaskEvent {
