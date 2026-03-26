@@ -1067,6 +1067,45 @@ impl GhHttp {
             .collect())
     }
 
+    fn combined_status_state(
+        total: u64,
+        failing: u64,
+        pending: u64,
+        has_workflows: bool,
+    ) -> String {
+        if failing > 0 {
+            "failure".to_string()
+        } else if pending > 0 || (total == 0 && has_workflows) {
+            "pending".to_string()
+        } else {
+            "success".to_string()
+        }
+    }
+
+    /// Return `true` when the repository has at least one GitHub Actions workflow.
+    ///
+    /// This is used to distinguish repos that genuinely have no CI configured from
+    /// repos where CI exists but GitHub has not surfaced any runs yet.
+    pub async fn has_workflows(&self, repo: &str) -> anyhow::Result<bool> {
+        let url = format!("{GITHUB_API}/repos/{repo}/actions/workflows?per_page=1");
+        let resp = self.get_json::<serde_json::Value>(&url).await;
+        match resp {
+            Ok(value) => Ok(value
+                .get("workflows")
+                .and_then(|v| v.as_array())
+                .map(|workflows| !workflows.is_empty())
+                .unwrap_or(false)),
+            Err(e) => {
+                let err = e.to_string();
+                if err.contains("404") {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     /// Get check runs for a PR head SHA.
     pub async fn get_check_runs(
         &self,
@@ -1560,6 +1599,7 @@ impl GhHttp {
         &self,
         repo: &str,
         git_ref: &str,
+        has_workflows: bool,
     ) -> anyhow::Result<(String, u64, u64, u64, u64)> {
         let url = format!("{GITHUB_API}/repos/{repo}/commits/{git_ref}/check-runs");
         let resp: serde_json::Value = self.get_json(&url).await?;
@@ -1596,16 +1636,7 @@ impl GhHttp {
         }
 
         let total = runs.len() as u64;
-        let state = if failing > 0 {
-            "failure".to_string()
-        } else if pending > 0 {
-            "pending".to_string()
-        } else {
-            // total == 0 (no checks registered) or all passing — treat as success.
-            // Previously total==0 returned "pending", causing auto_merge_pr to poll
-            // for 5 minutes and then incorrectly count it as a CI timeout failure.
-            "success".to_string()
-        };
+        let state = Self::combined_status_state(total, failing, pending, has_workflows);
 
         Ok((state, total, passing, failing, pending))
     }
@@ -1951,6 +1982,13 @@ mod tests {
         // remaining=5 is below threshold — proactive wait activates
         rl.remaining = Some(5);
         assert!(rl.is_active().is_some());
+    }
+
+    #[test]
+    fn combined_status_state_treats_empty_checks_as_pending_when_workflows_exist() {
+        assert_eq!(GhHttp::combined_status_state(0, 0, 0, true), "pending");
+        assert_eq!(GhHttp::combined_status_state(0, 0, 0, false), "success");
+        assert_eq!(GhHttp::combined_status_state(3, 1, 0, true), "failure");
     }
 
     #[test]

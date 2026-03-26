@@ -234,10 +234,16 @@ pub(crate) async fn auto_merge_pr(
         anyhow::bail!("PR is not mergeable (merge conflicts present)");
     }
     let head_sha = pr.head.sha.clone();
+    let base_branch = pr.base.ref_.clone();
     let required_contexts = gh
-        .get_required_status_check_contexts(repo, branch)
+        .get_required_status_check_contexts(repo, &base_branch)
         .await
         .unwrap_or_default();
+    let repo_has_workflows = if required_contexts.is_empty() {
+        gh.has_workflows(repo).await.unwrap_or(false)
+    } else {
+        true
+    };
 
     loop {
         // Acquire a global permit only for the HTTP polling batch.
@@ -245,7 +251,8 @@ pub(crate) async fn auto_merge_pr(
         let (state, total, passing, failing, pending) = {
             let _permit = ci_poll_semaphore().clone().acquire_owned().await;
             if required_contexts.is_empty() {
-                gh.get_combined_status(repo, &head_sha).await?
+                gh.get_combined_status(repo, &head_sha, repo_has_workflows)
+                    .await?
             } else {
                 let check_runs = gh.get_check_runs(repo, &head_sha).await.unwrap_or_default();
                 let statuses = gh
