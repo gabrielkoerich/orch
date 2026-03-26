@@ -101,7 +101,8 @@ async fn recover_missing_review_worktree(
 /// Ensure an open PR exists for the task branch before running the review agent.
 ///
 /// Checks the store first (avoids GitHub list-API cache race), then the API.
-/// If no PR exists but the branch has commits, attempts to create one.
+/// If no PR exists but the branch has commits, attempts to create one and
+/// continues with the same review pass.
 /// All error and no-op paths update task status and return [`EnsurePrResult::EarlyReturn`].
 #[allow(clippy::too_many_arguments)]
 async fn ensure_pr_exists(
@@ -189,18 +190,18 @@ async fn ensure_pr_exists(
                     .await
                 {
                     Ok(url) => {
-                        if let Some(pr_num_i64) = url
+                        let pr_num = url
                             .rsplit('/')
                             .next()
                             .filter(|s| !s.is_empty())
                             .and_then(|s| s.parse::<i64>().ok())
-                            .filter(|&n| n > 0)
-                        {
+                            .filter(|&n| n > 0);
+                        if let Some(pr_num) = pr_num {
                             store_set(
                                 &Some(Arc::clone(store)),
                                 repo,
                                 &task.id.0,
-                                &[("pr_number", serde_json::json!(pr_num_i64))],
+                                &[("pr_number", serde_json::json!(pr_num))],
                             )
                             .await;
                         }
@@ -208,11 +209,15 @@ async fn ensure_pr_exists(
                             task_id = task.id.0,
                             branch = %branch_name,
                             pr_url = %url,
-                            "created missing PR via GhHttp — retrying review"
+                            "created missing PR via GhHttp — continuing review"
                         );
-                        Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
-                            "created missing PR, retry".to_string(),
-                        )))
+                        if let Some(pr_num) = pr_num {
+                            Ok(EnsurePrResult::Ready(pr_num as u64))
+                        } else {
+                            Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
+                                "created missing PR, but could not parse PR number".to_string(),
+                            )))
+                        }
                     }
                     Err(e) => {
                         let e_str = format!("{e}");
@@ -261,30 +266,35 @@ async fn ensure_pr_exists(
                         match pr_result {
                             Ok(o) if o.status.success() => {
                                 let stdout = String::from_utf8_lossy(&o.stdout);
-                                if let Some(pr_num_i64) = stdout
+                                let pr_num = stdout
                                     .trim()
                                     .rsplit('/')
                                     .next()
                                     .filter(|s| !s.is_empty())
                                     .and_then(|s| s.parse::<i64>().ok())
-                                    .filter(|&n| n > 0)
-                                {
+                                    .filter(|&n| n > 0);
+                                if let Some(pr_num) = pr_num {
                                     store_set(
                                         &Some(Arc::clone(store)),
                                         repo,
                                         &task.id.0,
-                                        &[("pr_number", serde_json::json!(pr_num_i64))],
+                                        &[("pr_number", serde_json::json!(pr_num))],
                                     )
                                     .await;
                                 }
                                 tracing::info!(
                                     task_id = task.id.0,
                                     branch = %branch_name,
-                                    "created missing PR via CLI — retrying review"
+                                    "created missing PR via CLI — continuing review"
                                 );
-                                Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
-                                    "created missing PR, retry".to_string(),
-                                )))
+                                if let Some(pr_num) = pr_num {
+                                    Ok(EnsurePrResult::Ready(pr_num as u64))
+                                } else {
+                                    Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
+                                        "created missing PR via CLI, but could not parse PR number"
+                                            .to_string(),
+                                    )))
+                                }
                             }
                             Ok(o) => {
                                 let stderr = String::from_utf8_lossy(&o.stderr);
