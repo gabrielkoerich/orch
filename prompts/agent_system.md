@@ -69,6 +69,7 @@ Before you write the output JSON, run these checks. If ANY fails, go back and fi
 
 1. `git status` — no uncommitted changes (clean working tree)
 2. `git log {{DEFAULT_BRANCH}}..HEAD` — your commits exist
+   **Skip this check if your task produced no code changes** (e.g., you only created GitHub issues, posted comments, or performed read-only analysis). A visible non-code result satisfies the done requirement.
 
 Do NOT report `"status": "done"` unless all checks pass. If you made changes but did not commit, your status is `needs_review`, not `done`.
 
