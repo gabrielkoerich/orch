@@ -267,10 +267,25 @@ impl RouterConfig {
             config.weighted_round_robin = val == "true" || val == "1";
         }
 
-        // Parse pool: list of "agent:model" entries
-        if let Ok(pool_list) = crate::config::get_list("router.pool") {
-            if !pool_list.is_empty() {
+        // Parse pool: list of "agent:model" entries.
+        // `config::get_list()` returns Ok(vec![]) when the key is missing, so we
+        // can't rely on `is_ok()` to indicate presence.
+        match crate::config::get_list("router.pool") {
+            Ok(pool_list) if !pool_list.is_empty() => {
                 config.pool = pool_list;
+            }
+            _ => {
+                // Accept comma-separated string lists: "a,b,c"
+                if let Ok(pool_raw) = crate::config::get("router.pool") {
+                    let parsed = pool_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>();
+                    if !parsed.is_empty() {
+                        config.pool = parsed;
+                    }
+                }
             }
         }
 

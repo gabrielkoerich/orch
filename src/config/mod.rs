@@ -131,7 +131,11 @@ fn global_config_path() -> anyhow::Result<PathBuf> {
 /// Returns empty vec if key not found.
 pub fn get_list(key: &str) -> anyhow::Result<Vec<String>> {
     // Try project config first
-    let project_path = PathBuf::from(".orch.yml");
+    // Use an absolute path so the cache key is stable across tests/processes
+    // that change the current working directory.
+    let project_path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".orch.yml");
     if project_path.exists() {
         if let Ok(val) = resolve_list(&project_path, key) {
             if !val.is_empty() {
@@ -211,7 +215,11 @@ fn extract_list(root: &serde_yml::Value, key: &str) -> anyhow::Result<Vec<String
 /// Files are parsed once and cached for the process lifetime.
 pub fn get(key: &str) -> anyhow::Result<String> {
     // Try project config first
-    let project_path = PathBuf::from(".orch.yml");
+    // Use an absolute path so the cache key is stable across tests/processes
+    // that change the current working directory.
+    let project_path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".orch.yml");
     if project_path.exists() {
         if let Ok(val) = resolve_key(&project_path, key) {
             return Ok(val);

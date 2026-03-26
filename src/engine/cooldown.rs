@@ -129,16 +129,21 @@ fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) {
         );
     }
 
-    // Persist to KV via background task.
+    // Persist to KV via a background task when we have a runtime.
+    // Unit tests call cooldown helpers without a Tokio runtime; avoid panicking.
     let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
     if let Some(store) = store_opt {
         let kv_key = format!("{KV_PREFIX}{key}");
         let value = cooldown_until.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = store.kv_set(&kv_key, &value).await {
-                tracing::warn!(kv_key, err = %e, "failed to persist cooldown to KV store");
-            }
-        });
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                if let Err(e) = store.kv_set(&kv_key, &value).await {
+                    tracing::warn!(kv_key, err = %e, "failed to persist cooldown to KV store");
+                }
+            });
+        } else {
+            tracing::debug!(kv_key, "skipping KV cooldown persist (no Tokio runtime)");
+        }
     }
 }
 
