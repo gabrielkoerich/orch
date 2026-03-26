@@ -652,6 +652,7 @@ impl TaskStore {
             attempts = 0,
             route_attempts = 0,
             review_agent_failures = 0,
+            review_invocations = 0,
             merge_conflict_retries = 0,
             pr_create_failures = 0,
             review_session_expected = 0,

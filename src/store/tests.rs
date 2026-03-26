@@ -474,6 +474,7 @@ async fn helper_store_reset_failure_counters_preserves_review_cycles() {
 
     let opt_store = Some(store.clone());
     store_increment(&opt_store, "owner/repo", "93", "review_cycles").await;
+    store_increment(&opt_store, "owner/repo", "93", "review_invocations").await;
     store_increment(&opt_store, "owner/repo", "93", "attempts").await;
     store_increment(&opt_store, "owner/repo", "93", "merge_conflict_retries").await;
 
@@ -481,6 +482,7 @@ async fn helper_store_reset_failure_counters_preserves_review_cycles() {
 
     let task = store.get(id).await.unwrap();
     assert_eq!(task.review_cycles, 1);
+    assert_eq!(task.review_invocations, 0);
     assert_eq!(task.attempts, 0);
     assert_eq!(task.merge_conflict_retries, 0);
 }
