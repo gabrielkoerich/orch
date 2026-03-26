@@ -10,6 +10,7 @@
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
 use crate::engine::cleanup::cleanup_task_worktree;
+use crate::engine::runner::worktree;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubReview;
@@ -443,8 +444,7 @@ pub(crate) async fn auto_merge_pr(
                         worktree = %wt,
                         "attempting rebase to resolve merge conflict"
                     );
-                    let default_branch =
-                        config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+                    let default_branch = worktree::detect_default_branch(&wt_path).await;
                     let fetch_result = tokio::process::Command::new("git")
                         .args(["fetch", "origin"])
                         .current_dir(&wt_path)

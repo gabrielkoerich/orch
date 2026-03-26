@@ -139,8 +139,7 @@ async fn ensure_pr_exists(
         }
         Ok(None) => {
             // No open PR — check if branch has commits ahead of default branch.
-            let default_branch =
-                crate::config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+            let default_branch = worktree::detect_default_branch(worktree_path).await;
             let worktree_str = worktree_path.to_str().ok_or_else(|| {
                 anyhow::anyhow!(
                     "worktree path contains non-UTF-8 characters: {:?}",
@@ -574,8 +573,7 @@ pub(crate) async fn review_and_merge(
     };
 
     // 3. Build diff context
-    let default_branch =
-        crate::config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+    let default_branch = runner::worktree::detect_default_branch(&worktree_path).await;
     let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
 
