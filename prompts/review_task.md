@@ -14,50 +14,21 @@ Keep the branch up to date — other PRs may have merged since this was created:
 
 **Do NOT push** — the orchestrator handles pushing after review completes.
 
-### Step 2: Run local checks and fix failures
+### Step 2: Verify CI status
 
-1. Read `.github/workflows/` to identify what the CI pipeline runs (lint, format, test, build, etc.)
-2. Execute those exact commands locally — do not guess or hardcode language-specific commands
-3. Run only the checks that apply to the changed code (skip deploy/publish steps)
-
-If ANY check fails, try to fix it yourself:
-- Apply auto-fixers if available (e.g. formatter --fix, linter --fix)
-- Fix errors directly if straightforward
-
-Commit your fixes and re-run checks.
-
-If you cannot fix a failure, **before setting `request_changes`, check whether it pre-exists on `{{DEFAULT_BRANCH}}`**:
-
-1. List files changed by this PR: `git diff origin/{{DEFAULT_BRANCH}} --name-only`
-2. If the failing test/check does not touch any of those files, verify on the base branch:
-   ```bash
-   git stash
-   cargo nextest run <failing_test_name>   # or the equivalent failing command
-   git stash pop
-   ```
-3. If the failure reproduces on `{{DEFAULT_BRANCH}}` (pre-existing) → it is **not** caused by this PR.
-   - Do NOT block the PR for a pre-existing failure.
-   - Note it in your review summary and proceed with the rest of the review.
-4. If the failure only occurs with the PR changes → it is a regression. Set decision = `request_changes`.
-
-Do NOT push — the orchestrator handles that.
-
-### Step 2b: Verify GitHub CI status on the PR
+GitHub CI is the authoritative test environment. Check it:
 
 ```bash
 timeout 300 gh pr checks {{PR_NUMBER}} --watch --fail-fast || true
 ```
 
-**If all required checks pass on GitHub CI AND the branch is rebased on the latest default branch, skip local test runs entirely** — CI runs in a clean, reproducible environment. Local worktrees have sandbox restrictions and shared state paths that cause false failures.
+- **CI passes** → proceed to Step 3 (skip local test runs)
+- **CI fails** → check if the failure is related to files in this PR. If not, it's pre-existing — note it and proceed. If it is, set decision = `request_changes`
+- **CI not run yet or pending** → run local checks as fallback: read `.github/workflows/` to identify what CI runs and execute those commands. Do NOT hardcode language-specific commands
 
-If you rebased in Step 1 and the rebase changed anything, the orchestrator will push and CI will re-run. In that case, wait for the new CI run or note in your review that CI needs to re-run post-rebase.
+If you rebased in Step 1 and the rebase changed anything, CI will re-run after the orchestrator pushes. Note in your review that CI needs to re-run post-rebase.
 
-Only run local checks if:
-- CI has not run yet (no checks reported)
-- CI is still pending after 5 minutes
-- You need to verify a fix you applied during rebase
-
-If you do run local checks, read `.github/workflows/` to identify what CI runs and execute those commands. Do NOT request changes for local-only test failures when GitHub CI is green.
+**Do NOT request changes for local-only test failures when GitHub CI is green.**
 
 ### Step 3: Check architecture alignment
 
@@ -119,4 +90,4 @@ Do NOT respond with prose summaries.
 
 Decision rules:
 - **approve**: GitHub CI passes, branch is rebased, code meets requirements, no major issues
-- **request_changes**: GitHub CI fails, there are bugs, scope creep, or the code doesn't meet requirements. Do NOT request changes for local-only test failures when CI is green.
+- **request_changes**: GitHub CI fails on PR-related code, there are bugs, scope creep, or the code doesn't meet requirements
