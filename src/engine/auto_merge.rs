@@ -62,7 +62,7 @@ fn required_checks_state(
 
         if let Some((status, conclusion)) = check_run_match {
             matched = true;
-            if status != "completed" {
+            if status != "completed" || conclusion.is_none() {
                 pending += 1;
             } else if matches!(conclusion, Some("success" | "neutral" | "skipped")) {
                 passing += 1;
