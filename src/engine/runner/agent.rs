@@ -420,6 +420,21 @@ pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
 
     let sys_file = attempt_dir.join("prompt-sys.md");
     let msg_file = attempt_dir.join("prompt-msg.md");
+    std::fs::write(&sys_file, &inv.system_prompt)?;
+    std::fs::write(&msg_file, &inv.agent_message)?;
+
+    build_runner_script_in_dir(inv, &attempt_dir)
+}
+
+/// Inner script builder given a pre-created attempt directory.
+/// Separated from `build_runner_script` so tests can pass a temp dir and
+/// avoid racing with the parallel binary/lib test that shares `~/.orch/state/`.
+fn build_runner_script_in_dir(
+    inv: &AgentInvocation,
+    attempt_dir: &std::path::Path,
+) -> anyhow::Result<String> {
+    let sys_file = attempt_dir.join("prompt-sys.md");
+    let msg_file = attempt_dir.join("prompt-msg.md");
 
     // Build unified permission rules and sys content (minimal translation)
     let mut permissions = super::agents::PermissionRules::from_config();
@@ -431,10 +446,6 @@ pub fn build_runner_script(inv: &AgentInvocation) -> anyhow::Result<String> {
         }
     }
     permissions.allowed_edit_paths.push(inv.work_dir.clone());
-
-    let sys_content = inv.system_prompt.clone();
-    std::fs::write(&sys_file, &sys_content)?;
-    std::fs::write(&msg_file, &inv.agent_message)?;
 
     // Build agent command using per-agent runner
     let runner = super::agents::get_runner(&inv.agent);
@@ -476,10 +487,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    // Use a unique owner/repo that won't conflict with home.rs parallel tests
-    // which clean up under "test-owner" and "owner".
-    const TEST_REPO: &str = "orch-runner-test/token-check";
-
     fn test_invocation(task_id: &str) -> AgentInvocation {
         AgentInvocation {
             agent: "claude".to_string(),
@@ -493,17 +500,8 @@ mod tests {
             git_author_email: "bot@example.com".to_string(),
             output_file: PathBuf::from("/tmp/test-output.json"),
             timeout_seconds: 0,
-            repo: TEST_REPO.to_string(),
+            repo: "orch-runner-test/token-check".to_string(),
             attempt: 1,
-        }
-    }
-
-    fn cleanup_test_state(task_id: &str) {
-        if let Ok(dir) = crate::home::task_attempt_dir(TEST_REPO, task_id, 1) {
-            // Remove the task directory (two parents up from attempt/1/)
-            if let Some(task_dir) = dir.parent().and_then(|p| p.parent()) {
-                let _ = std::fs::remove_dir_all(task_dir);
-            }
         }
     }
 
@@ -532,31 +530,30 @@ mod tests {
         let inv = test_invocation("env-test");
         // Just verify the invocation can be created without panicking
         assert_eq!(inv.task_id, "env-test");
-        cleanup_test_state("env-test");
     }
 
     #[test]
     fn build_runner_script_persists_exit_status_on_failure() {
-        let task_id = "runner-status-test";
-        let inv = test_invocation(task_id);
-        let script = build_runner_script(&inv).expect("runner script should build");
+        // Use a temp dir so lib and bin compilation units don't race on ~/.orch/state/.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let inv = test_invocation("runner-status-test");
+        let script =
+            build_runner_script_in_dir(&inv, tmp.path()).expect("runner script should build");
 
         assert!(script
             .contains("trap 'status=$?; printf \"%s\\n\" \"$status\" > \"$status_file\"' EXIT"));
         assert!(script.contains("set +e"));
-
-        cleanup_test_state(task_id);
     }
 
     #[test]
     fn build_runner_script_reports_missing_worktree() {
-        let task_id = "runner-missing-worktree-test";
-        let inv = test_invocation(task_id);
-        let script = build_runner_script(&inv).expect("runner script should build");
+        // Use a temp dir so lib and bin compilation units don't race on ~/.orch/state/.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let inv = test_invocation("runner-missing-worktree-test");
+        let script =
+            build_runner_script_in_dir(&inv, tmp.path()).expect("runner script should build");
 
         assert!(script.contains("worktree directory does not exist: /tmp"));
         assert!(script.contains("stderr_file='"));
-
-        cleanup_test_state(task_id);
     }
 }
