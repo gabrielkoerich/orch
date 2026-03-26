@@ -345,9 +345,19 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
         None
     };
 
-    let repo_root = resolve_repo_root(repo).await?;
-
     let mut did_clean = false;
+
+    // If there's nothing to remove (no worktree path and no branch),
+    // treat as a no-op and return Ok(false) without attempting to
+    // resolve the repo root. Resolving the repo root can fail for
+    // projects not registered in config and that should not make
+    // cleanup a hard error when there is nothing to do.
+    let branch_nonempty = branch
+        .as_ref()
+        .and_then(|b| if b.is_empty() { None } else { Some(b) });
+    if worktree_to_remove.is_none() && branch_nonempty.is_none() {
+        return Ok(false);
+    }
 
     if let Some(wt) = worktree_to_remove {
         // TTL guard: skip if the worktree directory is too young.
@@ -383,6 +393,10 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             );
         } else {
             tracing::info!(task_id, worktree = %wt.display(), "removing worktree");
+            // We need the repo root to run git commands that remove the
+            // worktree and delete branches. Resolve it lazily here so
+            // that tasks with nothing to clean don't fail early.
+            let repo_root = resolve_repo_root(repo).await?;
             remove_worktree_and_branch(
                 task_id,
                 &wt,
@@ -397,6 +411,8 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
         // on the remote. Delete it to avoid orphaned branches.
         if !opts.dry_run {
             tracing::debug!(task_id, branch = %br, "no worktree on disk, cleaning up branch only");
+            // Resolve repo root lazily — branch cleanup needs it.
+            let repo_root = resolve_repo_root(repo).await?;
             delete_branches(task_id, br, std::path::Path::new(&repo_root)).await;
             did_clean = true;
         }
