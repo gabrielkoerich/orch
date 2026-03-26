@@ -490,10 +490,25 @@ pub(crate) async fn review_and_merge(
         .with_context(|| format!("store lookup failed for task {}", task.id.0))?;
 
     let store_id: Option<i64> = stored_task.as_ref().map(|t| t.id);
-    let review_attempt: u32 = stored_task
-        .as_ref()
-        .map(|t| (t.review_cycles + 1) as u32)
-        .unwrap_or(1);
+    // Increment a per-invocation counter so every review agent run gets a unique
+    // attempt directory, regardless of whether a previous attempt failed without
+    // producing a `request_changes` decision (which is the only time review_cycles
+    // increments). Stale output.json files from crashed attempts can no longer be
+    // silently reused.
+    let review_attempt: u32 = {
+        let v = store_increment(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            "review_invocations",
+        )
+        .await;
+        if v == 0 {
+            1
+        } else {
+            v as u32
+        }
+    };
 
     let mut worktree_path = match stored_task.as_ref().map(|t| t.worktree.as_str()) {
         Some(w) if !w.is_empty() => std::path::PathBuf::from(w),
