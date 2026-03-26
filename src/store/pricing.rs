@@ -37,9 +37,34 @@ pub struct CostEstimate {
     pub output_cost_usd: f64,
     pub total_cost_usd: f64,
 }
+/// Zero-cost pricing (subscription-based or free-tier models).
+const FREE: ModelPricing = ModelPricing {
+    input_per_million_usd: 0.0,
+    output_per_million_usd: 0.0,
+};
+
 /// Resolve model pricing using a built-in table and normalized model aliases.
 pub fn pricing_for_model(model: &str) -> ModelPricing {
     let normalized = model.trim().to_lowercase();
+
+    // GitHub Copilot subscription models — billed to Copilot account, not per-token.
+    if normalized.starts_with("github-copilot/") {
+        return FREE;
+    }
+
+    // Free-tier models (e.g. minimax-m2.5-free, nemotron-3-super-free).
+    if normalized.contains("-free") || normalized.ends_with("free") {
+        return FREE;
+    }
+
+    // DeepSeek models (e.g. deepseek-r1, deepseek-v3).
+    if normalized.starts_with("deepseek") {
+        return ModelPricing {
+            input_per_million_usd: 0.55,
+            output_per_million_usd: 2.19,
+        };
+    }
+
     // OpenAI models
     if normalized == "o3" {
         return ModelPricing {
@@ -59,6 +84,22 @@ pub fn pricing_for_model(model: &str) -> ModelPricing {
             output_per_million_usd: 8.0,
         };
     }
+    // Codex v5 mini variants (gpt-5.1-codex-mini, gpt-5.4-mini, etc.).
+    if normalized.starts_with("gpt-5") && normalized.contains("mini") {
+        return ModelPricing {
+            input_per_million_usd: 0.15,
+            output_per_million_usd: 0.6,
+        };
+    }
+    // Codex v5 full variants (gpt-5.2-codex, gpt-5.3-codex, etc.).
+    if normalized.starts_with("gpt-5") {
+        return ModelPricing {
+            input_per_million_usd: 2.0,
+            output_per_million_usd: 8.0,
+        };
+    }
+
+    // Claude models matched by family substring.
     if normalized.contains("opus") {
         return ModelPricing {
             input_per_million_usd: 15.0,
