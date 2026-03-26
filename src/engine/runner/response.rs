@@ -459,7 +459,15 @@ fn infer_review_response_from_text(text: &str) -> Option<ReviewResponse> {
         });
     }
 
-    if lower.contains("approved") {
+    let positive_approval = lower.contains("lgtm")
+        || lower.contains("looks good")
+        || (lower.contains("approved")
+            && !lower.contains("not approved")
+            && !lower.contains("unapproved")
+            && !lower.contains("not approving")
+            && !lower.contains("cannot approve")
+            && !lower.contains("can't approve"));
+    if positive_approval {
         return Some(ReviewResponse {
             decision: "approve".to_string(),
             notes: "Inferred decision from plain-text review output.".to_string(),
@@ -926,5 +934,43 @@ That's all."#;
         let extracted = ndjson_extract_text(ndjson);
         assert_eq!(extracted, "actual output");
         assert!(!extracted.contains("internal thoughts"));
+    }
+
+    /// Negation patterns must NOT trigger a false approval.
+    #[test]
+    fn infer_review_response_negation_not_approved() {
+        assert!(
+            parse_review_from_output("The changes were not approved.").is_err(),
+            "\"not approved\" should not infer approval"
+        );
+    }
+
+    #[test]
+    fn infer_review_response_negation_unapproved() {
+        assert!(
+            parse_review_from_output("Unapproved changes found in the diff.").is_err(),
+            "\"unapproved\" should not infer approval"
+        );
+    }
+
+    #[test]
+    fn infer_review_response_negation_not_approving() {
+        assert!(
+            parse_review_from_output("I am not approving this PR.").is_err(),
+            "\"not approving\" should not infer approval"
+        );
+    }
+
+    /// Positive plain-text approval signals must still work.
+    #[test]
+    fn infer_review_response_lgtm() {
+        let resp = parse_review_from_output("LGTM, everything looks fine.").unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn infer_review_response_looks_good() {
+        let resp = parse_review_from_output("Looks good to me!").unwrap();
+        assert_eq!(resp.decision, "approve");
     }
 }
