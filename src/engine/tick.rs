@@ -12,6 +12,7 @@
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
 use crate::config;
+use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::jobs;
 use crate::engine::router::{get_route_result, Router};
 use crate::engine::runner::{TaskRunner, WeightSignal};
@@ -558,13 +559,13 @@ pub(crate) async fn tick_dispatch_tasks(
                 continue;
             }
         }
+        // RAII guard — removes dispatch_key on drop even if the spawned task panics.
+        let dispatch_guard = DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
 
         // Check if already running (has active session)
         let session_name = tmux.session_name(repo, &task.id.0);
         if tmux.session_exists(&session_name).await {
-            let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-            guard.remove(&dispatch_key);
-            continue;
+            continue; // dispatch_guard drops here, removing the key
         }
 
         // Try to acquire a slot
@@ -572,9 +573,7 @@ pub(crate) async fn tick_dispatch_tasks(
             Ok(p) => p,
             Err(_) => {
                 tracing::debug!("all parallel slots busy, skipping remaining tasks");
-                let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-                guard.remove(&dispatch_key);
-                break;
+                break; // dispatch_guard drops here, removing the key
             }
         };
 
@@ -585,12 +584,8 @@ pub(crate) async fn tick_dispatch_tasks(
             .await;
         if let Err(e) = set_in_progress_result {
             tracing::error!(task_id, ?e, "failed to set in_progress, skipping dispatch");
-            // Remove from dispatching set since we won't actually dispatch
-            let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-            guard.remove(&dispatch_key);
-            drop(guard);
             drop(permit);
-            continue;
+            continue; // dispatch_guard drops here, removing the key
         }
 
         // Register session for capture
@@ -606,8 +601,6 @@ pub(crate) async fn tick_dispatch_tasks(
         let task_owned = task.clone();
         let weight_tx = weight_tx.clone();
         let repo_owned = repo.to_string();
-        let dispatching_for_cleanup = dispatching.clone();
-        let dispatch_key_for_cleanup = dispatch_key.clone();
         let task_manager_for_spawn = task_manager.clone();
         let store_for_spawn = store.clone();
 
@@ -616,6 +609,7 @@ pub(crate) async fn tick_dispatch_tasks(
 
         let repo_ctx = repo_owned.clone();
         tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
+            let _dispatch_guard = dispatch_guard; // released on drop (normal or panic)
             // Note: Using tracing::info_span directly without holding across await
             // to avoid Send issues with EnteredSpan
             tracing::info!(task_id, "dispatching task");
@@ -768,12 +762,9 @@ pub(crate) async fn tick_dispatch_tasks(
             // Unregister session from capture
             capture.unregister_session(&task_id_for_cleanup).await;
 
-            // Remove from dispatching set so the task can be re-dispatched if needed.
-            let mut guard = dispatching_for_cleanup.lock().unwrap_or_else(|e| e.into_inner());
-            guard.remove(&dispatch_key_for_cleanup);
-
             // Release the semaphore permit
             drop(permit);
+            // _dispatch_guard drops here, removing the key from the dispatching set.
         }));
     }
     Ok(())
