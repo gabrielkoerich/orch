@@ -625,6 +625,16 @@ pub(crate) async fn review_and_merge(
     let git_email = crate::config::get("git.email")
         .unwrap_or_else(|_| format!("{review_agent}[bot]@users.noreply.github.com"));
 
+    let review_timeout_secs: u64 = crate::config::get("workflow.review_timeout_seconds")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            crate::config::get("workflow.timeout_seconds")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1800)
+        });
+
     let system_prompt = runner::agent::review_system_prompt();
 
     let invocation = runner::agent::AgentInvocation {
@@ -638,7 +648,7 @@ pub(crate) async fn review_and_merge(
         git_author_name: git_name,
         git_author_email: git_email,
         output_file: output_file.clone(),
-        timeout_seconds: 600,
+        timeout_seconds: review_timeout_secs,
         repo: repo.to_string(),
         attempt: review_attempt,
     };
@@ -697,7 +707,7 @@ pub(crate) async fn review_and_merge(
 
     // 8. Wait for completion
     let poll_interval = std::time::Duration::from_secs(5);
-    let timeout_duration = std::time::Duration::from_secs(600);
+    let timeout_duration = std::time::Duration::from_secs(review_timeout_secs);
 
     let wait_result = tokio::time::timeout(
         timeout_duration,
