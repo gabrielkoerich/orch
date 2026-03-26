@@ -198,6 +198,10 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
     }
 
     let lower = trimmed.to_lowercase();
+    // Also accept plain-language confirmations of performed actions (issue/PR
+    // creation, comments, etc.) as a successful "done" signal. This prevents
+    // tasks from being retried when an agent reports success in free-form
+    // text instead of returning structured JSON.
     let looks_done = [
         "no changes",
         "nothing to",
@@ -210,6 +214,20 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
         "no action needed",
         "complete",
         "done",
+        // Action/issue completion phrases
+        "filed",
+        "filed issue",
+        "filed issues",
+        "created issue",
+        "created issues",
+        "opened issue",
+        "opened issues",
+        "issue created",
+        "issues created",
+        "issues filed",
+        "task created",
+        "posted comment",
+        "comment posted",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
@@ -828,6 +846,19 @@ mod tests {
     #[test]
     fn synthesize_response_rejects_empty_text() {
         assert!(synthesize_response_from_text("   \n\t  ").is_none());
+    }
+
+    #[test]
+    fn synthesize_response_marks_done_for_issue_creation_text() {
+        let response =
+            synthesize_response_from_text("Filed 3 high-value GitHub issues: #1037, #1038, #1039")
+                .unwrap();
+
+        assert_eq!(response.status, "done");
+        assert!(response.error.is_none());
+        assert!(response
+            .summary
+            .contains("Filed 3 high-value GitHub issues"));
     }
 
     // ── PermissionRules defaults ────────────────────────────────
