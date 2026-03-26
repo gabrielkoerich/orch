@@ -213,7 +213,11 @@ pub async fn build_git_diff(project_dir: &Path, default_branch: &str) -> String 
 /// Shows commit history for the feature branch.
 pub async fn build_git_log(project_dir: &Path, default_branch: &str) -> String {
     let output = Command::new("git")
-        .args(["log", "--oneline", &format!("{}..HEAD", default_branch)])
+        .args([
+            "log",
+            "--oneline",
+            &format!("origin/{default_branch}..HEAD"),
+        ])
         .current_dir(project_dir)
         .output_with_context()
         .await;
