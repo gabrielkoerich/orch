@@ -159,6 +159,29 @@ pub(crate) async fn auto_merge_pr(
     let pr_number = match gh.get_pr_number(repo, branch).await? {
         Some(n) => n,
         None => {
+            // No open PR — check if the branch was already merged/closed.
+            // Treat a closed/merged PR as idempotent success rather than a
+            // retryable failure so the review-agent failure counter is not
+            // incremented when the work is already done.
+            let already_merged = gh.is_pr_merged(repo, branch).await.unwrap_or(false);
+            if already_merged {
+                tracing::info!(
+                    task_id = task.id.0,
+                    branch,
+                    "PR already merged — marking task done (idempotent)"
+                );
+                task_manager
+                    .update_task_status(&task.id, Status::Done)
+                    .await?;
+                if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        err = %e,
+                        "post-merge cleanup failed"
+                    );
+                }
+                return Ok(());
+            }
             anyhow::bail!("no open PR found for branch {}", branch);
         }
     };
