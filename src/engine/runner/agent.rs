@@ -481,13 +481,14 @@ mod tests {
     const TEST_REPO: &str = "orch-runner-test/token-check";
 
     fn test_invocation(task_id: &str) -> AgentInvocation {
+        let unique_task_id = format!("{}-p{}", task_id, std::process::id());
         AgentInvocation {
             agent: "claude".to_string(),
             model: None,
             work_dir: PathBuf::from("/tmp"),
             system_prompt: "test system prompt".to_string(),
             agent_message: "test message".to_string(),
-            task_id: task_id.to_string(),
+            task_id: unique_task_id,
             disallowed_tools: vec![],
             git_author_name: "Test Bot".to_string(),
             git_author_email: "bot@example.com".to_string(),
@@ -499,7 +500,8 @@ mod tests {
     }
 
     fn cleanup_test_state(task_id: &str) {
-        if let Ok(dir) = crate::home::task_attempt_dir(TEST_REPO, task_id, 1) {
+        let unique_task_id = format!("{}-p{}", task_id, std::process::id());
+        if let Ok(dir) = crate::home::task_attempt_dir(TEST_REPO, &unique_task_id, 1) {
             // Remove the task directory (two parents up from attempt/1/)
             if let Some(task_dir) = dir.parent().and_then(|p| p.parent()) {
                 let _ = std::fs::remove_dir_all(task_dir);
@@ -531,7 +533,8 @@ mod tests {
         // not written to any file on disk.
         let inv = test_invocation("env-test");
         // Just verify the invocation can be created without panicking
-        assert_eq!(inv.task_id, "env-test");
+        // task_id is unique per process (appended with PID)
+        assert!(inv.task_id.starts_with("env-test-p"));
         cleanup_test_state("env-test");
     }
 
