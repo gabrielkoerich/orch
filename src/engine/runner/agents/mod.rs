@@ -202,35 +202,68 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
     // creation, comments, etc.) as a successful "done" signal. This prevents
     // tasks from being retried when an agent reports success in free-form
     // text instead of returning structured JSON.
-    let looks_done = [
-        "no changes",
-        "nothing to",
-        "nothing to do",
-        "nothing to execute",
-        "no positions",
-        "no open positions",
-        "no trades",
-        "no trade",
-        "no action needed",
-        "complete",
-        "done",
-        // Action/issue completion phrases
-        "filed",
-        "filed issue",
-        "filed issues",
-        "created issue",
-        "created issues",
-        "opened issue",
-        "opened issues",
-        "issue created",
-        "issues created",
-        "issues filed",
-        "task created",
-        "posted comment",
-        "comment posted",
+    // Returns true when `word` appears as a whole word in `text`
+    // (not preceded or followed by an ASCII alphanumeric character).
+    fn contains_word(text: &str, word: &str) -> bool {
+        let mut start = 0;
+        while let Some(pos) = text[start..].find(word) {
+            let abs = start + pos;
+            let before_ok = abs == 0 || !text.as_bytes()[abs - 1].is_ascii_alphanumeric();
+            let after_ok = abs + word.len() >= text.len()
+                || !text.as_bytes()[abs + word.len()].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs + 1;
+            if start >= text.len() {
+                break;
+            }
+        }
+        false
+    }
+
+    // Negation phrases that override a "done/completed" match.
+    let looks_negative = [
+        "not done",
+        "not yet done",
+        "not complete",
+        "not completed",
+        "incomplete",
+        "undone",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
+
+    let looks_done = !looks_negative
+        && ([
+            "no changes",
+            "nothing to",
+            "nothing to do",
+            "nothing to execute",
+            "no positions",
+            "no open positions",
+            "no trades",
+            "no trade",
+            "no action needed",
+            "completed",
+            // Action/issue completion phrases
+            "filed",
+            "filed issue",
+            "filed issues",
+            "created issue",
+            "created issues",
+            "opened issue",
+            "opened issues",
+            "issue created",
+            "issues created",
+            "issues filed",
+            "task created",
+            "posted comment",
+            "comment posted",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+            || contains_word(&lower, "done"));
 
     let looks_error = [
         "error:",
@@ -846,6 +879,46 @@ mod tests {
     #[test]
     fn synthesize_response_rejects_empty_text() {
         assert!(synthesize_response_from_text("   \n\t  ").is_none());
+    }
+
+    #[test]
+    fn synthesize_response_does_not_mark_done_for_incomplete() {
+        let response = synthesize_response_from_text("The task is incomplete").unwrap();
+        assert_eq!(
+            response.status, "needs_review",
+            "\"incomplete\" should not match \"complete\""
+        );
+    }
+
+    #[test]
+    fn synthesize_response_does_not_mark_done_for_not_done() {
+        let response = synthesize_response_from_text("Changes are not done yet").unwrap();
+        assert_eq!(
+            response.status, "needs_review",
+            "\"not done\" should not match bare \"done\""
+        );
+    }
+
+    #[test]
+    fn synthesize_response_does_not_mark_done_for_not_complete() {
+        let response = synthesize_response_from_text("Still in progress, not complete").unwrap();
+        assert_eq!(
+            response.status, "needs_review",
+            "\"not complete\" should not match \"complete\""
+        );
+    }
+
+    #[test]
+    fn synthesize_response_marks_done_for_completed() {
+        let response =
+            synthesize_response_from_text("Task has been completed successfully").unwrap();
+        assert_eq!(response.status, "done");
+    }
+
+    #[test]
+    fn synthesize_response_marks_done_for_word_boundary_done() {
+        let response = synthesize_response_from_text("All changes are done.").unwrap();
+        assert_eq!(response.status, "done");
     }
 
     #[test]
