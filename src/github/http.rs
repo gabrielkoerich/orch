@@ -1067,7 +1067,12 @@ impl GhHttp {
             .collect())
     }
 
-    fn combined_status_state(total: u64, failing: u64, pending: u64, has_workflows: bool) -> String {
+    fn combined_status_state(
+        total: u64,
+        failing: u64,
+        pending: u64,
+        has_workflows: bool,
+    ) -> String {
         if failing > 0 {
             "failure".to_string()
         } else if pending > 0 || (total == 0 && has_workflows) {
