@@ -24,7 +24,23 @@ If ANY check fails, try to fix it yourself:
 - Apply auto-fixers if available (e.g. formatter --fix, linter --fix)
 - Fix errors directly if straightforward
 
-Commit your fixes and re-run checks. If you cannot fix a failure, decision = `request_changes`. Do NOT push — the orchestrator handles that.
+Commit your fixes and re-run checks.
+
+If you cannot fix a failure, **before setting `request_changes`, check whether it pre-exists on `{{DEFAULT_BRANCH}}`**:
+
+1. List files changed by this PR: `git diff origin/{{DEFAULT_BRANCH}} --name-only`
+2. If the failing test/check does not touch any of those files, verify on the base branch:
+   ```bash
+   git stash
+   cargo nextest run <failing_test_name>   # or the equivalent failing command
+   git stash pop
+   ```
+3. If the failure reproduces on `{{DEFAULT_BRANCH}}` (pre-existing) → it is **not** caused by this PR.
+   - Do NOT block the PR for a pre-existing failure.
+   - Note it in your review summary and proceed with the rest of the review.
+4. If the failure only occurs with the PR changes → it is a regression. Set decision = `request_changes`.
+
+Do NOT push — the orchestrator handles that.
 
 ### Step 2b: Verify GitHub CI status on the PR
 
