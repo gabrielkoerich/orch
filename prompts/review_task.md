@@ -22,11 +22,10 @@ GitHub CI is the authoritative test environment. Check it:
 timeout 300 gh pr checks {{PR_NUMBER}} --watch --fail-fast || true
 ```
 
-- **CI passes** → proceed to Step 3 (skip local test runs)
+- **CI passes AND branch is up to date** (Step 1 rebase was a no-op or already applied) → proceed to Step 3 (skip local test runs)
+- **CI passes BUT branch was rebased** (Step 1 changed commits) → CI results are stale. Note in your review that CI needs to re-run post-rebase and proceed with code review. The orchestrator will push the rebased branch and CI will re-run before merging.
 - **CI fails** → check if the failure is related to files in this PR. If not, it's pre-existing — note it and proceed. If it is, set decision = `request_changes`
 - **CI not run yet or pending** → run local checks as fallback: read `.github/workflows/` to identify what CI runs and execute those commands. Do NOT hardcode language-specific commands
-
-If you rebased in Step 1 and the rebase changed anything, CI will re-run after the orchestrator pushes. Note in your review that CI needs to re-run post-rebase.
 
 **Do NOT request changes for local-only test failures when GitHub CI is green.**
 
