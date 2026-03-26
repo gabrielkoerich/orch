@@ -4027,6 +4027,41 @@ fn pricing_unknown_model_returns_fallback() {
     assert!((unknown.output_per_million_usd - 4.0).abs() < 0.01);
 }
 
+#[test]
+fn pricing_free_and_subscription_models() {
+    use super::pricing_for_model;
+
+    // GitHub Copilot subscription — $0
+    let copilot_sonnet = pricing_for_model("github-copilot/claude-sonnet-4-6");
+    assert_eq!(copilot_sonnet.input_per_million_usd, 0.0);
+    assert_eq!(copilot_sonnet.output_per_million_usd, 0.0);
+
+    let copilot_gpt = pricing_for_model("github-copilot/gpt-5.4-mini");
+    assert_eq!(copilot_gpt.input_per_million_usd, 0.0);
+
+    // Free-tier suffix — $0
+    let minimax_free = pricing_for_model("minimax-m2.5-free");
+    assert_eq!(minimax_free.input_per_million_usd, 0.0);
+
+    let nemotron_free = pricing_for_model("nemotron-3-super-free");
+    assert_eq!(nemotron_free.input_per_million_usd, 0.0);
+
+    // DeepSeek
+    let deepseek = pricing_for_model("deepseek-r1");
+    assert!((deepseek.input_per_million_usd - 0.55).abs() < 0.01);
+    assert!((deepseek.output_per_million_usd - 2.19).abs() < 0.01);
+
+    // Codex v5 mini
+    let codex_mini = pricing_for_model("gpt-5.1-codex-mini");
+    assert!((codex_mini.input_per_million_usd - 0.15).abs() < 0.01);
+    assert!((codex_mini.output_per_million_usd - 0.6).abs() < 0.01);
+
+    // Codex v5 full
+    let codex_full = pricing_for_model("gpt-5.2-codex");
+    assert!((codex_full.input_per_million_usd - 2.0).abs() < 0.01);
+    assert!((codex_full.output_per_million_usd - 8.0).abs() < 0.01);
+}
+
 // ── cost_summary static queries ──────────────────────────────────────
 
 #[tokio::test]
