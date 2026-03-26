@@ -308,7 +308,7 @@ pub async fn handle_success(
                 push_failures,
                 "agent done but push failed ({push_failures}/3) — rerouting to different agent"
             );
-            "routed"
+            "new"
         }
     } else if resp.status == "done" && has_pr {
         "needs_review"
