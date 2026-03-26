@@ -461,6 +461,11 @@ fn infer_review_response_from_text(text: &str) -> Option<ReviewResponse> {
 
     let positive_approval = lower.contains("lgtm")
         || lower.contains("looks good")
+        || lower.contains("all checks passed")
+        || lower.contains("checks passed")
+        || lower.contains("all tests passed")
+        || lower.contains("tests passed")
+        || lower.contains("no issues found")
         || (lower.contains("approved")
             && !lower.contains("not approved")
             && !lower.contains("unapproved")
@@ -971,6 +976,30 @@ That's all."#;
     #[test]
     fn infer_review_response_looks_good() {
         let resp = parse_review_from_output("Looks good to me!").unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    /// "All checks passed" should infer approval (real failure observed in task 16393).
+    #[test]
+    fn infer_review_response_all_checks_passed() {
+        let resp = parse_review_from_output(
+            "The background task completed but I already got the CI results directly. All checks passed — no action needed.",
+        )
+        .unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn infer_review_response_checks_passed() {
+        let resp =
+            parse_review_from_output("All CI checks passed (fmt ✓, clippy ✓, tests ✓).").unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn infer_review_response_no_issues_found() {
+        let resp =
+            parse_review_from_output("Review complete. No issues found in the diff.").unwrap();
         assert_eq!(resp.decision, "approve");
     }
 }
