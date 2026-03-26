@@ -576,6 +576,16 @@ pub(crate) async fn review_and_merge(
     // 3. Build diff context
     let default_branch =
         crate::config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
+
+    // Refresh remote refs before building diff context.
+    // The review agent is instructed to rebase on origin/{default_branch};
+    // this ensures the ref is current, mirroring what rebase_on_default() does for task agents.
+    let _ = tokio::process::Command::new("git")
+        .args(["fetch", "origin"])
+        .current_dir(&worktree_path)
+        .output()
+        .await;
+
     let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
 
