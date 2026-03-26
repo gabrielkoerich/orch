@@ -401,53 +401,92 @@ pub(crate) async fn auto_merge_pr(
                     );
                     let default_branch =
                         config::get("gh.default_branch").unwrap_or_else(|_| "main".to_string());
-                    let rebase_result = tokio::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(format!(
-                            "cd '{}' && git fetch origin && git -c commit.gpgsign=false rebase origin/{default_branch} && git push --force-with-lease",
-                            wt
-                        ))
+                    let fetch_result = tokio::process::Command::new("git")
+                        .args(["fetch", "origin"])
+                        .current_dir(&wt_path)
                         .output()
                         .await;
 
+                    let rebase_result = match fetch_result {
+                        Ok(out) if out.status.success() => {
+                            tokio::process::Command::new("git")
+                                .args([
+                                    "-c",
+                                    "commit.gpgsign=false",
+                                    "rebase",
+                                    &format!("origin/{default_branch}"),
+                                ])
+                                .current_dir(&wt_path)
+                                .output()
+                                .await
+                        }
+                        Ok(out) => Ok(out),
+                        Err(err) => Err(err),
+                    };
+
                     match rebase_result {
                         Ok(out) if out.status.success() => {
-                            tracing::info!(
+                            let push_result = tokio::process::Command::new("git")
+                                .args(["push", "--force-with-lease"])
+                                .current_dir(&wt_path)
+                                .output()
+                                .await;
+
+                            match push_result {
+                                Ok(push_out) if push_out.status.success() => {
+                                    tracing::info!(
                                 task_id = task.id.0,
                                 "rebase succeeded — resetting to NeedsReview for CI + merge"
                             );
-                            store_increment(
-                                &Some(Arc::clone(store)),
-                                repo,
-                                &task.id.0,
-                                "merge_conflict_retries",
-                            )
-                            .await;
-                            // Enable auto-merge — GitHub merges once CI passes.
-                            // If auto-merge isn't available, keep task in InReview
-                            // so the sync tick retries merge on the next cycle.
-                            match gh.enable_auto_merge(repo, pr_number).await {
-                                Ok(_) => {
-                                    task_manager
-                                        .update_task_status(&task.id, Status::Done)
-                                        .await?;
-                                    if let Err(ce) =
-                                        cleanup_task_worktree(&task.id.0, repo, store).await
-                                    {
-                                        tracing::warn!(task_id = task.id.0, err = %ce, "post-rebase cleanup failed");
+                                    store_increment(
+                                        &Some(Arc::clone(store)),
+                                        repo,
+                                        &task.id.0,
+                                        "merge_conflict_retries",
+                                    )
+                                    .await;
+                                    // Enable auto-merge — GitHub merges once CI passes.
+                                    // If auto-merge isn't available, keep task in InReview
+                                    // so the sync tick retries merge on the next cycle.
+                                    match gh.enable_auto_merge(repo, pr_number).await {
+                                        Ok(_) => {
+                                            task_manager
+                                                .update_task_status(&task.id, Status::Done)
+                                                .await?;
+                                            if let Err(ce) =
+                                                cleanup_task_worktree(&task.id.0, repo, store).await
+                                            {
+                                                tracing::warn!(task_id = task.id.0, err = %ce, "post-rebase cleanup failed");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                task_id = task.id.0,
+                                                error = %e,
+                                                "auto-merge unavailable — task stays in InReview for sync retry"
+                                            );
+                                            // Don't change status — sync tick will poll CI
+                                            // and retry merge when checks pass.
+                                        }
                                     }
+                                    return Ok(());
                                 }
-                                Err(e) => {
-                                    tracing::warn!(
+                                Ok(push_out) => {
+                                    let stderr = String::from_utf8_lossy(&push_out.stderr);
+                                    tracing::error!(
                                         task_id = task.id.0,
-                                        error = %e,
-                                        "auto-merge unavailable — task stays in InReview for sync retry"
+                                        stderr = %stderr,
+                                        "force-push after rebase failed — blocking for human review"
                                     );
-                                    // Don't change status — sync tick will poll CI
-                                    // and retry merge when checks pass.
+                                }
+                                Err(push_err) => {
+                                    tracing::error!(
+                                        task_id = task.id.0,
+                                        error = %push_err,
+                                        "force-push command error — blocking for human review"
+                                    );
                                 }
                             }
-                            return Ok(());
                         }
                         Ok(out) => {
                             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -461,7 +500,7 @@ pub(crate) async fn auto_merge_pr(
                             tracing::error!(
                                 task_id = task.id.0,
                                 error = %io_err,
-                                "rebase command error — blocking for human review"
+                                "fetch/rebase command error — blocking for human review"
                             );
                         }
                     }
