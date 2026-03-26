@@ -374,6 +374,21 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
         .as_ref()
         .and_then(|b| if b.is_empty() { None } else { Some(b) });
     if worktree_to_remove.is_none() && branch_nonempty.is_none() {
+        // If the stored worktree path is non-empty but doesn't exist on disk,
+        // the worktree is already gone — mark it cleaned so we stop retrying.
+        if worktree_path
+            .as_ref()
+            .is_some_and(|p| !p.as_os_str().is_empty())
+        {
+            tracing::debug!(
+                task_id,
+                worktree = ?worktree_path,
+                "stored worktree path no longer exists on disk — marking cleaned"
+            );
+            if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+                let _ = store.mark_cleaned(store_id).await;
+            }
+        }
         return Ok(false);
     }
 
@@ -437,7 +452,9 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     }
 
     if did_clean {
-        // Mark as cleaned in store so we don't retry next tick
+        // Mark as cleaned in store so we don't retry next tick.
+        // If resolve_task_id returns None the task is not (or no longer) in
+        // the store; that is fine — we already did the on-disk work.
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
             let _ = store.mark_cleaned(store_id).await;
         }
@@ -476,7 +493,39 @@ pub(crate) async fn remove_worktree_and_branch(
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!(task_id, err = %stderr, "failed to remove worktree");
+            // "is not a working tree" means git's metadata is stale — the path
+            // exists on disk but is no longer registered as a worktree. Treat
+            // this as an already-gone worktree: physically remove the directory
+            // and prune stale git metadata. Downgrade to debug — this is an
+            // expected idempotency case, not a real error.
+            if stderr.contains("is not a working tree") {
+                tracing::debug!(
+                    task_id,
+                    path = %wt.display(),
+                    "path is not a registered worktree (stale metadata) — removing directory and pruning"
+                );
+                if let Err(e) = std::fs::remove_dir_all(wt) {
+                    // Only warn if the directory actually still exists after removal attempt.
+                    if wt.exists() {
+                        tracing::warn!(
+                            task_id,
+                            path = %wt.display(),
+                            err = %e,
+                            "failed to remove stale worktree directory"
+                        );
+                    }
+                } else {
+                    tracing::debug!(task_id, path = %wt.display(), "stale worktree directory removed");
+                }
+                // Prune stale worktree entries from git metadata so the warning
+                // stops recurring on future `git worktree list` / cleanup cycles.
+                let _ = Command::new("git")
+                    .args(["-C", repo_root_str.as_ref(), "worktree", "prune"])
+                    .output()
+                    .await;
+            } else {
+                tracing::warn!(task_id, err = %stderr, "failed to remove worktree");
+            }
         }
         Err(e) => {
             tracing::warn!(task_id, err = %e, "failed to remove worktree");
@@ -999,5 +1048,72 @@ mod tests {
                 // The bug was that even with no worktree/branch, Ok(true) was returned.
             }
         }
+    }
+
+    /// When the stored worktree path no longer exists on disk and there is no
+    /// branch recorded, cleanup must mark the task as cleaned so subsequent
+    /// runs do not keep retrying (idempotency regression test for #1021).
+    #[tokio::test]
+    async fn cleanup_marks_cleaned_when_stored_path_is_gone() {
+        use crate::store::{NewTask, TaskStore};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A path that does NOT exist on disk.
+        let stale_wt = tmp.path().join("stale-worktree");
+        assert!(!stale_wt.exists(), "stale path must not exist");
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        let id = store
+            .create(&NewTask {
+                external_id: Some("1005".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Stale worktree task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Done)
+            .await
+            .unwrap();
+        // Set the stale worktree path on the task.
+        store
+            .set_fields(
+                id,
+                &[("worktree", stale_wt.to_string_lossy().as_ref().into())],
+            )
+            .await
+            .unwrap();
+
+        // Verify the task starts out NOT cleaned.
+        let before = store.get(id).await.unwrap();
+        assert!(!before.worktree_cleaned, "task should not be cleaned yet");
+        assert!(
+            !before.worktree.is_empty(),
+            "task must have a worktree path set"
+        );
+
+        let opts = JanitorOptions {
+            ttl_hours: 0,
+            dry_run: false,
+        };
+
+        let result = cleanup_task_worktree_with_opts("1005", "owner/repo", &store, &opts).await;
+
+        // The function should succeed (Ok) — stale path is not an error.
+        // It returns Ok(false) because there was nothing to actively remove.
+        match result {
+            Ok(_) => {}
+            Err(e) => panic!("cleanup should not error for stale path: {e}"),
+        }
+
+        // The task must now be marked cleaned so the next cycle skips it.
+        let after = store.get(id).await.unwrap();
+        assert!(
+            after.worktree_cleaned,
+            "task must be marked cleaned when stored worktree path is already gone"
+        );
     }
 }
