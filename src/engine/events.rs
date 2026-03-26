@@ -104,9 +104,10 @@ impl EventBus {
     /// Start the websocket server. Returns the bound port.
     /// Spawns a background task — does not block.
     pub async fn start_ws_server(&self) -> anyhow::Result<u16> {
-        // Bind port 0 to let the OS assign a free port (avoids TOCTOU race).
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-        let port = listener.local_addr()?.port();
+        // Select a deterministic port in the ephemeral range (49152-65535),
+        // starting from a hostname-based offset to be stable across restarts.
+        let port = select_available_port()?;
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
 
         // Write port file
         let state_dir = crate::home::state_dir()?;
@@ -175,7 +176,7 @@ impl EventBus {
 
 /// Find an available port in the ephemeral range (49152-65535).
 /// Starts from a deterministic offset based on hostname hash, then increments.
-#[cfg(test)]
+/// This gives stable first-attempt ports across restarts on the same machine.
 pub fn select_available_port() -> anyhow::Result<u16> {
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "orch".to_string());
     let hash = hostname
