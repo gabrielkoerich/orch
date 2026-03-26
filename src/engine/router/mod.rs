@@ -243,7 +243,7 @@ impl Router {
     /// Pick next agent via round-robin (for review or other non-task routing).
     /// Pick the next review agent, optionally excluding one (e.g. the task's original agent).
     /// Falls back to the excluded agent only if it's the only one available.
-    pub fn next_round_robin_agent(&mut self, exclude: Option<&str>) -> Option<String> {
+    pub fn next_round_robin_agent(&mut self, exclude: &[&str]) -> Option<String> {
         if self.available_agents.is_empty() {
             return None;
         }
@@ -254,7 +254,7 @@ impl Router {
         let agent = (0..n)
             .map(|offset| &self.available_agents[(idx + offset) % n])
             .find(|a| {
-                exclude != Some(a.as_str())
+                !exclude.contains(&a.as_str())
                     && !crate::engine::runner::response::is_agent_in_cooldown(a)
             })
             .cloned()
@@ -269,7 +269,7 @@ impl Router {
             .or_else(|| {
                 (0..n)
                     .map(|offset| &self.available_agents[(idx + offset) % n])
-                    .find(|a| exclude != Some(a.as_str()))
+                    .find(|a| !exclude.contains(&a.as_str()))
                     .cloned()
             })
             .or_else(|| self.available_agents.get(idx % n).cloned())?;
@@ -1616,9 +1616,9 @@ Hope that helps!"#;
             pool_index: 0,
         };
 
-        let a1 = router.next_round_robin_agent(None).unwrap();
-        let a2 = router.next_round_robin_agent(None).unwrap();
-        let a3 = router.next_round_robin_agent(None).unwrap();
+        let a1 = router.next_round_robin_agent(&[]).unwrap();
+        let a2 = router.next_round_robin_agent(&[]).unwrap();
+        let a3 = router.next_round_robin_agent(&[]).unwrap();
 
         // All three agents should appear (order depends on start index)
         let mut seen = vec![a1, a2, a3];

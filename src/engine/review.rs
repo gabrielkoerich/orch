@@ -608,14 +608,25 @@ pub(crate) async fn review_and_merge(
         .and_then(|t| t.agent)
         .unwrap_or_default();
     let (review_agent, review_model) = {
+        // Exclude the task agent AND any agents that previously failed review
+        // for this task, so we don't retry the same broken agent.
+        let mut exclude_list: Vec<String> = Vec::new();
+        if !task_agent.is_empty() {
+            exclude_list.push(task_agent.clone());
+        }
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task.id.0).await {
+            if let Ok(failed) = store.failed_review_agents(store_id).await {
+                for agent in failed {
+                    if !exclude_list.contains(&agent) {
+                        exclude_list.push(agent);
+                    }
+                }
+            }
+        }
+        let exclude_refs: Vec<&str> = exclude_list.iter().map(|s| s.as_str()).collect();
         let mut r = router.write().await;
-        let exclude = if task_agent.is_empty() {
-            None
-        } else {
-            Some(task_agent.as_str())
-        };
         let agent = r
-            .next_round_robin_agent(exclude)
+            .next_round_robin_agent(&exclude_refs)
             .unwrap_or_else(|| "claude".to_string());
         let model = r
             .config

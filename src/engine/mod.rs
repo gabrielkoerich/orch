@@ -318,14 +318,21 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
 
             let Some(task_id) = task_id_from_worktree_name(name) else {
                 tracing::info!(repo = %engine.repo, worktree = %worktree_dir.display(), "orphan worktree without task id, removing");
-                remove_worktree_and_branch(name, &worktree_dir, Some(name), &repo_root_path).await;
+                remove_worktree_and_branch(name, &worktree_dir, Some(name), &repo_root_path, false)
+                    .await;
                 continue;
             };
 
             let Some(store_id) = engine.store.resolve_task_id(&engine.repo, &task_id).await? else {
                 tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), "worktree has no matching task, removing");
-                remove_worktree_and_branch(&task_id, &worktree_dir, Some(name), &repo_root_path)
-                    .await;
+                remove_worktree_and_branch(
+                    &task_id,
+                    &worktree_dir,
+                    Some(name),
+                    &repo_root_path,
+                    false,
+                )
+                .await;
                 continue;
             };
 
@@ -357,6 +364,7 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                             &worktree_dir,
                             Some(branch_name),
                             &repo_root_path,
+                            false,
                         )
                         .await;
                         if let Ok(Some(reset_id)) =
@@ -374,12 +382,15 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                     }
                 }
                 _ => {
+                    let keep_remote =
+                        task.status == TaskStatus::Blocked && task.pr_number.is_some();
                     tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), status = ?task.status, "terminal task worktree, removing");
                     remove_worktree_and_branch(
                         &task_id,
                         &worktree_dir,
                         Some(branch_name),
                         &repo_root_path,
+                        keep_remote,
                     )
                     .await;
                 }

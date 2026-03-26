@@ -911,6 +911,20 @@ impl TaskStore {
         }
     }
 
+    /// List distinct agents that have failed review runs for a given task.
+    /// Used to exclude them when picking the next review agent.
+    pub async fn failed_review_agents(&self, task_id: i64) -> anyhow::Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT agent FROM task_runs \
+             WHERE task_id = ? AND run_type = 'review' AND outcome IN ('failed', 'timeout') \
+             ORDER BY agent",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(a,)| a).collect())
+    }
+
     /// Prune old runs for done/blocked tasks older than `days` days.
     #[allow(dead_code)]
     pub async fn prune_old_runs(&self, days: i32) -> anyhow::Result<u64> {

@@ -309,10 +309,16 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     store: &Arc<TaskStore>,
     opts: &JanitorOptions,
 ) -> anyhow::Result<bool> {
-    let (worktree, branch) = store::opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
-        .await
-        .map(|t| (Some(t.worktree), Some(t.branch)))
-        .unwrap_or((None, None));
+    let (worktree, branch, keep_remote_branch) =
+        store::opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
+            .await
+            .map(|t| {
+                // Blocked tasks with a PR should keep their remote branch so the
+                // PR stays open for human review.
+                let keep = t.status == TaskStatus::Blocked && t.pr_number.is_some();
+                (Some(t.worktree), Some(t.branch), keep)
+            })
+            .unwrap_or((None, None, false));
 
     let worktree_path = worktree.as_ref().map(std::path::PathBuf::from);
 
@@ -435,6 +441,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 &wt,
                 branch.as_deref(),
                 std::path::Path::new(&repo_root),
+                keep_remote_branch,
             )
             .await;
             did_clean = true;
@@ -442,7 +449,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     } else if let Some(ref br) = branch {
         // Worktree directory is already gone, but the branch may still exist
         // on the remote. Delete it to avoid orphaned branches.
-        if !opts.dry_run {
+        if !opts.dry_run && !keep_remote_branch {
             tracing::debug!(task_id, branch = %br, "no worktree on disk, cleaning up branch only");
             // Resolve repo root lazily — branch cleanup needs it.
             let repo_root = resolve_repo_root(repo).await?;
@@ -464,11 +471,15 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
 }
 
 /// Remove a git worktree directory and its local + remote branches.
+/// When `keep_remote_branch` is true, only the worktree and local branch are
+/// removed — the remote branch stays so that any linked PR remains open
+/// (used for blocked tasks awaiting human review).
 pub(crate) async fn remove_worktree_and_branch(
     task_id: &str,
     wt: &std::path::Path,
     branch: Option<&str>,
     repo_root: &std::path::Path,
+    keep_remote_branch: bool,
 ) {
     let wt_str = wt.to_string_lossy().to_string();
     let repo_root_str = repo_root.to_string_lossy();
@@ -538,9 +549,37 @@ pub(crate) async fn remove_worktree_and_branch(
         .output_with_context()
         .await;
 
-    // Delete local and remote branch from the main repo root (worktree is already gone)
+    // Delete local and remote branch from the main repo root (worktree is already gone).
+    // When keep_remote_branch is set, only delete the local branch — the remote stays
+    // so any linked PR remains open for human review.
     if let Some(br) = branch {
-        delete_branches(task_id, br, repo_root).await;
+        if keep_remote_branch {
+            // Only delete local branch
+            let branch_delete_result = Command::new("git")
+                .args(["-C", repo_root_str.as_ref(), "branch", "-D", br])
+                .output_with_context()
+                .await;
+            match branch_delete_result {
+                Ok(output) if output.status.success() => {
+                    tracing::info!(
+                        task_id,
+                        branch = br,
+                        "local branch deleted (keeping remote for open PR)"
+                    );
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.contains("not found") {
+                        tracing::debug!(task_id, branch = br, err = %stderr, "local branch delete failed (may already be gone)");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(task_id, branch = br, err = %e, "local branch delete failed");
+                }
+            }
+        } else {
+            delete_branches(task_id, br, repo_root).await;
+        }
     }
 }
 
