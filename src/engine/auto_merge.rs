@@ -234,8 +234,9 @@ pub(crate) async fn auto_merge_pr(
         anyhow::bail!("PR is not mergeable (merge conflicts present)");
     }
     let head_sha = pr.head.sha.clone();
+    let base_branch = pr.base.ref_.clone();
     let required_contexts = gh
-        .get_required_status_check_contexts(repo, branch)
+        .get_required_status_check_contexts(repo, &base_branch)
         .await
         .unwrap_or_default();
 
