@@ -146,7 +146,7 @@ impl OpenCodeRunner {
     /// Handles two text event formats emitted by different opencode versions:
     /// - Format 1 (current): `{"type":"text","part":{"type":"text","text":"..."}}`
     /// - Format 2 (newer):   `{"type":"text","text":"..."}`
-    fn extract_text(&self, events: &[serde_json::Value]) -> Option<String> {
+    fn extract_text_from_events(&self, events: &[serde_json::Value]) -> Option<String> {
         extract_ndjson_text(events)
     }
 
@@ -248,6 +248,26 @@ impl AgentRunner for OpenCodeRunner {
         "opencode"
     }
 
+    fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(String::new());
+        }
+
+        let events = self.parse_ndjson(trimmed);
+        if events.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+
+        // Propagate terminal errors so the review pipeline records cooldowns.
+        if let Some(err) = self.detect_error(&events) {
+            return Err(err);
+        }
+
+        // Concatenate all text events; fall back to raw output if none found.
+        Ok(extract_ndjson_text(&events).unwrap_or_else(|| trimmed.to_string()))
+    }
+
     fn build_command(
         &self,
         model: Option<&str>,
@@ -328,11 +348,11 @@ printf '%s\n' '{permission_json}' > .orch-opencode/opencode/opencode.json || {{ 
         }
 
         // Extract text
-        let text = self
-            .extract_text(&events)
-            .ok_or_else(|| AgentError::InvalidResponse {
-                raw: trimmed.to_string(),
-            })?;
+        let text =
+            self.extract_text_from_events(&events)
+                .ok_or_else(|| AgentError::InvalidResponse {
+                    raw: trimmed.to_string(),
+                })?;
 
         // Extract tokens
         let (input_tokens, output_tokens) = self.extract_tokens(&events);
@@ -860,5 +880,78 @@ mod tests {
         if let AgentError::ModelUnavailable { model, .. } = &err {
             assert_eq!(model, "anthropic/claude-sonnet-4-6");
         }
+    }
+
+    // ── extract_text ─────────────────────────────────────────────
+
+    /// OpenCode: extract_text concatenates text events for review parsing.
+    #[test]
+    fn extract_text_returns_text_events() {
+        let raw = concat!(
+            r#"{"type":"step_start","timestamp":1000,"sessionID":"ses_abc"}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}"}}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"stop","cost":0,"tokens":{"total":100,"input":90,"output":10}}}"#,
+        );
+        let text = runner().extract_text(raw).unwrap();
+        assert_eq!(
+            text,
+            r#"{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#
+        );
+    }
+
+    /// OpenCode: extract_text with newer direct-text format.
+    #[test]
+    fn extract_text_direct_text_event_format() {
+        let raw = concat!(
+            r#"{"type":"step_start","timestamp":1000,"sessionID":"ses_abc"}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"sessionID":"ses_abc","text":"Here is my review:\n\n```json\n{\"decision\":\"request_changes\",\"notes\":\"Fix the bug\",\"test_results\":\"fail\",\"issues\":[]}\n```\n"}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"sessionID":"ses_abc"}"#,
+        );
+        let text = runner().extract_text(raw).unwrap();
+        assert!(
+            text.contains("request_changes"),
+            "expected review JSON, got: {text}"
+        );
+    }
+
+    /// OpenCode: extract_text propagates RateLimit for terminal errors.
+    #[test]
+    fn extract_text_rate_limit_propagates() {
+        let raw = concat!(
+            r#"{"type":"step_start","timestamp":1000}"#,
+            "\n",
+            r#"{"type":"error","message":"rate limit exceeded: 429 Too Many Requests"}"#,
+        );
+        let err = runner().extract_text(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "expected RateLimit, got: {err:?}"
+        );
+    }
+
+    /// OpenCode: extract_text propagates Auth error.
+    #[test]
+    fn extract_text_auth_error_propagates() {
+        let raw = concat!(
+            r#"{"type":"step_start","timestamp":1000}"#,
+            "\n",
+            r#"{"type":"error","message":"401 Unauthorized: invalid api key"}"#,
+        );
+        let err = runner().extract_text(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::Auth { .. }),
+            "expected Auth, got: {err:?}"
+        );
+    }
+
+    /// OpenCode: extract_text on empty input returns empty string (not an error).
+    #[test]
+    fn extract_text_empty_input_returns_empty_ok() {
+        let text = runner().extract_text("").unwrap();
+        assert!(text.is_empty());
     }
 }

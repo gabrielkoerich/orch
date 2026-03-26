@@ -817,21 +817,13 @@ pub(crate) async fn review_and_merge(
     }
 
     // Stage 1: strip the agent-specific output envelope to get the review text.
-    let text_for_review = match agent_runner.parse_response(&raw_output) {
-        Ok(p) if !p.response.summary.is_empty() => p.response.summary,
+    let text_for_review = match agent_runner.extract_text(&raw_output) {
+        Ok(text) if !text.is_empty() => text,
         Ok(_) => {
             tracing::debug!(
                 task_id = task.id.0,
                 agent = %review_agent,
-                "review agent: empty summary after parse, falling back to raw output"
-            );
-            raw_output.clone()
-        }
-        Err(runner::agents::AgentError::InvalidResponse { .. }) => {
-            tracing::warn!(
-                task_id = task.id.0,
-                agent = %review_agent,
-                "review agent: envelope parse failed (InvalidResponse), falling back to raw output"
+                "review agent: empty text after envelope extraction, falling back to raw output"
             );
             raw_output.clone()
         }

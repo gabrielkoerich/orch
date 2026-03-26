@@ -212,6 +212,56 @@ impl AgentRunner for ClaudeRunner {
         &self.binary
     }
 
+    fn extract_text(&self, raw: &str) -> Result<String, super::AgentError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(String::new());
+        }
+
+        // For NDJSON (stream-json format): find the final "type":"result" line.
+        let envelope_str = find_ndjson_result_line(trimmed).unwrap_or(trimmed);
+        let Ok(parsed_json) = serde_json::from_str::<serde_json::Value>(envelope_str) else {
+            // Not a recognizable JSON envelope — return raw text as-is.
+            return Ok(trimmed.to_string());
+        };
+
+        let Some(envelope) = parsed_json.as_object() else {
+            return Ok(trimmed.to_string());
+        };
+
+        if envelope.get("type").and_then(|v| v.as_str()) != Some("result") {
+            return Ok(trimmed.to_string());
+        }
+
+        let is_error = envelope
+            .get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let result_text = envelope
+            .get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if is_error {
+            let combined = format!("{result_text} {envelope_str}");
+            if let Some(e) = super::patterns::detect_auth_error(&combined) {
+                return Err(e);
+            }
+            if let Some(e) = super::patterns::detect_rate_limit(&combined) {
+                return Err(e);
+            }
+            if let Some(e) = super::patterns::detect_context_overflow(&combined) {
+                return Err(e);
+            }
+            return Err(super::AgentError::AgentFailed {
+                message: result_text.to_string(),
+            });
+        }
+
+        Ok(result_text.to_string())
+    }
+
     fn build_command(
         &self,
         model: Option<&str>,
@@ -893,5 +943,80 @@ mod tests {
             matches!(err, AgentError::ContextOverflow { .. }),
             "got: {err:?}"
         );
+    }
+
+    // ── extract_text ─────────────────────────────────────────────
+
+    /// Claude stream-json: extract_text returns the inner result text for review parsing.
+    #[test]
+    fn extract_text_stream_json_returns_result_field() {
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reviewing..."}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}","usage":{"input_tokens":100,"output_tokens":20}}"#,
+        );
+        let text = runner().extract_text(raw).unwrap();
+        assert_eq!(
+            text,
+            r#"{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#
+        );
+    }
+
+    /// Claude stream-json with markdown-wrapped ReviewResponse in result field.
+    #[test]
+    fn extract_text_stream_json_markdown_result() {
+        let review_json =
+            r#"```json\n{"decision":"request_changes","notes":"Fix it","issues":[]}\n```"#;
+        let result_line = format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"result":"{review_json}","usage":{{"input_tokens":10,"output_tokens":5}}}}"#
+        );
+        let raw = format!(
+            "{}\n{}",
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#, result_line
+        );
+        let text = runner().extract_text(&raw).unwrap();
+        assert!(
+            text.contains("request_changes"),
+            "expected review JSON in result, got: {text}"
+        );
+    }
+
+    /// Claude stream-json error (is_error=true, rate limit): extract_text propagates RateLimit.
+    #[test]
+    fn extract_text_stream_json_rate_limit_propagates() {
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"error","is_error":true,"result":"rate limit exceeded: 429 Too Many Requests","usage":{"input_tokens":0,"output_tokens":0}}"#,
+        );
+        let err = runner().extract_text(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "expected RateLimit, got: {err:?}"
+        );
+    }
+
+    /// Claude stream-json error (is_error=true, auth): extract_text propagates Auth.
+    #[test]
+    fn extract_text_stream_json_auth_error_propagates() {
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"error","is_error":true,"result":"401 Unauthorized: invalid api key","usage":{"input_tokens":0,"output_tokens":0}}"#,
+        );
+        let err = runner().extract_text(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::Auth { .. }),
+            "expected Auth, got: {err:?}"
+        );
+    }
+
+    /// extract_text on empty input returns empty string (not an error).
+    #[test]
+    fn extract_text_empty_input_returns_empty_ok() {
+        let text = runner().extract_text("").unwrap();
+        assert!(text.is_empty());
     }
 }

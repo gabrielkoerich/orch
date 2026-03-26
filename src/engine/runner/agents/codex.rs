@@ -230,6 +230,29 @@ impl AgentRunner for CodexRunner {
         "codex"
     }
 
+    fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(String::new());
+        }
+
+        let events = self.parse_ndjson(trimmed);
+        if events.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+
+        // Propagate terminal errors (rate limit, auth) so the review pipeline
+        // can record cooldowns and abort cleanly.
+        if let Some(err) = self.detect_error(&events) {
+            return Err(err);
+        }
+
+        // Return agent_message text, or fall back to the raw output.
+        Ok(self
+            .extract_agent_text(&events)
+            .unwrap_or_else(|| trimmed.to_string()))
+    }
+
     fn build_command(
         &self,
         model: Option<&str>,
@@ -605,5 +628,69 @@ mod tests {
         if let AgentError::ModelUnavailable { model, .. } = &err {
             assert_eq!(model, "gpt-4.1");
         }
+    }
+
+    // ── extract_text ─────────────────────────────────────────────
+
+    /// Codex: extract_text returns the agent_message text for review parsing.
+    #[test]
+    fn extract_text_returns_agent_message() {
+        let raw = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"reasoning","text":"Thinking..."}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}"}}"#,
+            "\n",
+            r#"{"type":"turn.completed"}"#,
+        );
+        let text = runner().extract_text(raw).unwrap();
+        assert_eq!(
+            text,
+            r#"{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#
+        );
+    }
+
+    /// Codex: extract_text propagates RateLimit for terminal errors.
+    #[test]
+    fn extract_text_rate_limit_propagates() {
+        let raw = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"error","message":"You've hit your usage limit. Upgrade to continue."}"#,
+            "\n",
+            r#"{"type":"turn.failed","error":{"message":"usage limit exceeded"}}"#,
+        );
+        let err = runner().extract_text(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "expected RateLimit, got: {err:?}"
+        );
+    }
+
+    /// Codex: extract_text propagates Auth error.
+    #[test]
+    fn extract_text_auth_error_propagates() {
+        let raw = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"error","message":"401 Unauthorized: invalid api key"}"#,
+            "\n",
+            r#"{"type":"turn.failed","error":{"message":"auth failed"}}"#,
+        );
+        let err = runner().extract_text(raw).unwrap_err();
+        assert!(
+            matches!(err, AgentError::Auth { .. }),
+            "expected Auth, got: {err:?}"
+        );
+    }
+
+    /// Codex: extract_text on empty input returns empty string (not an error).
+    #[test]
+    fn extract_text_empty_input_returns_empty_ok() {
+        let text = runner().extract_text("").unwrap();
+        assert!(text.is_empty());
     }
 }
