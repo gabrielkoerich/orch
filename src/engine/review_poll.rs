@@ -5,7 +5,7 @@
 //! are requested.
 
 use crate::backends::{ExternalBackend, Status};
-use crate::engine::auto_merge::{dedup_reviews, MAX_MERGE_CONFLICT_RETRIES};
+use crate::engine::auto_merge::{dedup_reviews, handle_review_changes, MAX_MERGE_CONFLICT_RETRIES};
 use crate::engine::tasks::TaskManager;
 use crate::engine::EngineConfig;
 use crate::github::http::GhHttp;
@@ -432,29 +432,42 @@ pub(crate) async fn review_open_prs(
                 repo,
                 task_id,
                 &[(
-                    "pr_review_context",
-                    serde_json::json!(review_context.clone()),
-                )],
-            )
-            .await;
-
-            store_set(
-                &Some(Arc::clone(store)),
-                repo,
-                task_id,
-                &[(
                     "last_review_ts",
                     serde_json::json!(latest_review_ts.clone()),
                 )],
             )
             .await;
 
-            if let Err(e) = task_manager
-                .update_task_status(&task.id, Status::Routed)
-                .await
+            let task_agent = stored_task
+                .agent
+                .clone()
+                .unwrap_or_else(|| "orch".to_string());
+            let task_model = stored_task
+                .model
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let review_cycles = stored_task.review_cycles.max(0) as u32;
+            let max_cycles: u32 = crate::config::get("workflow.max_review_cycles")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2);
+
+            if let Err(e) = handle_review_changes(
+                &task,
+                &review_context,
+                &[],
+                backend,
+                repo,
+                pr_number,
+                &task_agent,
+                &task_model,
+                task_manager,
+                store,
+            )
+            .await
             {
-                tracing::warn!(task_id, err = %e, "failed to set status to routed for re-dispatch");
-            } else {
+                tracing::warn!(task_id, err = %e, "failed to handle review feedback");
+            } else if review_cycles < max_cycles {
                 tracing::info!(task_id, "re-dispatching task to address review feedback");
                 store_reset_failure_counters(&Some(Arc::clone(store)), repo, task_id).await;
             }
