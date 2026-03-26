@@ -205,8 +205,7 @@ pub(crate) async fn auto_merge_pr(
     let poll_interval = std::time::Duration::from_secs(15);
     let start = std::time::Instant::now();
 
-    // Acquire a global permit to limit concurrent CI polling loops across tasks.
-    let _permit = ci_poll_semaphore().clone().acquire_owned().await;
+    // Fetch PR and required contexts once (outside the polling loop).
     let pr = gh.get_pr(repo, pr_number).await?;
     if pr.mergeable == Some(false) {
         anyhow::bail!("PR is not mergeable (merge conflicts present)");
@@ -218,6 +217,10 @@ pub(crate) async fn auto_merge_pr(
         .unwrap_or_default();
 
     loop {
+        // Acquire a global permit for the duration of the HTTP polling batch only.
+        // Released before sleep so other tasks can acquire permits while we wait.
+        let _permit = ci_poll_semaphore().clone().acquire_owned().await;
+
         let (state, total, passing, failing, pending) = if required_contexts.is_empty() {
             gh.get_combined_status(repo, &head_sha).await?
         } else {
@@ -232,6 +235,8 @@ pub(crate) async fn auto_merge_pr(
                 .collect::<Vec<_>>();
             required_checks_state(&required_contexts, &check_runs, &statuses)
         };
+
+        // Permit dropped here (end of scope) before we check state and potentially sleep.
 
         tracing::info!(
             task_id = task.id.0,
@@ -315,6 +320,7 @@ pub(crate) async fn auto_merge_pr(
             }
         }
 
+        // Permit is already dropped above — sleep without holding it.
         tokio::time::sleep(poll_interval).await;
     }
 
