@@ -239,8 +239,18 @@ pub(crate) async fn auto_merge_pr(
         .get_required_status_check_contexts(repo, &base_branch)
         .await
         .unwrap_or_default();
+    // Determine whether the repository has any GitHub Actions workflows so that
+    // `get_combined_status` can distinguish "no CI configured" (legitimately
+    // empty check-run list → success) from "CI not started yet" (empty list
+    // because workflows exist but haven't queued yet → pending).
+    //
+    // IMPORTANT: transient lookup failures (rate-limit, 5xx, token scope) must
+    // NOT silently collapse to `false`.  If we assumed `false` on an error,
+    // `combined_status_state` would see `total == 0 && has_workflows == false`
+    // and return "success", letting the PR merge without any CI verification.
+    // Instead we propagate the error so the caller retries on the next sync tick.
     let repo_has_workflows = if required_contexts.is_empty() {
-        gh.has_workflows(repo).await.unwrap_or(false)
+        gh.has_workflows(repo).await?
     } else {
         true
     };
