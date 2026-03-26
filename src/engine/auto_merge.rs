@@ -205,8 +205,7 @@ pub(crate) async fn auto_merge_pr(
     let poll_interval = std::time::Duration::from_secs(15);
     let start = std::time::Instant::now();
 
-    // Acquire a global permit to limit concurrent CI polling loops across tasks.
-    let _permit = ci_poll_semaphore().clone().acquire_owned().await;
+    // Fetch PR and required contexts once (outside the polling loop).
     let pr = gh.get_pr(repo, pr_number).await?;
     if pr.mergeable == Some(false) {
         anyhow::bail!("PR is not mergeable (merge conflicts present)");
@@ -218,20 +217,25 @@ pub(crate) async fn auto_merge_pr(
         .unwrap_or_default();
 
     loop {
-        let (state, total, passing, failing, pending) = if required_contexts.is_empty() {
-            gh.get_combined_status(repo, &head_sha).await?
-        } else {
-            let check_runs = gh.get_check_runs(repo, &head_sha).await.unwrap_or_default();
-            let statuses = gh
-                .get_commit_status_contexts(repo, &head_sha)
-                .await
-                .unwrap_or_default();
-            let check_runs = check_runs
-                .into_iter()
-                .map(|run| (run.name, run.status, run.conclusion))
-                .collect::<Vec<_>>();
-            required_checks_state(&required_contexts, &check_runs, &statuses)
-        };
+        // Acquire a global permit only for the HTTP polling batch.
+        // The inner block ensures the permit drops before the match/sleep.
+        let (state, total, passing, failing, pending) = {
+            let _permit = ci_poll_semaphore().clone().acquire_owned().await;
+            if required_contexts.is_empty() {
+                gh.get_combined_status(repo, &head_sha).await?
+            } else {
+                let check_runs = gh.get_check_runs(repo, &head_sha).await.unwrap_or_default();
+                let statuses = gh
+                    .get_commit_status_contexts(repo, &head_sha)
+                    .await
+                    .unwrap_or_default();
+                let check_runs = check_runs
+                    .into_iter()
+                    .map(|run| (run.name, run.status, run.conclusion))
+                    .collect::<Vec<_>>();
+                required_checks_state(&required_contexts, &check_runs, &statuses)
+            }
+        }; // _permit dropped here — released before logging, match, and sleep.
 
         tracing::info!(
             task_id = task.id.0,
