@@ -1100,8 +1100,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result =
-            cleanup_task_worktree_with_opts("1005", "owner/repo", &store, &opts).await;
+        let result = cleanup_task_worktree_with_opts("1005", "owner/repo", &store, &opts).await;
 
         // The function should succeed (Ok) — stale path is not an error.
         // It returns Ok(false) because there was nothing to actively remove.
