@@ -80,9 +80,28 @@ async fn stream_from_ws(port: u16, repo: Option<&str>, task: Option<&str>) -> an
 
     println!("Connected to event bus (port {port}). Streaming events...\n");
 
+    // Open the store for lag resyncs (best-effort — None if unavailable).
+    let store = crate::cli::init_store().await.ok();
+
     while let Some(msg) = read.next().await {
         let msg = msg?;
         if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+            // First try to parse as a control message (lag notification).
+            if let Ok(ctrl) = serde_json::from_str::<crate::engine::events::ControlMessage>(&text) {
+                if ctrl.kind == "lagged" {
+                    eprintln!(
+                        "WARNING: event bus lagged — {} task transition(s) were dropped. \
+                         Resyncing current task state from store...",
+                        ctrl.missed
+                    );
+                    if let Some(ref s) = store {
+                        resync_from_store(s, repo, task).await;
+                    }
+                }
+                continue;
+            }
+
+            // Normal task event.
             let Ok(event) = serde_json::from_str::<crate::engine::events::TaskEvent>(&text) else {
                 continue;
             };
@@ -112,6 +131,54 @@ fn print_event(event: &crate::engine::events::TaskEvent) {
         "{time} {} {} \u{2192} {} {agent_str}{pr_str}",
         event.task_id, event.old_status, event.new_status,
     );
+}
+
+/// Resync: print current status of all active tasks from the store after a lag event.
+///
+/// This gives the operator a point-in-time snapshot so they know where things
+/// stand after missed transitions.
+async fn resync_from_store(
+    store: &crate::store::TaskStore,
+    repo_filter: Option<&str>,
+    task_filter: Option<&str>,
+) {
+    let tasks = match store.list_all_active_global().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  resync failed: {e:#}");
+            return;
+        }
+    };
+
+    let now = chrono::Utc::now().format("%H:%M:%S");
+    let mut printed = 0usize;
+    for t in &tasks {
+        if let Some(rf) = repo_filter {
+            if !t.repo.contains(rf) {
+                continue;
+            }
+        }
+        let key = task_key(t);
+        if let Some(tf) = task_filter {
+            if key != tf && t.external_id.as_deref() != Some(tf) {
+                continue;
+            }
+        }
+        let agent_str = t.agent.as_deref().unwrap_or("");
+        let pr_str = t
+            .pr_number
+            .map(|p| format!(" PR: #{p}"))
+            .unwrap_or_default();
+        println!(
+            "{now} [resync] {} {} {agent_str}{pr_str}",
+            key,
+            t.status.as_str(),
+        );
+        printed += 1;
+    }
+    if printed == 0 {
+        println!("{now} [resync] no active tasks");
+    }
 }
 
 /// Fallback: poll the SQLite store for task status changes.

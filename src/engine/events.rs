@@ -55,6 +55,21 @@ impl EventFilter {
     }
 }
 
+/// A control message sent by the server to the websocket client for out-of-band
+/// notifications such as lag warnings.
+///
+/// The client should treat these as advisory: print a warning to the operator
+/// and, when `kind == "lagged"`, resync task state from SQLite.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ControlMessage {
+    /// Discriminator — currently only `"lagged"`.
+    pub kind: String,
+    /// Human-readable description.
+    pub message: String,
+    /// Number of events skipped (for `"lagged"`).
+    pub missed: u64,
+}
+
 /// A task status transition event.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskEvent {
@@ -148,7 +163,25 @@ impl EventBus {
                                                     break;
                                                 }
                                             }
-                                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                                tracing::warn!(
+                                                    missed = n,
+                                                    "event bus ws client lagged — {n} events dropped"
+                                                );
+                                                let ctrl = ControlMessage {
+                                                    kind: "lagged".to_string(),
+                                                    message: format!(
+                                                        "event bus lagged: {n} events were dropped — resync from store"
+                                                    ),
+                                                    missed: n,
+                                                };
+                                                if let Ok(json) = serde_json::to_string(&ctrl) {
+                                                    let msg = tokio_tungstenite::tungstenite::Message::Text(json);
+                                                    if write.send(msg).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
                                             Err(_) => break,
                                         }
                                     }
@@ -217,6 +250,31 @@ fn ws_port_path() -> anyhow::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_message_serializes_to_json() {
+        let ctrl = ControlMessage {
+            kind: "lagged".to_string(),
+            message: "event bus lagged: 5 events were dropped".to_string(),
+            missed: 5,
+        };
+        let json = serde_json::to_string(&ctrl).unwrap();
+        assert!(json.contains("\"kind\":\"lagged\""));
+        assert!(json.contains("\"missed\":5"));
+    }
+
+    #[test]
+    fn control_message_round_trips() {
+        let ctrl = ControlMessage {
+            kind: "lagged".to_string(),
+            message: "test".to_string(),
+            missed: 42,
+        };
+        let json = serde_json::to_string(&ctrl).unwrap();
+        let decoded: ControlMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.kind, "lagged");
+        assert_eq!(decoded.missed, 42);
+    }
 
     #[test]
     fn task_event_serializes_to_json() {
@@ -512,6 +570,65 @@ mod tests {
         }
 
         assert_eq!(received_ids, vec!["1", "2", "3"]);
+
+        cleanup_port_file();
+    }
+
+    /// When the broadcast receiver lags (missed events), the server must send a
+    /// ControlMessage{kind:"lagged"} to the ws client instead of silently skipping.
+    #[tokio::test]
+    async fn ws_server_sends_lag_control_message() {
+        // Tiny capacity (1) so we can force lag by publishing faster than the
+        // client consumes.
+        let bus = EventBus::new(1);
+        let port = match bus.start_ws_server().await {
+            Ok(p) => p,
+            Err(_) => {
+                // Port unavailable (race with parallel tests) — skip gracefully.
+                return;
+            }
+        };
+
+        // Connect client, but don't read yet — let the buffer overflow.
+        let url = format!("ws://127.0.0.1:{port}/events");
+        let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (_write, mut read) = ws.split();
+
+        // Give the server a moment to register the client.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Flood the bus — many more events than the channel capacity (1).
+        // This guarantees the server-side rx will lag before the client reads.
+        for i in 0..20 {
+            bus.publish(make_event(&i.to_string(), "owner/repo"));
+        }
+
+        // Drain messages until we find a ControlMessage with kind=="lagged".
+        let mut got_lag = false;
+        for _ in 0..30 {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                StreamExt::next(&mut read),
+            )
+            .await;
+
+            let Ok(Some(Ok(msg))) = result else { break };
+
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                if let Ok(ctrl) = serde_json::from_str::<ControlMessage>(&text) {
+                    if ctrl.kind == "lagged" {
+                        got_lag = true;
+                        assert!(ctrl.missed > 0, "missed count must be > 0");
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            got_lag,
+            "expected a lagged ControlMessage when bus capacity is exceeded"
+        );
 
         cleanup_port_file();
     }
