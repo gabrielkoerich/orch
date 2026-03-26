@@ -1582,10 +1582,15 @@ impl GhHttp {
                 .unwrap_or("queued");
 
             match status {
-                "completed" => match conclusion {
-                    "success" | "neutral" | "skipped" => passing += 1,
-                    _ => failing += 1,
-                },
+                "completed" => {
+                    if conclusion.is_empty() {
+                        pending += 1;
+                    } else if matches!(conclusion, "success" | "neutral" | "skipped") {
+                        passing += 1;
+                    } else {
+                        failing += 1;
+                    }
+                }
                 _ => pending += 1,
             }
         }
