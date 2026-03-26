@@ -1,0 +1,1 @@
+ALTER TABLE tasks ADD COLUMN review_invocations INTEGER NOT NULL DEFAULT 0;
