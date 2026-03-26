@@ -1346,8 +1346,10 @@ pub async fn serve() -> anyhow::Result<()> {
                 tracing::info!(signal = signal_name, "beginning graceful shutdown");
 
                 // Reset in_progress tasks to routed so they re-dispatch after restart.
-                // The tmux sessions will be killed when the process exits.
+                // Also reset in_review tasks to needs_review — their review agent
+                // tmux sessions will be killed when the process exits.
                 let mut reset_count = 0u32;
+                let mut review_reset_count = 0u32;
                 for engine in &project_engines {
                     if let Ok(tasks) = engine.task_manager.list_external_by_status(Status::InProgress).await {
                         for task in &tasks {
@@ -1372,9 +1374,38 @@ pub async fn serve() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    // Reset in_review tasks — review agent sessions die on shutdown
+                    if let Ok(tasks) = engine.task_manager.list_external_by_status(Status::InReview).await {
+                        for task in &tasks {
+                            if let Err(e) = engine.task_manager.update_task_status(&task.id, Status::NeedsReview).await {
+                                tracing::warn!(task_id = task.id.0, ?e, "failed to reset in_review task on shutdown");
+                            } else {
+                                set_review_session_expected(&engine.store, &engine.repo, &task.id.0, false).await;
+                                review_reset_count += 1;
+                            }
+                        }
+                    }
+                    // Also reset internal in_review tasks
+                    if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, crate::store::TaskStatus::InReview).await {
+                        for task in &tasks {
+                            let task_id = format!("internal:{}", task.id);
+                            if let Err(e) = engine.task_manager.update_task_status(
+                                &crate::backends::ExternalId(task_id.clone()),
+                                Status::NeedsReview,
+                            ).await {
+                                tracing::warn!(task_id, ?e, "failed to reset internal in_review task on shutdown");
+                            } else {
+                                set_review_session_expected(&engine.store, &engine.repo, &task_id, false).await;
+                                review_reset_count += 1;
+                            }
+                        }
+                    }
                 }
                 if reset_count > 0 {
                     tracing::info!(reset_count, "reset in_progress tasks to routed for re-dispatch");
+                }
+                if review_reset_count > 0 {
+                    tracing::info!(review_reset_count, "reset in_review tasks to needs_review for re-dispatch");
                 }
                 break;
             }
