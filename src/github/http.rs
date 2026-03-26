@@ -1570,44 +1570,7 @@ impl GhHttp {
             .cloned()
             .unwrap_or_default();
 
-        let mut passing = 0u64;
-        let mut failing = 0u64;
-        let mut pending = 0u64;
-
-        for run in &runs {
-            let conclusion = run.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
-            let status = run
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("queued");
-
-            match status {
-                "completed" => {
-                    if conclusion.is_empty() {
-                        pending += 1;
-                    } else if matches!(conclusion, "success" | "neutral" | "skipped") {
-                        passing += 1;
-                    } else {
-                        failing += 1;
-                    }
-                }
-                _ => pending += 1,
-            }
-        }
-
-        let total = runs.len() as u64;
-        let state = if failing > 0 {
-            "failure".to_string()
-        } else if pending > 0 {
-            "pending".to_string()
-        } else {
-            // total == 0 (no checks registered) or all passing — treat as success.
-            // Previously total==0 returned "pending", causing auto_merge_pr to poll
-            // for 5 minutes and then incorrectly count it as a CI timeout failure.
-            "success".to_string()
-        };
-
-        Ok((state, total, passing, failing, pending))
+        Ok(classify_check_runs(&runs))
     }
 
     /// Rerun the latest failed workflow run for a given workflow name and branch.
@@ -1769,6 +1732,54 @@ fn parse_link_next(headers: &header::HeaderMap) -> Option<String> {
         }
     }
     None
+}
+
+/// Classify a list of check-run JSON objects into `(state, total, passing, failing, pending)`.
+///
+/// `null` conclusion on a `"completed"` run is treated as **pending** (not failing), because
+/// GitHub transiently emits `conclusion: null` before the conclusion is fully propagated.
+/// This mirrors the logic in `required_checks_state` in `engine/auto_merge.rs`.
+fn classify_check_runs(runs: &[serde_json::Value]) -> (String, u64, u64, u64, u64) {
+    let mut passing = 0u64;
+    let mut failing = 0u64;
+    let mut pending = 0u64;
+
+    for run in runs {
+        let conclusion = run.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+        let status = run
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("queued");
+
+        match status {
+            "completed" => {
+                if conclusion.is_empty() {
+                    // conclusion not yet populated by GitHub — treat as pending
+                    // (mirrors the fix in required_checks_state in auto_merge.rs)
+                    pending += 1;
+                } else if matches!(conclusion, "success" | "neutral" | "skipped") {
+                    passing += 1;
+                } else {
+                    failing += 1;
+                }
+            }
+            _ => pending += 1,
+        }
+    }
+
+    let total = runs.len() as u64;
+    let state = if failing > 0 {
+        "failure".to_string()
+    } else if pending > 0 {
+        "pending".to_string()
+    } else {
+        // total == 0 (no checks registered) or all passing — treat as success.
+        // Previously total==0 returned "pending", causing auto_merge_pr to poll
+        // for 5 minutes and then incorrectly count it as a CI timeout failure.
+        "success".to_string()
+    };
+
+    (state, total, passing, failing, pending)
 }
 
 /// Return the hex color string for a given `status:*` label.
@@ -2138,5 +2149,92 @@ mod tests {
             // Malformed Link header → pagination stops after first page, no panic.
             assert_eq!(result.len(), 1);
         }
+    }
+
+    // ── classify_check_runs unit tests ───────────────────────────────────────
+
+    fn make_run(status: &str, conclusion: Option<&str>) -> serde_json::Value {
+        match conclusion {
+            Some(c) => serde_json::json!({ "status": status, "conclusion": c }),
+            None => serde_json::json!({ "status": status, "conclusion": null }),
+        }
+    }
+
+    #[test]
+    fn classify_check_runs_empty_returns_success() {
+        let (state, total, passing, failing, pending) = classify_check_runs(&[]);
+        assert_eq!(state, "success");
+        assert_eq!(total, 0);
+        assert_eq!(passing, 0);
+        assert_eq!(failing, 0);
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn classify_check_runs_null_conclusion_is_pending_not_failing() {
+        // Core regression test: completed + null conclusion must NOT be counted as failing.
+        let runs = vec![make_run("completed", None)];
+        let (state, total, passing, failing, pending) = classify_check_runs(&runs);
+        assert_eq!(
+            state, "pending",
+            "null conclusion should yield pending state"
+        );
+        assert_eq!(total, 1);
+        assert_eq!(passing, 0);
+        assert_eq!(failing, 0, "null conclusion must not increment failing");
+        assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn classify_check_runs_success_neutral_skipped_pass() {
+        let runs = vec![
+            make_run("completed", Some("success")),
+            make_run("completed", Some("neutral")),
+            make_run("completed", Some("skipped")),
+        ];
+        let (state, total, passing, failing, pending) = classify_check_runs(&runs);
+        assert_eq!(state, "success");
+        assert_eq!(total, 3);
+        assert_eq!(passing, 3);
+        assert_eq!(failing, 0);
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn classify_check_runs_failure_conclusion_fails() {
+        let runs = vec![
+            make_run("completed", Some("success")),
+            make_run("completed", Some("failure")),
+        ];
+        let (state, total, passing, failing, pending) = classify_check_runs(&runs);
+        assert_eq!(state, "failure");
+        assert_eq!(total, 2);
+        assert_eq!(passing, 1);
+        assert_eq!(failing, 1);
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn classify_check_runs_non_completed_is_pending() {
+        let runs = vec![make_run("in_progress", None), make_run("queued", None)];
+        let (state, total, passing, failing, pending) = classify_check_runs(&runs);
+        assert_eq!(state, "pending");
+        assert_eq!(total, 2);
+        assert_eq!(passing, 0);
+        assert_eq!(failing, 0);
+        assert_eq!(pending, 2);
+    }
+
+    #[test]
+    fn classify_check_runs_failing_takes_priority_over_pending() {
+        // A mix: one failed, one pending — state should be "failure"
+        let runs = vec![
+            make_run("completed", Some("failure")),
+            make_run("in_progress", None),
+        ];
+        let (state, _total, _passing, failing, pending) = classify_check_runs(&runs);
+        assert_eq!(state, "failure");
+        assert_eq!(failing, 1);
+        assert_eq!(pending, 1);
     }
 }
