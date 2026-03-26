@@ -210,10 +210,13 @@ impl OutputBuffer {
             return None;
         }
 
-        let new_content = if self.last_len >= current_len {
-            // Content shrank (terminal cleared / overwritten) — no incremental diff available.
+        let new_content = if self.last_len > current_len {
+            // Content shrank (terminal cleared) — no incremental diff available.
             // Emitting full current_content would duplicate already-broadcast output.
             String::new()
+        } else if self.last_len == current_len {
+            // Same-length overwrite (e.g. spinner/progress refresh) — resync with full content.
+            current_content.to_string()
         } else {
             let mut offset = self.last_len.min(current_len);
             while offset < current_len && !current_content.is_char_boundary(offset) {
@@ -310,6 +313,16 @@ mod tests {
         // Pane cleared to empty
         let result = buf.diff_and_update("");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn same_length_content_change_is_broadcast() {
+        let mut buf = make_buffer();
+        buf.diff_and_update("aaaa");
+
+        let result = buf.diff_and_update("bbbb");
+
+        assert_eq!(result.as_deref(), Some("bbbb"));
     }
 
     #[test]
