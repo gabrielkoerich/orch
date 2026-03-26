@@ -299,6 +299,24 @@ pub trait AgentRunner: Send + Sync {
     /// output indicates an error or cannot be parsed.
     fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError>;
 
+    /// Extract the raw inner text from an agent output envelope, without
+    /// attempting to parse it as an `AgentResponse`.
+    ///
+    /// Use this in the review pipeline so that a `ReviewResponse` JSON can be
+    /// recovered even when the text doesn't match the task `AgentResponse` schema.
+    ///
+    /// - For Claude/Kimi/MiniMax: strips the `--output-format stream-json` NDJSON
+    ///   wrapper and returns the `"result"` field of the final `"type":"result"` line.
+    /// - For Codex: returns the text of the last `agent_message` item.
+    /// - For OpenCode: concatenates all `text` events.
+    /// - Default: returns `raw` unchanged (safe fallback for unknown agents).
+    ///
+    /// Returns `Err(AgentError)` only for terminal errors (rate limit, auth, etc.)
+    /// that should abort the review pipeline entirely.
+    fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
+        Ok(raw.to_string())
+    }
+
     /// Classify an error from exit code + stdout + stderr into an AgentError.
     ///
     /// Called when the agent process exits with a non-zero code, or when
