@@ -57,15 +57,24 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
     for event in events {
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-        if event_type == "text" {
+        // OpenCode emits several shapes across versions.
+        // We intentionally restrict extraction to event/part types that represent
+        // assistant text output (not tool I/O).
+        if event_type == "text" || event_type == "message" {
             if let Some(part) = event.get("part") {
-                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                    texts.push(text.to_string());
-                    continue;
-                }
+                texts.extend(extract_text_from_part(part));
             }
             if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
                 texts.push(text.to_string());
+            }
+            continue;
+        }
+
+        // Some builds use a generic event type but keep a text-ish part.
+        if let Some(part) = event.get("part") {
+            let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if part_type == "text" || part_type == "output_text" || part_type == "message" {
+                texts.extend(extract_text_from_part(part));
             }
         }
     }
@@ -98,6 +107,28 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
     Some(full)
 }
 
+fn extract_text_from_part(part: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+        out.push(text.to_string());
+    }
+
+    // Some schemas store text content as: {"content":[{"type":"text","text":"..."}, ...]}
+    if let Some(items) = part.get("content").and_then(|v| v.as_array()) {
+        for item in items {
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if item_type == "text" {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    out.push(text.to_string());
+                }
+            }
+        }
+    }
+
+    out
+}
+
 fn extract_json_object(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
@@ -122,6 +153,24 @@ pub(crate) fn extract_router_text(raw: &str) -> Option<String> {
         return None;
     }
     extract_ndjson_text(&events)
+}
+
+#[cfg(test)]
+mod router_text_tests {
+    use super::*;
+
+    #[test]
+    fn extract_router_text_supports_message_with_content_array() {
+        // Some opencode versions nest assistant text in a message.content array.
+        let raw = r#"{"type":"step_start","timestamp":1}
+{"type":"message","timestamp":2,"part":{"type":"message","content":[{"type":"text","text":"```json\n{\"executor\":\"opencode\",\"complexity\":\"medium\",\"reason\":\"ok\"}\n```"}]}}
+{"type":"step_finish","timestamp":3,"part":{"type":"step-finish","reason":"stop"}}"#;
+        let text = extract_router_text(raw).expect("should extract text");
+        assert!(
+            text.contains("executor"),
+            "extracted text should include JSON"
+        );
+    }
 }
 
 impl OpenCodeRunner {
