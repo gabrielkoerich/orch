@@ -383,7 +383,7 @@ pub(crate) async fn review_open_prs(
         // save it after handle_review_changes() succeeds so that a transient
         // failure does not silently drop the review on the next poll.
         let mut new_comment_review_ts: Option<String> = None;
-        if comment_changes_requested && review_context.is_empty() {
+        if comment_changes_requested {
             let last_comment_ts = stored_task.last_comment_review_ts.clone();
             if let Ok(comments) = gh.list_comments(repo, &pr_number.to_string()).await {
                 for c in comments.iter().rev() {
