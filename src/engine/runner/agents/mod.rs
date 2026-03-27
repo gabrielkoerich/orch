@@ -234,6 +234,7 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
         "not yet complete",
         "not completed",
         "not yet completed",
+        "not committed",
         "incomplete",
         "undone",
     ]
@@ -266,10 +267,14 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
             "task created",
             "posted comment",
             "comment posted",
+            "changes committed",
+            "commit created",
+            "the commit",
         ]
         .iter()
         .any(|needle| lower.contains(needle))
-            || contains_word(&lower, "done"));
+            || contains_word(&lower, "done")
+            || contains_word(&lower, "committed"));
 
     let looks_error = [
         "error:",
@@ -947,6 +952,31 @@ mod tests {
         assert!(response
             .summary
             .contains("Filed 3 high-value GitHub issues"));
+    }
+
+    #[test]
+    fn synthesize_response_marks_done_for_committed() {
+        let response =
+            synthesize_response_from_text("I've committed the changes to the repository").unwrap();
+        assert_eq!(response.status, "done");
+    }
+
+    #[test]
+    fn synthesize_response_marks_done_for_commit_created() {
+        let response = synthesize_response_from_text(
+            "The commit is created locally. The push is being blocked by permissions.",
+        )
+        .unwrap();
+        assert_eq!(response.status, "done");
+    }
+
+    #[test]
+    fn synthesize_response_does_not_mark_done_for_not_committed() {
+        let response = synthesize_response_from_text("The changes are not committed yet").unwrap();
+        assert_eq!(
+            response.status, "needs_review",
+            "\"not committed\" should not match \"committed\""
+        );
     }
 
     // ── PermissionRules defaults ────────────────────────────────
