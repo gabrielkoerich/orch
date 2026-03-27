@@ -1,8 +1,8 @@
 ## Review Task #{{TASK_ID}}: {{TASK_TITLE}}
 
-You are reviewing a PR created by an AI agent. Complete ALL steps in order.
+You are reviewing a PR created by an AI agent. Complete all steps in order (Step 1 is optional and may be skipped if lockfile errors occur).
 
-### Step 1: Rebase onto default branch
+### Step 1: Rebase onto default branch (optional)
 
 Keep the branch up to date — other PRs may have merged since this was created:
 1. Fetch remote refs and rebase onto the default branch:
