@@ -756,10 +756,26 @@ pub(crate) async fn check_merged_prs(
     } else {
         backend.list_by_status(Status::NeedsReview).await?
     };
-    let all_review_tasks: Vec<_> = in_review_tasks
+    let mut all_review_tasks: Vec<_> = in_review_tasks
         .into_iter()
         .chain(needs_review_tasks)
         .collect();
+
+    // Also include internal (SQLite) tasks — they create real GitHub PRs
+    // and their merged PRs must be detected the same way as external tasks.
+    if let Ok(internal_in_review) = task_manager
+        .list_internal_by_status(crate::store::TaskStatus::InReview)
+        .await
+    {
+        all_review_tasks.extend(internal_in_review);
+    }
+    if let Ok(internal_needs_review) = task_manager
+        .list_internal_by_status(crate::store::TaskStatus::NeedsReview)
+        .await
+    {
+        all_review_tasks.extend(internal_needs_review);
+    }
+
     tracing::debug!(
         count = all_review_tasks.len(),
         "checking review tasks for merged PRs"
