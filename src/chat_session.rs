@@ -14,8 +14,8 @@
 //! ## Agent support
 //!
 //! - **claude**: Interactive mode (no `-p`), `--append-system-prompt`
-//! - **codex**: Interactive mode, system prompt via file
-//! - **opencode**: Interactive mode with `--continue`
+//! - **codex**: Interactive mode, system prompt injected as first message
+//! - **opencode**: Interactive mode, system prompt injected as first message
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -294,6 +294,34 @@ async fn get_or_create_session(
 
     // Wait for the agent to be ready
     wait_for_agent_ready(&tmux, &session_name, agent).await?;
+
+    // For non-Claude agents, inject the system prompt as the first message.
+    // Claude gets it via --append-system-prompt flag, but codex and opencode
+    // don't have an equivalent flag for interactive mode.
+    if !matches!(agent, "claude" | "kimi" | "minimax") && !system_prompt_file.is_empty() {
+        if let Ok(prompt_content) = tokio::fs::read_to_string(system_prompt_file).await {
+            if !prompt_content.trim().is_empty() {
+                let injected = format!(
+                    "SYSTEM INSTRUCTIONS — follow these for the entire session:\n\n{}",
+                    prompt_content.trim()
+                );
+                tracing::debug!(
+                    session_id,
+                    agent,
+                    "injecting system prompt as first message"
+                );
+                send_message_to_tmux(&session_name, &injected).await?;
+                // Wait for the agent to process and return to ready state
+                wait_for_agent_ready(&tmux, &session_name, agent).await?;
+            }
+        } else {
+            tracing::warn!(
+                session_id,
+                system_prompt_file,
+                "failed to read system prompt file for injection"
+            );
+        }
+    }
 
     let state = std::sync::Arc::new(tokio::sync::Mutex::new(SessionState {
         tmux_session: session_name,
