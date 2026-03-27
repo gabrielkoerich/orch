@@ -149,6 +149,52 @@ pub async fn handle_error(
                 if let Some(m) = model_name {
                     response::record_model_failure(agent_name, m);
                 }
+                // Before falling through to handle_failover() (which tries claude/codex),
+                // check whether this agent has any free models that haven't been tried yet.
+                // This keeps silent failures contained within the free-model pool and
+                // preserves claude/codex capacity for tasks that genuinely need them.
+                let free = agent_runner.free_models();
+                if !free.is_empty() {
+                    let tried_models: String = store::opt_store_get_task(store, repo, task_id)
+                        .await
+                        .map(|t| t.model_reroute_chain)
+                        .unwrap_or_default();
+                    let tried_set: std::collections::HashSet<&str> =
+                        tried_models.split(',').filter(|s| !s.is_empty()).collect();
+                    let current = model_name.unwrap_or("");
+                    if let Some(next_free) = free.iter().find(|m| {
+                        m.as_str() != current
+                            && !tried_set.contains(m.as_str())
+                            && !response::is_model_in_cooldown(agent_name, m)
+                    }) {
+                        let new_tried = if tried_models.is_empty() {
+                            next_free.clone()
+                        } else {
+                            format!("{tried_models},{next_free}")
+                        };
+                        let msg = format!("silent exit 0, retrying with free model {next_free}");
+                        tracing::info!(
+                            task_id,
+                            model = %next_free,
+                            "silent exit-0: retrying with free model"
+                        );
+                        store::store_set(
+                            store,
+                            repo,
+                            task_id,
+                            &[
+                                ("agent", serde_json::json!("opencode")),
+                                ("model", serde_json::json!(next_free.to_string())),
+                                ("model_reroute_chain", serde_json::json!(new_tried)),
+                                ("last_error", serde_json::json!(msg)),
+                            ],
+                        )
+                        .await;
+                        return Ok(ErrorHandleResult::EarlyReturn {
+                            status: "new".to_string(),
+                        });
+                    }
+                }
             }
             (
                 response::RetryableError::Failed,
@@ -263,4 +309,127 @@ pub async fn handle_error(
     .await;
 
     Ok(ErrorHandleResult::Continue { status })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::runner::agents::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
+    use crate::parser::AgentResponse;
+
+    struct MockRunner {
+        free: Vec<String>,
+    }
+
+    impl AgentRunner for MockRunner {
+        fn name(&self) -> &str {
+            "opencode"
+        }
+
+        fn build_command(
+            &self,
+            _model: Option<&str>,
+            _timeout_cmd: &str,
+            _sys_file: &str,
+            _msg_file: &str,
+            _permissions: &PermissionRules,
+        ) -> String {
+            String::new()
+        }
+
+        fn parse_response(&self, _raw: &str) -> Result<ParsedResponse, AgentError> {
+            Ok(ParsedResponse {
+                response: AgentResponse {
+                    status: "done".to_string(),
+                    summary: String::new(),
+                    accomplished: vec![],
+                    remaining: vec![],
+                    files: vec![],
+                    error: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    learnings: vec![],
+                    delegations: vec![],
+                },
+                input_tokens: None,
+                output_tokens: None,
+                duration_ms: None,
+            })
+        }
+
+        fn classify_error(&self, _exit_code: i32, _stdout: &str, _stderr: &str) -> AgentError {
+            AgentError::Unknown {
+                exit_code: 0,
+                message: String::new(),
+            }
+        }
+
+        fn free_models(&self) -> Vec<String> {
+            self.free.clone()
+        }
+
+        fn router_command(
+            &self,
+            _prompt: &str,
+            _model: Option<&str>,
+        ) -> anyhow::Result<tokio::process::Command> {
+            anyhow::bail!("not implemented")
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_exit0_retries_free_model_before_failover() {
+        let runner = MockRunner {
+            free: vec!["opencode/mimo-v2-omni-free".to_string()],
+        };
+        let err = AgentError::Unknown {
+            exit_code: 0,
+            message: String::new(),
+        };
+
+        let result = handle_error(
+            "test-1112-a",
+            &err,
+            "opencode",
+            &runner,
+            Some("opencode/gpt-5.4-mini"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "new"),
+            "expected EarlyReturn{{status: new}} but got Continue — free model should be tried first"
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_exit0_falls_through_when_no_free_models() {
+        let runner = MockRunner { free: vec![] };
+        let err = AgentError::Unknown {
+            exit_code: 0,
+            message: String::new(),
+        };
+
+        let result = handle_error(
+            "test-1112-b",
+            &err,
+            "opencode",
+            &runner,
+            Some("opencode/gpt-5.4-mini"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, ErrorHandleResult::Continue { .. }),
+            "expected Continue (fallthrough to failover) when no free models available"
+        );
+    }
 }
