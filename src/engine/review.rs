@@ -1002,7 +1002,47 @@ pub(crate) async fn review_and_merge(
         "review agent decision received"
     );
 
-    // 12. Post automated review comment on the PR
+    // 12. Push the rebased branch before posting the review decision so the
+    // comment references code that's already on the PR.
+    match runner::git_ops::push_branch(&worktree_path, &branch_name, &default_branch).await {
+        Ok(_) => {
+            if opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
+                .await
+                .map(|t| t.last_error)
+                .unwrap_or_default()
+                .contains("push failed")
+            {
+                store_set(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    &[
+                        ("last_error", serde_json::json!("")),
+                        ("push_failures", serde_json::json!(0)),
+                    ],
+                )
+                .await;
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                task_id = task.id.0,
+                branch = %branch_name,
+                error = %e,
+                "review push failed"
+            );
+            store_set(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                &[("last_error", serde_json::json!(format!("push failed: {e}")))],
+            )
+            .await;
+            return Ok(ReviewDecision::Failed(format!("push failed: {e}")));
+        }
+    }
+
+    // 13. Post automated review comment on the PR
     let gh = GhHttp::new()?;
     let pr_comment = match &decision {
         ReviewDecision::Approve => {
@@ -1052,7 +1092,7 @@ pub(crate) async fn review_and_merge(
         }
     }
 
-    // 13. Complete run tracking
+    // 14. Complete run tracking
     if let Some(run_id) = run_id {
         let outcome = match &decision {
             ReviewDecision::Approve => "success",
@@ -1080,14 +1120,14 @@ pub(crate) async fn review_and_merge(
             .await;
     }
 
-    // 14. Check for push failures before acting on the decision.
+    // 15. Check for push failures before acting on the decision.
     let has_push_failure = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
         .await
         .map(|t| t.last_error)
         .unwrap_or_default()
         .contains("push failed");
 
-    // 15. Handle the decision
+    // 16. Handle the decision
     match decision {
         ReviewDecision::Approve => {
             if has_push_failure {
