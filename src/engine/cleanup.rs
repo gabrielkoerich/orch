@@ -463,7 +463,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             // worktree and delete branches. Resolve it lazily here so
             // that tasks with nothing to clean don't fail early.
             let repo_root = resolve_repo_root(repo).await?;
-            remove_worktree_and_branch(
+            let removed = remove_worktree_and_branch(
                 task_id,
                 &wt,
                 branch.as_deref(),
@@ -471,7 +471,15 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 keep_remote_branch,
             )
             .await;
-            did_clean = true;
+            if removed {
+                did_clean = true;
+            } else {
+                tracing::warn!(
+                    task_id,
+                    worktree = %wt.display(),
+                    "worktree directory still exists after removal attempt — not marking as cleaned"
+                );
+            }
         }
     } else if let Some(ref br) = branch {
         // Worktree directory is already gone, but the branch may still exist
@@ -517,13 +525,15 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
 /// When `keep_remote_branch` is true, only the worktree and local branch are
 /// removed — the remote branch stays so that any linked PR remains open
 /// (used for blocked tasks awaiting human review).
+/// Returns `true` if the worktree directory is gone after the call
+/// (either we removed it or it was already absent).
 pub(crate) async fn remove_worktree_and_branch(
     task_id: &str,
     wt: &std::path::Path,
     branch: Option<&str>,
     repo_root: &std::path::Path,
     keep_remote_branch: bool,
-) {
+) -> bool {
     let wt_str = wt.to_string_lossy().to_string();
     let repo_root_str = repo_root.to_string_lossy();
 
@@ -624,6 +634,9 @@ pub(crate) async fn remove_worktree_and_branch(
             delete_branches(task_id, br, repo_root).await;
         }
     }
+
+    // Definitively check: is the worktree directory actually gone?
+    !wt.exists()
 }
 
 /// Delete local and remote branches for a task.
@@ -1213,5 +1226,52 @@ mod tests {
             after.worktree_cleaned,
             "task must be marked cleaned when stored worktree path is already gone"
         );
+    }
+
+    /// `remove_worktree_and_branch` returns true when the worktree directory
+    /// is successfully removed (regression test for #1143).
+    #[tokio::test]
+    async fn remove_worktree_returns_true_on_success() {
+        let Some((tmp, wt_dir)) = setup_test_repo() else {
+            eprintln!("skipping test: git not available");
+            return;
+        };
+
+        let repo_dir = tmp.path().join("repo.git");
+        assert!(wt_dir.exists(), "worktree must exist before removal");
+
+        let removed =
+            remove_worktree_and_branch("42", &wt_dir, Some("gh-issue-42-test"), &repo_dir, false)
+                .await;
+
+        assert!(
+            removed,
+            "remove_worktree_and_branch should return true when directory is gone"
+        );
+        assert!(!wt_dir.exists(), "worktree directory should be removed");
+    }
+
+    /// `remove_worktree_and_branch` returns false when the worktree directory
+    /// cannot be removed (regression test for #1143 — prevents orphaned worktrees
+    /// from being permanently marked as cleaned).
+    #[tokio::test]
+    async fn remove_worktree_returns_false_when_dir_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a plain directory (not a real git worktree) — git will fail
+        // to remove it, so the directory stays on disk.
+        let fake_wt = tmp.path().join("not-a-worktree");
+        std::fs::create_dir_all(&fake_wt).unwrap();
+
+        // repo_root doesn't matter much — it just needs to exist for the -C flag.
+        // Using tmp itself; git commands will fail but that's the point.
+        let removed = remove_worktree_and_branch("99", &fake_wt, None, tmp.path(), false).await;
+
+        // The directory still exists because git couldn't remove it.
+        // Before the fix, this would still have been marked as cleaned.
+        assert!(
+            !removed,
+            "remove_worktree_and_branch should return false when directory still exists"
+        );
+        assert!(fake_wt.exists(), "directory should still be on disk");
     }
 }
