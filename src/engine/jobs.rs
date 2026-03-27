@@ -354,7 +354,11 @@ pub async fn tick(
         state.last_run = Some(now.format("%Y-%m-%dT%H:%M:%SZ").to_string());
         if let Some(s) = store {
             if let Err(e) = s.upsert_job_state(&state).await {
-                tracing::error!(job_id = job.id, ?e, "failed to persist job state before execution");
+                tracing::error!(
+                    job_id = job.id,
+                    ?e,
+                    "failed to persist job state before execution"
+                );
             }
         }
 
@@ -364,7 +368,11 @@ pub async fn tick(
         // Persist updated state (active_task_id, last_task_status) after execution.
         if let Some(s) = store {
             if let Err(e) = s.upsert_job_state(&state).await {
-                tracing::error!(job_id = job.id, ?e, "failed to persist job state after execution");
+                tracing::error!(
+                    job_id = job.id,
+                    ?e,
+                    "failed to persist job state after execution"
+                );
             }
         }
     }
