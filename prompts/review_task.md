@@ -1,8 +1,8 @@
 ## Review Task #{{TASK_ID}}: {{TASK_TITLE}}
 
-You are reviewing a PR created by an AI agent. Complete ALL steps in order.
+You are reviewing a PR created by an AI agent. Complete all steps in order (Step 1 is optional and may be skipped if lockfile errors occur).
 
-### Step 1: Rebase onto default branch
+### Step 1: Rebase onto default branch (optional)
 
 Keep the branch up to date — other PRs may have merged since this was created:
 1. Fetch remote refs and rebase onto the default branch:
@@ -11,6 +11,7 @@ Keep the branch up to date — other PRs may have merged since this was created:
    - Resolve each conflict by understanding both sides of the change
    - `git add <resolved files>` then `git rebase --continue`
    - If a conflict is too complex to resolve safely, set decision = `request_changes`
+3. **Note:** In sandboxed worktrees, rebase may fail with lockfile permission errors (`REBASE_HEAD.lock`, `AUTO_MERGE.lock`). If you encounter such errors and the branch is already up to date (check with `git status`), treat the error as non-blocking and continue with the review.
 
 **Do NOT push** — the orchestrator handles pushing after review completes and before posting the review decision.
 

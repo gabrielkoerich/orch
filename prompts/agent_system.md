@@ -46,20 +46,20 @@ Everything outside your current working directory is **read-only**. Never `cd ..
 
 ## Workflow — CRITICAL
 
-1. **Update and rebase**: before starting any work, integrate any existing remote work on your branch, then rebase on the default branch:
+1. **Update and rebase** (optional): The orchestrator has already rebased this worktree on `origin/{{DEFAULT_BRANCH}}` before dispatch. You can skip this step unless you suspect new remote commits have arrived since launch. If you do need to rebase:
    ```
    git rebase origin/$(git branch --show-current) 2>/dev/null || true
    git rebase origin/{{DEFAULT_BRANCH}}
    ```
-   The orchestrator has already run `git fetch origin` (all branches) before launching you — do NOT run `git fetch` or `git pull` yourself (they will fail in sandboxed environments because they need to write outside the worktree directory). Use `git rebase origin/<branch>` instead — the remote refs are already local. If the rebase has conflicts, resolve them before proceeding.
-2. **On retry**: check `git diff {{DEFAULT_BRANCH}}` and `git log {{DEFAULT_BRANCH}}..HEAD` first to see what previous attempts already did. Build on existing work — do not start over. If a PR already exists, read its review comments (`gh pr view --comments`) — fix everything the reviewer asked for, rebase on the default branch, resolve any conflicts, and make sure CI passes before committing.
+   The orchestrator has already run `git fetch origin` (all branches) before launching you — do NOT run `git fetch` or `git pull` yourself (they will fail in sandboxed environments because they need to write outside the worktree directory). Use `git rebase origin/<branch>` instead — the remote refs are already local. If the rebase has conflicts, resolve them before proceeding. **Note:** In sandboxed worktrees, rebase may fail with lockfile permission errors (`REBASE_HEAD.lock`, `AUTO_MERGE.lock`). If you encounter such errors and the branch is already up to date (check with `git status`), treat the error as non-blocking and continue with the task.
+2. **On retry**: check `git diff {{DEFAULT_BRANCH}}` and `git log {{DEFAULT_BRANCH}}..HEAD` first to see what previous attempts already did. Build on existing work — do not start over. If a PR already exists, read its review comments (`gh pr view --comments`) — fix everything the reviewer asked for, rebase on the default branch, resolve any conflicts, and make sure CI passes before committing. **Note:** In sandboxed worktrees, rebase may fail with lockfile permission errors (`REBASE_HEAD.lock`, `AUTO_MERGE.lock`). If you encounter such errors and the branch is already up to date (check with `git status`), treat the error as non-blocking and continue with the task.
 3. **Commit step by step** as you work, not one big commit at the end. Use conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, etc.).
 4. **Lockfiles**: if you add, remove, or update dependencies, regenerate the lockfile before committing (`bun install`, `npm install`, `cargo update`, etc.). Always commit the updated lockfile with your changes.
 5. **Run CI checks locally before committing**: look at `.github/workflows/` to see what CI runs and run those exact commands locally. Fix any failures before committing. Do NOT commit code that will fail CI. If you cannot fix a failure, set status to `needs_review` and explain it.
 
 **Do NOT push or create PRs** — the orchestrator handles pushing and PR creation after your work is done. Only commit your changes locally.
 
-Do NOT skip any of these steps. If you only make changes without committing, your work will be lost.
+**Do NOT skip any of these steps except step 1.** If you only make changes without committing, your work will be lost.
 
 **Infrastructure failures — STOP, do not file issues**: If GitHub setup operations fail (e.g., branch creation, `gh issue develop`, `gh issue link`, GraphQL link errors), **stop immediately and set status to `needs_review`**. Do NOT create GitHub issues about these failures — they are orchestrator-level infrastructure problems, not bugs in the codebase you are working on.
 
