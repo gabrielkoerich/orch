@@ -620,6 +620,72 @@ pub(crate) async fn auto_merge_pr(
     Ok(())
 }
 
+/// Returns `true` when the branch's latest commit is newer than the most
+/// recent automated review comment on the PR.
+///
+/// This is used to detect reviews that ran against stale code: if the agent
+/// pushed a fix *after* the review comment was posted, the review's feedback
+/// is no longer valid and we should not escalate based on it.
+///
+/// Returns `false` on any API error so that we always fall back to normal
+/// escalation behaviour rather than getting stuck in a retry loop.
+async fn branch_newer_than_last_review(
+    gh: &GhHttp,
+    repo: &str,
+    pr_number: u64,
+    pr_num_str: &str,
+) -> bool {
+    // 1. Get the current branch HEAD SHA.
+    let head_sha = match gh.get_pr(repo, pr_number).await {
+        Ok(pr) => pr.head.sha,
+        Err(e) => {
+            tracing::debug!(pr_number, err = %e, "stale-review check: failed to get PR");
+            return false;
+        }
+    };
+
+    // 2. Get the committer date of the HEAD commit.
+    let commit_date = match gh.get_commit_timestamp(repo, &head_sha).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!(pr_number, sha = %head_sha, err = %e, "stale-review check: failed to get commit date");
+            return false;
+        }
+    };
+
+    // 3. Find the latest automated review comment on the PR.
+    let comments = match gh.list_comments(repo, pr_num_str).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(pr_number, err = %e, "stale-review check: failed to list comments");
+            return false;
+        }
+    };
+
+    let last_review_date = comments
+        .iter()
+        .rev()
+        .find(|c| c.body.starts_with("## Automated Review"))
+        .map(|c| c.created_at.as_str());
+
+    match last_review_date {
+        Some(review_date) => {
+            let newer = commit_date.as_str() > review_date;
+            if newer {
+                tracing::info!(
+                    pr_number,
+                    commit_date = %commit_date,
+                    review_date = %review_date,
+                    "stale-review check: branch has commits newer than last review"
+                );
+            }
+            newer
+        }
+        // No automated review comment found — cannot determine staleness, don't skip escalation.
+        None => false,
+    }
+}
+
 /// Handle review changes request — re-dispatch the original agent.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_review_changes(
@@ -649,6 +715,32 @@ pub(crate) async fn handle_review_changes(
     let pr_num_str = pr_number.to_string();
 
     if review_cycles >= max_cycles {
+        // Before escalating, check whether the branch has been updated after the
+        // last automated review comment was posted.  If it has, the review that
+        // triggered this escalation ran against stale code — the agent already
+        // pushed a fix.  In that case, trigger one fresh review instead of
+        // blocking the PR with outdated feedback.
+        if branch_newer_than_last_review(&gh, repo, pr_number, &pr_num_str).await {
+            tracing::info!(
+                task_id = task.id.0,
+                review_cycles,
+                "branch updated since last review — triggering fresh review instead of escalating"
+            );
+            if let Err(e) = task_manager
+                .update_task_status(&task.id, Status::NeedsReview)
+                .await
+            {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    err = %e,
+                    "failed to set NeedsReview for fresh review — will escalate instead"
+                );
+                // Fall through to escalation below.
+            } else {
+                return Ok(());
+            }
+        }
+
         tracing::warn!(
             task_id = task.id.0,
             review_cycles,
@@ -750,6 +842,16 @@ pub(crate) async fn handle_review_changes(
     );
 
     Ok(())
+}
+
+/// ISO-8601 timestamp comparison sanity check used by `branch_newer_than_last_review`.
+///
+/// GitHub timestamps are RFC 3339 / ISO-8601 strings (e.g. `"2024-01-15T12:30:00Z"`).
+/// Lexicographic string ordering is equivalent to chronological ordering for this
+/// format, which is what we rely on in `branch_newer_than_last_review`.
+#[cfg(test)]
+fn iso8601_is_newer(newer: &str, older: &str) -> bool {
+    newer > older
 }
 
 #[cfg(test)]
@@ -1205,6 +1307,197 @@ mod tests {
             stored.status,
             TaskStatus::InReview,
             "status should remain InReview when Routed transition failed"
+        );
+    }
+
+    /// ISO-8601 timestamps returned by GitHub compare lexicographically in
+    /// chronological order.  `branch_newer_than_last_review` relies on this.
+    #[test]
+    fn iso8601_timestamps_compare_correctly() {
+        // newer commit (pushed after review) should be greater
+        assert!(iso8601_is_newer(
+            "2024-01-15T13:00:00Z",
+            "2024-01-15T12:30:00Z"
+        ));
+        // same timestamp is not "newer"
+        assert!(!iso8601_is_newer(
+            "2024-01-15T12:30:00Z",
+            "2024-01-15T12:30:00Z"
+        ));
+        // older commit is not newer
+        assert!(!iso8601_is_newer(
+            "2024-01-14T23:59:59Z",
+            "2024-01-15T00:00:01Z"
+        ));
+        // cross-day boundary
+        assert!(iso8601_is_newer(
+            "2024-01-16T00:00:01Z",
+            "2024-01-15T23:59:59Z"
+        ));
+    }
+
+    /// When the GitHub API is unavailable (no real token in unit tests),
+    /// `handle_review_changes` must still escalate correctly rather than
+    /// getting stuck.  The stale-review check fails gracefully and we fall
+    /// through to the normal Blocked path.
+    #[tokio::test]
+    async fn handle_review_changes_escalates_when_stale_check_fails() {
+        use crate::engine::tasks::TaskManager;
+        use crate::store::{TaskStatus, TaskStore};
+        use async_trait::async_trait;
+
+        struct NoopBackend;
+        #[async_trait]
+        impl crate::backends::ExternalBackend for NoopBackend {
+            fn name(&self) -> &str {
+                "noop"
+            }
+            async fn create_task(
+                &self,
+                _t: &str,
+                _b: &str,
+                _l: &[String],
+            ) -> anyhow::Result<ExternalId> {
+                Ok(ExternalId("new".into()))
+            }
+            async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask> {
+                Ok(ExternalTask {
+                    id: id.clone(),
+                    title: "t".into(),
+                    body: "".into(),
+                    state: "open".into(),
+                    labels: vec![],
+                    author: "bot".into(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    url: "".into(),
+                })
+            }
+            async fn list_by_status(&self, _s: Status) -> anyhow::Result<Vec<ExternalTask>> {
+                Ok(vec![])
+            }
+            async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+                Ok(vec![])
+            }
+            async fn post_comment(&self, _id: &ExternalId, _b: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn set_labels(&self, _id: &ExternalId, _l: &[String]) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn remove_label(&self, _id: &ExternalId, _l: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+                Ok(vec![])
+            }
+            async fn create_sub_task(
+                &self,
+                _p: &ExternalId,
+                _t: &str,
+                _b: &str,
+                _l: &[String],
+            ) -> anyhow::Result<ExternalId> {
+                Ok(ExternalId("child".into()))
+            }
+            async fn ensure_status_label(&self, _l: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn has_open_issue_with_title(&self, _t: &str, _l: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn health_check(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn is_pr_merged(&self, _b: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+                Ok(Some("bot".into()))
+            }
+            async fn get_mentions(&self, _s: &str) -> anyhow::Result<Vec<Mention>> {
+                Ok(vec![])
+            }
+            async fn update_status(&self, _id: &ExternalId, _s: Status) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let repo = "owner/repo";
+
+        let task_id_num = store
+            .create(&crate::store::NewTask {
+                external_id: None,
+                repo: repo.to_string(),
+                origin: "internal".to_string(),
+                title: "Fix defaults".to_string(),
+                body: "body".to_string(),
+                source: "cron".to_string(),
+                source_id: "daily".to_string(),
+                author: "".to_string(),
+                url: "".to_string(),
+                labels: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Set review_cycles to max so we enter the escalation path.
+        store
+            .set_fields(task_id_num, &[("review_cycles", serde_json::json!(2i64))])
+            .await
+            .unwrap();
+        store
+            .update_status(task_id_num, TaskStatus::InReview)
+            .await
+            .unwrap();
+
+        let task_id_str = format!("internal:{task_id_num}");
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(NoopBackend);
+        let task_manager = Arc::new(TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            repo.to_string(),
+        ));
+
+        let task = ExternalTask {
+            id: ExternalId(task_id_str.clone()),
+            title: "Fix defaults".to_string(),
+            body: "body".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "".to_string(),
+        };
+
+        // With no real GitHub token the stale check will fail gracefully and
+        // we fall through to normal escalation (Blocked status).
+        let result = handle_review_changes(
+            &task,
+            "sync_interval defaults are wrong",
+            &[],
+            &backend,
+            repo,
+            303,
+            "minimax",
+            "minimax-m2",
+            &task_manager,
+            &store,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "handle_review_changes must return Ok on escalation path: {result:?}"
+        );
+
+        let stored = store.get(task_id_num).await.unwrap();
+        assert_eq!(
+            stored.status,
+            TaskStatus::Blocked,
+            "task must be Blocked when max review cycles exceeded and stale check is unavailable"
         );
     }
 }
