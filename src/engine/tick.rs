@@ -607,10 +607,6 @@ pub(crate) async fn tick_dispatch_tasks(
         let repo_ctx = repo_owned.clone();
         tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
             let _dispatch_guard = dispatch_guard; // released on drop (normal or panic)
-            // Note: Using tracing::info_span directly without holding across await
-            // to avoid Send issues with EnteredSpan
-            tracing::info!(task_id, "dispatching task");
-
             let dispatch_start = std::time::Instant::now();
             match runner
                 .run_with_context(&task_owned, &backend, &tmux, route_result.as_ref())
