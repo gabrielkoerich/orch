@@ -447,12 +447,41 @@ pub(crate) mod patterns {
             "you've hit your usage limit",
             "529",
         ];
-        if patterns.iter().any(|p| lower.contains(p)) || lower.contains("429") {
-            return Some(AgentError::RateLimit {
-                message: safe_tail(text, 300),
-            });
+        // Find the earliest match position so we can extract context around the
+        // actual error message rather than the tail (which may be unrelated JSON).
+        let match_pos = patterns.iter().filter_map(|p| lower.find(p)).min();
+        let has_429 = lower.contains("429");
+        if match_pos.is_some() || has_429 {
+            let message = if let Some(pos) = match_pos {
+                extract_context_around(text, pos, 300)
+            } else {
+                safe_tail(text, 300)
+            };
+            return Some(AgentError::RateLimit { message });
         }
         None
+    }
+
+    /// Extract up to `window` bytes of context centred around `byte_pos`.
+    ///
+    /// Because `byte_pos` is derived from a lowercased copy, it is exact for
+    /// ASCII patterns (the vast majority of agent output).  For non-ASCII edge
+    /// cases the window may shift slightly but remains far more useful than
+    /// `safe_tail`.
+    fn extract_context_around(text: &str, byte_pos: usize, window: usize) -> String {
+        let half = window / 2;
+        let start = byte_pos.saturating_sub(half);
+        let end = (byte_pos + window).min(text.len());
+        // Align both ends to char boundaries.
+        let mut s = start;
+        while s < text.len() && !text.is_char_boundary(s) {
+            s += 1;
+        }
+        let mut e = end;
+        while e < text.len() && !text.is_char_boundary(e) {
+            e += 1;
+        }
+        text[s..e].to_string()
     }
 
     /// Returns true if `lower` contains the HTTP status `code` (e.g. "401") as a
@@ -760,6 +789,27 @@ mod tests {
         assert!(patterns::detect_rate_limit("HTTP 429 Too Many Requests").is_some());
         assert!(patterns::detect_rate_limit("You've hit your usage limit").is_some());
         assert!(patterns::detect_rate_limit("all good").is_none());
+    }
+
+    #[test]
+    fn detect_rate_limit_message_contains_context_not_tail() {
+        // Simulate a long claude NDJSON output where the rate limit message is in
+        // the middle and usage stats JSON is at the tail.
+        let padding = "x".repeat(5000);
+        let text = format!(
+            "{padding}you've reached your usage limit for this billing cycle{padding}\
+             {{\"web_fetch_requests\":0,\"service_tier\":\"standard\"}}"
+        );
+        let err = patterns::detect_rate_limit(&text).expect("should detect");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("usage limit"),
+            "message should contain the actual error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("web_fetch_requests"),
+            "message should not be the tail JSON, got: {msg}"
+        );
     }
 
     #[test]
