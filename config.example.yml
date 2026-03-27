@@ -149,10 +149,10 @@ webhook:
 # Engine settings
 engine:
   tick_interval: 10
-  sync_interval: 120
+  sync_interval: 45
   fallback_sync_interval: 30
   webhook_health_check_interval: 60
-  max_parallel: 8
+  max_parallel: 4
   stuck_timeout: 1800
   graceful_shutdown_timeout: 600
 
