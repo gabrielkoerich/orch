@@ -106,6 +106,25 @@ fn extract_json_block(text: &str) -> Option<String> {
     Some(text[content_start..end].to_string())
 }
 
+/// Fields that indicate a JSON blob is an AgentResponse (higher score = better match).
+const AGENT_RESPONSE_FIELDS: &[&str] = &[
+    "\"status\"",
+    "\"summary\"",
+    "\"accomplished\"",
+    "\"remaining\"",
+    "\"files\"",
+    "\"learnings\"",
+    "\"delegations\"",
+    "\"error\"",
+];
+
+fn agent_response_score(blob: &str) -> usize {
+    AGENT_RESPONSE_FIELDS
+        .iter()
+        .filter(|&&f| blob.contains(f))
+        .count()
+}
+
 fn json_candidates(raw: &str) -> Vec<String> {
     let mut candidates = Vec::new();
 
@@ -113,7 +132,12 @@ fn json_candidates(raw: &str) -> Vec<String> {
         candidates.push(block);
     }
 
-    if let Some(candidate) = extract_balanced_json(raw) {
+    // Collect ALL balanced JSON blobs and sort by how much they look like an
+    // AgentResponse, so the real response is tried before telemetry blobs.
+    let mut all_json = extract_all_balanced_json(raw);
+    all_json.sort_by_key(|b| std::cmp::Reverse(agent_response_score(b)));
+
+    for candidate in all_json {
         if !candidates.iter().any(|existing| existing == &candidate) {
             candidates.push(candidate);
         }
@@ -148,55 +172,77 @@ fn parse_candidate(candidate: &str) -> anyhow::Result<AgentResponse> {
     anyhow::bail!("invalid agent response candidate")
 }
 
-fn extract_balanced_json(text: &str) -> Option<String> {
-    let start = text
-        .char_indices()
-        .find(|(_, ch)| matches!(ch, '{' | '['))
-        .map(|(idx, _)| idx)?;
+/// Scan `text` and return every top-level balanced JSON object or array found.
+fn extract_all_balanced_json(text: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let mut pos = 0;
 
-    let mut stack = Vec::new();
-    let mut in_string = false;
-    let mut escape = false;
+    while pos < text.len() {
+        // Find the next `{` or `[` starting from `pos`.
+        let Some(start_offset) = text[pos..]
+            .char_indices()
+            .find(|(_, ch)| matches!(ch, '{' | '['))
+            .map(|(idx, _)| idx)
+        else {
+            break;
+        };
+        let start = pos + start_offset;
 
-    for (idx, ch) in text[start..].char_indices() {
-        let abs = start + idx;
-        if in_string {
-            if escape {
-                escape = false;
+        let mut stack = Vec::new();
+        let mut in_string = false;
+        let mut escape = false;
+        let mut end: Option<usize> = None;
+
+        for (idx, ch) in text[start..].char_indices() {
+            let abs = start + idx;
+            if in_string {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                match ch {
+                    '\\' => escape = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
                 continue;
             }
+
             match ch {
-                '\\' => escape = true,
-                '"' => in_string = false,
+                '"' => in_string = true,
+                '{' | '[' => stack.push(ch),
+                '}' => {
+                    if stack.pop() != Some('{') {
+                        break; // malformed — skip past this `{`
+                    }
+                    if stack.is_empty() {
+                        end = Some(abs);
+                        break;
+                    }
+                }
+                ']' => {
+                    if stack.pop() != Some('[') {
+                        break; // malformed — skip past this `[`
+                    }
+                    if stack.is_empty() {
+                        end = Some(abs);
+                        break;
+                    }
+                }
                 _ => {}
             }
-            continue;
         }
 
-        match ch {
-            '"' => in_string = true,
-            '{' | '[' => stack.push(ch),
-            '}' => {
-                if stack.pop() != Some('{') {
-                    return None;
-                }
-                if stack.is_empty() {
-                    return Some(text[start..=abs].to_string());
-                }
-            }
-            ']' => {
-                if stack.pop() != Some('[') {
-                    return None;
-                }
-                if stack.is_empty() {
-                    return Some(text[start..=abs].to_string());
-                }
-            }
-            _ => {}
+        if let Some(end_idx) = end {
+            results.push(text[start..=end_idx].to_string());
+            pos = end_idx + 1;
+        } else {
+            // No closing brace found — skip past the opening character.
+            pos = start + 1;
         }
     }
 
-    None
+    results
 }
 
 fn repair_json_like(text: &str) -> String {
@@ -537,5 +583,34 @@ Thanks"#;
         assert_eq!(resp.delegations.len(), 1);
         assert_eq!(resp.delegations[0].title, "Subtask");
         assert!(resp.delegations[0].labels.is_empty());
+    }
+
+    #[test]
+    fn parse_response_after_telemetry_json() {
+        // Telemetry JSON appears before the actual response JSON.
+        // The parser must skip the telemetry blob and find the real response.
+        let input = r#"Processing...
+{"type":"telemetry","message":"starting task","tokens":42}
+Some output here.
+{"status":"done","summary":"Fixed the bug","accomplished":["patched parser"],"remaining":[],"files":["src/parser.rs"]}
+"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "done");
+        assert_eq!(resp.summary, "Fixed the bug");
+        assert_eq!(resp.files, vec!["src/parser.rs"]);
+    }
+
+    #[test]
+    fn parse_response_from_ndjson_multiple_objects() {
+        // NDJSON stream: only the last object has `status` — must select it.
+        let input = r#"{"type":"text","text":"Working on it..."}
+{"type":"tool_call","name":"bash","input":{"command":"cargo test"}}
+{"type":"tool_result","output":"test passed"}
+{"status":"needs_review","summary":"All tests pass","accomplished":["fixed bug"],"remaining":[],"files":["src/lib.rs"]}
+"#;
+        let resp = parse(input).unwrap();
+        assert_eq!(resp.status, "needs_review");
+        assert_eq!(resp.summary, "All tests pass");
+        assert_eq!(resp.files, vec!["src/lib.rs"]);
     }
 }
