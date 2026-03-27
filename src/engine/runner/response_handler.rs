@@ -284,13 +284,7 @@ pub async fn handle_success(
         let push_failures = store::store_increment(store, repo, task_id, "push_failures").await;
 
         // Clear agent so router picks a different one on reroute
-        store::store_set(
-            store,
-            repo,
-            task_id,
-            &[ ("agent", serde_json::json!(null)) ],
-        )
-        .await;
+        store::store_set(store, repo, task_id, &[("agent", serde_json::json!(null))]).await;
 
         if push_failures >= 3 {
             tracing::error!(
