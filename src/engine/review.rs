@@ -629,11 +629,18 @@ pub(crate) async fn review_and_merge(
     // 3. Fetch latest remote refs before building diff context.
     // Without this, build_git_diff and build_git_log operate on stale
     // origin/{default_branch}, producing false diffs and incorrect baselines.
-    let _ = Command::new("git")
+    if let Err(e) = Command::new("git")
         .args(["fetch", "origin", "--prune"])
         .current_dir(&worktree_path)
         .output_with_context()
-        .await;
+        .await
+    {
+        tracing::warn!(
+            task_id = task.id.0,
+            error = %e,
+            "review: git fetch failed — diff/log may use stale remote refs"
+        );
+    }
 
     // 4. Build diff context
     let default_branch = runner::worktree::detect_default_branch(&worktree_path).await;
