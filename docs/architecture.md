@@ -232,8 +232,8 @@ new → routed → in_progress → needs_review → in_review → done
 │     - Recent summaries (last 20)               │
 │  3. Resolve model/agent from KV                │
 │  4. Invoke agent one-shot:                     │
-    │     - get_runner(agent).build_command()         │
-    │     - bash -c (120s timeout)                   │
+│     - get_runner(agent).build_command()         │
+│     - bash -c (120s timeout)                   │
 │     - get_runner(agent).parse_response()        │
 │     - get_runner(agent).classify_error()        │
 │  5. Extract text + tokens from response        │
