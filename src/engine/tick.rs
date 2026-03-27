@@ -555,7 +555,6 @@ pub(crate) async fn tick_dispatch_tasks(
                 continue;
             }
         }
-        tracing::info!(task_id = task.id.0, "dispatching task");
         // RAII guard — removes dispatch_key on drop even if the spawned task panics.
         let dispatch_guard = DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
 
@@ -584,6 +583,7 @@ pub(crate) async fn tick_dispatch_tasks(
             drop(permit);
             continue; // dispatch_guard drops here, removing the key
         }
+        tracing::info!(task_id, "dispatching task");
 
         // Register session for capture
         let session_name = tmux.session_name(repo, &task_id);
