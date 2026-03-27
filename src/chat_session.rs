@@ -395,32 +395,57 @@ async fn wait_for_agent_ready(tmux: &TmuxManager, session: &str, agent: &str) ->
 /// This approach handles arbitrary content including special characters
 /// and multi-line text, avoiding shell escaping issues with send-keys.
 async fn send_message_to_tmux(session: &str, message: &str) -> Result<()> {
-    // Write message to a temp file
+    // Write message to a unique temp file (timestamp + pid to avoid collisions
+    // between concurrent sessions)
     let tmp_dir = std::env::temp_dir();
-    let msg_file = tmp_dir.join(format!("orch-chat-msg-{}", std::process::id()));
+    let unique_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let msg_file = tmp_dir.join(format!(
+        "orch-chat-msg-{}-{}",
+        std::process::id(),
+        unique_id
+    ));
     tokio::fs::write(&msg_file, message).await?;
 
-    // Load into tmux paste buffer
+    // Use a unique named buffer to avoid races between concurrent sessions
+    let buffer_name = format!("orch-{}-{}", std::process::id(), unique_id);
+
+    // Load into a named tmux paste buffer
     let output = Command::new("tmux")
-        .args(["load-buffer", msg_file.to_str().unwrap_or("/tmp/orch-msg")])
+        .args([
+            "load-buffer",
+            "-b",
+            &buffer_name,
+            msg_file.to_str().unwrap_or("/tmp/orch-msg"),
+        ])
         .output()
         .await
         .context("tmux load-buffer")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = tokio::fs::remove_file(&msg_file).await;
         anyhow::bail!("tmux load-buffer failed: {stderr}");
     }
 
-    // Paste into the session
+    // Paste the named buffer into the session
     let output = Command::new("tmux")
-        .args(["paste-buffer", "-t", session])
+        .args(["paste-buffer", "-b", &buffer_name, "-t", session])
         .output()
         .await
         .context("tmux paste-buffer")?;
 
+    // Delete the named buffer regardless of paste result
+    let _ = Command::new("tmux")
+        .args(["delete-buffer", "-b", &buffer_name])
+        .output()
+        .await;
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = tokio::fs::remove_file(&msg_file).await;
         anyhow::bail!("tmux paste-buffer failed: {stderr}");
     }
 
