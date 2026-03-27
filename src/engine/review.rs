@@ -173,11 +173,48 @@ async fn ensure_pr_exists(
                     branch = %branch_name,
                     "no open PR but branch has commits — attempting to create PR"
                 );
-                // Push first in case agent forgot
-                let _ = tokio::process::Command::new("git")
-                    .args(["-C", worktree_str, "push", "-u", "origin", branch_name])
+                // Push first in case agent forgot (use token auth like git_ops::push_branch)
+                let auth_args = runner::git_ops::build_git_auth_args();
+                let mut push_args: Vec<String> = auth_args;
+                push_args.extend([
+                    "-C".to_string(),
+                    worktree_str.to_string(),
+                    "push".to_string(),
+                    "-u".to_string(),
+                    "origin".to_string(),
+                    branch_name.to_string(),
+                ]);
+
+                // Run a credentialed push and log any errors so failures are
+                // visible in logs instead of being silently discarded.
+                match tokio::process::Command::new("git")
+                    .args(&push_args)
                     .output()
-                    .await;
+                    .await
+                {
+                    Ok(o) => {
+                        if !o.status.success() {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                branch = %branch_name,
+                                exit_code = ?o.status.code(),
+                                stdout = %String::from_utf8_lossy(&o.stdout),
+                                stderr = %String::from_utf8_lossy(&o.stderr),
+                                "review gate fallback push failed"
+                            );
+                        } else {
+                            tracing::info!(task_id = task.id.0, branch = %branch_name, "review gate fallback push succeeded");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            task_id = task.id.0,
+                            branch = %branch_name,
+                            error = %e,
+                            "review gate fallback push command failed to run"
+                        );
+                    }
+                }
 
                 let task_ref = runner::git_ops::format_task_ref(&task.id.0);
                 let pr_body = format!(

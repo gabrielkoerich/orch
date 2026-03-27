@@ -292,7 +292,7 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
 ///
 /// Returns a `Vec<String>` of alternating `-c KEY=VALUE` pairs suitable for
 /// prepending to any `git` command's argument list.
-fn build_git_auth_args() -> Vec<String> {
+pub(crate) fn build_git_auth_args() -> Vec<String> {
     // Use a fresh resolver here so tests that temporarily set env vars
     // are not affected by a process-wide cached resolver. The global
     // `shared()` resolver intentionally caches tokens for the running
