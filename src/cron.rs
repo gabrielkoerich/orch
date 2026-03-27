@@ -19,14 +19,17 @@ pub fn normalize_dow(expression: &str) -> String {
         return expression.to_string();
     }
     let dow = fields[4];
-    // Replace 0 with 7 in the DOW field, handling ranges/lists (e.g. "0,3" → "7,3", "0-5" → "7-5")
+    // Replace 0 with 7 in the DOW field, handling ranges/lists.
+    // Examples: "0" → "7", "0,3" → "7,3", "0-5" → "1-5,7" (split: Mon-Fri + Sunday)
+    // Ranges starting at 0 cannot be expressed as a single contiguous range in the
+    // cron crate (Sun=7 > Sat=6), so we split: "0-N" → "1-N,7".
     let normalized_dow = dow
         .split(',')
         .map(|part| {
             if part == "0" {
                 "7".to_string()
             } else if let Some(rest) = part.strip_prefix("0-") {
-                format!("1-{rest}")
+                format!("1-{rest},7")
             } else {
                 part.to_string()
             }
@@ -198,6 +201,60 @@ mod tests {
         // "0-4" = Sunday through Thursday in standard cron
         let result = check("0 9 * * 0-4", None);
         assert!(result.is_ok(), "DOW range 0-4 should parse: {result:?}");
+    }
+
+    #[test]
+    fn normalize_dow_range_zero_to_five_includes_sunday() {
+        // "0-5" must normalize to "1-5,7": Mon-Fri (1-5) + Sunday (7)
+        let normalized = normalize_dow("0 9 * * 0-5");
+        assert!(
+            normalized.ends_with("1-5,7"),
+            "Expected DOW field to be '1-5,7' but got: {normalized}"
+        );
+    }
+
+    #[test]
+    fn normalize_dow_range_zero_to_four_includes_sunday() {
+        // "0-4" must normalize to "1-4,7": Mon-Thu (1-4) + Sunday (7)
+        let normalized = normalize_dow("0 9 * * 0-4");
+        assert!(
+            normalized.ends_with("1-4,7"),
+            "Expected DOW field to be '1-4,7' but got: {normalized}"
+        );
+    }
+
+    #[test]
+    fn dow_range_zero_to_six_includes_sunday() {
+        // "0-6" = every day; normalizes to "1-6,7"
+        let normalized = normalize_dow("0 9 * * 0-6");
+        assert!(
+            normalized.ends_with("1-6,7"),
+            "Expected DOW field to be '1-6,7' but got: {normalized}"
+        );
+        // Also verify it parses and fires (every day schedule always matches now)
+        let result = check("0 9 * * 0-6", None);
+        assert!(result.is_ok(), "DOW range 0-6 should parse: {result:?}");
+    }
+
+    #[test]
+    fn dow_range_zero_to_five_fires_on_sunday() {
+        use chrono::{Datelike, TimeZone};
+        use cron::Schedule;
+        use std::str::FromStr;
+
+        // Normalize and build a 7-field expression, then check that a known Sunday
+        // appears in the schedule's upcoming occurrences.
+        let normalized = normalize_dow("0 9 * * 0-5");
+        let full_expr = format!("0 {normalized} *");
+        let schedule = Schedule::from_str(&full_expr).expect("should parse");
+
+        // Find the next 14 occurrences and verify at least one is a Sunday (weekday 0 in chrono).
+        let base = Utc.with_ymd_and_hms(2026, 3, 23, 0, 0, 0).unwrap(); // Monday
+        let has_sunday = schedule
+            .after(&base)
+            .take(14)
+            .any(|dt| dt.weekday() == chrono::Weekday::Sun);
+        assert!(has_sunday, "Schedule '0 9 * * 0-5' must fire on Sunday");
     }
 
     #[test]
