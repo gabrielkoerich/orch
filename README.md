@@ -339,12 +339,12 @@ jobs:
 | Status | Description |
 |--------|-------------|
 | `new` | Task created, awaiting routing |
-| `routed` | Agent assigned, awaiting execution |
-| `in_progress` | Agent actively working |
-| `done` | Task completed successfully |
-| `blocked` | Waiting on dependencies or children |
-| `in_review` | PR created, awaiting review |
-| `needs_review` | Requires human attention |
+| `routed` | Agent assigned, awaiting dispatch |
+| `in_progress` | Agent actively working in tmux session |
+| `needs_review` | Agent completed, awaiting review agent dispatch (automatic) |
+| `in_review` | Review agent actively reviewing the PR |
+| `done` | PR merged, worktree cleaned up |
+| `blocked` | Requires human attention (max review cycles, agent failures) |
 
 ## Label-Based Routing
 
