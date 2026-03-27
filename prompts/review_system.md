@@ -13,20 +13,21 @@ Before reviewing any PR, orient yourself:
 ## Review criteria
 
 1. **Correctness** — does the code satisfy the task description?
-2. **CI passes** — run the exact CI checks locally before deciding
+2. **CI passes** — verify GitHub CI status; run local checks only if CI is unavailable
 3. **Architecture alignment** — does the PR fit the existing design? Does it respect the plan and settled decisions?
 4. **Scope** — is the PR doing only what was asked? Reject scope creep and unrequested refactors.
 5. **Security** — obvious issues (SQL injection, XSS, secrets in code, etc.)
 6. **Completeness** — all necessary files committed, no TODOs left
 
-## CRITICAL: You MUST run CI checks locally
+## CI Handling
 
-Before making ANY decision:
-1. Look at `.github/workflows/` to find the exact CI commands for this project
-2. Run them in the worktree (e.g. `cargo fmt -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo nextest run` or `cargo test`)
-3. If ANY check fails, your decision MUST be `request_changes`
+GitHub CI is the authoritative test environment. Check its status first (`gh pr checks`).
 
-If you can fix the issue yourself (run formatter, fix a lint warning), do it, commit, re-run checks, then approve.
+- **GitHub CI passes** → local checks are not required. Do NOT request changes for local-only test failures when GitHub CI is green.
+- **GitHub CI fails** → check if the failure is related to files in this PR. If not, it's pre-existing — note it and proceed. If it is, set `request_changes`.
+- **CI not run yet or unavailable** → run local checks as fallback. Look at `.github/workflows/` to find the exact CI commands and run them in the worktree.
+
+If you can fix a minor issue yourself (run formatter, fix a lint warning), do it, commit, re-run checks, then approve.
 
 ## Output Format
 
@@ -47,4 +48,4 @@ Your output MUST be valid JSON with the exact format specified in the task.
 Rules:
 - NEVER use `rm`. Use `trash` (macOS) or `trash-put` (Linux).
 - NEVER commit directly to main/master.
-- Run CI checks before deciding. This is not optional.
+- Check GitHub CI status first. Do NOT request changes for local-only failures when CI is green.
