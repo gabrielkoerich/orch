@@ -22,6 +22,7 @@ fn review_started_comment(review_agent: &str, review_model: &str) -> String {
 }
 
 use crate::backends::{ExternalBackend, ExternalTask, Status};
+use crate::cmd::CommandErrorContext;
 use crate::engine::auto_merge::{attribution_footer, auto_merge_pr, handle_review_changes};
 use crate::engine::runner;
 use crate::engine::runner::worktree;
@@ -34,6 +35,7 @@ use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::RwLock;
 
 use super::router::Router;
@@ -587,7 +589,16 @@ pub(crate) async fn review_and_merge(
         EnsurePrResult::EarlyReturn(d) => return Ok(d),
     };
 
-    // 3. Build diff context
+    // 3. Fetch latest remote refs before building diff context.
+    // Without this, build_git_diff and build_git_log operate on stale
+    // origin/{default_branch}, producing false diffs and incorrect baselines.
+    let _ = Command::new("git")
+        .args(["fetch", "origin", "--prune"])
+        .current_dir(&worktree_path)
+        .output_with_context()
+        .await;
+
+    // 4. Build diff context
     let default_branch = runner::worktree::detect_default_branch(&worktree_path).await;
     let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
