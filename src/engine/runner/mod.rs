@@ -719,18 +719,36 @@ impl TaskRunner {
             .await
             .unwrap_or_default();
         if !delegations_raw.is_empty() {
-            if let Ok(delegations) =
-                serde_json::from_str::<Vec<crate::parser::Delegation>>(&delegations_raw)
-            {
-                if !delegations.is_empty() {
+            match serde_json::from_str::<Vec<crate::parser::Delegation>>(&delegations_raw) {
+                Ok(delegations) if !delegations.is_empty() => {
                     self.process_delegations(task, &delegations, backend)
                         .await?;
-                    // Clear delegations after processing
                     store::store_set(
                         &self.store,
                         &self.repo,
                         task_id,
                         &[("delegations", serde_json::json!([]))],
+                    )
+                    .await;
+                }
+                Ok(_) => {} // empty list, nothing to do
+                Err(e) => {
+                    tracing::error!(task_id, error = %e, "corrupt delegations JSON — clearing");
+                    store::store_set(
+                        &self.store,
+                        &self.repo,
+                        task_id,
+                        &[("delegations", serde_json::json!([]))],
+                    )
+                    .await;
+                    store::store_set(
+                        &self.store,
+                        &self.repo,
+                        task_id,
+                        &[(
+                            "last_error",
+                            serde_json::json!(format!("delegation parse failed: {e}")),
+                        )],
                     )
                     .await;
                 }
