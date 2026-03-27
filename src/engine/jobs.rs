@@ -347,15 +347,32 @@ pub async fn tick(
 
         tracing::info!(job_id = job.id, r#type = job.r#type, "job due, executing");
 
-        // Set last_run BEFORE execution (prevents catch-up loops on restart)
+        // Persist last_run BEFORE execution to prevent catch-up on restart.
+        // On restart the runtime state is loaded from SQLite, so writing
+        // last_run here ensures a crash during execution won't cause the
+        // job to be considered due again immediately.
         state.last_run = Some(now.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-
-        execute_job(job, &mut state, backend, store, repo).await;
-
-        // Persist state to SQLite
         if let Some(s) = store {
             if let Err(e) = s.upsert_job_state(&state).await {
-                tracing::error!(job_id = job.id, ?e, "failed to persist job state");
+                tracing::error!(
+                    job_id = job.id,
+                    ?e,
+                    "failed to persist job state before execution"
+                );
+            }
+        }
+
+        // Execute the job (may mutate state.active_task_id / last_task_status).
+        execute_job(job, &mut state, backend, store, repo).await;
+
+        // Persist updated state (active_task_id, last_task_status) after execution.
+        if let Some(s) = store {
+            if let Err(e) = s.upsert_job_state(&state).await {
+                tracing::error!(
+                    job_id = job.id,
+                    ?e,
+                    "failed to persist job state after execution"
+                );
             }
         }
     }
