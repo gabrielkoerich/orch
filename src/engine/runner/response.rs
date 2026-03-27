@@ -462,9 +462,7 @@ fn infer_review_response_from_text(text: &str) -> Option<ReviewResponse> {
     let positive_approval = lower.contains("lgtm")
         || lower.contains("looks good")
         || lower.contains("all checks passed")
-        || lower.contains("checks passed")
         || lower.contains("all tests passed")
-        || lower.contains("tests passed")
         || lower.contains("no issues found")
         || (lower.contains("approved")
             && !lower.contains("not approved")
@@ -992,7 +990,15 @@ That's all."#;
     #[test]
     fn infer_review_response_checks_passed() {
         let resp =
-            parse_review_from_output("All CI checks passed (fmt ✓, clippy ✓, tests ✓).").unwrap();
+            parse_review_from_output("All checks passed (fmt ✓, clippy ✓, tests ✓).").unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn infer_review_response_all_tests_passed() {
+        let resp =
+            parse_review_from_output("All tests passed and the implementation looks correct.")
+                .unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
@@ -1001,5 +1007,19 @@ That's all."#;
         let resp =
             parse_review_from_output("Review complete. No issues found in the diff.").unwrap();
         assert_eq!(resp.decision, "approve");
+    }
+
+    /// Partial "tests passed" mid-sentence must NOT infer approval without "all" prefix.
+    #[test]
+    fn infer_review_response_partial_tests_passed_no_approve() {
+        let text = "The existing tests passed before this change but the new payment logic has a null-pointer risk on line 42.";
+        assert!(parse_review_from_output(text).is_err());
+    }
+
+    /// Partial "checks passed" mid-sentence must NOT infer approval without "all" prefix.
+    #[test]
+    fn infer_review_response_partial_checks_passed_no_approve() {
+        let text = "CI checks passed for the base branch but this PR adds a broken path.";
+        assert!(parse_review_from_output(text).is_err());
     }
 }
