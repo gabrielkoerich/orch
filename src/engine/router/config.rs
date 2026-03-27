@@ -45,6 +45,14 @@ pub struct RouterConfig {
     /// Fallback `agent:model` when all pool entries are cooled or fail.
     /// When empty, defaults to `router_agent:router_model`.
     pub fallback: String,
+    /// Penalty weight applied when the LLM routes a task to itself (the routing agent).
+    ///
+    /// Range: `0.0` (always redirect away from router agent) to `1.0` (no penalty, default).
+    /// When `< 1.0` and the LLM selects its own agent, the router probabilistically
+    /// redirects to another available agent, reducing self-routing bias.
+    ///
+    /// Example: `0.5` means ~50% of self-routed tasks are redirected to another agent.
+    pub self_routing_penalty: f64,
 }
 
 /// Parse an `agent:model` pool entry string, splitting on the first colon.
@@ -134,6 +142,7 @@ impl Default for RouterConfig {
             max_route_attempts: 3,
             pool: vec![],
             fallback: String::new(),
+            self_routing_penalty: 1.0,
             allowed_tools: vec![
                 "yq".to_string(),
                 "jq".to_string(),
@@ -265,6 +274,13 @@ impl RouterConfig {
         // Parse weighted_round_robin
         if let Ok(val) = crate::config::get("router.weighted_round_robin") {
             config.weighted_round_robin = val == "true" || val == "1";
+        }
+
+        // Parse self_routing_penalty
+        if let Ok(val) = crate::config::get("router.self_routing_penalty") {
+            if let Ok(penalty) = val.parse::<f64>() {
+                config.self_routing_penalty = penalty.clamp(0.0, 1.0);
+            }
         }
 
         // Parse pool: list of "agent:model" entries.
@@ -458,6 +474,30 @@ mod tests {
     fn cwd_mutex() -> &'static Mutex<()> {
         static CWD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
         CWD_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn default_self_routing_penalty_is_one() {
+        let config = RouterConfig::default();
+        assert_eq!(
+            config.self_routing_penalty, 1.0,
+            "default penalty must be 1.0 (no penalty = full self-routing allowed)"
+        );
+    }
+
+    #[test]
+    fn from_config_reads_self_routing_penalty() {
+        let _lock = cwd_mutex().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".orch.yml"),
+            "router:\n  self_routing_penalty: 0.5\n",
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::set(dir.path());
+
+        let config = RouterConfig::from_config();
+        assert_eq!(config.self_routing_penalty, 0.5);
     }
 
     #[test]
