@@ -89,14 +89,14 @@ Cross-agent transfer is feasible at the **conversation content level**:
 ### Practical Use Cases
 
 1. **Rate limit handoff:** Agent A hits rate limit → dump conversation summary → continue on Agent B
-   - Feasible via orch's existing sidecar + prompt injection. No session import needed — just inject the conversation history as context into the system prompt.
+   - Feasible via orch's existing SQLite task store + prompt injection. No session import needed — just inject the conversation history as context into the system prompt.
 
 2. **Strength-based handoff:** Claude for architecture → Codex for implementation
    - Best approach: use orch's worktree + git as the transfer medium. Agent A commits work + writes a handoff doc. Agent B reads the doc + git log and continues.
    - Session-level transfer adds little value here since the code is the primary artifact.
 
 3. **Review → fix handoff:** Review agent passes context to fix agent
-   - Already implemented in orch via `pr_review_context` field in sidecar. The fix agent reads the review comments and PR diff.
+   - Already implemented in orch via `pr_review_context` field in SQLite task store. The fix agent reads the review comments and PR diff.
 
 ## Recommended Approach
 
