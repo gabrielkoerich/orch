@@ -147,7 +147,11 @@ pub async fn handle_error(
             // the same model is not retried on every subsequent task.
             if *exit_code == 0 && message.is_empty() {
                 if let Some(m) = model_name {
-                    response::record_model_failure(agent_name, m);
+                    // Use a 4-hour cooldown for silent exits instead of the default 1-hour
+                    // model cooldown.  These models (especially github-copilot/* in opencode)
+                    // fail consistently across multiple hours; a 1-hour window means ~12
+                    // wasted 2-minute attempts per day per model.  4 hours cuts that to ~3.
+                    crate::engine::cooldown::set_model_cooldown(agent_name, m, 4 * 3600);
                 }
                 // Before falling through to handle_failover() (which tries claude/codex),
                 // check whether this agent has any free models that haven't been tried yet.
