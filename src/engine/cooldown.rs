@@ -370,9 +370,6 @@ mod tests {
             remaining <= SILENCE_AGENT_COOLDOWN_SECS as i64,
             "silence agent cooldown should be <= {SILENCE_AGENT_COOLDOWN_SECS}s, got {remaining}s"
         );
-        assert!(
-            remaining > 0,
-            "cooldown should still be active"
-        );
+        assert!(remaining > 0, "cooldown should still be active");
     }
 }
