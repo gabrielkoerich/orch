@@ -229,6 +229,27 @@ pub async fn resolve_main_repo(project_dir: &Path) -> PathBuf {
     project_dir.to_path_buf()
 }
 
+/// Resolve the starting point for creating a new local branch.
+///
+/// If `origin/<branch>` exists in the repository (e.g. cleanup kept the
+/// remote branch after deleting the local one), use it so the new worktree
+/// starts from the agent's committed work rather than the default branch tip.
+/// Falls back to `default_branch` when no remote tracking ref is found.
+async fn resolve_branch_start_point(repo_root: &str, branch: &str, default_branch: &str) -> String {
+    let origin_ref = format!("origin/{branch}");
+    let has_remote = Command::new("git")
+        .args(["-C", repo_root, "rev-parse", "--verify", &origin_ref])
+        .output_with_context()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if has_remote {
+        origin_ref
+    } else {
+        default_branch.to_string()
+    }
+}
+
 /// Check if a directory is a bare git repository.
 async fn is_bare_repo(dir: &Path) -> bool {
     let output = Command::new("git")
@@ -337,14 +358,23 @@ pub async fn setup_worktree(
                 .await;
         }
 
-        // Create local branch from default
+        // Create local branch. Prefer `origin/<branch>` when it already exists
+        // (recovery case: cleanup deleted local branch but kept the remote),
+        // so the new worktree starts from the agent's committed work instead
+        // of the default branch tip.
+        let start_point = resolve_branch_start_point(
+            &main_dir.to_string_lossy(),
+            &branch_name_str,
+            &default_branch,
+        )
+        .await;
         let _ = Command::new("git")
             .args([
                 "-C",
                 &main_dir.to_string_lossy(),
                 "branch",
                 &branch_name_str,
-                &default_branch,
+                &start_point,
             ])
             .output_with_context()
             .await;
@@ -399,7 +429,7 @@ pub async fn setup_worktree(
                     &main_dir.to_string_lossy(),
                     "branch",
                     &branch_name_str,
-                    &default_branch,
+                    &start_point,
                 ])
                 .output_with_context()
                 .await;
@@ -541,6 +571,127 @@ fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper: run a git command in `dir`, panicking on failure.
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {:?} failed to start: {e}", args));
+        if !out.status.success() {
+            panic!(
+                "git {:?} failed:\nstdout: {}\nstderr: {}",
+                args,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// When `origin/<branch>` exists, `resolve_branch_start_point` should
+    /// return `"origin/<branch>"` so that the worktree starts from the
+    /// already-committed work, not from the default branch tip.
+    #[tokio::test]
+    async fn resolve_branch_start_point_prefers_remote_over_default() {
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare"]);
+
+        // Set up a working clone to push branches to the remote.
+        let setup = tempfile::tempdir().unwrap();
+        git(
+            setup.path(),
+            &["clone", remote.path().to_str().unwrap(), "."],
+        );
+        git(setup.path(), &["config", "user.email", "t@t.com"]);
+        git(setup.path(), &["config", "user.name", "T"]);
+
+        // Initial commit on main.
+        std::fs::write(setup.path().join("README.md"), "main").unwrap();
+        git(setup.path(), &["add", "."]);
+        git(setup.path(), &["commit", "-m", "init"]);
+        git(setup.path(), &["push", "origin", "HEAD:main"]);
+
+        // Feature branch with a distinct commit.
+        git(
+            setup.path(),
+            &["checkout", "-b", "gh-issue-42-fix-login-bug"],
+        );
+        std::fs::write(setup.path().join("feature.txt"), "work").unwrap();
+        git(setup.path(), &["add", "."]);
+        git(setup.path(), &["commit", "-m", "feature work"]);
+        git(
+            setup.path(),
+            &["push", "origin", "gh-issue-42-fix-login-bug"],
+        );
+
+        // Local repo: clone + fetch, but NO local branch (simulates cleanup
+        // with keep_remote_branch=true where local branch was deleted).
+        let local = tempfile::tempdir().unwrap();
+        git(
+            local.path(),
+            &["clone", remote.path().to_str().unwrap(), "."],
+        );
+        git(local.path(), &["config", "user.email", "t@t.com"]);
+        git(local.path(), &["config", "user.name", "T"]);
+        git(local.path(), &["fetch", "--all"]);
+        // Confirm the local branch does NOT exist; only the remote tracking ref.
+        let has_local = std::process::Command::new("git")
+            .args([
+                "-C",
+                local.path().to_str().unwrap(),
+                "rev-parse",
+                "--verify",
+                "gh-issue-42-fix-login-bug",
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(!has_local, "local branch should not exist before the test");
+
+        let repo_root = local.path().to_str().unwrap();
+
+        // With remote branch present → should prefer origin/<branch>.
+        let start =
+            resolve_branch_start_point(repo_root, "gh-issue-42-fix-login-bug", "main").await;
+        assert_eq!(
+            start, "origin/gh-issue-42-fix-login-bug",
+            "should use remote branch as start point when origin/<branch> exists"
+        );
+    }
+
+    /// When `origin/<branch>` does NOT exist, `resolve_branch_start_point`
+    /// should fall back to the default branch.
+    #[tokio::test]
+    async fn resolve_branch_start_point_falls_back_to_default() {
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare"]);
+
+        let local = tempfile::tempdir().unwrap();
+        git(
+            local.path(),
+            &["clone", remote.path().to_str().unwrap(), "."],
+        );
+        git(local.path(), &["config", "user.email", "t@t.com"]);
+        git(local.path(), &["config", "user.name", "T"]);
+
+        // Commit something so origin/main exists.
+        std::fs::write(local.path().join("README.md"), "main").unwrap();
+        git(local.path(), &["add", "."]);
+        git(local.path(), &["commit", "-m", "init"]);
+        git(local.path(), &["push", "origin", "HEAD:main"]);
+        git(local.path(), &["fetch", "--all"]);
+
+        let repo_root = local.path().to_str().unwrap();
+
+        // Branch "no-such-branch" has never been pushed → should fall back.
+        let start = resolve_branch_start_point(repo_root, "no-such-branch", "main").await;
+        assert_eq!(
+            start, "main",
+            "should fall back to default_branch when remote does not exist"
+        );
+    }
 
     #[test]
     fn branch_name_basic() {
