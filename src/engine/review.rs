@@ -187,7 +187,11 @@ async fn ensure_pr_exists(
 
                 // Run a credentialed push and log any errors so failures are
                 // visible in logs instead of being silently discarded.
-                match tokio::process::Command::new("git").args(&push_args).output().await {
+                match tokio::process::Command::new("git")
+                    .args(&push_args)
+                    .output()
+                    .await
+                {
                     Ok(o) => {
                         if !o.status.success() {
                             tracing::warn!(
