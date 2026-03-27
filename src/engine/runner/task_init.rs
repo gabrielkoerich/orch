@@ -189,7 +189,11 @@ pub async fn prepare_task(
     let output_file = attempt_dir.join("output.json");
 
     // Build sandbox disallowed tools
-    let mut disallowed_tools = vec!["Bash(rm *)".to_string(), "Bash(rm -*)".to_string()];
+    let mut disallowed_tools = vec![
+        "Bash(rm *)".to_string(),
+        "Bash(rm -*)".to_string(),
+        "Bash(git push*)".to_string(),
+    ];
 
     // Sandbox: block access to main project dir
     if wt.work_dir != wt.main_project_dir {
