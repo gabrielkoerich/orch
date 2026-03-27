@@ -105,6 +105,118 @@ async fn stuck_task_timing(
     })
 }
 
+/// Phase 1b of tick: detect agents that have produced no output since session start
+/// and have exceeded the silence grace period.
+///
+/// Only triggers on complete silence (agent never produced any output). Agents that
+/// produced output then went quiet (e.g. long tool calls) are NOT affected.
+///
+/// On silence: kills the tmux session, applies model-level cooldown, resets the task
+/// to `New` so the router picks a different agent/model.
+pub(crate) async fn tick_detect_silent_agents(
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    capture: &Arc<CaptureService>,
+    backend: &Arc<dyn ExternalBackend>,
+    task_manager: &Arc<TaskManager>,
+    config: &EngineConfig,
+    store: &Arc<TaskStore>,
+) -> anyhow::Result<()> {
+    let _span = tracing::info_span!("engine.tick.phase1b.silence").entered();
+    let grace = std::time::Duration::from_secs(config.silence_grace_period);
+    let silent_sessions = capture.get_silent_sessions(grace).await;
+
+    for (task_id, session_name) in silent_sessions {
+        // Look up agent + model from the store so we can cooldown the right model.
+        let store_task = match store.resolve_task_id(repo, &task_id).await {
+            Ok(Some(store_id)) => store.get(store_id).await.ok(),
+            _ => None,
+        };
+        let agent_name = store_task
+            .as_ref()
+            .and_then(|t| t.agent.clone())
+            .unwrap_or_default();
+        let model_name = store_task
+            .as_ref()
+            .and_then(|t| t.model.clone())
+            .unwrap_or_default();
+
+        tracing::warn!(
+            task_id,
+            agent = %agent_name,
+            model = %model_name,
+            grace_secs = config.silence_grace_period,
+            cooldown_secs = config.silence_cooldown,
+            "agent silent since session start — killing session, cooling down model, re-routing"
+        );
+
+        // 1. Kill the tmux session
+        if let Err(e) = tmux.kill_session(&session_name).await {
+            tracing::debug!(
+                task_id,
+                ?e,
+                "kill_session failed for silent agent (may already be gone)"
+            );
+        }
+
+        // 2. Unregister from capture
+        capture.unregister_session(&task_id).await;
+
+        // 3. Cooldown the specific model (not the whole agent)
+        if !agent_name.is_empty() && !model_name.is_empty() {
+            crate::engine::cooldown::set_model_cooldown(
+                &agent_name,
+                &model_name,
+                config.silence_cooldown,
+            );
+        }
+
+        // 4. Clear routing state and reset to New for re-routing
+        let task_eid = ExternalId(task_id.clone());
+        if let Some(ref st) = store_task {
+            for label in &st.labels {
+                if label.starts_with("agent:") || label.starts_with("complexity:") {
+                    backend.remove_label(&task_eid, label).await.ok();
+                }
+            }
+        }
+        store::store_set(
+            &Some(Arc::clone(store)),
+            repo,
+            &task_id,
+            &[
+                ("agent", serde_json::Value::Null),
+                ("model", serde_json::Value::Null),
+                ("route_attempts", serde_json::json!(0)),
+            ],
+        )
+        .await;
+        if let Err(e) = task_manager
+            .update_task_status(&task_eid, Status::New)
+            .await
+        {
+            tracing::warn!(task_id, ?e, "failed to reset silent task status");
+            continue;
+        }
+
+        // 5. Post a comment explaining what happened
+        let comment = format!(
+            "[{}] agent silent for {}s since session start — killed session, cooled down model `{}:{}` for {}s, re-routing task{}",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            config.silence_grace_period,
+            agent_name,
+            model_name,
+            config.silence_cooldown,
+            crate::engine::orch_footer(),
+        );
+        if let Err(e) = backend.post_comment(&task_eid, &comment).await {
+            tracing::warn!(task_id, ?e, "failed to post silence detection comment");
+        }
+    }
+
+    Ok(())
+}
+
 /// Phase 2 of tick: detect tasks stuck in_progress or in_review without an active tmux session and reset them.
 /// - `in_progress` tasks → reset to `New` (clears routing state so the LLM router re-routes)
 /// - `in_review` tasks   → reset to `NeedsReview` (keeps routing state; review agent re-triggers)
@@ -860,6 +972,7 @@ pub(crate) async fn tick(
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
     tick_check_session_completions(tmux, repo, capture).await?;
+    tick_detect_silent_agents(tmux, repo, capture, backend, task_manager, config, store).await?;
     tick_recover_stuck_tasks(backend, tmux, repo, task_manager, config, store).await?;
     tick_route_tasks(backend, task_manager, router, store, repo).await?;
     tick_dispatch_tasks(

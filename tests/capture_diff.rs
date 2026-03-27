@@ -23,6 +23,10 @@ mod channels {
         pub struct Transport;
 
         impl Transport {
+            pub fn new() -> Self {
+                Self
+            }
+
             pub async fn get_session_output(&self, _task_id: &str) -> Option<String> {
                 None
             }
@@ -47,6 +51,8 @@ fn buffer() -> OutputBuffer {
         last_hash: None,
         last_capture: chrono::Utc::now(),
         seen_alive: false,
+        registered_at: chrono::Utc::now(),
+        has_output: false,
     }
 }
 
