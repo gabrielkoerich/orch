@@ -537,10 +537,6 @@ pub(crate) async fn tick_dispatch_tasks(
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
         .collect();
 
-    if !dispatchable.is_empty() {
-        tracing::info!(count = dispatchable.len(), "dispatchable tasks found");
-    }
-
     for task in dispatchable {
         // In-memory guard: prevents double-dispatch due to GitHub API eventual consistency.
         // After update_status(InProgress), the label removal fires a webhook that can
@@ -559,6 +555,7 @@ pub(crate) async fn tick_dispatch_tasks(
                 continue;
             }
         }
+        tracing::info!(task_id = task.id.0, "dispatching task");
         // RAII guard — removes dispatch_key on drop even if the spawned task panics.
         let dispatch_guard = DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
 
