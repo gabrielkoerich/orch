@@ -42,6 +42,66 @@ pub fn normalize_dow(expression: &str) -> String {
     )
 }
 
+/// Expand cron alias strings (like `@hourly`, `@daily 9:30`) into standard
+/// 5-field cron expressions.  Unrecognized strings are returned unchanged.
+///
+/// | Alias      | Parameter     | Example        | Expands to      |
+/// |------------|---------------|----------------|-----------------|
+/// | `@hourly`  | minute 0-59   | `@hourly 30`   | `30 * * * *`    |
+/// | `@hourly`  | none          | `@hourly`      | `0 * * * *`     |
+/// | `@daily`   | hour          | `@daily 9`     | `0 9 * * *`     |
+/// | `@daily`   | hour:min      | `@daily 9:30`  | `30 9 * * *`    |
+/// | `@daily`   | none          | `@daily`       | `0 0 * * *`     |
+/// | `@weekly`  | day (0=Sun)   | `@weekly 1`    | `0 0 * * 1`     |
+/// | `@weekly`  | none          | `@weekly`      | `0 0 * * 0`     |
+/// | `@monthly` | day-of-month  | `@monthly 15`  | `0 0 15 * *`    |
+/// | `@monthly` | none          | `@monthly`     | `0 0 1 * *`     |
+/// | `@yearly`  | month-day     | `@yearly 3-15` | `0 0 15 3 *`    |
+/// | `@yearly`  | none          | `@yearly`      | `0 0 1 1 *`     |
+pub fn expand_alias(s: &str) -> String {
+    let s = s.trim();
+    let (alias, param) = match s.split_once(char::is_whitespace) {
+        Some((a, p)) => (a, p.trim()),
+        None => (s, ""),
+    };
+    match alias {
+        "@hourly" => {
+            let min: u8 = param.parse().unwrap_or(0);
+            format!("{min} * * * *")
+        }
+        "@daily" => {
+            if param.contains(':') {
+                let (h, m) = param.split_once(':').unwrap();
+                let hour: u8 = h.parse().unwrap_or(0);
+                let min: u8 = m.parse().unwrap_or(0);
+                format!("{min} {hour} * * *")
+            } else {
+                let hour: u8 = param.parse().unwrap_or(0);
+                format!("0 {hour} * * *")
+            }
+        }
+        "@weekly" => {
+            let day: u8 = param.parse().unwrap_or(0);
+            format!("0 0 * * {day}")
+        }
+        "@monthly" => {
+            let dom: u8 = param.parse().unwrap_or(1);
+            format!("0 0 {dom} * *")
+        }
+        "@yearly" => {
+            if param.contains('-') {
+                let (m, d) = param.split_once('-').unwrap();
+                let month: u8 = m.parse().unwrap_or(1);
+                let dom: u8 = d.parse().unwrap_or(1);
+                format!("0 0 {dom} {month} *")
+            } else {
+                "0 0 1 1 *".to_string()
+            }
+        }
+        _ => s.to_string(),
+    }
+}
+
 /// Check if a cron expression matches now, or (with `since`) has matched
 /// at any point between `since` and now.
 ///
@@ -52,7 +112,8 @@ pub fn check(expression: &str, since: Option<&str>) -> anyhow::Result<bool> {
     //
     // The cron crate uses 1-7 for DOW (Sun=1..Sat=7), but standard cron uses
     // 0-7 where both 0 and 7 mean Sunday. Normalize DOW=0 → DOW=7.
-    let normalized = normalize_dow(expression);
+    let expanded = expand_alias(expression);
+    let normalized = normalize_dow(&expanded);
     let full_expr = format!("0 {normalized} *");
 
     let schedule = Schedule::from_str(&full_expr)
@@ -255,6 +316,96 @@ mod tests {
             .take(14)
             .any(|dt| dt.weekday() == chrono::Weekday::Sun);
         assert!(has_sunday, "Schedule '0 9 * * 0-5' must fire on Sunday");
+    }
+
+    // --- expand_alias tests ---
+
+    #[test]
+    fn expand_alias_hourly_no_param() {
+        assert_eq!(expand_alias("@hourly"), "0 * * * *");
+    }
+
+    #[test]
+    fn expand_alias_hourly_with_minute() {
+        assert_eq!(expand_alias("@hourly 30"), "30 * * * *");
+    }
+
+    #[test]
+    fn expand_alias_daily_no_param() {
+        assert_eq!(expand_alias("@daily"), "0 0 * * *");
+    }
+
+    #[test]
+    fn expand_alias_daily_with_hour() {
+        assert_eq!(expand_alias("@daily 9"), "0 9 * * *");
+    }
+
+    #[test]
+    fn expand_alias_daily_with_hour_and_minute() {
+        assert_eq!(expand_alias("@daily 9:30"), "30 9 * * *");
+    }
+
+    #[test]
+    fn expand_alias_weekly_no_param() {
+        assert_eq!(expand_alias("@weekly"), "0 0 * * 0");
+    }
+
+    #[test]
+    fn expand_alias_weekly_with_day() {
+        assert_eq!(expand_alias("@weekly 1"), "0 0 * * 1");
+    }
+
+    #[test]
+    fn expand_alias_monthly_no_param() {
+        assert_eq!(expand_alias("@monthly"), "0 0 1 * *");
+    }
+
+    #[test]
+    fn expand_alias_monthly_with_day() {
+        assert_eq!(expand_alias("@monthly 15"), "0 0 15 * *");
+    }
+
+    #[test]
+    fn expand_alias_yearly_no_param() {
+        assert_eq!(expand_alias("@yearly"), "0 0 1 1 *");
+    }
+
+    #[test]
+    fn expand_alias_yearly_with_month_day() {
+        assert_eq!(expand_alias("@yearly 3-15"), "0 0 15 3 *");
+    }
+
+    #[test]
+    fn expand_alias_passthrough_regular_cron() {
+        assert_eq!(expand_alias("30 9 * * 1"), "30 9 * * 1");
+    }
+
+    #[test]
+    fn expand_alias_unknown_at_prefix_passthrough() {
+        assert_eq!(expand_alias("@unknown"), "@unknown");
+    }
+
+    #[test]
+    fn expand_alias_check_integration_daily_9_30() {
+        // @daily 9:30 should produce a valid parseable cron expression
+        let expanded = expand_alias("@daily 9:30");
+        let normalized = normalize_dow(&expanded);
+        let full = format!("0 {normalized} *");
+        assert!(
+            Schedule::from_str(&full).is_ok(),
+            "expanded '@daily 9:30' → '{expanded}' should parse"
+        );
+    }
+
+    #[test]
+    fn expand_alias_check_integration_weekly_monday() {
+        let expanded = expand_alias("@weekly 1");
+        let normalized = normalize_dow(&expanded);
+        let full = format!("0 {normalized} *");
+        assert!(
+            Schedule::from_str(&full).is_ok(),
+            "expanded '@weekly 1' → '{expanded}' should parse"
+        );
     }
 
     #[test]
