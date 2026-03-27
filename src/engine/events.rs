@@ -250,7 +250,13 @@ pub fn cleanup_version_file() {
 }
 
 fn ws_port_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(crate::home::state_dir()?.join("ws.port"))
+    if cfg!(test) {
+        let dir = std::env::temp_dir().join("orch-test-state");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir.join("ws.port"))
+    } else {
+        Ok(crate::home::state_dir()?.join("ws.port"))
+    }
 }
 
 #[cfg(test)]
