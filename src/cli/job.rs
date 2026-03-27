@@ -262,7 +262,11 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
     state.last_run = Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
     if let Some(ref s) = store {
         if let Err(e) = s.upsert_job_state(&state).await {
-            tracing::error!(job_id = job_id, ?e, "failed to persist job state before execution");
+            tracing::error!(
+                job_id = job_id,
+                ?e,
+                "failed to persist job state before execution",
+            );
         }
     }
 
