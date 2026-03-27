@@ -240,14 +240,16 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
         tracing::debug!(raw = date_str, "could not parse retry-at date");
     }
 
-    // "billing cycle" / "next cycle" / "quota" without a specific date → cooldown 5 hours
+    // "billing cycle" / "next cycle" / "quota" without a specific date → cooldown 24 hours.
+    // Billing cycles are typically daily/weekly/monthly so a 5-hour cooldown was too short:
+    // the model would be retried multiple times per day, wasting ~2 min per attempt.
     if lower.contains("billing cycle")
         || lower.contains("next cycle")
         || lower.contains("quota will be refreshed")
     {
-        let five_hours = chrono::Utc::now().timestamp() + 5 * 60 * 60;
-        tracing::info!("detected billing cycle limit — cooldown for 5 hours");
-        return Some(five_hours);
+        let twenty_four_hours = chrono::Utc::now().timestamp() + 24 * 60 * 60;
+        tracing::info!("detected billing cycle limit — cooldown for 24 hours");
+        return Some(twenty_four_hours);
     }
 
     None
@@ -343,6 +345,20 @@ mod tests {
     fn parse_retry_at_no_date() {
         assert!(parse_retry_at("generic rate limit error").is_none());
         assert!(parse_retry_at("").is_none());
+    }
+
+    #[test]
+    fn parse_retry_at_billing_cycle_sets_24h_cooldown() {
+        let msg = "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle. Upgrade to get more.";
+        let ts = parse_retry_at(msg);
+        assert!(ts.is_some(), "billing cycle message should set a cooldown");
+        let now = chrono::Utc::now().timestamp();
+        let remaining = ts.unwrap() - now;
+        // Should be ~24 hours (86400s), allow ±5s for test execution time
+        assert!(
+            remaining > 86395 && remaining <= 86400,
+            "billing cycle cooldown should be ~24 hours, got {remaining}s"
+        );
     }
 
     #[test]
