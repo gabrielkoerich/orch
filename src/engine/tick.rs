@@ -537,10 +537,6 @@ pub(crate) async fn tick_dispatch_tasks(
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
         .collect();
 
-    if !dispatchable.is_empty() {
-        tracing::info!(count = dispatchable.len(), "dispatchable tasks found");
-    }
-
     for task in dispatchable {
         // In-memory guard: prevents double-dispatch due to GitHub API eventual consistency.
         // After update_status(InProgress), the label removal fires a webhook that can
@@ -587,6 +583,7 @@ pub(crate) async fn tick_dispatch_tasks(
             drop(permit);
             continue; // dispatch_guard drops here, removing the key
         }
+        tracing::info!(task_id, "dispatching task");
 
         // Register session for capture
         let session_name = tmux.session_name(repo, &task_id);
@@ -610,10 +607,6 @@ pub(crate) async fn tick_dispatch_tasks(
         let repo_ctx = repo_owned.clone();
         tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {
             let _dispatch_guard = dispatch_guard; // released on drop (normal or panic)
-            // Note: Using tracing::info_span directly without holding across await
-            // to avoid Send issues with EnteredSpan
-            tracing::info!(task_id, "dispatching task");
-
             let dispatch_start = std::time::Instant::now();
             match runner
                 .run_with_context(&task_owned, &backend, &tmux, route_result.as_ref())
