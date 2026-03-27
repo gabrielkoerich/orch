@@ -1146,6 +1146,20 @@ impl GhHttp {
         .await
     }
 
+    /// Get the committer timestamp for a specific commit SHA.
+    ///
+    /// Returns an ISO-8601 string, e.g. `"2024-01-15T12:00:00Z"`.
+    /// Used to determine whether the branch has been updated since a review was submitted.
+    pub async fn get_commit_timestamp(&self, repo: &str, sha: &str) -> anyhow::Result<String> {
+        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}");
+        let value: serde_json::Value = self.get_json(&url).await?;
+        value
+            .pointer("/commit/committer/date")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("commit {sha} has no committer date"))
+    }
+
     /// Update the body of a pull request.
     pub async fn update_pr_body(
         &self,
