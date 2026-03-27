@@ -370,6 +370,17 @@ orch version                                # 5. verify
 
 Do not skip steps — the service runs from the Homebrew cellar, not the repo.
 
+## Graceful Shutdown
+
+On SIGTERM (e.g. `orch service restart` or `brew services restart orch`), the engine:
+
+1. Resets all `in_progress` tasks → `routed` so they re-dispatch into existing worktrees on next start
+2. Resets all `in_review` tasks → `needs_review` so review agents are re-spawned on next start (review agent tmux sessions are killed when the process exits)
+3. Kills all `orch-*` tmux sessions to release resources
+4. Waits up to `engine.graceful_shutdown_timeout` seconds (default: 600) for in-flight work to settle
+
+No work is lost — tasks resume from their worktrees on restart.
+
 ## Task status semantics
 
 - **`blocked`** — waiting on a dependency (parent blocked on children, missing worktree/dir)

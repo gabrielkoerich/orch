@@ -4,14 +4,14 @@ description = "Automated PR reviews using a different agent"
 weight = 10
 +++
 
-The review agent automatically reviews pull requests after an agent completes a task. It picks a different agent from the one that wrote the code (e.g. if codex wrote the code, claude reviews it), and posts a real GitHub PR review.
+The review agent automatically reviews pull requests after an agent completes a task. It picks a different agent from the one that wrote the code (and from any agents that previously reviewed the same task), and posts a real GitHub PR review.
 
 ## How It Works
 
 1. Agent completes a task and returns `status: done`
 2. Orchestrator detects an open PR on the task's branch → sets status to `in_review`
 3. If `enable_review_agent` is `true`, the review agent runs:
-   - Picks the **opposite agent** (first available agent different from the executor). The review agent excludes the original task's executor from selection to avoid self-review.
+   - Picks a reviewer via round-robin, excluding the task executor and all agents that have previously reviewed this task.
    - Fetches the PR diff via `gh pr diff`
    - Sends the diff, task summary, and files changed to the review agent
    - Parses the review decision
@@ -25,16 +25,16 @@ The review agent automatically reviews pull requests after an agent completes a 
 
 ## Agent Selection
 
-The `opposite_agent()` function picks the reviewer:
+The review agent is chosen via round-robin, excluding the task executor and all agents that have previously reviewed this task:
 
-1. Iterates available agents (not disabled, installed on the system)
-2. Returns the first agent that differs from the task's executor
+1. Build an exclude list: the task's executor + all agents that have previously run as reviewer on this task
+2. Pick the next available agent (not disabled, installed on the system) not in the exclude list
 3. Falls back to `workflow.review_agent` config if no different agent is available
-4. Last resort: uses the same agent
+4. Last resort: uses the same agent as the executor
 
 Examples:
-- codex wrote the code → claude reviews
-- claude wrote the code → codex reviews
+- codex wrote the code → claude reviews (first cycle); if claude fails, kimi reviews (second cycle)
+- claude wrote the code → codex reviews (first cycle)
 - Only one agent installed → that agent reviews (same as executor)
 
 Override the reviewer for a specific run:

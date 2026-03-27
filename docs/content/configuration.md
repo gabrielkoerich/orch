@@ -12,6 +12,10 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 |---------|-----|-------------|---------|
 | top-level | `project_dir` | Override project directory (auto-detected from CWD) | `""` |
 | top-level | `required_tools` | Tools that must exist on PATH before launching an agent | `[]` |
+| `engine` | `tick_interval` | Main engine tick interval in seconds | `10` |
+| `engine` | `sync_interval` | Sync tick interval in seconds (GitHub ingest, cleanup) | `45` |
+| `engine` | `max_parallel` | Max tasks dispatched concurrently | `4` |
+| `engine` | `graceful_shutdown_timeout` | Seconds to wait for in-flight tasks on SIGTERM | `600` |
 | `workflow` | `auto_close` | Auto-close GitHub issues when tasks are `done` | `true` |
 | `workflow` | `review_owner` | GitHub handle to tag when review is needed | `@owner` |
 | `workflow` | `enable_review_agent` | Run a [review agent](@/review-agent.md) after task completion | `false` |
