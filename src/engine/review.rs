@@ -184,17 +184,30 @@ async fn ensure_pr_exists(
                     "origin".to_string(),
                     branch_name.to_string(),
                 ]);
-                let push_result = tokio::process::Command::new("git")
-                    .args(&push_args)
-                    .output()
-                    .await;
-                if let Ok(o) = push_result {
-                    if !o.status.success() {
-                        tracing::warn!(
+
+                // Run a credentialed push and log any errors so failures are
+                // visible in logs instead of being silently discarded.
+                match tokio::process::Command::new("git").args(&push_args).output().await {
+                    Ok(o) => {
+                        if !o.status.success() {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                branch = %branch_name,
+                                exit_code = ?o.status.code(),
+                                stdout = %String::from_utf8_lossy(&o.stdout),
+                                stderr = %String::from_utf8_lossy(&o.stderr),
+                                "review gate fallback push failed"
+                            );
+                        } else {
+                            tracing::info!(task_id = task.id.0, branch = %branch_name, "review gate fallback push succeeded");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
                             task_id = task.id.0,
                             branch = %branch_name,
-                            stderr = %String::from_utf8_lossy(&o.stderr),
-                            "review gate fallback push failed"
+                            error = %e,
+                            "review gate fallback push command failed to run"
                         );
                     }
                 }
