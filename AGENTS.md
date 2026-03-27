@@ -383,8 +383,13 @@ No work is lost — tasks resume from their worktrees on restart.
 
 ## Task status semantics
 
-- **`blocked`** — waiting on a dependency (parent blocked on children, missing worktree/dir)
-- **`needs_review`** — requires human attention (max attempts, review rejection, agent failures, retry loops, timeouts)
+- **`new`** — just created, awaiting routing
+- **`routed`** — agent and model selected, awaiting dispatch
+- **`in_progress`** — agent is working on the task in a tmux session
+- **`needs_review`** — agent completed, awaiting review agent dispatch (automatic, not human)
+- **`in_review`** — review agent is actively reviewing the PR
+- **`done`** — PR merged, worktree cleaned up
+- **`blocked`** — requires human attention (max review cycles, max attempts, agent failures, unrecoverable errors)
 - `mark_needs_review()` sets `needs_review`, NOT `blocked`
 - Only parent tasks waiting on children should be `blocked`
 - Engine auto-unblocks parent tasks when all children are done (Phase 4 of tick)
