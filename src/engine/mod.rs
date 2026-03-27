@@ -378,12 +378,13 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                     {
                         tracing::warn!(repo = %engine.repo, task_id = %task_id, err = %e, "startup rebase failed, resetting task");
                         abort_worktree_rebase(&worktree_dir).await;
+                        let keep_remote = task.pr_number.is_some();
                         remove_worktree_and_branch(
                             &task_id,
                             &worktree_dir,
                             Some(branch_name),
                             &repo_root_path,
-                            false,
+                            keep_remote,
                         )
                         .await;
                         if let Ok(Some(reset_id)) =
