@@ -1,5 +1,6 @@
 mod backends;
 mod channels;
+mod chat_session;
 mod cli;
 mod cmd;
 mod cmd_cache;
