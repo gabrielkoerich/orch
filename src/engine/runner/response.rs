@@ -464,10 +464,11 @@ fn infer_review_response_from_text(text: &str) -> Option<ReviewResponse> {
         || lower.contains("all checks passed")
         || lower.contains("all tests passed")
         || lower.contains("no issues found")
-        // "decision is `approve`" or "decision: approve" — LLMs often echo the JSON field value
+        // "decision is `approve`" or "decision: `approve`" — LLMs often echo the JSON field value
+        || lower.contains("decision is `approve`")
+        || lower.contains("decision: `approve`")
         || lower.contains("decision is approve")
         || lower.contains("decision: approve")
-        || lower.contains("`approve`")
         || (lower.contains("approved")
             && !lower.contains("not approved")
             && !lower.contains("unapproved")
@@ -1041,5 +1042,16 @@ That's all."#;
         let text = "Reviewed the PR. No blocking issues found. Decision: approve";
         let resp = parse_review_from_output(text).unwrap();
         assert_eq!(resp.decision, "approve");
+    }
+
+    /// Bare backtick `approve` in a negative context must NOT infer approval.
+    /// e.g. "do not `approve`" previously matched the removed `lower.contains("`approve`")` check.
+    #[test]
+    fn infer_review_response_negation_do_not_approve_backtick() {
+        let text = "There are unresolved issues — do not `approve` this PR until they are fixed.";
+        assert!(
+            parse_review_from_output(text).is_err(),
+            "negative context with backtick approve must not infer approval"
+        );
     }
 }
