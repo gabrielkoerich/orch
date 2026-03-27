@@ -15,7 +15,6 @@ use crate::config;
 use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::store;
-use crate::store::review_session_expected;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
@@ -175,18 +174,17 @@ pub(crate) async fn sync_tick(
                 }
             }
 
-            if !review_session_expected(store, repo, &task.id.0).await {
-                tracing::debug!(
-                    task_id = task.id.0,
-                    "InReview task is waiting on PR review, skipping stale review-session recovery"
-                );
+            let review_task_id = format!("{}-review", task.id.0);
+            let review_session = tmux.session_name(repo, &review_task_id);
+            if tmux.session_exists(&review_session).await {
+                // Review agent is still alive — skip.
                 continue;
             }
 
-            let review_task_id = format!("{}-review", task.id.0);
-            let review_session = tmux.session_name(repo, &review_task_id);
-            let has_session = tmux.session_exists(&review_session).await;
-            if !has_session {
+            // No review session exists. The review agent is dead regardless of
+            // review_session_expected — hard restart, crash, or flag not persisted.
+            // Reset to NeedsReview so the subscriber re-dispatches.
+            {
                 tracing::warn!(
                     task_id = task.id.0,
                     session = %review_session,
@@ -1067,8 +1065,10 @@ mod tests {
         );
     }
 
+    /// An InReview task with no tmux session should be reset to NeedsReview
+    /// regardless of review_session_expected — the review agent is dead.
     #[tokio::test]
-    async fn stale_in_review_recovery_skips_tasks_waiting_for_human_review() {
+    async fn stale_in_review_recovery_resets_orphaned_task_without_session() {
         let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
@@ -1085,7 +1085,7 @@ mod tests {
             .upsert_external(&crate::store::UpsertExternal {
                 repo: "owner/repo",
                 ext_id: "55",
-                title: "Waiting for human review",
+                title: "Orphaned review",
                 body: "",
                 author: "",
                 url: "",
@@ -1102,6 +1102,7 @@ mod tests {
             .set_fields(id, &[("branch", serde_json::json!("feature/55"))])
             .await
             .unwrap();
+        // Make it old enough to be considered stale (>2 min)
         sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
             .bind(id)
             .execute(store.pool())
@@ -1121,6 +1122,64 @@ mod tests {
         .await
         .unwrap();
 
+        // Should be reset to NeedsReview since no tmux session exists
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
+    }
+
+    /// A fresh InReview task (<1 min old) should NOT be reset — the review
+    /// agent may still be starting up.
+    #[tokio::test]
+    async fn stale_in_review_recovery_skips_fresh_tasks() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "66",
+                title: "Fresh review",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        store
+            .set_fields(id, &[("branch", serde_json::json!("feature/66"))])
+            .await
+            .unwrap();
+        // Don't backdate — task is fresh (just created)
+
+        sync_tick(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &EngineConfig::default(),
+            &router,
+            &task_manager,
+            &store,
+            &dispatching,
+        )
+        .await
+        .unwrap();
+
+        // Should stay InReview — too young to be considered orphaned
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, crate::store::TaskStatus::InReview);
     }
