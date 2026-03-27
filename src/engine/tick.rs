@@ -147,7 +147,7 @@ pub(crate) async fn tick_detect_silent_agents(
             model = %model_name,
             grace_secs = config.silence_grace_period,
             cooldown_secs = config.silence_cooldown,
-            "agent silent since session start — killing session, cooling down model, re-routing"
+            "agent silent since session start — killing session, cooling down model + agent, re-routing"
         );
 
         // 1. Kill the tmux session
@@ -168,6 +168,16 @@ pub(crate) async fn tick_detect_silent_agents(
                 &agent_name,
                 &model_name,
                 config.silence_cooldown,
+            );
+        }
+
+        // 3b. Short agent-level cooldown to force router to pick a different agent.
+        // Without this, the router picks the same agent with a different model,
+        // looping through all models (~2 min each) before the long agent cooldown kicks in.
+        if !agent_name.is_empty() {
+            crate::engine::cooldown::set_agent_cooldown(
+                &agent_name,
+                crate::engine::cooldown::SILENCE_AGENT_COOLDOWN_SECS,
             );
         }
 
@@ -201,12 +211,14 @@ pub(crate) async fn tick_detect_silent_agents(
 
         // 5. Post a comment explaining what happened
         let comment = format!(
-            "[{}] agent silent for {}s since session start — killed session, cooled down model `{}:{}` for {}s, re-routing task{}",
+            "[{}] agent silent for {}s since session start — killed session, cooled down model `{}:{}` for {}s, agent `{}` for {}s, re-routing task{}",
             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
             config.silence_grace_period,
             agent_name,
             model_name,
             config.silence_cooldown,
+            agent_name,
+            crate::engine::cooldown::SILENCE_AGENT_COOLDOWN_SECS,
             crate::engine::orch_footer(),
         );
         if let Err(e) = backend.post_comment(&task_eid, &comment).await {

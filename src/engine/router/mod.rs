@@ -463,6 +463,21 @@ impl Router {
         task: &ExternalTask,
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
+        // Filter out cooled agents so the LLM only sees available ones.
+        // Fall back to the full list if all agents are cooled.
+        // Cloned to avoid borrow conflict with &mut self in the loop.
+        let uncooled_agents: Vec<String> = self
+            .available_agents
+            .iter()
+            .filter(|a| !crate::engine::cooldown::is_agent_in_cooldown(a))
+            .cloned()
+            .collect();
+        let llm_agents: Vec<String> = if uncooled_agents.is_empty() {
+            self.available_agents.clone()
+        } else {
+            uncooled_agents
+        };
+
         let pool = self.router_pool.clone();
         let n = pool.len();
         let start = self.pool_index;
@@ -489,7 +504,7 @@ impl Router {
                 .llm_router
                 .route_with_llm_using(
                     task,
-                    &self.available_agents,
+                    &llm_agents,
                     &self.config,
                     &mut self.last_agent,
                     repo,
@@ -548,7 +563,7 @@ impl Router {
                 .llm_router
                 .route_with_llm_using(
                     task,
-                    &self.available_agents,
+                    &llm_agents,
                     &self.config,
                     &mut self.last_agent,
                     repo,

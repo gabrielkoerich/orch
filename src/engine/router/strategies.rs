@@ -99,12 +99,30 @@ pub(super) fn route_via_round_robin_stateful(
     }
 
     let mut agent_idx = *rr_index % agents.len();
-    if agents.len() > 1 {
-        if let Some(ref last) = last_agent {
-            if agents.get(agent_idx).map(|a| a.as_str()) == Some(last.as_str()) {
-                agent_idx = (agent_idx + 1) % agents.len();
+
+    // Skip cooled agents (e.g. from silence detection short cooldown)
+    let mut found = false;
+    for offset in 0..agents.len() {
+        let idx = (agent_idx + offset) % agents.len();
+        let candidate = &agents[idx];
+        if crate::engine::cooldown::is_agent_in_cooldown(candidate) {
+            continue;
+        }
+        // Also skip last-used agent when possible
+        if agents.len() > 1 {
+            if let Some(ref last) = last_agent {
+                if candidate == last && offset + 1 < agents.len() {
+                    continue;
+                }
             }
         }
+        agent_idx = idx;
+        found = true;
+        break;
+    }
+    // If all agents are cooled, fall back to the original index
+    if !found {
+        agent_idx = *rr_index % agents.len();
     }
 
     let agent = agents[agent_idx].clone();
@@ -152,9 +170,21 @@ pub(super) fn route_via_weighted_round_robin(
         anyhow::bail!("no agent CLIs found in PATH");
     }
 
+    // Filter out cooled agents (e.g. from silence detection short cooldown)
+    let uncooled: Vec<String> = agents
+        .iter()
+        .filter(|a| !crate::engine::cooldown::is_agent_in_cooldown(a))
+        .cloned()
+        .collect();
+    let candidates = if uncooled.is_empty() {
+        agents
+    } else {
+        &uncooled
+    };
+
     let agent = weights
-        .weighted_select(agents, &task.id.0)
-        .unwrap_or_else(|| agents[0].clone());
+        .weighted_select(candidates, &task.id.0)
+        .unwrap_or_else(|| candidates[0].clone());
 
     let weight = weights.get_weight(&agent);
     let complexity = extract_complexity_from_labels(&task.labels);
