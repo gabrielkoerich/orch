@@ -22,6 +22,13 @@ pub const AGENT_COOLDOWN_SECS: i64 = 30 * 60;
 /// Default cooldown duration for model-specific failures (1 hour).
 pub const MODEL_COOLDOWN_SECS: i64 = 60 * 60;
 
+/// Short agent cooldown applied on silence detection (120 seconds).
+///
+/// Forces the router to pick a different agent immediately on re-route,
+/// without long-term blocking. The model cooldown (30 min) keeps the dead
+/// model out while this short cooldown just breaks the same-agent loop.
+pub const SILENCE_AGENT_COOLDOWN_SECS: u64 = 120;
+
 /// KV key prefix for persisted cooldowns (both agent and model).
 const KV_PREFIX: &str = "cooldown:";
 
@@ -113,6 +120,17 @@ pub fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64) {
     let key = format!("{agent_name}:{model}");
     let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
     set_cooldown(&key, cooldown_until, "silence_detected");
+}
+
+/// Set a short agent-level cooldown (in seconds).
+///
+/// Used by silence detection to temporarily block the whole agent so the
+/// router picks a different one on re-route. Unlike `record_agent_failure`
+/// (30 min), this uses a short duration (typically 120s) — just enough to
+/// force one re-route cycle to a different agent.
+pub fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
+    let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
+    set_cooldown(agent_name, cooldown_until, "silence_agent_cooldown");
 }
 
 /// Check if a specific agent+model combo is in cooldown.
@@ -333,5 +351,28 @@ mod tests {
         let agent = "test_agent_persist_check";
         record_agent_failure_with_message(agent, "");
         assert!(is_agent_in_cooldown(agent));
+    }
+
+    #[test]
+    fn silence_agent_cooldown_is_short_lived() {
+        let agent = "test_silence_agent_cd";
+        assert!(!is_agent_in_cooldown(agent));
+
+        set_agent_cooldown(agent, SILENCE_AGENT_COOLDOWN_SECS);
+        assert!(is_agent_in_cooldown(agent));
+
+        // Verify it's a short cooldown (120s), not the long one (30 min)
+        let map = cooldowns().lock().unwrap();
+        let entry = map.get(agent).expect("should have cooldown entry");
+        let now = chrono::Utc::now().timestamp();
+        let remaining = entry.cooldown_until - now;
+        assert!(
+            remaining <= SILENCE_AGENT_COOLDOWN_SECS as i64,
+            "silence agent cooldown should be <= {SILENCE_AGENT_COOLDOWN_SECS}s, got {remaining}s"
+        );
+        assert!(
+            remaining > 0,
+            "cooldown should still be active"
+        );
     }
 }
