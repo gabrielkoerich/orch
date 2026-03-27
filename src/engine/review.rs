@@ -1301,8 +1301,10 @@ mod tests {
     #[tokio::test]
     async fn recover_missing_review_worktree_recreates_worktree() {
         let temp_home = TempDir::new().unwrap();
-        let old_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", temp_home.path());
+        let orch_dir = temp_home.path().join(".orch");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        let old_orch_home = std::env::var_os("ORCH_HOME");
+        std::env::set_var("ORCH_HOME", &orch_dir);
 
         let project_dir = temp_home.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -1313,8 +1315,6 @@ mod tests {
         git(&project_dir, &["add", "README.md"]);
         git(&project_dir, &["commit", "-m", "init"]);
 
-        let orch_dir = temp_home.path().join(".orch");
-        std::fs::create_dir_all(&orch_dir).unwrap();
         std::fs::write(
             orch_dir.join("config.yml"),
             format!("projects:\n  - {}\n", project_dir.display()),
@@ -1348,10 +1348,10 @@ mod tests {
         assert!(recovered.work_dir.exists());
         assert!(recovered.branch.starts_with("gh-issue-1-"));
 
-        if let Some(home) = old_home {
-            std::env::set_var("HOME", home);
+        if let Some(old) = old_orch_home {
+            std::env::set_var("ORCH_HOME", old);
         } else {
-            std::env::remove_var("HOME");
+            std::env::remove_var("ORCH_HOME");
         }
     }
 }

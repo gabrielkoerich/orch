@@ -11,7 +11,15 @@ use std::path::PathBuf;
 const HOME_DIR: &str = ".orch";
 
 /// Get the orch home directory path (~/.orch/).
+///
+/// Can be overridden via the `ORCH_HOME` environment variable. This is useful
+/// in tests and CI environments to avoid reading/writing the real state directory.
 pub fn orch_home() -> anyhow::Result<PathBuf> {
+    if let Ok(dir) = std::env::var("ORCH_HOME") {
+        let path = PathBuf::from(dir);
+        std::fs::create_dir_all(&path)?;
+        return Ok(path);
+    }
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let path = home.join(HOME_DIR);
@@ -164,65 +172,72 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_orch_home_creates_directory() {
+    /// Helper to set ORCH_HOME to a temp dir for the duration of a test.
+    ///
+    /// Returns the temp dir (keep alive for the test) and the previous value of
+    /// ORCH_HOME so the caller can restore it in the test teardown.
+    fn with_temp_orch_home() -> (TempDir, Option<String>) {
         let temp = TempDir::new().unwrap();
-        let home = temp.path().join("home");
-        std::fs::create_dir(&home).unwrap();
+        let orch_home = temp.path().join(".orch");
+        std::fs::create_dir_all(&orch_home).unwrap();
+        let prev = std::env::var("ORCH_HOME").ok();
+        std::env::set_var("ORCH_HOME", &orch_home);
+        (temp, prev)
+    }
 
-        let orch_path = home.join(HOME_DIR);
-        std::fs::create_dir_all(&orch_path).unwrap();
-
-        assert!(orch_path.exists());
+    fn restore_orch_home(prev: Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var("ORCH_HOME", v),
+            None => std::env::remove_var("ORCH_HOME"),
+        }
     }
 
     #[test]
-    fn test_state_dir() {
+    fn test_orch_home_env_override() {
         let temp = TempDir::new().unwrap();
-        let home = temp.path().join("home");
-        std::fs::create_dir(&home).unwrap();
+        let custom_dir = temp.path().join(".orch-custom");
+        let prev = std::env::var("ORCH_HOME").ok();
+        std::env::set_var("ORCH_HOME", &custom_dir);
 
-        let state = home.join(HOME_DIR).join("state");
-        std::fs::create_dir_all(&state).unwrap();
+        let result = orch_home().unwrap();
+        assert_eq!(result, custom_dir);
+        assert!(result.exists());
 
-        assert!(state.exists());
+        restore_orch_home(prev);
     }
 
     #[test]
     fn test_task_dir_creates_path() {
-        // Use a temporary HOME so we don't touch the developer's real home dir.
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        std::env::set_var("HOME", home);
+        // Use ORCH_HOME so we don't touch the developer's real home dir.
+        let (_temp, prev) = with_temp_orch_home();
 
         let dir = task_dir("test-owner/test-repo", "42").unwrap();
         assert!(dir.exists());
         assert!(dir.ends_with("test-owner/test-repo/tasks/42"));
-        // Cleanup is handled by TempDir when it drops.
+
+        restore_orch_home(prev);
     }
 
     #[test]
     fn test_task_attempt_dir_creates_path() {
-        // Use a temporary HOME so we don't touch the developer's real home dir.
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        std::env::set_var("HOME", home);
+        // Use ORCH_HOME so we don't touch the developer's real home dir.
+        let (_temp, prev) = with_temp_orch_home();
 
         let dir = task_attempt_dir("test-owner/test-repo", "42", 1).unwrap();
         assert!(dir.exists());
         assert!(dir.ends_with("test-owner/test-repo/tasks/42/attempts/1"));
-        // Cleanup is handled by TempDir when it drops.
+
+        restore_orch_home(prev);
     }
 
     #[test]
     fn test_repo_state_dir_separates_repos() {
-        let temp = TempDir::new().unwrap();
-        let home = temp.path();
-        std::env::set_var("HOME", home);
+        let (_temp, prev) = with_temp_orch_home();
 
         let dir_a = repo_state_dir("owner/repo-a").unwrap();
         let dir_b = repo_state_dir("owner/repo-b").unwrap();
         assert_ne!(dir_a, dir_b);
-        // Cleanup is handled by TempDir when it drops.
+
+        restore_orch_home(prev);
     }
 }

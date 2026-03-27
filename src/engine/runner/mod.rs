@@ -1394,8 +1394,10 @@ mod tests {
     async fn process_delegations_creates_subtasks_and_blocks_parent() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_home = TempDir::new().unwrap();
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", temp_home.path());
+        let orch_home = temp_home.path().join(".orch");
+        std::fs::create_dir_all(&orch_home).unwrap();
+        let old_orch_home = std::env::var("ORCH_HOME").ok();
+        std::env::set_var("ORCH_HOME", &orch_home);
 
         let runner = TaskRunner::new("owner/repo".to_string());
         let parent = make_task("99");
@@ -1460,10 +1462,10 @@ mod tests {
             "summary should mention Subtask B"
         );
 
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
+        if let Some(old) = old_orch_home {
+            std::env::set_var("ORCH_HOME", old);
         } else {
-            std::env::remove_var("HOME");
+            std::env::remove_var("ORCH_HOME");
         }
     }
 
@@ -1472,8 +1474,10 @@ mod tests {
     async fn process_delegations_single_subtask() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp_home = TempDir::new().unwrap();
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", temp_home.path());
+        let orch_home = temp_home.path().join(".orch");
+        std::fs::create_dir_all(&orch_home).unwrap();
+        let old_orch_home = std::env::var("ORCH_HOME").ok();
+        std::env::set_var("ORCH_HOME", &orch_home);
 
         let runner = TaskRunner::new("owner/repo".to_string());
         let parent = make_task("101");
@@ -1512,10 +1516,10 @@ mod tests {
             "comment should count one subtask"
         );
 
-        if let Some(old_home) = old_home {
-            std::env::set_var("HOME", old_home);
+        if let Some(old) = old_orch_home {
+            std::env::set_var("ORCH_HOME", old);
         } else {
-            std::env::remove_var("HOME");
+            std::env::remove_var("ORCH_HOME");
         }
     }
 }
