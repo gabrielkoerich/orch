@@ -113,6 +113,7 @@ pub async fn handle_success(
     // Auto-commit, push, create PR
     let mut has_pr = false;
     let mut has_pushed = false;
+    let mut has_commits = false;
     if resp.status == "done" || resp.status == "in_progress" {
         if let Err(e) =
             git_ops::auto_commit(&wt.work_dir, task_id, task_title, agent_name, new_attempts).await
@@ -131,12 +132,26 @@ pub async fn handle_success(
         // Skip push + PR if there are no commits ahead of the default branch.
         // No-op tasks (e.g. "nothing to execute") produce no commits, so pushing
         // and creating a PR would just waste API calls and trigger 422 errors.
-        let has_commits = git_ops::has_commits_ahead(&wt.work_dir, &wt.default_branch).await;
+        has_commits = git_ops::has_commits_ahead(&wt.work_dir, &wt.default_branch).await;
         if !has_commits {
             tracing::info!(
                 task_id,
                 "no commits ahead of default branch, skipping push + PR"
             );
+            // Clear stale push failure from previous runs
+            let last_err = store::opt_store_get_task(store, repo, task_id)
+                .await
+                .map(|t| t.last_error)
+                .unwrap_or_default();
+            if last_err.contains("push failed") {
+                store::store_set(
+                    store,
+                    repo,
+                    task_id,
+                    &[("last_error", serde_json::json!(""))],
+                )
+                .await;
+            }
         }
 
         // Push
@@ -366,8 +381,8 @@ pub async fn handle_success(
 
     // Track push failures — block after 3 consecutive failures
     // Check if push was attempted but failed: agent said done, tried to push, but has_pushed is still false
-    // and last_error contains a push failure.
-    let push_failed = resp.status == "done" && !has_pushed && {
+    // and last_error contains a push failure. Only count when there were commits to push.
+    let push_failed = resp.status == "done" && !has_pushed && has_commits && {
         let last_err = store::opt_store_get_task(store, repo, task_id)
             .await
             .map(|t| t.last_error)
