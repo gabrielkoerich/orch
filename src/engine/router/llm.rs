@@ -47,6 +47,50 @@ pub(crate) struct LlmAgentProfile {
     pub(crate) constraints: Vec<String>,
 }
 
+/// Apply self-routing penalty: if the LLM chose the same agent that's running the router,
+/// probabilistically redirect to another agent.
+///
+/// Returns `Some(agent)` with the redirected agent, or `None` if no redirect is needed.
+///
+/// - `penalty = 1.0` → never redirect (no penalty, default)
+/// - `penalty = 0.0` → always redirect (maximum penalty)
+/// - `penalty = 0.5` → redirect ~50% of self-routed tasks
+pub(super) fn apply_self_routing_penalty(
+    chosen_agent: &str,
+    router_agent: &str,
+    available_agents: &[String],
+    penalty: f64,
+    task_id: &str,
+) -> Option<String> {
+    // No penalty configured, or LLM chose a different agent — nothing to do
+    if penalty >= 1.0 || chosen_agent != router_agent {
+        return None;
+    }
+
+    // Collect alternative agents (everyone except the router)
+    let alternatives: Vec<&String> = available_agents
+        .iter()
+        .filter(|a| a.as_str() != router_agent)
+        .collect();
+
+    if alternatives.is_empty() {
+        return None;
+    }
+
+    // Probabilistically override: keep original if rand < penalty, else redirect.
+    // Using simple_hash_fraction_for gives deterministic-ish behavior per task_id
+    // so the same task always routes consistently.
+    let rand = super::selection::simple_hash_fraction_for(task_id);
+    if rand < penalty {
+        return None; // Keep the LLM's choice
+    }
+
+    // Redirect to an alternative agent chosen by hash
+    let idx =
+        super::selection::simple_hash_index_for(alternatives.len(), &format!("penalty:{task_id}"));
+    Some(alternatives[idx].clone())
+}
+
 /// Handles LLM-based task routing.
 ///
 /// `LlmRouter` is a self-contained unit: it builds a prompt from the task and
@@ -88,7 +132,7 @@ impl LlmRouter {
         }
 
         // Build the routing prompt
-        let prompt = self.build_routing_prompt(task, available_agents)?;
+        let prompt = self.build_routing_prompt(task, available_agents, router_agent)?;
 
         // Save prompt and response to per-task routing dir for debugging
         let routing_dir = crate::home::task_dir(repo, &task.id.0)
@@ -131,6 +175,24 @@ impl LlmRouter {
                 "selected agent not available, using fallback"
             );
             agent = first_available;
+        }
+
+        // Apply self-routing penalty: reduce bias toward the router's own agent
+        if let Some(redirected) = apply_self_routing_penalty(
+            &agent,
+            router_agent,
+            available_agents,
+            config.self_routing_penalty,
+            &task.id.0,
+        ) {
+            tracing::info!(
+                original_agent = %agent,
+                redirected_agent = %redirected,
+                router_agent,
+                penalty = config.self_routing_penalty,
+                "self-routing penalty applied — redirecting to alternate agent"
+            );
+            agent = redirected;
         }
 
         // Build the profile
@@ -192,6 +254,7 @@ impl LlmRouter {
         &self,
         task: &ExternalTask,
         available_agents: &[String],
+        router_agent: &str,
     ) -> anyhow::Result<String> {
         let template = include_str!("../../../prompts/route.md");
 
@@ -206,6 +269,7 @@ impl LlmRouter {
 
         // Simple template substitution
         let prompt = template
+            .replace("{{ROUTER_AGENT}}", router_agent)
             .replace("{{AVAILABLE_AGENTS}}", &available_agents_str)
             .replace("{{SKILLS_CATALOG}}", &skills_catalog)
             .replace("{{TASK_ID}}", &task.id.0)
@@ -783,5 +847,78 @@ mod tests {
             warning.is_some(),
             "label matching should be case-insensitive"
         );
+    }
+
+    // ── apply_self_routing_penalty ────────────────────────────────────────────
+
+    #[test]
+    fn self_routing_penalty_zero_always_redirects() {
+        let agents = vec![
+            "opencode".to_string(),
+            "claude".to_string(),
+            "codex".to_string(),
+        ];
+        // penalty=0.0: any hash ∈ [0,1) is never < 0.0, so always redirects
+        let result = apply_self_routing_penalty("opencode", "opencode", &agents, 0.0, "task-42");
+        assert!(result.is_some(), "penalty=0.0 must redirect self-routing");
+        assert_ne!(
+            result.unwrap(),
+            "opencode",
+            "redirected agent must not be the router agent"
+        );
+    }
+
+    #[test]
+    fn self_routing_penalty_one_keeps_self_routing() {
+        let agents = vec!["opencode".to_string(), "claude".to_string()];
+        // penalty=1.0: any hash ∈ [0,1) is always < 1.0, so never redirects
+        let result = apply_self_routing_penalty("opencode", "opencode", &agents, 1.0, "task-42");
+        assert!(result.is_none(), "penalty=1.0 must not redirect");
+    }
+
+    #[test]
+    fn self_routing_penalty_no_redirect_when_different_agent_chosen() {
+        let agents = vec!["opencode".to_string(), "claude".to_string()];
+        // LLM chose claude, router is opencode — no self-routing, no penalty
+        let result = apply_self_routing_penalty("claude", "opencode", &agents, 0.0, "task-42");
+        assert!(
+            result.is_none(),
+            "no redirect when LLM chose a different agent than the router"
+        );
+    }
+
+    #[test]
+    fn self_routing_penalty_no_redirect_when_no_alternatives() {
+        // Only one agent available — can't redirect anywhere else
+        let agents = vec!["opencode".to_string()];
+        let result = apply_self_routing_penalty("opencode", "opencode", &agents, 0.0, "task-42");
+        assert!(
+            result.is_none(),
+            "no redirect when no alternative agents are available"
+        );
+    }
+
+    #[test]
+    fn self_routing_penalty_redirects_only_to_non_router_agents() {
+        let agents = vec![
+            "opencode".to_string(),
+            "claude".to_string(),
+            "codex".to_string(),
+        ];
+        // penalty=0.0 always redirects — verify the redirected agent is never "opencode"
+        for suffix in &["1", "2", "3", "4", "5", "42", "100", "999"] {
+            let task_id = format!("task-{suffix}");
+            let result = apply_self_routing_penalty("opencode", "opencode", &agents, 0.0, &task_id);
+            if let Some(agent) = result {
+                assert_ne!(
+                    agent, "opencode",
+                    "redirected agent must not be router agent"
+                );
+                assert!(
+                    agents.contains(&agent),
+                    "redirected agent must be in available_agents"
+                );
+            }
+        }
     }
 }
