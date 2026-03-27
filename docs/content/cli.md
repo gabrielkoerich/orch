@@ -17,7 +17,7 @@ orch metrics
 orch cost
 ```
 
-Top-level shortcuts: `serve`, `init`, `log`, `agents`, `version`, `completions`.
+Top-level shortcuts: `serve`, `init`, `log`, `chat`, `agents`, `version`, `completions`.
 
 ## Task Commands
 
@@ -97,6 +97,33 @@ orch job enable <id>                      # enable a job
 orch job disable <id>                     # disable a job
 orch job tick                             # run one job scheduler tick manually
 ```
+
+## Version
+
+```bash
+orch version    # show CLI version and service version (warns on mismatch)
+```
+
+Shows the CLI version and, if the service is running, the version the service was built from. Warns when they differ so you can detect CLI/service drift:
+
+```
+CLI:     0.12.3
+Service: 0.12.3  ✓ in sync
+```
+
+When out of sync, run `brew upgrade orch && brew services restart orch`.
+
+## Chat
+
+```bash
+orch chat                           # interactive REPL
+orch chat "what's running?"         # single message
+orch chat --session ops             # use a named session profile
+orch chat history                   # show recent messages
+orch chat history --search "bean"   # search past conversations
+```
+
+Conversational control plane — talk to the orchestrator in natural language. Each message invokes a one-shot agent with context assembled from the live task state, memories, and recent summaries. Switch the model with `/model agent:model` inside the REPL.
 
 ## Agent Management
 

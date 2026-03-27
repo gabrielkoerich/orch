@@ -134,7 +134,7 @@ claude -p \
 After agent completion, if a PR is open and `enable_review_agent` is true:
 
 1. Status transitions to `needs_review`, then `in_review` (this transition is the atomic guard)
-2. Opposite agent selected (codex wrote → claude reviews)
+2. Reviewer selected via round-robin, excluding the task executor and all prior review agents for this task
 3. PR diff fetched via `gh pr diff`
 4. Review agent evaluates and posts a comment with `## Automated Review — Approve/Changes Requested` header
 5. CI workflow reads the review comment to determine approval

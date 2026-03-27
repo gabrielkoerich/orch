@@ -312,6 +312,8 @@ graph LR
 │                                                  │
 │  Shutdown:                                       │
 │    - SIGTERM → reset in_progress → routed        │
+│    - SIGTERM → reset in_review → needs_review    │
+│    - Kill all orch-* tmux sessions               │
 │    - Tasks re-dispatch into existing worktrees   │
 └──────────────────────────────────────────────────┘
 ```
