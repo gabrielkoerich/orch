@@ -105,6 +105,16 @@ pub fn record_model_failure(agent_name: &str, model: &str) {
     set_cooldown(&key, cooldown_until, "model_error");
 }
 
+/// Set a model cooldown with a custom duration (in seconds).
+///
+/// Used by silence detection to cooldown the specific model that failed to
+/// produce any output, with a configurable duration.
+pub fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64) {
+    let key = format!("{agent_name}:{model}");
+    let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
+    set_cooldown(&key, cooldown_until, "silence_detected");
+}
+
 /// Check if a specific agent+model combo is in cooldown.
 pub fn is_model_in_cooldown(agent_name: &str, model: &str) -> bool {
     let key = format!("{agent_name}:{model}");

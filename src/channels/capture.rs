@@ -39,6 +39,13 @@ pub struct OutputBuffer {
     /// Prevents firing "session ended" for sessions that were registered
     /// before the tmux session was actually created.
     pub seen_alive: bool,
+    /// When this session was registered for capture.
+    pub registered_at: DateTime<Utc>,
+    /// Whether the agent has produced any meaningful output since session start.
+    /// Used for silence detection: only agents that never produced output are
+    /// considered silent. Agents that produced output then go quiet are NOT
+    /// killed (they may be running long tool calls with sparse output).
+    pub has_output: bool,
 }
 
 /// Service that captures tmux pane output and broadcasts to transport.
@@ -63,14 +70,17 @@ impl CaptureService {
 
     /// Register a session to be tracked.
     pub async fn register_session(&self, task_id: &str, session: &str) {
+        let now = Utc::now();
         let buffer = OutputBuffer {
             session: session.to_string(),
             task_id: task_id.to_string(),
             last_content: String::new(),
             last_len: 0,
             last_hash: None,
-            last_capture: Utc::now(),
+            last_capture: now,
             seen_alive: false,
+            registered_at: now,
+            has_output: false,
         };
         self.buffers
             .write()
@@ -125,6 +135,33 @@ impl CaptureService {
 
             self.tick().await;
         }
+    }
+
+    /// Return task IDs of sessions that have been silent since registration.
+    ///
+    /// A session is "silent" when:
+    /// 1. It has been registered for longer than `grace_period`
+    /// 2. It has NEVER produced any meaningful output (`has_output == false`)
+    ///
+    /// This intentionally does NOT flag agents that produced output then went
+    /// quiet (e.g. long tool calls with sparse output).
+    pub async fn get_silent_sessions(
+        &self,
+        grace_period: std::time::Duration,
+    ) -> Vec<(String, String)> {
+        let now = Utc::now();
+        let buffers = self.buffers.read().await;
+        let mut silent = Vec::new();
+        for buf in buffers.values() {
+            if buf.has_output {
+                continue;
+            }
+            let age = now.signed_duration_since(buf.registered_at);
+            if age.num_seconds() > grace_period.as_secs() as i64 {
+                silent.push((buf.task_id.clone(), buf.session.clone()));
+            }
+        }
+        silent
     }
 
     /// Run one tick of the capture loop.
@@ -233,6 +270,7 @@ impl OutputBuffer {
         if new_content.trim().is_empty() {
             None
         } else {
+            self.has_output = true;
             Some(new_content)
         }
     }
@@ -259,6 +297,7 @@ fn cap_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::transport::Transport;
 
     fn make_buffer() -> OutputBuffer {
         OutputBuffer {
@@ -269,6 +308,8 @@ mod tests {
             last_hash: None,
             last_capture: Utc::now(),
             seen_alive: false,
+            registered_at: Utc::now(),
+            has_output: false,
         }
     }
 
@@ -330,6 +371,64 @@ mod tests {
         let mut buf = make_buffer();
         let result = buf.diff_and_update("");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn has_output_set_on_meaningful_content() {
+        let mut buf = make_buffer();
+        assert!(!buf.has_output);
+        buf.diff_and_update("hello");
+        assert!(buf.has_output);
+    }
+
+    #[test]
+    fn has_output_not_set_on_empty_content() {
+        let mut buf = make_buffer();
+        buf.diff_and_update("");
+        assert!(!buf.has_output, "empty content should not set has_output");
+    }
+
+    #[test]
+    fn has_output_stays_true_after_silence() {
+        let mut buf = make_buffer();
+        buf.diff_and_update("hello");
+        assert!(buf.has_output);
+        // Same content (no new output) — has_output should remain true
+        buf.diff_and_update("hello");
+        assert!(buf.has_output, "has_output should not revert once set");
+    }
+
+    #[tokio::test]
+    async fn get_silent_sessions_returns_only_no_output_past_grace() {
+        let transport = Arc::new(Transport::new());
+        let svc = CaptureService::new(transport);
+
+        // Register a session and backdate it past the grace period
+        svc.register_session("silent-task", "orch-test-silent")
+            .await;
+        {
+            let mut buffers = svc.buffers.write().await;
+            let buf = buffers.get_mut("silent-task").unwrap();
+            buf.registered_at = Utc::now() - chrono::Duration::seconds(200);
+        }
+
+        // Register a session that HAS produced output (should not be returned)
+        svc.register_session("active-task", "orch-test-active")
+            .await;
+        {
+            let mut buffers = svc.buffers.write().await;
+            let buf = buffers.get_mut("active-task").unwrap();
+            buf.registered_at = Utc::now() - chrono::Duration::seconds(200);
+            buf.has_output = true;
+        }
+
+        // Register a fresh session within grace period (should not be returned)
+        svc.register_session("new-task", "orch-test-new").await;
+
+        let grace = std::time::Duration::from_secs(120);
+        let silent = svc.get_silent_sessions(grace).await;
+        assert_eq!(silent.len(), 1);
+        assert_eq!(silent[0].0, "silent-task");
     }
 
     #[test]

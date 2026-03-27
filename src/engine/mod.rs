@@ -111,6 +111,11 @@ pub struct EngineConfig {
     pub auto_close_task_on_approval: bool,
     /// Graceful shutdown timeout — how long to wait for running agents before exiting.
     pub graceful_shutdown_timeout: std::time::Duration,
+    /// Grace period before silence detection kicks in (seconds).
+    /// Allows time for agent startup, model download, API handshake.
+    pub silence_grace_period: u64,
+    /// Cooldown duration for a model detected as silent (seconds).
+    pub silence_cooldown: u64,
 }
 
 impl Default for EngineConfig {
@@ -125,6 +130,8 @@ impl Default for EngineConfig {
             auto_create_followup_on_changes: true,
             auto_close_task_on_approval: false,
             graceful_shutdown_timeout: std::time::Duration::from_secs(600),
+            silence_grace_period: 120,
+            silence_cooldown: 3600,
         }
     }
 }
@@ -190,6 +197,18 @@ impl EngineConfig {
         if let Ok(val) = crate::config::get("engine.graceful_shutdown_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.graceful_shutdown_timeout = std::time::Duration::from_secs(secs);
+            }
+        }
+
+        if let Ok(val) = crate::config::get("engine.silence_grace_period") {
+            if let Ok(secs) = val.parse::<u64>() {
+                config.silence_grace_period = secs;
+            }
+        }
+
+        if let Ok(val) = crate::config::get("engine.silence_cooldown") {
+            if let Ok(secs) = val.parse::<u64>() {
+                config.silence_cooldown = secs;
             }
         }
 
