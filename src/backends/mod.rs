@@ -190,6 +190,14 @@ pub trait ExternalBackend: Send + Sync {
         Ok(all_tasks)
     }
 
+    /// List tasks for closed-issue reconciliation fallback.
+    ///
+    /// Used when `list_all_tasks` fails (e.g., transient API issues).
+    /// Default implementation returns an empty list, meaning no fallback data.
+    async fn list_reconciliation_candidates(&self) -> anyhow::Result<Vec<ExternalTask>> {
+        Ok(Vec::new())
+    }
+
     /// List open tasks that are routable — no `status:*` label yet, or `status:new`.
     ///
     /// Default implementation falls back to `list_by_status(New)`.

@@ -539,44 +539,79 @@ impl GhHttp {
         let mut all: Vec<T> = Vec::new();
         let mut next_url: Option<String> = None;
         let mut is_first = true;
+        const MAX_JSON_DECODE_RETRIES: u32 = 2;
+        const JSON_DECODE_RETRY_BACKOFF_MS: u64 = 200;
 
         loop {
-            let resp = if is_first {
+            let (request_url, request_query) = if is_first {
                 is_first = false;
-                let auth = self.auth_header().await?;
-                self.client
-                    .get(url)
-                    .query(query)
-                    .header(header::AUTHORIZATION, auth)
-                    .header(header::ACCEPT, "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", "2022-11-28")
-                    .send()
-                    .await?
+                (url, Some(query))
             } else {
                 let Some(u) = next_url.as_ref() else { break };
+                (u.as_str(), None)
+            };
+
+            let mut decode_attempt = 0;
+            let (page, next) = loop {
                 let auth = self.auth_header().await?;
-                self.client
-                    .get(u)
+                let mut req = self
+                    .client
+                    .get(request_url)
                     .header(header::AUTHORIZATION, auth)
                     .header(header::ACCEPT, "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", "2022-11-28")
-                    .send()
-                    .await?
+                    .header("X-GitHub-Api-Version", "2022-11-28");
+                if let Some(q) = request_query {
+                    req = req.query(q);
+                }
+
+                let resp = req.send().await?;
+                Self::record_response(&resp);
+                let status = resp.status();
+                let next_from_headers = parse_link_next(resp.headers());
+                let content_type = resp
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "<missing>".to_string());
+
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    Self::maybe_record_rate_limit_from_body(status, &body);
+                    anyhow::bail!("GitHub API GET (paginated) failed ({status}): {body}");
+                }
+
+                let text = resp.text().await?;
+                match serde_json::from_str::<Vec<T>>(&text) {
+                    Ok(page) => break (page, next_from_headers),
+                    Err(err) => {
+                        let snippet: String = text.chars().take(200).collect();
+                        let decode_error = anyhow::anyhow!(
+                            "GitHub API GET (paginated) JSON decode failed ({status}, content-type={content_type}): {snippet}"
+                        )
+                        .context(err);
+                        if decode_attempt < MAX_JSON_DECODE_RETRIES {
+                            decode_attempt += 1;
+                            tracing::warn!(
+                                attempt = decode_attempt,
+                                max_attempts = MAX_JSON_DECODE_RETRIES,
+                                status = %status,
+                                content_type,
+                                err = %decode_error,
+                                "json decode failed; retrying paginated GET"
+                            );
+                            tokio::time::sleep(Duration::from_millis(
+                                JSON_DECODE_RETRY_BACKOFF_MS * u64::from(decode_attempt),
+                            ))
+                            .await;
+                            continue;
+                        }
+                        return Err(decode_error);
+                    }
+                }
             };
-            Self::record_response(&resp);
-            let status = resp.status();
 
-            // Parse Link header for next page
-            next_url = parse_link_next(resp.headers());
-
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                Self::maybe_record_rate_limit_from_body(status, &body);
-                anyhow::bail!("GitHub API GET (paginated) failed ({status}): {body}");
-            }
-
-            let text = resp.text().await?;
-            let page: Vec<T> = serde_json::from_str(&text)?;
+            next_url = next;
             all.extend(page);
 
             if next_url.is_none() {
@@ -741,6 +776,25 @@ impl GhHttp {
                     ("since", since),
                     ("per_page", "100"),
                 ],
+            )
+            .await?;
+        Ok(all
+            .into_iter()
+            .filter(|i| i.pull_request.is_none())
+            .collect())
+    }
+
+    /// List closed issues updated since `since` (ISO 8601), no label filter.
+    pub async fn list_closed_issues_since(
+        &self,
+        repo: &str,
+        since: &str,
+    ) -> anyhow::Result<Vec<GitHubIssue>> {
+        let url = format!("{GITHUB_API}/repos/{repo}/issues");
+        let all: Vec<GitHubIssue> = self
+            .get_all_pages(
+                &url,
+                &[("state", "closed"), ("since", since), ("per_page", "100")],
             )
             .await?;
         Ok(all

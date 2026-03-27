@@ -7,6 +7,7 @@ use super::{ExternalBackend, ExternalId, ExternalTask, Mention, Status};
 use crate::github::http::{status_label_color, GhHttp};
 use crate::github::projects::ProjectSync;
 use async_trait::async_trait;
+use chrono::{Duration, Utc};
 
 /// Author associations that are allowed to create tasks.
 /// Issues from other authors are silently ignored during ingestion.
@@ -221,6 +222,29 @@ impl ExternalBackend for GitHubBackend {
         let issues = self.gh.list_all_issues(&self.repo).await?;
         Ok(issues
             .into_iter()
+            .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
+            .filter(is_trusted_author) // Only trusted authors
+            .map(|issue| ExternalTask {
+                id: ExternalId(issue.number.to_string()),
+                title: issue.title,
+                body: issue.body.unwrap_or_default(),
+                state: issue.state,
+                labels: issue.labels.into_iter().map(|l| l.name).collect(),
+                author: issue.user.login,
+                created_at: issue.created_at,
+                updated_at: issue.updated_at,
+                url: issue.html_url,
+            })
+            .collect())
+    }
+
+    async fn list_reconciliation_candidates(&self) -> anyhow::Result<Vec<ExternalTask>> {
+        let since = (Utc::now() - Duration::days(30)).to_rfc3339();
+        let open = self.gh.list_all_open_issues(&self.repo).await?;
+        let closed = self.gh.list_closed_issues_since(&self.repo, &since).await?;
+        let issues = open.into_iter().chain(closed);
+
+        Ok(issues
             .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
             .filter(is_trusted_author) // Only trusted authors
             .map(|issue| ExternalTask {
