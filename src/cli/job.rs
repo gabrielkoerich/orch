@@ -255,13 +255,19 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
 
     println!("Running job '{}' ({}) in {}", job_id, job.r#type, repo);
 
-    jobs::execute_job(&job, &mut state, &backend, store.as_ref(), &repo).await;
-
-    // Update last_run and persist
+    // Persist last_run BEFORE execution to avoid duplicate runs if the
+    // process crashes or is restarted during execution. The job runtime
+    // state is loaded from SQLite on restart, so writing last_run first
+    // prevents an immediate catch-up run.
     state.last_run = Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
     if let Some(ref s) = store {
-        s.upsert_job_state(&state).await?;
+        if let Err(e) = s.upsert_job_state(&state).await {
+            tracing::error!(job_id = job_id, ?e, "failed to persist job state before execution");
+        }
     }
+
+    // Execute the job (may mutate state.active_task_id / last_task_status).
+    jobs::execute_job(&job, &mut state, &backend, store.as_ref(), &repo).await;
 
     let status = state.last_task_status.as_deref().unwrap_or("unknown");
     if let Some(ref task_id) = state.active_task_id {
