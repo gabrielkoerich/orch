@@ -59,7 +59,7 @@ Everything outside your current working directory is **read-only**. Never `cd ..
 
 **Do NOT push or create PRs** — the orchestrator handles pushing and PR creation after your work is done. Only commit your changes locally.
 
-Do NOT skip any of these steps. If you only make changes without committing, your work will be lost.
+**Do NOT skip any of these steps except step 1.** If you only make changes without committing, your work will be lost.
 
 **Infrastructure failures — STOP, do not file issues**: If GitHub setup operations fail (e.g., branch creation, `gh issue develop`, `gh issue link`, GraphQL link errors), **stop immediately and set status to `needs_review`**. Do NOT create GitHub issues about these failures — they are orchestrator-level infrastructure problems, not bugs in the codebase you are working on.
 
