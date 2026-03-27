@@ -267,7 +267,7 @@ router:
   mode: "llm"              # "llm" (default) or "round_robin"
   agent: "claude"          # which LLM performs routing
   model: "haiku"           # fast/cheap model for classification
-  timeout_seconds: 120
+  timeout_seconds: 60
   fallback_executor: "codex"
 
 model_map:

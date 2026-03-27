@@ -129,7 +129,7 @@ sequenceDiagram
         S->>J: jobs tick (cron match)
     end
 
-    Note over S,GH: Every 120s: sync tick (ingest issues, review PRs, owner commands)
+    Note over S,GH: Every 45s: sync tick (ingest issues, review PRs, owner commands)
 ```
 
 ## Task Lifecycle
@@ -232,8 +232,8 @@ new → routed → in_progress → needs_review → in_review → done
 │     - Recent summaries (last 20)               │
 │  3. Resolve model/agent from KV                │
 │  4. Invoke agent one-shot:                     │
-│     - get_runner(agent).build_command()         │
-│     - bash -c (120s timeout)                   │
+    │     - get_runner(agent).build_command()         │
+    │     - bash -c (120s timeout)                   │
 │     - get_runner(agent).parse_response()        │
 │     - get_runner(agent).classify_error()        │
 │  5. Extract text + tokens from response        │
@@ -298,7 +298,7 @@ graph LR
 │    5. Unblock parents (sub-issue check)          │
 │    6. Job scheduler (cron matching)              │
 │                                                  │
-│  Sync (every 120s):                              │
+│  Sync (every 45s):                              │
 │    - Ingest external tasks (GitHub issues)       │
 │    - Review open PRs                             │
 │    - Scan for owner commands (/retry, /close)    │
