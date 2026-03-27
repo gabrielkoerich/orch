@@ -14,7 +14,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | top-level | `required_tools` | Tools that must exist on PATH before launching an agent | `[]` |
 | `engine` | `tick_interval` | Main engine tick interval in seconds | `10` |
 | `engine` | `sync_interval` | Sync tick interval in seconds (GitHub ingest, cleanup) | `120` |
-| `engine` | `max_parallel` | Max tasks dispatched concurrently | `4` |
+| `engine` | `max_parallel` | Max tasks dispatched concurrently | `8` |
 | `engine` | `graceful_shutdown_timeout` | Seconds to wait for in-flight tasks on SIGTERM | `600` |
 | `workflow` | `auto_close` | Auto-close GitHub issues when tasks are `done` | `true` |
 | `workflow` | `review_owner` | GitHub handle to tag when review is needed | `@owner` |

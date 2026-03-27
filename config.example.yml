@@ -152,8 +152,9 @@ engine:
   sync_interval: 120
   fallback_sync_interval: 30
   webhook_health_check_interval: 60
-  max_parallel: 4
+  max_parallel: 8
   stuck_timeout: 1800
+  graceful_shutdown_timeout: 600
 
 # Task completion notifications — broadcast to all configured channels.
 # Level controls which events are sent:

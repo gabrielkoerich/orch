@@ -21,7 +21,7 @@ Issue → Branch + Worktree → Agent works → Push → PR → Review Agent →
 7. **Fix + Reply** — fix review findings, commit fixes (engine pushes)
 8. **Merge** — engine merges PR after review approval and CI passes
 9. **Release** — CI auto-tags, generates changelog, creates GitHub release, updates Homebrew
-10. **Cleanup** — engine detects merged PR, removes worktree + local branch
+10. **Cleanup** — engine detects merged PR, removes worktree + local branch. Blocked tasks with an open PR keep their remote branch. Stale worktree metadata is auto-pruned during sync.
 
 ## Mention-Driven Tasks
 
@@ -67,7 +67,7 @@ The Rust engine ticks every `engine.tick_interval` seconds (default 10s). Each t
 
 A separate **sync tick** (~45s) handles less-frequent operations:
 
-1. **Cleanup** — removes worktrees for done tasks (runs in background), deletes orphaned remote branches, pulls main once per cycle
+1. **Cleanup** — removes worktrees for done tasks (runs in background), deletes orphaned remote branches, auto-prunes stale worktree metadata, pulls main once per cycle; remote branch is kept when a blocked task has an open PR
 2. **Merged PR detection** — marks tasks done when their PRs are merged
 3. **Mention scanning** — detects `@orchestrator` mentions in issue comments
 4. **PR review processing** — re-routes tasks when reviews request changes (not child task creation), resets `ci_merge_failures` counter on re-route
