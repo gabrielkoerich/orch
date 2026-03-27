@@ -141,10 +141,20 @@ pub async fn handle_error(
                 status: "new".to_string(),
             });
         }
-        agents::AgentError::Unknown { exit_code, message } => (
-            response::RetryableError::Failed,
-            format!("{agent_name} exit {exit_code}: {message}"),
-        ),
+        agents::AgentError::Unknown { exit_code, message } => {
+            // Exit 0 with empty output is a silent failure (common with GitHub
+            // Copilot models in opencode).  Record a model-specific cooldown so
+            // the same model is not retried on every subsequent task.
+            if *exit_code == 0 && message.is_empty() {
+                if let Some(m) = model_name {
+                    response::record_model_failure(agent_name, m);
+                }
+            }
+            (
+                response::RetryableError::Failed,
+                format!("{agent_name} exit {exit_code}: {message}"),
+            )
+        }
     };
 
     // If this was a timeout, clear the stored agent so the router can
