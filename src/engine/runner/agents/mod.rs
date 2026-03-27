@@ -54,7 +54,11 @@ impl Default for PermissionRules {
         Self {
             autonomous: true,
             sandbox: SandboxLevel::WorkspaceWrite,
-            disallowed_tools: vec!["Bash(rm *)".to_string(), "Bash(rm -*)".to_string()],
+            disallowed_tools: vec![
+                "Bash(rm *)".to_string(),
+                "Bash(rm -*)".to_string(),
+                "Bash(git push*)".to_string(),
+            ],
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
         }
