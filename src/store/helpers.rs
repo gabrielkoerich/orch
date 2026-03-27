@@ -39,6 +39,39 @@ pub async fn store_set(
     }
 }
 
+/// Append a lifecycle activity event to a task timeline.
+#[allow(clippy::too_many_arguments)]
+pub async fn store_log_activity(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    event_type: &str,
+    from_status: Option<&str>,
+    to_status: Option<&str>,
+    agent: Option<&str>,
+    model: Option<&str>,
+    details: Option<&serde_json::Value>,
+) {
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
+            if let Err(e) = s
+                .append_activity(
+                    store_id,
+                    event_type,
+                    from_status,
+                    to_status,
+                    agent,
+                    model,
+                    details,
+                )
+                .await
+            {
+                tracing::warn!(task_id, event_type, error = %e, "store append_activity failed");
+            }
+        }
+    }
+}
+
 pub async fn review_session_expected(store: &Arc<TaskStore>, repo: &str, task_id: &str) -> bool {
     match store.resolve_task_id(repo, task_id).await {
         Ok(Some(store_id)) => store

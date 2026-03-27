@@ -155,6 +155,20 @@ pub struct TaskRun {
     pub completed_at: Option<String>,
 }
 
+/// A single task lifecycle activity event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskActivity {
+    pub id: i64,
+    pub task_id: i64,
+    pub timestamp: String,
+    pub event_type: String,
+    pub from_status: Option<String>,
+    pub to_status: Option<String>,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub details: serde_json::Value,
+}
+
 /// Token usage for a run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunTokenUsage {
@@ -223,6 +237,68 @@ pub struct MigrateResult {
 }
 
 impl TaskStore {
+    /// Append a lifecycle activity event for a task.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_activity(
+        &self,
+        task_id: i64,
+        event_type: &str,
+        from_status: Option<&str>,
+        to_status: Option<&str>,
+        agent: Option<&str>,
+        model: Option<&str>,
+        details: Option<&serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let details_json = match details {
+            Some(v) => serde_json::to_string(v)?,
+            None => "{}".to_string(),
+        };
+        sqlx::query(
+            "INSERT INTO task_activity
+             (task_id, event_type, from_status, to_status, agent, model, details)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(task_id)
+        .bind(event_type)
+        .bind(from_status)
+        .bind(to_status)
+        .bind(agent)
+        .bind(model)
+        .bind(details_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get task activity timeline in chronological order.
+    pub async fn get_activity(
+        &self,
+        task_id: i64,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<TaskActivity>> {
+        let rows = if let Some(limit) = limit {
+            let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+            sqlx::query(
+                "SELECT * FROM task_activity WHERE task_id = ?
+                 ORDER BY timestamp ASC, id ASC LIMIT ?",
+            )
+            .bind(task_id)
+            .bind(limit_i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT * FROM task_activity WHERE task_id = ?
+                 ORDER BY timestamp ASC, id ASC",
+            )
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.iter().map(Self::row_to_activity).collect()
+    }
+
     pub async fn create(&self, new: &NewTask) -> anyhow::Result<i64> {
         let labels_json = serde_json::to_string(&new.labels)?;
         let row = sqlx::query(
@@ -343,6 +419,13 @@ impl TaskStore {
 
     /// Update the status of a task.
     pub async fn update_status(&self, id: i64, status: TaskStatus) -> anyhow::Result<()> {
+        let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        let from_status: String = previous.get("status");
+        let agent: Option<String> = previous.get("agent");
+        let model: Option<String> = previous.get("model");
         let sql = if status == TaskStatus::Blocked {
             "UPDATE tasks SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
         } else if status == TaskStatus::NeedsReview {
@@ -355,16 +438,45 @@ impl TaskStore {
             .bind(id)
             .execute(&self.pool)
             .await?;
+
+        self.append_activity(
+            id,
+            "status_change",
+            Some(from_status.as_str()),
+            Some(status.as_str()),
+            agent.as_deref(),
+            model.as_deref(),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
     /// Reset a task back to `new`.
     pub async fn reset_to_new(&self, id: i64) -> anyhow::Result<()> {
+        let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        let from_status: String = previous.get("status");
+        let agent: Option<String> = previous.get("agent");
+        let model: Option<String> = previous.get("model");
         sqlx::query(
             "UPDATE tasks SET status = 'new', branch = '', worktree = '', worktree_cleaned = 0, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
         )
         .bind(id)
         .execute(&self.pool)
+        .await?;
+        let details = serde_json::json!({ "op": "reset_to_new" });
+        self.append_activity(
+            id,
+            "status_change",
+            Some(from_status.as_str()),
+            Some(TaskStatus::New.as_str()),
+            agent.as_deref(),
+            model.as_deref(),
+            Some(&details),
+        )
         .await?;
         Ok(())
     }
@@ -694,6 +806,21 @@ impl TaskStore {
         .bind(route.id)
         .execute(&self.pool)
         .await?;
+        let details = serde_json::json!({
+            "complexity": route.complexity,
+            "reason": route.reason,
+            "skills": route.skills,
+        });
+        self.append_activity(
+            route.id,
+            "dispatch",
+            None,
+            None,
+            Some(route.agent),
+            route.model,
+            Some(&details),
+        )
+        .await?;
         Ok(())
     }
 
@@ -804,6 +931,16 @@ impl TaskStore {
     .bind(id)
     .execute(&self.pool)
     .await?;
+        self.append_activity(
+            id,
+            "branch_delete",
+            None,
+            None,
+            None,
+            None,
+            Some(&serde_json::json!({ "worktree_cleaned": true })),
+        )
+        .await?;
         Ok(())
     }
 
@@ -850,11 +987,37 @@ impl TaskStore {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(row.get("id"))
+        let run_id = row.get("id");
+        let event_type = match run.run_type {
+            "review" => "review_start",
+            _ => "dispatch",
+        };
+        let details = serde_json::json!({
+            "run_type": run.run_type,
+            "attempt": run.attempt,
+            "command": run.command,
+        });
+        self.append_activity(
+            run.task_id,
+            event_type,
+            None,
+            None,
+            Some(run.agent),
+            Some(run.model),
+            Some(&details),
+        )
+        .await?;
+
+        Ok(run_id)
     }
 
     /// Complete a run with results.
     pub async fn complete_run(&self, run: &CompleteRun<'_>) -> anyhow::Result<()> {
+        let run_ctx =
+            sqlx::query("SELECT task_id, run_type, agent, model FROM task_runs WHERE id = ?")
+                .bind(run.run_id)
+                .fetch_optional(&self.pool)
+                .await?;
         sqlx::query(
             "UPDATE task_runs SET
             exit_code = ?, stdout = ?, stderr = ?, parsed_response = ?,
@@ -877,6 +1040,43 @@ impl TaskStore {
         .bind(run.run_id)
         .execute(&self.pool)
         .await?;
+        if let Some(run_ctx) = run_ctx {
+            let task_id: i64 = run_ctx.get("task_id");
+            let run_type: String = run_ctx.get("run_type");
+            let agent: String = run_ctx.get("agent");
+            let model: String = run_ctx.get("model");
+            if run.outcome == "timeout" {
+                self.append_activity(
+                    task_id,
+                    "timeout",
+                    None,
+                    None,
+                    Some(&agent),
+                    Some(&model),
+                    Some(&serde_json::json!({
+                        "run_type": run_type,
+                        "error": run.error,
+                        "stderr": run.stderr,
+                    })),
+                )
+                .await?;
+            } else if run.outcome != "success" {
+                self.append_activity(
+                    task_id,
+                    "error",
+                    None,
+                    None,
+                    Some(&agent),
+                    Some(&model),
+                    Some(&serde_json::json!({
+                        "run_type": run_type,
+                        "outcome": run.outcome,
+                        "error": run.error,
+                    })),
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -1193,6 +1393,21 @@ impl TaskStore {
             duration_secs: row.get("duration_secs"),
             started_at: row.get("started_at"),
             completed_at: row.get("completed_at"),
+        })
+    }
+
+    fn row_to_activity(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskActivity> {
+        let details_str: String = row.get("details");
+        Ok(TaskActivity {
+            id: row.get("id"),
+            task_id: row.get("task_id"),
+            timestamp: row.get("timestamp"),
+            event_type: row.get("event_type"),
+            from_status: row.get("from_status"),
+            to_status: row.get("to_status"),
+            agent: row.get("agent"),
+            model: row.get("model"),
+            details: serde_json::from_str(&details_str).unwrap_or_else(|_| serde_json::json!({})),
         })
     }
 

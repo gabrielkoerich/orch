@@ -467,6 +467,17 @@ enum TaskAction {
         /// Task ID (e.g. "internal:8" or issue number)
         id: String,
     },
+    /// Show task activity timeline
+    Log {
+        /// Task ID (e.g. "internal:8" or issue number)
+        id: String,
+        /// Max number of events to show
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Print raw JSON details
+        #[arg(long)]
+        json: bool,
+    },
     /// Show task run history and audit details
     Runs {
         /// Task ID (e.g. "internal:8" or issue number)
@@ -715,6 +726,9 @@ async fn main() -> anyhow::Result<()> {
             }
             TaskAction::Logs { id } => {
                 cli::task::logs(&id).await?;
+            }
+            TaskAction::Log { id, limit, json } => {
+                cli::task::activity_log(&id, limit, json).await?;
             }
             TaskAction::Runs { id, verbose } => {
                 cli::task::runs(&id, verbose).await?;

@@ -8,6 +8,7 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::cmd::CommandErrorContext;
 use crate::engine::tasks::TaskManager;
 use crate::store;
+use crate::store::store_log_activity;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use std::sync::Arc;
@@ -485,6 +486,22 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     }
 
     if did_clean {
+        store_log_activity(
+            &Some(Arc::clone(store)),
+            repo,
+            task_id,
+            "branch_delete",
+            None,
+            None,
+            None,
+            None,
+            Some(&serde_json::json!({
+                "worktree": worktree_path.map(|p| p.display().to_string()),
+                "branch": branch,
+                "keep_remote_branch": keep_remote_branch,
+            })),
+        )
+        .await;
         // Mark as cleaned in store so we don't retry next tick.
         // If resolve_task_id returns None the task is not (or no longer) in
         // the store; that is fine — we already did the on-disk work.

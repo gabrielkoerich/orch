@@ -1375,6 +1375,51 @@ pub async fn runs(id: &str, verbose: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Show lifecycle activity timeline for a task.
+pub async fn activity_log(id: &str, limit: Option<usize>, json: bool) -> anyhow::Result<()> {
+    let store = crate::cli::init_store().await?;
+    let repo = config::get_current_repo().unwrap_or_default();
+    let Some(task_id) = store.resolve_task_id(&repo, id).await? else {
+        anyhow::bail!("task not found: {id}");
+    };
+
+    let events = store.get_activity(task_id, limit).await?;
+    if events.is_empty() {
+        println!("No activity found for task {id}.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<20} {:<16} {:<12} {:<12} {:<10} {:<14} DETAILS",
+        "TIME", "EVENT", "FROM", "TO", "AGENT", "MODEL"
+    );
+    println!("{}", "-".repeat(120));
+
+    for event in events {
+        let details = if json {
+            serde_json::to_string(&event.details).unwrap_or_else(|_| "{}".to_string())
+        } else if event.details.is_null() || event.details == serde_json::json!({}) {
+            String::new()
+        } else {
+            let compact =
+                serde_json::to_string(&event.details).unwrap_or_else(|_| "{}".to_string());
+            truncate_err(&compact, 80)
+        };
+        println!(
+            "{:<20} {:<16} {:<12} {:<12} {:<10} {:<14} {}",
+            event.timestamp,
+            event.event_type,
+            event.from_status.as_deref().unwrap_or("-"),
+            event.to_status.as_deref().unwrap_or("-"),
+            event.agent.as_deref().unwrap_or("-"),
+            event.model.as_deref().unwrap_or("-"),
+            details
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
