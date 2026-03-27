@@ -98,7 +98,7 @@ and closed all remaining open issues. Zero open issues, zero open PRs.
 ### Features
 
 - **Polling fallback for webhooks** (#127, PR #131): When webhooks are disabled or fail,
-  the engine automatically uses faster polling (30s instead of 120s):
+  the engine automatically uses faster polling (30s instead of 45s):
   - Webhook health check pings local `/health` endpoint every 60s (with 5s timeout)
   - Automatic fallback mode switching with clear log messages
   - When webhooks disabled, starts in polling mode immediately

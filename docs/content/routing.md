@@ -33,7 +33,7 @@ The orchestrator uses an LLM-as-classifier to route each task to the best agent.
 router:
   agent: "claude"           # which LLM does the routing
   model: "haiku"            # fast/cheap model for classification
-  timeout_seconds: 120
+  timeout_seconds: 60
   fallback_executor: "codex"  # safety net if routing fails
   disabled_agents:          # exclude agents from routing
     - opencode

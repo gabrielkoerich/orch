@@ -28,7 +28,7 @@ router:
   mode: "llm"  # "llm" (default) or "round_robin"
   agent: "claude"
   model: "haiku"
-  timeout_seconds: 120
+  timeout_seconds: 60
   fallback_executor: "codex"
   max_route_attempts: 3  # After N LLM routing failures, fall back to round-robin
   # Enable weighted round-robin: deprioritize agents hitting rate limits.

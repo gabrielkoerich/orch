@@ -28,7 +28,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 | `workflow` | `disallowed_tools` | Tool patterns blocked via `--disallowedTools` | `["Bash(rm *)","Bash(rm -*)"]` |
 | `router` | `agent` | Default router executor | `claude` |
 | `router` | `model` | Router model name | `haiku` |
-| `router` | `timeout_seconds` | Router timeout (0 disables timeout) | `120` |
+| `router` | `timeout_seconds` | Router timeout (0 disables timeout) | `60` |
 | `router` | `disabled_agents` | Agents to exclude from routing (e.g. `[opencode]`) | `[]` |
 | `router` | `fallback_executor` | Fallback executor when router fails | `codex` |
 | `router` | `allowed_tools` | Default tool allowlist used in routing prompts | `[yq, jq, bash, ...]` |

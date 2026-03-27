@@ -111,14 +111,14 @@ Sharding is only needed for bots in 2 500+ guilds. For most deployments, the def
 The orchestrator has two modes for receiving GitHub events:
 
 1. **Webhook mode** (instant) — via `webhook.enabled: true` in config
-2. **Polling mode** — via periodic `sync_tick()` (every 120s by default)
+2. **Polling mode** — via periodic `sync_tick()` (every 45s by default)
 
 ### Polling Fallback
 
 When webhooks are enabled but the local server becomes unavailable (e.g. port conflict, crash), the orchestrator automatically switches to polling fallback mode. When webhooks are disabled entirely, polling mode is used from the start.
 
 - **Health check**: Pings the local webhook server's `/health` endpoint every 60 seconds (configurable). This verifies the local HTTP listener is running — it does not verify GitHub-side reachability or webhook secret validity.
-- **Faster polling**: When in fallback mode, sync operations run every 30 seconds (configurable) instead of 120s
+- **Faster polling**: When in fallback mode, sync operations run every 30 seconds (configurable) instead of 45s
 - **Logging**: Clear log messages when entering/exiting fallback mode:
   - `entering polling fallback mode` — webhook health check failed
   - `exiting polling fallback mode` — webhook health restored
@@ -133,7 +133,7 @@ webhook:
 
 engine:
   tick_interval: 10          # Main tick interval (seconds)
-  sync_interval: 120        # Normal sync interval (seconds)
+  sync_interval: 45         # Normal sync interval (seconds)
   fallback_sync_interval: 30 # Faster sync when webhooks fail
   webhook_health_check_interval: 60 # Health check frequency
 ```
@@ -214,7 +214,7 @@ router:
   mode: "llm"              # "llm" (default) or "round_robin"
   agent: "claude"          # which LLM performs routing
   model: "haiku"           # fast/cheap model for classification
-  timeout_seconds: 120     # routing timeout
+  timeout_seconds: 60     # routing timeout
   fallback_executor: "codex"  # fallback if routing fails
   max_route_attempts: 3    # after N LLM failures, fall back to round-robin
   agents:                  # agents to discover in PATH

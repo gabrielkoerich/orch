@@ -129,7 +129,7 @@ sequenceDiagram
         S->>J: jobs tick (cron match)
     end
 
-    Note over S,GH: Every 120s: sync tick (ingest issues, review PRs, owner commands)
+    Note over S,GH: Every 45s: sync tick (ingest issues, review PRs, owner commands)
 ```
 
 ## Task Lifecycle
@@ -298,7 +298,7 @@ graph LR
 │    5. Unblock parents (sub-issue check)          │
 │    6. Job scheduler (cron matching)              │
 │                                                  │
-│  Sync (every 120s):                              │
+│  Sync (every 45s):                              │
 │    - Ingest external tasks (GitHub issues)       │
 │    - Review open PRs                             │
 │    - Scan for owner commands (/retry, /close)    │
