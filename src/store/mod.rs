@@ -25,8 +25,8 @@ pub use control::{parse_since_duration, ControlMessage, MemoryEntry};
 #[allow(unused_imports)]
 pub use helpers::{
     get_cost_estimate, get_recent_memory, get_token_usage, get_total_tokens, opt_store_get_task,
-    review_session_expected, set_review_session_expected, store_increment, store_reset_counters,
-    store_reset_failure_counters, store_set,
+    review_session_expected, set_review_session_expected, store_increment, store_log_activity,
+    store_reset_counters, store_reset_failure_counters, store_set,
 };
 #[allow(unused_imports)]
 pub use jobs::JobState;
@@ -39,8 +39,8 @@ pub use metrics::{
 pub use pricing::{pricing_for_model, CostEstimate, ModelPricing, TokenUsage};
 #[allow(unused_imports)]
 pub use tasks::{
-    CompleteRun, MigrateResult, NewTask, RunTokenUsage, StartRun, StoreRoute, Task, TaskRun,
-    TaskStatus, UpsertExternal,
+    CompleteRun, MigrateResult, NewTask, RunTokenUsage, StartRun, StoreRoute, Task, TaskActivity,
+    TaskRun, TaskStatus, UpsertExternal,
 };
 
 /// Default database path: `~/.orch/orch.db`
