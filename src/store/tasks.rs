@@ -345,6 +345,8 @@ impl TaskStore {
     pub async fn update_status(&self, id: i64, status: TaskStatus) -> anyhow::Result<()> {
         let sql = if status == TaskStatus::Blocked {
             "UPDATE tasks SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
+        } else if status == TaskStatus::NeedsReview {
+            "UPDATE tasks SET status = ?, block_reason = NULL, review_cycles = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
         } else {
             "UPDATE tasks SET status = ?, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
         };
