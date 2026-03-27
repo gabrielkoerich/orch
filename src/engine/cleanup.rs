@@ -4,7 +4,7 @@
 //! deleting local/remote branches, pulling main, and detecting
 //! already-merged PRs so their tasks can be marked done.
 
-use crate::backends::{ExternalBackend, ExternalId, Status};
+use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::cmd::CommandErrorContext;
 use crate::engine::tasks::TaskManager;
 use crate::store;
@@ -75,6 +75,73 @@ pub(crate) async fn cleanup_done_worktrees(
     cleanup_done_worktrees_with_opts(backend, repo, task_manager, store, &opts).await
 }
 
+async fn reconcile_closed_tasks(
+    task_ids: &mut Vec<String>,
+    all_tasks: &[ExternalTask],
+    task_manager: &TaskManager,
+) {
+    let done_set: std::collections::HashSet<String> = task_ids.iter().cloned().collect();
+    let closed_not_in_store: Vec<_> = all_tasks
+        .iter()
+        .filter(|t| t.state == "closed" && !done_set.contains(&t.id.0))
+        .collect();
+
+    // Split: issues that already have status:done label just need worktree
+    // cleanup (no API call needed), vs those needing label reconciliation.
+    let mut already_labeled: Vec<String> = Vec::new();
+    let mut needs_reconcile: Vec<&ExternalTask> = Vec::new();
+    for task in &closed_not_in_store {
+        if task.labels.iter().any(|l| l == "status:done") {
+            already_labeled.push(task.id.0.clone());
+        } else {
+            needs_reconcile.push(task);
+        }
+    }
+
+    // Add already-labeled issues directly (no API call).
+    if !already_labeled.is_empty() {
+        tracing::debug!(
+            count = already_labeled.len(),
+            "closed issues already labeled status:done — adding to cleanup set"
+        );
+        task_ids.extend(already_labeled);
+    }
+
+    // Reconcile issues missing the done label — cap to avoid rate-limit
+    // exhaustion. Remaining issues will be picked up in subsequent cycles.
+    const MAX_RECONCILE_PER_CYCLE: usize = 10;
+    if needs_reconcile.len() > MAX_RECONCILE_PER_CYCLE {
+        tracing::info!(
+            total = needs_reconcile.len(),
+            batch = MAX_RECONCILE_PER_CYCLE,
+            "capping closed-issue reconciliation to avoid rate-limit exhaustion"
+        );
+    }
+    for task in needs_reconcile.iter().take(MAX_RECONCILE_PER_CYCLE) {
+        tracing::info!(
+            task_id = task.id.0,
+            labels = ?task.labels,
+            "closed issue with stale status label — reconciling to done and cleaning up"
+        );
+        if let Err(e) = task_manager
+            .update_task_status(&task.id, Status::Done)
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id.0,
+                err = %e,
+                "failed to reconcile closed issue status to done"
+            );
+        }
+    }
+    task_ids.extend(
+        needs_reconcile
+            .iter()
+            .take(MAX_RECONCILE_PER_CYCLE)
+            .map(|t| t.id.0.clone()),
+    );
+}
+
 /// Cleanup worktrees for completed tasks with explicit options.
 ///
 /// Separated from `cleanup_done_worktrees` so that integration tests can
@@ -113,69 +180,28 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     // is backend-specific and not tracked in the store.
     match backend.list_all_tasks().await {
         Ok(all_tasks) => {
-            let done_set: std::collections::HashSet<String> = task_ids.iter().cloned().collect();
-            let closed_not_in_store: Vec<_> = all_tasks
-                .iter()
-                .filter(|t| t.state == "closed" && !done_set.contains(&t.id.0))
-                .collect();
-
-            // Split: issues that already have status:done label just need worktree
-            // cleanup (no API call needed), vs those needing label reconciliation.
-            let mut already_labeled: Vec<String> = Vec::new();
-            let mut needs_reconcile: Vec<&crate::backends::ExternalTask> = Vec::new();
-            for task in &closed_not_in_store {
-                if task.labels.iter().any(|l| l == "status:done") {
-                    already_labeled.push(task.id.0.clone());
-                } else {
-                    needs_reconcile.push(task);
-                }
-            }
-
-            // Add already-labeled issues directly (no API call).
-            if !already_labeled.is_empty() {
-                tracing::debug!(
-                    count = already_labeled.len(),
-                    "closed issues already labeled status:done — adding to cleanup set"
-                );
-                task_ids.extend(already_labeled);
-            }
-
-            // Reconcile issues missing the done label — cap to avoid rate-limit
-            // exhaustion. Remaining issues will be picked up in subsequent cycles.
-            const MAX_RECONCILE_PER_CYCLE: usize = 10;
-            if needs_reconcile.len() > MAX_RECONCILE_PER_CYCLE {
-                tracing::info!(
-                    total = needs_reconcile.len(),
-                    batch = MAX_RECONCILE_PER_CYCLE,
-                    "capping closed-issue reconciliation to avoid rate-limit exhaustion"
-                );
-            }
-            for task in needs_reconcile.iter().take(MAX_RECONCILE_PER_CYCLE) {
-                tracing::info!(
-                    task_id = task.id.0,
-                    labels = ?task.labels,
-                    "closed issue with stale status label — reconciling to done and cleaning up"
-                );
-                if let Err(e) = task_manager
-                    .update_task_status(&task.id, Status::Done)
-                    .await
-                {
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        err = %e,
-                        "failed to reconcile closed issue status to done"
-                    );
-                }
-            }
-            task_ids.extend(
-                needs_reconcile
-                    .iter()
-                    .take(MAX_RECONCILE_PER_CYCLE)
-                    .map(|t| t.id.0.clone()),
-            );
+            reconcile_closed_tasks(&mut task_ids, &all_tasks, task_manager).await;
         }
         Err(e) => {
             tracing::warn!(err = %e, "failed to list all tasks for closed-issue reconciliation");
+            match backend.list_reconciliation_candidates().await {
+                Ok(fallback_tasks) if !fallback_tasks.is_empty() => {
+                    tracing::info!(
+                        count = fallback_tasks.len(),
+                        "using fallback tasks for closed-issue reconciliation"
+                    );
+                    reconcile_closed_tasks(&mut task_ids, &fallback_tasks, task_manager).await;
+                }
+                Ok(_) => {
+                    tracing::debug!("no fallback tasks available for closed-issue reconciliation");
+                }
+                Err(fallback_err) => {
+                    tracing::warn!(
+                        err = %fallback_err,
+                        "failed to list fallback tasks for closed-issue reconciliation"
+                    );
+                }
+            }
         }
     }
 
