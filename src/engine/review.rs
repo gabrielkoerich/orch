@@ -28,6 +28,7 @@ use crate::engine::runner;
 use crate::engine::runner::worktree;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
+use crate::store::store_log_activity;
 use crate::store::store_set;
 use crate::store::TaskStore;
 use crate::store::{opt_store_get_task, set_review_session_expected, store_increment};
@@ -1008,11 +1009,50 @@ pub(crate) async fn review_and_merge(
         decision = ?decision,
         "review agent decision received"
     );
+    let decision_name = match &decision {
+        ReviewDecision::Approve => "approve",
+        ReviewDecision::RequestChanges { .. } => "request_changes",
+        ReviewDecision::Failed(_) => "failed",
+        ReviewDecision::Blocked(_) => "blocked",
+        ReviewDecision::Skipped => "skipped",
+    };
+    store_log_activity(
+        &Some(Arc::clone(store)),
+        repo,
+        &task.id.0,
+        "review_decision",
+        None,
+        None,
+        Some(&review_agent),
+        Some(&review_model),
+        Some(&serde_json::json!({
+            "decision": decision_name,
+            "pr_number": pr_number_early,
+        })),
+    )
+    .await;
 
     // 12. Push the rebased branch before posting the review decision so the
     // comment references code that's already on the PR.
     match runner::git_ops::push_branch(&worktree_path, &branch_name, &default_branch).await {
         Ok(_) => {
+            store_log_activity(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                "push",
+                None,
+                None,
+                Some(&review_agent),
+                Some(&review_model),
+                Some(&serde_json::json!({
+                    "status": "ok",
+                    "branch": branch_name.clone(),
+                    "default_branch": default_branch.clone(),
+                    "phase": "review",
+                })),
+            )
+            .await;
             if opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
                 .await
                 .map(|t| t.last_error)
@@ -1032,6 +1072,24 @@ pub(crate) async fn review_and_merge(
             }
         }
         Err(e) => {
+            store_log_activity(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                "push",
+                None,
+                None,
+                Some(&review_agent),
+                Some(&review_model),
+                Some(&serde_json::json!({
+                    "status": "error",
+                    "branch": branch_name.clone(),
+                    "default_branch": default_branch.clone(),
+                    "phase": "review",
+                    "error": e.to_string(),
+                })),
+            )
+            .await;
             tracing::error!(
                 task_id = task.id.0,
                 branch = %branch_name,

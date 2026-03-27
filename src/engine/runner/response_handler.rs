@@ -141,11 +141,44 @@ pub async fn handle_success(
 
         // Push
         let push_ok = if !has_commits {
+            store::store_log_activity(
+                store,
+                repo,
+                task_id,
+                "push",
+                None,
+                None,
+                Some(agent_name),
+                model_name,
+                Some(&serde_json::json!({
+                    "status": "skipped",
+                    "reason": "no_commits_ahead",
+                    "branch": wt.branch,
+                    "default_branch": wt.default_branch,
+                })),
+            )
+            .await;
             false
         } else {
             match git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await {
                 Ok(_) => {
                     has_pushed = true;
+                    store::store_log_activity(
+                        store,
+                        repo,
+                        task_id,
+                        "push",
+                        None,
+                        None,
+                        Some(agent_name),
+                        model_name,
+                        Some(&serde_json::json!({
+                            "status": "ok",
+                            "branch": wt.branch,
+                            "default_branch": wt.default_branch,
+                        })),
+                    )
+                    .await;
                     // Clear any stale push failure from a previous run so review_and_merge
                     // does not incorrectly block an approved task.
                     store::store_set(
@@ -162,6 +195,23 @@ pub async fn handle_success(
                 }
                 Err(e) => {
                     tracing::error!(task_id, error = ?e, "push failed");
+                    store::store_log_activity(
+                        store,
+                        repo,
+                        task_id,
+                        "push",
+                        None,
+                        None,
+                        Some(agent_name),
+                        model_name,
+                        Some(&serde_json::json!({
+                            "status": "error",
+                            "branch": wt.branch,
+                            "default_branch": wt.default_branch,
+                            "error": e.to_string(),
+                        })),
+                    )
+                    .await;
                     let msg = format!("push failed: {e}");
                     store::store_set(
                         store,
@@ -214,14 +264,60 @@ pub async fn handle_success(
                         )
                         .await;
                     }
+                    store::store_log_activity(
+                        store,
+                        repo,
+                        task_id,
+                        "pr_create",
+                        None,
+                        None,
+                        Some(agent_name),
+                        model_name,
+                        Some(&serde_json::json!({
+                            "status": "created",
+                            "url": url,
+                        })),
+                    )
+                    .await;
                 }
                 Ok(None) => {
                     // PR already existed
                     has_pr = true;
+                    store::store_log_activity(
+                        store,
+                        repo,
+                        task_id,
+                        "pr_create",
+                        None,
+                        None,
+                        Some(agent_name),
+                        model_name,
+                        Some(&serde_json::json!({
+                            "status": "already_exists",
+                            "branch": wt.branch,
+                        })),
+                    )
+                    .await;
                 }
                 Err(e) => {
                     let err_str = format!("{e}");
                     tracing::error!(task_id, error = ?e, "create PR failed");
+                    store::store_log_activity(
+                        store,
+                        repo,
+                        task_id,
+                        "pr_create",
+                        None,
+                        None,
+                        Some(agent_name),
+                        model_name,
+                        Some(&serde_json::json!({
+                            "status": "error",
+                            "branch": wt.branch,
+                            "error": err_str.clone(),
+                        })),
+                    )
+                    .await;
                     let msg = format!("create PR failed: {e}");
                     store::store_set(
                         store,
