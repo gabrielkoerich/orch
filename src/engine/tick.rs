@@ -127,6 +127,7 @@ pub(crate) async fn tick_detect_silent_agents(
     let silent_sessions = capture.get_silent_sessions_for_repo(repo, grace).await;
 
     for (task_id, session_name) in silent_sessions {
+        let use_backend = should_use_backend(&task_id);
         // Look up agent + model from the store so we can cooldown the right model.
         let store_task = match store.resolve_task_id(repo, &task_id).await {
             Ok(Some(store_id)) => store.get(store_id).await.ok(),
@@ -196,10 +197,12 @@ pub(crate) async fn tick_detect_silent_agents(
 
         // 4. Clear routing state and reset to New for re-routing
         let task_eid = ExternalId(task_id.clone());
-        if let Some(ref st) = store_task {
-            for label in &st.labels {
-                if label.starts_with("agent:") || label.starts_with("complexity:") {
-                    backend.remove_label(&task_eid, label).await.ok();
+        if use_backend {
+            if let Some(ref st) = store_task {
+                for label in &st.labels {
+                    if label.starts_with("agent:") || label.starts_with("complexity:") {
+                        backend.remove_label(&task_eid, label).await.ok();
+                    }
                 }
             }
         }
@@ -235,12 +238,18 @@ pub(crate) async fn tick_detect_silent_agents(
             crate::engine::cooldown::SILENCE_AGENT_COOLDOWN_SECS,
             crate::engine::orch_footer(),
         );
-        if let Err(e) = backend.post_comment(&task_eid, &comment).await {
-            tracing::warn!(task_id, ?e, "failed to post silence detection comment");
+        if use_backend {
+            if let Err(e) = backend.post_comment(&task_eid, &comment).await {
+                tracing::warn!(task_id, ?e, "failed to post silence detection comment");
+            }
         }
     }
 
     Ok(())
+}
+
+fn should_use_backend(task_id: &str) -> bool {
+    !is_internal_id(task_id)
 }
 
 /// Phase 2 of tick: detect tasks stuck in_progress or in_review without an active tmux session and reset them.
@@ -1034,6 +1043,7 @@ pub(crate) async fn tick(
 mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
+    use crate::channels::transport::Transport;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -1049,6 +1059,10 @@ mod tests {
         tasks_by_id: std::collections::HashMap<String, ExternalTask>,
         /// Recorded `update_status` calls.
         status_updates: Arc<Mutex<Vec<(String, Status)>>>,
+        /// Recorded `remove_label` calls.
+        removed_labels: Arc<Mutex<Vec<(String, String)>>>,
+        /// Recorded `post_comment` calls.
+        posted_comments: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl MockBackend {
@@ -1058,6 +1072,8 @@ mod tests {
                 sub_issues: Default::default(),
                 tasks_by_id: Default::default(),
                 status_updates: Arc::new(Mutex::new(vec![])),
+                removed_labels: Arc::new(Mutex::new(vec![])),
+                posted_comments: Arc::new(Mutex::new(vec![])),
             }
         }
     }
@@ -1106,12 +1122,20 @@ mod tests {
             Ok(vec![])
         }
         async fn post_comment(&self, _id: &ExternalId, _body: &str) -> anyhow::Result<()> {
+            self.posted_comments
+                .lock()
+                .unwrap()
+                .push((_id.0.clone(), _body.to_string()));
             Ok(())
         }
         async fn set_labels(&self, _id: &ExternalId, _labels: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         async fn remove_label(&self, _id: &ExternalId, _label: &str) -> anyhow::Result<()> {
+            self.removed_labels
+                .lock()
+                .unwrap()
+                .push((_id.0.clone(), _label.to_string()));
             Ok(())
         }
         async fn get_sub_issues(&self, id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
@@ -1509,5 +1533,67 @@ mod tests {
         assert_eq!(updates.len(), 1, "only one parent should be unblocked");
         assert_eq!(updates[0].0, "40", "task 40 should be unblocked");
         assert_eq!(updates[0].1, Status::New);
+    }
+
+    #[tokio::test]
+    async fn detect_silent_agents_skips_backend_for_internal_tasks() {
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport));
+        let mock = Arc::new(MockBackend::new());
+        let backend: Arc<dyn ExternalBackend> = mock.clone();
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let config = EngineConfig {
+            silence_grace_period: 0,
+            ..EngineConfig::default()
+        };
+
+        let internal_id = store
+            .create_internal("owner/repo", "Silent internal", "", "cron", "1")
+            .await
+            .unwrap();
+        store
+            .update_status(internal_id, crate::store::TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        let task_id = format!("internal:{internal_id}");
+        capture
+            .register_session(&task_id, "orch-test-internal")
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        tick_detect_silent_agents(
+            &tmux,
+            "owner/repo",
+            &capture,
+            &backend,
+            &task_manager,
+            &config,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            mock.removed_labels.lock().unwrap().is_empty(),
+            "internal tasks should skip backend label removal"
+        );
+        assert!(
+            mock.posted_comments.lock().unwrap().is_empty(),
+            "internal tasks should skip backend comments"
+        );
+
+        let task = store.get(internal_id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::New,
+            "internal task should reset to New"
+        );
     }
 }
