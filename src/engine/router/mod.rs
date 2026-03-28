@@ -902,12 +902,11 @@ mod tests {
             );
         }
 
-        // Drop the cooldown by removing from map isn't exposed; instead verify all-cooled fallback
-        // Cool model-b too
+        // Cool model-b too — now all models are cooled
         record_model_failure("opencode", "model-b");
-        // All cooled → deterministic fallback to pool[0] = model-a
+        // All cooled → return None so the caller can fall back to a different agent
         let fallback = config.model_for_complexity("opencode", "simple", "task-fallback");
-        assert_eq!(fallback, Some("model-a".to_string()));
+        assert_eq!(fallback, None);
         let _ = HashMap::<(), ()>::new(); // suppress unused import lint
     }
 
