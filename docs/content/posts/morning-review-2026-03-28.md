@@ -52,8 +52,19 @@ Version drift resolved. No action needed.
 
 ### GitHub Issues
 
-**0 open issues** — all known bugs are either fixed or have no issues filed. The pipeline consumed
-every tracked item overnight.
+**6 open issues** — filed by the morning review job shortly after this post was initially written:
+
+| # | Title | Status |
+|---|-------|--------|
+| [#1173](https://github.com/gabrielkoerich/orch/issues/1173) | chat_session get_or_create_session races and can leak tmux sessions | open |
+| [#1171](https://github.com/gabrielkoerich/orch/issues/1171) | minimax review agent produces unparseable output — 4 parse errors stall review cycles | in_progress (codex) |
+| [#1170](https://github.com/gabrielkoerich/orch/issues/1170) | kimi is out of Copilot quota — review agent fails 100% for 16+ hours | in_progress (codex) |
+| [#1169](https://github.com/gabrielkoerich/orch/issues/1169) | github-copilot models on opencode have ~99% failure rate — silent exit 0 loops waste hours per day | in_review (codex) |
+| [#1168](https://github.com/gabrielkoerich/orch/issues/1168) | chat_session pane diff slices at raw byte offset — wrong output or panic when scrollback shifts | in_progress (codex) |
+| [#1167](https://github.com/gabrielkoerich/orch/issues/1167) | auto_unblock_count reset to 0 when increment fails — bypasses 3-retry guard | in_progress (opencode) |
+
+Three distinct problem areas: opencode/kimi model quota/reliability, chat session concurrency, and a
+correctness bug in the auto-unblock counter.
 
 ### Task Run Outcomes (Last 24h)
 
@@ -126,14 +137,14 @@ and fell back successfully. This is the same pattern from yesterday; it is handl
 
 ## Today's Priorities
 
-1. **Watch bean tasks** — `internal:20405`, `internal:20406`, `internal:20407` are newly queued.
-   First run under the new silence escalation logic; confirm they dispatch and complete cleanly.
-2. **Monitor opencode github-copilot/* failure rate** — with #1165 and #1166 in place, the
-   escalation should reduce wasted re-attempts. If the failure rate stays above ~50% over the next
-   24h, consider disabling `github-copilot/*` models in the config.
-3. **Update SKILL.md** — add notes on silence detection workflow, cooldown escalation behavior,
-   and the `github-copilot/*` reliability pattern. Low urgency but accumulating debt.
-4. **#1148 self-improvement** — still queued (`new`). If pipeline has capacity, dispatch it to
-   continue the error diagnostics work.
-5. **0 open issues** — this is unusual. If no issues emerge from today's runs, the pipeline is
-   truly caught up. Verify by end of day.
+1. **Resolve #1169 (github-copilot ~99% failure)** — currently in_review. If the fix lands, verify
+   the failure rate drops. If it doesn't, disable `github-copilot/*` in config.
+2. **Resolve #1170 (kimi quota exhausted)** and **#1171 (minimax unparseable output)** — both
+   degrade review agent reliability significantly. Kimi quota may self-heal; minimax needs a parser fix.
+3. **Resolve #1167 (auto_unblock_count bug)** — silent correctness bug that bypasses the 3-retry
+   guard. Small fix but high impact on task lifecycle correctness.
+4. **Resolve #1168 and #1173 (chat session bugs)** — byte-offset slicing and race conditions in
+   `get_or_create_session`. Lower urgency but could cause data corruption.
+5. **Watch bean tasks** — `internal:20405`, `internal:20406`, `internal:20407` are queued.
+   Confirm they dispatch and complete cleanly under the new silence escalation logic.
+6. **Update SKILL.md** — capture silence detection and cooldown escalation patterns. Low urgency.
