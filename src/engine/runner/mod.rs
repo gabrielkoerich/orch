@@ -109,7 +109,7 @@ fn classify_run_error_type(last_error: &str) -> &'static str {
         "success"
     } else if last_error.contains("timeout") {
         "timeout"
-    } else if last_error.contains("rate limit") || last_error.contains("usage") {
+    } else if last_error.contains("rate limit") || last_error.contains("usage limit") {
         "rate_limit"
     } else if last_error.contains("auth") || last_error.contains("billing") {
         "auth_error"
@@ -126,13 +126,19 @@ fn classify_run_error_type(last_error: &str) -> &'static str {
         "parse_error"
     } else if last_error.contains("exceeded max attempts") {
         "max_attempts"
-    } else if last_error.contains("cargo")
-        || last_error.contains("clippy")
-        || last_error.contains("test")
-    {
-        "ci_failure"
     } else {
-        "failed"
+        let lower = last_error.to_ascii_lowercase();
+        if lower.contains("cargo build failed")
+            || lower.contains("cargo test")
+            || lower.contains("cargo clippy")
+            || lower.contains("clippy")
+            || lower.contains("test suite failed")
+            || lower.contains("nextest")
+        {
+            "ci_failure"
+        } else {
+            "failed"
+        }
     }
 }
 
@@ -1238,8 +1244,11 @@ mod tests {
             ("parse error: missing json", "parse_error"),
             ("exceeded max attempts while rerouting", "max_attempts"),
             ("cargo test failed", "ci_failure"),
+            ("cargo build failed: error[E0308]", "ci_failure"),
+            ("cargo clippy -- -D warnings failed", "ci_failure"),
             ("clippy failed on warning", "ci_failure"),
-            ("test command exited 1", "ci_failure"),
+            ("nextest run exited 1", "ci_failure"),
+            ("test suite failed: 3 tests failed", "ci_failure"),
         ];
 
         for (input, expected) in cases {
@@ -1263,6 +1272,40 @@ mod tests {
         assert_eq!(
             classify_run_error_type("connection reset while reading pull request data"),
             "failed"
+        );
+    }
+
+    #[test]
+    fn classify_run_error_type_url_with_test_substring_is_not_ci_failure() {
+        // A connection error whose URL path contains "/test-org/" must NOT be ci_failure.
+        assert_eq!(
+            classify_run_error_type(
+                "failed to connect to api.github.com/repos/test-org/repo/pulls/123"
+            ),
+            "failed"
+        );
+        // Bare "test" word in an unrelated error must not trigger ci_failure.
+        assert_eq!(
+            classify_run_error_type("context deadline exceeded testing connection"),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn classify_run_error_type_usage_without_limit_is_not_rate_limit() {
+        // "usage" alone (e.g. token usage reporting) must NOT be rate_limit.
+        assert_eq!(
+            classify_run_error_type("token usage: 1245 tokens"),
+            "failed"
+        );
+        assert_eq!(
+            classify_run_error_type("incorrect usage of git command"),
+            "failed"
+        );
+        // Only "usage limit" should trigger rate_limit.
+        assert_eq!(
+            classify_run_error_type("exceeded usage limit for this billing period"),
+            "rate_limit"
         );
     }
 
