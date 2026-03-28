@@ -162,6 +162,8 @@ pub(crate) async fn tick_detect_silent_agents(
         // 2. Unregister from capture
         capture.unregister_session(&task_id).await;
 
+        let mut extended_note = String::new();
+
         // 3. Cooldown the specific model (not the whole agent)
         if !agent_name.is_empty() && !model_name.is_empty() {
             crate::engine::cooldown::set_model_cooldown(
@@ -169,6 +171,17 @@ pub(crate) async fn tick_detect_silent_agents(
                 &model_name,
                 config.silence_cooldown,
             );
+            if let Some(result) =
+                crate::engine::cooldown::record_silence_detection(&agent_name, &model_name).await
+            {
+                if result.extended_cooldown_applied {
+                    extended_note = format!(
+                        " ({} silences in 24h -> extended cooldown {}s)",
+                        result.count,
+                        crate::engine::cooldown::SILENCE_EXTENDED_COOLDOWN_SECS
+                    );
+                }
+            }
         }
 
         // 3b. Short agent-level cooldown to force router to pick a different agent.
@@ -211,12 +224,13 @@ pub(crate) async fn tick_detect_silent_agents(
 
         // 5. Post a comment explaining what happened
         let comment = format!(
-            "[{}] agent silent for {}s since session start — killed session, cooled down model `{}:{}` for {}s, agent `{}` for {}s, re-routing task{}",
+            "[{}] agent silent for {}s since session start — killed session, cooled down model `{}:{}` for {}s{}, agent `{}` for {}s, re-routing task{}",
             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
             config.silence_grace_period,
             agent_name,
             model_name,
             config.silence_cooldown,
+            extended_note,
             agent_name,
             crate::engine::cooldown::SILENCE_AGENT_COOLDOWN_SECS,
             crate::engine::orch_footer(),

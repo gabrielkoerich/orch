@@ -29,14 +29,31 @@ pub const MODEL_COOLDOWN_SECS: i64 = 60 * 60;
 /// model out while this short cooldown just breaks the same-agent loop.
 pub const SILENCE_AGENT_COOLDOWN_SECS: u64 = 120;
 
+/// Silence detections before applying an extended cooldown (rolling window).
+pub const SILENCE_COUNT_THRESHOLD: usize = 5;
+
+/// Rolling window for silence detections (24 hours).
+pub const SILENCE_COUNT_WINDOW_SECS: i64 = 24 * 60 * 60;
+
+/// Extended cooldown applied after repeated silence detections (4 hours).
+pub const SILENCE_EXTENDED_COOLDOWN_SECS: u64 = 4 * 60 * 60;
+
 /// KV key prefix for persisted cooldowns (both agent and model).
 const KV_PREFIX: &str = "cooldown:";
+
+/// KV key prefix for rolling silence counters.
+const SILENCE_COUNT_PREFIX: &str = "silence_count:";
 
 struct CooldownEntry {
     /// Unix timestamp when the cooldown expires.
     cooldown_until: i64,
     #[allow(dead_code)]
     reason: String,
+}
+
+pub struct SilenceCountResult {
+    pub count: usize,
+    pub extended_cooldown_applied: bool,
 }
 
 /// Global in-memory cooldown map, protected by a Mutex.
@@ -131,6 +148,61 @@ pub fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64) {
 pub fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
     let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
     set_cooldown(agent_name, cooldown_until, "silence_agent_cooldown");
+}
+
+/// Record a silence detection for an agent+model and apply extended cooldowns
+/// when repeated silences exceed the threshold within the rolling window.
+pub async fn record_silence_detection(agent_name: &str, model: &str) -> Option<SilenceCountResult> {
+    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    let store = match store_opt {
+        Some(store) => store,
+        None => {
+            tracing::debug!(
+                agent = agent_name,
+                model,
+                "skipping silence count record (no KV store)"
+            );
+            return None;
+        }
+    };
+
+    let key = format!("{SILENCE_COUNT_PREFIX}{agent_name}:{model}");
+    let now = chrono::Utc::now().timestamp();
+    let window_start = now - SILENCE_COUNT_WINDOW_SECS;
+
+    let mut timestamps = match store.kv_get(&key).await {
+        Ok(Some(raw)) => serde_json::from_str::<Vec<i64>>(&raw).unwrap_or_default(),
+        Ok(None) => Vec::new(),
+        Err(err) => {
+            tracing::warn!(
+                kv_key = key,
+                err = %err,
+                "failed to load silence count from KV"
+            );
+            Vec::new()
+        }
+    };
+
+    timestamps.retain(|ts| *ts >= window_start);
+    timestamps.push(now);
+
+    let count = timestamps.len();
+    let mut extended_cooldown_applied = false;
+    if count >= SILENCE_COUNT_THRESHOLD {
+        set_model_cooldown(agent_name, model, SILENCE_EXTENDED_COOLDOWN_SECS);
+        extended_cooldown_applied = true;
+        timestamps.clear();
+    }
+
+    let value = serde_json::to_string(&timestamps).unwrap_or_else(|_| "[]".to_string());
+    if let Err(err) = store.kv_set(&key, &value).await {
+        tracing::warn!(kv_key = key, err = %err, "failed to persist silence count");
+    }
+
+    Some(SilenceCountResult {
+        count,
+        extended_cooldown_applied,
+    })
 }
 
 /// Check if a specific agent+model combo is in cooldown.
@@ -387,5 +459,39 @@ mod tests {
             "silence agent cooldown should be <= {SILENCE_AGENT_COOLDOWN_SECS}s, got {remaining}s"
         );
         assert!(remaining > 0, "cooldown should still be active");
+    }
+
+    #[tokio::test]
+    async fn record_silence_detection_applies_extended_cooldown() {
+        let store = test_store().await;
+        {
+            let mut slot = cooldown_store().lock().unwrap();
+            *slot = Some(store.clone());
+        }
+
+        let agent = "test_silence_count_agent";
+        let model = "test_silence_count_model";
+        assert!(!is_model_in_cooldown(agent, model));
+
+        for _ in 0..SILENCE_COUNT_THRESHOLD {
+            let result = record_silence_detection(agent, model).await;
+            assert!(result.is_some());
+        }
+
+        assert!(is_model_in_cooldown(agent, model));
+        let key = format!("{agent}:{model}");
+        let remaining = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(&key).expect("cooldown entry should exist");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        assert!(
+            remaining >= SILENCE_EXTENDED_COOLDOWN_SECS as i64 - 5,
+            "extended cooldown should be applied, got {remaining}s"
+        );
+
+        let kv_key = format!("{SILENCE_COUNT_PREFIX}{agent}:{model}");
+        let stored = store.kv_get(&kv_key).await.unwrap().unwrap();
+        assert_eq!(stored, "[]");
     }
 }
