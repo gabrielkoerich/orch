@@ -281,6 +281,13 @@ pub trait ExternalBackend: Send + Sync {
     async fn get_mentions(&self, _since: &str) -> anyhow::Result<Vec<Mention>> {
         Ok(vec![])
     }
+
+    /// Get all comments for a specific task/issue.
+    ///
+    /// Returns empty by default (backends that don't support per-issue comment listing).
+    async fn list_issue_comments(&self, _id: &ExternalId) -> anyhow::Result<Vec<Mention>> {
+        Ok(vec![])
+    }
 }
 
 #[cfg(test)]

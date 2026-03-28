@@ -960,6 +960,16 @@ impl GhHttp {
             .await
     }
 
+    /// Get all comments for a specific issue number.
+    pub async fn get_issue_comments(
+        &self,
+        repo: &str,
+        issue_number: u64,
+    ) -> anyhow::Result<Vec<GitHubComment>> {
+        let url = format!("{GITHUB_API}/repos/{repo}/issues/{issue_number}/comments");
+        self.get_all_pages(&url, &[("per_page", "100")]).await
+    }
+
     /// Get the current authenticated username.
     pub async fn get_whoami(&self) -> anyhow::Result<String> {
         let user: serde_json::Value = self.get_json(&format!("{GITHUB_API}/user")).await?;
