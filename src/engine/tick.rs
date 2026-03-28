@@ -1564,7 +1564,7 @@ mod tests {
 
         let task_id = format!("internal:{internal_id}");
         capture
-            .register_session(&task_id, "orch-test-internal")
+            .register_session("owner/repo", &task_id, "orch-test-internal")
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
