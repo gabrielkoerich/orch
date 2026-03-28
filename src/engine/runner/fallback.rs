@@ -260,8 +260,9 @@ pub async fn handle_error(
             .any(|a| a.as_str() != agent_name && !chain_set.contains(a.as_str()))
     };
 
-    if all_agents_tried {
-        // All agents exhausted — try free models via opencode
+    let is_simple = matches!(complexity, None | Some("simple"));
+    if all_agents_tried && is_simple {
+        // All agents exhausted — try free models via opencode (only for simple tasks)
         let free = agent_runner.free_models();
         if !free.is_empty() {
             let tried_models: String = store::opt_store_get_task(store, repo, task_id)
