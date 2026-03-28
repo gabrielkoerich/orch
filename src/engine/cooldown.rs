@@ -284,7 +284,7 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
     let lower = error_message.to_lowercase();
     let retry_marker = "try again at ";
     if let Some(idx) = lower.find(retry_marker) {
-        let date_str = &error_message[idx + retry_marker.len()..];
+        let date_str = &lower[idx + retry_marker.len()..];
         // Take until period, newline, or end
         let date_str = date_str
             .split(['.', '\n'])
