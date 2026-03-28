@@ -332,8 +332,20 @@ pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> 
     // Step 2: NDJSON — extract text events and parse the concatenated text
     let extracted = ndjson_extract_text(output);
     if !extracted.is_empty() {
-        return parse_review_response(&extracted)
-            .map_err(|e| anyhow::anyhow!("parse failed after NDJSON extraction: {e}"));
+        if let Ok(resp) = parse_review_response(&extracted) {
+            return Ok(resp);
+        }
+        // Extracted text may be plain-text (e.g. "LGTM") — try keyword inference
+        if let Some(resp) = infer_review_response_from_text(&extracted) {
+            tracing::warn!(
+                output_len = output.len(),
+                "review response parsed via keyword fallback on NDJSON text"
+            );
+            return Ok(resp);
+        }
+        anyhow::bail!(
+            "parse failed after NDJSON extraction: no structured JSON or recognizable keywords"
+        );
     }
 
     // Step 3: heuristic fallback for plain-text decisions
@@ -921,6 +933,20 @@ That's all."#;
             r#"{"type":"step_start","timestamp":1000}"#,
             "\n",
             r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}"}}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002}"#,
+        );
+        let resp = parse_review_from_output(ndjson).unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    /// NDJSON with plain-text approval (no JSON) — keyword inference must fire on extracted text.
+    #[test]
+    fn parse_review_from_output_ndjson_plain_text_keyword_fallback() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000,"sessionID":"ses_abc"}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"text":"LGTM, all checks pass, no issues found."}"#,
             "\n",
             r#"{"type":"step_finish","timestamp":1002}"#,
         );
