@@ -60,6 +60,7 @@ enum FailureCategory {
     TokenBudgetExceeded,
     PushFailed,
     PrCreateFailed,
+    ModelUnavailable,
     Unknown,
 }
 
@@ -76,6 +77,7 @@ impl FailureCategory {
                 | FailureCategory::AllAgentsExhausted
                 | FailureCategory::ParseError
                 | FailureCategory::MaxAttempts
+                | FailureCategory::ModelUnavailable
         )
     }
 }
@@ -109,6 +111,13 @@ fn classify_failure(error: &str, outcome: &str) -> FailureCategory {
 
     if lower.contains("output-format=stream-json") && lower.contains("requires --verbose") {
         return FailureCategory::CliFlagError;
+    }
+
+    if lower.contains("model unavailable")
+        || lower.contains("model not found")
+        || lower.contains("does not exist") && lower.contains("model")
+    {
+        return FailureCategory::ModelUnavailable;
     }
 
     if lower.contains("push failed") {
@@ -1587,6 +1596,109 @@ mod tests {
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, crate::store::TaskStatus::Blocked);
         assert_eq!(task.auto_unblock_count, 0);
+    }
+
+    // ── classify_failure: ModelUnavailable ──────────────────────────────
+
+    #[test]
+    fn classify_failure_model_unavailable_phrase_is_recoverable() {
+        let category = classify_failure("model unavailable (anthropic/claude-sonnet-4-6): Model not found: anthropic/claude-sonnet-4-6", "error");
+        assert_eq!(
+            category,
+            FailureCategory::ModelUnavailable,
+            "\"model unavailable\" error must classify as ModelUnavailable"
+        );
+        assert!(
+            category.is_recoverable(),
+            "ModelUnavailable must be recoverable so auto-unblock can re-route"
+        );
+    }
+
+    #[test]
+    fn classify_failure_model_not_found_is_recoverable() {
+        let category = classify_failure("Model not found: gpt-5-ultra", "error");
+        assert_eq!(
+            category,
+            FailureCategory::ModelUnavailable,
+            "\"model not found\" error must classify as ModelUnavailable"
+        );
+        assert!(category.is_recoverable());
+    }
+
+    #[test]
+    fn classify_failure_model_does_not_exist_is_recoverable() {
+        let category = classify_failure("The model `claude-opus-99` does not exist", "error");
+        assert_eq!(category, FailureCategory::ModelUnavailable);
+        assert!(category.is_recoverable());
+    }
+
+    #[tokio::test]
+    async fn auto_unblock_routes_task_blocked_by_model_unavailable() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "1202",
+                title: "Task blocked by model unavailable",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+
+        let run_id = store
+            .start_run(&crate::store::StartRun {
+                task_id: id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "opencode",
+                model: "anthropic/claude-sonnet-4-6",
+                command: "opencode",
+                prompt: "fix the bug",
+            })
+            .await
+            .unwrap();
+        store
+            .complete_run(&crate::store::CompleteRun {
+                run_id,
+                exit_code: Some(1),
+                stdout: "",
+                stderr: "",
+                parsed: "",
+                outcome: "error",
+                error: "model unavailable (anthropic/claude-sonnet-4-6): Model not found: anthropic/claude-sonnet-4-6",
+                tokens: crate::store::RunTokenUsage::default(),
+            })
+            .await
+            .unwrap();
+
+        auto_unblock_blocked_tasks("owner/repo", &task_manager, &store, &dispatching)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::Routed,
+            "task blocked by model unavailable must be auto-unblocked and re-routed"
+        );
+        assert_eq!(task.auto_unblock_count, 1);
     }
 
     #[test]
