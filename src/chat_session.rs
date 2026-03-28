@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 
 use crate::tmux::TmuxManager;
 
@@ -40,14 +41,6 @@ const MAX_RESPONSE_WAIT: Duration = Duration::from_secs(300); // 5 min
 /// Minimum time to wait before checking for completion (let agent start).
 const MIN_RESPONSE_TIME: Duration = Duration::from_secs(1);
 
-/// Global registry of persistent chat sessions.
-///
-/// Keyed by `session_id`. Each entry holds an `Arc<tokio::sync::Mutex<SessionState>>`
-/// so we can hold async locks while sending/capturing.
-static SESSIONS: std::sync::LazyLock<
-    Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<SessionState>>>>,
-> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
 /// Internal state for a persistent chat session.
 struct SessionState {
     tmux_session: String,
@@ -56,6 +49,16 @@ struct SessionState {
     last_activity: Instant,
     idle_timeout: Duration,
 }
+
+type SessionHandle = std::sync::Arc<tokio::sync::Mutex<SessionState>>;
+type SessionCell = std::sync::Arc<OnceCell<SessionHandle>>;
+
+/// Global registry of persistent chat sessions.
+///
+/// Keyed by `session_id`. Each entry holds a single-flight `OnceCell` that
+/// resolves to a `SessionHandle` so concurrent callers await the same creation.
+static SESSIONS: std::sync::LazyLock<Mutex<HashMap<String, SessionCell>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Result of sending a message to a persistent session.
 pub struct SessionResponse {
@@ -186,10 +189,22 @@ pub async fn kill_session(session_id: &str) -> Result<bool> {
     };
 
     if let Some(state) = state {
-        let guard = state.lock().await;
-        let tmux = TmuxManager::new();
-        tmux.kill_session(&guard.tmux_session).await?;
-        Ok(true)
+        if let Some(state) = state.get() {
+            let guard = state.lock().await;
+            let tmux = TmuxManager::new();
+            tmux.kill_session(&guard.tmux_session).await?;
+            Ok(true)
+        } else {
+            // No initialized state yet; fall back to killing by convention name.
+            let session_name = tmux_session_name(session_id);
+            let tmux = TmuxManager::new();
+            if tmux.session_exists(&session_name).await {
+                tmux.kill_session(&session_name).await?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
     } else {
         // Try to kill by convention name even if not in registry
         let session_name = tmux_session_name(session_id);
@@ -218,7 +233,7 @@ pub async fn session_info(session_id: &str) -> Option<String> {
         map.get(session_id).cloned()
     };
 
-    if let Some(state) = state {
+    if let Some(state) = state.and_then(|cell| cell.get().cloned()) {
         let guard = state.lock().await;
         let active = {
             let tmux = TmuxManager::new();
@@ -250,93 +265,97 @@ async fn get_or_create_session(
     agent: &str,
     model: &str,
     system_prompt_file: &str,
-) -> Result<std::sync::Arc<tokio::sync::Mutex<SessionState>>> {
-    // Check registry first
-    {
-        let map = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(state) = map.get(session_id) {
-            return Ok(std::sync::Arc::clone(state));
-        }
-    }
-
-    // Create new session
-    let tmux = TmuxManager::new();
-    let session_name = tmux_session_name(session_id);
-
-    // Kill any stale session with the same name
-    if tmux.session_exists(&session_name).await {
-        let _ = tmux.kill_session(&session_name).await;
-    }
-
-    let command = build_interactive_command(agent, model, system_prompt_file);
-    tracing::info!(session_id, agent, model, %session_name, "creating persistent chat session");
-
-    // Create the tmux session directly (not via TmuxManager.create_session
-    // which uses project/task_id naming)
-    let output = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            &session_name,
-            "-c",
-            "/tmp",
-            &command,
-        ])
-        .output()
-        .await
-        .context("spawning tmux session for chat")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("tmux new-session failed for chat: {stderr}");
-    }
-
-    // Wait for the agent to be ready
-    wait_for_agent_ready(&tmux, &session_name, agent).await?;
-
-    // For non-Claude agents, inject the system prompt as the first message.
-    // Claude gets it via --append-system-prompt flag, but codex and opencode
-    // don't have an equivalent flag for interactive mode.
-    if !matches!(agent, "claude" | "kimi" | "minimax") && !system_prompt_file.is_empty() {
-        if let Ok(prompt_content) = tokio::fs::read_to_string(system_prompt_file).await {
-            if !prompt_content.trim().is_empty() {
-                let injected = format!(
-                    "SYSTEM INSTRUCTIONS — follow these for the entire session:\n\n{}",
-                    prompt_content.trim()
-                );
-                tracing::debug!(
-                    session_id,
-                    agent,
-                    "injecting system prompt as first message"
-                );
-                send_message_to_tmux(&session_name, &injected).await?;
-                // Wait for the agent to process and return to ready state
-                wait_for_agent_ready(&tmux, &session_name, agent).await?;
-            }
-        } else {
-            tracing::warn!(
-                session_id,
-                system_prompt_file,
-                "failed to read system prompt file for injection"
-            );
-        }
-    }
-
-    let state = std::sync::Arc::new(tokio::sync::Mutex::new(SessionState {
-        tmux_session: session_name,
-        agent: agent.to_string(),
-        model: model.to_string(),
-        last_activity: Instant::now(),
-        idle_timeout: DEFAULT_IDLE_TIMEOUT,
-    }));
-
-    {
+) -> Result<SessionHandle> {
+    let cell = {
         let mut map = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-        map.insert(session_id.to_string(), std::sync::Arc::clone(&state));
-    }
+        map.entry(session_id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(OnceCell::new()))
+            .clone()
+    };
 
-    Ok(state)
+    let state = cell
+        .get_or_try_init(|| async move {
+            // Create new session
+            let tmux = TmuxManager::new();
+            let session_name = tmux_session_name(session_id);
+
+            // Kill any stale session with the same name
+            if tmux.session_exists(&session_name).await {
+                let _ = tmux.kill_session(&session_name).await;
+            }
+
+            let command = build_interactive_command(agent, model, system_prompt_file);
+            tracing::info!(
+                session_id,
+                agent,
+                model,
+                %session_name,
+                "creating persistent chat session"
+            );
+
+            // Create the tmux session directly (not via TmuxManager.create_session
+            // which uses project/task_id naming)
+            let output = Command::new("tmux")
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &session_name,
+                    "-c",
+                    "/tmp",
+                    &command,
+                ])
+                .output()
+                .await
+                .context("spawning tmux session for chat")?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("tmux new-session failed for chat: {stderr}");
+            }
+
+            // Wait for the agent to be ready
+            wait_for_agent_ready(&tmux, &session_name, agent).await?;
+
+            // For non-Claude agents, inject the system prompt as the first message.
+            // Claude gets it via --append-system-prompt flag, but codex and opencode
+            // don't have an equivalent flag for interactive mode.
+            if !matches!(agent, "claude" | "kimi" | "minimax") && !system_prompt_file.is_empty() {
+                if let Ok(prompt_content) = tokio::fs::read_to_string(system_prompt_file).await {
+                    if !prompt_content.trim().is_empty() {
+                        let injected = format!(
+                            "SYSTEM INSTRUCTIONS — follow these for the entire session:\n\n{}",
+                            prompt_content.trim()
+                        );
+                        tracing::debug!(
+                            session_id,
+                            agent,
+                            "injecting system prompt as first message"
+                        );
+                        send_message_to_tmux(&session_name, &injected).await?;
+                        // Wait for the agent to process and return to ready state
+                        wait_for_agent_ready(&tmux, &session_name, agent).await?;
+                    }
+                } else {
+                    tracing::warn!(
+                        session_id,
+                        system_prompt_file,
+                        "failed to read system prompt file for injection"
+                    );
+                }
+            }
+
+            Ok(std::sync::Arc::new(tokio::sync::Mutex::new(SessionState {
+                tmux_session: session_name,
+                agent: agent.to_string(),
+                model: model.to_string(),
+                last_activity: Instant::now(),
+                idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            })))
+        })
+        .await?;
+
+    Ok(std::sync::Arc::clone(state))
 }
 
 /// Build the interactive command for an agent.
