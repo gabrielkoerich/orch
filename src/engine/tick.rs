@@ -124,7 +124,7 @@ pub(crate) async fn tick_detect_silent_agents(
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase1b.silence").entered();
     let grace = std::time::Duration::from_secs(config.silence_grace_period);
-    let silent_sessions = capture.get_silent_sessions(grace).await;
+    let silent_sessions = capture.get_silent_sessions_for_repo(repo, grace).await;
 
     for (task_id, session_name) in silent_sessions {
         // Look up agent + model from the store so we can cooldown the right model.
@@ -731,7 +731,9 @@ pub(crate) async fn tick_dispatch_tasks(
 
         // Register session for capture
         let session_name = tmux.session_name(repo, &task_id);
-        capture.register_session(&task_id, &session_name).await;
+        capture
+            .register_session(repo, &task_id, &session_name)
+            .await;
 
         // Dispatch task
         let runner = runner.clone();

@@ -1552,7 +1552,9 @@ mod tests {
             .expect("failed to start tmux session");
 
         // Register session with capture service and transport binding
-        capture.register_session(&task_id, &session_name).await;
+        capture
+            .register_session("owner/repo", &task_id, &session_name)
+            .await;
         transport
             .bind(&task_id, &session_name, "telegram", "12345")
             .await;

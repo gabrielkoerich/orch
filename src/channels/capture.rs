@@ -23,6 +23,8 @@ pub(crate) const MAX_OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
 /// Buffer for tracking session output state.
 #[derive(Debug, Clone)]
 pub struct OutputBuffer {
+    /// Repo slug (owner/repo) that owns this session.
+    pub repo: String,
     /// The tmux session name (e.g., "orch-myproject-42")
     pub session: String,
     /// The task ID this session belongs to
@@ -69,9 +71,10 @@ impl CaptureService {
     }
 
     /// Register a session to be tracked.
-    pub async fn register_session(&self, task_id: &str, session: &str) {
+    pub async fn register_session(&self, repo: &str, task_id: &str, session: &str) {
         let now = Utc::now();
         let buffer = OutputBuffer {
+            repo: repo.to_string(),
             session: session.to_string(),
             task_id: task_id.to_string(),
             last_content: String::new(),
@@ -86,13 +89,14 @@ impl CaptureService {
             .write()
             .await
             .insert(task_id.to_string(), buffer);
-        tracing::debug!(task_id, session, "session registered for capture");
+        tracing::debug!(repo, task_id, session, "session registered for capture");
     }
 
     /// Unregister a session (stop tracking).
     pub async fn unregister_session(&self, task_id: &str) {
         if let Some(buffer) = self.buffers.write().await.remove(task_id) {
             tracing::debug!(
+                repo = buffer.repo,
                 task_id = buffer.task_id,
                 session = buffer.session,
                 "session unregistered"
@@ -145,14 +149,18 @@ impl CaptureService {
     ///
     /// This intentionally does NOT flag agents that produced output then went
     /// quiet (e.g. long tool calls with sparse output).
-    pub async fn get_silent_sessions(
+    pub async fn get_silent_sessions_for_repo(
         &self,
+        repo: &str,
         grace_period: std::time::Duration,
     ) -> Vec<(String, String)> {
         let now = Utc::now();
         let buffers = self.buffers.read().await;
         let mut silent = Vec::new();
         for buf in buffers.values() {
+            if buf.repo != repo {
+                continue;
+            }
             if buf.has_output {
                 continue;
             }
@@ -301,6 +309,7 @@ mod tests {
 
     fn make_buffer() -> OutputBuffer {
         OutputBuffer {
+            repo: "owner/repo".to_string(),
             session: "test-session".to_string(),
             task_id: "task-1".to_string(),
             last_content: String::new(),
@@ -402,9 +411,10 @@ mod tests {
     async fn get_silent_sessions_returns_only_no_output_past_grace() {
         let transport = Arc::new(Transport::new());
         let svc = CaptureService::new(transport);
+        let repo = "owner/repo";
 
         // Register a session and backdate it past the grace period
-        svc.register_session("silent-task", "orch-test-silent")
+        svc.register_session(repo, "silent-task", "orch-test-silent")
             .await;
         {
             let mut buffers = svc.buffers.write().await;
@@ -413,7 +423,7 @@ mod tests {
         }
 
         // Register a session that HAS produced output (should not be returned)
-        svc.register_session("active-task", "orch-test-active")
+        svc.register_session(repo, "active-task", "orch-test-active")
             .await;
         {
             let mut buffers = svc.buffers.write().await;
@@ -423,12 +433,44 @@ mod tests {
         }
 
         // Register a fresh session within grace period (should not be returned)
-        svc.register_session("new-task", "orch-test-new").await;
+        svc.register_session(repo, "new-task", "orch-test-new")
+            .await;
 
         let grace = std::time::Duration::from_secs(120);
-        let silent = svc.get_silent_sessions(grace).await;
+        let silent = svc.get_silent_sessions_for_repo(repo, grace).await;
         assert_eq!(silent.len(), 1);
         assert_eq!(silent[0].0, "silent-task");
+    }
+
+    #[tokio::test]
+    async fn get_silent_sessions_filters_by_repo() {
+        let transport = Arc::new(Transport::new());
+        let svc = CaptureService::new(transport);
+
+        svc.register_session("owner/repo-a", "task-a", "orch-a")
+            .await;
+        svc.register_session("owner/repo-b", "task-b", "orch-b")
+            .await;
+        {
+            let mut buffers = svc.buffers.write().await;
+            let buf_a = buffers.get_mut("task-a").unwrap();
+            buf_a.registered_at = Utc::now() - chrono::Duration::seconds(200);
+            let buf_b = buffers.get_mut("task-b").unwrap();
+            buf_b.registered_at = Utc::now() - chrono::Duration::seconds(200);
+        }
+
+        let grace = std::time::Duration::from_secs(120);
+        let silent_a = svc
+            .get_silent_sessions_for_repo("owner/repo-a", grace)
+            .await;
+        assert_eq!(silent_a.len(), 1);
+        assert_eq!(silent_a[0].0, "task-a");
+
+        let silent_b = svc
+            .get_silent_sessions_for_repo("owner/repo-b", grace)
+            .await;
+        assert_eq!(silent_b.len(), 1);
+        assert_eq!(silent_b[0].0, "task-b");
     }
 
     #[test]

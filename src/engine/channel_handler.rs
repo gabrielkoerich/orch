@@ -255,7 +255,9 @@ async fn create_and_announce_task(
             transport
                 .bind(&task_id, &session_name, channel, thread_id)
                 .await;
-            capture.register_session(&task_id, &session_name).await;
+            capture
+                .register_session(repo, &task_id, &session_name)
+                .await;
             let transport_clone = transport.clone();
             let channels_clone = channels.clone();
             let task_id_clone = task_id.clone();

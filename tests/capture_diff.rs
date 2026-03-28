@@ -44,6 +44,7 @@ use capture::{OutputBuffer, MAX_OUTPUT_BUFFER_BYTES};
 
 fn buffer() -> OutputBuffer {
     OutputBuffer {
+        repo: "owner/repo".to_string(),
         session: "session".to_string(),
         task_id: "task".to_string(),
         last_content: String::new(),
