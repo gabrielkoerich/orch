@@ -1604,21 +1604,53 @@ mod tests {
         assert_eq!(task.auto_unblock_count, 0);
     }
 
-    // ── classify_failure: ModelUnavailable ──────────────────────────────
+     // ── classify_failure: ModelUnavailable ──────────────────────────────
 
-    #[test]
-    fn classify_failure_model_unavailable_phrase_is_recoverable() {
-        let category = classify_failure("model unavailable (anthropic/claude-sonnet-4-6): Model not found: anthropic/claude-sonnet-4-6", "error");
-        assert_eq!(
-            category,
-            FailureCategory::ModelUnavailable,
-            "\"model unavailable\" error must classify as ModelUnavailable"
-        );
-        assert!(
-            category.is_recoverable(),
-            "ModelUnavailable must be recoverable so auto-unblock can re-route"
-        );
-    }
+     #[test]
+     fn classify_failure_model_unavailable_phrase_is_recoverable() {
+         let category = classify_failure("model unavailable (anthropic/claude-sonnet-4-6): Model not found: anthropic/claude-sonnet-4-6", "error");
+         assert_eq!(
+             category,
+             FailureCategory::ModelUnavailable,
+             "\"model unavailable\" error must classify as ModelUnavailable"
+         );
+         assert!(
+             category.is_recoverable(),
+             "ModelUnavailable must be recoverable so auto-unblock can re-route"
+         );
+     }
+
+     // ── classify_failure: PrCreateFailed ──────────────────────────────
+     #[test]
+     fn classify_failure_pr_create_failed_specific_patterns() {
+         // These should be classified as PrCreateFailed
+         assert_eq!(
+             classify_failure("create pr failed", ""),
+             FailureCategory::PrCreateFailed
+         );
+         assert_eq!(
+             classify_failure("failed to create pull request", ""),
+             FailureCategory::PrCreateFailed
+         );
+         assert_eq!(
+             classify_failure("pull request creation failed", ""),
+             FailureCategory::PrCreateFailed
+         );
+         
+         // These should NOT be classified as PrCreateFailed (they were before the fix)
+         assert_ne!(
+             classify_failure("network failed while fetching pull request status", ""),
+             FailureCategory::PrCreateFailed
+         );
+         assert_ne!(
+             classify_failure("connection failed, retrying pull request check", ""),
+             FailureCategory::PrCreateFailed
+         );
+         assert_ne!(
+             classify_failure("pull request created but failed to merge", ""),
+             FailureCategory::PrCreateFailed
+         );
+     }
 
     #[test]
     fn classify_failure_model_not_found_is_recoverable() {
