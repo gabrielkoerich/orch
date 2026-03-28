@@ -30,6 +30,7 @@ pub async fn handle_error(
     agent_name: &str,
     agent_runner: &dyn agents::AgentRunner,
     model_name: Option<&str>,
+    complexity: Option<&str>,
     new_attempts: u32,
     store: &Option<Arc<TaskStore>>,
     repo: &str,
@@ -155,10 +156,13 @@ pub async fn handle_error(
                 }
                 // Before falling through to handle_failover() (which tries claude/codex),
                 // check whether this agent has any free models that haven't been tried yet.
-                // This keeps silent failures contained within the free-model pool and
-                // preserves claude/codex capacity for tasks that genuinely need them.
+                // Only do this for simple-complexity tasks: free models are the right tier
+                // for simple tasks.  For medium/complex tasks, fall through to
+                // handle_failover() so the next agent is chosen at the same complexity
+                // level (e.g. claude/sonnet or codex/gpt-5.2) instead of a weaker model.
+                let is_simple = matches!(complexity, None | Some("simple"));
                 let free = agent_runner.free_models();
-                if !free.is_empty() {
+                if is_simple && !free.is_empty() {
                     let tried_models: String = store::opt_store_get_task(store, repo, task_id)
                         .await
                         .map(|t| t.model_reroute_chain)
@@ -382,7 +386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn silent_exit0_retries_free_model_before_failover() {
+    async fn silent_exit0_retries_free_model_for_simple_complexity() {
         let runner = MockRunner {
             free: vec!["opencode/mimo-v2-omni-free".to_string()],
         };
@@ -391,12 +395,14 @@ mod tests {
             message: String::new(),
         };
 
+        // complexity=simple → free model retry is appropriate
         let result = handle_error(
             "test-1112-a",
             &err,
             "opencode",
             &runner,
             Some("opencode/gpt-5.4-mini"),
+            Some("simple"),
             1,
             &None,
             "owner/repo",
@@ -406,7 +412,100 @@ mod tests {
 
         assert!(
             matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "new"),
-            "expected EarlyReturn{{status: new}} but got Continue — free model should be tried first"
+            "expected EarlyReturn{{status: new}} for simple complexity — free model should be tried first"
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_exit0_retries_free_model_when_complexity_unknown() {
+        let runner = MockRunner {
+            free: vec!["opencode/mimo-v2-omni-free".to_string()],
+        };
+        let err = AgentError::Unknown {
+            exit_code: 0,
+            message: String::new(),
+        };
+
+        // complexity=None (unknown) → treated as simple → free model retry
+        let result = handle_error(
+            "test-1112-a2",
+            &err,
+            "opencode",
+            &runner,
+            Some("opencode/gpt-5.4-mini"),
+            None,
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "new"),
+            "expected EarlyReturn{{status: new}} for unknown complexity — free model should be tried first"
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_exit0_skips_free_model_for_medium_complexity() {
+        let runner = MockRunner {
+            free: vec!["opencode/mimo-v2-omni-free".to_string()],
+        };
+        let err = AgentError::Unknown {
+            exit_code: 0,
+            message: String::new(),
+        };
+
+        // complexity=medium → skip free model retry, fall through to agent failover
+        let result = handle_error(
+            "test-1195-medium",
+            &err,
+            "opencode",
+            &runner,
+            Some("opencode/copilot-gpt-5.4-mini"),
+            Some("medium"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, ErrorHandleResult::Continue { .. }),
+            "expected Continue for medium complexity — should fall through to agent failover, not retry with free model"
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_exit0_skips_free_model_for_complex_complexity() {
+        let runner = MockRunner {
+            free: vec!["opencode/mimo-v2-omni-free".to_string()],
+        };
+        let err = AgentError::Unknown {
+            exit_code: 0,
+            message: String::new(),
+        };
+
+        // complexity=complex → skip free model retry, fall through to agent failover
+        let result = handle_error(
+            "test-1195-complex",
+            &err,
+            "opencode",
+            &runner,
+            Some("opencode/copilot-gpt-5.4-mini"),
+            Some("complex"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, ErrorHandleResult::Continue { .. }),
+            "expected Continue for complex complexity — should fall through to agent failover, not retry with free model"
         );
     }
 
@@ -424,6 +523,7 @@ mod tests {
             "opencode",
             &runner,
             Some("opencode/gpt-5.4-mini"),
+            Some("simple"),
             1,
             &None,
             "owner/repo",
@@ -436,4 +536,5 @@ mod tests {
             "expected Continue (fallthrough to failover) when no free models available"
         );
     }
+
 }
