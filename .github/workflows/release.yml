@@ -45,9 +45,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run tests
-        run: cargo nextest run --no-fail-fast
-
       - name: Run tests with coverage
         run: cargo llvm-cov nextest --lcov --output-path lcov.info
 
