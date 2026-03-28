@@ -30,7 +30,7 @@ timeout 300 gh pr checks {{PR_NUMBER}} --watch --fail-fast --required || true
 
 **Do NOT request changes for local-only test failures when required checks are green.**
 
-**Non-required checks** (e.g. `review-gate`, `deploy`, `release`, `build-macos`, `check-release`) are informational — ignore their pass/fail status. Do NOT request changes based on non-required check failures.
+**Non-required checks** are informational — the `--required` flag filters to required checks only. The only non-required check orch installs is `review-gate`. Ignore pass/fail status of non-required checks. Do NOT request changes based on non-required check failures.
 
 ### Step 3: Check architecture alignment
 
@@ -93,4 +93,4 @@ Do NOT respond with prose summaries.
 Decision rules:
 - **approve**: Required GitHub CI checks pass, branch is rebased, code meets requirements, no major issues
 - **request_changes**: Required GitHub CI checks fail on PR-related code, there are bugs, scope creep, or the code doesn't meet requirements
-- **Do NOT** request changes solely because non-required checks (e.g. `review-gate`, `deploy`, `release`) are failing
+- **Do NOT** request changes solely because non-required checks are failing
