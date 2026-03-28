@@ -18,6 +18,7 @@ use super::{agent, context, git_ops, worktree};
 pub struct TaskInitResult {
     pub agent_name: String,
     pub model_name: Option<String>,
+    pub complexity: Option<String>,
     pub task_title: String,
     pub wt: worktree::WorktreeSetup,
     pub invocation: agent::AgentInvocation,
@@ -147,6 +148,8 @@ pub async fn prepare_task(
         .map(String::from)
         .or_else(|| route_result.as_ref().and_then(|r| r.model.clone()));
 
+    let complexity = route_result.as_ref().map(|r| r.complexity.clone());
+
     // Build a minimal ExternalTask for prompt building
     let pseudo_task = build_pseudo_task(task_id, store, repo).await;
     let task_title = pseudo_task.title.clone();
@@ -241,6 +244,7 @@ pub async fn prepare_task(
     Ok(TaskInitResult {
         agent_name,
         model_name,
+        complexity,
         task_title,
         wt,
         invocation,

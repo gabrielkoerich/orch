@@ -480,6 +480,7 @@ impl TaskRunner {
                     &init.agent_name,
                     &*agent_runner,
                     init.model_name.as_deref(),
+                    init.complexity.as_deref(),
                     init.new_attempts,
                     &self.store,
                     &self.repo,
