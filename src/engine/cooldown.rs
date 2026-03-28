@@ -220,6 +220,14 @@ pub fn is_agent_in_cooldown(agent_name: &str) -> bool {
 fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) {
     {
         let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map.get(key) {
+            // Never shorten an existing cooldown. This prevents a short
+            // retry window (e.g., generic rate limit) from overriding a longer
+            // billing-cycle cooldown.
+            if existing.cooldown_until >= cooldown_until {
+                return;
+            }
+        }
         map.insert(
             key.to_string(),
             CooldownEntry {
@@ -318,6 +326,8 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
     if lower.contains("billing cycle")
         || lower.contains("next cycle")
         || lower.contains("quota will be refreshed")
+        || lower.contains("usage limit")
+        || lower.contains("quota exceeded")
     {
         let twenty_four_hours = chrono::Utc::now().timestamp() + 24 * 60 * 60;
         tracing::info!("detected billing cycle limit — cooldown for 24 hours");
@@ -439,6 +449,31 @@ mod tests {
         let agent = "test_agent_persist_check";
         record_agent_failure_with_message(agent, "");
         assert!(is_agent_in_cooldown(agent));
+    }
+
+    #[test]
+    fn cooldown_never_shortens() {
+        let agent = "test_agent_no_shorten";
+        set_agent_cooldown(agent, 24 * 60 * 60);
+        let initial = {
+            let map = cooldowns().lock().unwrap();
+            map.get(agent)
+                .expect("cooldown entry should exist")
+                .cooldown_until
+        };
+
+        // Shorter cooldown attempt should not override the existing one.
+        record_agent_failure_with_message(agent, "rate limit");
+        let after = {
+            let map = cooldowns().lock().unwrap();
+            map.get(agent)
+                .expect("cooldown entry should exist")
+                .cooldown_until
+        };
+        assert_eq!(
+            initial, after,
+            "cooldown should not be shortened by later failures"
+        );
     }
 
     #[test]
