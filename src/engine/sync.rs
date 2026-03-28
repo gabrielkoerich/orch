@@ -135,7 +135,10 @@ fn classify_failure(error: &str, outcome: &str) -> FailureCategory {
         return FailureCategory::SilentExit0;
     }
 
-    if outcome == "parse_error" || lower.contains("invalid response") {
+    if outcome == "parse_error"
+        || lower.contains("invalid response")
+        || lower.contains("parse error")
+    {
         return FailureCategory::ParseError;
     }
 

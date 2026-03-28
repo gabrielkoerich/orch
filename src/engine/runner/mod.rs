@@ -119,7 +119,7 @@ fn classify_run_error_type(last_error: &str) -> &'static str {
         "no_commits"
     } else if last_error.contains("create PR failed") || last_error.contains("pull request") {
         "pr_failed"
-    } else if last_error.contains("invalid response") {
+    } else if last_error.contains("invalid response") || last_error.contains("parse error") {
         "parse_error"
     } else if last_error.contains("exceeded max attempts") {
         "max_attempts"
