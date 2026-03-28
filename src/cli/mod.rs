@@ -391,7 +391,9 @@ pub async fn stream_task(task_id: &str, raw: bool) -> anyhow::Result<()> {
     // Start a CaptureService to poll the tmux session and push chunks to transport.
     // This is necessary because the CLI's Transport is isolated from the engine's.
     let capture = Arc::new(CaptureService::new(transport.clone()));
-    capture.register_session(task_id, &session_name).await;
+    capture
+        .register_session(&repo, task_id, &session_name)
+        .await;
     let capture_handle = tokio::spawn({
         let capture = capture.clone();
         async move { capture.run().await }
@@ -488,7 +490,7 @@ pub async fn stream_all(raw: bool) -> anyhow::Result<()> {
                     transport
                         .bind(&session, &session, "cli", "stream-all")
                         .await;
-                    capture.register_session(&session, &session).await;
+                    capture.register_session("cli", &session, &session).await;
                     known.insert(session.clone());
                     added.push(session);
                 }
