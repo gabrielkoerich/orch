@@ -686,6 +686,74 @@ async fn branch_newer_than_last_review(
     }
 }
 
+/// Check whether all *required* CI checks pass for the given PR.
+///
+/// Returns `Some(true)` when all required contexts report success, `Some(false)` when
+/// at least one required check is failing or pending, and `None` on any API error (so
+/// the caller can fall through to the default escalation path).
+async fn required_ci_checks_pass(gh: &GhHttp, repo: &str, pr_number: u64) -> Option<bool> {
+    let pr = match gh.get_pr(repo, pr_number).await {
+        Ok(pr) => pr,
+        Err(e) => {
+            tracing::warn!(pr_number, err = %e, "required_ci_checks_pass: failed to fetch PR");
+            return None;
+        }
+    };
+
+    let head_sha = pr.head.sha.clone();
+    let base_branch = pr.base.ref_.clone();
+
+    let required_contexts = match gh
+        .get_required_status_check_contexts(repo, &base_branch)
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            tracing::warn!(
+                pr_number,
+                err = %e,
+                "required_ci_checks_pass: failed to fetch required contexts"
+            );
+            return None;
+        }
+    };
+
+    // No required contexts configured — treat as passing.
+    if required_contexts.is_empty() {
+        return Some(true);
+    }
+
+    let check_runs = match gh.get_check_runs(repo, &head_sha).await {
+        Ok(runs) => runs
+            .into_iter()
+            .map(|r| (r.name, r.status, r.conclusion))
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!(
+                pr_number,
+                err = %e,
+                "required_ci_checks_pass: failed to fetch check runs"
+            );
+            return None;
+        }
+    };
+
+    let statuses = match gh.get_commit_status_contexts(repo, &head_sha).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                pr_number,
+                err = %e,
+                "required_ci_checks_pass: failed to fetch commit statuses"
+            );
+            return None;
+        }
+    };
+
+    let (state, ..) = required_checks_state(&required_contexts, &check_runs, &statuses);
+    Some(state == "success")
+}
+
 /// Handle review changes request — re-dispatch the original agent.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_review_changes(
@@ -701,8 +769,9 @@ pub(crate) async fn handle_review_changes(
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     // 1. Check review cycle count (max 2 review rounds)
-    let review_cycles: u32 = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
-        .await
+    let task_store_record = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await;
+    let review_cycles: u32 = task_store_record
+        .as_ref()
         .map(|t| t.review_cycles.max(0) as u32)
         .unwrap_or(0);
 
@@ -738,6 +807,82 @@ pub(crate) async fn handle_review_changes(
                 // Fall through to escalation below.
             } else {
                 return Ok(());
+            }
+        }
+
+        // Before blocking, check whether all *required* CI checks pass.
+        // If they do, the review agent may have been triggered by a non-required
+        // check failure (e.g. `review-gate`).  Allow one auto-recovery to reset
+        // the review cycle counter and re-trigger the review agent.
+        let ci_recovery_count: i32 = task_store_record
+            .as_ref()
+            .map(|t| t.auto_unblock_count)
+            .unwrap_or(0);
+
+        if ci_recovery_count < 1 {
+            match required_ci_checks_pass(&gh, repo, pr_number).await {
+                Some(true) => {
+                    tracing::info!(
+                        task_id = task.id.0,
+                        review_cycles,
+                        "required CI checks pass — auto-recovering from non-required check failure"
+                    );
+                    store_set(
+                        &Some(Arc::clone(store)),
+                        repo,
+                        &task.id.0,
+                        &[("review_cycles", serde_json::json!(0))],
+                    )
+                    .await;
+                    store_increment(
+                        &Some(Arc::clone(store)),
+                        repo,
+                        &task.id.0,
+                        "auto_unblock_count",
+                    )
+                    .await;
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::NeedsReview)
+                        .await
+                    {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            err = %e,
+                            "auto-recovery: failed to set NeedsReview — will escalate instead"
+                        );
+                        // Fall through to escalation below.
+                    } else {
+                        let recovery_comment = format!(
+                            "🔄 Auto-recovery: required CI checks pass. \
+                            The review agent may have been blocked by a non-required check failure. \
+                            Resetting review cycles and re-triggering review.{}",
+                            attribution_footer("Commented", review_agent, review_model)
+                        );
+                        if let Err(e) = gh.add_comment(repo, &pr_num_str, &recovery_comment).await {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                pr_number,
+                                err = %e,
+                                "auto-recovery: failed to post recovery comment on PR"
+                            );
+                        }
+                        return Ok(());
+                    }
+                }
+                Some(false) => {
+                    tracing::info!(
+                        task_id = task.id.0,
+                        review_cycles,
+                        "required CI checks failing — escalating to Blocked"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        review_cycles,
+                        "could not determine required CI check state — escalating to Blocked"
+                    );
+                }
             }
         }
 
