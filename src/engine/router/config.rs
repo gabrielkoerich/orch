@@ -73,65 +73,6 @@ pub fn parse_pool_entry(entry: &str) -> (String, String) {
 
 impl Default for RouterConfig {
     fn default() -> Self {
-        let mut model_map = HashMap::new();
-
-        // Simple tasks — fast, cheap models
-        let mut simple = HashMap::new();
-        simple.insert(
-            "claude".to_string(),
-            vec!["claude-haiku-4-5-20251001".to_string()],
-        );
-        simple.insert("codex".to_string(), vec!["o4-mini".to_string()]);
-        simple.insert(
-            "opencode".to_string(),
-            vec!["openai/gpt-4.1-mini".to_string()],
-        );
-        simple.insert(
-            "kimi".to_string(),
-            vec!["claude-haiku-4-5-20251001".to_string()],
-        );
-        simple.insert(
-            "minimax".to_string(),
-            vec!["claude-haiku-4-5-20251001".to_string()],
-        );
-        model_map.insert("simple".to_string(), simple);
-
-        // Medium tasks — balanced cost/capability
-        let mut medium = HashMap::new();
-        medium.insert("claude".to_string(), vec!["claude-sonnet-4-6".to_string()]);
-        medium.insert("codex".to_string(), vec!["gpt-4.1".to_string()]);
-        medium.insert(
-            "opencode".to_string(),
-            vec!["anthropic/claude-sonnet-4-6".to_string()],
-        );
-        medium.insert("kimi".to_string(), vec!["claude-sonnet-4-6".to_string()]);
-        medium.insert("minimax".to_string(), vec!["claude-sonnet-4-6".to_string()]);
-        model_map.insert("medium".to_string(), medium);
-
-        // Complex tasks — most capable models
-        let mut complex = HashMap::new();
-        complex.insert("claude".to_string(), vec!["claude-opus-4-6".to_string()]);
-        complex.insert("codex".to_string(), vec!["o3".to_string()]);
-        complex.insert(
-            "opencode".to_string(),
-            vec!["anthropic/claude-opus-4-6".to_string()],
-        );
-        complex.insert("kimi".to_string(), vec!["claude-opus-4-6".to_string()]);
-        complex.insert("minimax".to_string(), vec!["claude-opus-4-6".to_string()]);
-        model_map.insert("complex".to_string(), complex);
-
-        // Review tasks — strong reasoning, moderate cost
-        let mut review = HashMap::new();
-        review.insert("claude".to_string(), vec!["claude-sonnet-4-6".to_string()]);
-        review.insert("codex".to_string(), vec!["gpt-4.1".to_string()]);
-        review.insert(
-            "opencode".to_string(),
-            vec!["anthropic/claude-sonnet-4-6".to_string()],
-        );
-        review.insert("kimi".to_string(), vec!["claude-sonnet-4-6".to_string()]);
-        review.insert("minimax".to_string(), vec!["claude-sonnet-4-6".to_string()]);
-        model_map.insert("review".to_string(), review);
-
         Self {
             mode: "llm".to_string(),
             router_agent: "claude".to_string(),
@@ -158,7 +99,10 @@ impl Default for RouterConfig {
                 "bun".to_string(),
             ],
             default_skills: vec!["gh".to_string(), "git-worktree".to_string()],
-            model_map,
+            // model_map is intentionally empty — config.yml is the sole source of truth.
+            // Hardcoded models cause "Model not found" failures when the model does not
+            // exist for a particular agent (e.g. anthropic/ prefixed models for opencode).
+            model_map: HashMap::new(),
             weighted_round_robin: false,
         }
     }
@@ -314,8 +258,11 @@ impl RouterConfig {
 
         // Load model_map overrides from config (model_map.{complexity}.{agent})
         // Value may be a single string ("model-name") or a JSON array (["m1","m2"]).
+        // Iterate over all known complexity tiers regardless of what is in model_map —
+        // the Default impl has no hardcoded entries, so iterating over keys() would be a no-op.
         let known_agents = ["claude", "codex", "opencode", "kimi", "minimax"];
-        for complexity in config.model_map.keys().cloned().collect::<Vec<_>>() {
+        let known_complexities = ["simple", "medium", "complex", "review"];
+        for complexity in known_complexities {
             for agent in &known_agents {
                 let key = format!("model_map.{complexity}.{agent}");
                 // Try as list first (YAML arrays), fall back to single string
@@ -323,7 +270,7 @@ impl RouterConfig {
                     if !list.is_empty() {
                         config
                             .model_map
-                            .entry(complexity.clone())
+                            .entry(complexity.to_string())
                             .or_default()
                             .insert(agent.to_string(), list);
                     }
@@ -331,7 +278,7 @@ impl RouterConfig {
                     if !val.is_empty() {
                         config
                             .model_map
-                            .entry(complexity.clone())
+                            .entry(complexity.to_string())
                             .or_default()
                             .insert(agent.to_string(), vec![val]);
                     }
@@ -423,25 +370,6 @@ impl RouterConfig {
         }
         // All models cooled — return None so the caller can fall back to a different agent
         None
-    }
-
-    /// Get the model for a given agent and complexity level, falling back to built-in defaults.
-    ///
-    /// Unlike [`model_for_complexity`], this always returns a non-empty `String`.
-    /// Use this instead of hardcoding fallback model names at call sites.
-    pub fn model_for_complexity_or_default(
-        &self,
-        agent: &str,
-        complexity: &str,
-        task_id: &str,
-    ) -> String {
-        self.model_for_complexity(agent, complexity, task_id)
-            .or_else(|| Self::default().model_for_complexity(agent, complexity, task_id))
-            .unwrap_or_else(|| match agent {
-                "codex" => "o3".to_string(),
-                "opencode" => "anthropic/claude-sonnet-4-6".to_string(),
-                _ => "claude-sonnet-4-6".to_string(),
-            })
     }
 }
 
@@ -567,6 +495,19 @@ mod tests {
 
         let config = RouterConfig::from_config();
         assert_eq!(config.self_routing_penalty, 0.5);
+    }
+
+    #[test]
+    fn default_config_model_map_is_empty() {
+        // model_map must be empty — config.yml is the sole source of truth for models.
+        // Hardcoded defaults (especially anthropic/ prefixed opencode models) cause
+        // "Model not found" failures when the model does not exist for a given agent.
+        let config = RouterConfig::default();
+        assert!(
+            config.model_map.is_empty(),
+            "Default RouterConfig must have no hardcoded models; got {:?}",
+            config.model_map
+        );
     }
 
     #[test]

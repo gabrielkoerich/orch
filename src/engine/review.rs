@@ -684,16 +684,18 @@ pub(crate) async fn review_and_merge(
         let agent = r
             .next_round_robin_agent(&exclude_refs)
             .unwrap_or_else(|| "claude".to_string());
-        let model = r
-            .config
-            .model_for_complexity_or_default(&agent, "review", &task.id.0);
+        let model = r.config.model_for_complexity(&agent, "review", &task.id.0);
         (agent, model)
     };
+    // Derive a &str view for call sites that require a concrete string (e.g. attribution,
+    // activity logging). An empty string is used when no model is configured so that
+    // downstream code does not silently use a hardcoded model name.
+    let review_model_str = review_model.as_deref().unwrap_or("");
 
     tracing::info!(
         task_id = task.id.0,
         agent = %review_agent,
-        model = %review_model,
+        model = ?review_model,
         "spawning review agent"
     );
 
@@ -721,7 +723,7 @@ pub(crate) async fn review_and_merge(
 
     let invocation = runner::agent::AgentInvocation {
         agent: review_agent.clone(),
-        model: Some(review_model.clone()),
+        model: review_model.clone(),
         work_dir: worktree_path.clone(),
         system_prompt,
         agent_message: review_prompt,
@@ -743,7 +745,7 @@ pub(crate) async fn review_and_merge(
                 attempt: review_attempt as i32,
                 run_type: "review",
                 agent: &review_agent,
-                model: &review_model,
+                model: review_model.as_deref().unwrap_or(""),
                 command: "",
                 prompt: "",
             })
@@ -762,7 +764,7 @@ pub(crate) async fn review_and_merge(
         }
     };
 
-    let start_comment = review_started_comment(&review_agent, &review_model);
+    let start_comment = review_started_comment(&review_agent, review_model_str);
     match GhHttp::new() {
         Ok(gh) => {
             if let Err(e) = gh
@@ -1066,7 +1068,7 @@ pub(crate) async fn review_and_merge(
         None,
         None,
         Some(&review_agent),
-        Some(&review_model),
+        review_model.as_deref(),
         Some(&serde_json::json!({
             "decision": decision_name,
             "pr_number": pr_number_early,
@@ -1086,7 +1088,7 @@ pub(crate) async fn review_and_merge(
                 None,
                 None,
                 Some(&review_agent),
-                Some(&review_model),
+                review_model.as_deref(),
                 Some(&serde_json::json!({
                     "status": "ok",
                     "branch": branch_name.clone(),
@@ -1122,7 +1124,7 @@ pub(crate) async fn review_and_merge(
                 None,
                 None,
                 Some(&review_agent),
-                Some(&review_model),
+                review_model.as_deref(),
                 Some(&serde_json::json!({
                     "status": "error",
                     "branch": branch_name.clone(),
@@ -1184,7 +1186,7 @@ pub(crate) async fn review_and_merge(
     };
 
     if !pr_comment.is_empty() {
-        let footer = attribution_footer("Reviewed", &review_agent, &review_model);
+        let footer = attribution_footer("Reviewed", &review_agent, review_model_str);
         let pr_comment_with_footer = format!("{}{}", pr_comment, footer);
         if let Err(e) = gh
             .add_comment(repo, &pr_number_early.to_string(), &pr_comment_with_footer)
@@ -1267,7 +1269,7 @@ pub(crate) async fn review_and_merge(
                     backend,
                     repo,
                     &review_agent,
-                    &review_model,
+                    review_model_str,
                     task_manager,
                     store,
                 )
@@ -1313,7 +1315,7 @@ pub(crate) async fn review_and_merge(
                 repo,
                 pr_number_early,
                 &review_agent,
-                &review_model,
+                review_model_str,
                 task_manager,
                 store,
             )
@@ -1462,27 +1464,15 @@ mod tests {
     }
 
     #[test]
-    fn test_router_config_model_for_complexity_returns_nonempty() {
+    fn test_router_config_model_for_complexity_returns_none_without_config() {
+        // With no model_map configured, model_for_complexity must return None rather than
+        // silently using a hardcoded model that may not exist for the given agent.
         let cfg = RouterConfig::default();
-        assert!(!cfg
-            .model_for_complexity_or_default("claude", "simple", "")
-            .is_empty());
-        assert!(!cfg
-            .model_for_complexity_or_default("claude", "medium", "")
-            .is_empty());
-        assert!(!cfg
-            .model_for_complexity_or_default("claude", "complex", "")
-            .is_empty());
-        assert!(!cfg
-            .model_for_complexity_or_default("claude", "review", "")
-            .is_empty());
-    }
-
-    #[test]
-    fn test_router_config_model_for_complexity_unknown_agent() {
-        let cfg = RouterConfig::default();
-        let model = cfg.model_for_complexity_or_default("unknown_agent_xyz", "simple", "");
-        assert!(!model.is_empty());
+        assert!(cfg.model_for_complexity("claude", "simple", "").is_none());
+        assert!(cfg.model_for_complexity("opencode", "review", "").is_none());
+        assert!(cfg
+            .model_for_complexity("unknown_agent_xyz", "simple", "")
+            .is_none());
     }
 
     #[test]
