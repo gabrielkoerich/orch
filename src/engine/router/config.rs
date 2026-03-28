@@ -411,9 +411,6 @@ impl RouterConfig {
         if expanded_pool.is_empty() {
             return None;
         }
-        if expanded_pool.len() == 1 {
-            return Some(expanded_pool[0].clone());
-        }
         // Random starting index — varies per task_id to distribute across the pool
         let start =
             crate::engine::router::selection::simple_hash_index_for(expanded_pool.len(), task_id);
@@ -424,8 +421,8 @@ impl RouterConfig {
                 return Some(model.clone());
             }
         }
-        // All models cooled — deterministic fallback to first entry
-        Some(expanded_pool[0].clone())
+        // All models cooled — return None so the caller can fall back to a different agent
+        None
     }
 
     /// Get the model for a given agent and complexity level, falling back to built-in defaults.
@@ -474,6 +471,78 @@ mod tests {
     fn cwd_mutex() -> &'static Mutex<()> {
         static CWD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
         CWD_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn model_for_complexity_returns_none_when_all_models_cooled() {
+        let mut config = RouterConfig::default();
+        // Inject a two-model pool for a unique agent name to avoid cross-test pollution
+        config
+            .model_map
+            .entry("complex".to_string())
+            .or_default()
+            .insert(
+                "testagent_allcooled".to_string(),
+                vec![
+                    "cooldown-model-a".to_string(),
+                    "cooldown-model-b".to_string(),
+                ],
+            );
+
+        // Put both models into cooldown
+        crate::engine::cooldown::record_model_failure("testagent_allcooled", "cooldown-model-a");
+        crate::engine::cooldown::record_model_failure("testagent_allcooled", "cooldown-model-b");
+
+        let result = config.model_for_complexity("testagent_allcooled", "complex", "task-0");
+        assert!(
+            result.is_none(),
+            "should return None when all models in pool are in cooldown, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn model_for_complexity_returns_none_when_single_model_cooled() {
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("complex".to_string())
+            .or_default()
+            .insert(
+                "testagent_singlecooled".to_string(),
+                vec!["single-cooled-model".to_string()],
+            );
+
+        crate::engine::cooldown::record_model_failure(
+            "testagent_singlecooled",
+            "single-cooled-model",
+        );
+
+        let result = config.model_for_complexity("testagent_singlecooled", "complex", "task-0");
+        assert!(
+            result.is_none(),
+            "should return None when the only model in pool is in cooldown, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn model_for_complexity_returns_model_when_not_cooled() {
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("complex".to_string())
+            .or_default()
+            .insert(
+                "testagent_notcooled".to_string(),
+                vec!["healthy-model".to_string()],
+            );
+
+        // Ensure no cooldown is active for this specific model
+        let result = config.model_for_complexity("testagent_notcooled", "complex", "task-0");
+        assert_eq!(
+            result.as_deref(),
+            Some("healthy-model"),
+            "should return the model when it is not in cooldown"
+        );
     }
 
     #[test]
