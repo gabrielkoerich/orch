@@ -13,6 +13,7 @@ use crate::backends::{ExternalBackend, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine::router::Router;
+use crate::engine::runner::agents::patterns;
 use crate::engine::tasks::TaskManager;
 use crate::store;
 use crate::store::TaskStatus;
@@ -44,6 +45,264 @@ async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
 use super::review_poll::review_open_prs;
 use super::EngineConfig;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureCategory {
+    FalseFailure,
+    RateLimit,
+    SilentExit0,
+    Timeout,
+    ConnectionError,
+    CliFlagError,
+    AllAgentsExhausted,
+    ParseError,
+    MaxAttempts,
+    TokenBudgetExceeded,
+    PushFailed,
+    PrCreateFailed,
+    Unknown,
+}
+
+impl FailureCategory {
+    fn is_recoverable(self) -> bool {
+        matches!(
+            self,
+            FailureCategory::FalseFailure
+                | FailureCategory::RateLimit
+                | FailureCategory::SilentExit0
+                | FailureCategory::Timeout
+                | FailureCategory::ConnectionError
+                | FailureCategory::CliFlagError
+                | FailureCategory::AllAgentsExhausted
+                | FailureCategory::ParseError
+                | FailureCategory::MaxAttempts
+        )
+    }
+}
+
+fn classify_failure(error: &str, outcome: &str) -> FailureCategory {
+    let lower = error.to_lowercase();
+
+    if outcome == "timeout" || lower.contains("timeout") {
+        return FailureCategory::Timeout;
+    }
+
+    if outcome == "rate_limit" || lower.contains("rate limit") || lower.contains("usage limit") {
+        return FailureCategory::RateLimit;
+    }
+
+    if error.trim().is_empty() {
+        return FailureCategory::FalseFailure;
+    }
+
+    if lower.contains("token budget exceeded") {
+        return FailureCategory::TokenBudgetExceeded;
+    }
+
+    if lower.contains("all agents exhausted") {
+        return FailureCategory::AllAgentsExhausted;
+    }
+
+    if lower.contains("max attempts") || lower.contains("exceeded max attempts") {
+        return FailureCategory::MaxAttempts;
+    }
+
+    if lower.contains("output-format=stream-json") && lower.contains("requires --verbose") {
+        return FailureCategory::CliFlagError;
+    }
+
+    if lower.contains("push failed") {
+        return FailureCategory::PushFailed;
+    }
+
+    if lower.contains("create pr failed")
+        || lower.contains("pull request") && lower.contains("fail")
+    {
+        return FailureCategory::PrCreateFailed;
+    }
+
+    if lower.contains("exit 0") {
+        return FailureCategory::SilentExit0;
+    }
+
+    if outcome == "parse_error" || lower.contains("invalid response") || lower.contains("parse") {
+        return FailureCategory::ParseError;
+    }
+
+    if patterns::detect_network_error(&lower).is_some() {
+        return FailureCategory::ConnectionError;
+    }
+
+    FailureCategory::Unknown
+}
+
+fn classify_failure_from_run(run: &crate::store::TaskRun) -> Option<FailureCategory> {
+    if run.outcome == "success" && run.error.trim().is_empty() {
+        return None;
+    }
+
+    let has_output = !run.stdout.trim().is_empty() || !run.stderr.trim().is_empty();
+    if run.exit_code == Some(0) && !has_output && run.outcome != "success" {
+        return Some(FailureCategory::SilentExit0);
+    }
+
+    let mut category = classify_failure(&run.error, &run.outcome);
+
+    if category == FailureCategory::FalseFailure
+        && (run.exit_code != Some(0) || run.stdout.trim().is_empty())
+    {
+        category = FailureCategory::Unknown;
+    }
+
+    Some(category)
+}
+
+fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
+    if count == 0 {
+        return true;
+    }
+
+    let required = match count {
+        1 => chrono::Duration::minutes(30),
+        2 => chrono::Duration::hours(2),
+        _ => return false,
+    };
+
+    if last_at.trim().is_empty() {
+        return true;
+    }
+
+    match chrono::DateTime::parse_from_rfc3339(last_at) {
+        Ok(ts) => chrono::Utc::now() - ts.with_timezone(&chrono::Utc) >= required,
+        Err(_) => true,
+    }
+}
+
+async fn auto_unblock_blocked_tasks(
+    repo: &str,
+    task_manager: &Arc<TaskManager>,
+    store: &Arc<TaskStore>,
+    dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+) -> anyhow::Result<()> {
+    let blocked = store
+        .list_by_status(repo, TaskStatus::Blocked)
+        .await
+        .unwrap_or_default();
+
+    if blocked.is_empty() {
+        return Ok(());
+    }
+
+    for task in blocked {
+        if task.block_reason.is_some() {
+            continue;
+        }
+
+        if task.budget_exceeded
+            || task
+                .last_error
+                .to_lowercase()
+                .contains("token budget exceeded")
+        {
+            continue;
+        }
+
+        if task.auto_unblock_count >= 3 {
+            continue;
+        }
+
+        if !auto_unblock_cooldown_elapsed(task.auto_unblock_count, &task.auto_unblock_last_at) {
+            continue;
+        }
+
+        let dispatch_key = format!("{}/{}", repo, task.external_id.clone().unwrap_or_default());
+        {
+            let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.contains(&dispatch_key) {
+                continue;
+            }
+        }
+
+        let runs = store.get_runs(task.id).await.unwrap_or_default();
+        let mut failures = Vec::new();
+        for run in runs.iter().rev() {
+            if let Some(category) = classify_failure_from_run(run) {
+                failures.push(category);
+            }
+            if failures.len() >= 3 {
+                break;
+            }
+        }
+
+        if failures.is_empty() || !failures.iter().all(|f| f.is_recoverable()) {
+            continue;
+        }
+
+        if failures.contains(&FailureCategory::MaxAttempts) {
+            let _ = store
+                .set_fields(
+                    task.id,
+                    &[
+                        ("attempts", serde_json::json!(0)),
+                        ("route_attempts", serde_json::json!(0)),
+                    ],
+                )
+                .await;
+        }
+
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let new_count = store
+            .increment(task.id, "auto_unblock_count")
+            .await
+            .unwrap_or(0);
+        let _ = store
+            .set_fields(
+                task.id,
+                &[
+                    ("auto_unblock_last_at", serde_json::json!(now)),
+                    ("auto_unblock_count", serde_json::json!(new_count)),
+                ],
+            )
+            .await;
+
+        let ext_id = task
+            .external_id
+            .clone()
+            .unwrap_or_else(|| format!("internal:{}", task.id));
+        let _ = store
+            .append_activity(
+                task.id,
+                "auto_unblock",
+                Some("blocked"),
+                Some("routed"),
+                task.agent.as_deref(),
+                task.model.as_deref(),
+                Some(&serde_json::json!({
+                    "failures": failures.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>(),
+                })),
+            )
+            .await;
+
+        if let Err(e) = task_manager
+            .update_task_status(&crate::backends::ExternalId(ext_id), Status::Routed)
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id,
+                err = %e,
+                "auto-unblock failed to update status"
+            );
+        } else {
+            tracing::info!(
+                task_id = task.id,
+                failures = ?failures,
+                "auto-unblocked task with recoverable failures"
+            );
+        }
+    }
+
+    Ok(())
+}
 
 /// Sync tick — runs every 45s.
 ///
@@ -309,6 +568,11 @@ pub(crate) async fn sync_tick(
                 );
             }
         }
+    }
+
+    // 5c. Auto-unblock tasks with recoverable failures.
+    if let Err(e) = auto_unblock_blocked_tasks(repo, task_manager, store, dispatching).await {
+        tracing::warn!(err = %e, "auto-unblock failed");
     }
 
     // 6. Scan for owner /slash commands in issue comments
@@ -606,6 +870,7 @@ mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
     use async_trait::async_trait;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     // ── ingest_external_tasks tests ─────────────────────────────────────────
@@ -1190,6 +1455,141 @@ mod tests {
         // Should stay InReview — too young to be considered orphaned
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, crate::store::TaskStatus::InReview);
+    }
+
+    #[tokio::test]
+    async fn auto_unblock_routes_recoverable_failure() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "77",
+                title: "Blocked task",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+
+        let run_id = store
+            .start_run(&crate::store::StartRun {
+                task_id: id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "codex",
+                model: "gpt-5",
+                command: "codex --model gpt-5",
+                prompt: "do thing",
+            })
+            .await
+            .unwrap();
+        store
+            .complete_run(&crate::store::CompleteRun {
+                run_id,
+                exit_code: Some(1),
+                stdout: "",
+                stderr: "",
+                parsed: "",
+                outcome: "rate_limit",
+                error: "rate limit exceeded",
+                tokens: crate::store::RunTokenUsage::default(),
+            })
+            .await
+            .unwrap();
+
+        auto_unblock_blocked_tasks("owner/repo", &task_manager, &store, &dispatching)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::Routed);
+        assert_eq!(task.auto_unblock_count, 1);
+        assert!(!task.auto_unblock_last_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_unblock_skips_manual_block() {
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "88",
+                title: "Manually blocked",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+        store
+            .set_block_reason(id, Some("waiting on input"))
+            .await
+            .unwrap();
+
+        let run_id = store
+            .start_run(&crate::store::StartRun {
+                task_id: id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "codex",
+                model: "gpt-5",
+                command: "codex --model gpt-5",
+                prompt: "do thing",
+            })
+            .await
+            .unwrap();
+        store
+            .complete_run(&crate::store::CompleteRun {
+                run_id,
+                exit_code: Some(1),
+                stdout: "",
+                stderr: "",
+                parsed: "",
+                outcome: "rate_limit",
+                error: "rate limit exceeded",
+                tokens: crate::store::RunTokenUsage::default(),
+            })
+            .await
+            .unwrap();
+
+        auto_unblock_blocked_tasks("owner/repo", &task_manager, &store, &dispatching)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::Blocked);
+        assert_eq!(task.auto_unblock_count, 0);
     }
 
     #[test]

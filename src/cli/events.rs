@@ -354,6 +354,8 @@ mod tests {
             budget_exceeded: false,
             memory: Vec::new(),
             delegations: Vec::new(),
+            auto_unblock_count: 0,
+            auto_unblock_last_at: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -413,6 +415,8 @@ mod tests {
             budget_exceeded: false,
             memory: Vec::new(),
             delegations: Vec::new(),
+            auto_unblock_count: 0,
+            auto_unblock_last_at: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
         };
