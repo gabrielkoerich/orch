@@ -1,7 +1,7 @@
 //! Home directory utilities.
 //!
 //! All orch state lives under `~/.orch/`. This is completely separate from
-//! the bash orchestrator's `~/.orchestrator/` directory — both tools can
+//! the legacy bash orchestrator's `~/.orchestrator/` directory — both tools can
 //! run side by side without conflicts.
 
 use anyhow::Context;
@@ -40,16 +40,16 @@ pub fn state_dir() -> anyhow::Result<PathBuf> {
 
 /// Legacy state directories for backward-compatible reads.
 ///
-/// Checks `~/.orchestrator/state/` first, then `~/.orchestrator/.orchestrator/`.
+/// Checks legacy `~/.orchestrator/state/` first, then `~/.orchestrator/.orchestrator/`.
 /// Never writes to these locations.
 fn legacy_state_dir() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    // Check ~/.orchestrator/state/ (intermediate migration path)
+    // Check legacy ~/.orchestrator/state/ (intermediate migration path)
     let mid = home.join(".orchestrator").join("state");
     if mid.is_dir() {
         return Some(mid);
     }
-    // Check ~/.orchestrator/.orchestrator/ (original nested path)
+    // Check legacy ~/.orchestrator/.orchestrator/ (original nested path)
     let old = home.join(".orchestrator").join(".orchestrator");
     if old.is_dir() {
         return Some(old);
@@ -82,7 +82,7 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
 
 /// Get the path to the tasks database file (~/.orch/orch.db).
 ///
-/// Also migrates `orchestrator.db` → `orch.db` transparently if the old file
+/// Also migrates legacy `orchestrator.db` → `orch.db` transparently if the old file
 /// exists and the new one does not.
 pub fn db_path() -> anyhow::Result<PathBuf> {
     let home = orch_home()?;
@@ -96,7 +96,7 @@ pub fn db_path() -> anyhow::Result<PathBuf> {
                 new_path.display()
             )
         })?;
-        tracing::info!("migrated database: orchestrator.db -> orch.db");
+        tracing::info!("migrated database: legacy orchestrator.db -> orch.db");
     }
     Ok(new_path)
 }

@@ -599,7 +599,7 @@ pub(crate) async fn sync_tick(
 
 /// Scan for @mentions and create internal tasks.
 ///
-/// Checks recent issue comments for @orchestrator mentions,
+/// Checks recent issue comments for @orch (and legacy @orchestrator) mentions,
 /// creates internal tasks, and acknowledges them.
 async fn scan_mentions(
     backend: &Arc<dyn ExternalBackend>,
@@ -653,7 +653,10 @@ async fn scan_mentions(
             continue;
         }
 
-        if !mention.body.contains(&current_user) && !mention.body.contains("@orchestrator") {
+        if !mention.body.contains(&current_user)
+            && !mention.body.contains("@orch")
+            && !mention.body.contains("@orchestrator")
+        {
             continue;
         }
 

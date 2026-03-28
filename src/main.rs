@@ -208,17 +208,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the orchestrator service
+    /// Start the orch service
     Serve,
     /// Show version information
     Version,
-    /// Initialize orchestrator for a project
+    /// Initialize orch for a project
     Init {
         /// Repository in OWNER/REPO format
         #[arg(long)]
         repo: Option<String>,
     },
-    /// Tail orchestrator logs
+    /// Tail orch logs
     Log {
         /// Number of lines to show, or "watch" for live follow
         #[arg(default_value = "50")]
@@ -252,7 +252,7 @@ enum Commands {
         #[arg(long)]
         raw: bool,
     },
-    /// Chat with the orchestrator control session
+    /// Chat with the orch control session
     #[command(
         subcommand_precedence_over_arg = true,
         args_conflicts_with_subcommands = true
@@ -581,11 +581,11 @@ enum ProjectAction {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    /// Start the orchestrator service
+    /// Start the orch service
     Start,
-    /// Stop the orchestrator service
+    /// Stop the orch service
     Stop,
-    /// Restart the orchestrator service
+    /// Restart the orch service
     Restart,
     /// Show service status
     Status,

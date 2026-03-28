@@ -46,7 +46,7 @@ pub fn version() {
     }
 }
 
-/// Initialize orchestrator for a project.
+/// Initialize orch for a project.
 pub fn init(repo: Option<String>) -> anyhow::Result<()> {
     let orch_home = crate::home::orch_home()?;
     std::fs::create_dir_all(&orch_home)?;
@@ -157,7 +157,7 @@ fn install_review_workflow(project_dir: &std::path::Path) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Show orchestrator logs.
+/// Show orch logs.
 pub fn log(lines: &str) -> anyhow::Result<()> {
     let state_dir = crate::home::state_dir().unwrap_or_default();
     let brew_prefix = std::env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".into());
@@ -790,7 +790,7 @@ fn project_add_local(path: &str) -> anyhow::Result<()> {
         // Check for legacy .orchestrator.yml
         let legacy = abs_path.join(".orchestrator.yml");
         if legacy.exists() {
-            println!("Found .orchestrator.yml — consider renaming to .orch.yml");
+            println!("Found legacy .orchestrator.yml — consider renaming to .orch.yml");
         } else {
             anyhow::bail!(
                 "no .orch.yml found in {} — run `orch init` in the project first",

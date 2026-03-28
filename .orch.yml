@@ -34,7 +34,7 @@ jobs:
 
       ## Create GitHub issues for findings
 
-      Use `gh issue create --title "..." --body "..." --label "bug"` to create issues. The orchestrator will sync and dispatch them.
+      Use `gh issue create --title "..." --body "..." --label "bug"` to create issues. Orch will sync and dispatch them.
 
       - Maximum 2-3 issues. Fewer is better.
       - Each issue MUST include: file path, line numbers, what's wrong, and what the fix should be.
@@ -53,7 +53,7 @@ jobs:
   task:
     title: 'Code development: find improvements and create tasks'
     body: |
-      You are a planning agent for the orch orchestrator. Your job is to find high-value improvements and create tasks for them. Do NOT implement anything — the task pipeline handles execution.
+      You are a planning agent for orch. Your job is to find high-value improvements and create tasks for them. Do NOT implement anything — the task pipeline handles execution.
 
       ## Where to look (in priority order)
 
@@ -80,7 +80,7 @@ jobs:
 
       ## Create GitHub issues
 
-      Use `gh issue create --title "..." --body "..." --label "enhancement"` to create issues. The orchestrator will sync and dispatch them.
+      Use `gh issue create --title "..." --body "..." --label "enhancement"` to create issues. Orch will sync and dispatch them.
 
       - Maximum 2-3 issues per run. Fewer is better.
       - Each issue MUST be actionable: include file paths, line numbers when available, user/operator impact, and a clear description of what should change.
