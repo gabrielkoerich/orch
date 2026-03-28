@@ -200,7 +200,7 @@ mod tests {
 }
 
 #[derive(Parser)]
-#[command(name = "orch", version = env!("ORCH_VERSION"), about = "Orch — The Agent Orchestration Engine")]
+#[command(name = "orch", version = env!("ORCH_VERSION"), about = "Orch — The Agent Orchestrator")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
