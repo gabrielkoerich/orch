@@ -300,6 +300,8 @@ git:
 
 Place in your project root. Values here override global defaults.
 
+See [`.orch.yml`](.orch.yml) for a real-world example — orch uses itself to build, review, and improve its own codebase.
+
 ```yaml
 # Required — identifies this project on GitHub
 gh:
