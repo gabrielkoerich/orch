@@ -536,5 +536,4 @@ mod tests {
             "expected Continue (fallthrough to failover) when no free models available"
         );
     }
-
 }
