@@ -259,10 +259,7 @@ async fn auto_unblock_blocked_tasks(
                 e
             })?;
         let _ = store
-            .set_fields(
-                task.id,
-                &[("auto_unblock_last_at", serde_json::json!(now))],
-            )
+            .set_fields(task.id, &[("auto_unblock_last_at", serde_json::json!(now))])
             .await;
 
         let ext_id = task
