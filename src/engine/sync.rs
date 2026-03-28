@@ -251,13 +251,10 @@ async fn auto_unblock_blocked_tasks(
         }
 
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        store
-            .increment(task.id, "auto_unblock_count")
-            .await
-            .map_err(|e| {
-                tracing::warn!(task_id = task.id, err = %e, "failed to increment auto_unblock_count");
-                e
-            })?;
+        if let Err(e) = store.increment(task.id, "auto_unblock_count").await {
+            tracing::warn!(task_id = task.id, err = %e, "failed to increment auto_unblock_count");
+            continue;
+        }
         let _ = store
             .set_fields(task.id, &[("auto_unblock_last_at", serde_json::json!(now))])
             .await;
