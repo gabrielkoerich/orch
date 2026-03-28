@@ -773,9 +773,11 @@ impl TaskRunner {
             .unwrap_or_default();
 
         // Determine weight signal based on outcome
-        let is_rate_limited = last_error.contains("usage")
-            || last_error.contains("rate limit")
-            || last_error.contains("rerouted");
+        // Only treat explicit rate-limit messages (or usage limit) as rate-limited.
+        // Do NOT consider generic "rerouted" text as evidence of a rate limit —
+        // reroutes can happen for timeouts, auth errors, missing tools, etc.
+        let is_rate_limited =
+            last_error.contains("usage limit") || last_error.contains("rate limit");
         let weight_signal = if status == "new" && is_rate_limited {
             WeightSignal::RateLimited {
                 agent: agent_name.clone(),
