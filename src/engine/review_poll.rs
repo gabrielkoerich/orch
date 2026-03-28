@@ -55,6 +55,7 @@ pub(crate) async fn review_open_prs(
     }
 
     if in_review_tasks.is_empty() {
+        tracing::debug!(count = 0, "checking in_review tasks for PR reviews");
         return Ok(());
     }
 
