@@ -135,7 +135,10 @@ fn classify_failure(error: &str, outcome: &str) -> FailureCategory {
         return FailureCategory::SilentExit0;
     }
 
-    if outcome == "parse_error" || lower.contains("invalid response") || lower.contains("parse") {
+    if outcome == "parse_error"
+        || lower.contains("invalid response")
+        || lower.contains("parse error")
+    {
         return FailureCategory::ParseError;
     }
 
@@ -1737,6 +1740,33 @@ mod tests {
             "task blocked by model unavailable must be auto-unblocked and re-routed"
         );
         assert_eq!(task.auto_unblock_count, 1);
+    }
+
+    // ── classify_failure: sparse checkout (regression for substring false positive) ──
+
+    #[test]
+    fn classify_failure_sparse_checkout_not_parse_error() {
+        // Regression test for #1204: "sparse" substring contains "parse",
+        // so overly broad substring match would misclassify git sparse-checkout errors
+        let category = classify_failure("error: cannot reset paths in a sparse checkout", "error");
+        assert_ne!(
+            category,
+            FailureCategory::ParseError,
+            "sparse checkout errors must NOT be classified as ParseError"
+        );
+        assert_eq!(
+            category,
+            FailureCategory::Unknown,
+            "sparse checkout errors should be Unknown (not recoverable auto-unblock)"
+        );
+    }
+
+    #[test]
+    fn classify_failure_sparse_index_not_parse_error() {
+        // Another sparse-checkout variant that contains "parse"
+        let category = classify_failure("failed due to sparse index configuration", "error");
+        assert_ne!(category, FailureCategory::ParseError);
+        assert_eq!(category, FailureCategory::Unknown);
     }
 
     #[test]
