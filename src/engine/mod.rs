@@ -48,6 +48,7 @@ use crate::channels::telegram::TelegramChannel;
 use crate::channels::tmux::TmuxChannel;
 use crate::channels::transport::Transport;
 use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage};
+use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine::cleanup::remove_worktree_and_branch;
 use crate::engine::router::Router;
@@ -64,6 +65,7 @@ use crate::tmux::TmuxManager;
 use runner::WeightSignal;
 // AtomicBool/Ordering removed — shutdown is now immediate (reset tasks + break)
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 
 use crate::backends::Status;
@@ -414,6 +416,25 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                     )
                     .await;
                 }
+            }
+        }
+
+        // Prune stale .git/worktrees/ entries whose directories no longer exist.
+        // This handles entries left behind by crashes or manual directory removal.
+        let prune = Command::new("git")
+            .args(["-C", &repo_root.to_string_lossy(), "worktree", "prune"])
+            .output_with_context()
+            .await;
+        match prune {
+            Ok(output) if output.status.success() => {
+                tracing::debug!(repo = %engine.repo, "startup worktree prune completed");
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(repo = %engine.repo, err = %stderr, "startup worktree prune failed");
+            }
+            Err(e) => {
+                tracing::warn!(repo = %engine.repo, err = %e, "startup worktree prune failed");
             }
         }
     }
