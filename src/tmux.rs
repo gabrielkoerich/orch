@@ -173,6 +173,34 @@ impl TmuxManager {
         }
     }
 
+    /// Extract the task_id from a full session name.
+    ///
+    /// Session names follow the format `orch-{project}-{task_id}`, where
+    /// `{task_id}` may itself contain `-` (e.g. internal tasks: `internal-21116`).
+    ///
+    /// Splitting on the last `-` only works for numeric external IDs. For internal
+    /// tasks, we detect the `-internal-` marker and take everything from `internal-`
+    /// onward as the task_id.
+    ///
+    /// Returns `None` if the name does not start with the orch prefix.
+    pub fn task_id_from_session_name(&self, name: &str) -> Option<String> {
+        let after_prefix = name.strip_prefix(&self.prefix)?;
+        // Internal tasks produce names like "{project}-internal-{n}".
+        // Find the last occurrence of "-internal-" and take from "internal-" onward.
+        if let Some(pos) = after_prefix.find("-internal-") {
+            Some(after_prefix[pos + 1..].to_string())
+        } else {
+            // External task: numeric id is the last segment.
+            Some(
+                after_prefix
+                    .rsplit('-')
+                    .next()
+                    .unwrap_or(after_prefix)
+                    .to_string(),
+            )
+        }
+    }
+
     /// List all orch-prefixed sessions with metadata.
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
         let output = Command::new("tmux")
@@ -187,15 +215,7 @@ impl TmuxManager {
         let mut sessions = Vec::new();
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             let name = line.trim().to_string();
-            if name.starts_with(&self.prefix) {
-                // Extract task_id: "orch-{project}-{id}" → last segment after final '-'
-                let after_prefix = name.strip_prefix(&self.prefix).unwrap_or("");
-                let task_id = after_prefix
-                    .rsplit('-')
-                    .next()
-                    .unwrap_or(after_prefix)
-                    .to_string();
-
+            if let Some(task_id) = self.task_id_from_session_name(&name) {
                 sessions.push(Session { name, task_id });
             }
         }
@@ -362,6 +382,42 @@ mod tests {
             tmux.session_name("owner/repo", "internal:8"),
             "orch-repo-internal-8"
         );
+    }
+
+    #[test]
+    fn task_id_from_session_name_parses_external_task() {
+        let tmux = TmuxManager::new();
+        // "orch-repo-1234" → task_id "1234"
+        assert_eq!(
+            tmux.task_id_from_session_name("orch-repo-1234"),
+            Some("1234".to_string())
+        );
+    }
+
+    #[test]
+    fn task_id_from_session_name_parses_internal_task() {
+        let tmux = TmuxManager::new();
+        // "orch-orch-internal-21116" → task_id "internal-21116", not "21116"
+        assert_eq!(
+            tmux.task_id_from_session_name("orch-orch-internal-21116"),
+            Some("internal-21116".to_string())
+        );
+    }
+
+    #[test]
+    fn task_id_from_session_name_parses_internal_task_small_id() {
+        let tmux = TmuxManager::new();
+        // "orch-repo-internal-8" → task_id "internal-8"
+        assert_eq!(
+            tmux.task_id_from_session_name("orch-repo-internal-8"),
+            Some("internal-8".to_string())
+        );
+    }
+
+    #[test]
+    fn task_id_from_session_name_returns_none_for_non_orch_session() {
+        let tmux = TmuxManager::new();
+        assert_eq!(tmux.task_id_from_session_name("some-other-session"), None);
     }
 
     /// Verify set_env runs the correct tmux set-environment command.
