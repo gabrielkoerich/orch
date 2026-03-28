@@ -1136,13 +1136,11 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                     .unwrap_or_else(|| format!("internal:{}", int.id));
             }
             Err(e) => {
-                // Could not resolve task metadata; continue and try sidecar only
                 println!("ID: {}", id);
                 println!("(could not resolve task metadata: {})", e);
             }
         }
     } else {
-        // Non-numeric external id (rare) — use as-is for sidecar lookup
         println!("ID: {}", id);
     }
 

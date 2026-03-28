@@ -1,8 +1,8 @@
 //! Unified task store — SQLite as single source of truth.
 //!
-//! `TaskStore` replaces the combination of sidecar JSON files, `internal_tasks` table,
-//! and GitHub labels as the authoritative task state. External backends (GitHub, Linear)
-//! become sync adapters that mirror state changes outward.
+//! `TaskStore` replaces the legacy `internal_tasks` table and GitHub labels as the
+//! authoritative task state. External backends (GitHub, Linear) become sync adapters
+//! that mirror state changes outward.
 //!
 //! Uses sqlx for async SQLite access with file-based migrations.
 //!
@@ -39,8 +39,8 @@ pub use metrics::{
 pub use pricing::{pricing_for_model, CostEstimate, ModelPricing, TokenUsage};
 #[allow(unused_imports)]
 pub use tasks::{
-    CompleteRun, MigrateResult, NewTask, RunTokenUsage, StartRun, StoreRoute, Task, TaskActivity,
-    TaskRun, TaskStatus, UpsertExternal,
+    CompleteRun, NewTask, RunTokenUsage, StartRun, StoreRoute, Task, TaskActivity, TaskRun,
+    TaskStatus, UpsertExternal,
 };
 
 /// Default database path: `~/.orch/orch.db`
