@@ -198,7 +198,7 @@ jobs:
 
       1. Check recent task run logs for failures:
          ```
-         sqlite3 ~/.orch/orch.db "SELECT id, external_id, status, agent, last_error, last_response FROM tasks WHERE status IN ('blocked', 'needs_review') AND updated_at > datetime('now', '-12 hours') ORDER BY updated_at DESC LIMIT 20;"
+          sqlite3 ~/.orch/orch.db "SELECT id, external_id, status, agent, model, last_error, block_reason, updated_at FROM tasks WHERE status IN ('blocked', 'needs_review') AND updated_at > datetime('now', '-12 hours') ORDER BY updated_at DESC LIMIT 20;"
          ```
       2. Check recent task run audit trails:
          ```
