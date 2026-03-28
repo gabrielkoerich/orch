@@ -782,7 +782,11 @@ impl TaskRunner {
             WeightSignal::RateLimited {
                 agent: agent_name.clone(),
             }
-        } else if status == "done" || status == "in_progress" || status == "in_review" {
+        } else if status == "done"
+            || status == "needs_review"
+            || status == "in_progress"
+            || status == "in_review"
+        {
             WeightSignal::Success {
                 agent: agent_name.clone(),
             }
@@ -1603,5 +1607,68 @@ mod tests {
         } else {
             std::env::remove_var("ORCH_HOME");
         }
+    }
+
+    // ── weight signal logic ───────────────────────────────────────────────────
+
+    fn weight_signal_for(status: &str, is_rate_limited: bool, agent: &str) -> WeightSignal {
+        if status == "new" && is_rate_limited {
+            WeightSignal::RateLimited {
+                agent: agent.to_string(),
+            }
+        } else if status == "done"
+            || status == "needs_review"
+            || status == "in_progress"
+            || status == "in_review"
+        {
+            WeightSignal::Success {
+                agent: agent.to_string(),
+            }
+        } else if status == "blocked" {
+            WeightSignal::Blocked
+        } else {
+            WeightSignal::None
+        }
+    }
+
+    #[test]
+    fn weight_signal_success_includes_needs_review() {
+        // The normal happy-path for code tasks: agent reports done, has a PR,
+        // so handle_success returns "needs_review". This must map to Success.
+        let signal = weight_signal_for("needs_review", false, "claude");
+        assert!(
+            matches!(signal, WeightSignal::Success { agent } if agent == "claude"),
+            "needs_review should produce WeightSignal::Success"
+        );
+    }
+
+    #[test]
+    fn weight_signal_success_for_all_done_statuses() {
+        for status in ["done", "needs_review", "in_progress", "in_review"] {
+            let signal = weight_signal_for(status, false, "codex");
+            assert!(
+                matches!(signal, WeightSignal::Success { agent } if agent == "codex"),
+                "{status} should produce WeightSignal::Success"
+            );
+        }
+    }
+
+    #[test]
+    fn weight_signal_rate_limited_overrides_success() {
+        // Rate limit on "new" status (rerouted back) should be RateLimited.
+        let signal = weight_signal_for("new", true, "claude");
+        assert!(matches!(signal, WeightSignal::RateLimited { .. }));
+    }
+
+    #[test]
+    fn weight_signal_blocked_status() {
+        let signal = weight_signal_for("blocked", false, "claude");
+        assert!(matches!(signal, WeightSignal::Blocked));
+    }
+
+    #[test]
+    fn weight_signal_none_for_unknown_status() {
+        let signal = weight_signal_for("routed", false, "claude");
+        assert!(matches!(signal, WeightSignal::None));
     }
 }
