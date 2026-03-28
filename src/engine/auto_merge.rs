@@ -494,14 +494,14 @@ pub(crate) async fn auto_merge_pr(
                                     // so the sync tick retries merge on the next cycle.
                                     match gh.enable_auto_merge(repo, pr_number).await {
                                         Ok(_) => {
-                                            task_manager
-                                                .update_task_status(&task.id, Status::Done)
-                                                .await?;
-                                            if let Err(ce) =
-                                                cleanup_task_worktree(&task.id.0, repo, store).await
-                                            {
-                                                tracing::warn!(task_id = task.id.0, err = %ce, "post-rebase cleanup failed");
-                                            }
+                                            tracing::info!(
+                                                task_id = task.id.0,
+                                                "auto-merge enabled — task stays in InReview until GitHub merges"
+                                            );
+                                            // Don't mark Done yet — GitHub auto-merge fires only
+                                            // after CI passes on the rebased SHA. If CI fails the
+                                            // PR stays open. check_merged_prs (sync tick) will
+                                            // detect the actual merge and mark Done then.
                                         }
                                         Err(e) => {
                                             tracing::warn!(
