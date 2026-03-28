@@ -265,9 +265,13 @@ async fn auto_unblock_blocked_tasks(
             tracing::warn!(task_id = task.id, err = %e, "failed to increment auto_unblock_count");
             continue;
         }
-        let _ = store
+        if let Err(e) = store
             .set_fields(task.id, &[("auto_unblock_last_at", serde_json::json!(now))])
-            .await;
+            .await
+        {
+            tracing::warn!(task_id = task.id, err = %e, "failed to set auto_unblock_last_at — skipping unblock");
+            continue;
+        }
 
         let ext_id = task
             .external_id
