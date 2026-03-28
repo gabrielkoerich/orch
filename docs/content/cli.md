@@ -123,7 +123,7 @@ orch chat history                   # show recent messages
 orch chat history --search "bean"   # search past conversations
 ```
 
-Conversational control plane — talk to the orchestrator in natural language. Each message invokes a one-shot agent with context assembled from the live task state, memories, and recent summaries. Switch the model with `/model agent:model` inside the REPL.
+Conversational control plane — talk to orch in natural language. Each message invokes a one-shot agent with context assembled from the live task state, memories, and recent summaries. Switch the model with `/model agent:model` inside the REPL.
 
 ## Agent Management
 

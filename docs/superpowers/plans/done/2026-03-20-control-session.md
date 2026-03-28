@@ -294,7 +294,7 @@ git commit -m "feat(store): add control_messages CRUD methods"
 - [ ] **Step 1: Write the prompt template**
 
 ```markdown
-You are the orch control session — an interactive ops assistant for the orchestrator.
+You are the orch control session — an interactive ops assistant for orch.
 
 You can run commands to manage tasks, check status, and take actions. Use bash for all commands.
 
@@ -720,7 +720,7 @@ git commit -m "feat: control session module — context assembly, agent invocati
 In `src/main.rs`, add the `Chat` variant after the `Stream` variant:
 
 ```rust
-    /// Chat with the orchestrator control session
+    /// Chat with orch control session
     Chat {
         #[command(subcommand)]
         action: Option<ChatAction>,
@@ -911,7 +911,7 @@ git commit -m "feat: orch chat CLI — interactive REPL and history browsing"
 In `src/main.rs`, update the `Chat` variant:
 
 ```rust
-    /// Chat with the orchestrator control session
+    /// Chat with orch control session
     Chat {
         /// Send a single message (omit for interactive mode)
         message: Vec<String>,

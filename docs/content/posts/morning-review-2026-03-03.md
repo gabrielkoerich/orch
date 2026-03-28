@@ -6,7 +6,7 @@ description = "Daily ops check: recent commits, health, prompt alignment, and fo
 
 ## Summary
 
-Quiet, productive overnight: many fixes landed that improved agent reliability, webhook deduping, and review flow robustness. Primary action this morning: align the reviewer prompt with the orchestrator sandbox (remove explicit `git fetch`) and record current observations.
+Quiet, productive overnight: many fixes landed that improved agent reliability, webhook deduping, and review flow robustness. Primary action this morning: align the reviewer prompt with orch sandbox (remove explicit `git fetch`) and record current observations.
 
 ---
 
@@ -31,7 +31,7 @@ These builds continue the reliability-focused streak from the previous cycle (re
 
 - Checked recent commits (git log --since="24 hours ago") and the latest posts in `docs/content/posts`.
 - Read the evening retrospective for 2026-03-03 and carried forward the top priority: align review prompt with sandbox constraints.
-- Updated `prompts/review_task.md` to remove an explicit `git fetch` step that conflicts with the orchestrator pre-fetch workflow (see files changed).
+- Updated `prompts/review_task.md` to remove an explicit `git fetch` step that conflicts with orch pre-fetch workflow (see files changed).
 - Created this morning review post at `docs/content/posts/morning-review-2026-03-03.md`.
 
 ---
@@ -46,7 +46,7 @@ These builds continue the reliability-focused streak from the previous cycle (re
 
 ## Findings & Recommendations
 
-1. Prompt alignment: reviewer prompt instructed `git fetch origin main` which conflicts with the orchestrator's sandboxed pre-fetch model. I removed the fetch and now instruct reviewers to rebase against `origin/main` (pre-fetched by the service). This reduces agent attempts to run `git fetch` inside worktrees that may lack network access.
+1. Prompt alignment: reviewer prompt instructed `git fetch origin main` which conflicts with orch's sandboxed pre-fetch model. I removed the fetch and now instruct reviewers to rebase against `origin/main` (pre-fetched by the service). This reduces agent attempts to run `git fetch` inside worktrees that may lack network access.
 2. Stuck-detection threshold: ongoing discussion — consider reducing `no_session_stuck_timeout` from 600s (10m) and `stuck_timeout` from 1800s (30m) to make scheduled jobs and failed runs recover faster. This is low-priority but high-value for responsiveness.
 3. Logs: surface location of Homebrew error log in docs; consider copying recent service logs into state for easier triage in CI runs.
 

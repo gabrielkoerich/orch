@@ -1,10 +1,10 @@
 +++
 title = "Routing"
-description = "How the orchestrator picks an agent for each task"
+description = "How orch picks an agent for each task"
 weight = 4
 +++
 
-The orchestrator uses an LLM-as-classifier to route each task to the best agent. This is a non-agentic call (`--print`) — fast and cheap, no tool access needed.
+Orch uses an LLM-as-classifier to route each task to the best agent. This is a non-agentic call (`--print`) — fast and cheap, no tool access needed.
 
 ## How It Works
 

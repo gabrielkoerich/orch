@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/gabrielkoerich/orch/actions/workflows/release.yml/badge.svg)](https://github.com/gabrielkoerich/orch/actions/workflows/release.yml)
 
-An autonomous task orchestrator that delegates work to AI coding agents (Claude, Codex, OpenCode, Kimi, MiniMax). Runs as a background service, manages isolated worktrees, syncs with GitHub Issues, and handles the full task lifecycle from routing to PR creation.
+An autonomous task orchestration engine that delegates work to AI coding agents (Claude, Codex, OpenCode, Kimi, MiniMax). Runs as a background service, manages isolated worktrees, syncs with GitHub Issues, and handles the full task lifecycle from routing to PR creation.
 
 ## Features
 
@@ -97,7 +97,7 @@ github:
   private_key_path: "/path/to/app-private-key.pem"
 ```
 
-The orchestrator automatically generates JWTs and refreshes installation tokens before expiry.
+Orch automatically generates JWTs and refreshes installation tokens before expiry.
 
 ### gh CLI (Default fallback)
 
@@ -148,7 +148,7 @@ export GH_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
 ### Service Management
 
 ```bash
-orch serve                    # Run the orchestrator service (foreground)
+orch serve                    # Run orch service (foreground)
 orch service start            # Start background service
 orch service stop             # Stop background service
 orch service restart          # Restart service

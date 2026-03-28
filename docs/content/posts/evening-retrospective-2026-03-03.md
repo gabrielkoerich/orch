@@ -123,7 +123,7 @@ The following significant changes landed today:
 
 ### Observations
 
-1. **Prompt alignment complete**: Both `agent_system.md` and `review_task.md` now consistently instruct agents to use `git rebase` instead of `git fetch`, matching the orchestrator's pre-fetch workflow.
+1. **Prompt alignment complete**: Both `agent_system.md` and `review_task.md` now consistently instruct agents to use `git rebase` instead of `git fetch`, matching orch's pre-fetch workflow.
 2. **Security posture improved**: GH_TOKEN no longer embedded in per-task runner scripts; GitHub App auth integrated natively.
 3. **gh CLI dependency reduced**: Native `GhHttp` now handles PR creation and other GitHub API operations.
 4. **Test failures observed**: Some CI test failures occurred (see recent `gh run list`); may need investigation but review gate passed.

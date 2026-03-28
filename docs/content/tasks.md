@@ -62,7 +62,7 @@ orch task plan "Complex feature" "Detailed description"
 orch task add "title" "body" "plan"
 ```
 
-The orchestrator will:
+Orch will:
 - Create child tasks with `parent_id` set
 - Block the parent until children are done
 - Re-run the parent via `poll` or `rejoin`

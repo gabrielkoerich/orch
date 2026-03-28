@@ -48,7 +48,7 @@ Bare clones live at `~/.orch/projects/<owner>/<repo>.git`. Agents always work in
 
 ## GitHub Authentication
 
-The orchestrator requires GitHub authentication to create issues, post comments, and manage PRs. Three auth methods are supported:
+Orch requires GitHub authentication to create issues, post comments, and manage PRs. Three auth methods are supported:
 
 ### Option 1: Personal Access Token (Recommended for individuals)
 
@@ -80,7 +80,7 @@ github:
   private_key_path: "/path/to/app-private-key.pem"
 ```
 
-The orchestrator automatically exchanges the App credentials for installation tokens and refreshes them before expiry.
+Orch automatically exchanges the App credentials for installation tokens and refreshes them before expiry.
 
 ### Option 3: gh CLI (Default fallback)
 

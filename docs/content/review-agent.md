@@ -9,7 +9,7 @@ The review agent automatically reviews pull requests after an agent completes a 
 ## How It Works
 
 1. Agent completes a task and returns `status: done`
-2. Orchestrator detects an open PR on the task's branch → sets status to `in_review`
+2. Orch detects an open PR on the task's branch → sets status to `in_review`
 3. If `enable_review_agent` is `true`, the review agent runs:
    - Picks a reviewer via round-robin, excluding the task executor and all agents that have previously reviewed this task.
    - Fetches the PR diff via `gh pr diff`

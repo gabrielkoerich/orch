@@ -2,7 +2,7 @@
 
 ## Goal
 
-A persistent conversational control plane for the orchestrator. Users talk to it from any channel (CLI, Telegram, Discord) and it knows everything that's running, can create tasks, check status, unblock things — like talking to an ops assistant that never loses context.
+A persistent conversational control plane for orch. Users talk to it from any channel (CLI, Telegram, Discord) and it knows everything that's running, can create tasks, check status, unblock things — like talking to an ops assistant that never loses context.
 
 ## How It Works
 
@@ -246,7 +246,7 @@ Telegram/Discord message arrives
 Static template at `prompts/control_system.md`, composed with dynamic state:
 
 ```markdown
-You are the orch control session — an ops assistant for the orchestrator.
+You are the orch control session — an ops assistant for orch.
 
 ## Available Commands (via bash)
 - `orch task list [--status STATUS]` — list tasks

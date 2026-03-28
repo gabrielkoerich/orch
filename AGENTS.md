@@ -1,6 +1,6 @@
-# Orchestrator — Agent & Developer Notes
+# Orch — Agent & Developer Notes
 
-You are an autonomous orchestrator. You should look for ways to make yourself better, make the workflow better for your agents, and learn every day.
+You are an autonomous orch agent. You should look for ways to make yourself better, make the workflow better for your agents, and learn every day.
 
 ## Upgrading
 
@@ -33,7 +33,7 @@ orch task unblock all
 
 ## Live Session Streaming
 
-The orchestrator can stream live output from running agent sessions. This allows you to watch agent work in real-time from the terminal.
+Orch can stream live output from running agent sessions. This allows you to watch agent work in real-time from the terminal.
 
 ### Streaming via CLI
 
@@ -108,14 +108,14 @@ Sharding is only needed for bots in 2 500+ guilds. For most deployments, the def
 
 ## Webhooks & Polling Fallback
 
-The orchestrator has two modes for receiving GitHub events:
+Orch has two modes for receiving GitHub events:
 
 1. **Webhook mode** (instant) — via `webhook.enabled: true` in config
 2. **Polling mode** — via periodic `sync_tick()` (every 45s by default)
 
 ### Polling Fallback
 
-When webhooks are enabled but the local server becomes unavailable (e.g. port conflict, crash), the orchestrator automatically switches to polling fallback mode. When webhooks are disabled entirely, polling mode is used from the start.
+When webhooks are enabled but the local server becomes unavailable (e.g. port conflict, crash), orch automatically switches to polling fallback mode. When webhooks are disabled entirely, polling mode is used from the start.
 
 - **Health check**: Pings the local webhook server's `/health` endpoint every 60 seconds (configurable). This verifies the local HTTP listener is running — it does not verify GitHub-side reachability or webhook secret validity.
 - **Faster polling**: When in fallback mode, sync operations run every 30 seconds (configurable) instead of 45s
@@ -150,7 +150,7 @@ engine:
 
 ## PR Review Integration
 
-The orchestrator re-routes tasks when PR reviews request changes, closing the feedback loop between code review and agent execution.
+Orch re-routes tasks when PR reviews request changes, closing the feedback loop between code review and agent execution.
 
 ### How It Works
 
@@ -450,11 +450,11 @@ Modes:
 - `full-auto` (default) — filesystem sandboxed, network enabled
 - `workspace-write` — same sandbox, explicit mode
 - `danger-full-access` — no sandbox (for tasks needing bun, solana-test-validator, etc.)
-- `none` — bypasses all Codex sandboxing (orchestrator is the sandbox)
+- `none` — bypasses all Codex sandboxing (orch is the sandbox)
 
 ## Control Session (`orch chat`)
 
-An interactive conversational control plane. Talk to the orchestrator in natural language — ask about running tasks, create new ones, check status, unblock things.
+An interactive conversational control plane. Talk to orch in natural language — ask about running tasks, create new ones, check status, unblock things.
 
 ### How It Works
 
