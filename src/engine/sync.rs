@@ -125,7 +125,8 @@ fn classify_failure(error: &str, outcome: &str) -> FailureCategory {
     }
 
     if lower.contains("create pr failed")
-        || lower.contains("pull request") && lower.contains("fail")
+        || lower.contains("failed to create pull request")
+        || lower.contains("pull request creation failed")
     {
         return FailureCategory::PrCreateFailed;
     }
