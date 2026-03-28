@@ -917,7 +917,7 @@ pub(crate) async fn review_and_merge(
     }
 
     // Stage 1: strip the agent-specific output envelope to get the review text.
-    let text_for_review = match agent_runner.extract_text(&raw_output) {
+    let mut text_for_review = match agent_runner.extract_text(&raw_output) {
         Ok(text) if !text.is_empty() => text,
         Ok(_) => {
             tracing::debug!(
@@ -966,27 +966,69 @@ pub(crate) async fn review_and_merge(
     let review_response = match runner::response::parse_review_from_output(&text_for_review) {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(
-                task_id = task.id.0,
-                error = %e,
-                output = %text_for_review.chars().take(300).collect::<String>(),
-                "failed to parse review response"
-            );
-            if let Some(rid) = run_id {
-                let _ = store
-                    .complete_run(&CompleteRun {
-                        run_id: rid,
-                        exit_code: Some(exit_code),
-                        stdout: &raw_output,
-                        stderr: &stderr,
-                        parsed: &text_for_review,
-                        outcome: "failed",
-                        error: &format!("parse error: {e}"),
-                        tokens: RunTokenUsage::default(),
-                    })
-                    .await;
+            if raw_output != text_for_review {
+                match runner::response::parse_review_from_output(&raw_output) {
+                    Ok(r) => {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            error = %e,
+                            "review response parsed from raw output fallback"
+                        );
+                        text_for_review = raw_output.clone();
+                        r
+                    }
+                    Err(fallback_err) => {
+                        let combined_error = format!(
+                            "primary parse error: {e}; raw output parse error: {fallback_err}"
+                        );
+                        tracing::error!(
+                            task_id = task.id.0,
+                            error = %combined_error,
+                            output = %text_for_review.chars().take(300).collect::<String>(),
+                            "failed to parse review response"
+                        );
+                        if let Some(rid) = run_id {
+                            let _ = store
+                                .complete_run(&CompleteRun {
+                                    run_id: rid,
+                                    exit_code: Some(exit_code),
+                                    stdout: &raw_output,
+                                    stderr: &stderr,
+                                    parsed: &text_for_review,
+                                    outcome: "failed",
+                                    error: &format!("parse error: {combined_error}"),
+                                    tokens: RunTokenUsage::default(),
+                                })
+                                .await;
+                        }
+                        return Ok(ReviewDecision::Failed(format!(
+                            "parse error: {combined_error}"
+                        )));
+                    }
+                }
+            } else {
+                tracing::error!(
+                    task_id = task.id.0,
+                    error = %e,
+                    output = %text_for_review.chars().take(300).collect::<String>(),
+                    "failed to parse review response"
+                );
+                if let Some(rid) = run_id {
+                    let _ = store
+                        .complete_run(&CompleteRun {
+                            run_id: rid,
+                            exit_code: Some(exit_code),
+                            stdout: &raw_output,
+                            stderr: &stderr,
+                            parsed: &text_for_review,
+                            outcome: "failed",
+                            error: &format!("parse error: {e}"),
+                            tokens: RunTokenUsage::default(),
+                        })
+                        .await;
+                }
+                return Ok(ReviewDecision::Failed(format!("parse error: {e}")));
             }
-            return Ok(ReviewDecision::Failed(format!("parse error: {e}")));
         }
     };
 
