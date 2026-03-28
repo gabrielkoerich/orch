@@ -233,8 +233,9 @@ async fn auto_unblock_blocked_tasks(
         }
 
         let runs = store.get_runs(task.id).await.unwrap_or_default();
+        let agent_runs: Vec<_> = runs.into_iter().filter(|r| r.run_type == "agent").collect();
         let mut failures = Vec::new();
-        for run in runs.iter().rev() {
+        for run in agent_runs.iter().rev() {
             if let Some(category) = classify_failure_from_run(run) {
                 failures.push(category);
             }
