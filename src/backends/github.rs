@@ -391,4 +391,21 @@ impl ExternalBackend for GitHubBackend {
             })
             .collect())
     }
+
+    async fn list_issue_comments(&self, id: &ExternalId) -> anyhow::Result<Vec<Mention>> {
+        let issue_number: u64 =
+            id.0.parse()
+                .map_err(|_| anyhow::anyhow!("invalid issue number: {}", id.0))?;
+        let comments = self.gh.get_issue_comments(&self.repo, issue_number).await?;
+        Ok(comments
+            .into_iter()
+            .map(|c| Mention {
+                id: c.id.to_string(),
+                body: c.body,
+                author: c.user.login,
+                created_at: c.created_at,
+                issue_url: c.issue_url,
+            })
+            .collect())
+    }
 }

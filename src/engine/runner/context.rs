@@ -241,38 +241,53 @@ pub async fn build_git_log(project_dir: &Path, default_branch: &str) -> String {
     }
 }
 
-/// Fetch recent issue comments for agent context.
+/// Returns true if the comment is from an automated bot and should be skipped.
+fn is_bot_comment(mention: &crate::backends::Mention) -> bool {
+    // Skip GitHub Actions bots and other automated accounts
+    if mention.author.ends_with("[bot]") {
+        return true;
+    }
+    // Skip automated review comments posted by orch itself
+    if mention.body.starts_with("## Automated Review") {
+        return true;
+    }
+    false
+}
+
+/// Fetch issue comments for agent context.
+///
+/// Fetches all comments for the specific issue using the per-issue API endpoint,
+/// then returns the last `limit` non-bot comments formatted for the prompt.
 pub async fn fetch_issue_comments(
     backend: &dyn ExternalBackend,
     task_id: &str,
     limit: usize,
 ) -> String {
-    let since = chrono::Utc::now() - chrono::Duration::days(30);
-    let since_str = since.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-    let mentions = match backend.get_mentions(&since_str).await {
-        Ok(m) => m,
-        Err(_) => return String::new(),
+    let id = crate::backends::ExternalId(task_id.to_string());
+    let all_comments = match backend.list_issue_comments(&id).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(task_id, error = %e, "failed to fetch issue comments");
+            return String::new();
+        }
     };
 
-    // Filter to comments on this task
-    let mut comments = String::new();
-    let mut count = 0;
-    for mention in mentions.iter().rev() {
-        if count >= limit {
-            break;
-        }
-        // Include if the mention references this task
-        if mention.id.contains(task_id) || mention.body.contains(&format!("#{task_id}")) {
-            comments.push_str(&format!(
-                "**@{}** ({}):\n{}\n\n",
-                mention.author, mention.created_at, mention.body
-            ));
-            count += 1;
-        }
+    // Filter bot comments, then take the last `limit` entries
+    let human_comments: Vec<_> = all_comments
+        .into_iter()
+        .filter(|c| !is_bot_comment(c))
+        .collect();
+
+    let start = human_comments.len().saturating_sub(limit);
+    let mut formatted = String::new();
+    for comment in &human_comments[start..] {
+        formatted.push_str(&format!(
+            "**@{}** ({}):\n{}\n\n",
+            comment.author, comment.created_at, comment.body
+        ));
     }
 
-    comments
+    formatted
 }
 
 /// Build memory context from previous attempts.
