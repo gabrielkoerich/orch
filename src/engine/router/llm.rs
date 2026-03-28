@@ -495,7 +495,22 @@ impl LlmRouter {
 
     fn extract_agent_text(&self, agent: &str, raw: &str) -> anyhow::Result<String> {
         match agent {
-            "opencode" => Ok(opencode::extract_router_text(raw).unwrap_or_else(|| raw.to_string())),
+            "opencode" => {
+                let events = opencode::parse_ndjson_events(raw.trim());
+                if events.is_empty() {
+                    // No parseable NDJSON lines — treat as plain text
+                    Ok(raw.to_string())
+                } else {
+                    match opencode::extract_ndjson_text(&events) {
+                        Some(text) => Ok(text),
+                        None => {
+                            anyhow::bail!(
+                                "opencode produced no text output (NDJSON had no text events)"
+                            )
+                        }
+                    }
+                }
+            }
             "claude" | "kimi" | "minimax" => match claude::extract_stream_json_result_text(raw) {
                 Ok(text) => Ok(text),
                 Err(AgentError::AgentFailed { message }) => {
@@ -761,6 +776,27 @@ mod tests {
         let resp = router.parse_llm_response("opencode", raw).unwrap();
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "simple");
+    }
+
+    #[test]
+    fn parse_opencode_ndjson_no_text_events_returns_clear_error() {
+        // When opencode emits only control events (step_start/step_finish) with
+        // no text payload, extract_agent_text must return a clear error instead
+        // of falling back to the raw NDJSON string (which would cause parse_llm_response
+        // to extract a step_start event and produce a misleading "could not parse" error).
+        let router = make_router();
+        let raw = r#"{"type":"step_start","timestamp":1774721088828,"sessionID":"ses_abc","part":{"type":"step-start","snapshot":""}}
+{"type":"step_finish","timestamp":1774721089000,"part":{"type":"step-finish","reason":"stop","cost":0,"tokens":{"total":100,"input":99,"output":1}}}"#;
+        let err = router.parse_llm_response("opencode", raw).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no text") || msg.contains("no text events"),
+            "error should mention missing text output, got: {msg}"
+        );
+        assert!(
+            !msg.contains("step_start"),
+            "error must not expose raw NDJSON step_start event, got: {msg}"
+        );
     }
 
     #[test]
