@@ -157,15 +157,16 @@ pub async fn send_persistent(
         .capture_pane(&guard.tmux_session, 5000)
         .await
         .unwrap_or_default();
-    let before_len = before.len();
+    let before_lines = before.lines().count();
 
     // Send message via tmux
     send_message_to_tmux(&guard.tmux_session, message).await?;
 
     // Wait for response and capture it
-    let response = wait_and_capture_response(&tmux, &guard.tmux_session, before_len, &guard.agent)
-        .await
-        .context("waiting for agent response")?;
+    let response =
+        wait_and_capture_response(&tmux, &guard.tmux_session, before_lines, &guard.agent)
+            .await
+            .context("waiting for agent response")?;
 
     guard.last_activity = Instant::now();
 
@@ -475,7 +476,7 @@ async fn send_message_to_tmux(session: &str, message: &str) -> Result<()> {
 async fn wait_and_capture_response(
     tmux: &TmuxManager,
     session: &str,
-    before_len: usize,
+    before_lines: usize,
     agent: &str,
 ) -> Result<String> {
     let start = Instant::now();
@@ -495,11 +496,11 @@ async fn wait_and_capture_response(
         // Check if session died
         if !tmux.is_session_active(session).await && current == last_content {
             // Session ended — return whatever we have
-            return extract_response(&current, before_len, agent);
+            return extract_response(&current, before_lines, agent);
         }
 
         // Check for new content since the message was sent
-        if current.len() > before_len {
+        if current.lines().count() > before_lines {
             has_new_content = true;
         }
 
@@ -519,20 +520,20 @@ async fn wait_and_capture_response(
             // Also verify the agent prompt has reappeared (stronger signal)
             if is_agent_prompt(&last_content, agent) || last_change.elapsed() > STABLE_THRESHOLD * 2
             {
-                return extract_response(&last_content, before_len, agent);
+                return extract_response(&last_content, before_lines, agent);
             }
         }
     }
 }
 
 /// Extract the response text from pane content by diffing with before state.
-fn extract_response(content: &str, before_len: usize, agent: &str) -> Result<String> {
+fn extract_response(content: &str, before_lines: usize, agent: &str) -> Result<String> {
     // Get the new content that appeared after the message was sent
-    let new_content = if content.len() > before_len {
-        &content[before_len..]
-    } else {
-        content
-    };
+    let new_content = content
+        .lines()
+        .skip(before_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Split into lines and clean up
     let lines: Vec<&str> = new_content.lines().collect();
@@ -698,7 +699,7 @@ mod tests {
     fn extract_response_basic() {
         let before = "previous content\n";
         let after = "previous content\nuser message\nagent response line 1\nresponse line 2\n❯ ";
-        let result = extract_response(after, before.len(), "claude").unwrap();
+        let result = extract_response(after, before.lines().count(), "claude").unwrap();
         assert!(result.contains("agent response line 1"));
         assert!(result.contains("response line 2"));
         assert!(!result.contains("❯"));
