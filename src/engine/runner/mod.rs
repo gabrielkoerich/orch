@@ -117,7 +117,10 @@ fn classify_run_error_type(last_error: &str) -> &'static str {
         "push_failed"
     } else if last_error.contains("No commits between") || last_error.contains("no commits") {
         "no_commits"
-    } else if last_error.contains("create PR failed") || last_error.contains("pull request") {
+    } else if last_error.contains("create PR failed")
+        || last_error.contains("failed to create pull request")
+        || last_error.contains("pull request creation failed")
+    {
         "pr_failed"
     } else if last_error.contains("invalid response") || last_error.contains("parse error") {
         "parse_error"
@@ -1247,6 +1250,20 @@ mod tests {
     #[test]
     fn classify_run_error_type_falls_back_for_unknown_errors() {
         assert_eq!(classify_run_error_type("something unexpected"), "failed");
+    }
+
+    #[test]
+    fn classify_run_error_type_connection_error_mentioning_pull_request_is_not_pr_failed() {
+        // A generic GitHub API or connection error whose message happens to contain the
+        // substring "pull request" must NOT be classified as pr_failed.
+        assert_eq!(
+            classify_run_error_type("failed to fetch pull request details from GitHub"),
+            "failed"
+        );
+        assert_eq!(
+            classify_run_error_type("connection reset while reading pull request data"),
+            "failed"
+        );
     }
 
     // ── resolve_project_dir ──────────────────────────────────────────────────
