@@ -452,8 +452,8 @@ impl TaskRunner {
                 )
                 .await?;
                 if budget_exceeded {
-                    // Token budget exceeded — store already updated, return without
-                    // tmux cleanup or metrics (preserves original behavior)
+                    // Token budget exceeded — clean up tmux session and env secrets
+                    session::cleanup_session(task_id, &tmux, &tmux_session).await;
                     let audit = self
                         .build_run_audit(RunAuditInput {
                             task_id,
@@ -487,7 +487,8 @@ impl TaskRunner {
                 .await?
                 {
                     fallback::ErrorHandleResult::EarlyReturn { status } => {
-                        // Task rerouted — return (metrics recorded in run_with_context)
+                        // Task rerouted — clean up tmux session and env secrets
+                        session::cleanup_session(task_id, &tmux, &tmux_session).await;
                         let audit = self
                             .build_run_audit(RunAuditInput {
                                 task_id,
