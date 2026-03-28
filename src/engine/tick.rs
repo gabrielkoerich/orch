@@ -661,6 +661,12 @@ pub(crate) async fn tick_dispatch_tasks(
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
         .collect();
 
+    if dispatchable.is_empty() {
+        tracing::debug!(count = 0, "dispatchable tasks found");
+    } else {
+        tracing::info!(count = dispatchable.len(), "dispatchable tasks found");
+    }
+
     for task in dispatchable {
         // In-memory guard: prevents double-dispatch due to GitHub API eventual consistency.
         // After update_status(InProgress), the label removal fires a webhook that can

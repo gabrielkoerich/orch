@@ -256,10 +256,18 @@ pub(crate) async fn sync_tick(
         };
 
         const MIN_STALE_NEEDS_REVIEW_MINUTES: i64 = 1;
-        tracing::info!(
-            count = needs_review_tasks.len(),
-            "sync catch-up: checking stale NeedsReview tasks"
-        );
+        let needs_review_count = needs_review_tasks.len();
+        if needs_review_count > 0 {
+            tracing::info!(
+                count = needs_review_count,
+                "sync catch-up: checking stale NeedsReview tasks"
+            );
+        } else {
+            tracing::debug!(
+                count = needs_review_count,
+                "sync catch-up: checking stale NeedsReview tasks"
+            );
+        }
         for task in needs_review_tasks {
             // Only retry tasks that have been in NeedsReview long enough that the
             // subscriber should have handled them by now. Fresh tasks (just transitioned)
