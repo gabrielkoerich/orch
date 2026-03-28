@@ -17,18 +17,20 @@ Keep the branch up to date — other PRs may have merged since this was created:
 
 ### Step 2: Verify CI status
 
-GitHub CI is the authoritative test environment. Check it:
+GitHub CI is the authoritative test environment. Check **required checks only**:
 
 ```bash
-timeout 300 gh pr checks {{PR_NUMBER}} --watch --fail-fast || true
+timeout 300 gh pr checks {{PR_NUMBER}} --watch --fail-fast --required || true
 ```
 
-- **CI passes AND branch is up to date** (Step 1 rebase was a no-op or already applied) → proceed to Step 3 (skip local test runs)
-- **CI passes BUT branch was rebased** (Step 1 changed commits) → CI results are stale. Note in your review that CI needs to re-run post-rebase and proceed with code review. Orch will push the rebased branch (before posting the review decision) and CI will re-run before merging.
-- **CI fails** → check if the failure is related to files in this PR. If not, it's pre-existing — note it and proceed. If it is, set decision = `request_changes`
-- **CI not run yet or pending** → run local checks as fallback: read `.github/workflows/` to identify what CI runs and execute those commands. Do NOT hardcode language-specific commands
+- **Required checks pass AND branch is up to date** (Step 1 rebase was a no-op or already applied) → proceed to Step 3 (skip local test runs)
+- **Required checks pass BUT branch was rebased** (Step 1 changed commits) → CI results are stale. Note in your review that CI needs to re-run post-rebase and proceed with code review. Orch will push the rebased branch (before posting the review decision) and CI will re-run before merging.
+- **Required checks fail** → check if the failure is related to files in this PR. If not, it's pre-existing — note it and proceed. If it is, set decision = `request_changes`
+- **Required checks not run yet or pending** → run local checks as fallback: read `.github/workflows/` to identify what CI runs and execute those commands. Do NOT hardcode language-specific commands
 
-**Do NOT request changes for local-only test failures when GitHub CI is green.**
+**Do NOT request changes for local-only test failures when required checks are green.**
+
+**Non-required checks** (e.g. `review-gate`, `deploy`, `release`, `build-macos`, `check-release`) are informational — ignore their pass/fail status. Do NOT request changes based on non-required check failures.
 
 ### Step 3: Check architecture alignment
 
@@ -89,5 +91,6 @@ Do NOT respond with prose summaries.
 ```
 
 Decision rules:
-- **approve**: GitHub CI passes, branch is rebased, code meets requirements, no major issues
-- **request_changes**: GitHub CI fails on PR-related code, there are bugs, scope creep, or the code doesn't meet requirements
+- **approve**: Required GitHub CI checks pass, branch is rebased, code meets requirements, no major issues
+- **request_changes**: Required GitHub CI checks fail on PR-related code, there are bugs, scope creep, or the code doesn't meet requirements
+- **Do NOT** request changes solely because non-required checks (e.g. `review-gate`, `deploy`, `release`) are failing
