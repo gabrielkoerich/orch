@@ -443,6 +443,10 @@ pub fn parse_review_response(text: &str) -> anyhow::Result<ReviewResponse> {
         }
     }
 
+    if let Some(resp) = extract_review_response_object(text) {
+        return Ok(resp);
+    }
+
     anyhow::bail!("failed to parse review response")
 }
 
@@ -512,6 +516,58 @@ fn extract_json_block(text: &str) -> Option<String> {
         }
         search_from = end + 3;
     }
+    None
+}
+
+/// Extract a ReviewResponse JSON object from arbitrary text.
+///
+/// Scans for balanced JSON objects and tries to parse them as ReviewResponse.
+fn extract_review_response_object(text: &str) -> Option<ReviewResponse> {
+    let mut start: Option<usize> = None;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (idx, ch) in text.char_indices() {
+        if start.is_some() {
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if ch == '\\' {
+                    escape = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let start_idx = start.unwrap();
+                        let candidate = &text[start_idx..=idx];
+                        if let Ok(resp) = serde_json::from_str::<ReviewResponse>(candidate) {
+                            return Some(resp);
+                        }
+                        start = None;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if ch == '{' {
+            start = Some(idx);
+            depth = 1;
+            in_string = false;
+            escape = false;
+        }
+    }
+
     None
 }
 
@@ -753,6 +809,14 @@ That's all."#;
         assert_eq!(resp.decision, "request_changes");
         assert_eq!(resp.issues.len(), 1);
         assert_eq!(resp.issues[0].file, "src/main.rs");
+    }
+
+    #[test]
+    fn parse_review_response_embedded_json_object() {
+        let text = "Review complete.\n\n{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}\nThanks!";
+        let resp = parse_review_response(text).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert_eq!(resp.notes, "LGTM");
     }
 
     #[test]
