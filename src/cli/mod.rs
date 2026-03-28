@@ -169,9 +169,6 @@ pub fn log(lines: &str) -> anyhow::Result<()> {
         state_dir.join("orch.error.log"),
         std::path::PathBuf::from(&brew_prefix).join("var/log/orch.log"),
         std::path::PathBuf::from(&brew_prefix).join("var/log/orch.error.log"),
-        // Legacy paths
-        std::path::PathBuf::from(&brew_prefix).join("var/log/orchestrator.log"),
-        std::path::PathBuf::from(&brew_prefix).join("var/log/orchestrator.error.log"),
     ];
 
     for path in &candidates {
