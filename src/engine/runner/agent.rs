@@ -120,7 +120,7 @@ export GIT_AUTHOR_EMAIL="{git_email}"
 export GIT_COMMITTER_EMAIL="{git_email}"
 export TASK_ID="{task_id}"
 export OUTPUT_FILE="{output_file}"
-unset CLAUDECODE  # allow nested claude invocations from orchestrator
+unset CLAUDECODE  # allow nested claude invocations from orch
 
 cd "{work_dir}" || {{
     printf '%s\n' "worktree directory does not exist: {work_dir}" > "$stderr_file"

@@ -54,7 +54,7 @@ All runtime configuration lives in `~/.orch/config.yml` (`ORCH_HOME`), unless ov
 
 ## Authentication
 
-The orchestrator supports three authentication methods for GitHub API access:
+Orch supports three authentication methods for GitHub API access:
 
 ### Personal Access Token (PAT)
 
@@ -81,7 +81,7 @@ gh:
     # installation_id: "78901234"
 ```
 
-The orchestrator automatically:
+Orch automatically:
 - Generates JWTs from your App credentials
 - Exchanges JWTs for installation access tokens
 - Refreshes tokens before they expire (valid for 1 hour)
@@ -98,7 +98,7 @@ Requires `gh auth login` to be run interactively. Not recommended for service en
 
 ## Per-Project Config
 
-Drop a `.orch.yml` or `.orchestrator.yml` in your project root to override global config (project-level keys take precedence over global).
+Drop a `.orch.yml` (legacy `.orchestrator.yml` is still supported) in your project root to override global config (project-level keys take precedence over global).
 
 ```yaml
 # ~/projects/my-app/.orch.yml

@@ -539,7 +539,7 @@ pub async fn create_pr_if_needed(
 
 /// Append the Orch attribution footer to an existing PR body if not already present.
 ///
-/// Called when the agent created the PR directly (bypassing the orchestrator's
+/// Called when the agent created the PR directly (bypassing orch's
 /// `create_pr_if_needed`), so the footer was never added by `build_pr_body`.
 async fn append_pr_footer_if_missing(
     gh: &GhHttp,

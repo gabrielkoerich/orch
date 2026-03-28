@@ -45,7 +45,7 @@ pub enum SandboxLevel {
     WorkspaceWrite,
     /// Agent has full filesystem access (dangerous).
     FullAccess,
-    /// No sandboxing (orchestrator manages isolation externally).
+    /// No sandboxing (orch manages isolation externally).
     None,
 }
 

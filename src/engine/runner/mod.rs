@@ -198,7 +198,7 @@ fn parse_success_output(
 pub struct TaskRunner {
     /// Repository slug (owner/repo)
     repo: String,
-    /// Path to the orchestrator home directory
+    /// Path to the orch home directory
     orch_home: PathBuf,
     /// Unified task store for run audit trail
     store: Option<Arc<crate::store::TaskStore>>,

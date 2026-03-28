@@ -1244,7 +1244,7 @@ mod tests {
             },
             "comment": {
                 "id": 12345,
-                "body": "@orchestrator please fix this",
+                "body": "@orch please fix this",
                 "user": {"login": "contributor"},
                 "created_at": "2024-06-15T12:00:00Z"
             }
@@ -1264,7 +1264,7 @@ mod tests {
         let msg = rx.try_recv().expect("should receive comment message");
         assert_eq!(msg.thread_id, "42", "thread_id should be the issue number");
         assert_eq!(msg.author, "contributor");
-        assert!(msg.body.contains("@orchestrator"));
+        assert!(msg.body.contains("@orch"));
     }
 
     /// Integration test: verify pull_request_review.submitted events are handled.

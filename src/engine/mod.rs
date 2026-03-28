@@ -32,7 +32,7 @@ pub mod tick;
 /// Standard Orch attribution footer for issue bodies, PR bodies, and comments.
 ///
 /// Append to every user-visible string posted to GitHub so activity is
-/// clearly attributed to the orchestrator rather than appearing as a human post.
+/// clearly attributed to orch rather than appearing as a human post.
 pub fn orch_footer() -> &'static str {
     "\n\n---\n*Posted by [Orch](https://github.com/gabrielkoerich/orch)*"
 }
@@ -456,7 +456,7 @@ fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelC
     }
 }
 
-/// Start the orchestrator service.
+/// Start the orch service.
 ///
 /// This is the main entry point — called by `orch serve`.
 pub async fn serve() -> anyhow::Result<()> {

@@ -1,10 +1,10 @@
 +++
 title = "Workflow"
-description = "How the orchestrator runs tasks end-to-end"
+description = "How orch runs tasks end-to-end"
 weight = 3
 +++
 
-How the orchestrator runs tasks end-to-end.
+How orch runs tasks end-to-end.
 
 ## Full Development Cycle
 
@@ -25,17 +25,17 @@ Issue → Branch + Worktree → Agent works → Push → PR → Review Agent →
 
 ## Mention-Driven Tasks
 
-When someone comments `@orchestrator ...` on a GitHub issue/PR, the GitHub mentions listener can create a task like:
+When someone comments `@orch ...` (or legacy `@orchestrator ...`) on a GitHub issue/PR, the GitHub mentions listener can create a task like:
 
 ```
-Respond to @orchestrator mention in #<N>
+Respond to @orch mention in #<N>
 ```
 
 Expected outcome:
 
 - Read the mention body + any referenced issues/PRs
 - Reply back on the *target* issue with a concise status update and clear next steps
-- Avoid including `@orchestrator` in automated replies or agent summaries (use `orchestrator` without the `@`) to prevent mention-task feedback loops
+- Avoid including `@orch` in automated replies or agent summaries (use `orch` without the `@`) to prevent mention-task feedback loops
 - If no code/docs changes are required, the task can be completed without opening a PR
 
 ## Task Lifecycle
@@ -69,7 +69,7 @@ A separate **sync tick** (~45s) handles less-frequent operations:
 
 1. **Cleanup** — removes worktrees for done tasks (runs in background), deletes orphaned remote branches, auto-prunes stale worktree metadata, pulls main once per cycle; remote branch is kept when a blocked task has an open PR
 2. **Merged PR detection** — marks tasks done when their PRs are merged
-3. **Mention scanning** — detects `@orchestrator` mentions in issue comments
+3. **Mention scanning** — detects `@orch` (and legacy `@orchestrator`) mentions in issue comments
 4. **PR review processing** — re-routes tasks when reviews request changes (not child task creation), resets `ci_merge_failures` counter on re-route
 5. **Review agent** — spawns review agent for `needs_review` tasks
 6. **Stale review detection** — resets `in_review` tasks with no active tmux session (>5 min)

@@ -14,7 +14,7 @@ Agents execute inside an isolated git worktree created for the task (not your ma
 
 ## tmux Runner
 
-Agent sessions run inside tmux sessions. The orchestrator spawns the agent CLI as the tmux session shell, so tmux provides the PTY. There is no external PTY process or `portable_pty` crate. Prompt files are written to per-attempt directories for auditability.
+Agent sessions run inside tmux sessions. Orch spawns the agent CLI as the tmux session shell, so tmux provides the PTY. There is no external PTY process or `portable_pty` crate. Prompt files are written to per-attempt directories for auditability.
 
 ## Agent Output
 
@@ -36,7 +36,7 @@ The agent writes a JSON file to `~/.orch/state/{repo}/tasks/{id}/attempts/{n}/ou
 
 ## PATH Configuration
 
-When orchestrator runs as a service (e.g. via `brew services`), agents start with a minimal PATH that may not include tools like `bun`, `anchor`, `cargo`, or `solana`. There are two ways to fix this:
+When orch runs as a service (e.g. via `brew services`), agents start with a minimal PATH that may not include tools like `bun`, `anchor`, `cargo`, or `solana`. There are two ways to fix this:
 
 **Option 1: Create `~/.path` (recommended)**
 
@@ -51,11 +51,11 @@ export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-The orchestrator sources this file before launching agents, so any tool on your PATH will be available to agents when the runner is configured to inherit the shell environment.
+Orch sources this file before launching agents, so any tool on your PATH will be available to agents when the runner is configured to inherit the shell environment.
 
 **Option 2: Default fallback**
 
-If `~/.path` doesn't exist, orchestrator automatically adds common paths:
+If `~/.path` doesn't exist, orch automatically adds common paths:
 
 - `$HOME/.bun/bin`
 - `$HOME/.cargo/bin`
@@ -76,9 +76,9 @@ Agents are constrained by rules in the system prompt and by runner-enforced tool
 
 ## Worktrees
 
-The orchestrator creates worktrees before launching agents. Agents do NOT create worktrees themselves.
+Orch creates worktrees before launching agents. Agents do NOT create worktrees themselves.
 
-**Path:** `~/.orch/worktrees/<project>/<branch>/` — worktrees are always placed under `~/.orch/worktrees` with a project/branch layout. Worktrees live in the orchestrator home directory (`ORCH_HOME`, default `~/.orch`) and are safe to remove by the cleanup process once branches are merged.
+**Path:** `~/.orch/worktrees/<project>/<branch>/` — worktrees are always placed under `~/.orch/worktrees` with a project/branch layout. Worktrees live in orch home directory (`ORCH_HOME`, default `~/.orch`) and are safe to remove by the cleanup process once branches are merged.
 
 **Steps:**
 1. `gh issue develop <issue> --base main --name <branch>` — registers branch with GitHub
@@ -86,7 +86,7 @@ The orchestrator creates worktrees before launching agents. Agents do NOT create
 3. `git worktree add <path> <branch>` — creates worktree
 4. Agent runs inside the worktree directory
 
-After an agent finishes, the orchestrator handles all git operations: pushing the branch, creating the PR, and linking it to the issue. Agents only commit — they do not push or create PRs. The runner injects `GH_TOKEN` into the environment for read-only operations (e.g., checking CI status), but agents should not call GitHub write APIs directly. Attribution footers (for example: `Created by claude[bot] via Orch`) are added to issue and PR comments so it's clear which agent produced the content.
+After an agent finishes, orch handles all git operations: pushing the branch, creating the PR, and linking it to the issue. Agents only commit — they do not push or create PRs. The runner injects `GH_TOKEN` into the environment for read-only operations (e.g., checking CI status), but agents should not call GitHub write APIs directly. Attribution footers (for example: `Created by claude[bot] via Orch`) are added to issue and PR comments so it's clear which agent produced the content.
 
 ## Context Enrichment
 
@@ -112,7 +112,7 @@ Every agent receives a rich context built from multiple sources:
 
 When a task fails:
 1. Error is recorded in `last_error` and `history`
-2. After repeated failures the task is moved to `needs_review` (human attention) instead of being permanently blocked; the orchestrator also removes any forced `agent:*` label so an owner can reassign or inspect the task. The change in behavior ensures tasks don't remain stuck with a forced agent after owner intervention is needed.
+2. After repeated failures the task is moved to `needs_review` (human attention) instead of being permanently blocked; orch also removes any forced `agent:*` label so an owner can reassign or inspect the task. The change in behavior ensures tasks don't remain stuck with a forced agent after owner intervention is needed.
 3. A structured comment is posted on the linked GitHub issue with an attribution footer (for example: `Created by claude[bot] via Orch`) so it's clear which agent produced the comment
 4. A `needs_review` label is applied to the issue and the configured review owner is notified
 
@@ -133,4 +133,4 @@ Codex supports multiple sandbox configurations. When a workspace-write sandbox i
 - `sandbox_workspace_write.network_access=true`
 - `shell_environment_policy.inherit=all`
 
-These are configured by the orchestrator when spawning the Codex runner — do not rely on agents to set these themselves.
+These are configured by orch when spawning the Codex runner — do not rely on agents to set these themselves.

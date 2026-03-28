@@ -13,17 +13,17 @@ fn brew_services(action: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Start the orchestrator service.
+/// Start the orch service.
 pub fn start() -> anyhow::Result<()> {
     brew_services("start")
 }
 
-/// Stop the orchestrator service.
+/// Stop the orch service.
 pub fn stop() -> anyhow::Result<()> {
     brew_services("stop")
 }
 
-/// Restart the orchestrator service.
+/// Restart the orch service.
 pub fn restart() -> anyhow::Result<()> {
     brew_services("restart")
 }

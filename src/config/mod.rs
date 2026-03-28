@@ -333,7 +333,7 @@ pub fn get_repo_for_project(project_path: &std::path::Path) -> anyhow::Result<St
 
 /// Resolve project path from CWD by finding the nearest `.orch.yml`.
 ///
-/// Walks up from the current directory looking for `.orch.yml` or `.orchestrator.yml`.
+/// Walks up from the current directory looking for `.orch.yml` or legacy `.orchestrator.yml`.
 pub fn find_project_root() -> anyhow::Result<std::path::PathBuf> {
     let mut dir = std::env::current_dir()?;
 

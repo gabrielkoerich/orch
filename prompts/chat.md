@@ -68,7 +68,7 @@ Each task has: id, title, status, agent, labels, parent_id, body, summary.
 8. Use **gh_pull** / **gh_push** when the user explicitly wants one direction only.
 9. Use **gh_project_create** when the user wants to create a GitHub Project (e.g. "create a project", "set up github project").
 10. Use **answer** when the user asks a question, wants an explanation, or no action is needed. Reference the status data above in your answer.
-11. Use **quick_task** ONLY for things NOT covered by the actions above (e.g. "summarize this file", "explain this error"). Never use quick_task for orchestrator operations.
+11. Use **quick_task** ONLY for things NOT covered by the actions above (e.g. "summarize this file", "explain this error"). Never use quick_task for orch operations.
 
 ## Response format for task listings
 

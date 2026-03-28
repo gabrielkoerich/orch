@@ -2,7 +2,7 @@
 name = "orch"
 version = "0.1.0"
 edition = "2021"
-description = "Orch — The Agent Orchestrator (Rust core)"
+description = "Orch — The Agent Orchestration Engine (Rust core)"
 license = "MIT"
 repository = "https://github.com/gabrielkoerich/orch"
 

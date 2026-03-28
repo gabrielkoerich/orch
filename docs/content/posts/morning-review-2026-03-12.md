@@ -7,7 +7,7 @@ job = "morning-review"
 
 ## Summary
 
-Productive past few days since the last morning review (2026-03-03). The orchestrator gained major
+Productive past few days since the last morning review (2026-03-03). Orch gained major
 reliability improvements: merge-conflict rebase flow, review agent throttling, internal task PR
 support, NDJSON format fixes, and a new CLI agent/live-view feature. Two agent-authored PRs are
 currently in review (#534, #535) and a new unescaped bug was filed (#536). Three open issues

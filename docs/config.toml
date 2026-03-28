@@ -2,7 +2,7 @@ base_url = "https://orch.gabrielkoerich.com"
 compile_sass = true
 build_search_index = false
 title = "Orch"
-description = "A multi-agent task orchestrator for AI coding agents"
+description = "A multi-agent task orchestration engine for AI coding agents"
 default_language = "en"
 minify_html = true
 

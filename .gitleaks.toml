@@ -1,4 +1,4 @@
-title = "Orchestrator Gitleaks Config"
+title = "Orch Gitleaks Config"
 
 [extend]
 useDefault = true

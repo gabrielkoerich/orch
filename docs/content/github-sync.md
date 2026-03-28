@@ -4,7 +4,7 @@ description = "GitHub Issues as the native task backend"
 weight = 8
 +++
 
-Tasks are stored in a unified SQLite database (`~/.orch/orch.db`) and synced to GitHub Issues (when `gh.enabled: true`). External tasks from GitHub are ingested into the store on each sync tick, so the store always has the latest data. The orchestrator centralizes GitHub API calls via the server and uses a native HTTP client (`reqwest`) or the `gh` CLI internally.
+Tasks are stored in a unified SQLite database (`~/.orch/orch.db`) and synced to GitHub Issues (when `gh.enabled: true`). External tasks from GitHub are ingested into the store on each sync tick, so the store always has the latest data. Orch centralizes GitHub API calls via the server and uses a native HTTP client (`reqwest`) or the `gh` CLI internally.
 
 ## Setup
 
@@ -55,7 +55,7 @@ orch project info --fix     # auto-fills project field/option IDs into config
 
 ### Agent Response Comments
 
-When an agent completes a task, the orchestrator posts a structured comment:
+When an agent completes a task, orch posts a structured comment:
 
 - **Agent badges**: 🟣 Claude, 🟢 Codex, 🔵 OpenCode
 - **Metadata table**: status, agent, model, attempt, duration, tokens, prompt hash
@@ -78,7 +78,7 @@ Machine-specific fields (branch, worktree path, attempt count, agent, model, pr_
 
 ## Backoff
 
-When GitHub rate limits or abuse detection triggers, the orchestrator sleeps and retries:
+When GitHub rate limits or abuse detection triggers, orch sleeps and retries:
 
 ```yaml
 gh:
@@ -118,7 +118,7 @@ orch project info --fix  # auto-fill into config
 
 ## Owner Feedback
 
-When the repo owner comments on a GitHub issue linked to a completed task, the orchestrator detects the feedback and re-activates the task:
+When the repo owner comments on a GitHub issue linked to a completed task, orch detects the feedback and re-activates the task:
 
 1. Tasks with status `done`, `in_review`, or `needs_review` are checked for new owner comments
 2. If new comments are found, the task is reset to `routed` (keeping its agent assignment)
@@ -142,4 +142,4 @@ Owner comments can also start with a slash command on the **first line** (case-i
 
 - The repo is resolved from `config.yml` or `gh repo view`
 - Tasks with `no_gh` or `local-only` labels are skipped
-- Agents never call GitHub directly; the orchestrator handles all API calls so it can back off safely. The runner injects `GH_TOKEN` at spawn time for convenience, but agents should not perform repository writes or API calls — the orchestrator performs these actions to maintain a single place for backoff and rate-limit handling.
+- Agents never call GitHub directly; orch handles all API calls so it can back off safely. The runner injects `GH_TOKEN` at spawn time for convenience, but agents should not perform repository writes or API calls — orch performs these actions to maintain a single place for backoff and rate-limit handling.

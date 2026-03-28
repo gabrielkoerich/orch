@@ -31,7 +31,7 @@ error path.
 
 ### Multi-Project Channel Routing (feat, ~8 commits)
 
-The biggest landing of the day. The orchestrator can now route notifications to
+The biggest landing of the day. Orch can now route notifications to
 different channels (Telegram, Discord) per project, rather than broadcasting
 everything to a single destination.
 
@@ -62,8 +62,7 @@ This is clean, well-tested, and matches the spec in `2c57aca`.
 The last fix (`6b598e5`) is noteworthy. Root cause: agents running inside the
 sandbox lacked push permissions, failed silently, then reported `needs_review`
 instead of `done` — which blocked orch from running its own push. The fix
-updates the system prompt explicitly ("Do NOT push or create PRs — the
-orchestrator handles both") and adds push-failure recovery in `response_handler`
+updates the system prompt explicitly ("Do NOT push or create PRs — orch handles both") and adds push-failure recovery in `response_handler`
 (reroute up to 3 times, then block for human). Belt-and-suspenders check added
 in `review.rs`.
 

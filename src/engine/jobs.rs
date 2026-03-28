@@ -108,7 +108,7 @@ pub fn resolve_jobs_path() -> PathBuf {
     crate::home::config_path().unwrap_or_else(|_| PathBuf::from(".orch/config.yml"))
 }
 
-/// Load jobs from the orchestrator config file.
+/// Load jobs from the orch config file.
 ///
 /// Reads the `jobs` key from `.orch.yml` (project) or
 /// `~/.orch/config.yml` (global).
@@ -644,7 +644,7 @@ Consider investigating the {} agent for:
 
 ## Evidence
 
-This issue was automatically created by the orchestrator's self-review job."#,
+This issue was automatically created by orch's self-review job."#,
                     stat.agent,
                     stat.total_runs,
                     stat.success_count,
@@ -689,7 +689,9 @@ fn detect_common_errors(errors: &[ErrorStat]) -> Option<ImprovementIssue> {
             ));
         }
     }
-    body.push_str("\n## Evidence\n\nThis issue was automatically created by the orchestrator's self-review job.\n");
+    body.push_str(
+        "\n## Evidence\n\nThis issue was automatically created by orch's self-review job.\n",
+    );
 
     Some(ImprovementIssue {
         title: "[Self-Improvement] Recurring error patterns detected".to_string(),
@@ -745,7 +747,7 @@ fn detect_slow_tasks(
     body.push_str("- Add more specific skills or tools for complex work\n");
     body.push_str("- Consider using a more capable model for complex tasks\n");
     body.push_str("\n## Evidence\n\n");
-    body.push_str("This issue was automatically created by the orchestrator's self-review job.\n");
+    body.push_str("This issue was automatically created by orch's self-review job.\n");
 
     Some(ImprovementIssue {
         title: "[Self-Improvement] Slow task execution patterns detected".to_string(),
@@ -795,7 +797,7 @@ fn detect_review_loops(high_cycle_tasks: &[HighReviewCycleTask]) -> Option<Impro
         "- Review the agent memory system — are learnings from failed attempts being persisted?\n",
     );
     body.push_str(
-        "\n## Evidence\n\nThis issue was automatically created by the orchestrator's self-review job.\n",
+        "\n## Evidence\n\nThis issue was automatically created by orch's self-review job.\n",
     );
 
     Some(ImprovementIssue {
