@@ -158,26 +158,55 @@ fn install_review_workflow(project_dir: &std::path::Path) -> anyhow::Result<()> 
 }
 
 /// Show orch logs.
-pub fn log(lines: &str) -> anyhow::Result<()> {
+pub fn log(lines: &str, include_legacy_flag: bool) -> anyhow::Result<()> {
     let state_dir = crate::home::state_dir().unwrap_or_default();
     let brew_prefix = std::env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".into());
 
     let mut log_files = Vec::new();
 
-    let candidates = [
+    // Always prefer current orch logs (state dir + brew prefix).
+    let mut current_candidates = vec![
         state_dir.join("orch.log"),
         state_dir.join("orch.error.log"),
         std::path::PathBuf::from(&brew_prefix).join("var/log/orch.log"),
         std::path::PathBuf::from(&brew_prefix).join("var/log/orch.error.log"),
     ];
 
-    for path in &candidates {
+    for path in &current_candidates {
         if path.exists()
             && std::fs::metadata(path)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
         {
             log_files.push(path.clone());
+        }
+    }
+
+    // Legacy orchestrator logs are noisy on upgraded installs. Include them
+    // only when explicitly requested via the CLI flag or the environment
+    // variable ORCH_INCLUDE_LEGACY_LOGS (for backward compatibility).
+    let include_legacy_env = std::env::var("ORCH_INCLUDE_LEGACY_LOGS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let include_legacy = include_legacy_flag || include_legacy_env;
+
+    if include_legacy {
+        let legacy_candidates = [
+            state_dir.join("orchestrator.log"),
+            state_dir.join("orchestrator.error.log"),
+            std::path::PathBuf::from(&brew_prefix).join("var/log/orchestrator.log"),
+            std::path::PathBuf::from(&brew_prefix).join("var/log/orchestrator.error.log"),
+        ];
+
+        for path in &legacy_candidates {
+            if path.exists()
+                && std::fs::metadata(path)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+            {
+                log_files.push(path.clone());
+            }
         }
     }
 

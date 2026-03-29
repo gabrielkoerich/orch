@@ -223,6 +223,9 @@ enum Commands {
         /// Number of lines to show, or "watch" for live follow
         #[arg(default_value = "50")]
         lines: String,
+        /// Include legacy Homebrew "orchestrator" logs (opt-in)
+        #[arg(long, default_value_t = false)]
+        include_legacy: bool,
     },
     /// List installed agent CLIs
     Agents,
@@ -627,8 +630,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init { repo } => {
             cli::init(repo)?;
         }
-        Commands::Log { lines } => {
-            cli::log(&lines)?;
+        Commands::Log { lines, include_legacy } => {
+            cli::log(&lines, include_legacy)?;
         }
         Commands::Agents => {
             cli::agents();
