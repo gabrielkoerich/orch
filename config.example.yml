@@ -63,28 +63,38 @@ model_map:
     claude: haiku
     codex: gpt-5.1-codex-mini
     opencode:
-      - opencode:free
+      - github-copilot/gpt-5-mini
+      - github-copilot/gemini-3-flash-preview
+      - opencode/minimax-m2.5-free
+      - opencode/nemotron-3-super-free
     kimi: haiku
     minimax: haiku
   medium:
     claude: sonnet
     codex: gpt-5.2
     opencode:
-      - opencode:free
+      - github-copilot/gpt-5.4-mini
+      - github-copilot/claude-sonnet-4-6
+      - github-copilot/gemini-2.5-pro
+      - opencode/mimo-v2-pro-free
     kimi: sonnet
     minimax: sonnet
   complex:
     claude: opus
     codex: gpt-5.3-codex
     opencode:
-      - opencode:free
+      - github-copilot/gpt-5.4
+      - github-copilot/claude-opus-4-6
+      - github-copilot/gpt-5.2
     kimi: opus
     minimax: opus
   review:
     claude: sonnet
     codex: gpt-5.2
     opencode:
-      - opencode:free
+      - github-copilot/gpt-5.4
+      - github-copilot/claude-sonnet-4-6
+      - github-copilot/gemini-2.5-pro
     kimi: sonnet
     minimax: sonnet
   # Free models used as fallback when hitting usage limits (round-robin)

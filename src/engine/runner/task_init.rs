@@ -209,6 +209,20 @@ pub async fn prepare_task(
         ]);
     }
 
+    if let Ok(orch_home) = crate::home::orch_home() {
+        for path in [
+            orch_home.join("config.yml"),
+            orch_home.join("config.example.yml"),
+        ] {
+            let path_str = path.to_string_lossy();
+            disallowed_tools.extend([
+                format!("Read({path_str})"),
+                format!("Write({path_str})"),
+                format!("Edit({path_str})"),
+            ]);
+        }
+    }
+
     // Timeout
     let timeout_seconds: u64 = config::get("workflow.timeout_seconds")
         .ok()
