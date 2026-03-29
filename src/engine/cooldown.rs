@@ -320,18 +320,18 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
         tracing::debug!(raw = date_str, "could not parse retry-at date");
     }
 
-    // "billing cycle" / "next cycle" / "quota" without a specific date → cooldown 24 hours.
-    // Billing cycles are typically daily/weekly/monthly so a 5-hour cooldown was too short:
-    // the model would be retried multiple times per day, wasting ~2 min per attempt.
+    // "billing cycle" / "next cycle" / "quota" without a specific date → cooldown 7 days.
+    // Billing cycles are typically weekly or monthly so a 24-hour cooldown was too short:
+    // the model would be retried ~30 times per month, burning task attempts and wasting runtime.
     if lower.contains("billing cycle")
         || lower.contains("next cycle")
         || lower.contains("quota will be refreshed")
         || lower.contains("usage limit")
         || lower.contains("quota exceeded")
     {
-        let twenty_four_hours = chrono::Utc::now().timestamp() + 24 * 60 * 60;
-        tracing::info!("detected billing cycle limit — cooldown for 24 hours");
-        return Some(twenty_four_hours);
+        let seven_days = chrono::Utc::now().timestamp() + 7 * 24 * 60 * 60;
+        tracing::info!("detected billing cycle limit — cooldown for 7 days");
+        return Some(seven_days);
     }
 
     None
@@ -430,16 +430,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_at_billing_cycle_sets_24h_cooldown() {
+    fn parse_retry_at_billing_cycle_sets_7d_cooldown() {
         let msg = "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle. Upgrade to get more.";
         let ts = parse_retry_at(msg);
         assert!(ts.is_some(), "billing cycle message should set a cooldown");
         let now = chrono::Utc::now().timestamp();
         let remaining = ts.unwrap() - now;
-        // Should be ~24 hours (86400s), allow ±5s for test execution time
+        // Should be ~7 days (604800s), allow ±5s for test execution time
         assert!(
-            remaining > 86395 && remaining <= 86400,
-            "billing cycle cooldown should be ~24 hours, got {remaining}s"
+            remaining > 604795 && remaining <= 604800,
+            "billing cycle cooldown should be ~7 days, got {remaining}s"
         );
     }
 
