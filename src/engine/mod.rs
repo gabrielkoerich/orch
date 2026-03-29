@@ -52,10 +52,8 @@ use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine::cleanup::remove_worktree_and_branch;
 use crate::engine::router::Router;
-use crate::engine::runner::worktree::{
-    abort_worktree_rebase, list_project_worktrees, rebase_worktree_on_origin_main,
-    task_id_from_worktree_name,
-};
+use crate::engine::runner::git_ops::rebase_on_default;
+use crate::engine::runner::worktree::{list_project_worktrees, task_id_from_worktree_name};
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{rate_limit_metrics, GhHttp};
 use crate::repo_context::REPO_CONTEXT;
@@ -381,33 +379,7 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                 | TaskStatus::NeedsReview
                 | TaskStatus::InReview => {
                     tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), "rebasing startup worktree");
-                    if let Err(e) =
-                        rebase_worktree_on_origin_main(&worktree_dir, &default_branch).await
-                    {
-                        tracing::warn!(repo = %engine.repo, task_id = %task_id, err = %e, "startup rebase failed, resetting task");
-                        abort_worktree_rebase(&worktree_dir).await;
-                        let keep_remote = task.pr_number.is_some();
-                        remove_worktree_and_branch(
-                            &task_id,
-                            &worktree_dir,
-                            Some(branch_name),
-                            &repo_root_path,
-                            keep_remote,
-                        )
-                        .await;
-                        if let Ok(Some(reset_id)) =
-                            engine.store.resolve_task_id(&engine.repo, &task_id).await
-                        {
-                            let _ = engine.store.reset_to_new(reset_id).await;
-                        }
-                        let _ = engine
-                            .task_manager
-                            .update_task_status(
-                                &ExternalId(task_id.clone()),
-                                crate::backends::Status::New,
-                            )
-                            .await;
-                    }
+                    rebase_on_default(&worktree_dir, &default_branch).await;
                 }
                 _ => {
                     let keep_remote =

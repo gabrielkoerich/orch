@@ -450,35 +450,6 @@ impl TaskStore {
         Ok(())
     }
 
-    /// Reset a task back to `new`.
-    pub async fn reset_to_new(&self, id: i64) -> anyhow::Result<()> {
-        let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await?;
-        let from_status: String = previous.get("status");
-        let agent: Option<String> = previous.get("agent");
-        let model: Option<String> = previous.get("model");
-        sqlx::query(
-            "UPDATE tasks SET status = 'new', branch = '', worktree = '', worktree_cleaned = 0, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        let details = serde_json::json!({ "op": "reset_to_new" });
-        self.append_activity(
-            id,
-            "status_change",
-            Some(from_status.as_str()),
-            Some(TaskStatus::New.as_str()),
-            agent.as_deref(),
-            model.as_deref(),
-            Some(&details),
-        )
-        .await?;
-        Ok(())
-    }
-
     /// Update the block reason for a task.
     pub async fn set_block_reason(&self, id: i64, reason: Option<&str>) -> anyhow::Result<()> {
         let value = reason
