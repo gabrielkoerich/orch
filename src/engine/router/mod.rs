@@ -382,32 +382,53 @@ impl Router {
 
             if let Some(agent) = resolved_agent {
                 let complexity = strategies::extract_complexity_from_labels(&task.labels);
+                // If agent appears routable (not in agent-wide cooldown and has
+                // available models or no model_map configured), check whether
+                // we actually have a concrete model to dispatch. If the
+                // resolved label maps to no model (None), we fall through to
+                // the standard routing logic so the router LLM can pick a
+                // proper agent/model, instead of dispatching with an empty
+                // model which causes some agents (e.g. opencode) to exit
+                // silently.
                 if self.agent_is_routable(&agent, &complexity) {
                     let model = self
                         .config
                         .model_for_complexity(&agent, &complexity, &task.id.0);
-                    let profile = AgentProfile {
-                        role: format!("{} specialist", agent),
-                        skills: vec![],
-                        tools: self.config.allowed_tools.clone(),
-                        constraints: vec![],
-                    };
 
-                    tracing::debug!(
-                        task_id = %task.id.0,
-                        agent = %agent,
-                        complexity = %complexity,
-                        "routed via label"
-                    );
-                    return Ok(RouteResult {
-                        agent: agent.clone(),
-                        model,
-                        complexity: complexity.clone(),
-                        reason: format!("label agent:{agent}"),
-                        profile,
-                        selected_skills: self.config.default_skills.clone(),
-                        warning: None,
-                    });
+                    // Preserve label override for non-opencode agents even when
+                    // no explicit model is configured (backwards compatibility).
+                    // For opencode, an empty model leads to silent exits, so
+                    // require a concrete model for opencode labels.
+                    if model.is_some() || agent != "opencode" {
+                        let profile = AgentProfile {
+                            role: format!("{} specialist", agent),
+                            skills: vec![],
+                            tools: self.config.allowed_tools.clone(),
+                            constraints: vec![],
+                        };
+
+                        tracing::debug!(
+                            task_id = %task.id.0,
+                            agent = %agent,
+                            complexity = %complexity,
+                            "routed via label"
+                        );
+                        return Ok(RouteResult {
+                            agent: agent.clone(),
+                            model,
+                            complexity: complexity.clone(),
+                            reason: format!("label agent:{agent}"),
+                            profile,
+                            selected_skills: self.config.default_skills.clone(),
+                            warning: None,
+                        });
+                    } else {
+                        // No concrete model found for opencode — fall through to
+                        // standard routing so another agent or LLM-chosen
+                        // model can be used instead of dispatching with empty
+                        // model which causes opencode to exit silently.
+                        tracing::warn!(task_id = %task.id.0, agent = %agent, "label agent has no available model (opencode) — falling through to LLM routing");
+                    }
                 }
 
                 let candidates = self.available_agents_for_complexity(&complexity);
@@ -415,7 +436,7 @@ impl Router {
                     self.wait_for_cooldown(Some(&complexity)).await?;
                     continue;
                 }
-                // Label target is cooled; fall through to standard routing.
+                // Label target is cooled or lacked model; fall through to standard routing.
             }
 
             let complexity = strategies::extract_complexity_from_labels(&task.labels);

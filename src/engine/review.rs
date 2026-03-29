@@ -699,10 +699,56 @@ pub(crate) async fn review_and_merge(
         }
         let exclude_refs: Vec<&str> = exclude_list.iter().map(|s| s.as_str()).collect();
         let mut r = router.write().await;
-        let agent = r
-            .next_round_robin_agent(&exclude_refs)
-            .unwrap_or_else(|| "claude".to_string());
-        let model = r.config.model_for_complexity(&agent, "review", &task.id.0);
+        // Pick a review agent via round-robin, but skip agents whose entire
+        // model pool is currently cooled (model_for_complexity -> None).
+        // If all agents are exhausted, fall back to the first candidate and
+        // allow a None model (caller treats empty model as unspecified).
+        let mut tried_agents: Vec<String> = Vec::new();
+        let mut chosen_agent: Option<String> = None;
+        let mut chosen_model: Option<String> = None;
+        let available_count = r.available_agents.len().max(1);
+        loop {
+            let tmp_exclude_refs: Vec<&str> = exclude_list.iter().map(|s| s.as_str()).collect();
+            let agent_opt = r.next_round_robin_agent(&tmp_exclude_refs);
+            let agent = match agent_opt {
+                Some(a) => a,
+                None => break,
+            };
+            // Avoid infinite loops — stop if we've tried every available agent
+            if tried_agents.contains(&agent) {
+                break;
+            }
+            tried_agents.push(agent.clone());
+
+            let model = r.config.model_for_complexity(&agent, "review", &task.id.0);
+            if model.is_some() {
+                chosen_agent = Some(agent);
+                chosen_model = model;
+                break;
+            }
+
+            // Model pool for this agent is exhausted/cooled — exclude and retry
+            if !exclude_list.contains(&agent) {
+                exclude_list.push(agent.clone());
+            }
+            // If we've excluded all known agents, stop searching
+            if exclude_list.len() >= available_count {
+                break;
+            }
+        }
+
+        // If no suitable agent/model pair was found, fall back to a single
+        // pick using the router's round-robin (preserves previous behaviour).
+        let (agent, model) = if let Some(a) = chosen_agent {
+            (a, chosen_model)
+        } else {
+            let final_exclude_refs: Vec<&str> = exclude_list.iter().map(|s| s.as_str()).collect();
+            let fallback_agent = r
+                .next_round_robin_agent(&final_exclude_refs)
+                .unwrap_or_else(|| "claude".to_string());
+            let fallback_model = r.config.model_for_complexity(&fallback_agent, "review", &task.id.0);
+            (fallback_agent, fallback_model)
+        };
         (agent, model)
     };
     // Derive a &str view for call sites that require a concrete string (e.g. attribution,
