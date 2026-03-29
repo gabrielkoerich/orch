@@ -415,7 +415,11 @@ The agent runner uses tmux as the PTY (tmux already provides a PTY to whatever r
 
 ### Config files are off-limits
 
-Agents must NEVER modify `~/.orch/config.yml`, `config.example.yml`, or any `.orch.yml` project config. If a config change is needed, describe the change in the issue body or PR description — the human operator will apply it.
+Agents must NEVER modify `~/.orch/config.yml`, `config.example.yml`, or any `.orch.yml` project config. These files control the running service and model routing — changes have immediate, global impact.
+
+If a config change is needed, describe the required change in the issue body or PR description. The human operator will apply it. Do not write config changes directly, do not include config file edits in PRs, and do not suggest "just update config.yml" as a fix.
+
+Issues #1261 and #1172 were caused by agents modifying config files without permission.
 
 ### No external endpoints
 
@@ -522,7 +526,7 @@ All in `~/.orch/orch.db`:
 - `src/cli/chat.rs` — CLI handlers (REPL, single-message, history)
 - `prompts/control_system.md` — system prompt template with `{current_state}`, `{memories}`, `{recent_summaries}` placeholders
 - Reuses runner infrastructure: `get_runner()`, `build_command()`, `parse_response()`, `classify_error()` from `src/engine/runner/agents/`
-- Agent invocations run via `bash -c` with timeout (120s), not tmux
+- Agent invocations run via `bash -c` with timeout (45s), not tmux
 
 ### Configuration
 

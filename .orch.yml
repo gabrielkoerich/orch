@@ -117,6 +117,8 @@ jobs:
       2. Are there error patterns in logs (`orch log 200`)? Note them.
       3. Did the evening retro flag anything? Is it resolved or still pending?
       4. Are there tasks waiting on owner feedback?
+      5. Check task_runs for agent/model failure patterns: `sqlite3 ~/.orch/orch.db "SELECT agent, model, outcome, COUNT(*) FROM task_runs WHERE started_at > datetime('now', '-24 hours') GROUP BY agent, model, outcome ORDER BY COUNT(*) DESC;"`
+      6. If `task_activity` table exists, check recent events: `sqlite3 ~/.orch/orch.db "SELECT event_type, COUNT(*) FROM task_activity WHERE timestamp > datetime('now', '-12 hours') GROUP BY event_type ORDER BY COUNT(*) DESC;" 2>/dev/null`
 
       ## Write the summary
 
@@ -155,14 +157,16 @@ jobs:
       3. Read today's morning review — what was planned, what got done
       4. `gh issue list --state open` — what's still pending
       5. `gh issue list --state closed --limit 10` — what was resolved today
+      6. Read `~/.claude/skills/orch/SKILL.md` — check for new learnings, patterns, and operational notes added during the day
 
       ## Analyze the day
 
       1. Which tasks completed? What went well?
-      2. Which tasks failed or needed retries? Why?
+      2. Which tasks failed or needed retries? Why? Check `task_runs` for patterns.
       3. Are agent prompts effective or do they need tuning?
-      4. Is the routing accurate? Check route decisions vs outcomes.
-      5. Are there performance bottlenecks (slow syncs, lock contention, API rate limits)?
+      4. Is the routing accurate? Check route decisions vs outcomes. Are certain models failing silently?
+      5. Are there performance bottlenecks (slow syncs, lock contention, API rate limits, dead models)?
+      6. What learnings were captured in the orch skill today? Are they reflected in code/config changes?
 
       ## Write the summary
 
@@ -193,6 +197,10 @@ jobs:
     title: 'Self-improvement: debug agent errors and fix root causes'
     body: |
       You are a self-improvement agent. Your job is to analyze recent agent failures, find root causes, and either fix them directly or file detailed issues.
+
+      ## Step 0: Read the orch skill
+
+      Read `~/.claude/skills/orch/SKILL.md` first — it contains operational learnings, known patterns, common fixes, and agent/model notes accumulated from previous sessions. Use this context to avoid re-discovering known issues. If your analysis reveals new patterns or corrections, update the skill file at the end of your run.
 
       ## Step 1: Gather failure data
 
@@ -226,11 +234,18 @@ jobs:
       - **Review loop** — task stuck cycling between statuses
       - **State drift** — task status doesn't match reality (merged PR but task still blocked)
 
-      ## Step 3: Fix or file
+      ## Step 3: File detailed issues (DO NOT fix code directly)
 
-      For each root cause:
-      - If it's a code fix you can make (parser improvement, error handling, config change) → **fix it directly**, commit, and explain the fix
-      - If it requires architectural changes or you're unsure → **file a GitHub issue** with full root cause analysis, logs, and suggested fix
+      For each root cause, file a GitHub issue with `gh issue create`. Do NOT modify code yourself — the task pipeline handles implementation. Your job is analysis and documentation.
+
+      Each issue MUST include:
+      - **What you found** — the specific error, task IDs, log lines
+      - **Why it's happening** — root cause analysis with file paths and line numbers
+      - **Why it matters** — impact (how many tasks affected, how much time wasted)
+      - **Suggested fix** — concrete approach with files to change
+      - **Evidence** — actual error messages, SQL query results, log snippets
+
+      Use `gh issue create --title "bug: ..." --body "..." --label "bug"` for bugs and `--label "enhancement"` for improvements.
 
       ## Before starting
 
@@ -244,7 +259,8 @@ jobs:
       - Focus on ROOT CAUSES, not symptoms
       - Always include the actual error message and task ID in issues
       - Max 3 issues per run — prioritize by impact (looping tasks > one-off failures)
-      - If a task is stuck looping, fix the loop first, then the underlying issue
+      - Do NOT modify code, prompts, or config — only file issues
+      - Explain your reasoning: why you identified this as a problem, what data led you there
     labels:
     - self-improvement
     agent: null

@@ -492,9 +492,28 @@ pub(crate) async fn auto_merge_pr(
                                     // Enable auto-merge — GitHub merges once CI passes.
                                     // If auto-merge isn't available, keep task in InReview
                                     // so the sync tick retries merge on the next cycle.
-                                    let auto_merge_result =
-                                        gh.enable_auto_merge(repo, pr_number).await;
-                                    log_auto_merge_result(&task.id.0, &auto_merge_result);
+                                    match gh.enable_auto_merge(repo, pr_number).await {
+                                        Ok(_) => {
+                                            tracing::info!(
+                                                task_id = task.id.0,
+                                                "auto-merge enabled — task stays in InReview until GitHub merges"
+                                            );
+                                            // Don't mark Done or clean up worktree yet.
+                                            // GitHub auto-merge fires only after CI passes on the
+                                            // rebased commit. If CI fails, the PR stays open.
+                                            // check_merged_prs (sync tick) will detect the actual
+                                            // merge and mark Done at that point.
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                task_id = task.id.0,
+                                                error = %e,
+                                                "auto-merge unavailable — task stays in InReview for sync retry"
+                                            );
+                                            // Don't change status — sync tick will poll CI
+                                            // and retry merge when checks pass.
+                                        }
+                                    }
                                     return Ok(());
                                 }
                                 Ok(push_out) => {
@@ -798,7 +817,7 @@ pub(crate) async fn handle_review_changes(
         // the review cycle counter and re-trigger the review agent.
         let ci_recovery_count: i32 = task_store_record
             .as_ref()
-            .map(|t| t.ci_recovery_count)
+            .map(|t| t.auto_unblock_count)
             .unwrap_or(0);
 
         if ci_recovery_count < 1 {
@@ -820,7 +839,7 @@ pub(crate) async fn handle_review_changes(
                         &Some(Arc::clone(store)),
                         repo,
                         &task.id.0,
-                        "ci_recovery_count",
+                        "auto_unblock_count",
                     )
                     .await;
                     if let Err(e) = task_manager
@@ -969,31 +988,6 @@ pub(crate) async fn handle_review_changes(
     );
 
     Ok(())
-}
-
-/// Log the result of `enable_auto_merge` after a successful rebase.
-///
-/// In both cases (Ok and Err) the task intentionally stays in InReview:
-/// - **Ok**: GitHub auto-merge fires only after CI passes on the rebased SHA.
-///   If CI fails, the PR stays open. `check_merged_prs` (sync tick) detects
-///   the actual merge and marks Done then.
-/// - **Err**: auto-merge unavailable — sync tick will poll CI and retry merge.
-fn log_auto_merge_result(task_id: &str, result: &Result<(), anyhow::Error>) {
-    match result {
-        Ok(()) => {
-            tracing::info!(
-                task_id,
-                "auto-merge enabled — task stays in InReview until GitHub merges"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                task_id,
-                error = %e,
-                "auto-merge unavailable — task stays in InReview for sync retry"
-            );
-        }
-    }
 }
 
 /// ISO-8601 timestamp comparison sanity check used by `branch_newer_than_last_review`.
@@ -1650,68 +1644,6 @@ mod tests {
             stored.status,
             TaskStatus::Blocked,
             "task must be Blocked when max review cycles exceeded and stale check is unavailable"
-        );
-    }
-
-    /// Regression test for #1224: after `enable_auto_merge` succeeds post-rebase,
-    /// the task must remain in InReview — NOT be marked Done. GitHub auto-merge
-    /// only fires after CI passes on the new rebased SHA; if CI fails the PR stays
-    /// open. `check_merged_prs` (sync tick) detects the actual merge later.
-    ///
-    /// This test verifies that `log_auto_merge_result` does not modify task state
-    /// and that the caller (`auto_merge_pr`) returns without changing status.
-    #[tokio::test]
-    async fn enable_auto_merge_success_does_not_mark_done() {
-        use crate::store::{TaskStatus, TaskStore};
-
-        let store = Arc::new(TaskStore::open_memory().await.unwrap());
-        let repo = "owner/repo";
-
-        let task_id_num = store
-            .create(&crate::store::NewTask {
-                external_id: None,
-                repo: repo.to_string(),
-                origin: "internal".to_string(),
-                title: "Feature with auto-merge".to_string(),
-                body: "body".to_string(),
-                source: "cron".to_string(),
-                source_id: "daily".to_string(),
-                author: "".to_string(),
-                url: "".to_string(),
-                labels: vec![],
-            })
-            .await
-            .unwrap();
-        store
-            .update_status(task_id_num, TaskStatus::InReview)
-            .await
-            .unwrap();
-
-        // Simulate what auto_merge_pr does after a successful rebase + push:
-        // call log_auto_merge_result (Ok path) and return — no status change.
-        let ok_result: Result<(), anyhow::Error> = Ok(());
-        log_auto_merge_result(&format!("internal:{task_id_num}"), &ok_result);
-
-        // Task must still be InReview — NOT Done.
-        let stored = store.get(task_id_num).await.unwrap();
-        assert_eq!(
-            stored.status,
-            TaskStatus::InReview,
-            "task must remain InReview after enable_auto_merge succeeds — \
-             check_merged_prs will mark Done when GitHub actually merges"
-        );
-
-        // Also verify the Err path leaves status unchanged.
-        let err_result: Result<(), anyhow::Error> =
-            Err(anyhow::anyhow!("auto-merge not available"));
-        log_auto_merge_result(&format!("internal:{task_id_num}"), &err_result);
-
-        let stored = store.get(task_id_num).await.unwrap();
-        assert_eq!(
-            stored.status,
-            TaskStatus::InReview,
-            "task must remain InReview after enable_auto_merge fails — \
-             sync tick will retry merge when checks pass"
         );
     }
 }
