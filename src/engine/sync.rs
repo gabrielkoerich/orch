@@ -277,6 +277,16 @@ async fn auto_unblock_blocked_tasks(
             continue;
         }
 
+        let _ = store
+            .set_fields(
+                task.id,
+                &[
+                    ("agent", serde_json::Value::Null),
+                    ("model", serde_json::Value::Null),
+                ],
+            )
+            .await;
+
         let ext_id = task
             .external_id
             .clone()
@@ -286,9 +296,9 @@ async fn auto_unblock_blocked_tasks(
                 task.id,
                 "auto_unblock",
                 Some("blocked"),
-                Some("routed"),
-                task.agent.as_deref(),
-                task.model.as_deref(),
+                Some("new"),
+                None,
+                None,
                 Some(&serde_json::json!({
                     "failures": failures.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>(),
                 })),
@@ -296,7 +306,7 @@ async fn auto_unblock_blocked_tasks(
             .await;
 
         if let Err(e) = task_manager
-            .update_task_status(&crate::backends::ExternalId(ext_id), Status::Routed)
+            .update_task_status(&crate::backends::ExternalId(ext_id), Status::New)
             .await
         {
             tracing::warn!(
@@ -1501,6 +1511,16 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::Blocked)
             .await
             .unwrap();
+        store
+            .set_fields(
+                id,
+                &[
+                    ("agent", serde_json::json!("codex")),
+                    ("model", serde_json::json!("gpt-5")),
+                ],
+            )
+            .await
+            .unwrap();
 
         let run_id = store
             .start_run(&crate::store::StartRun {
@@ -1533,7 +1553,9 @@ mod tests {
             .unwrap();
 
         let task = store.get(id).await.unwrap();
-        assert_eq!(task.status, crate::store::TaskStatus::Routed);
+        assert_eq!(task.status, crate::store::TaskStatus::New);
+        assert!(task.agent.is_none());
+        assert!(task.model.is_none());
         assert_eq!(task.auto_unblock_count, 1);
         assert!(!task.auto_unblock_last_at.is_empty());
     }
@@ -1736,7 +1758,7 @@ mod tests {
         let task = store.get(id).await.unwrap();
         assert_eq!(
             task.status,
-            crate::store::TaskStatus::Routed,
+            crate::store::TaskStatus::New,
             "task blocked by model unavailable must be auto-unblocked and re-routed"
         );
         assert_eq!(task.auto_unblock_count, 1);
