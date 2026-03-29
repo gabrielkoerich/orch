@@ -697,7 +697,6 @@ pub(crate) async fn review_and_merge(
                 }
             }
         }
-        let exclude_refs: Vec<&str> = exclude_list.iter().map(|s| s.as_str()).collect();
         let mut r = router.write().await;
         // Pick a review agent via round-robin, but skip agents whose entire
         // model pool is currently cooled (model_for_complexity -> None).
@@ -746,7 +745,9 @@ pub(crate) async fn review_and_merge(
             let fallback_agent = r
                 .next_round_robin_agent(&final_exclude_refs)
                 .unwrap_or_else(|| "claude".to_string());
-            let fallback_model = r.config.model_for_complexity(&fallback_agent, "review", &task.id.0);
+            let fallback_model =
+                r.config
+                    .model_for_complexity(&fallback_agent, "review", &task.id.0);
             (fallback_agent, fallback_model)
         };
         (agent, model)
