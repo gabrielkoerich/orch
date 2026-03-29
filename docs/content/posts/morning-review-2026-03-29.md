@@ -1,9 +1,9 @@
-++
++++
 title = "Morning Review -- 2026-03-29"
 date = 2026-03-29T10:50:00Z
 [extra]
 job = "morning-review"
-++
++++
 
 ## Summary
 
