@@ -322,22 +322,10 @@ impl RouterConfig {
         }
     }
 
-    /// Get the model for a given agent and complexity level.
-    ///
-    /// When the complexity tier has a pool of models, selects randomly using
-    /// `task_id` as an entropy source and skips models currently in cooldown.
-    /// Falls back to `pool[0]` if all models are cooled.
-    ///
-    /// Backward-compatible: a single-model pool always returns that model.
-    pub fn model_for_complexity(
-        &self,
-        agent: &str,
-        complexity: &str,
-        task_id: &str,
-    ) -> Option<String> {
+    fn expanded_model_pool(&self, agent: &str, complexity: &str) -> Option<Vec<String>> {
         let pool = self.model_map.get(complexity)?.get(agent)?;
         if pool.is_empty() {
-            return None;
+            return Some(Vec::new());
         }
 
         let mut expanded_pool = Vec::new();
@@ -355,6 +343,40 @@ impl RouterConfig {
             expanded_pool.extend(Self::discover_free_opencode_models());
         }
 
+        Some(expanded_pool)
+    }
+
+    pub(crate) fn model_pool_for_complexity(
+        &self,
+        agent: &str,
+        complexity: &str,
+    ) -> Option<Vec<String>> {
+        self.expanded_model_pool(agent, complexity)
+    }
+
+    pub fn has_available_model_for_complexity(&self, agent: &str, complexity: &str) -> bool {
+        match self.expanded_model_pool(agent, complexity) {
+            None => true,
+            Some(pool) => pool
+                .iter()
+                .any(|model| !crate::engine::cooldown::is_model_in_cooldown(agent, model)),
+        }
+    }
+
+    /// Get the model for a given agent and complexity level.
+    ///
+    /// When the complexity tier has a pool of models, selects randomly using
+    /// `task_id` as an entropy source and skips models currently in cooldown.
+    /// Falls back to `pool[0]` if all models are cooled.
+    ///
+    /// Backward-compatible: a single-model pool always returns that model.
+    pub fn model_for_complexity(
+        &self,
+        agent: &str,
+        complexity: &str,
+        task_id: &str,
+    ) -> Option<String> {
+        let expanded_pool = self.expanded_model_pool(agent, complexity)?;
         if expanded_pool.is_empty() {
             return None;
         }
