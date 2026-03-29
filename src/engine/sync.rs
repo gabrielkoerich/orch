@@ -158,6 +158,9 @@ fn classify_failure_from_run(run: &crate::store::TaskRun) -> Option<FailureCateg
     // Skip runs with no meaningful data. Some runs are created then never
     // populated (aborted/stale work). Treat these as non-failures so they
     // don't block auto-unblock logic which considers recent failures.
+    // Historically an all-NULL/empty run would be promoted to Unknown which
+    // prevented auto-unblock. Ensure we early-return None for truly empty
+    // runs (no outcome, no error, no exit_code, no output).
     if run.outcome.trim().is_empty()
         && run.error.trim().is_empty()
         && run.exit_code.is_none()
@@ -179,10 +182,15 @@ fn classify_failure_from_run(run: &crate::store::TaskRun) -> Option<FailureCateg
     // Do NOT promote when exit_code is None (incomplete run) — those are
     // handled above by skipping. This prevents NULL/aborted runs from
     // turning recoverable FalseFailure into non-recoverable Unknown.
-    if category == FailureCategory::FalseFailure
-        && (run.exit_code.is_some() && run.exit_code != Some(0) || !run.stdout.trim().is_empty())
-    {
-        category = FailureCategory::Unknown;
+    // Only promote when we have explicit evidence: a non-zero exit code
+    // or non-empty stdout/stderr. If exit_code is None we keep FalseFailure
+    // so the run remains recoverable.
+    if category == FailureCategory::FalseFailure {
+        let has_nonzero_exit = run.exit_code.is_some() && run.exit_code != Some(0);
+        let has_output = !run.stdout.trim().is_empty() || !run.stderr.trim().is_empty();
+        if has_nonzero_exit || has_output {
+            category = FailureCategory::Unknown;
+        }
     }
 
     Some(category)
