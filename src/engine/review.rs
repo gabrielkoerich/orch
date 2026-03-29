@@ -707,12 +707,13 @@ pub(crate) async fn review_and_merge(
         let mut chosen_model: Option<String> = None;
         let available_count = r.available_agents.len().max(1);
         loop {
+            // Build a temporary exclude slice for the round-robin helper.
             let tmp_exclude_refs: Vec<&str> = exclude_list.iter().map(|s| s.as_str()).collect();
-            let agent_opt = r.next_round_robin_agent(&tmp_exclude_refs);
-            let agent = match agent_opt {
+            let agent = match r.next_round_robin_agent(&tmp_exclude_refs) {
                 Some(a) => a,
                 None => break,
             };
+
             // Avoid infinite loops — stop if we've tried every available agent
             if tried_agents.contains(&agent) {
                 break;
@@ -745,9 +746,17 @@ pub(crate) async fn review_and_merge(
             let fallback_agent = r
                 .next_round_robin_agent(&final_exclude_refs)
                 .unwrap_or_else(|| "claude".to_string());
-            let fallback_model =
-                r.config
-                    .model_for_complexity(&fallback_agent, "review", &task.id.0);
+
+            // Break the model lookup across lines so rustfmt/clippy do not complain
+            // about overly long lines.
+            let fallback_model = r
+                .config
+                .model_for_complexity(
+                    &fallback_agent,
+                    "review",
+                    &task.id.0,
+                );
+
             (fallback_agent, fallback_model)
         };
         (agent, model)
