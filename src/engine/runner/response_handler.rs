@@ -409,10 +409,31 @@ pub async fn handle_success(
             "agent done, commits pushed, but PR creation failed — routing to review gate"
         );
         "needs_review"
+    } else if resp.status == "done" && !has_pr && !task_id.starts_with("internal:") {
+        tracing::warn!(
+            task_id,
+            "agent reported done but produced no code changes on external task — re-routing"
+        );
+        // Clear agent/model so router picks a different one
+        store::store_set(
+            store,
+            repo,
+            task_id,
+            &[
+                ("agent", serde_json::json!(null)),
+                ("model", serde_json::json!(null)),
+                (
+                    "last_error",
+                    serde_json::json!("agent completed without code changes"),
+                ),
+            ],
+        )
+        .await;
+        "new"
     } else if resp.status == "done" && !has_pr {
         tracing::info!(
             task_id,
-            "agent reported done with no PR and no delegations — marking done"
+            "internal task reported done with no PR — marking done"
         );
         "done"
     } else {
