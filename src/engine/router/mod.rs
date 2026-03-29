@@ -395,11 +395,14 @@ impl Router {
                         .config
                         .model_for_complexity(&agent, &complexity, &task.id.0);
 
-                    // Preserve label override for non-opencode agents even when
-                    // no explicit model is configured (backwards compatibility).
-                    // For opencode, an empty model leads to silent exits, so
-                    // require a concrete model for opencode labels.
-                    if model.is_some() || agent != "opencode" {
+                    // Only dispatch label overrides when we have a concrete
+                    // model to send to the executor. Dispatching with an
+                    // empty model led to silent exits for some agents
+                    // (notably opencode). If no concrete model is available
+                    // for the labeled agent, fall through to the standard
+                    // routing logic so the LLM or round-robin can pick an
+                    // appropriate agent/model.
+                    if model.is_some() {
                         let profile = AgentProfile {
                             role: format!("{} specialist", agent),
                             skills: vec![],
@@ -423,11 +426,11 @@ impl Router {
                             warning: None,
                         });
                     } else {
-                        // No concrete model found for opencode — fall through to
-                        // standard routing so another agent or LLM-chosen
-                        // model can be used instead of dispatching with empty
-                        // model which causes opencode to exit silently.
-                        tracing::warn!(task_id = %task.id.0, agent = %agent, "label agent has no available model (opencode) — falling through to LLM routing");
+                        // No concrete model found for the labeled agent — do
+                        // not honor the label override. Fall through to the
+                        // standard routing logic so another agent or the LLM
+                        // can be chosen with a valid model.
+                        tracing::warn!(task_id = %task.id.0, agent = %agent, "label agent has no available model — falling through to LLM routing");
                     }
                 }
 
@@ -927,7 +930,14 @@ mod tests {
 
     #[test]
     fn extract_agent_from_labels() {
-        let config = RouterConfig::default();
+        let mut config = RouterConfig::default();
+        // Ensure a concrete model exists for the labeled agent so the label
+        // override is honored by the router (routing requires a model).
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert("claude".to_string(), vec!["haiku".to_string()]);
 
         assert_eq!(
             strategies::extract_agent_from_labels(&config.agents, &["agent:claude".to_string()]),
@@ -1012,7 +1022,14 @@ mod tests {
 
     #[test]
     fn router_config_default() {
-        let config = RouterConfig::default();
+        let mut config = RouterConfig::default();
+        // Ensure a concrete model exists for the labeled agent so the label
+        // override is honored by the router (routing requires a model).
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert("claude".to_string(), vec!["haiku".to_string()]);
 
         assert_eq!(config.mode, "llm");
         assert_eq!(config.router_agent, "claude");
@@ -1383,7 +1400,14 @@ Hope that helps!"#;
 
     #[tokio::test]
     async fn route_uses_label_override() {
-        let config = RouterConfig::default();
+        let mut config = RouterConfig::default();
+        // Ensure a concrete model exists so the label override can be honored
+        // in the test environment where no external config.yml is present.
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert("claude".to_string(), vec!["haiku".to_string()]);
         let agents = vec!["claude".to_string(), "codex".to_string()];
         let mut weights = AgentWeights::default();
         weights.ensure_agents(&agents);
@@ -1719,10 +1743,16 @@ Hope that helps!"#;
 
     #[tokio::test]
     async fn route_weighted_round_robin_basic() {
-        let config = RouterConfig {
+        let mut config = RouterConfig {
             weighted_round_robin: true,
             ..Default::default()
         };
+        // Provide a concrete model for codex so label override can be used.
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert("codex".to_string(), vec!["gpt-5.2".to_string()]);
 
         let agents = vec!["claude".to_string(), "codex".to_string()];
         let mut weights = AgentWeights::default();
@@ -1754,10 +1784,16 @@ Hope that helps!"#;
 
     #[tokio::test]
     async fn route_weighted_round_robin_respects_label_override() {
-        let config = RouterConfig {
+        let mut config = RouterConfig {
             weighted_round_robin: true,
             ..Default::default()
         };
+        // Provide a concrete model for codex so label override can be used.
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert("codex".to_string(), vec!["gpt-5.2".to_string()]);
 
         let agents = vec!["claude".to_string(), "codex".to_string()];
         let mut weights = AgentWeights::default();
