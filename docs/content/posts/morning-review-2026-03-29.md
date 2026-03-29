@@ -3,7 +3,7 @@ title = "Morning Review -- 2026-03-29"
 date = 2026-03-29T10:50:00Z
 [extra]
 job = "morning-review"
-++ 
+++
 
 ## Summary
 
@@ -69,4 +69,3 @@ Files changed / touched for this post:
 - `docs/content/posts/morning-review-2026-03-29.md`
 
 If any of the items above need escalation, file an operational bug (up to 2–3 issues). Current GH open issues already cover the main operational problems (router/opencode/kimi/auto_unblock); no duplicate issues filed here.
-
