@@ -100,12 +100,6 @@ impl Transport {
             .insert(key, task_id.to_string());
     }
 
-    /// Clear cached last output for a task (used when rebinding/new session).
-    pub async fn clear_output(&self, task_id: &str) {
-        let mut last = self.last_output.write().await;
-        last.remove(task_id);
-    }
-
     /// Get the broadcast receiver for a task's output stream.
     pub async fn subscribe(&self, task_id: &str) -> Option<broadcast::Receiver<OutputChunk>> {
         let bindings = self.bindings.read().await;
