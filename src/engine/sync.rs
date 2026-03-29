@@ -269,10 +269,6 @@ async fn auto_unblock_blocked_tasks(
             continue;
         }
 
-        if !auto_unblock_cooldown_elapsed(task.auto_unblock_count, &task.auto_unblock_last_at) {
-            continue;
-        }
-
         let dispatch_key = format!("{}/{}", repo, task.external_id.clone().unwrap_or_default());
         {
             let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
@@ -302,25 +298,33 @@ async fn auto_unblock_blocked_tasks(
 
         // Reset counter when the failure reason changes — exponential backoff should
         // only accumulate for repeated identical failures, not different ones.
+        // This check must run BEFORE the cooldown check so new reasons bypass old cooldown.
         let current_reason = task.auto_unblock_last_reason.clone();
-        let do_increment = if reason_key != current_reason {
+        let reason_changed = reason_key != current_reason;
+        if reason_changed {
             if let Err(e) = store
-                .set_fields(
-                    task.id,
-                    &[
-                        ("auto_unblock_count", serde_json::json!(0)),
-                        ("auto_unblock_last_reason", serde_json::json!(reason_key)),
-                    ],
-                )
+                .set_fields(task.id, &[("auto_unblock_count", serde_json::json!(0))])
                 .await
             {
                 tracing::warn!(task_id = task.id, err = %e, "failed to reset auto_unblock counter for new reason — skipping");
                 continue;
             }
-            true
+        }
+
+        // Check cooldown after reason-change detection (so new reasons bypass old cooldown).
+        let cooldown_count = if reason_changed {
+            0
         } else {
-            false
+            task.auto_unblock_count
         };
+        if !auto_unblock_cooldown_elapsed(cooldown_count, &task.auto_unblock_last_at) {
+            continue;
+        }
+
+        // Always increment after cooldown check. When reason changed, count was reset to 0
+        // above — incrementing after that gives count=1 (first time with this new reason).
+        // When reason is the same, increment advances from current count for exponential backoff.
+        let do_increment = true;
 
         if failures.contains(&FailureCategory::MaxAttempts) {
             let _ = store
@@ -378,6 +382,8 @@ async fn auto_unblock_blocked_tasks(
                 None,
                 None,
                 Some(&serde_json::json!({
+                    "reason": reason_key,
+                    "count": if reason_changed { 1 } else { task.auto_unblock_count + 1 },
                     "failures": failures.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>(),
                 })),
             )
