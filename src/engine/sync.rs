@@ -80,6 +80,25 @@ impl FailureCategory {
                 | FailureCategory::ModelUnavailable
         )
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            FailureCategory::FalseFailure => "FalseFailure",
+            FailureCategory::RateLimit => "RateLimit",
+            FailureCategory::SilentExit0 => "SilentExit0",
+            FailureCategory::Timeout => "Timeout",
+            FailureCategory::ConnectionError => "ConnectionError",
+            FailureCategory::CliFlagError => "CliFlagError",
+            FailureCategory::AllAgentsExhausted => "AllAgentsExhausted",
+            FailureCategory::ParseError => "ParseError",
+            FailureCategory::MaxAttempts => "MaxAttempts",
+            FailureCategory::TokenBudgetExceeded => "TokenBudgetExceeded",
+            FailureCategory::PushFailed => "PushFailed",
+            FailureCategory::PrCreateFailed => "PrCreateFailed",
+            FailureCategory::ModelUnavailable => "ModelUnavailable",
+            FailureCategory::Unknown => "Unknown",
+        }
+    }
 }
 
 fn classify_failure(error: &str, outcome: &str) -> FailureCategory {
@@ -278,6 +297,31 @@ async fn auto_unblock_blocked_tasks(
             continue;
         }
 
+        // Determine the most recent failure category as the "reason key" for this unblock.
+        let reason_key = failures.first().map(|f| f.as_str()).unwrap_or("");
+
+        // Reset counter when the failure reason changes — exponential backoff should
+        // only accumulate for repeated identical failures, not different ones.
+        let current_reason = task.auto_unblock_last_reason.clone();
+        let do_increment = if reason_key != current_reason {
+            if let Err(e) = store
+                .set_fields(
+                    task.id,
+                    &[
+                        ("auto_unblock_count", serde_json::json!(0)),
+                        ("auto_unblock_last_reason", serde_json::json!(reason_key)),
+                    ],
+                )
+                .await
+            {
+                tracing::warn!(task_id = task.id, err = %e, "failed to reset auto_unblock counter for new reason — skipping");
+                continue;
+            }
+            true
+        } else {
+            false
+        };
+
         if failures.contains(&FailureCategory::MaxAttempts) {
             let _ = store
                 .set_fields(
@@ -291,12 +335,20 @@ async fn auto_unblock_blocked_tasks(
         }
 
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        if let Err(e) = store.increment(task.id, "auto_unblock_count").await {
-            tracing::warn!(task_id = task.id, err = %e, "failed to increment auto_unblock_count");
-            continue;
+        if do_increment {
+            if let Err(e) = store.increment(task.id, "auto_unblock_count").await {
+                tracing::warn!(task_id = task.id, err = %e, "failed to increment auto_unblock_count");
+                continue;
+            }
         }
         if let Err(e) = store
-            .set_fields(task.id, &[("auto_unblock_last_at", serde_json::json!(now))])
+            .set_fields(
+                task.id,
+                &[
+                    ("auto_unblock_last_at", serde_json::json!(now)),
+                    ("auto_unblock_last_reason", serde_json::json!(reason_key)),
+                ],
+            )
             .await
         {
             tracing::warn!(task_id = task.id, err = %e, "failed to set auto_unblock_last_at — skipping unblock");
@@ -1584,6 +1636,7 @@ mod tests {
         assert!(task.model.is_none());
         assert_eq!(task.auto_unblock_count, 1);
         assert!(!task.auto_unblock_last_at.is_empty());
+        assert_eq!(task.auto_unblock_last_reason, "RateLimit");
     }
 
     #[tokio::test]
@@ -1653,6 +1706,37 @@ mod tests {
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, crate::store::TaskStatus::Blocked);
         assert_eq!(task.auto_unblock_count, 0);
+    }
+
+    // ── FailureCategory::as_str ─────────────────────────────────────────
+
+    #[test]
+    fn failure_category_as_str() {
+        // as_str() must return a stable, human-readable string used as the
+        // reason key in auto_unblock tracking (stored in auto_unblock_last_reason).
+        assert_eq!(FailureCategory::RateLimit.as_str(), "RateLimit");
+        assert_eq!(FailureCategory::Timeout.as_str(), "Timeout");
+        assert_eq!(
+            FailureCategory::ModelUnavailable.as_str(),
+            "ModelUnavailable"
+        );
+        assert_eq!(FailureCategory::MaxAttempts.as_str(), "MaxAttempts");
+        assert_eq!(FailureCategory::Unknown.as_str(), "Unknown");
+        assert_eq!(FailureCategory::SilentExit0.as_str(), "SilentExit0");
+        assert_eq!(FailureCategory::ConnectionError.as_str(), "ConnectionError");
+        assert_eq!(FailureCategory::CliFlagError.as_str(), "CliFlagError");
+        assert_eq!(
+            FailureCategory::AllAgentsExhausted.as_str(),
+            "AllAgentsExhausted"
+        );
+        assert_eq!(FailureCategory::ParseError.as_str(), "ParseError");
+        assert_eq!(FailureCategory::FalseFailure.as_str(), "FalseFailure");
+        assert_eq!(
+            FailureCategory::TokenBudgetExceeded.as_str(),
+            "TokenBudgetExceeded"
+        );
+        assert_eq!(FailureCategory::PushFailed.as_str(), "PushFailed");
+        assert_eq!(FailureCategory::PrCreateFailed.as_str(), "PrCreateFailed");
     }
 
     // ── classify_failure: ModelUnavailable ──────────────────────────────
@@ -1788,6 +1872,172 @@ mod tests {
             "task blocked by model unavailable must be auto-unblocked and re-routed"
         );
         assert_eq!(task.auto_unblock_count, 1);
+        assert_eq!(task.auto_unblock_last_reason, "ModelUnavailable");
+    }
+
+    // ── auto_unblock: reason-reset (regression for #1227) ─────────────────
+
+    #[tokio::test]
+    async fn auto_unblock_resets_count_when_reason_changes() {
+        // Regression test for #1227: when a task is blocked for a different failure
+        // reason than the last auto-unblock, the counter should reset to 0 (immediate
+        // retry) instead of accumulating across unrelated failures.
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "1227",
+                title: "Task with different failure reason",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+        // Simulate: task was previously auto-unblocked for ModelUnavailable (count=1)
+        store
+            .set_fields(
+                id,
+                &[
+                    ("auto_unblock_count", serde_json::json!(1)),
+                    (
+                        "auto_unblock_last_reason",
+                        serde_json::json!("ModelUnavailable"),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Add a run with a DIFFERENT failure: MaxAttempts
+        let run_id = store
+            .start_run(&crate::store::StartRun {
+                task_id: id,
+                attempt: 2,
+                run_type: "agent",
+                agent: "claude",
+                model: "opus",
+                command: "claude",
+                prompt: "fix the bug",
+            })
+            .await
+            .unwrap();
+        store
+            .complete_run(&crate::store::CompleteRun {
+                run_id,
+                exit_code: Some(1),
+                stdout: "",
+                stderr: "",
+                parsed: "",
+                outcome: "error",
+                error: "exceeded max attempts",
+                tokens: crate::store::RunTokenUsage::default(),
+            })
+            .await
+            .unwrap();
+
+        auto_unblock_blocked_tasks("owner/repo", &task_manager, &store, &dispatching)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::New,
+            "task must be auto-unblocked even with count=1 from a different reason"
+        );
+        // Count is reset to 0, then incremented to 1 for the new reason
+        assert_eq!(task.auto_unblock_count, 1);
+        assert_eq!(
+            task.auto_unblock_last_reason, "MaxAttempts",
+            "reason must be updated to the new failure category"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_unblock_stores_reason_on_first_unblock() {
+        // When a task is auto-unblocked for the first time, the failure reason
+        // should be stored so subsequent blocks can be compared.
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend,
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "1227b",
+                title: "Task for first-time reason storage",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::Blocked)
+            .await
+            .unwrap();
+
+        let run_id = store
+            .start_run(&crate::store::StartRun {
+                task_id: id,
+                attempt: 1,
+                run_type: "agent",
+                agent: "claude",
+                model: "opus",
+                command: "claude",
+                prompt: "fix the bug",
+            })
+            .await
+            .unwrap();
+        store
+            .complete_run(&crate::store::CompleteRun {
+                run_id,
+                exit_code: Some(1),
+                stdout: "",
+                stderr: "",
+                parsed: "",
+                outcome: "timeout",
+                error: "task timed out",
+                tokens: crate::store::RunTokenUsage::default(),
+            })
+            .await
+            .unwrap();
+
+        auto_unblock_blocked_tasks("owner/repo", &task_manager, &store, &dispatching)
+            .await
+            .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::New);
+        assert_eq!(task.auto_unblock_count, 1);
+        assert_eq!(
+            task.auto_unblock_last_reason, "Timeout",
+            "reason must be stored on first auto-unblock"
+        );
     }
 
     // ── classify_failure: sparse checkout (regression for substring false positive) ──
