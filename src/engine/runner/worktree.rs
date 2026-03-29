@@ -91,21 +91,8 @@ pub async fn abort_worktree_rebase(worktree_dir: &Path) {
 /// Rebase a worktree on top of `origin/{default_branch}`.
 pub async fn rebase_worktree_on_origin_main(
     worktree_dir: &Path,
-    repo_root: &Path,
     default_branch: &str,
 ) -> anyhow::Result<()> {
-    let repo_root_str = repo_root.to_string_lossy();
-    let fetch = Command::new("git")
-        .args(["-C", repo_root_str.as_ref(), "fetch", "origin"])
-        .output_with_context()
-        .await?;
-    if !fetch.status.success() {
-        anyhow::bail!(
-            "git fetch origin failed: {}",
-            String::from_utf8_lossy(&fetch.stderr).trim()
-        );
-    }
-
     let origin_branch = format!("origin/{default_branch}");
     let rebase = Command::new("git")
         .args([

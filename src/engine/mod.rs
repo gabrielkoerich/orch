@@ -332,6 +332,16 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
             crate::engine::runner::worktree::detect_default_branch(&repo_root_path).await;
         let worktrees = list_project_worktrees(&repo_root_path)?;
 
+        // Fetch refs once for all worktrees in this project, so rebase below
+        // operates on up-to-date origin/* refs without N sequential fetches.
+        if let Err(e) = Command::new("git")
+            .args(["-C", &repo_root.to_string_lossy(), "fetch", "origin"])
+            .output_with_context()
+            .await
+        {
+            tracing::warn!(repo = %engine.repo, err = %e, "startup git fetch origin failed, rebases may use stale refs");
+        }
+
         for worktree_dir in worktrees {
             let Some(name) = worktree_dir.file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -371,12 +381,8 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                 | TaskStatus::NeedsReview
                 | TaskStatus::InReview => {
                     tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), "rebasing startup worktree");
-                    if let Err(e) = rebase_worktree_on_origin_main(
-                        &worktree_dir,
-                        &repo_root_path,
-                        &default_branch,
-                    )
-                    .await
+                    if let Err(e) =
+                        rebase_worktree_on_origin_main(&worktree_dir, &default_branch).await
                     {
                         tracing::warn!(repo = %engine.repo, task_id = %task_id, err = %e, "startup rebase failed, resetting task");
                         abort_worktree_rebase(&worktree_dir).await;
