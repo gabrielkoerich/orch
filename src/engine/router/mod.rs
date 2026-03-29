@@ -829,41 +829,35 @@ mod tests {
     }
 
     #[test]
-    fn model_map_lookup() {
+    fn model_map_lookup_returns_none_without_config() {
+        // Default config has no hardcoded models — config.yml is the source of truth.
         let config = RouterConfig::default();
+        assert!(config
+            .model_for_complexity("claude", "simple", "")
+            .is_none());
+        assert!(config
+            .model_for_complexity("claude", "medium", "")
+            .is_none());
+        assert!(config
+            .model_for_complexity("claude", "complex", "")
+            .is_none());
+        assert!(config
+            .model_for_complexity("opencode", "review", "")
+            .is_none());
+    }
 
+    #[test]
+    fn model_map_lookup_returns_configured_value() {
+        // When model_map is populated (from config), it is returned correctly.
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("simple".to_string())
+            .or_default()
+            .insert("claude".to_string(), vec!["haiku".to_string()]);
         assert_eq!(
             config.model_for_complexity("claude", "simple", ""),
-            Some("claude-haiku-4-5-20251001".to_string())
-        );
-        assert_eq!(
-            config.model_for_complexity("claude", "medium", ""),
-            Some("claude-sonnet-4-6".to_string())
-        );
-        assert_eq!(
-            config.model_for_complexity("claude", "complex", ""),
-            Some("claude-opus-4-6".to_string())
-        );
-        assert_eq!(
-            config.model_for_complexity("codex", "simple", ""),
-            Some("o4-mini".to_string())
-        );
-        // Verify kimi and minimax use same models as claude
-        assert_eq!(
-            config.model_for_complexity("kimi", "simple", ""),
-            Some("claude-haiku-4-5-20251001".to_string())
-        );
-        assert_eq!(
-            config.model_for_complexity("kimi", "complex", ""),
-            Some("claude-opus-4-6".to_string())
-        );
-        assert_eq!(
-            config.model_for_complexity("minimax", "medium", ""),
-            Some("claude-sonnet-4-6".to_string())
-        );
-        assert_eq!(
-            config.model_for_complexity("minimax", "complex", ""),
-            Some("claude-opus-4-6".to_string())
+            Some("haiku".to_string())
         );
     }
 
@@ -912,11 +906,16 @@ mod tests {
 
     #[test]
     fn model_pool_single_string_backward_compat() {
-        // Single-item pools behave identically to the old string format
-        let config = RouterConfig::default();
-        // All default entries are single-item pools
+        // Single-item pools behave identically to the old string format.
+        // Manually insert a single-item pool and verify it is returned correctly.
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("simple".to_string())
+            .or_default()
+            .insert("claude".to_string(), vec!["haiku".to_string()]);
         let m = config.model_for_complexity("claude", "simple", "any-task");
-        assert_eq!(m, Some("claude-haiku-4-5-20251001".to_string()));
+        assert_eq!(m, Some("haiku".to_string()));
     }
 
     #[test]
