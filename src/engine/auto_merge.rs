@@ -798,7 +798,7 @@ pub(crate) async fn handle_review_changes(
         // the review cycle counter and re-trigger the review agent.
         let ci_recovery_count: i32 = task_store_record
             .as_ref()
-            .map(|t| t.auto_unblock_count)
+            .map(|t| t.ci_recovery_count)
             .unwrap_or(0);
 
         if ci_recovery_count < 1 {
@@ -820,7 +820,7 @@ pub(crate) async fn handle_review_changes(
                         &Some(Arc::clone(store)),
                         repo,
                         &task.id.0,
-                        "auto_unblock_count",
+                        "ci_recovery_count",
                     )
                     .await;
                     if let Err(e) = task_manager

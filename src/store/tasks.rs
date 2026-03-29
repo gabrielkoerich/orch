@@ -112,6 +112,9 @@ pub struct Task {
     pub auto_unblock_count: i32,
     pub auto_unblock_last_at: String,
 
+    // CI-based auto-recovery tracking (separate from auto_unblock_count)
+    pub ci_recovery_count: i32,
+
     // Timestamps
     pub created_at: String,
     pub updated_at: String,
@@ -665,6 +668,7 @@ impl TaskStore {
             "labels",
             "auto_unblock_count",
             "auto_unblock_last_at",
+            "ci_recovery_count",
         ];
 
         for (col, _) in updates {
@@ -717,6 +721,7 @@ impl TaskStore {
             "review_cycles",
             "review_invocations",
             "auto_unblock_count",
+            "ci_recovery_count",
         ];
 
         anyhow::ensure!(
@@ -749,6 +754,7 @@ impl TaskStore {
             review_session_expected = 0,
             auto_unblock_count = 0,
             auto_unblock_last_at = '',
+            ci_recovery_count = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
@@ -777,6 +783,7 @@ impl TaskStore {
             review_session_expected = 0,
             auto_unblock_count = 0,
             auto_unblock_last_at = '',
+            ci_recovery_count = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
@@ -1228,6 +1235,7 @@ impl TaskStore {
                 .unwrap_or_default(),
             auto_unblock_count: row.get("auto_unblock_count"),
             auto_unblock_last_at: row.get("auto_unblock_last_at"),
+            ci_recovery_count: row.get("ci_recovery_count"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })
