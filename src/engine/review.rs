@@ -481,6 +481,24 @@ async fn ensure_pr_exists(
                     return Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Skipped));
                 }
 
+                if last_error.contains("no fallback agents")
+                    || last_error.contains("all agents exhausted")
+                {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        branch = %branch_name,
+                        last_error = %last_error,
+                        "no PR and no commits after failover exhaustion — marking blocked to stop loop"
+                    );
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::Blocked)
+                        .await
+                    {
+                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Blocked) failed — task may be stuck in NeedsReview");
+                    }
+                    return Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Skipped));
+                }
+
                 tracing::warn!(
                     task_id = task.id.0,
                     branch = %branch_name,
