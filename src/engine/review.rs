@@ -747,15 +747,9 @@ pub(crate) async fn review_and_merge(
                 .next_round_robin_agent(&final_exclude_refs)
                 .unwrap_or_else(|| "claude".to_string());
 
-            // Break the model lookup across lines so rustfmt/clippy do not complain
-            // about overly long lines.
-            let fallback_model = r
-                .config
-                .model_for_complexity(
-                    &fallback_agent,
-                    "review",
-                    &task.id.0,
-                );
+            let fallback_model =
+                r.config
+                    .model_for_complexity(&fallback_agent, "review", &task.id.0);
 
             (fallback_agent, fallback_model)
         };
