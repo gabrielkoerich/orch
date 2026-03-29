@@ -47,6 +47,123 @@ pub(crate) struct LlmAgentProfile {
     pub(crate) constraints: Vec<String>,
 }
 
+/// Detect a known error envelope in a parsed JSON value.
+///
+/// Returns `Some(summary)` if the value looks like an error response from the LLM
+/// provider (type=error, error.message, rate limit signatures, etc.), or `None`
+/// if it doesn't match any known pattern.
+fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+
+    // Direct `{"type":"error",...}` envelope — check this BEFORE nested error branch
+    // since type=error envelopes also have an `error` key that would match the nested branch.
+    if obj.get("type").and_then(|v| v.as_str()) == Some("error") {
+        if let Some(msg) = obj
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return Some(format!("type=error: {msg}"));
+        }
+        if let Some(msg) = obj.get("error").and_then(|e| e.as_str()) {
+            return Some(format!("type=error: {msg}"));
+        }
+        // Handle `{"error":{"name":"...","data":{"message":"..."}}}` inside type=error envelope
+        if let Some(error_obj) = obj.get("error").and_then(|e| e.as_object()) {
+            if let Some(data) = error_obj.get("data").and_then(|d| d.as_object()) {
+                if let Some(data_msg) = data.get("message").and_then(|m| m.as_str()) {
+                    let name = error_obj
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("UnknownError");
+                    return Some(format!("type=error: error.name={name}: {data_msg}"));
+                }
+            }
+            if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
+                let name = error_obj
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("UnknownError");
+                return Some(format!("type=error: error.name={name}: {msg}"));
+            }
+        }
+        if let Some(msg) = obj.get("message").and_then(|m| m.as_str()) {
+            return Some(format!("type=error: {msg}"));
+        }
+        if let Some(name) = obj
+            .get("error")
+            .and_then(|e| e.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            return Some(format!("type=error: error.name={name}"));
+        }
+        return Some("type=error (no message extracted)".to_string());
+    }
+
+    // Nested `{"error":{"name":"...","message":"...",...}}` or `{"error":{"type":"...","message":"...",...}}` envelope
+    if let Some(error_obj) = obj.get("error").and_then(|e| e.as_object()) {
+        let name = error_obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UnknownError");
+        if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
+            return Some(format!("error.name={name}: {msg}"));
+        }
+        if let Some(data) = error_obj.get("data").and_then(|d| d.as_object()) {
+            if let Some(data_msg) = data.get("message").and_then(|m| m.as_str()) {
+                return Some(format!("error.name={name}: {data_msg}"));
+            }
+        }
+        if let Some(etype) = error_obj.get("type").and_then(|t| t.as_str()) {
+            if let Some(msg) = error_obj.get("message").and_then(|m| m.as_str()) {
+                return Some(format!("error.type={etype}: {msg}"));
+            }
+            return Some(format!("error.type={etype}"));
+        }
+        return Some(format!("error.name={name}"));
+    }
+
+    // OpenAI-style `{"error": "message string"}`
+    if let Some(err_str) = obj.get("error").and_then(|e| e.as_str()) {
+        return Some(format!("error: {err_str}"));
+    }
+
+    // Error message substring detection (defense in depth)
+    let raw = serde_json::to_string(value).ok()?;
+    let raw_lower = raw.to_lowercase();
+    let error_indicators = [
+        "rate limit",
+        "overloaded",
+        "quota",
+        "permission",
+        "unauthorized",
+        "authentication",
+        "429",
+        "401",
+        "403",
+        "503",
+        "500",
+        "529",
+        "context_length",
+        "max_tokens",
+    ];
+    for indicator in &error_indicators {
+        if raw_lower.contains(indicator) {
+            // Extract a short snippet around the indicator
+            if let Some(pos) = raw_lower.find(indicator) {
+                let start = pos.saturating_sub(30);
+                let end = (pos + indicator.len() + 30).min(raw.len());
+                let snippet = &raw[start..end];
+                return Some(format!(
+                    "error indicator '{indicator}' found near: {snippet}"
+                ));
+            }
+        }
+    }
+
+    None
+}
+
 /// Apply self-routing penalty: if the LLM chose the same agent that's running the router,
 /// probabilistically redirect to another agent.
 ///
@@ -484,9 +601,17 @@ impl LlmRouter {
                 if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
                     return Ok(parsed);
                 }
+
+                // json_str is valid JSON but not LlmRouteResponse — check for error envelopes
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(err_msg) = detect_error_envelope(&value) {
+                        anyhow::bail!("router LLM returned error payload: {err_msg}");
+                    }
+                }
             }
         }
 
+        // True parse failure: not valid JSON
         anyhow::bail!(
             "could not parse LLM response as JSON: {}",
             &text[..text.len().min(200)]
@@ -599,6 +724,129 @@ mod tests {
         }
     }
 
+    // ── detect_error_envelope ─────────────────────────────────────────────────
+
+    #[test]
+    fn detect_error_type_field_direct() {
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"type":"error","message":"connection failed"}"#).unwrap();
+        let result = detect_error_envelope(&json);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("connection failed"));
+    }
+
+    #[test]
+    fn detect_error_type_field_with_nested_error() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"type":"error","timestamp":1743212400,"error":{"name":"UnknownError","data":{"message":"Unable to connect"}}}"#,
+        )
+        .unwrap();
+        let result = detect_error_envelope(&json).unwrap();
+        assert!(
+            result.contains("type=error") && result.contains("Unable to connect"),
+            "should extract data.message, got: {result}"
+        );
+    }
+
+    #[test]
+    fn detect_error_kimi_nested_envelope() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"error":{"type":"permission_error","message":"You've reached your usage limit"},"type":"error"}"#,
+        )
+        .unwrap();
+        let result = detect_error_envelope(&json).unwrap();
+        assert!(
+            result.contains("type=error") && result.contains("usage limit"),
+            "should extract usage limit message, got: {result}"
+        );
+    }
+
+    #[test]
+    fn detect_error_kimi_nested_without_outer_type() {
+        // Kimi-style nested error WITHOUT outer type=error — tests the nested branch in isolation
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"error":{"name":"RateLimitError","message":"rate limit exceeded"}}"#,
+        )
+        .unwrap();
+        let result = detect_error_envelope(&json).unwrap();
+        assert!(
+            result.contains("error.name=RateLimitError") && result.contains("rate limit"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn detect_error_kimi_billing_envelope() {
+        // The exact Kimi rate-limit envelope from the issue comments
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"error":{"type":"permission_error","message":"You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle. Upgrade to get more: https://example.com"},"type":"error"}"#,
+        )
+        .unwrap();
+        let result = detect_error_envelope(&json).unwrap();
+        assert!(
+            result.contains("type=error") && result.contains("usage limit"),
+            "should extract usage limit message, got: {result}"
+        );
+    }
+
+    #[test]
+    fn detect_error_openai_flat_style() {
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"error":"rate limit exceeded","type":"standard"}"#).unwrap();
+        let result = detect_error_envelope(&json).unwrap();
+        assert!(result.contains("error:"));
+    }
+
+    #[test]
+    fn detect_error_indicator_429() {
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"status":429,"message":"Too Many Requests"}"#).unwrap();
+        let result = detect_error_envelope(&json);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("429"));
+    }
+
+    #[test]
+    fn detect_error_indicator_overloaded() {
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"status":529,"message":"Service overloaded"}"#).unwrap();
+        let result = detect_error_envelope(&json);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("overloaded"));
+    }
+
+    #[test]
+    fn detect_error_indicator_auth() {
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"status":401,"message":"Unauthorized"}"#).unwrap();
+        let result = detect_error_envelope(&json);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("401"));
+    }
+
+    #[test]
+    fn detect_error_returns_none_for_valid_route_response() {
+        // A valid route response should NOT be detected as an error
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"executor":"claude","complexity":"medium","reason":"good fit"}"#,
+        )
+        .unwrap();
+        let result = detect_error_envelope(&json);
+        assert!(
+            result.is_none(),
+            "valid route response must not be detected as error"
+        );
+    }
+
+    #[test]
+    fn detect_error_returns_none_for_non_object() {
+        // Non-object JSON values should return None
+        let json: serde_json::Value = serde_json::from_str(r#""just a string""#).unwrap();
+        assert!(detect_error_envelope(&json).is_none());
+        let json: serde_json::Value = serde_json::from_str(r#"[1,2,3]"#).unwrap();
+        assert!(detect_error_envelope(&json).is_none());
+    }
+
     // ── parse_llm_response ────────────────────────────────────────────────────
 
     #[test]
@@ -689,6 +937,95 @@ mod tests {
         let md = "```\n{\"executor\":\"minimax\",\"complexity\":\"medium\",\"reason\":\"ok\"}\n```";
         let resp = router.parse_llm_response("claude", md).unwrap();
         assert_eq!(resp.executor, "minimax");
+    }
+
+    #[test]
+    fn parse_valid_json_error_envelope_type_error() {
+        // Valid JSON with {"type":"error",...} should NOT produce "could not parse" error.
+        // Instead it should surface as "router LLM returned error payload: ...".
+        let router = make_router();
+        let json = r#"{"type":"error","timestamp":1743212400,"error":{"name":"UnknownError","data":{"message":"Unable to connect to upstream"}}}"#;
+        let err = router.parse_llm_response("claude", json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("router LLM returned error payload"),
+            "should be structured error, got: {msg}"
+        );
+        assert!(
+            msg.contains("Unable to connect"),
+            "should extract the error message: {msg}"
+        );
+        assert!(
+            !msg.contains("could not parse"),
+            "must NOT say 'could not parse' for valid JSON: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_valid_json_error_envelope_kimi_style() {
+        // Kimi-style error envelope with nested error object
+        let router = make_router();
+        let json = r#"{"error":{"type":"permission_error","message":"You've reached your usage limit for this billing cycle."},"type":"error"}"#;
+        let err = router.parse_llm_response("kimi", json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error") && !msg.contains("could not parse"),
+            "should surface error for Kimi-style envelope, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_valid_json_error_envelope_openai_style() {
+        // OpenAI-style {"error": "message string"} envelope
+        let router = make_router();
+        let json = r#"{"error":"rate limit exceeded","type":"standard"}"#;
+        let err = router.parse_llm_response("claude", json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("could not parse"),
+            "valid JSON should not produce parse failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_valid_json_error_envelope_with_indicator() {
+        // Valid JSON that contains error indicators but no explicit error envelope
+        let router = make_router();
+        let json = r#"{"status":503,"message":"Service overloaded, retry later","retry_after":30}"#;
+        let err = router.parse_llm_response("claude", json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("could not parse"),
+            "valid JSON with error indicator should not produce parse failure: {msg}"
+        );
+        assert!(
+            msg.contains("error indicator"),
+            "should mention the detected indicator: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_malformed_json_produces_parse_failure() {
+        // True malformed JSON must still produce "could not parse" error
+        let router = make_router();
+        let err = router
+            .parse_llm_response("claude", "{ invalid json }")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("could not parse"),
+            "malformed JSON must produce parse failure, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_valid_route_json_still_succeeds() {
+        // Ensure the success path still works (valid JSON that is LlmRouteResponse)
+        let router = make_router();
+        let json = r#"{"executor":"claude","complexity":"medium","reason":"test"}"#;
+        let resp = router.parse_llm_response("claude", json).unwrap();
+        assert_eq!(resp.executor, "claude");
+        assert_eq!(resp.complexity, "medium");
     }
 
     #[test]
