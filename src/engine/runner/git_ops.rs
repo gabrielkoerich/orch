@@ -445,8 +445,7 @@ fn push_needs_rebase(stderr: &str) -> bool {
 /// fallback is used, ensuring consistent behavior across environments.
 ///
 /// # Returns
-/// - `Ok(Some(url))` - PR was successfully created
-/// - `Ok(None)` - PR already exists (not an error)
+/// - `Ok(url)` - PR URL (newly created or already existed)
 /// - `Err(PrCreateError)` - API error or other failure
 #[allow(clippy::too_many_arguments)]
 pub async fn create_pr_if_needed(
@@ -462,7 +461,7 @@ pub async fn create_pr_if_needed(
     model: Option<&str>,
     repo: &str,
     base_branch: &str,
-) -> PrCreateResult<Option<String>> {
+) -> PrCreateResult<String> {
     let gh = GhHttp::new()?;
 
     // Check if PR already exists using GhHttp API
@@ -471,7 +470,15 @@ pub async fn create_pr_if_needed(
             tracing::info!(task_id, pr = pr_number, "PR already exists");
             // Append attribution footer if the agent created the PR without one.
             append_pr_footer_if_missing(&gh, repo, pr_number, task_id, agent, model).await;
-            return Ok(None);
+            // Fetch the existing PR to get its URL so the caller can store pr_number.
+            let pr = match gh.get_pr(repo, pr_number).await {
+                Ok(pr) => pr,
+                Err(e) => {
+                    tracing::warn!(task_id, error = %e, "get_pr API call failed after detecting existing PR");
+                    return Err(PrCreateError::ApiError(e));
+                }
+            };
+            return Ok(pr.html_url);
         }
         Ok(None) => {
             // No PR exists, proceed to create one
@@ -534,7 +541,7 @@ pub async fn create_pr_if_needed(
 
     tracing::info!(task_id, pr_url = %url, "created PR via GhHttp API");
 
-    Ok(Some(url))
+    Ok(url)
 }
 
 /// Append the Orch attribution footer to an existing PR body if not already present.
