@@ -83,6 +83,10 @@ impl Transport {
         });
         // Always update tmux_session — task retries get a new session
         binding.tmux_session = tmux_session.to_string();
+        // When rebinding a task (retry/new tmux session), clear any cached
+        // last_output for the previous session so stale text is not replayed
+        // into the new attempt. Use the helper to centralize behavior.
+        self.clear_output(task_id).await;
         if !binding.connected_threads.contains(&key) {
             binding.connected_threads.push(key.clone());
         }
@@ -132,6 +136,16 @@ impl Transport {
     pub async fn get_session_output(&self, task_id: &str) -> Option<String> {
         let last = self.last_output.read().await;
         last.get(task_id).cloned()
+    }
+
+    /// Clear any cached last_output for a task.
+    ///
+    /// When a task is rebound to a new tmux session (retry) the previous
+    /// run's output must not be replayed. Call this when registering or
+    /// rebinding sessions so stale output is discarded.
+    pub async fn clear_output(&self, task_id: &str) {
+        let mut last = self.last_output.write().await;
+        last.remove(task_id);
     }
 
     /// Get the session binding for a specific task, if any.
