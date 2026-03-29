@@ -1176,7 +1176,11 @@ impl GhHttp {
         repo: &str,
         sha: &str,
     ) -> anyhow::Result<Vec<GitHubCheckRun>> {
-        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}/check-runs");
+        // Use `filter=latest` so GitHub returns only the most recent check run
+        // per check name. Without this, the API returns all runs (oldest
+        // first) and callers that pick the first match may observe a stale
+        // failed run when a newer run with the same name has succeeded.
+        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}/check-runs?filter=latest");
         let resp: serde_json::Value = self.get_json(&url).await?;
         Ok(resp
             .get("check_runs")
