@@ -89,26 +89,61 @@ pub async fn abort_worktree_rebase(worktree_dir: &Path) {
 }
 
 /// Rebase a worktree on top of `origin/{default_branch}`.
+///
+/// Stashes any uncommitted changes before rebasing to avoid failing the
+/// rebase due to "You have unstaged changes".  The stash is popped after
+/// the rebase succeeds; if the pop fails the stash is left on the stack
+/// for manual recovery rather than destroying the worktree.
 pub async fn rebase_worktree_on_origin_main(
     worktree_dir: &Path,
     default_branch: &str,
 ) -> anyhow::Result<()> {
+    let worktree_str = worktree_dir.to_string_lossy();
     let origin_branch = format!("origin/{default_branch}");
+
+    // Stash uncommitted changes before rebasing.
+    let did_stash = {
+        let stash = Command::new("git")
+            .args([
+                "-C",
+                &worktree_str,
+                "stash",
+                "push",
+                "--include-untracked",
+                "-m",
+                "orch-startup-rebase",
+            ])
+            .output_with_context()
+            .await?;
+        stash.status.success()
+    };
+
     let rebase = Command::new("git")
-        .args([
-            "-C",
-            &worktree_dir.to_string_lossy(),
-            "rebase",
-            &origin_branch,
-        ])
+        .args(["-C", &worktree_str, "rebase", &origin_branch])
         .output_with_context()
         .await?;
+
     if !rebase.status.success() {
         anyhow::bail!(
             "git rebase {} failed: {}",
             origin_branch,
             String::from_utf8_lossy(&rebase.stderr).trim()
         );
+    }
+
+    // Restore stashed changes.
+    if did_stash {
+        if let Err(e) = Command::new("git")
+            .args(["-C", &worktree_str, "stash", "pop"])
+            .output_with_context()
+            .await
+        {
+            tracing::warn!(
+                worktree = %worktree_dir.display(),
+                error = %e,
+                "git stash pop failed after rebase; changes are preserved in stash"
+            );
+        }
     }
 
     Ok(())
