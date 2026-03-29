@@ -356,6 +356,7 @@ mod tests {
             delegations: Vec::new(),
             auto_unblock_count: 0,
             auto_unblock_last_at: String::new(),
+            ci_recovery_count: 0,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -417,6 +418,7 @@ mod tests {
             delegations: Vec::new(),
             auto_unblock_count: 0,
             auto_unblock_last_at: String::new(),
+            ci_recovery_count: 0,
             created_at: String::new(),
             updated_at: String::new(),
         };
