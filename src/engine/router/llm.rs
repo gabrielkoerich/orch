@@ -534,7 +534,9 @@ impl LlmRouter {
                     crate::engine::runner::response::record_model_failure(agent, model_str);
                     anyhow::bail!("router LLM rate limited: {agent}:{model_str}");
                 }
-                tracing::warn!(stderr = %stderr, stdout = %stdout, "router LLM command failed");
+                let stdout_preview = &stdout[..stdout.len().min(500)];
+                let stderr_preview = &stderr[..stderr.len().min(500)];
+                tracing::warn!(stderr = %stderr_preview, stdout = %stdout_preview, "router LLM command failed");
                 anyhow::bail!("router LLM failed: {stderr}");
             }
             Err(DirectCommandError::Timeout { secs }) => {
