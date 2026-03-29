@@ -216,6 +216,19 @@ pub fn is_agent_in_cooldown(agent_name: &str) -> bool {
     is_in_cooldown(agent_name)
 }
 
+/// Return the cooldown expiry timestamp for a key (agent or agent:model), if active.
+pub fn cooldown_until(key: &str) -> Option<i64> {
+    let map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(key).and_then(|entry| {
+        let now = chrono::Utc::now().timestamp();
+        if now < entry.cooldown_until {
+            Some(entry.cooldown_until)
+        } else {
+            None
+        }
+    })
+}
+
 /// Set a cooldown with a specific expiry timestamp. Persists to KV.
 fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) {
     {
