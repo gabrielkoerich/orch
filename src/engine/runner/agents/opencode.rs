@@ -548,6 +548,12 @@ fn classify_opencode_message(message: &str) -> AgentError {
         || lower.contains("429")
         || lower.contains("usage limit")
         || lower.contains("too many requests")
+        // GitHub Copilot quota exhaustion — daily cap hit for subscription models.
+        || (lower.contains("copilot")
+            && (lower.contains("quota")
+                || lower.contains("limit")
+                || lower.contains("exceeded")
+                || lower.contains("exhausted")))
     {
         return AgentError::RateLimit {
             message: message.to_string(),
@@ -728,6 +734,24 @@ mod tests {
     fn classify_opencode_rate_limit() {
         let err = classify_opencode_message("429 Too Many Requests");
         assert!(matches!(err, AgentError::RateLimit { .. }));
+    }
+
+    #[test]
+    fn classify_opencode_copilot_quota_exceeded() {
+        let err = classify_opencode_message("GitHub Copilot quota exceeded for this model");
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "copilot quota should classify as RateLimit, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_opencode_copilot_limit_reached() {
+        let err = classify_opencode_message("copilot limit reached for today's usage");
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "copilot limit should classify as RateLimit, got: {err:?}"
+        );
     }
 
     #[test]

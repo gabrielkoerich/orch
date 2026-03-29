@@ -142,12 +142,22 @@ pub(crate) async fn tick_detect_silent_agents(
             .and_then(|t| t.model.clone())
             .unwrap_or_default();
 
+        // GitHub Copilot models get an 8-hour silence cooldown; other models use the
+        // configured value (default 1h).  Copilot exhausts its daily quota and then
+        // silently exits on every subsequent task for hours; a short cooldown means
+        // ~12 wasted retry cycles per day.  8h cuts that to ~3.
+        let model_cooldown_secs = if crate::engine::cooldown::is_copilot_model(&model_name) {
+            crate::engine::cooldown::COPILOT_SILENCE_COOLDOWN_SECS
+        } else {
+            config.silence_cooldown
+        };
+
         tracing::warn!(
             task_id,
             agent = %agent_name,
             model = %model_name,
             grace_secs = config.silence_grace_period,
-            cooldown_secs = config.silence_cooldown,
+            cooldown_secs = model_cooldown_secs,
             "agent silent since session start — killing session, cooling down model + agent, re-routing"
         );
 
@@ -165,12 +175,12 @@ pub(crate) async fn tick_detect_silent_agents(
 
         let mut extended_note = String::new();
 
-        // 3. Cooldown the specific model (not the whole agent)
+        // 3. Cooldown the specific model (not the whole agent).
         if !agent_name.is_empty() && !model_name.is_empty() {
             crate::engine::cooldown::set_model_cooldown(
                 &agent_name,
                 &model_name,
-                config.silence_cooldown,
+                model_cooldown_secs,
             );
             if let Some(result) =
                 crate::engine::cooldown::record_silence_detection(&agent_name, &model_name).await
@@ -232,7 +242,7 @@ pub(crate) async fn tick_detect_silent_agents(
             config.silence_grace_period,
             agent_name,
             model_name,
-            config.silence_cooldown,
+            model_cooldown_secs,
             extended_note,
             agent_name,
             crate::engine::cooldown::SILENCE_AGENT_COOLDOWN_SECS,

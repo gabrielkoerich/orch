@@ -38,6 +38,20 @@ pub const SILENCE_COUNT_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// Extended cooldown applied after repeated silence detections (4 hours).
 pub const SILENCE_EXTENDED_COOLDOWN_SECS: u64 = 4 * 60 * 60;
 
+/// Cooldown for GitHub Copilot models on silence or silent exit 0.
+///
+/// Copilot models under `github-copilot/*` consistently fail across multiple
+/// hours when the daily quota is exhausted. A short cooldown (1h) means ~12
+/// wasted retry cycles per day; 8 hours cuts that to ~3.
+pub const COPILOT_SILENCE_COOLDOWN_SECS: u64 = 8 * 60 * 60;
+
+/// Returns `true` if the model name identifies a GitHub Copilot subscription model.
+///
+/// Copilot models use the `github-copilot/` vendor prefix in opencode.
+pub fn is_copilot_model(model: &str) -> bool {
+    model.starts_with("github-copilot/")
+}
+
 /// KV key prefix for persisted cooldowns (both agent and model).
 const KV_PREFIX: &str = "cooldown:";
 
@@ -333,6 +347,20 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
         tracing::debug!(raw = date_str, "could not parse retry-at date");
     }
 
+    // GitHub Copilot quota exhausted without a specific retry time → cooldown 8 hours.
+    // Checked BEFORE the generic "quota exceeded" pattern so copilot messages get the
+    // shorter cooldown (8h) instead of the 24h billing-cycle default.
+    if lower.contains("copilot")
+        && (lower.contains("quota")
+            || lower.contains("limit")
+            || lower.contains("exceeded")
+            || lower.contains("exhausted"))
+    {
+        let eight_hours = chrono::Utc::now().timestamp() + COPILOT_SILENCE_COOLDOWN_SECS as i64;
+        tracing::info!("detected GitHub Copilot quota limit — cooldown for 8 hours");
+        return Some(eight_hours);
+    }
+
     // "billing cycle" / "next cycle" / "quota" without a specific date → cooldown 24 hours.
     if lower.contains("billing cycle")
         || lower.contains("next cycle")
@@ -420,6 +448,36 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         // Should be in the future (cooldown_until, not failed_at)
         assert!(ts > now, "persisted timestamp should be in the future");
+    }
+
+    #[test]
+    fn is_copilot_model_detects_github_copilot_prefix() {
+        assert!(is_copilot_model("github-copilot/claude-sonnet-4-6"));
+        assert!(is_copilot_model("github-copilot/gpt-5.4-mini"));
+        assert!(!is_copilot_model("anthropic/claude-sonnet-4-6"));
+        assert!(!is_copilot_model("opencode/minimax-m2.5-free"));
+        assert!(!is_copilot_model(""));
+    }
+
+    #[test]
+    fn parse_retry_at_copilot_quota_sets_8h_cooldown() {
+        let msg = "GitHub Copilot quota exceeded for this model. Please try again later.";
+        let ts = parse_retry_at(msg);
+        assert!(ts.is_some(), "copilot quota message should set a cooldown");
+        let now = chrono::Utc::now().timestamp();
+        let remaining = ts.unwrap() - now;
+        // Should be ~8 hours (28800s), allow ±5s
+        assert!(
+            remaining > 28795 && remaining <= 28800,
+            "copilot quota cooldown should be ~8 hours, got {remaining}s"
+        );
+    }
+
+    #[test]
+    fn parse_retry_at_copilot_limit_sets_8h_cooldown() {
+        let msg = "copilot limit reached for today";
+        let ts = parse_retry_at(msg);
+        assert!(ts.is_some(), "copilot limit message should set a cooldown");
     }
 
     #[test]

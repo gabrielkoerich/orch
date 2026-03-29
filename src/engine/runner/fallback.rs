@@ -120,10 +120,25 @@ pub async fn handle_error(
             response::RetryableError::Failed,
             format!("permission denied: {message}"),
         ),
-        agents::AgentError::InvalidResponse { .. } => (
-            response::RetryableError::Failed,
-            format!("{agent_name} invalid response"),
-        ),
+        agents::AgentError::InvalidResponse { .. } => {
+            // Copilot models sometimes emit NDJSON with only step_start/step_finish
+            // (no text events) and exit 0 — this looks like InvalidResponse but is
+            // actually a silent quota failure.  Apply the same 8-hour cooldown to
+            // avoid retrying the same model on every subsequent task.
+            if let Some(m) = model_name {
+                if crate::engine::cooldown::is_copilot_model(m) {
+                    crate::engine::cooldown::set_model_cooldown(
+                        agent_name,
+                        m,
+                        crate::engine::cooldown::COPILOT_SILENCE_COOLDOWN_SECS,
+                    );
+                }
+            }
+            (
+                response::RetryableError::Failed,
+                format!("{agent_name} invalid response"),
+            )
+        }
         agents::AgentError::AgentFailed { message } => (
             response::RetryableError::Failed,
             format!("{agent_name} failed: {message}"),
@@ -148,11 +163,15 @@ pub async fn handle_error(
             // the same model is not retried on every subsequent task.
             if *exit_code == 0 && message.is_empty() {
                 if let Some(m) = model_name {
-                    // Use a 4-hour cooldown for silent exits instead of the default 1-hour
-                    // model cooldown.  These models (especially github-copilot/* in opencode)
-                    // fail consistently across multiple hours; a 1-hour window means ~12
-                    // wasted 2-minute attempts per day per model.  4 hours cuts that to ~3.
-                    crate::engine::cooldown::set_model_cooldown(agent_name, m, 4 * 3600);
+                    // Copilot models get an 8-hour cooldown (COPILOT_SILENCE_COOLDOWN_SECS);
+                    // other models get 4 hours.  Copilot exhausts its daily quota and then
+                    // silently exits consistently for many hours.
+                    let cooldown = if crate::engine::cooldown::is_copilot_model(m) {
+                        crate::engine::cooldown::COPILOT_SILENCE_COOLDOWN_SECS
+                    } else {
+                        4 * 3600
+                    };
+                    crate::engine::cooldown::set_model_cooldown(agent_name, m, cooldown);
                 }
                 // Before falling through to handle_failover() (which tries claude/codex),
                 // check whether this agent has any free models that haven't been tried yet.
