@@ -366,7 +366,10 @@ pub(crate) async fn tick_recover_stuck_tasks(
     {
         Ok(tasks) => tasks,
         Err(e) => {
-            tracing::warn!(?e, "failed to list internal in_progress tasks for stuck recovery");
+            tracing::warn!(
+                ?e,
+                "failed to list internal in_progress tasks for stuck recovery"
+            );
             vec![]
         }
     };
@@ -425,10 +428,7 @@ pub(crate) async fn tick_recover_stuck_tasks(
     // Recover external tasks stuck in in_review.
     // Unlike in_progress recovery, we reset to NeedsReview (not New) so the review
     // agent re-triggers without clearing the routing state.
-    let in_review = match task_manager
-        .list_external_by_status(Status::InReview)
-        .await
-    {
+    let in_review = match task_manager.list_external_by_status(Status::InReview).await {
         Ok(tasks) => tasks,
         Err(e) => {
             tracing::warn!(?e, "failed to list in_review tasks for stuck recovery");

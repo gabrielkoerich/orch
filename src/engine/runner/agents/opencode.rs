@@ -57,16 +57,35 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
     for event in events {
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-        // OpenCode emits several shapes across versions.
-        // We intentionally restrict extraction to event/part types that represent
-        // assistant text output (not tool I/O).
-        if event_type == "text" || event_type == "message" {
+        // OpenCode emits several shapes across versions. Also scan assistant
+        // messages coming from Claude-like wrappers which use `type: "assistant"`
+        // with a `message.content` array containing text items.
+        // We intentionally restrict extraction to event/part/message types that
+        // represent assistant text output (not tool I/O).
+        if event_type == "text" || event_type == "message" || event_type == "assistant" {
             if let Some(part) = event.get("part") {
                 texts.extend(extract_text_from_part(part));
             }
+
+            // Handle opencode `text` events that put text at top-level
             if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
                 texts.push(text.to_string());
             }
+
+            // Handle Claude-like assistant messages: message.content -> [{type:"text", text:...}]
+            if let Some(message) = event.get("message") {
+                if let Some(items) = message.get("content").and_then(|v| v.as_array()) {
+                    for item in items {
+                        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if item_type == "text" {
+                            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                texts.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
             continue;
         }
 
