@@ -893,9 +893,9 @@ async fn skills_sync() -> anyhow::Result<()> {
         } else {
             // Clone the repository (shallow for efficiency)
             tracing::debug!(repo = %skill.repo, "cloning skill repo");
-            let parent = repo_dir
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("skill repo path has no parent directory"))?;
+            let parent = repo_dir.parent().ok_or_else(|| {
+                anyhow::anyhow!("skill repo path has no parent directory")
+            })?;
             // Use async filesystem API to avoid blocking the Tokio reactor.
             tokio::fs::create_dir_all(parent).await?;
             let repo_dir_str = repo_dir
