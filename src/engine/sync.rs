@@ -915,18 +915,18 @@ async fn skills_sync() -> anyhow::Result<()> {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     tracing::warn!(repo = %skill.repo, err = %stderr, "git clone failed");
                     // Clean up partial clone to allow retry on next tick
-                    let _ = std::fs::remove_dir_all(&repo_dir);
+                    let _ = tokio::fs::remove_dir_all(&repo_dir).await;
                 }
                 Ok(Ok(_)) => {
                     tracing::info!(repo = %skill.repo, "skill repo cloned");
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(repo = %skill.repo, err = %e, "git clone error");
-                    let _ = std::fs::remove_dir_all(&repo_dir);
+                    let _ = tokio::fs::remove_dir_all(&repo_dir).await;
                 }
                 Err(_) => {
                     tracing::warn!(repo = %skill.repo, "git clone timed out after 60s");
-                    let _ = std::fs::remove_dir_all(&repo_dir);
+                    let _ = tokio::fs::remove_dir_all(&repo_dir).await;
                 }
             }
         }

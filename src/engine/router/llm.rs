@@ -248,9 +248,10 @@ impl LlmRouter {
             anyhow::bail!("no agent CLIs found in PATH");
         }
 
-        // Build the routing prompt
-        let prompt =
-            self.build_routing_prompt(task, available_agents, router_agent, &config.weights)?;
+        // Build the routing prompt (async; offload blocking work inside)
+        let prompt = self
+            .build_routing_prompt(task, available_agents, router_agent, &config.weights)
+            .await?;
 
         // Save prompt and response to per-task routing dir for debugging
         let routing_dir = crate::home::task_dir(repo, &task.id.0)
@@ -368,7 +369,7 @@ impl LlmRouter {
     }
 
     /// Build the routing prompt from the template.
-    fn build_routing_prompt(
+    async fn build_routing_prompt(
         &self,
         task: &ExternalTask,
         available_agents: &[String],
@@ -397,8 +398,11 @@ impl LlmRouter {
         // Build labels string
         let labels = task.labels.join(", ");
 
-        // Load skills catalog if available
-        let skills_catalog = self.load_skills_catalog();
+        // Load skills catalog if available — perform blocking FS work off the async reactor.
+        let skills_catalog = match self.load_skills_catalog().await {
+            Ok(s) => s,
+            Err(_) => "[]".to_string(),
+        };
 
         // Simple template substitution
         let prompt = template
@@ -425,22 +429,95 @@ impl LlmRouter {
 
     /// Load skills catalog from skills.yml or skills directory.
     /// Cached after first load to avoid blocking I/O in async context.
-    fn load_skills_catalog(&self) -> String {
-        // Check cache first
+    async fn load_skills_catalog(&self) -> anyhow::Result<String> {
+        // Check cache first (quick lock, drop immediately)
         if let Ok(cache) = self.skills_catalog.lock() {
             if let Some(ref catalog) = *cache {
-                return catalog.clone();
+                return Ok(catalog.clone());
             }
         }
 
-        // Load and cache
-        let catalog = self.load_skills_catalog_uncached();
+        // Offload uncached loading to blocking thread pool to avoid blocking the Tokio reactor.
+        // Clone any data we need to avoid capturing &self across thread boundary.
+        // The uncached loader only needs paths and env; we'll call it via an owned closure
+        // that takes ownership of a PathBuf for the ORCH_HOME/skills path if present.
+        let skills_dir_opt: Option<PathBuf> = std::env::var("ORCH_HOME").ok().map(|orch_home| PathBuf::from(orch_home).join("skills"));
+
+        let catalog = tokio::task::spawn_blocking(move || {
+            // Re-implement the uncached loading logic here in the blocking thread without capturing self.
+            // Try skills.yml in current directory
+            if let Ok(content) = std::fs::read_to_string("skills.yml") {
+                if let Ok(yaml) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                    if let Some(skills) = yaml.get("skills") {
+                        if let Ok(json) = serde_json::to_string(skills) {
+                            return Ok(json);
+                        }
+                    }
+                }
+            }
+
+            // Try ORCH_HOME/skills directory
+            if let Some(skills_dir) = skills_dir_opt.as_ref() {
+                if skills_dir.exists() {
+                    let mut skills = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(skills_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                let skill_id = path.file_name().unwrap_or_default().to_string_lossy();
+                                let skill_file = path.join("SKILL.md");
+                                if skill_file.exists() {
+                                    let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
+                                    let name = content.lines().next().unwrap_or("").trim_start_matches("# ").to_string();
+                                    skills.push(serde_json::json!({"id": skill_id, "name": name}));
+                                }
+                            }
+                        }
+                    }
+                    if !skills.is_empty() {
+                        if let Ok(json) = serde_json::to_string(&skills) {
+                            return Ok(json);
+                        }
+                    }
+                }
+            }
+
+            // Try ~/.orch/skills
+            if let Ok(skills_dir) = crate::home::skills_dir() {
+                if skills_dir.exists() {
+                    let mut skills = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                let skill_id = path.file_name().unwrap_or_default().to_string_lossy();
+                                let skill_file = path.join("SKILL.md");
+                                if skill_file.exists() {
+                                    let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
+                                    let name = content.lines().next().unwrap_or("").trim_start_matches("# ").to_string();
+                                    skills.push(serde_json::json!({"id": skill_id, "name": name}));
+                                }
+                            }
+                        }
+                    }
+                    if !skills.is_empty() {
+                        if let Ok(json) = serde_json::to_string(&skills) {
+                            return Ok(json);
+                        }
+                    }
+                }
+            }
+
+            Ok("[]".to_string())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
 
         if let Ok(mut cache) = self.skills_catalog.lock() {
             *cache = Some(catalog.clone());
         }
 
-        catalog
+        Ok(catalog)
     }
 
     fn load_skills_catalog_uncached(&self) -> String {
@@ -501,6 +578,45 @@ impl LlmRouter {
 
         Ok(serde_json::to_string(&skills)?)
     }
+
+/// Blocking helper variant of build_skills_catalog_from_dir used inside spawn_blocking.
+fn build_skills_catalog_from_dir_blocking(dir: &PathBuf) -> anyhow::Result<String> {
+    if !dir.exists() {
+        anyhow::bail!("skills directory does not exist");
+    }
+
+    let mut skills = Vec::new();
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            let skill_id = path.file_name().unwrap_or_default().to_string_lossy();
+            let skill_file = path.join("SKILL.md");
+
+            if skill_file.exists() {
+                // Read SKILL.md for metadata
+                let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
+
+                // Extract name from first line (title)
+                let name = content
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches("# ")
+                    .to_string();
+
+                skills.push(serde_json::json!({
+                    "id": skill_id,
+                    "name": name,
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::to_string(&skills)?)
+}
 
     /// Call the specified router LLM to classify the task.
     ///
