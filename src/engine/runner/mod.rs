@@ -376,31 +376,37 @@ impl TaskRunner {
         )
         .await;
 
-        // Silence detection (tick phase1b) may have already reset this task to New
-        // and killed the tmux session. If so, skip all fallback/review processing
-        // to avoid spurious needs_review cycles.
-        if let Some(task) = store::opt_store_get_task(&self.store, &self.repo, task_id).await {
-            if task.status == crate::store::TaskStatus::New {
-                tracing::debug!(
+        // If silence detection (tick phase1b) already reset this task to `New` while the
+        // session was running, skip all fallback/review processing. Without this check the
+        // runner would call `fallback::handle_error` on the empty output, exhaust fallback
+        // agents, and mark the task `needs_review` — overwriting the `New` status and
+        // triggering a spurious review cycle before `review.rs::ensure_pr_exists` finally
+        // re-routes back to `New`.
+        if let Some(stored) = store::opt_store_get_task(&self.store, &self.repo, task_id).await {
+            if stored.status == crate::store::TaskStatus::New {
+                tracing::info!(
                     task_id,
-                    "task already reset to New by silence detection — skipping fallback"
+                    "task already reset to New by silence detection — skipping fallback processing"
                 );
-                // Kill the tmux session in case silence detection missed it
-                let _ = tmux.kill_session(&tmux_session).await;
+                session::cleanup_session(task_id, &tmux, &tmux_session).await;
+                let silence_err = agents::patterns::classify_from_text(0, "silence detected");
+                let silence_parse: Result<agents::ParsedResponse, agents::AgentError> =
+                    Err(silence_err);
+                let audit = self
+                    .build_run_audit(RunAuditInput {
+                        task_id,
+                        status: "new",
+                        parse_result: &silence_parse,
+                        raw_stdout: &session_output.raw_stdout,
+                        raw_stderr: &session_output.raw_stderr,
+                        started_at,
+                        error_override: Some("silence detection reset task to New".to_string()),
+                    })
+                    .await;
                 return Ok(Some(RunExecution {
                     status: "new".to_string(),
                     exit_code: Some(session_output.exit_code),
-                    audit: RunAudit {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        parsed_response: String::new(),
-                        outcome: String::new(),
-                        error: String::new(),
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        total_cost_usd: 0.0,
-                        duration_secs: 0.0,
-                    },
+                    audit,
                 }));
             }
         }

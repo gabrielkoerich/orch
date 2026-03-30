@@ -358,6 +358,7 @@ mod tests {
             auto_unblock_last_at: String::new(),
             auto_unblock_last_reason: String::new(),
             ci_recovery_count: 0,
+            no_code_reroutes: 0,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -421,6 +422,7 @@ mod tests {
             auto_unblock_last_at: String::new(),
             auto_unblock_last_reason: String::new(),
             ci_recovery_count: 0,
+            no_code_reroutes: 0,
             created_at: String::new(),
             updated_at: String::new(),
         };

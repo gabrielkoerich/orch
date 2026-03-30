@@ -419,7 +419,9 @@ pub async fn handle_success(
             .ok()
             .and_then(|s| s.parse().ok())
             .or_else(|| {
-                config::get("workflow.max_attempts").ok().and_then(|s| s.parse().ok())
+                config::get("workflow.max_attempts")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
             })
             .unwrap_or(3);
 
@@ -429,18 +431,6 @@ pub async fn handle_success(
             max_reroutes,
             "agent reported done but produced no code changes on external task"
         );
-
-        // Reset any previous no-code reroute counter if this run actually produced
-        // commits (guard against stale counters).
-        if has_commits {
-            store::store_set(
-                store,
-                repo,
-                task_id,
-                &[("no_code_reroutes", serde_json::json!(0))],
-            )
-            .await;
-        }
 
         // Atomically increment the persistent reroute counter and decide.
         let reroutes = store::store_increment(store, repo, task_id, "no_code_reroutes").await;
@@ -479,7 +469,10 @@ pub async fn handle_success(
                 &[
                     ("agent", serde_json::json!(null)),
                     ("model", serde_json::json!(null)),
-                    ("last_error", serde_json::json!("agent completed without code changes")),
+                    (
+                        "last_error",
+                        serde_json::json!("agent completed without code changes"),
+                    ),
                 ],
             )
             .await;
