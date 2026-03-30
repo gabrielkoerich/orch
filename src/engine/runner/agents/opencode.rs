@@ -132,7 +132,19 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
 
     let full = texts.join("");
     if let Some(json) = extract_json_object(&full) {
-        return Some(json);
+        // Be conservative: only accept a full-json payload if it looks like a
+        // structured task response / routing decision. This avoids returning
+        // unrelated JSON fragments that happen to appear in prose and causing
+        // false-positive parse failures upstream.
+        let lower = json.to_ascii_lowercase();
+        if lower.contains("\"executor\"")
+            || lower.contains("\"status\"")
+            || lower.contains("\"complexity\"")
+            || lower.contains("\"decision\"")
+        {
+            return Some(json);
+        }
+        // Otherwise fall through and try per-event heuristics below
     }
 
     for text in texts.iter().rev() {
