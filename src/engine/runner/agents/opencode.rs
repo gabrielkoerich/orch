@@ -693,6 +693,68 @@ fn discover_free_models() -> Vec<String> {
     }
 }
 
+/// Extract a structured `AgentResult` from OpenCode NDJSON output.
+///
+/// Concatenates text from `type:text` events (both `part.text` and direct
+/// `text` field formats), extracts tokens from the last `step_finish` event,
+/// and checks for `error` / `step_finish.reason=error` events.
+///
+/// Returns `None` only if no parseable NDJSON events are found.
+pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
+    let events = parse_ndjson_events(ndjson.trim());
+    if events.is_empty() {
+        return None;
+    }
+
+    // Check for errors first
+    let is_error;
+    let error_text;
+    let runner = OpenCodeRunner::new();
+    if let Some(err) = runner.detect_error(&events) {
+        is_error = true;
+        error_text = Some(err.to_string());
+    } else {
+        is_error = false;
+        error_text = None;
+    }
+
+    // Extract text content
+    let result_text = if is_error {
+        error_text.unwrap_or_default()
+    } else {
+        extract_ndjson_text(&events).unwrap_or_default()
+    };
+
+    if result_text.is_empty() && !is_error {
+        return None;
+    }
+
+    // Extract tokens from step_finish
+    let (input_tokens, output_tokens) = runner.extract_tokens(&events);
+
+    // Extract cost from step_finish if available
+    let cost_usd = events.iter().rev().find_map(|event| {
+        if event.get("type").and_then(|v| v.as_str()) == Some("step_finish") {
+            event
+                .get("part")
+                .and_then(|p| p.get("cost"))
+                .and_then(|c| c.as_f64())
+                .filter(|&c| c > 0.0)
+        } else {
+            None
+        }
+    });
+
+    Some(super::AgentResult {
+        is_error,
+        result_text,
+        input_tokens,
+        output_tokens,
+        cost_usd,
+        duration_ms: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,5 +1127,57 @@ mod tests {
     fn extract_text_empty_input_returns_empty_ok() {
         let text = runner().extract_text("").unwrap();
         assert!(text.is_empty());
+    }
+
+    // ── find_opencode_result ────────────────────────────────────
+
+    #[test]
+    fn find_opencode_result_success_with_tokens() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000,"part":{"type":"step-start"}}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"{\"decision\":\"approve\",\"notes\":\"LGTM\"}"}}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"stop","cost":0.05,"tokens":{"input":5000,"output":200}}}"#,
+        );
+        let result = find_opencode_result(ndjson).expect("should find result");
+        assert!(!result.is_error);
+        assert!(result.result_text.contains("approve"));
+        assert_eq!(result.input_tokens, Some(5000));
+        assert_eq!(result.output_tokens, Some(200));
+        assert_eq!(result.cost_usd, Some(0.05));
+    }
+
+    #[test]
+    fn find_opencode_result_error_event() {
+        let ndjson = r#"{"type":"error","message":"rate limit exceeded: 429"}"#;
+        let result = find_opencode_result(ndjson).expect("should find error result");
+        assert!(result.is_error);
+        assert!(result.result_text.contains("rate limit"));
+    }
+
+    #[test]
+    fn find_opencode_result_empty_returns_none() {
+        assert!(find_opencode_result("").is_none());
+        assert!(find_opencode_result("   ").is_none());
+    }
+
+    #[test]
+    fn find_opencode_result_direct_text_format() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"text":"Review complete. All tests passed."}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"stop","tokens":{"input":100,"output":10}}}"#,
+        );
+        let result = find_opencode_result(ndjson).expect("should find result");
+        assert!(!result.is_error);
+        assert!(result.result_text.contains("All tests passed"));
+    }
+
+    #[test]
+    fn find_opencode_result_plain_text_returns_none() {
+        assert!(find_opencode_result("just some plain text").is_none());
     }
 }

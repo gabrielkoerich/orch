@@ -390,6 +390,50 @@ fn extract_quoted(text: &str, quote: char) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Extract a structured `AgentResult` from Codex NDJSON output.
+///
+/// Finds `item.completed` events with `type:agent_message` for the result text.
+/// Checks for `turn.failed`, `error`, and `item.completed` error events.
+///
+/// Returns `None` only if no parseable NDJSON events are found.
+pub fn find_codex_result(ndjson: &str) -> Option<super::AgentResult> {
+    let runner = CodexRunner;
+    let events = runner.parse_ndjson(ndjson.trim());
+    if events.is_empty() {
+        return None;
+    }
+
+    // Check for errors first
+    let is_error;
+    let error_text;
+    if let Some(err) = runner.detect_error(&events) {
+        is_error = true;
+        error_text = Some(err.to_string());
+    } else {
+        is_error = false;
+        error_text = None;
+    }
+
+    let result_text = if is_error {
+        error_text.unwrap_or_default()
+    } else {
+        runner.extract_agent_text(&events).unwrap_or_default()
+    };
+
+    if result_text.is_empty() && !is_error {
+        return None;
+    }
+
+    Some(super::AgentResult {
+        is_error,
+        result_text,
+        input_tokens: None,
+        output_tokens: None,
+        cost_usd: None,
+        duration_ms: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,5 +736,60 @@ mod tests {
     fn extract_text_empty_input_returns_empty_ok() {
         let text = runner().extract_text("").unwrap();
         assert!(text.is_empty());
+    }
+
+    // ── find_codex_result ───────────────────────────────────────
+
+    #[test]
+    fn find_codex_result_success() {
+        let ndjson = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"{\"decision\":\"approve\",\"notes\":\"LGTM\"}"}}"#,
+            "\n",
+            r#"{"type":"turn.completed"}"#,
+        );
+        let result = find_codex_result(ndjson).expect("should find result");
+        assert!(!result.is_error);
+        assert!(result.result_text.contains("approve"));
+    }
+
+    #[test]
+    fn find_codex_result_error() {
+        let ndjson = concat!(
+            r#"{"type":"error","message":"You've hit your usage limit"}"#,
+            "\n",
+            r#"{"type":"turn.failed","error":{"message":"usage limit"}}"#,
+        );
+        let result = find_codex_result(ndjson).expect("should find error result");
+        assert!(result.is_error);
+        assert!(result.result_text.contains("rate limit"));
+    }
+
+    #[test]
+    fn find_codex_result_empty_returns_none() {
+        assert!(find_codex_result("").is_none());
+        assert!(find_codex_result("   ").is_none());
+    }
+
+    #[test]
+    fn find_codex_result_plain_text_returns_none() {
+        assert!(find_codex_result("just some plain text").is_none());
+    }
+
+    #[test]
+    fn find_codex_result_skips_reasoning_and_commands() {
+        let ndjson = concat!(
+            r#"{"type":"item.completed","item":{"type":"reasoning","text":"Thinking..."}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"cargo test"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"All tests passed"}}"#,
+        );
+        let result = find_codex_result(ndjson).expect("should find result");
+        assert!(!result.is_error);
+        assert_eq!(result.result_text, "All tests passed");
     }
 }
