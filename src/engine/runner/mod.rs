@@ -172,6 +172,7 @@ struct RunAuditInput<'a> {
     raw_stderr: &'a str,
     started_at: &'a chrono::DateTime<Utc>,
     error_override: Option<String>,
+    elapsed_secs: Option<u64>,
 }
 
 fn parse_success_output(
@@ -270,6 +271,11 @@ impl TaskRunner {
 
         let (input_tokens, output_tokens) = extract_run_tokens(input.parse_result);
 
+        let duration_secs = input
+            .elapsed_secs
+            .map(|s| s as f64)
+            .unwrap_or_else(|| run_duration_secs(input.started_at));
+
         RunAudit {
             stdout: input.raw_stdout.to_string(),
             stderr: input.raw_stderr.to_string(),
@@ -279,7 +285,7 @@ impl TaskRunner {
             input_tokens,
             output_tokens,
             total_cost_usd,
-            duration_secs: run_duration_secs(input.started_at),
+            duration_secs,
         }
     }
 
@@ -401,6 +407,7 @@ impl TaskRunner {
                         raw_stderr: &session_output.raw_stderr,
                         started_at,
                         error_override: Some("silence detection reset task to New".to_string()),
+                        elapsed_secs: session_output.elapsed_secs,
                     })
                     .await;
                 return Ok(Some(RunExecution {
@@ -453,10 +460,11 @@ impl TaskRunner {
                 &session_output.raw_stdout,
             )
         } else if session_output.exit_code != 0 {
-            Err(agent_runner.classify_error(
+            Err(agent_runner.classify_error_with_elapsed(
                 session_output.exit_code,
                 &session_output.raw_stdout,
                 &session_output.raw_stderr,
+                session_output.elapsed_secs,
             ))
         } else {
             // Exit 0 but empty output — check stderr for clues
@@ -507,6 +515,7 @@ impl TaskRunner {
                             raw_stderr: &session_output.raw_stderr,
                             started_at,
                             error_override: None,
+                            elapsed_secs: session_output.elapsed_secs,
                         })
                         .await;
                     return Ok(Some(RunExecution {
@@ -543,6 +552,7 @@ impl TaskRunner {
                                 raw_stderr: &session_output.raw_stderr,
                                 started_at,
                                 error_override: Some(agent_err.to_string()),
+                                elapsed_secs: session_output.elapsed_secs,
                             })
                             .await;
                         return Ok(Some(RunExecution {
@@ -582,6 +592,7 @@ impl TaskRunner {
                 raw_stderr: &session_output.raw_stderr,
                 started_at,
                 error_override: None,
+                elapsed_secs: session_output.elapsed_secs,
             })
             .await;
 
