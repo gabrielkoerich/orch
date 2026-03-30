@@ -22,6 +22,31 @@ pub const AGENT_COOLDOWN_SECS: i64 = 30 * 60;
 /// Default cooldown duration for model-specific failures (1 hour).
 pub const MODEL_COOLDOWN_SECS: i64 = 60 * 60;
 
+/// Cooldown duration for credit exhaustion (out_of_credits) - 6 hours.
+pub const CREDIT_EXHAUSTION_COOLDOWN_SECS: i64 = 6 * 60 * 60;
+
+/// Cooldown duration for org-level disabling (org_level_disabled) - 12 hours.
+pub const ORG_LEVEL_DISABLED_COOLDOWN_SECS: i64 = 12 * 60 * 60;
+
+/// Credit exhaustion reason detected from error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreditExhaustionReason {
+    /// Per-model credit exhaustion (out_of_credits).
+    OutOfCredits,
+    /// Organization-level disabling (org_level_disabled).
+    OrgLevelDisabled,
+}
+
+impl CreditExhaustionReason {
+    /// Returns the cooldown duration for this reason.
+    pub fn cooldown_secs(&self) -> i64 {
+        match self {
+            CreditExhaustionReason::OutOfCredits => CREDIT_EXHAUSTION_COOLDOWN_SECS,
+            CreditExhaustionReason::OrgLevelDisabled => ORG_LEVEL_DISABLED_COOLDOWN_SECS,
+        }
+    }
+}
+
 /// Short agent cooldown applied on silence detection (120 seconds).
 ///
 /// Forces the router to pick a different agent immediately on re-route,
@@ -118,6 +143,75 @@ pub fn record_agent_failure_with_message(agent_name: &str, error_message: &str) 
         .unwrap_or_else(|| chrono::Utc::now().timestamp() + AGENT_COOLDOWN_SECS);
 
     set_cooldown(agent_name, cooldown_until, "agent_error");
+}
+
+/// Detect credit exhaustion reasons from error message.
+///
+/// Returns `Some(CreditExhaustionReason)` if the error indicates
+/// out_of_credits or org_level_disabled, which require longer agent-wide cooldowns.
+pub fn detect_credit_exhaustion(error_message: &str) -> Option<CreditExhaustionReason> {
+    let lower = error_message.to_lowercase();
+
+    let overage_patterns = [
+        "overagedisabledreason",
+        "overage_disabled_reason",
+        "overage disabled reason",
+    ];
+
+    if overage_patterns.iter().any(|p| lower.contains(p)) {
+        if lower.contains("out_of_credits") || lower.contains("outofcredits") {
+            return Some(CreditExhaustionReason::OutOfCredits);
+        }
+        if lower.contains("org_level_disabled") || lower.contains("orgdisabled") {
+            return Some(CreditExhaustionReason::OrgLevelDisabled);
+        }
+    }
+
+    let billing_patterns = [
+        "credit balance too low",
+        "credit balance insufficient",
+        "insufficient credit balance",
+        "billing quota exceeded",
+        "billing limit exceeded",
+        "organization has been disabled",
+        "org disabled",
+    ];
+
+    if billing_patterns.iter().any(|p| lower.contains(p)) {
+        return Some(CreditExhaustionReason::OrgLevelDisabled);
+    }
+
+    if lower.contains("out of credits")
+        || lower.contains("outofcredits")
+        || lower.contains("insufficient funds")
+        || lower.contains("no credits remaining")
+        || lower.contains("insufficient_quota")
+        || lower.contains("quota exceeded")
+    {
+        return Some(CreditExhaustionReason::OutOfCredits);
+    }
+
+    None
+}
+
+/// Record an agent-level cooldown for credit exhaustion.
+///
+/// This applies a longer cooldown (6h for out_of_credits, 12h for org_level_disabled)
+/// across ALL models for the given agent, not just the specific model that failed.
+/// This prevents repeated wasted attempts when the entire org or billing account is disabled.
+pub fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustionReason) {
+    let cooldown_until = chrono::Utc::now().timestamp() + reason.cooldown_secs();
+    let reason_str = match reason {
+        CreditExhaustionReason::OutOfCredits => "credit_exhaustion_out_of_credits",
+        CreditExhaustionReason::OrgLevelDisabled => "credit_exhaustion_org_level_disabled",
+    };
+    set_cooldown(agent_name, cooldown_until, reason_str);
+    tracing::warn!(
+        agent = agent_name,
+        reason = reason_str,
+        cooldown_secs = reason.cooldown_secs(),
+        "credit exhaustion detected: applying agent-wide cooldown"
+    );
 }
 
 /// Record that a specific agent+model combo has failed.
@@ -530,5 +624,136 @@ mod tests {
         let kv_key = format!("{SILENCE_COUNT_PREFIX}{agent}:{model}");
         let stored = store.kv_get(&kv_key).await.unwrap().unwrap();
         assert_eq!(stored, "[]");
+    }
+
+    #[test]
+    fn detect_credit_exhaustion_out_of_credits() {
+        let msg = "Error: API error - {\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"param\":null,\"code\":\"insufficient_quota\"}}";
+        assert_eq!(
+            detect_credit_exhaustion(msg),
+            Some(CreditExhaustionReason::OutOfCredits)
+        );
+    }
+
+    #[test]
+    fn detect_credit_exhaustion_out_of_credits_variations() {
+        assert_eq!(
+            detect_credit_exhaustion("out of credits"),
+            Some(CreditExhaustionReason::OutOfCredits)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("outofcredits"),
+            Some(CreditExhaustionReason::OutOfCredits)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("no credits remaining"),
+            Some(CreditExhaustionReason::OutOfCredits)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("insufficient funds"),
+            Some(CreditExhaustionReason::OutOfCredits)
+        );
+    }
+
+    #[test]
+    fn detect_credit_exhaustion_org_level_disabled() {
+        let msg = "Error: API error - {\"error\":{\"message\":\"Organization has been disabled\",\"type\":\"org_disabled\",\"code\":\"overageDisabledReason:org_level_disabled\"}}";
+        assert_eq!(
+            detect_credit_exhaustion(msg),
+            Some(CreditExhaustionReason::OrgLevelDisabled)
+        );
+    }
+
+    #[test]
+    fn detect_credit_exhaustion_org_level_disabled_variations() {
+        assert_eq!(
+            detect_credit_exhaustion("organization has been disabled"),
+            Some(CreditExhaustionReason::OrgLevelDisabled)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("org disabled"),
+            Some(CreditExhaustionReason::OrgLevelDisabled)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("billing quota exceeded"),
+            Some(CreditExhaustionReason::OrgLevelDisabled)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("credit balance too low"),
+            Some(CreditExhaustionReason::OrgLevelDisabled)
+        );
+    }
+
+    #[test]
+    fn detect_credit_exhaustion_overage_disabled_reason_parsing() {
+        let msg = "overageDisabledReason: out_of_credits";
+        assert_eq!(
+            detect_credit_exhaustion(msg),
+            Some(CreditExhaustionReason::OutOfCredits)
+        );
+
+        let msg = "overageDisabledReason: org_level_disabled";
+        assert_eq!(
+            detect_credit_exhaustion(msg),
+            Some(CreditExhaustionReason::OrgLevelDisabled)
+        );
+    }
+
+    #[test]
+    fn detect_credit_exhaustion_none_for_regular_rate_limit() {
+        assert!(detect_credit_exhaustion("rate limit exceeded").is_none());
+        assert!(detect_credit_exhaustion("too many requests").is_none());
+        assert!(detect_credit_exhaustion("429 Too Many Requests").is_none());
+        assert!(detect_credit_exhaustion("you've hit your usage limit").is_none());
+    }
+
+    #[test]
+    fn record_credit_exhaustion_applies_agent_cooldown() {
+        let agent = "test_credit_exhaust_agent";
+        assert!(!is_agent_in_cooldown(agent));
+
+        record_credit_exhaustion(agent, CreditExhaustionReason::OutOfCredits);
+        assert!(is_agent_in_cooldown(agent));
+
+        let remaining = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("cooldown entry should exist");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        assert!(
+            remaining >= CREDIT_EXHAUSTION_COOLDOWN_SECS - 5,
+            "credit exhaustion cooldown should be ~6 hours, got {remaining}s"
+        );
+    }
+
+    #[test]
+    fn record_credit_exhaustion_org_level_applies_longer_cooldown() {
+        let agent = "test_org_disabled_agent";
+        assert!(!is_agent_in_cooldown(agent));
+
+        record_credit_exhaustion(agent, CreditExhaustionReason::OrgLevelDisabled);
+        assert!(is_agent_in_cooldown(agent));
+
+        let remaining = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("cooldown entry should exist");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        assert!(
+            remaining >= ORG_LEVEL_DISABLED_COOLDOWN_SECS - 5,
+            "org-level disabled cooldown should be ~12 hours, got {remaining}s"
+        );
+    }
+
+    #[test]
+    fn credit_exhaustion_reason_cooldown_durations() {
+        assert_eq!(
+            CreditExhaustionReason::OutOfCredits.cooldown_secs(),
+            CREDIT_EXHAUSTION_COOLDOWN_SECS
+        );
+        assert_eq!(
+            CreditExhaustionReason::OrgLevelDisabled.cooldown_secs(),
+            ORG_LEVEL_DISABLED_COOLDOWN_SECS
+        );
     }
 }
