@@ -124,7 +124,8 @@ async fn collect_output(
     };
 
     // Read raw output (offloaded inside read_output_file) and stderr (blocking read offloaded)
-    let raw_stdout = response::read_output_file(task_id, &invocation.output_file, &invocation.repo).await;
+    let raw_stdout =
+        response::read_output_file(task_id, &invocation.output_file, &invocation.repo).await;
 
     let stderr_path_attempt = attempt_dir.join("stderr.txt");
     let stderr_path_legacy = crate::home::state_file(&format!("stderr-{task_id}.txt"))
