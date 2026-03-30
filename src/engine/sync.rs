@@ -730,6 +730,10 @@ pub(crate) async fn sync_tick(
         }
     }
 
+    // Emit degraded-agents metric/log if needed (best-effort)
+    let r = router.read().await;
+    emit_degraded_agents_if_needed(&r, Some(store)).await;
+
     Ok(())
 }
 
@@ -927,6 +931,56 @@ async fn skills_sync() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Inspect router & cooldown state and emit a warning + persisted metric when
+/// three or more agents are concurrently degraded.
+async fn emit_degraded_agents_if_needed(
+    router: &crate::engine::router::Router,
+    store: Option<&Arc<TaskStore>>,
+) {
+    // Complexity tiers to check for configured models. If an agent has no
+    // available model across all tiers, treat it as degraded.
+    const COMPLEXITIES: &[&str] = &["simple", "medium", "complex", "review"];
+
+    let mut degraded: Vec<String> = Vec::new();
+    for agent in &router.available_agents {
+        let agent_in_cd = crate::engine::cooldown::is_agent_in_cooldown(agent);
+
+        // Determine if the agent has any available model across complexities.
+        let mut has_model = false;
+        for comp in COMPLEXITIES {
+            if router
+                .config
+                .has_available_model_for_complexity(agent, comp)
+            {
+                has_model = true;
+                break;
+            }
+        }
+
+        if agent_in_cd || !has_model {
+            degraded.push(agent.clone());
+        }
+    }
+
+    let count = degraded.len();
+    if count >= 3 {
+        tracing::warn!(
+            degraded_count = count,
+            degraded_agents = ?degraded,
+            "multi-agent degradation detected"
+        );
+
+        // Persist a machine-readable metric to the KV store as a pragmatic
+        // fallback until a centralized metrics client is present.
+        kv_set_prefer_store(
+            &store,
+            "metrics:orch.degraded_agents.count",
+            &count.to_string(),
+        )
+        .await;
+    }
 }
 
 /// Ingest all active external tasks into the unified SQLite store.
@@ -2136,5 +2190,35 @@ mod tests {
                 "same task ID in different repo should not be blocked"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn emit_degraded_agents_writes_metric_when_three_or_more_agents_degraded() {
+        use crate::engine::router::{Router, RouterConfig};
+
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+
+        // Create a router and set deterministic available agents
+        let mut router = Router::new(RouterConfig::default());
+        router.available_agents = vec![
+            "agent-a".to_string(),
+            "agent-b".to_string(),
+            "agent-c".to_string(),
+            "agent-d".to_string(),
+        ];
+
+        // Place three agents into cooldown (in-memory only)
+        crate::engine::cooldown::set_agent_cooldown("agent-a", 3600);
+        crate::engine::cooldown::set_agent_cooldown("agent-b", 3600);
+        crate::engine::cooldown::set_agent_cooldown("agent-c", 3600);
+
+        // Call the helper and assert KV metric written
+        emit_degraded_agents_if_needed(&router, Some(&store)).await;
+
+        let val = store
+            .kv_get("metrics:orch.degraded_agents.count")
+            .await
+            .unwrap();
+        assert_eq!(val.as_deref(), Some("3"));
     }
 }
