@@ -195,7 +195,9 @@ pub(crate) async fn tick_detect_silent_agents(
             );
         }
 
-        // 4. Clear routing state and reset to New for re-routing
+        // 4. Clear routing state and reset to New for re-routing.
+        // Preserve route_attempts so the router knows this task has been routed before
+        // and can fall back to round-robin after max_route_attempts failures.
         let task_eid = ExternalId(task_id.clone());
         if use_backend {
             if let Some(ref st) = store_task {
@@ -213,7 +215,6 @@ pub(crate) async fn tick_detect_silent_agents(
             &[
                 ("agent", serde_json::Value::Null),
                 ("model", serde_json::Value::Null),
-                ("route_attempts", serde_json::json!(0)),
             ],
         )
         .await;
