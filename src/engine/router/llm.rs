@@ -441,16 +441,18 @@ impl LlmRouter {
         // Clone any data we need to avoid capturing &self across thread boundary.
         // The uncached loader only needs paths and env; we'll call it via an owned closure
         // that takes ownership of a PathBuf for the ORCH_HOME/skills path if present.
-        let skills_dir_opt: Option<PathBuf> = std::env::var("ORCH_HOME").ok().map(|orch_home| PathBuf::from(orch_home).join("skills"));
+        let skills_dir_opt: Option<PathBuf> = std::env::var("ORCH_HOME")
+            .ok()
+            .map(|orch_home| PathBuf::from(orch_home).join("skills"));
 
-        let catalog = tokio::task::spawn_blocking(move || {
+        let catalog = tokio::task::spawn_blocking(move || -> String {
             // Re-implement the uncached loading logic here in the blocking thread without capturing self.
             // Try skills.yml in current directory
             if let Ok(content) = std::fs::read_to_string("skills.yml") {
                 if let Ok(yaml) = serde_yml::from_str::<serde_yml::Value>(&content) {
                     if let Some(skills) = yaml.get("skills") {
                         if let Ok(json) = serde_json::to_string(skills) {
-                            return Ok(json);
+                            return json;
                         }
                     }
                 }
@@ -464,11 +466,18 @@ impl LlmRouter {
                         for entry in entries.flatten() {
                             let path = entry.path();
                             if path.is_dir() {
-                                let skill_id = path.file_name().unwrap_or_default().to_string_lossy();
+                                let skill_id =
+                                    path.file_name().unwrap_or_default().to_string_lossy();
                                 let skill_file = path.join("SKILL.md");
                                 if skill_file.exists() {
-                                    let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
-                                    let name = content.lines().next().unwrap_or("").trim_start_matches("# ").to_string();
+                                    let content =
+                                        std::fs::read_to_string(&skill_file).unwrap_or_default();
+                                    let name = content
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("")
+                                        .trim_start_matches("# ")
+                                        .to_string();
                                     skills.push(serde_json::json!({"id": skill_id, "name": name}));
                                 }
                             }
@@ -476,7 +485,7 @@ impl LlmRouter {
                     }
                     if !skills.is_empty() {
                         if let Ok(json) = serde_json::to_string(&skills) {
-                            return Ok(json);
+                            return json;
                         }
                     }
                 }
@@ -490,11 +499,18 @@ impl LlmRouter {
                         for entry in entries.flatten() {
                             let path = entry.path();
                             if path.is_dir() {
-                                let skill_id = path.file_name().unwrap_or_default().to_string_lossy();
+                                let skill_id =
+                                    path.file_name().unwrap_or_default().to_string_lossy();
                                 let skill_file = path.join("SKILL.md");
                                 if skill_file.exists() {
-                                    let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
-                                    let name = content.lines().next().unwrap_or("").trim_start_matches("# ").to_string();
+                                    let content =
+                                        std::fs::read_to_string(&skill_file).unwrap_or_default();
+                                    let name = content
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("")
+                                        .trim_start_matches("# ")
+                                        .to_string();
                                     skills.push(serde_json::json!({"id": skill_id, "name": name}));
                                 }
                             }
@@ -502,13 +518,13 @@ impl LlmRouter {
                     }
                     if !skills.is_empty() {
                         if let Ok(json) = serde_json::to_string(&skills) {
-                            return Ok(json);
+                            return json;
                         }
                     }
                 }
             }
 
-            Ok("[]".to_string())
+            "[]".to_string()
         })
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
@@ -519,104 +535,6 @@ impl LlmRouter {
 
         Ok(catalog)
     }
-
-    fn load_skills_catalog_uncached(&self) -> String {
-        // Try ORCH_HOME/skills directory
-        if let Ok(orch_home) = std::env::var("ORCH_HOME") {
-            let skills_dir = PathBuf::from(orch_home).join("skills");
-            if let Ok(catalog) = self.build_skills_catalog_from_dir(&skills_dir) {
-                return catalog;
-            }
-        }
-
-        // Try ~/.orch/skills
-        if let Ok(skills_dir) = crate::home::skills_dir() {
-            if let Ok(catalog) = self.build_skills_catalog_from_dir(&skills_dir) {
-                return catalog;
-            }
-        }
-
-        // Return empty array as default
-        "[]".to_string()
-    }
-
-    /// Build skills catalog from a directory.
-    fn build_skills_catalog_from_dir(&self, dir: &PathBuf) -> anyhow::Result<String> {
-        if !dir.exists() {
-            anyhow::bail!("skills directory does not exist");
-        }
-
-        let mut skills = Vec::new();
-
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                let skill_id = path.file_name().unwrap_or_default().to_string_lossy();
-                let skill_file = path.join("SKILL.md");
-
-                if skill_file.exists() {
-                    // Read SKILL.md for metadata
-                    let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
-
-                    // Extract name from first line (title)
-                    let name = content
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .trim_start_matches("# ")
-                        .to_string();
-
-                    skills.push(serde_json::json!({
-                        "id": skill_id,
-                        "name": name,
-                    }));
-                }
-            }
-        }
-
-        Ok(serde_json::to_string(&skills)?)
-    }
-
-/// Blocking helper variant of build_skills_catalog_from_dir used inside spawn_blocking.
-fn build_skills_catalog_from_dir_blocking(dir: &PathBuf) -> anyhow::Result<String> {
-    if !dir.exists() {
-        anyhow::bail!("skills directory does not exist");
-    }
-
-    let mut skills = Vec::new();
-
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            let skill_id = path.file_name().unwrap_or_default().to_string_lossy();
-            let skill_file = path.join("SKILL.md");
-
-            if skill_file.exists() {
-                // Read SKILL.md for metadata
-                let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
-
-                // Extract name from first line (title)
-                let name = content
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim_start_matches("# ")
-                    .to_string();
-
-                skills.push(serde_json::json!({
-                    "id": skill_id,
-                    "name": name,
-                }));
-            }
-        }
-    }
-
-    Ok(serde_json::to_string(&skills)?)
-}
 
     /// Call the specified router LLM to classify the task.
     ///
