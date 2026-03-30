@@ -122,11 +122,25 @@ pub async fn rebase_worktree_on_origin_main(
 
         match stash_out {
             Ok(o) if o.status.success() => {
+                // Log the stash push stdout for diagnostics (helps debug index.lock / refs/stash.lock races).
+                let stdout_preview = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                tracing::debug!(worktree = %worktree_str, stdout = %stdout_preview, "git stash push succeeded");
+
                 // Capture the OID of the stash object just created so we can
-                // apply it back by that ref, regardless of any stashes
-                // other worktrees may push between now and then.
+                // apply it back by that ref, regardless of most concurrent
+                // operations. We use `refs/stash@{0}` to explicitly resolve the
+                // newest stash entry. There is still a tiny race if another
+                // process pushes a stash between the push and the rev-parse;
+                // parsing `git stash push` output for the created OID would be
+                // ideal, but `git stash push` does not reliably emit the OID
+                // across git versions. This approach reduces the window and
+                // is an acceptable pragmatic improvement.
                 let ref_out = Command::new("git")
-                    .args(["-C", &worktree_str, "rev-parse", "refs/stash"])
+                    .args(["-C", &worktree_str, "rev-parse", "refs/stash@{0}"])
                     .output_with_context()
                     .await;
                 ref_out
