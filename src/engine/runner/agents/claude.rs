@@ -164,6 +164,9 @@ pub(crate) fn extract_stream_json_result_text(raw: &str) -> Result<String, Agent
         return Err(AgentError::InvalidResponse { raw: String::new() });
     }
 
+    // Prefer the final result envelope, but guard against the case where the
+    // runner emits a leading `system init` event and no result line was found.
+    // find_ndjson_result_line will return the last line with `"type":"result"`.
     let envelope_text = find_ndjson_result_line(trimmed).unwrap_or(trimmed);
     let parsed_json: serde_json::Value =
         serde_json::from_str(envelope_text).map_err(|_| AgentError::InvalidResponse {
@@ -177,6 +180,16 @@ pub(crate) fn extract_stream_json_result_text(raw: &str) -> Result<String, Agent
         })?;
 
     if envelope.get("type").and_then(|v| v.as_str()) != Some("result") {
+        // If the only JSON envelope found is a non-result (eg. system/init),
+        // try to find any subsequent lines with text/result content. This
+        // handles wrappers that emit an init envelope then the real result
+        // in a following event.
+        if let Some(fallback) =
+            crate::engine::runner::agents::opencode::extract_router_text(trimmed)
+        {
+            return Ok(fallback);
+        }
+
         return Ok(trimmed.to_string());
     }
 

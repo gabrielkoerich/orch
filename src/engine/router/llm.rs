@@ -644,7 +644,36 @@ impl LlmRouter {
                 }
             }
             "claude" | "kimi" | "minimax" => match claude::extract_stream_json_result_text(raw) {
-                Ok(text) => Ok(text),
+                Ok(text) => {
+                    // Defensive: some wrappers emit a single `system init` envelope
+                    // before the actual result. If the extracted text looks like a
+                    // system/init envelope (no useful result), try a more lenient
+                    // NDJSON extractor that scans all lines for text/result events.
+                    let trimmed_text = text.trim();
+                    // If the extracted text is itself a JSON envelope that only
+                    // contains a `type: system` or `subtype: init` event (startup
+                    // envelope), treat it as non-informative and try a lenient
+                    // NDJSON extractor that scans all lines for text/result events.
+                    let looks_like_system_init = if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed_text) {
+                        val.get("type").and_then(|v| v.as_str()) == Some("system")
+                            || val
+                                .get("subtype")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s == "init")
+                                .unwrap_or(false)
+                    } else {
+                        false
+                    };
+
+                    if looks_like_system_init {
+                        if let Some(fallback) = opencode::extract_router_text(raw) {
+                            return Ok(fallback);
+                        }
+                        anyhow::bail!("router LLM produced only system/init envelope with no text result")
+                    }
+
+                    Ok(text)
+                }
                 Err(AgentError::AgentFailed { message }) => {
                     anyhow::bail!("router LLM returned error: {message}")
                 }

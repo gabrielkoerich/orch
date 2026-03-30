@@ -79,7 +79,35 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
         }
     }
 
+    // If we found no text-like events, try to look for a terminal `result` event
+    // which some opencode builds emit. Prefer the last result event (newest).
     if texts.is_empty() {
+        for event in events.iter().rev() {
+            if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
+                // Ignore system/init envelopes
+                if event_type == "system" {
+                    continue;
+                }
+            }
+
+            if let Some(result) = event.get("result") {
+                // If result is a string, return it; if object/array return its JSON
+                if let Some(s) = result.as_str() {
+                    return Some(s.to_string());
+                }
+                if result.is_object() || result.is_array() {
+                    return Some(result.to_string());
+                }
+            }
+
+            // Some events include direct text payloads outside of `part`
+            if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
+                if !text.trim().is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+
         return None;
     }
 
