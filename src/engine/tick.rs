@@ -264,9 +264,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
-    let in_progress = task_manager
+    let in_progress = match task_manager
         .list_external_by_status(Status::InProgress)
-        .await?;
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(?e, "failed to list in_progress tasks for stuck recovery");
+            vec![]
+        }
+    };
     for task in &in_progress {
         let Some(timing) = stuck_task_timing(
             tmux,
@@ -353,9 +360,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
     // Recover internal (SQLite) tasks stuck in in_progress.
     // These have no GitHub labels or comments — just reset the DB status to New.
     use crate::store::TaskStatus as DbStatus;
-    let internal_in_progress = task_manager
+    let internal_in_progress = match task_manager
         .list_internal_by_status(DbStatus::InProgress)
-        .await?;
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(?e, "failed to list internal in_progress tasks for stuck recovery");
+            vec![]
+        }
+    };
     for task in &internal_in_progress {
         let task_id = task.id.0.clone();
         let Some(timing) = stuck_task_timing(
@@ -411,9 +425,16 @@ pub(crate) async fn tick_recover_stuck_tasks(
     // Recover external tasks stuck in in_review.
     // Unlike in_progress recovery, we reset to NeedsReview (not New) so the review
     // agent re-triggers without clearing the routing state.
-    let in_review = task_manager
+    let in_review = match task_manager
         .list_external_by_status(Status::InReview)
-        .await?;
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(?e, "failed to list in_review tasks for stuck recovery");
+            vec![]
+        }
+    };
     for task in &in_review {
         if !review_session_expected(store, repo, &task.id.0).await {
             tracing::debug!(
