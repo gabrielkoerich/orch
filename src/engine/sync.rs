@@ -844,13 +844,7 @@ async fn skills_sync() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Resolve skills base on the blocking thread pool to avoid calling
-    // sync filesystem helpers (which use std::fs::create_dir_all) on the
-    // tokio reactor. `crate::home::skills_dir()` may perform blocking
-    // directory creation, so run it in `spawn_blocking`.
-    let skills_base = tokio::task::spawn_blocking(crate::home::skills_dir)
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+    let skills_base = crate::home::skills_dir()?;
     let git_timeout = std::time::Duration::from_secs(60);
 
     for skill in skills {
@@ -902,8 +896,7 @@ async fn skills_sync() -> anyhow::Result<()> {
             let parent = repo_dir
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("skill repo path has no parent directory"))?;
-            // Use async filesystem API to avoid blocking the Tokio reactor.
-            tokio::fs::create_dir_all(parent).await?;
+            std::fs::create_dir_all(parent)?;
             let repo_dir_str = repo_dir
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("skill repo path is not valid UTF-8"))?;

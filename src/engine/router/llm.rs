@@ -600,8 +600,12 @@ impl LlmRouter {
 
         let text = inner.trim();
 
-        // Step 2: Try to parse directly as JSON
+        // Step 2: Try to parse directly as JSON. If successful, ensure the
+        // required `executor` field is present and non-empty before accepting.
         if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(text) {
+            if parsed.executor.trim().is_empty() {
+                anyhow::bail!("LLM response missing required 'executor' field");
+            }
             return Ok(parsed);
         }
 
@@ -611,6 +615,11 @@ impl LlmRouter {
             if let Some(json_end) = after_start.find("```") {
                 let json_str = &after_start[..json_end].trim();
                 if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
+                    if parsed.executor.trim().is_empty() {
+                        anyhow::bail!(
+                            "LLM response missing required 'executor' field in fenced block"
+                        );
+                    }
                     return Ok(parsed);
                 }
             }
@@ -631,12 +640,27 @@ impl LlmRouter {
         if let Some(start) = text.find('{') {
             if let Some(end) = text.rfind('}') {
                 let json_str = &text[start..=end];
-                if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
-                    return Ok(parsed);
-                }
-
-                // json_str is valid JSON but not LlmRouteResponse — check for error envelopes
+                // Attempt to parse the curly-brace substring as a generic JSON
+                // value first so we can inspect keys before accepting it as a
+                // routing decision. This prevents accidental acceptance of
+                // unrelated JSON fragments embedded in prose (e.g. log
+                // snippets). Only accept the JSON if it contains an
+                // identifying routing key ("executor" or alias "agent").
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(obj) = value.as_object() {
+                        // Only accept if it contains routing-identifying keys
+                        if obj.contains_key("executor") || obj.contains_key("agent") {
+                            if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
+                                if parsed.executor.trim().is_empty() {
+                                    anyhow::bail!("LLM response contained empty 'executor' field");
+                                }
+                                return Ok(parsed);
+                            }
+                        }
+                    }
+
+                    // json_str is valid JSON but not a routing response — check
+                    // for known error envelopes and surface those first.
                     if let Some(err_msg) = detect_error_envelope(&value) {
                         anyhow::bail!("router LLM returned error payload: {err_msg}");
                     }
@@ -707,6 +731,10 @@ impl LlmRouter {
                     anyhow::bail!("router LLM returned error: {message}")
                 }
                 Err(AgentError::InvalidResponse { raw }) => {
+                    // If the agent's extract_text failed to parse structured
+                    // response, try a conservative NDJSON extraction for router
+                    // text (opencode-style). If that returns some usable text,
+                    // prefer it; otherwise treat as plain raw text.
                     if let Some(text) = opencode::extract_router_text(&raw) {
                         return Ok(text);
                     }
@@ -1100,6 +1128,22 @@ mod tests {
         let resp = router.parse_llm_response("claude", text).unwrap();
         assert_eq!(resp.executor, "claude");
         assert_eq!(resp.complexity, "complex");
+    }
+
+    #[test]
+    fn parse_embedded_json_fragment_without_executor_is_ignored() {
+        let router = make_router();
+        let text = r#"Here is a debug trace: {"trace":{"duration":123,"id":"abc"}} — end of log."#;
+        // The embedded JSON does not contain an `executor`/`agent` key and
+        // should not be accepted as a routing decision.
+        assert!(router.parse_llm_response("claude", text).is_err());
+    }
+
+    #[test]
+    fn parse_fenced_json_without_executor_fails() {
+        let router = make_router();
+        let md = "```json\n{\"trace\":{\"duration\":10}}\n```";
+        assert!(router.parse_llm_response("claude", md).is_err());
     }
 
     #[test]

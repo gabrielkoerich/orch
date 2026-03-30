@@ -567,8 +567,15 @@ fn ndjson_extract_text(ndjson: &str) -> String {
 
     for text in texts.iter().rev() {
         let trimmed = text.trim();
-        if trimmed.contains('{') && trimmed.contains("decision") {
-            return text.clone();
+        // Only accept a chunk that actually parses as JSON containing a
+        // "decision" key — substring matching on "decision" can false-positive
+        // on prose that merely mentions the word.
+        if trimmed.contains('{') {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if val.as_object().is_some_and(|o| o.contains_key("decision")) {
+                    return text.clone();
+                }
+            }
         }
     }
 
@@ -1338,6 +1345,28 @@ That's all."#;
         assert!(
             result.is_err() || result.as_ref().is_ok_and(|r| r.decision != "text"),
             "should not extract review from embedded JSON fragment"
+        );
+    }
+
+    /// Prose containing the word "decision" and a JSON-like fragment must not
+    /// be misidentified as a review response by `extract_review_response_object`.
+    #[test]
+    fn parse_review_response_ignores_prose_with_decision_word() {
+        let text = r#"The decision was made. Here is a debug trace: {"trace":123}"#;
+        assert!(
+            parse_review_response(text).is_err(),
+            "prose with 'decision' word and unrelated JSON should not parse as ReviewResponse"
+        );
+    }
+
+    /// Plain text with an embedded JSON object that has unrelated keys should
+    /// not be extracted as a review response.
+    #[test]
+    fn parse_review_response_ignores_embedded_json_without_decision_key() {
+        let text = r#"Analysis complete. Config: {"timeout":30,"retries":3}. Done."#;
+        assert!(
+            parse_review_response(text).is_err(),
+            "embedded JSON without 'decision' key should not parse as ReviewResponse"
         );
     }
 }
