@@ -164,12 +164,19 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
         // As a conservative fallback, if the trimmed chunk contains a '{' and
         // looks like it mentions routing keys, return it. We keep this branch
         // minimal to avoid accidental acceptance of unrelated log blobs.
-        if trimmed.contains('{')
-            && (trimmed.contains("executor")
-                || trimmed.contains("status")
-                || trimmed.contains("complexity"))
-        {
-            return Some(text.clone());
+        if trimmed.contains('{') {
+            // As a last-ditch conservative heuristic, only accept the chunk if
+            // it parses as JSON and the resulting object contains routing keys.
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(obj) = val.as_object() {
+                    if obj.contains_key("executor")
+                        || obj.contains_key("status")
+                        || obj.contains_key("complexity")
+                    {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -835,6 +842,25 @@ mod tests {
         let text = extract_router_text(raw).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["executor"], "claude");
+    }
+
+    #[test]
+    fn parse_opencode_embedded_json_fragment_without_executor_is_ignored() {
+        // NDJSON with a text event that contains a JSON-like fragment which does
+        // NOT include routing keys (executor/status). This should NOT be
+        // interpreted as a routing payload; parse_response should fail with
+        // InvalidResponse rather than accidentally accepting the fragment.
+        let raw = r#"{"type":"step_start","timestamp":1}
+{"type":"text","timestamp":2,"part":{"type":"text","text":"Here is a debug trace: {\"trace\":{\"duration\":123,\"id\":\"abc\"}}"}}
+{"type":"step_finish","timestamp":3,"part":{"type":"step-finish","reason":"stop"}}"#;
+
+        let err = runner().parse_response(raw).unwrap_err();
+        match err {
+            AgentError::InvalidResponse { raw: _ } => {
+                // expected
+            }
+            other => panic!("expected InvalidResponse, got: {other:?}"),
+        }
     }
 
     #[test]
