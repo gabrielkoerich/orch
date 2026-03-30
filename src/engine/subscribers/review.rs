@@ -128,6 +128,43 @@ pub fn spawn(
                         }
                     }
 
+                    // Check model-level cooldowns before selecting an agent.
+                    // This prevents dispatching multiple reviews to the same
+                    // rate-limited model when events arrive concurrently.
+                    // The review agent selection (review.rs) also checks this,
+                    // but we check here to fail fast and avoid acquiring the
+                    // semaphore if the model is already cooled.
+                    {
+                        let router_guard = router.read().await;
+                        let config = &router_guard.config;
+                        let mut all_models_cooled = true;
+                        for agent in &router_guard.available_agents {
+                            if config
+                                .model_for_complexity(agent, "review", task_id)
+                                .is_some()
+                            {
+                                all_models_cooled = false;
+                                break;
+                            }
+                        }
+                        if all_models_cooled && !router_guard.available_agents.is_empty() {
+                            let now = chrono::Utc::now().timestamp();
+                            let wait_secs = router_guard
+                                .available_agents
+                                .iter()
+                                .filter_map(|a| crate::engine::cooldown::cooldown_until(a))
+                                .min()
+                                .map(|until| ((until - now).max(1)) as u64)
+                                .unwrap_or(crate::engine::cooldown::MODEL_COOLDOWN_SECS as u64);
+                            tracing::info!(
+                                task_id,
+                                wait_secs,
+                                "all review models cooled — delaying review until cooldown expires"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                        }
+                    }
+
                     // Try to acquire a semaphore permit.
                     let permit = match semaphore.clone().try_acquire_owned() {
                         Ok(p) => p,
@@ -388,6 +425,12 @@ pub fn spawn(
                         drop(permit);
                         // _dispatch_guard dropped here — releases the per-task lock.
                     }));
+
+                    // Small delay between dispatches to allow cooldowns from
+                    // early failures to propagate before subsequent reviews are
+                    // dispatched. This prevents batch dispatch of N reviews to
+                    // the same rate-limited agent when events arrive concurrently.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
                 Ok(_) => {} // Not a needs_review event or different repo
                 Err(broadcast::error::RecvError::Lagged(n)) => {
