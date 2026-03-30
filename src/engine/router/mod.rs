@@ -591,15 +591,11 @@ impl Router {
                 }
                 Err(e) => {
                     if let Some(err) = e.downcast_ref::<AllCooledError>() {
-                        // Extract scope string from enum variant
-                        let scope_str: &str = match err {
-                            AllCooledError::Agents(s) | AllCooledError::Models(s) => s.as_str(),
-                        };
-                        tracing::warn!(scope = %scope_str, "router cooldown gate tripped");
-                        let scope = if scope_str == "all agents" {
+                        tracing::warn!(scope = %err.scope, "router cooldown gate tripped");
+                        let scope = if err.scope == "all agents" {
                             None
                         } else {
-                            Some(scope_str)
+                            Some(err.scope.as_str())
                         };
                         self.wait_for_cooldown(scope).await?;
                         continue;
@@ -708,7 +704,10 @@ impl Router {
             .cloned()
             .collect();
         if uncooled_agents.is_empty() {
-            return Err(AllCooledError::Agents("all agents".to_string()).into());
+            return Err(AllCooledError {
+                scope: "all agents".to_string(),
+            }
+            .into());
         }
         let llm_agents = uncooled_agents;
 
