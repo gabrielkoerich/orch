@@ -411,32 +411,51 @@ pub async fn handle_success(
         "needs_review"
     } else if resp.status == "done" && !has_pr && !task_id.starts_with("internal:") {
         // Agent claimed done but produced no code changes on an external task.
-        // Instead of unconditionally re-routing, guard with the configured
-        // `workflow.max_attempts` so we don't loop forever when a fix is already
-        // merged or the task doesn't require code changes.
-        let max_attempts: u32 = config::get("workflow.max_attempts")
+        // Use a dedicated circuit-breaker counter persisted in the store so
+        // repeated reroutes across separate runs are counted. Prefer a
+        // dedicated config key `workflow.max_reroute_attempts` (fallback to
+        // `workflow.max_attempts` for backwards compatibility).
+        let max_reroutes: u32 = config::get("workflow.max_reroute_attempts")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
+            .or_else(|| {
+                config::get("workflow.max_attempts").ok().and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(3);
 
         tracing::warn!(
             task_id,
             attempts = new_attempts,
-            max_attempts,
+            max_reroutes,
             "agent reported done but produced no code changes on external task"
         );
 
-        if new_attempts >= max_attempts {
+        // Reset any previous no-code reroute counter if this run actually produced
+        // commits (guard against stale counters).
+        if has_commits {
+            store::store_set(
+                store,
+                repo,
+                task_id,
+                &[("no_code_reroutes", serde_json::json!(0))],
+            )
+            .await;
+        }
+
+        // Atomically increment the persistent reroute counter and decide.
+        let reroutes = store::store_increment(store, repo, task_id, "no_code_reroutes").await;
+
+        if reroutes as u32 >= max_reroutes {
             tracing::error!(
                 task_id,
-                attempts = new_attempts,
-                max_attempts,
-                "reached max attempts for no-code-result — blocking for human review"
+                reroutes,
+                max_reroutes,
+                "reached max reroute attempts for no-code-result — blocking for human review"
             );
             // Clear agent/model and record an explanatory last_error
             let msg = format!(
-                "agent completed without code changes after {}/{} attempts",
-                new_attempts, max_attempts
+                "agent completed without code changes after {}/{} reroute attempts",
+                reroutes, max_reroutes
             );
             store::store_set(
                 store,
@@ -460,10 +479,7 @@ pub async fn handle_success(
                 &[
                     ("agent", serde_json::json!(null)),
                     ("model", serde_json::json!(null)),
-                    (
-                        "last_error",
-                        serde_json::json!("agent completed without code changes"),
-                    ),
+                    ("last_error", serde_json::json!("agent completed without code changes")),
                 ],
             )
             .await;
