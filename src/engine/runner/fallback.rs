@@ -86,6 +86,8 @@ pub async fn handle_error(
                 )
                 .await;
                 // Skip normal failover — we're retrying same agent with different model
+                // Apply backoff to pace retries
+                response::wait_for_fallback_backoff(task_id, store, repo).await;
                 return Ok(ErrorHandleResult::EarlyReturn {
                     status: "new".to_string(),
                 });
@@ -138,6 +140,8 @@ pub async fn handle_error(
                 &[("last_error", serde_json::json!(msg))],
             )
             .await;
+            // Apply backoff to pace retries
+            response::wait_for_fallback_backoff(task_id, store, repo).await;
             return Ok(ErrorHandleResult::EarlyReturn {
                 status: "new".to_string(),
             });
@@ -198,6 +202,8 @@ pub async fn handle_error(
                             ],
                         )
                         .await;
+                        // Apply backoff to pace retries
+                        response::wait_for_fallback_backoff(task_id, store, repo).await;
                         return Ok(ErrorHandleResult::EarlyReturn {
                             status: "new".to_string(),
                         });

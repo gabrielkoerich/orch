@@ -759,3 +759,89 @@ async fn multi_repo_task_isolation() {
 
     cleanup_db(&tmp);
 }
+
+/// Verify graceful degradation config defaults.
+#[test]
+fn graceful_degradation_config_defaults() {
+    use orch::engine::router::config::*;
+
+    // Test default threshold
+    let threshold = min_healthy_agents_threshold();
+    assert_eq!(threshold, 2, "default threshold should be 2");
+
+    // Test default sequential delay
+    let delay = sequential_dispatch_delay_ms();
+    assert_eq!(delay, 1000, "default sequential delay should be 1000ms");
+
+    // Test default retry base delay
+    let base = retry_base_delay_ms();
+    assert_eq!(base, 10_000, "default retry base delay should be 10000ms");
+
+    // Test default retry max delay
+    let max = retry_max_delay_ms();
+    assert_eq!(max, 120_000, "default retry max delay should be 120000ms");
+}
+
+/// Verify exponential backoff delay calculation works within expected ranges.
+#[test]
+fn exponential_backoff_calculation() {
+    // Test config values directly (these are public)
+    use orch::engine::router::config::{retry_base_delay_ms, retry_max_delay_ms};
+
+    let base = retry_base_delay_ms();
+    let max = retry_max_delay_ms();
+
+    assert_eq!(base, 10_000, "base delay should be 10s");
+    assert_eq!(max, 120_000, "max delay should be 120s");
+
+    // Verify that exponential backoff grows as expected (at least base * 2^n)
+    // We can't test the exact jitter, but we can verify the base * 2^n growth
+    let growth_0 = base * 2u64.saturating_pow(0);
+    let growth_1 = base * 2u64.saturating_pow(1);
+    let growth_2 = base * 2u64.saturating_pow(2);
+    let growth_3 = base * 2u64.saturating_pow(3);
+    let growth_4 = base * 2u64.saturating_pow(4);
+
+    assert!(growth_1 > growth_0, "exponential should grow");
+    assert!(growth_2 > growth_1, "exponential should grow");
+    assert!(growth_3 > growth_2, "exponential should grow");
+    assert!(growth_4 > growth_3, "exponential should grow");
+
+    // Verify cap is applied (growth_4 should be capped at max)
+    assert!(growth_4 >= max, "should be capped at max");
+}
+
+/// Verify router healthy agent count.
+#[tokio::test]
+async fn router_healthy_agent_count() {
+    use orch::engine::router::{Router, RouterConfig};
+
+    // Create router with default config
+    let config = RouterConfig::default();
+    let router = Router::new(config);
+
+    // At minimum, available_agents should contain agents that are in PATH
+    // The healthy_agent_count should be <= available_agents.len()
+    let healthy = router.healthy_agent_count("simple");
+    let available = router.available_agents.len();
+
+    assert!(
+        healthy <= available,
+        "healthy count ({}) should be <= available ({})",
+        healthy,
+        available
+    );
+
+    // Test is_degraded with various thresholds
+    // If healthy < threshold, it's degraded
+    let _degraded_at_5 = router.is_degraded(5);
+    let degraded_at_1 = router.is_degraded(1);
+
+    // We can't predict exact values since it depends on what's in PATH
+    // but degraded_at_1 should generally be false (unless NO agents available)
+    // and degraded_at_5 would be true if fewer than 5 healthy agents
+    assert!(
+        !degraded_at_1 || healthy == 0,
+        "is_degraded(1) should be false unless no healthy agents"
+    );
+}

@@ -277,6 +277,19 @@ impl Router {
             .collect()
     }
 
+    /// Count of healthy (routable) agents for a given complexity.
+    /// Returns the number of agents that are available, not in cooldown, and have an available model.
+    pub fn healthy_agent_count(&self, complexity: &str) -> usize {
+        self.available_agents_for_complexity(complexity).len()
+    }
+
+    /// Check if the system is in degraded mode (fewer than threshold healthy agents).
+    /// Uses "simple" complexity as the baseline since it has the widest model support.
+    #[allow(dead_code)]
+    pub fn is_degraded(&self, threshold: usize) -> bool {
+        self.healthy_agent_count("simple") < threshold
+    }
+
     fn earliest_cooldown_until(&self, complexity: Option<&str>) -> Option<i64> {
         let mut earliest: Option<i64> = None;
 

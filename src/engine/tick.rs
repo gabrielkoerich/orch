@@ -686,7 +686,7 @@ pub(crate) async fn tick_dispatch_tasks(
     semaphore: &Arc<Semaphore>,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
-    _router_arc: &Arc<RwLock<Router>>,
+    router_arc: &Arc<RwLock<Router>>,
     dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
@@ -701,8 +701,9 @@ pub(crate) async fn tick_dispatch_tasks(
         .await?;
     routed_tasks.extend(internal_routed);
 
-    let dispatchable: Vec<&ExternalTask> = routed_tasks
-        .iter()
+    // Filter and collect owned tasks to avoid lifetime issues
+    let dispatchable: Vec<ExternalTask> = routed_tasks
+        .into_iter()
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
         .collect();
 
@@ -712,7 +713,36 @@ pub(crate) async fn tick_dispatch_tasks(
         tracing::info!(count = dispatchable.len(), "dispatchable tasks found");
     }
 
-    for task in dispatchable {
+    // Check if we are in degraded mode (fewer than threshold healthy agents)
+    let threshold = crate::engine::router::config::min_healthy_agents_threshold();
+    let healthy_count = router_arc.read().await.healthy_agent_count("simple");
+    let is_degraded = healthy_count < threshold;
+
+    if is_degraded {
+        tracing::warn!(
+            healthy_agents = healthy_count,
+            threshold = threshold,
+            "degraded mode: using sequential dispatch"
+        );
+    }
+
+    let sequential_delay = if is_degraded {
+        crate::engine::router::config::sequential_dispatch_delay_ms()
+    } else {
+        0
+    };
+
+    for (idx, task) in dispatchable.into_iter().enumerate() {
+        // In degraded mode, add delay between dispatches to pace the system
+        if idx > 0 && is_degraded {
+            let delay_ms = sequential_delay;
+            tracing::debug!(
+                task_id = task.id.0,
+                delay_ms = delay_ms,
+                "sequential dispatch: waiting before dispatch"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
         // In-memory guard: prevents double-dispatch due to GitHub API eventual consistency.
         // After update_status(InProgress), the label removal fires a webhook that can
         // trigger an immediate tick. GitHub's search index may not yet reflect the label
@@ -772,7 +802,7 @@ pub(crate) async fn tick_dispatch_tasks(
         let tmux = tmux.clone();
         let capture = capture.clone();
         let task_id_for_cleanup = task_id.clone();
-        let task_owned = task.clone();
+        let task_owned = task;
         let weight_tx = weight_tx.clone();
         let repo_owned = repo.to_string();
         let task_manager_for_spawn = task_manager.clone();
