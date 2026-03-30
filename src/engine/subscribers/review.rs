@@ -119,7 +119,11 @@ pub fn spawn(
                                 .min()
                                 .map(|until| ((until - now).max(1)) as u64)
                                 .unwrap_or(crate::engine::cooldown::AGENT_COOLDOWN_SECS as u64);
-                            tracing::info!(task_id, wait_secs, "all agents cooled — delaying review until cooldown expires");
+                            tracing::info!(
+                                task_id,
+                                wait_secs,
+                                "all agents cooled — delaying review until cooldown expires"
+                            );
                             tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                         }
                     }
