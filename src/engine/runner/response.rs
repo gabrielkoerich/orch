@@ -174,18 +174,13 @@ pub fn pick_fallback_agent(
         if is_agent_in_cooldown(agent) {
             continue;
         }
-        // Also avoid agents that are heavily rate-limited (weight close to 0)
-        // if the AgentWeights machinery is available (best-effort).
-        let weight_ok = match crate::engine::router::weights::AgentWeights::default()
-            .get_weight(agent.as_str())
-        {
-            // If we cannot determine weight (default path), assume OK
-            _ => true,
-        };
-
-        if weight_ok {
-            return Some(agent.clone());
-        }
+        // Weight-based filtering was removed from this module because it used
+        // a default-constructed AgentWeights (dead code that always returned
+        // true). Keep failover behavior simple here: prefer the first agent
+        // that is not in cooldown and not in the reroute chain. If we later
+        // expose the router's AgentWeights snapshot to this module we can add
+        // weight-based avoidance back in a non-dead way.
+        return Some(agent.clone());
     }
 
     None
