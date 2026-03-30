@@ -88,12 +88,13 @@ pub enum WeightSignal {
 /// Checks per-task attempt directory first, then legacy flat paths.
 pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> String {
     // Primary: explicit output file (already points to attempt dir)
-    if let Ok(content) = tokio::task::spawn_blocking({
+    if let Some(content) = tokio::task::spawn_blocking({
         let p = primary_path.to_path_buf();
         move || std::fs::read_to_string(p)
     })
     .await
-    .and_then(|r| r)
+    .ok()
+    .and_then(|r| r.ok())
     {
         if !content.is_empty() {
             return content;
@@ -121,12 +122,13 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
             attempt_nums.sort_unstable_by(|a, b| b.cmp(a)); // newest first
             for n in attempt_nums {
                 let p = attempts_dir.join(n.to_string()).join("output.json");
-                if let Ok(content) = tokio::task::spawn_blocking({
+                if let Some(content) = tokio::task::spawn_blocking({
                     let p = p.clone();
                     move || std::fs::read_to_string(p)
                 })
                 .await
-                .and_then(|r| r)
+                .ok()
+                .and_then(|r| r.ok())
                 {
                     if !content.is_empty() {
                         tracing::info!(task_id, path = %p.display(), "read output from attempt dir");
@@ -152,12 +154,13 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
     }
 
     for path in &fallbacks {
-        if let Ok(content) = tokio::task::spawn_blocking({
+        if let Some(content) = tokio::task::spawn_blocking({
             let p = path.clone();
             move || std::fs::read_to_string(p)
         })
         .await
-        .and_then(|r| r)
+        .ok()
+        .and_then(|r| r.ok())
         {
             if !content.is_empty() {
                 tracing::info!(task_id, path = %path.display(), "read output from legacy fallback");

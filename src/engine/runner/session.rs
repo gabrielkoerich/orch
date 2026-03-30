@@ -110,18 +110,15 @@ async fn collect_output(
     let legacy_exit = crate::home::state_file(&format!("exit-{task_id}.txt"))
         .unwrap_or_else(|_| orch_home.join("state").join(format!("exit-{task_id}.txt")));
 
-    let exit_code: i32 = match tokio::task::spawn_blocking(move || {
+    let exit_code: i32 = (tokio::task::spawn_blocking(move || {
         std::fs::read_to_string(&attempt_exit)
             .or_else(|_| std::fs::read_to_string(&legacy_exit))
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(-1)
     })
-    .await
-    {
-        Ok(code) => code,
-        Err(_) => -1,
-    };
+    .await)
+        .unwrap_or(-1);
 
     // Read raw output (offloaded inside read_output_file) and stderr (blocking read offloaded)
     let raw_stdout =
@@ -131,16 +128,13 @@ async fn collect_output(
     let stderr_path_legacy = crate::home::state_file(&format!("stderr-{task_id}.txt"))
         .unwrap_or_else(|_| PathBuf::from(format!("/tmp/stderr-{task_id}.txt")));
 
-    let raw_stderr: String = match tokio::task::spawn_blocking(move || {
+    let raw_stderr: String = (tokio::task::spawn_blocking(move || {
         std::fs::read_to_string(&stderr_path_attempt)
             .or_else(|_| std::fs::read_to_string(&stderr_path_legacy))
             .unwrap_or_default()
     })
-    .await
-    {
-        Ok(s) => s,
-        Err(_) => String::new(),
-    };
+    .await)
+        .unwrap_or_default();
 
     SessionOutput {
         exit_code,
