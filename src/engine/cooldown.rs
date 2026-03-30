@@ -372,6 +372,109 @@ fn is_in_cooldown(key: &str) -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Degraded-agent tracking (pre-emptive health check)
+// ---------------------------------------------------------------------------
+
+/// Default health check window for recent rate-limit events (hours).
+pub const DEFAULT_HEALTH_CHECK_WINDOW_HOURS: u32 = 6;
+
+/// Default threshold: minimum rate-limit events within the window to consider
+/// an agent degraded.  A single transient 429 shouldn't mark an agent; we need
+/// a pattern of repeated failures.
+pub const DEFAULT_DEGRADED_RATE_LIMIT_THRESHOLD: i64 = 3;
+
+/// In-memory set of agents currently flagged as degraded.
+fn degraded_agents() -> &'static Mutex<std::collections::HashSet<String>> {
+    static DEGRADED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    DEGRADED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Check if an agent is currently flagged as degraded by the health check.
+///
+/// Degraded means: all configured models are cooled **or** the agent has
+/// exceeded the rate-limit/out_of_credits threshold within the configured
+/// lookback window.
+pub fn is_agent_degraded(agent: &str) -> bool {
+    let set = degraded_agents().lock().unwrap_or_else(|e| e.into_inner());
+    set.contains(agent)
+}
+
+/// Mark an agent as degraded (called by [`refresh_degraded_agents`]).
+pub fn mark_agent_degraded(agent: &str) {
+    let mut set = degraded_agents().lock().unwrap_or_else(|e| e.into_inner());
+    set.insert(agent.to_string());
+}
+
+/// Clear the degraded flag for an agent.
+pub fn clear_agent_degraded(agent: &str) {
+    let mut set = degraded_agents().lock().unwrap_or_else(|e| e.into_inner());
+    set.remove(agent);
+}
+
+/// Refresh the degraded-agent set from the rate_limits table and cooldown state.
+///
+/// An agent is marked degraded when:
+/// 1. It is in agent-level cooldown, **or**
+/// 2. All its configured models are in cooldown, **or**
+/// 3. It has >= `threshold` rate_limit/out_of_credits events within `window_hours`.
+///
+/// Agents that no longer meet these criteria are cleared.
+pub async fn refresh_degraded_agents(
+    store: &Arc<crate::store::TaskStore>,
+    available_agents: &[String],
+    model_checker: &dyn Fn(&str) -> bool,
+    window_hours: u32,
+    threshold: i64,
+) {
+    let counts = match store.recent_rate_limit_counts(window_hours).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to query recent rate limit counts for health check");
+            return;
+        }
+    };
+
+    for agent in available_agents {
+        let in_cooldown = is_agent_in_cooldown(agent);
+        let no_models = !model_checker(agent);
+        let rate_limit_count = counts.get(agent.as_str()).copied().unwrap_or(0);
+        let over_threshold = rate_limit_count >= threshold;
+
+        let degraded = in_cooldown || no_models || over_threshold;
+
+        if degraded {
+            if !is_agent_degraded(agent) {
+                let reason = if in_cooldown {
+                    "agent in cooldown"
+                } else if no_models {
+                    "all models cooled"
+                } else {
+                    "rate limit threshold exceeded"
+                };
+                tracing::warn!(
+                    agent,
+                    reason,
+                    rate_limit_count,
+                    window_hours,
+                    threshold,
+                    "pre-emptive health check: marking agent as degraded"
+                );
+            }
+            mark_agent_degraded(agent);
+        } else {
+            if is_agent_degraded(agent) {
+                tracing::info!(
+                    agent,
+                    rate_limit_count,
+                    "pre-emptive health check: agent recovered, clearing degraded flag"
+                );
+            }
+            clear_agent_degraded(agent);
+        }
+    }
+}
+
 /// Clear expired cooldowns from the in-memory map.
 pub fn clear_expired_cooldowns() {
     let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
@@ -754,6 +857,126 @@ mod tests {
         assert_eq!(
             CreditExhaustionReason::OrgLevelDisabled.cooldown_secs(),
             ORG_LEVEL_DISABLED_COOLDOWN_SECS
+        );
+    }
+
+    // ---- Degraded-agent tracking tests ----
+
+    #[test]
+    fn mark_and_check_agent_degraded() {
+        let agent = "test_degraded_mark";
+        assert!(!is_agent_degraded(agent));
+        mark_agent_degraded(agent);
+        assert!(is_agent_degraded(agent));
+        clear_agent_degraded(agent);
+        assert!(!is_agent_degraded(agent));
+    }
+
+    #[tokio::test]
+    async fn refresh_degraded_agents_marks_cooled_agent() {
+        let store = test_store().await;
+        let agent = "test_refresh_cooled";
+
+        // Put agent in cooldown
+        record_agent_failure_with_message(agent, "");
+        assert!(is_agent_in_cooldown(agent));
+
+        // model_checker always returns true (agent has models)
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+
+        assert!(
+            is_agent_degraded(agent),
+            "agent in cooldown should be marked degraded"
+        );
+
+        // Cleanup
+        clear_agent_degraded(agent);
+    }
+
+    #[tokio::test]
+    async fn refresh_degraded_agents_marks_no_models_agent() {
+        let store = test_store().await;
+        let agent = "test_refresh_no_models";
+
+        // model_checker returns false (no available models)
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| false, 6, 3).await;
+
+        assert!(
+            is_agent_degraded(agent),
+            "agent with no available models should be marked degraded"
+        );
+
+        // Cleanup
+        clear_agent_degraded(agent);
+    }
+
+    #[tokio::test]
+    async fn refresh_degraded_agents_marks_rate_limited_agent() {
+        let store = test_store().await;
+        let agent = "test_refresh_rate_limited";
+
+        // Insert rate limit events exceeding threshold
+        for _ in 0..4 {
+            store
+                .record_rate_limit(agent, "rate_limit", None)
+                .await
+                .unwrap();
+        }
+
+        let agents = vec![agent.to_string()];
+        // threshold=3, window=6h — 4 events should trigger degraded
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+
+        assert!(
+            is_agent_degraded(agent),
+            "agent with rate limit count >= threshold should be marked degraded"
+        );
+
+        // Cleanup
+        clear_agent_degraded(agent);
+    }
+
+    #[tokio::test]
+    async fn refresh_degraded_agents_clears_healthy_agent() {
+        let store = test_store().await;
+        let agent = "test_refresh_healthy";
+
+        // Pre-mark as degraded
+        mark_agent_degraded(agent);
+        assert!(is_agent_degraded(agent));
+
+        // No cooldown, has models, no rate limit events
+        let agents = vec![agent.to_string()];
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+
+        assert!(
+            !is_agent_degraded(agent),
+            "healthy agent should have degraded flag cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_degraded_agents_below_threshold_not_degraded() {
+        let store = test_store().await;
+        let agent = "test_refresh_below_threshold";
+
+        // Insert rate limit events below threshold
+        for _ in 0..2 {
+            store
+                .record_rate_limit(agent, "rate_limit", None)
+                .await
+                .unwrap();
+        }
+
+        let agents = vec![agent.to_string()];
+        // threshold=3, only 2 events — should NOT be degraded
+        refresh_degraded_agents(&store, &agents, &|_| true, 6, 3).await;
+
+        assert!(
+            !is_agent_degraded(agent),
+            "agent with rate limit count < threshold should not be degraded"
         );
     }
 }

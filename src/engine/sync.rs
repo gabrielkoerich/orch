@@ -730,6 +730,12 @@ pub(crate) async fn sync_tick(
         }
     }
 
+    // Pre-emptive health check: refresh degraded-agent flags from rate_limits table.
+    {
+        let r = router.read().await;
+        r.refresh_health(store).await;
+    }
+
     // Emit degraded-agents metric/log if needed (best-effort)
     let r = router.read().await;
     emit_degraded_agents_if_needed(&r, Some(store)).await;

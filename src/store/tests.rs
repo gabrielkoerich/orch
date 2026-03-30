@@ -5081,3 +5081,34 @@ async fn migrations_are_idempotent() {
     let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
     let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
 }
+
+// ── Recent rate limit counts (health check query) ───────────────
+
+#[tokio::test]
+async fn recent_rate_limit_counts_empty() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let counts = store.recent_rate_limit_counts(6).await.unwrap();
+    assert!(counts.is_empty());
+}
+
+#[tokio::test]
+async fn recent_rate_limit_counts_groups_by_agent() {
+    let store = TaskStore::open_memory().await.unwrap();
+    store
+        .record_rate_limit("claude", "rate_limit", None)
+        .await
+        .unwrap();
+    store
+        .record_rate_limit("claude", "out_of_credits", None)
+        .await
+        .unwrap();
+    store
+        .record_rate_limit("codex", "rate_limit", None)
+        .await
+        .unwrap();
+
+    let counts = store.recent_rate_limit_counts(6).await.unwrap();
+    assert_eq!(counts.get("claude"), Some(&2));
+    assert_eq!(counts.get("codex"), Some(&1));
+    assert_eq!(counts.get("opencode"), None);
+}

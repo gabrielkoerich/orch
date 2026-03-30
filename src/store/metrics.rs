@@ -431,6 +431,38 @@ impl TaskStore {
         Ok(row.get("id"))
     }
 
+    /// Count recent rate limit events per agent within the given window (in hours).
+    ///
+    /// Returns a map of `agent -> count` for agents that have rate_limit or
+    /// out_of_credits events in the `rate_limits` table within the window.
+    /// Used by the pre-emptive health check to detect degraded agents.
+    pub async fn recent_rate_limit_counts(
+        &self,
+        window_hours: u32,
+    ) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+        // SQLite datetime modifiers don't support parameterised intervals, so
+        // we build the interval string and embed it directly.  The value comes
+        // from a config integer, not user input, so this is safe.
+        let interval = format!("-{window_hours} hours");
+        let rows = sqlx::query(
+            "SELECT agent, COUNT(*) as cnt
+             FROM rate_limits
+             WHERE occurred_at >= datetime('now', ?)
+             GROUP BY agent",
+        )
+        .bind(&interval)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map = std::collections::HashMap::new();
+        for row in &rows {
+            let agent: String = row.get("agent");
+            let cnt: i64 = row.get("cnt");
+            map.insert(agent, cnt);
+        }
+        Ok(map)
+    }
+
     /// Get slow tasks (top 10 longest running) from the last 7 days.
     pub async fn get_slow_tasks_7d(&self) -> anyhow::Result<Vec<SlowTaskInfo>> {
         let rows = sqlx::query(
