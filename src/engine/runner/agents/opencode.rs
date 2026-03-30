@@ -199,6 +199,22 @@ mod router_text_tests {
             "extracted text should include JSON"
         );
     }
+
+    #[test]
+    fn extract_router_text_ignores_leading_system_init() {
+        // Early opencode wrappers may emit a system/init envelope before the
+        // actual text/result event. Ensure the extractor skips the init envelope
+        // and returns the real JSON payload from the subsequent text event.
+        let raw = r#"{"type":"system","subtype":"init","cwd":"/"}
+{"type":"text","timestamp":2,"text":"{\"executor\":\"opencode\",\"complexity\":\"medium\",\"reason\":\"ndjson\"}"}
+{"type":"step_finish","timestamp":3}"#;
+
+        let text = extract_router_text(raw).expect("should extract text even with leading init");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).expect("extracted text must be JSON");
+        assert_eq!(parsed["executor"], "opencode");
+        assert_eq!(parsed["complexity"], "medium");
+    }
 }
 
 impl OpenCodeRunner {
