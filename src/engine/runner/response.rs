@@ -236,6 +236,13 @@ pub async fn handle_failover(
 
     // No fallback available
     tracing::warn!(task_id, agent = agent_name, "no fallback agents available");
+
+    // Record agent failure for cooldown tracking
+    // Skip cooldown for MissingTooling — it's permanent, not transient
+    if !matches!(error_type, RetryableError::MissingTooling) {
+        record_agent_failure_with_message(agent_name, error_message);
+    }
+
     let msg = format!("{error_message}, no fallback agents");
     store::store_set(
         store,
