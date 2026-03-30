@@ -422,6 +422,23 @@ pub trait AgentRunner: Send + Sync {
     /// parse_response fails to find a valid result.
     fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError;
 
+    /// Classify error with elapsed session time (for accurate timeout reporting).
+    fn classify_error_with_elapsed(
+        &self,
+        exit_code: i32,
+        stdout: &str,
+        stderr: &str,
+        elapsed_secs: Option<u64>,
+    ) -> AgentError {
+        let mut err = self.classify_error(exit_code, stdout, stderr);
+        if let AgentError::Timeout { elapsed } = &mut err {
+            if let Some(actual_elapsed) = elapsed_secs {
+                *elapsed = Duration::from_secs(actual_elapsed);
+            }
+        }
+        err
+    }
+
     /// Models available for this agent (for intra-agent failover).
     fn available_models(&self) -> Vec<String> {
         vec![]

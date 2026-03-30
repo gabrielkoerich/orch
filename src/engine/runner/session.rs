@@ -15,6 +15,7 @@ pub struct SessionOutput {
     pub exit_code: i32,
     pub raw_stdout: String,
     pub raw_stderr: String,
+    pub elapsed_secs: Option<u64>,
 }
 
 /// Spawn the agent in tmux, wait for completion, and collect output.
@@ -38,6 +39,10 @@ pub async fn run_agent_session(
 
     let tmux = TmuxManager::new();
 
+    // Start timing before session setup so elapsed includes spawn/setup time.
+    // This helps distinguish "never started" vs "ran for a while then stopped".
+    let session_start = std::time::Instant::now();
+
     let session = match agent::spawn_in_tmux(&tmux, invocation).await {
         Ok(s) => s,
         Err(e) => {
@@ -49,18 +54,20 @@ pub async fn run_agent_session(
                     exit_code: -1,
                     raw_stdout: String::new(),
                     raw_stderr: e.to_string(),
+                    elapsed_secs: None,
                 },
             );
         }
     };
 
-    // Wait for completion with timeout
     let poll_interval = Duration::from_secs(5);
     let wait_result = timeout(
         task_timeout,
         tmux.wait_for_completion(&session, poll_interval),
     )
     .await;
+
+    let elapsed_since_session_start = session_start.elapsed().as_secs();
 
     match wait_result {
         Ok(Ok(_output)) => {
@@ -72,14 +79,21 @@ pub async fn run_agent_session(
         Err(_) => {
             tracing::error!(
                 task_id,
-                "agent timed out after {} minutes",
-                task_timeout_secs / 60
+                elapsed_secs = elapsed_since_session_start,
+                "agent timed out after {} seconds",
+                elapsed_since_session_start
             );
             let _ = tmux.kill_session(&session).await;
         }
     }
 
-    let output = collect_output(task_id, invocation, attempt_dir, orch_home);
+    let output = collect_output(
+        task_id,
+        invocation,
+        attempt_dir,
+        orch_home,
+        elapsed_since_session_start,
+    );
     (tmux, session, output)
 }
 
@@ -88,6 +102,7 @@ fn collect_output(
     invocation: &agent::AgentInvocation,
     attempt_dir: &Path,
     orch_home: &Path,
+    elapsed_secs: u64,
 ) -> SessionOutput {
     // Read exit code — check per-task attempt dir first, fall back to legacy
     let exit_code: i32 = {
@@ -116,6 +131,7 @@ fn collect_output(
         exit_code,
         raw_stdout,
         raw_stderr,
+        elapsed_secs: Some(elapsed_secs),
     }
 }
 
