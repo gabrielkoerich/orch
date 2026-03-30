@@ -39,6 +39,10 @@ pub async fn run_agent_session(
 
     let tmux = TmuxManager::new();
 
+    // Start timing before session setup so elapsed includes spawn/setup time.
+    // This helps distinguish "never started" vs "ran for a while then stopped".
+    let session_start = std::time::Instant::now();
+
     let session = match agent::spawn_in_tmux(&tmux, invocation).await {
         Ok(s) => s,
         Err(e) => {
@@ -56,8 +60,6 @@ pub async fn run_agent_session(
         }
     };
 
-    // Wait for completion with timeout
-    let session_start = std::time::Instant::now();
     let poll_interval = Duration::from_secs(5);
     let wait_result = timeout(
         task_timeout,
