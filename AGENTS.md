@@ -431,11 +431,42 @@ The cooldown system (`src/engine/cooldown.rs`) and failure recovery (`src/engine
 - Silence detection → model cooldown + short agent cooldown → re-route
 - Billing cycle exhaustion → 24h cooldown (or vendor-specified date)
 
+**Exception for pre-emptive routability checks**: The router performs proactive checks to skip agents/models that are likely to fail based on routing weight decay and cooldown states. This is not considered special-casing because it uses the same generic cooldown system and weight decay mechanisms that feed into the routing decision process.
+
 **Do not file issues to add special handling for specific models or agents** (e.g., "copilot models need longer cooldowns", "add fallback for kimi rate limits"). If a model silently fails, the existing silence detection + cooldown handles it. If a model is rate-limited, `parse_retry_at` handles it. If all models for an agent are cooled, the router picks a different agent.
 
 Issue #1286 was closed as invalid — it proposed special-casing copilot model failures when the generic system already handles them.
 
 If you believe the generic system has a bug (e.g., cooldowns not being applied, silence not detected), file an issue about the **generic mechanism**, not about a specific model.
+
+#### Pre-emptive Routability and Circuit-Breaker Behavior
+
+The router now implements two key optimizations to prevent unnecessary agent invocations:
+
+1. **Pre-emptive routability check**: Before attempting to route a task, the router evaluates each agent/model combination's routing weight. If the weight has decayed below a configurable threshold (indicating poor recent performance), that combination is skipped entirely.
+
+2. **Circuit-breaker behavior**: When specific failure events occur (`out_of_credits` or `org_level_disabled`), the router applies extended cooldown periods (typically 2-4x longer than standard cooldowns) to prevent repeated futile attempts.
+
+These mechanisms integrate with the generic cooldown system as follows:
+- Routing weight decay is tracked in the same system that handles failure recovery
+- Extended cooldowns for special events are still managed by `src/engine/cooldown.rs`
+- The router queries the cooldown system to determine if an agent/model is available
+- All cooldown state remains the single source of truth in the SQLite store
+
+**Monitoring and alerting guidance**:
+- Monitor the percentage of agent/model combinations that are skipped due to low routing weight
+- Set up alerts when 3+ agents show degraded routing weight (weight < threshold) simultaneously
+- Track the frequency and duration of extended cooldowns for `out_of_credits` and `org_level_disabled` events
+- Review router logs for messages indicating skipped agents due to weight decay or circuit-breaker activation
+
+**Example integration points**:
+In `src/engine/router/selection.rs`, the router calls:
+- `cooldown.is_agent_available(agent)` to check standard cooldown state
+- `cooldown.is_model_available(agent, model)` to check model-specific cooldown
+- `weight_calculator.get_weight(agent, model)` to assess routing weight decay
+- `cooldown.get_extended_cooldown_reason()` to detect if special event cooldowns apply
+
+These checks happen before LLM-based routing, preventing unnecessary invocation attempts when success is unlikely.
 
 ### Migrations are immutable — NEVER modify existing migration files
 
