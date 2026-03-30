@@ -91,13 +91,13 @@ async fn store_opens_and_migrates() {
 async fn store_migrations_idempotent() {
     let tmp = std::env::temp_dir().join(format!("orch-engine-test-{}.db", std::process::id()));
 
-    // First open
+    // First open (uses real open with max_connections(5) — production path)
     {
         let result = TaskStore::open(&tmp).await;
         assert!(result.is_ok(), "first open failed: {:?}", result.err());
     }
 
-    // Second open (validates checksums)
+    // Second open (validates checksums against already-applied migrations)
     {
         let result = TaskStore::open(&tmp).await;
         assert!(
@@ -116,7 +116,7 @@ async fn store_migrations_idempotent() {
 #[tokio::test]
 async fn store_tasks_table_exists() {
     let tmp = std::env::temp_dir().join(format!("orch-engine-table-{}.db", std::process::id()));
-    let store = TaskStore::open(&tmp).await.expect("open store");
+    let store = TaskStore::open_single(&tmp).await.expect("open store");
 
     // Just verify the tasks table is queryable (schema is correct)
     let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tasks")
@@ -151,10 +151,611 @@ async fn mock_backend_health_check() {
 #[tokio::test]
 async fn cooldown_init_with_store() {
     let tmp = std::env::temp_dir().join(format!("orch-engine-cooldown-{}.db", std::process::id()));
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
     orch::engine::cooldown::init_cooldown_store(store).await;
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
     let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
     // Should not panic — that's the test
+}
+
+// ---------------------------------------------------------------------------
+// Engine integration tests — exercise the engine startup path and core
+// components (store, task manager, router, runner) wired together.
+// ---------------------------------------------------------------------------
+
+/// Helper: create a temp DB path with a unique suffix and return it.
+/// The caller is responsible for cleanup. Uses an atomic counter to
+/// guarantee uniqueness even when tests run in parallel threads.
+fn temp_db(label: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("orch-integ-{label}-{}-{n}.db", std::process::id(),))
+}
+
+/// Helper: remove a temp DB and its WAL/SHM files.
+fn cleanup_db(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+}
+
+/// Verify that a ProjectEngine can be fully constructed from mock components.
+///
+/// This exercises the same wiring path as `init_project_engines()` in the
+/// real engine: store + backend + TaskManager + TaskRunner + ProjectEngine.
+/// If any struct field changes or a constructor signature drifts, this fails.
+#[tokio::test]
+async fn project_engine_constructs() {
+    use orch::engine::runner::TaskRunner;
+    use orch::engine::tasks::TaskManager;
+    use orch::engine::ProjectEngine;
+
+    let tmp = temp_db("pe-construct");
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+
+    let task_manager = Arc::new(TaskManager::with_store(
+        backend.clone(),
+        store.clone(),
+        "test/repo".to_string(),
+    ));
+
+    let runner = Arc::new(TaskRunner::new("test/repo".to_string()).with_store(store.clone()));
+
+    let engine = ProjectEngine {
+        repo: "test/repo".to_string(),
+        project_dir: std::path::PathBuf::from("/tmp/test-project"),
+        backend,
+        task_manager,
+        runner,
+        store: store.clone(),
+    };
+
+    assert_eq!(engine.repo, "test/repo");
+    cleanup_db(&tmp);
+}
+
+/// Verify that TaskManager can create an internal task and the task appears
+/// in the store with status `New`.
+#[tokio::test]
+async fn task_manager_creates_internal_task() {
+    use orch::engine::tasks::TaskManager;
+    use orch::store::TaskStatus;
+
+    let tmp = temp_db("tm-create");
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
+    let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
+
+    let tm = TaskManager::with_store(backend, store.clone(), "test/repo".to_string());
+
+    // Create an internal task via the store directly (TaskManager.create_task
+    // requires more setup; the store method is what the engine uses internally).
+    let task_id = store
+        .create_internal(
+            "test/repo",
+            "Fix the widget",
+            "The widget is broken",
+            "test",
+            "1",
+        )
+        .await
+        .expect("create internal task");
+
+    // Verify it exists and has the right status
+    let task = store.get(task_id).await.expect("get task");
+    assert_eq!(task.title, "Fix the widget");
+    assert_eq!(task.status, TaskStatus::New);
+    assert_eq!(task.repo, "test/repo");
+
+    // Verify it shows up in the routable list (status = new)
+    let routable = store
+        .list_routable("test/repo")
+        .await
+        .expect("list routable");
+    assert_eq!(routable.len(), 1);
+    assert_eq!(routable[0].id, task_id);
+
+    // Verify TaskManager is usable (no panic on list)
+    let internal = tm
+        .list_internal_by_status(TaskStatus::New)
+        .await
+        .expect("list internal");
+    assert_eq!(internal.len(), 1);
+
+    cleanup_db(&tmp);
+}
+
+/// Verify that creating an external task works and the task can be
+/// retrieved by external ID.
+#[tokio::test]
+async fn create_external_task_and_retrieve() {
+    use orch::store::{NewTask, TaskStatus};
+
+    let tmp = temp_db("create-ext");
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
+
+    let id = store
+        .create(&NewTask {
+            external_id: Some("42".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Add dark mode".to_string(),
+            body: "Users want dark mode support".to_string(),
+            source: "webhook".to_string(),
+            source_id: "42".to_string(),
+            author: "user1".to_string(),
+            url: "https://github.com/owner/repo/issues/42".to_string(),
+            labels: vec!["enhancement".to_string()],
+        })
+        .await
+        .expect("create external task");
+
+    let task = store.get(id).await.expect("get task");
+    assert_eq!(task.title, "Add dark mode");
+    assert_eq!(task.status, TaskStatus::New);
+    assert_eq!(task.external_id.as_deref(), Some("42"));
+    assert_eq!(task.origin, "github");
+    assert_eq!(task.labels, vec!["enhancement"]);
+
+    // Verify it shows up in external task listing
+    let all = store
+        .list_all_external("owner/repo")
+        .await
+        .expect("list all external");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].title, "Add dark mode");
+
+    cleanup_db(&tmp);
+}
+
+/// Verify task status transitions through the full lifecycle.
+///
+/// This catches regressions in the status update SQL and the
+/// TaskStatus enum serialization.
+#[tokio::test]
+async fn task_status_lifecycle() {
+    use orch::store::TaskStatus;
+
+    let tmp = temp_db("status-lifecycle");
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
+
+    let id = store
+        .create_internal("test/repo", "Lifecycle test", "", "test", "lc-1")
+        .await
+        .expect("create task");
+
+    // new → routed
+    store
+        .update_status(id, TaskStatus::Routed)
+        .await
+        .expect("new → routed");
+    assert_eq!(store.get(id).await.unwrap().status, TaskStatus::Routed);
+
+    // routed → in_progress
+    store
+        .update_status(id, TaskStatus::InProgress)
+        .await
+        .expect("routed → in_progress");
+    assert_eq!(store.get(id).await.unwrap().status, TaskStatus::InProgress);
+
+    // in_progress → needs_review
+    store
+        .update_status(id, TaskStatus::NeedsReview)
+        .await
+        .expect("in_progress → needs_review");
+    assert_eq!(store.get(id).await.unwrap().status, TaskStatus::NeedsReview);
+
+    // needs_review → in_review
+    store
+        .update_status(id, TaskStatus::InReview)
+        .await
+        .expect("needs_review → in_review");
+    assert_eq!(store.get(id).await.unwrap().status, TaskStatus::InReview);
+
+    // in_review → done
+    store
+        .update_status(id, TaskStatus::Done)
+        .await
+        .expect("in_review → done");
+    assert_eq!(store.get(id).await.unwrap().status, TaskStatus::Done);
+
+    cleanup_db(&tmp);
+}
+
+/// Verify that storing a route result persists agent, model, and complexity.
+///
+/// This exercises the same code path as `tick_route_tasks` without needing
+/// an LLM call or tmux session.
+#[tokio::test]
+async fn store_route_result_persists() {
+    use orch::store::{StoreRoute, TaskStatus};
+
+    let tmp = temp_db("route-persist");
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
+
+    let id = store
+        .create_internal("test/repo", "Route me", "task body", "test", "rt-1")
+        .await
+        .expect("create task");
+
+    // Simulate what the router does after routing
+    store
+        .store_route(&StoreRoute {
+            id,
+            agent: "claude",
+            model: Some("sonnet"),
+            complexity: "medium",
+            reason: "test routing",
+            profile: r#"{"role":"backend specialist","skills":[],"tools":[],"constraints":[]}"#,
+            skills: r#"["gh","git-worktree"]"#,
+        })
+        .await
+        .expect("store route");
+
+    // Update status to routed (as the engine does after storing the route)
+    store
+        .update_status(id, TaskStatus::Routed)
+        .await
+        .expect("update to routed");
+
+    // Verify the route data persisted
+    let task = store.get(id).await.expect("get routed task");
+    assert_eq!(task.status, TaskStatus::Routed);
+    assert_eq!(task.agent.as_deref(), Some("claude"));
+    assert_eq!(task.model.as_deref(), Some("sonnet"));
+    assert_eq!(task.complexity, "medium");
+    assert_eq!(task.route_reason, "test routing");
+
+    cleanup_db(&tmp);
+}
+
+/// Verify that the Router can be constructed and that round-robin routing
+/// works without any LLM call.
+///
+/// This is the closest we can get to testing the actual routing phase from
+/// an integration test, since tick_route_tasks is pub(crate).
+#[tokio::test]
+async fn router_round_robin_routes_task() {
+    use orch::engine::router::config::RouterConfig;
+    use orch::engine::router::Router;
+    use orch::store::UpsertExternal;
+
+    let tmp = temp_db("rr-route");
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
+
+    // Use round_robin mode so no LLM call is needed.
+    // Only include agents likely to be in PATH on CI/dev machines.
+    let config = RouterConfig {
+        mode: "round_robin".to_string(),
+        agents: vec!["claude".to_string(), "codex".to_string()],
+        ..RouterConfig::default()
+    };
+
+    let mut router = Router::new(config);
+
+    // If no agents are discovered (CI has none), skip the routing assertion
+    // but still verify the router constructed without panic.
+    if router.available_agents.is_empty() {
+        // Router constructed, agents discovered (none found) — still a valid test
+        return;
+    }
+
+    // Create a task in the store so resolve_task_id works
+    let ext = UpsertExternal {
+        repo: "test/repo",
+        ext_id: "99",
+        title: "Round-robin test task",
+        body: "Test body for routing",
+        author: "test",
+        url: "",
+        labels: &[],
+        origin: "github",
+    };
+    store.upsert_external(&ext).await.expect("upsert");
+
+    // Build an ExternalTask to pass to route()
+    let task = ExternalTask {
+        id: ExternalId("99".to_string()),
+        title: "Round-robin test task".to_string(),
+        body: "Test body for routing".to_string(),
+        state: "open".to_string(),
+        labels: vec![],
+        author: "test".to_string(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+        url: "".to_string(),
+    };
+
+    let result = router.route(&task, &store, "test/repo").await;
+    assert!(
+        result.is_ok(),
+        "round-robin routing should succeed: {:?}",
+        result.err()
+    );
+
+    let route = result.unwrap();
+    assert!(
+        router.available_agents.contains(&route.agent),
+        "routed agent {:?} should be in available agents {:?}",
+        route.agent,
+        router.available_agents
+    );
+    assert!(
+        !route.complexity.is_empty(),
+        "complexity should not be empty"
+    );
+    assert!(!route.reason.is_empty(), "reason should not be empty");
+
+    // Store the route result and verify persistence
+    router
+        .store_route_result("99", &route, &store, "test/repo")
+        .await
+        .expect("store route result");
+
+    let stored = orch::engine::router::get_route_result(&store, "test/repo", "99")
+        .await
+        .expect("get route result");
+    assert_eq!(stored.agent, route.agent);
+    assert_eq!(stored.complexity, route.complexity);
+
+    cleanup_db(&tmp);
+}
+
+/// Verify that the TaskRunner can be constructed with a store.
+///
+/// The runner requires tmux for actual dispatch, but construction and
+/// store wiring should not panic.
+#[tokio::test]
+async fn task_runner_constructs_with_store() {
+    use orch::engine::runner::TaskRunner;
+
+    let tmp = temp_db("runner-construct");
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
+
+    let _runner = TaskRunner::new("test/repo".to_string()).with_store(store);
+    // Construction succeeded without panic — that's the test
+
+    cleanup_db(&tmp);
+}
+
+/// Verify that task activity tracking works (append + retrieve).
+///
+/// The engine appends activity entries on every status change. If the
+/// activity schema breaks, the engine panics mid-tick.
+#[tokio::test]
+async fn task_activity_tracking() {
+    let tmp = temp_db("activity");
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
+
+    let id = store
+        .create_internal("test/repo", "Activity test", "", "test", "act-1")
+        .await
+        .expect("create task");
+
+    // Status updates automatically append activity entries
+    store
+        .update_status(id, orch::store::TaskStatus::Routed)
+        .await
+        .expect("route");
+    store
+        .update_status(id, orch::store::TaskStatus::InProgress)
+        .await
+        .expect("dispatch");
+
+    let activity = store.get_activity(id, None).await.expect("get activity");
+    // Should have at least the status change entries
+    assert!(
+        !activity.is_empty(),
+        "activity log should not be empty after status changes"
+    );
+
+    cleanup_db(&tmp);
+}
+
+/// Verify that the full engine wiring path works end-to-end:
+/// store + task creation + routing data + status update + retrieval.
+///
+/// This simulates what a single tick does (minus tmux dispatch):
+/// 1. Task appears in store (new)
+/// 2. Router selects agent (store route)
+/// 3. Status updated to routed
+/// 4. Verify task is no longer in the routable list
+#[tokio::test]
+async fn engine_tick_simulation() {
+    use orch::store::{StoreRoute, TaskStatus, UpsertExternal};
+
+    let tmp = temp_db("tick-sim");
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
+
+    // Phase 0: upsert an external task (simulates sync from GitHub)
+    let ext = UpsertExternal {
+        repo: "owner/repo",
+        ext_id: "101",
+        title: "Implement caching layer",
+        body: "We need Redis-backed caching for the API",
+        author: "engineer",
+        url: "https://github.com/owner/repo/issues/101",
+        labels: &["enhancement".to_string(), "backend".to_string()],
+        origin: "github",
+    };
+    let id = store.upsert_external(&ext).await.expect("upsert");
+
+    // Verify task is routable (status = new)
+    let routable = store
+        .list_routable("owner/repo")
+        .await
+        .expect("list routable");
+    assert_eq!(routable.len(), 1);
+
+    // Phase 3a: Route the task (simulates tick_route_tasks)
+    store
+        .store_route(&StoreRoute {
+            id,
+            agent: "claude",
+            model: Some("opus"),
+            complexity: "complex",
+            reason: "backend task requiring deep caching knowledge",
+            profile: r#"{"role":"backend specialist","skills":["redis"],"tools":["bash"],"constraints":[]}"#,
+            skills: r#"["gh"]"#,
+        })
+        .await
+        .expect("store route");
+
+    store
+        .update_status(id, TaskStatus::Routed)
+        .await
+        .expect("mark routed");
+
+    // Verify task is no longer routable
+    let routable_after = store
+        .list_routable("owner/repo")
+        .await
+        .expect("list routable after");
+    assert!(
+        routable_after.is_empty(),
+        "routed task should not appear in routable list"
+    );
+
+    // Verify routed state
+    let task = store.get(id).await.expect("get routed task");
+    assert_eq!(task.status, TaskStatus::Routed);
+    assert_eq!(task.agent.as_deref(), Some("claude"));
+    assert_eq!(task.model.as_deref(), Some("opus"));
+
+    // Phase 3b: Dispatch (simulates tick_dispatch_tasks — just update status)
+    store
+        .update_status(id, TaskStatus::InProgress)
+        .await
+        .expect("mark in_progress");
+
+    let dispatched = store.get(id).await.expect("get dispatched");
+    assert_eq!(dispatched.status, TaskStatus::InProgress);
+
+    // Simulate completion → needs_review → done
+    store
+        .update_status(id, TaskStatus::NeedsReview)
+        .await
+        .expect("needs_review");
+    store
+        .update_status(id, TaskStatus::InReview)
+        .await
+        .expect("in_review");
+    store
+        .update_status(id, TaskStatus::Done)
+        .await
+        .expect("done");
+
+    let final_task = store.get(id).await.expect("get final");
+    assert_eq!(final_task.status, TaskStatus::Done);
+
+    // Verify activity trail has entries for the full lifecycle
+    let activity = store.get_activity(id, None).await.expect("activity");
+    assert!(
+        activity.len() >= 4,
+        "expected at least 4 activity entries for full lifecycle, got {}",
+        activity.len()
+    );
+
+    cleanup_db(&tmp);
+}
+
+/// Verify that blocked status works and block_reason is stored.
+#[tokio::test]
+async fn task_blocked_with_reason() {
+    use orch::store::TaskStatus;
+
+    let tmp = temp_db("blocked");
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
+
+    let id = store
+        .create_internal("test/repo", "Blocked task", "", "test", "blk-1")
+        .await
+        .expect("create task");
+
+    store
+        .update_status(id, TaskStatus::Blocked)
+        .await
+        .expect("block");
+    store
+        .set_block_reason(id, Some("max review cycles exceeded"))
+        .await
+        .expect("set block reason");
+
+    let task = store.get(id).await.expect("get blocked task");
+    assert_eq!(task.status, TaskStatus::Blocked);
+    assert_eq!(
+        task.block_reason.as_deref(),
+        Some("max review cycles exceeded")
+    );
+
+    // Unblock
+    store
+        .update_status(id, TaskStatus::New)
+        .await
+        .expect("unblock");
+    store
+        .set_block_reason(id, None)
+        .await
+        .expect("clear block reason");
+
+    let unblocked = store.get(id).await.expect("get unblocked");
+    assert_eq!(unblocked.status, TaskStatus::New);
+    assert!(unblocked.block_reason.is_none());
+
+    cleanup_db(&tmp);
+}
+
+/// Verify that multiple tasks across repos are isolated correctly.
+///
+/// The engine runs multiple ProjectEngines — one per repo. Tasks from
+/// different repos must not leak into each other's routable lists.
+#[tokio::test]
+async fn multi_repo_task_isolation() {
+    use orch::store::TaskStatus;
+
+    let tmp = temp_db("multi-repo");
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
+
+    store
+        .create_internal("repo-a/project", "Task A", "", "test", "a-1")
+        .await
+        .expect("create task A");
+    store
+        .create_internal("repo-b/project", "Task B", "", "test", "b-1")
+        .await
+        .expect("create task B");
+
+    let routable_a = store.list_routable("repo-a/project").await.expect("list A");
+    let routable_b = store.list_routable("repo-b/project").await.expect("list B");
+
+    assert_eq!(routable_a.len(), 1, "repo A should have 1 routable task");
+    assert_eq!(routable_b.len(), 1, "repo B should have 1 routable task");
+    assert_eq!(routable_a[0].title, "Task A");
+    assert_eq!(routable_b[0].title, "Task B");
+
+    // Routing task A should not affect repo B
+    store
+        .update_status(routable_a[0].id, TaskStatus::Routed)
+        .await
+        .expect("route A");
+
+    let routable_a_after = store
+        .list_routable("repo-a/project")
+        .await
+        .expect("list A after");
+    let routable_b_after = store
+        .list_routable("repo-b/project")
+        .await
+        .expect("list B after");
+
+    assert!(routable_a_after.is_empty(), "repo A should have 0 routable");
+    assert_eq!(
+        routable_b_after.len(),
+        1,
+        "repo B should still have 1 routable"
+    );
+
+    cleanup_db(&tmp);
 }

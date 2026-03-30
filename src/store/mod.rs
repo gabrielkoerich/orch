@@ -77,6 +77,31 @@ impl TaskStore {
         Ok(store)
     }
 
+    /// Open a store with a single connection.
+    #[allow(dead_code)]
+    ///
+    /// Uses `max_connections(1)` to avoid WAL visibility issues where a write
+    /// on one pooled connection isn't visible to a read on another. Used by
+    /// integration tests that need read-your-own-writes consistency.
+    pub async fn open_single(db_path: &Path) -> anyhow::Result<Self> {
+        let options = SqliteConnectOptions::new()
+            .filename(db_path)
+            .journal_mode(SqliteJournalMode::Wal)
+            .create_if_missing(true)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .pragma("foreign_keys", "ON");
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .with_context(|| format!("opening task store (single): {}", db_path.display()))?;
+
+        let store = Self { pool };
+        store.migrate().await?;
+        Ok(store)
+    }
+
     /// Open an in-memory store (for testing).
     #[cfg(test)]
     pub async fn open_memory() -> anyhow::Result<Self> {
