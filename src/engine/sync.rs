@@ -804,7 +804,12 @@ async fn skills_sync() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let skills_base = crate::home::skills_dir()?;
+    // `crate::home::skills_dir()` performs blocking filesystem operations
+    // (creates directories as needed). Run it on the blocking thread pool so
+    // the async reactor isn't blocked.
+    let skills_base = tokio::task::spawn_blocking(crate::home::skills_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
     let git_timeout = std::time::Duration::from_secs(60);
 
     for skill in skills {
