@@ -924,7 +924,7 @@ pub(crate) async fn review_and_merge(
         file_size,
         "reading review agent output"
     );
-    let raw_output = runner::response::read_output_file(&review_task_id, &output_file, repo);
+    let raw_output = runner::response::read_output_file(&review_task_id, &output_file, repo).await;
     let agent_runner = runner::agents::get_runner(&review_agent);
 
     let exit_code = std::fs::read_to_string(review_attempt_dir.join("exit.txt"))

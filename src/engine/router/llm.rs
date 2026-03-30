@@ -478,10 +478,7 @@ impl LlmRouter {
                                 continue;
                             }
 
-                            let content = match std::fs::read_to_string(&skill_file) {
-                                Ok(c) => c,
-                                Err(_) => String::new(),
-                            };
+                            let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
                             let name = content
                                 .lines()
                                 .next()
@@ -519,10 +516,7 @@ impl LlmRouter {
                                 continue;
                             }
 
-                            let content = match std::fs::read_to_string(&skill_file) {
-                                Ok(c) => c,
-                                Err(_) => String::new(),
-                            };
+                            let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
                             let name = content
                                 .lines()
                                 .next()
