@@ -144,6 +144,7 @@ pub fn spawn(
                         let tid = task.id.0.clone();
                         enum ReviewOutcome {
                             Reset,
+                            RateLimited,
                             Block,
                             Ok,
                         }
@@ -167,65 +168,87 @@ pub fn spawn(
                                 ReviewOutcome::Block
                             }
                             Ok(ReviewDecision::Failed(reason)) => {
-                                let failures = crate::store::store_increment(
-                                    &Some(store_c.clone()),
-                                    &repo_s,
-                                    &tid,
-                                    "review_agent_failures",
-                                )
-                                .await;
-                                let blocking = failures >= MAX_REVIEW_AGENT_FAILURES;
-                                // Post failure comment to the PR so the history is visible.
-                                post_review_failure_comment(
-                                    &store_c, &repo_s, &tid, &reason, failures, blocking,
-                                ).await;
-                                if blocking {
-                                    tracing::error!(
+                                // Rate-limit failures are not real review failures — don't count
+                                // them toward MAX_REVIEW_AGENT_FAILURES. The cooldown system will
+                                // steer the next attempt to an available agent.
+                                if reason.to_lowercase().contains("rate limit") {
+                                    tracing::warn!(
                                         task_id = tid,
                                         reason,
-                                        failures,
-                                        "review agent failed too many times — blocking task"
+                                        "review agent hit rate limit — deferring retry until cooldown expires"
                                     );
-                                    ReviewOutcome::Block
+                                    ReviewOutcome::RateLimited
                                 } else {
-                                    tracing::error!(
-                                        task_id = tid,
-                                        reason,
-                                        failures,
-                                        "review agent failed — resetting to NeedsReview for retry"
-                                    );
-                                    ReviewOutcome::Reset
+                                    let failures = crate::store::store_increment(
+                                        &Some(store_c.clone()),
+                                        &repo_s,
+                                        &tid,
+                                        "review_agent_failures",
+                                    )
+                                    .await;
+                                    let blocking = failures >= MAX_REVIEW_AGENT_FAILURES;
+                                    // Post failure comment to the PR so the history is visible.
+                                    post_review_failure_comment(
+                                        &store_c, &repo_s, &tid, &reason, failures, blocking,
+                                    ).await;
+                                    if blocking {
+                                        tracing::error!(
+                                            task_id = tid,
+                                            reason,
+                                            failures,
+                                            "review agent failed too many times — blocking task"
+                                        );
+                                        ReviewOutcome::Block
+                                    } else {
+                                        tracing::error!(
+                                            task_id = tid,
+                                            reason,
+                                            failures,
+                                            "review agent failed — resetting to NeedsReview for retry"
+                                        );
+                                        ReviewOutcome::Reset
+                                    }
                                 }
                             }
                             Err(e) => {
-                                let failures = crate::store::store_increment(
-                                    &Some(store_c.clone()),
-                                    &repo_s,
-                                    &tid,
-                                    "review_agent_failures",
-                                )
-                                .await;
                                 let reason = format!("{e:#}");
-                                let blocking = failures >= MAX_REVIEW_AGENT_FAILURES;
-                                post_review_failure_comment(
-                                    &store_c, &repo_s, &tid, &reason, failures, blocking,
-                                ).await;
-                                if blocking {
-                                    tracing::error!(
+                                // Rate-limit errors don't count against the failure threshold.
+                                if reason.to_lowercase().contains("rate limit") {
+                                    tracing::warn!(
                                         task_id = tid,
-                                        error = %e,
-                                        failures,
-                                        "review_and_merge failed too many times — blocking task"
+                                        reason,
+                                        "review_and_merge hit rate limit — deferring retry until cooldown expires"
                                     );
-                                    ReviewOutcome::Block
+                                    ReviewOutcome::RateLimited
                                 } else {
-                                    tracing::error!(
-                                        task_id = tid,
-                                        error = %e,
-                                        failures,
-                                        "review_and_merge failed — resetting to NeedsReview for retry"
-                                    );
-                                    ReviewOutcome::Reset
+                                    let failures = crate::store::store_increment(
+                                        &Some(store_c.clone()),
+                                        &repo_s,
+                                        &tid,
+                                        "review_agent_failures",
+                                    )
+                                    .await;
+                                    let blocking = failures >= MAX_REVIEW_AGENT_FAILURES;
+                                    post_review_failure_comment(
+                                        &store_c, &repo_s, &tid, &reason, failures, blocking,
+                                    ).await;
+                                    if blocking {
+                                        tracing::error!(
+                                            task_id = tid,
+                                            error = %e,
+                                            failures,
+                                            "review_and_merge failed too many times — blocking task"
+                                        );
+                                        ReviewOutcome::Block
+                                    } else {
+                                        tracing::error!(
+                                            task_id = tid,
+                                            error = %e,
+                                            failures,
+                                            "review_and_merge failed — resetting to NeedsReview for retry"
+                                        );
+                                        ReviewOutcome::Reset
+                                    }
                                 }
                             }
                             Ok(ReviewDecision::Approve) | Ok(ReviewDecision::Skipped) => {
@@ -278,6 +301,48 @@ pub fn spawn(
                                     .await
                                 {
                                     tracing::error!(task_id = %tid, err = %e, "update_task_status(NeedsReview) failed — task may be stuck in InReview");
+                                }
+                            }
+                            ReviewOutcome::RateLimited => {
+                                // Kill stale tmux session — same as Reset.
+                                let stale_session =
+                                    tmux_c.session_name(&repo_s, &format!("{}-review", tid));
+                                tmux_c.kill_session(&stale_session).await.ok();
+
+                                // Compute wait duration: if any agent is available right now,
+                                // use a short backoff (30 s). If every agent is cooled, sleep
+                                // until the earliest cooldown expires so we don't spin.
+                                let wait_secs = {
+                                    let agents = router_c.read().await.available_agents.clone();
+                                    let any_available = agents
+                                        .iter()
+                                        .any(|a| !crate::engine::cooldown::is_agent_in_cooldown(a));
+                                    if any_available {
+                                        30u64
+                                    } else {
+                                        let now = chrono::Utc::now().timestamp();
+                                        agents
+                                            .iter()
+                                            .filter_map(|a| crate::engine::cooldown::cooldown_until(a))
+                                            .min()
+                                            .map(|until| ((until - now).max(1)) as u64)
+                                            .unwrap_or(crate::engine::cooldown::AGENT_COOLDOWN_SECS as u64)
+                                    }
+                                };
+                                tracing::info!(
+                                    task_id = tid,
+                                    wait_secs,
+                                    "deferring review retry due to agent rate limit cooldown"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                                if let Err(e) = task_manager_c
+                                    .update_task_status(
+                                        &ExternalId(tid.clone()),
+                                        Status::NeedsReview,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(task_id = %tid, err = %e, "update_task_status(NeedsReview) failed after rate limit backoff — task may be stuck in InReview");
                                 }
                             }
                             ReviewOutcome::Block => {
