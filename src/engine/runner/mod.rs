@@ -387,21 +387,9 @@ impl TaskRunner {
                 );
                 // Kill the tmux session in case silence detection missed it
                 let _ = tmux.kill_session(&tmux_session).await;
-                return Ok(Some(RunExecution {
-                    status: "new".to_string(),
-                    exit_code: Some(session_output.exit_code),
-                    audit: RunAudit {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        parsed_response: String::new(),
-                        outcome: String::new(),
-                        error: String::new(),
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        total_cost_usd: 0.0,
-                        duration_secs: 0.0,
-                    },
-                }));
+                // Return Ok(None) so run_with_context treats this as a guard skip
+                // and does not post stale results or update task status.
+                return Ok(None);
             }
         }
 
