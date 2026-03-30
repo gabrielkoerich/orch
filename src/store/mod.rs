@@ -67,7 +67,7 @@ impl TaskStore {
             .pragma("foreign_keys", "ON");
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(5)
             .connect_with(options)
             .await
             .with_context(|| format!("opening task store: {}", db_path.display()))?;
