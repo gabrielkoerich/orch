@@ -55,7 +55,13 @@ pub async fn has_commits_ahead(dir: &Path, default_branch: &str) -> bool {
                 .unwrap_or(0);
             count > 0
         }
-        _ => false,
+        _ => {
+            tracing::debug!(default_branch, "git rev-list failed for compare ref, assuming commits ahead");
+            // If we can't determine, assume there ARE commits ahead so we
+            // attempt a push (better to try and fail loudly than silently
+            // skip push and lose the PR creation path).
+            true
+        }
     }
 }
 
