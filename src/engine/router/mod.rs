@@ -299,6 +299,20 @@ impl Router {
             tracing::debug!(agent, "agent skipped: degraded (pre-emptive health check)");
             return false;
         }
+        // If weighted routing is used, consider the agent degraded when its
+        // weight has decayed below the configured threshold. This avoids
+        // proactively routing to agents that recently hit many rate limits.
+        if self.config.weighted_round_robin {
+            let weight = self.weights.get_weight(agent);
+            if weight < self.config.skip_limited_threshold {
+                tracing::debug!(
+                    agent,
+                    weight,
+                    "agent considered degraded by weight threshold, skipping"
+                );
+                return false;
+            }
+        }
         if !self
             .config
             .has_available_model_for_complexity(agent, complexity)

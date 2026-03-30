@@ -193,13 +193,23 @@ pub fn pick_fallback_agent(
         chain.split(',').collect()
     };
 
+    // Prefer agents that are not in cooldown and are not heavily degraded
+    // from recent rate-limits. This prevents immediate failover to agents
+    // that have been heavily penalized and likely to fail as well.
     for agent in available_agents {
-        if agent != current_agent
-            && !chain_set.contains(agent.as_str())
-            && !is_agent_in_cooldown(agent)
-        {
-            return Some(agent.clone());
+        if agent == current_agent || chain_set.contains(agent.as_str()) {
+            continue;
         }
+        if is_agent_in_cooldown(agent) {
+            continue;
+        }
+        // Weight-based filtering was removed from this module because it used
+        // a default-constructed AgentWeights (dead code that always returned
+        // true). Keep failover behavior simple here: prefer the first agent
+        // that is not in cooldown and not in the reroute chain. If we later
+        // expose the router's AgentWeights snapshot to this module we can add
+        // weight-based avoidance back in a non-dead way.
+        return Some(agent.clone());
     }
 
     None

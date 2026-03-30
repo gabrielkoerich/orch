@@ -461,10 +461,11 @@ These mechanisms integrate with the generic cooldown system as follows:
 
 **Actual integration points** (in `src/engine/router/mod.rs`):
 - `router.refresh_health(&store)` — called each tick; delegates to `cooldown::refresh_degraded_agents()` which queries the `rate_limits` table and updates the in-memory degraded set
-- `router.agent_is_routable(agent, complexity)` — guards all routing paths; returns `false` when `cooldown::is_agent_in_cooldown(agent)` or `cooldown::is_agent_degraded(agent)` is true
+- `router.agent_is_routable(agent, complexity)` — guards all routing paths; returns `false` when `cooldown::is_agent_in_cooldown(agent)` or `cooldown::is_agent_degraded(agent)` is true; additionally skips agents whose `AgentWeights::get_weight` has fallen below `router.skip_limited_threshold` when `weighted_round_robin` is enabled
 - `router.available_agents_for_complexity(complexity)` — filters `available_agents` through `agent_is_routable`; used by round-robin, weighted, and LLM routing paths
 - `cooldown::record_credit_exhaustion(agent, reason)` — applies 6 h (`out_of_credits`) or 12 h (`org_level_disabled`) agent cooldown, which causes `is_agent_in_cooldown` to return true on next check
 - `weights.get_weight(agent)` (in `AgentWeights`) — used by weighted-round-robin; decays on each `record_rate_limit` call and recovers toward 1.0 over time
+- `router.skip_limited_threshold` (`RouterConfig`) — weight threshold below which an agent is considered too degraded for proactive routing; default `0.3`; only evaluated when `weighted_round_robin` is enabled
 
 These checks happen before LLM-based routing, preventing unnecessary invocation attempts when success is unlikely.
 
