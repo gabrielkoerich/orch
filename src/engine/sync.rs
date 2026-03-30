@@ -822,7 +822,13 @@ async fn skills_sync() -> anyhow::Result<()> {
         let repo_dir = skills_base.join(&skill.repo);
         let repo_url = format!("https://github.com/{}.git", skill.repo);
 
-        if repo_dir.exists() {
+        // Use async metadata check instead of `Path::exists()` to avoid
+        // performing blocking syscall on the reactor thread.
+        let repo_exists = tokio::fs::metadata(&repo_dir)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if repo_exists {
             // Pull latest changes with timeout
             tracing::debug!(repo = %skill.repo, "pulling skill repo");
             let pull_result = tokio::time::timeout(
@@ -855,7 +861,7 @@ async fn skills_sync() -> anyhow::Result<()> {
             let parent = repo_dir
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("skill repo path has no parent directory"))?;
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
             let repo_dir_str = repo_dir
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("skill repo path is not valid UTF-8"))?;
