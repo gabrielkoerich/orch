@@ -278,10 +278,17 @@ async fn auto_unblock_blocked_tasks(
         }
 
         let runs = store.get_runs(task.id).await.unwrap_or_default();
-        let agent_runs: Vec<_> = runs.into_iter().filter(|r| r.run_type == "agent").collect();
+        let relevant_runs: Vec<_> = runs
+            .into_iter()
+            .filter(|r| r.run_type == "agent" || r.run_type == "review")
+            .collect();
         let mut failures = Vec::new();
-        for run in agent_runs.iter().rev() {
+        let mut has_review_failure = false;
+        for run in relevant_runs.iter().rev() {
             if let Some(category) = classify_failure_from_run(run) {
+                if run.run_type == "review" {
+                    has_review_failure = true;
+                }
                 failures.push(category);
             }
             if failures.len() >= 3 {
@@ -338,6 +345,18 @@ async fn auto_unblock_blocked_tasks(
                 .await;
         }
 
+        if has_review_failure {
+            let _ = store
+                .set_fields(
+                    task.id,
+                    &[
+                        ("review_agent_failures", serde_json::json!(0)),
+                        ("review_invocations", serde_json::json!(0)),
+                    ],
+                )
+                .await;
+        }
+
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         if do_increment {
             if let Err(e) = store.increment(task.id, "auto_unblock_count").await {
@@ -373,12 +392,22 @@ async fn auto_unblock_blocked_tasks(
             .external_id
             .clone()
             .unwrap_or_else(|| format!("internal:{}", task.id));
+        let new_status = if has_review_failure {
+            Status::NeedsReview
+        } else {
+            Status::New
+        };
+        let new_status_str = if has_review_failure {
+            "needs_review"
+        } else {
+            "new"
+        };
         let _ = store
             .append_activity(
                 task.id,
                 "auto_unblock",
                 Some("blocked"),
-                Some("new"),
+                Some(new_status_str),
                 None,
                 None,
                 Some(&serde_json::json!({
@@ -390,7 +419,7 @@ async fn auto_unblock_blocked_tasks(
             .await;
 
         if let Err(e) = task_manager
-            .update_task_status(&crate::backends::ExternalId(ext_id), Status::New)
+            .update_task_status(&crate::backends::ExternalId(ext_id), new_status)
             .await
         {
             tracing::warn!(
@@ -402,6 +431,7 @@ async fn auto_unblock_blocked_tasks(
             tracing::info!(
                 task_id = task.id,
                 failures = ?failures,
+                review_failure = has_review_failure,
                 "auto-unblocked task with recoverable failures"
             );
         }
