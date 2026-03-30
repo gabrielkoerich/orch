@@ -101,7 +101,20 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
 /// Extract the first JSON code block from markdown.
 fn extract_json_block(text: &str) -> Option<String> {
     let start = text.find("```json")?;
-    let content_start = text[start..].find('\n')? + start + 1;
+    let fence_end = start + "```json".len();
+
+    // Find the first non-whitespace character after the opening fence.
+    // Accept both styles:
+    //  - Block fence with a newline: ```json\n{...}\n```
+    //  - Inline fence with JSON on the same line: ```json{"..."}```
+    let content_start = match text[fence_end..]
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+    {
+        Some((idx, _)) => fence_end + idx,
+        None => fence_end,
+    };
+
     let end = text[content_start..].find("```")? + content_start;
     Some(text[content_start..end].to_string())
 }
@@ -494,6 +507,13 @@ Thanks"#;
         let text = "prefix\n```json\n{\"key\":\"value\"}\n```\nsuffix";
         let block = extract_json_block(text).unwrap();
         assert_eq!(block, "{\"key\":\"value\"}\n");
+    }
+
+    #[test]
+    fn extract_json_block_inline_fence() {
+        let text = "prefix\n```json{\"key\":\"value\"}```\nsuffix";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, "{\"key\":\"value\"}");
     }
 
     #[test]
