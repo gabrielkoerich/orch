@@ -19,6 +19,28 @@ pub fn sequential_dispatch_delay_ms() -> u64 {
         .unwrap_or(1000)
 }
 
+/// Lookback window (in hours) for the pre-emptive agent health check.
+///
+/// The health check queries `rate_limits` for events within this window.
+/// Configurable via `dispatch.health_check_window_hours` (default: 6).
+pub fn health_check_window_hours() -> u32 {
+    crate::config::get("dispatch.health_check_window_hours")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(crate::engine::cooldown::DEFAULT_HEALTH_CHECK_WINDOW_HOURS)
+}
+
+/// Minimum number of rate-limit events within the health check window to
+/// consider an agent degraded.
+///
+/// Configurable via `dispatch.degraded_rate_limit_threshold` (default: 3).
+pub fn degraded_rate_limit_threshold() -> i64 {
+    crate::config::get("dispatch.degraded_rate_limit_threshold")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(crate::engine::cooldown::DEFAULT_DEGRADED_RATE_LIMIT_THRESHOLD)
+}
+
 /// Base delay in milliseconds for exponential backoff between fallback retries.
 pub fn retry_base_delay_ms() -> u64 {
     crate::config::get("dispatch.retry_base_delay_ms")

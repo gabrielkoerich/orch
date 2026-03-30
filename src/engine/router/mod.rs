@@ -256,17 +256,57 @@ impl Router {
         }
     }
 
+    /// Run the pre-emptive health check, refreshing the degraded-agent set.
+    ///
+    /// Queries the `rate_limits` table for recent events and combines with
+    /// cooldown state to mark agents as degraded before routing attempts them.
+    pub async fn refresh_health(&self, store: &std::sync::Arc<crate::store::TaskStore>) {
+        let config_ref = &self.config;
+        let agents = self.available_agents.clone();
+        let model_checker = |agent: &str| -> bool {
+            // Agent has at least one available model across any complexity tier
+            for comp in &["simple", "medium", "complex", "review"] {
+                if config_ref.has_available_model_for_complexity(agent, comp) {
+                    return true;
+                }
+            }
+            false
+        };
+        crate::engine::cooldown::refresh_degraded_agents(
+            store,
+            &agents,
+            &model_checker,
+            config::health_check_window_hours(),
+            config::degraded_rate_limit_threshold(),
+        )
+        .await;
+    }
+
     /// Check if an agent is available.
     pub fn is_agent_available(&self, agent: &str) -> bool {
         self.available_agents.contains(&agent.to_string())
     }
 
     fn agent_is_routable(&self, agent: &str, complexity: &str) -> bool {
-        self.is_agent_available(agent)
-            && !crate::engine::cooldown::is_agent_in_cooldown(agent)
-            && self
-                .config
-                .has_available_model_for_complexity(agent, complexity)
+        if !self.is_agent_available(agent) {
+            return false;
+        }
+        if crate::engine::cooldown::is_agent_in_cooldown(agent) {
+            tracing::debug!(agent, "agent skipped: in cooldown");
+            return false;
+        }
+        if crate::engine::cooldown::is_agent_degraded(agent) {
+            tracing::debug!(agent, "agent skipped: degraded (pre-emptive health check)");
+            return false;
+        }
+        if !self
+            .config
+            .has_available_model_for_complexity(agent, complexity)
+        {
+            tracing::debug!(agent, complexity, "agent skipped: no available model");
+            return false;
+        }
+        true
     }
 
     fn available_agents_for_complexity(&self, complexity: &str) -> Vec<String> {
@@ -385,6 +425,9 @@ impl Router {
         store: &std::sync::Arc<crate::store::TaskStore>,
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
+        // Pre-emptive health check: refresh degraded-agent flags before routing.
+        self.refresh_health(store).await;
+
         loop {
             // 1. Check store agent field first (set by failover, authoritative over labels)
             let store_agent = match store.resolve_task_id(repo, &task.id.0).await {
@@ -2114,5 +2157,106 @@ Hope that helps!"#;
         router.advance_pool_index_after_attempt(2, router.router_pool.len());
 
         assert_eq!(router.pool_index, 0);
+    }
+
+    // ---- Pre-emptive health check: degraded agent exclusion ----
+
+    #[test]
+    fn degraded_agent_excluded_from_routing() {
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert(
+                "test_degraded_routing".to_string(),
+                vec!["model-a".to_string()],
+            );
+
+        let mut router = Router::new(config);
+        router.available_agents = vec!["test_degraded_routing".to_string()];
+
+        // Agent is routable before degradation
+        assert!(router.agent_is_routable("test_degraded_routing", "medium"));
+
+        // Mark as degraded
+        crate::engine::cooldown::mark_agent_degraded("test_degraded_routing");
+
+        // Now excluded from routing
+        assert!(!router.agent_is_routable("test_degraded_routing", "medium"));
+
+        // available_agents_for_complexity returns empty
+        assert!(
+            router.available_agents_for_complexity("medium").is_empty(),
+            "degraded agent should be excluded from available agents"
+        );
+
+        // healthy_agent_count reflects exclusion
+        assert_eq!(router.healthy_agent_count("medium"), 0);
+
+        // Cleanup
+        crate::engine::cooldown::clear_agent_degraded("test_degraded_routing");
+    }
+
+    #[test]
+    fn healthy_agents_skips_degraded_but_keeps_healthy() {
+        let mut config = RouterConfig::default();
+        for agent in &["agent_healthy", "agent_degraded"] {
+            config
+                .model_map
+                .entry("medium".to_string())
+                .or_default()
+                .insert(agent.to_string(), vec!["model-x".to_string()]);
+        }
+
+        let mut router = Router::new(config);
+        router.available_agents = vec!["agent_healthy".to_string(), "agent_degraded".to_string()];
+
+        crate::engine::cooldown::mark_agent_degraded("agent_degraded");
+
+        let candidates = router.available_agents_for_complexity("medium");
+        assert_eq!(candidates, vec!["agent_healthy".to_string()]);
+        assert_eq!(router.healthy_agent_count("medium"), 1);
+
+        // Cleanup
+        crate::engine::cooldown::clear_agent_degraded("agent_degraded");
+    }
+
+    #[tokio::test]
+    async fn refresh_health_marks_degraded_from_rate_limits() {
+        let store = test_store().await;
+        let agent = "test_refresh_health_agent";
+
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert(agent.to_string(), vec!["model-z".to_string()]);
+
+        let mut router = Router::new(config);
+        router.available_agents = vec![agent.to_string()];
+
+        // Insert rate limit events exceeding default threshold (3)
+        for _ in 0..4 {
+            store
+                .record_rate_limit(agent, "rate_limit", None)
+                .await
+                .unwrap();
+        }
+
+        router.refresh_health(&store).await;
+
+        assert!(
+            crate::engine::cooldown::is_agent_degraded(agent),
+            "agent should be degraded after exceeding rate limit threshold"
+        );
+        assert!(
+            !router.agent_is_routable(agent, "medium"),
+            "degraded agent should not be routable"
+        );
+
+        // Cleanup
+        crate::engine::cooldown::clear_agent_degraded(agent);
     }
 }
