@@ -249,7 +249,8 @@ impl LlmRouter {
         }
 
         // Build the routing prompt
-        let prompt = self.build_routing_prompt(task, available_agents, router_agent)?;
+        let prompt =
+            self.build_routing_prompt(task, available_agents, router_agent, &config.weights)?;
 
         // Save prompt and response to per-task routing dir for debugging
         let routing_dir = crate::home::task_dir(repo, &task.id.0)
@@ -372,11 +373,26 @@ impl LlmRouter {
         task: &ExternalTask,
         available_agents: &[String],
         router_agent: &str,
+        configured_weights: &std::collections::HashMap<String, f64>,
     ) -> anyhow::Result<String> {
         let template = include_str!("../../../prompts/route.md");
 
         // Build available agents string
         let available_agents_str = available_agents.join(", ");
+
+        // Build weights string for the prompt
+        let weights_str = if configured_weights.is_empty() {
+            "No weights configured — distribute evenly.".to_string()
+        } else {
+            available_agents
+                .iter()
+                .map(|a| {
+                    let w = configured_weights.get(a).copied().unwrap_or(1.0);
+                    format!("{a}: {w}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
 
         // Build labels string
         let labels = task.labels.join(", ");
@@ -388,6 +404,7 @@ impl LlmRouter {
         let prompt = template
             .replace("{{ROUTER_AGENT}}", router_agent)
             .replace("{{AVAILABLE_AGENTS}}", &available_agents_str)
+            .replace("{{AGENT_WEIGHTS}}", &weights_str)
             .replace("{{SKILLS_CATALOG}}", &skills_catalog)
             .replace("{{TASK_ID}}", &task.id.0)
             .replace("{{TASK_TITLE}}", &task.title)

@@ -98,8 +98,17 @@ impl Router {
     /// Create a new router with the given configuration.
     pub fn new(config: RouterConfig) -> Self {
         let available_agents = Self::discover_agents(&config.agents);
-        let mut weights = AgentWeights::default();
-        weights.ensure_agents(&available_agents);
+        let mut weights = AgentWeights {
+            base_weights: config.weights.clone(),
+            ..Default::default()
+        };
+        weights.ensure_agents_with_weights(&available_agents, &config.weights);
+        if !config.weights.is_empty() {
+            tracing::info!(
+                weights = ?config.weights,
+                "configured agent routing weights"
+            );
+        }
         let router_pool = Self::expand_pool(&config);
         tracing::info!(
             pool = ?router_pool,
@@ -616,7 +625,12 @@ impl Router {
                         self.wait_for_cooldown(Some(&complexity)).await?;
                         continue;
                     }
-                    return strategies::route_via_fallback(&candidates, &self.config, task);
+                    return strategies::route_via_fallback(
+                        &candidates,
+                        &self.config,
+                        task,
+                        Some(&self.weights),
+                    );
                 }
             }
         }

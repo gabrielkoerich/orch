@@ -231,14 +231,33 @@ pub(super) fn route_via_weighted_round_robin(
 
 /// Fallback routing when LLM fails.
 ///
-/// If `fallback_executor` is "round_robin", uses stateless round-robin.
+/// If `fallback_executor` is "round_robin", uses weighted selection when
+/// weights are configured, otherwise stateless round-robin.
 /// Otherwise uses the named agent, falling back to the first available.
 pub(super) fn route_via_fallback(
     available_agents: &[String],
     config: &RouterConfig,
     task: &ExternalTask,
+    weights: Option<&AgentWeights>,
 ) -> anyhow::Result<RouteResult> {
     if config.fallback_executor == "round_robin" {
+        // Use weighted selection if weights are configured
+        if let Some(w) = weights {
+            if !config.weights.is_empty() {
+                let mut last = None;
+                return route_via_weighted_round_robin(
+                    available_agents,
+                    w,
+                    config,
+                    task,
+                    &mut last,
+                )
+                .map(|mut r| {
+                    r.reason = format!("router failed; fallback weighted → {}", r.agent);
+                    r
+                });
+            }
+        }
         return route_via_round_robin(available_agents, config, task).map(|mut r| {
             r.reason = format!("router failed; fallback round_robin → {}", r.agent);
             r

@@ -107,13 +107,45 @@ impl RateLimitState {
 #[derive(Debug, Clone, Default)]
 pub struct AgentWeights {
     pub states: HashMap<String, RateLimitState>,
+    /// Configured base weights per agent (from config.yml).
+    /// Used as the recovery ceiling instead of DEFAULT_WEIGHT.
+    pub base_weights: HashMap<String, f64>,
 }
 
 impl AgentWeights {
-    /// Ensure all available agents have an entry.
+    /// Ensure all available agents have an entry, using configured base weights.
     pub fn ensure_agents(&mut self, agents: &[String]) {
         for agent in agents {
             self.states.entry(agent.clone()).or_default();
+        }
+    }
+
+    /// Ensure all available agents have an entry, applying configured base weights.
+    ///
+    /// Agents with an explicit weight in `config.yml` use that as their base.
+    /// Agents without a configured weight default to `DEFAULT_WEIGHT` (1.0).
+    pub fn ensure_agents_with_weights(
+        &mut self,
+        agents: &[String],
+        configured_weights: &std::collections::HashMap<String, f64>,
+    ) {
+        for agent in agents {
+            let base = configured_weights
+                .get(agent)
+                .copied()
+                .unwrap_or(DEFAULT_WEIGHT);
+            let state = self
+                .states
+                .entry(agent.clone())
+                .or_insert_with(|| RateLimitState {
+                    weight: base,
+                    ..Default::default()
+                });
+            // Update base weight if agent was already initialized (e.g. after config reload)
+            // but only if the agent isn't currently rate-limited (don't override decay)
+            if !state.is_limited() {
+                state.weight = base;
+            }
         }
     }
 
@@ -167,7 +199,7 @@ impl AgentWeights {
                 self.states
                     .get(a)
                     .map(|s| s.weight)
-                    .unwrap_or(DEFAULT_WEIGHT)
+                    .unwrap_or_else(|| self.base_weights.get(a).copied().unwrap_or(DEFAULT_WEIGHT))
             })
             .collect();
 
@@ -195,10 +227,12 @@ impl AgentWeights {
 
     /// Get the current weight for an agent.
     pub fn get_weight(&self, agent: &str) -> f64 {
-        self.states
-            .get(agent)
-            .map(|s| s.weight)
-            .unwrap_or(DEFAULT_WEIGHT)
+        self.states.get(agent).map(|s| s.weight).unwrap_or_else(|| {
+            self.base_weights
+                .get(agent)
+                .copied()
+                .unwrap_or(DEFAULT_WEIGHT)
+        })
     }
 
     /// Get a snapshot of all agent weights (for logging/debugging).

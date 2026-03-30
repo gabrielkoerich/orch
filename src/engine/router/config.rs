@@ -53,6 +53,24 @@ pub struct RouterConfig {
     ///
     /// Example: `0.5` means ~50% of self-routed tasks are redirected to another agent.
     pub self_routing_penalty: f64,
+    /// Configurable base weights per agent.
+    ///
+    /// Higher weight = more tasks routed to this agent. Agents without an explicit
+    /// weight default to 1.0. The weighted selection normalizes these into
+    /// probabilities, so `{claude: 0.6, minimax: 0.03}` means claude gets ~95%
+    /// of tasks when both are available.
+    ///
+    /// Set in `config.yml` under `router.weights`:
+    /// ```yaml
+    /// router:
+    ///   weights:
+    ///     claude: 0.6
+    ///     codex: 0.2
+    ///     opencode: 0.15
+    ///     minimax: 0.03
+    ///     kimi: 0.02
+    /// ```
+    pub weights: HashMap<String, f64>,
 }
 
 /// Parse an `agent:model` pool entry string, splitting on the first colon.
@@ -84,6 +102,7 @@ impl Default for RouterConfig {
             pool: vec![],
             fallback: String::new(),
             self_routing_penalty: 1.0,
+            weights: HashMap::new(),
             allowed_tools: vec![
                 "yq".to_string(),
                 "jq".to_string(),
@@ -224,6 +243,16 @@ impl RouterConfig {
         if let Ok(val) = crate::config::get("router.self_routing_penalty") {
             if let Ok(penalty) = val.parse::<f64>() {
                 config.self_routing_penalty = penalty.clamp(0.0, 1.0);
+            }
+        }
+
+        // Parse per-agent weights from router.weights.<agent>
+        for agent in &config.agents {
+            let key = format!("router.weights.{agent}");
+            if let Ok(val) = crate::config::get(&key) {
+                if let Ok(w) = val.parse::<f64>() {
+                    config.weights.insert(agent.clone(), w.max(0.0));
+                }
             }
         }
 
