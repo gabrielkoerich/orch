@@ -106,7 +106,9 @@ pub async fn rebase_worktree_on_origin_main(
     // cannot interfere by popping the wrong stash. If the stash command
     // fails we log the stderr and SKIP the startup rebase to avoid
     // destroying a worktree due to an un-stashed dirty state.
-    let stash_ref: Option<String> = if crate::engine::runner::git_ops::has_changes(&worktree_dir).await {
+    let stash_ref: Option<String> = if crate::engine::runner::git_ops::has_changes(worktree_dir)
+        .await
+    {
         let stash_out = Command::new("git")
             .args([
                 "-C",

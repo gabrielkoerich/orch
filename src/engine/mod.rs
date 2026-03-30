@@ -381,7 +381,8 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                 | TaskStatus::NeedsReview
                 | TaskStatus::InReview => {
                     tracing::info!(repo = %engine.repo, task_id = %task_id, worktree = %worktree_dir.display(), "rebasing startup worktree");
-                    if let Err(e) = rebase_worktree_on_origin_main(&worktree_dir, &default_branch).await
+                    if let Err(e) =
+                        rebase_worktree_on_origin_main(&worktree_dir, &default_branch).await
                     {
                         // If rebase failed we already made efforts to stash and
                         // restore changes safely. Log the error and reset the
