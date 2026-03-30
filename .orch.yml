@@ -57,7 +57,7 @@ jobs:
 
       ## Where to look (in priority order)
 
-      1. **Design specs** - check `docs/superpowers/specs/` for concrete, unimplemented items. FIRST verify whether each item already exists in code, prompts, schema, or tests before filing anything. Break real gaps into small, actionable tasks.
+      1. **Design specs** - check `docs/research/*.md`, `docs/specs/*.md` and `docs/plans/*.md` for concrete, unimplemented items. FIRST verify whether each item already exists in code, prompts, schema, or tests before filing anything and respect docs/architecture.md decisions. Break real gaps into small, actionable tasks.
       2. **Agent failures** - check `orch task list --status blocked` and `orch task list --status needs_review`. Read recent task attempts in `~/.orch/state/*/tasks/*/attempts/` and determine the root cause: prompt weakness, missing tool, timeout, flaky workflow, model limitation, or missing product logic.
       3. **Logs and operations** - run `orch log 200` and look for recurring failures, noisy warnings, retries, rate limits, slow paths, webhook/polling confusion, and dispatch loops. Create tasks that remove the underlying cause, not just the visible symptom.
       4. **Prompt effectiveness** - review `prompts/*.md` and compare them with recent task behavior. Look for unclear instructions, conflicting constraints, brittle output requirements, missing examples, or prompts that encourage duplicated/repeated work.
