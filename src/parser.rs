@@ -102,21 +102,46 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
 fn extract_json_block(text: &str) -> Option<String> {
     let start = text.find("```json")?;
     let fence_end = start + "```json".len();
+    let remainder = &text[fence_end..];
 
-    // Find the first non-whitespace character after the opening fence.
-    // Accept both styles:
-    //  - Block fence with a newline: ```json\n{...}\n```
-    //  - Inline fence with JSON on the same line: ```json{"..."}```
-    let content_start = match text[fence_end..]
-        .char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
-    {
-        Some((idx, _)) => fence_end + idx,
-        None => fence_end,
-    };
+    // Find the position of the first newline and first closing fence after the opening fence
+    let newline_pos = remainder.find('\n');
+    let close_fence_pos = remainder.find("```");
 
-    let end = text[content_start..].find("```")? + content_start;
-    Some(text[content_start..end].to_string())
+    // If there's a closing fence before the first newline (or no newline), treat as inline
+    // Otherwise, treat as a fenced block
+    if let Some(close_pos) = close_fence_pos {
+        if let Some(newline_pos) = newline_pos {
+            // Both newline and closing fence exist - check which comes first
+            if close_pos < newline_pos {
+                // Closing fence comes first - inline JSON
+                // Find first non-whitespace character after the fence
+                let content_start = remainder
+                    .char_indices()
+                    .find(|(_, ch)| !ch.is_whitespace())
+                    .map_or(fence_end, |(idx, _)| fence_end + idx);
+                let end = text[content_start..].find("```")? + content_start;
+                return Some(text[content_start..end].to_string());
+            } else {
+                // Newline comes first - fenced block
+                let content_start = fence_end + newline_pos + 1;
+                let end = text[content_start..].find("```")? + content_start;
+                return Some(text[content_start..end].to_string());
+            }
+        } else {
+            // No newline found - definitely inline JSON
+            // Find first non-whitespace character after the fence
+            let content_start = remainder
+                .char_indices()
+                .find(|(_, ch)| !ch.is_whitespace())
+                .map_or(fence_end, |(idx, _)| fence_end + idx);
+            let end = text[content_start..].find("```")? + content_start;
+            return Some(text[content_start..end].to_string());
+        }
+    } else {
+        // No closing fence found - invalid block
+        None
+    }
 }
 
 /// Fields that indicate a JSON blob is an AgentResponse (higher score = better match).
@@ -514,6 +539,28 @@ Thanks"#;
         let text = "prefix\n```json{\"key\":\"value\"}```\nsuffix";
         let block = extract_json_block(text).unwrap();
         assert_eq!(block, "{\"key\":\"value\"}");
+    }
+
+    #[test]
+    fn extract_json_block_with_info_string() {
+        let text = "prefix\n```json some-meta\n{\"key\":\"value\"}\n```\nsuffix";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, "{\"key\":\"value\"}\n");
+    }
+
+    #[test]
+    fn extract_json_block_with_info_string_and_whitespace() {
+        let text = "prefix\n```json   some-meta   \n{\"key\":\"value\"}\n```\nsuffix";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, "{\"key\":\"value\"}\n");
+    }
+
+    #[test]
+    fn extract_json_block_inline_with_internal_newline() {
+        // Inline JSON that contains a newline inside the JSON value
+        let text = "prefix\n```json{\"key\":\"value\\nwith newline\"}```\nsuffix";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, r#"{"key":"value\nwith newline"}"#);
     }
 
     #[test]
