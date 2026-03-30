@@ -616,7 +616,9 @@ impl LlmRouter {
                 let json_str = &after_start[..json_end].trim();
                 if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
                     if parsed.executor.trim().is_empty() {
-                        anyhow::bail!("LLM response missing required 'executor' field in fenced block");
+                        anyhow::bail!(
+                            "LLM response missing required 'executor' field in fenced block"
+                        );
                     }
                     return Ok(parsed);
                 }
