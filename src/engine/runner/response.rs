@@ -1276,7 +1276,6 @@ That's all."#;
         );
     }
 
-<<<<<<< HEAD
     // ── parse_review_from_agent_output ──────────────────────────
 
     #[test]
