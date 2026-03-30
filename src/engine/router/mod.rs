@@ -509,13 +509,15 @@ impl Router {
 
             let complexity = strategies::extract_complexity_from_labels(&task.labels);
 
+            // Check if any agents have available models for this complexity
+            let candidates = self.available_agents_for_complexity(&complexity);
+            if candidates.is_empty() {
+                self.wait_for_cooldown(Some(&complexity)).await?;
+                continue;
+            }
+
             // 2. Weighted round-robin — capacity-based selection
             if self.config.weighted_round_robin {
-                let candidates = self.available_agents_for_complexity(&complexity);
-                if candidates.is_empty() {
-                    self.wait_for_cooldown(Some(&complexity)).await?;
-                    continue;
-                }
                 return strategies::route_via_weighted_round_robin(
                     &candidates,
                     &self.weights,
@@ -527,11 +529,6 @@ impl Router {
 
             // 3. Round-robin mode — use stateful round-robin
             if self.config.mode == "round_robin" {
-                let candidates = self.available_agents_for_complexity(&complexity);
-                if candidates.is_empty() {
-                    self.wait_for_cooldown(Some(&complexity)).await?;
-                    continue;
-                }
                 tracing::debug!(task_id = %task.id.0, "routing via round-robin mode");
                 return strategies::route_via_round_robin_stateful(
                     &candidates,
@@ -634,13 +631,14 @@ impl Router {
                 }
                 Err(e) => {
                     if let Some(err) = e.downcast_ref::<AllCooledError>() {
-                        tracing::warn!(scope = %err.scope, "router cooldown gate tripped");
-                        let scope = if err.scope == "all agents" {
+                        let scope = err.scope.as_str();
+                        tracing::warn!(scope = %scope, "router cooldown gate tripped");
+                        let scope_opt = if scope == "all agents" {
                             None
                         } else {
-                            Some(err.scope.as_str())
+                            Some(scope)
                         };
-                        self.wait_for_cooldown(scope).await?;
+                        self.wait_for_cooldown(scope_opt).await?;
                         continue;
                     }
 

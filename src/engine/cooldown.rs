@@ -72,7 +72,6 @@ const SILENCE_COUNT_PREFIX: &str = "silence_count:";
 struct CooldownEntry {
     /// Unix timestamp when the cooldown expires.
     cooldown_until: i64,
-    #[allow(dead_code)]
     reason: String,
 }
 
@@ -317,6 +316,19 @@ pub fn cooldown_until(key: &str) -> Option<i64> {
         let now = chrono::Utc::now().timestamp();
         if now < entry.cooldown_until {
             Some(entry.cooldown_until)
+        } else {
+            None
+        }
+    })
+}
+
+/// Return the reason string recorded when a cooldown was set, if the cooldown is still active.
+pub fn cooldown_reason(key: &str) -> Option<String> {
+    let map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(key).and_then(|entry| {
+        let now = chrono::Utc::now().timestamp();
+        if now < entry.cooldown_until {
+            Some(entry.reason.clone())
         } else {
             None
         }
