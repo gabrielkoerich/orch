@@ -337,3 +337,6 @@ graph LR
 - **`src/engine/runner/`** — Tmux IS the PTY. No external PTY runners.
 - **`src/github/auth.rs`** — Deleted (dead code). Do not recreate.
 - **No external endpoints** — Orch is an internal tool with no external network access. No public HTTP/webhook endpoints. The webhook receiver exists but only works when the machine is reachable (rarely). External consumers (CLI, local tools) connect via localhost-only websocket. Do not add externally-reachable servers or rely on inbound connections from GitHub/other services.
+- **Migrations are immutable** — Never modify existing migration files in `migrations/`. SQLx locks checksums on first run. Always create a new numbered migration file instead. Modifying an existing one breaks `TaskStore::open()` on all existing databases.
+- **Config files are off-limits** — Agents must never modify `~/.orch/config.yml`, `config.example.yml`, or `.orch.yml` project configs.
+- **Cooldown system is generic** — Do not add special-case handling for specific models/agents. The cooldown system handles all failures generically.

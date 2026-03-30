@@ -437,6 +437,12 @@ Issue #1286 was closed as invalid — it proposed special-casing copilot model f
 
 If you believe the generic system has a bug (e.g., cooldowns not being applied, silence not detected), file an issue about the **generic mechanism**, not about a specific model.
 
+### Migrations are immutable — NEVER modify existing migration files
+
+Once a migration file has been applied to any database, its checksum is locked by SQLx. Modifying an existing migration file changes the checksum, causing `sqlx::migrate!()` to fail on every startup — breaking the service completely.
+
+**Always create a NEW migration file** (e.g., `014_new_column.sql`) instead of editing an existing one. Issue `d02cdda` modified `012_auto_unblock.sql` and broke the service for 70+ minutes.
+
 ### No external endpoints
 
 Orch is an internal tool running on a local machine with no external network access. There are no publicly reachable HTTP/webhook endpoints. The webhook receiver in the config exists but only works when the machine happens to be reachable (rare). GitHub polling fallback is the default mode.

@@ -513,7 +513,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     // orch.error.log, so any warn!/error! here would appear as
                     // spurious noise even when projects are configured correctly
                     // and the service will succeed on the next attempt.
-                    tracing::debug!(
+                    tracing::warn!(
                         delay_secs,
                         attempt,
                         "project backends unavailable, retrying: {e}"
