@@ -116,6 +116,9 @@ pub struct Task {
     // CI-based auto-recovery tracking (separate from auto_unblock_count)
     pub ci_recovery_count: i32,
 
+    // Done-without-PR circuit breaker
+    pub no_code_reroutes: i32,
+
     // Timestamps
     pub created_at: String,
     pub updated_at: String,
@@ -671,6 +674,7 @@ impl TaskStore {
             "auto_unblock_last_at",
             "auto_unblock_last_reason",
             "ci_recovery_count",
+            "no_code_reroutes",
         ];
 
         for (col, _) in updates {
@@ -724,6 +728,7 @@ impl TaskStore {
             "review_invocations",
             "auto_unblock_count",
             "ci_recovery_count",
+            "no_code_reroutes",
         ];
 
         anyhow::ensure!(
@@ -758,6 +763,7 @@ impl TaskStore {
             auto_unblock_last_at = '',
             auto_unblock_last_reason = '',
             ci_recovery_count = 0,
+            no_code_reroutes = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
@@ -788,6 +794,7 @@ impl TaskStore {
             auto_unblock_last_at = '',
             auto_unblock_last_reason = '',
             ci_recovery_count = 0,
+            no_code_reroutes = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
@@ -1241,6 +1248,7 @@ impl TaskStore {
             auto_unblock_last_at: row.get("auto_unblock_last_at"),
             auto_unblock_last_reason: row.get("auto_unblock_last_reason"),
             ci_recovery_count: row.get("ci_recovery_count"),
+            no_code_reroutes: row.get("no_code_reroutes"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         })
