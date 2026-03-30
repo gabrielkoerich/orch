@@ -44,14 +44,26 @@ pub async fn handle_error(
 
     // Map AgentError to RetryableError for the existing handle_failover()
     let (retryable, error_msg) = match agent_err {
-        agents::AgentError::RateLimit { message, .. } => (
-            response::RetryableError::UsageLimit,
-            format!("{agent_name} rate limit: {message}"),
-        ),
-        agents::AgentError::Auth { message } => (
-            response::RetryableError::AuthError,
-            format!("{agent_name} auth error: {message}"),
-        ),
+        agents::AgentError::RateLimit { message, .. } => {
+            // Check for credit exhaustion - these require longer agent-wide cooldowns
+            if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
+                crate::engine::cooldown::record_credit_exhaustion(agent_name, reason);
+            }
+            (
+                response::RetryableError::UsageLimit,
+                format!("{agent_name} rate limit: {message}"),
+            )
+        }
+        agents::AgentError::Auth { message } => {
+            // Check for credit exhaustion in auth errors (billing-related)
+            if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
+                crate::engine::cooldown::record_credit_exhaustion(agent_name, reason);
+            }
+            (
+                response::RetryableError::AuthError,
+                format!("{agent_name} auth error: {message}"),
+            )
+        }
         agents::AgentError::Timeout { elapsed } => (
             response::RetryableError::Timeout,
             format!("{agent_name} timed out after {}s", elapsed.as_secs()),
