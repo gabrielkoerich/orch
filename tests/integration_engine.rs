@@ -91,13 +91,13 @@ async fn store_opens_and_migrates() {
 async fn store_migrations_idempotent() {
     let tmp = std::env::temp_dir().join(format!("orch-engine-test-{}.db", std::process::id()));
 
-    // First open
+    // First open (uses real open with max_connections(5) — production path)
     {
         let result = TaskStore::open(&tmp).await;
         assert!(result.is_ok(), "first open failed: {:?}", result.err());
     }
 
-    // Second open (validates checksums)
+    // Second open (validates checksums against already-applied migrations)
     {
         let result = TaskStore::open(&tmp).await;
         assert!(
@@ -116,7 +116,7 @@ async fn store_migrations_idempotent() {
 #[tokio::test]
 async fn store_tasks_table_exists() {
     let tmp = std::env::temp_dir().join(format!("orch-engine-table-{}.db", std::process::id()));
-    let store = TaskStore::open(&tmp).await.expect("open store");
+    let store = TaskStore::open_single(&tmp).await.expect("open store");
 
     // Just verify the tasks table is queryable (schema is correct)
     let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tasks")
@@ -151,7 +151,7 @@ async fn mock_backend_health_check() {
 #[tokio::test]
 async fn cooldown_init_with_store() {
     let tmp = std::env::temp_dir().join(format!("orch-engine-cooldown-{}.db", std::process::id()));
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
     orch::engine::cooldown::init_cooldown_store(store).await;
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
@@ -193,7 +193,7 @@ async fn project_engine_constructs() {
     use orch::engine::ProjectEngine;
 
     let tmp = temp_db("pe-construct");
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
     let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
 
     let task_manager = Arc::new(TaskManager::with_store(
@@ -225,7 +225,7 @@ async fn task_manager_creates_internal_task() {
     use orch::store::TaskStatus;
 
     let tmp = temp_db("tm-create");
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
     let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend);
 
     let tm = TaskManager::with_store(backend, store.clone(), "test/repo".to_string());
@@ -274,7 +274,7 @@ async fn create_external_task_and_retrieve() {
     use orch::store::{NewTask, TaskStatus};
 
     let tmp = temp_db("create-ext");
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     let id = store
         .create(&NewTask {
@@ -319,7 +319,7 @@ async fn task_status_lifecycle() {
     use orch::store::TaskStatus;
 
     let tmp = temp_db("status-lifecycle");
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     let id = store
         .create_internal("test/repo", "Lifecycle test", "", "test", "lc-1")
@@ -373,7 +373,7 @@ async fn store_route_result_persists() {
     use orch::store::{StoreRoute, TaskStatus};
 
     let tmp = temp_db("route-persist");
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     let id = store
         .create_internal("test/repo", "Route me", "task body", "test", "rt-1")
@@ -423,7 +423,7 @@ async fn router_round_robin_routes_task() {
     use orch::store::UpsertExternal;
 
     let tmp = temp_db("rr-route");
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     // Use round_robin mode so no LLM call is needed.
     // Only include agents likely to be in PATH on CI/dev machines.
@@ -512,7 +512,7 @@ async fn task_runner_constructs_with_store() {
     use orch::engine::runner::TaskRunner;
 
     let tmp = temp_db("runner-construct");
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     let _runner = TaskRunner::new("test/repo".to_string()).with_store(store);
     // Construction succeeded without panic — that's the test
@@ -527,7 +527,7 @@ async fn task_runner_constructs_with_store() {
 #[tokio::test]
 async fn task_activity_tracking() {
     let tmp = temp_db("activity");
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     let id = store
         .create_internal("test/repo", "Activity test", "", "test", "act-1")
@@ -567,7 +567,7 @@ async fn engine_tick_simulation() {
     use orch::store::{StoreRoute, TaskStatus, UpsertExternal};
 
     let tmp = temp_db("tick-sim");
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     // Phase 0: upsert an external task (simulates sync from GitHub)
     let ext = UpsertExternal {
@@ -667,7 +667,7 @@ async fn task_blocked_with_reason() {
     use orch::store::TaskStatus;
 
     let tmp = temp_db("blocked");
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     let id = store
         .create_internal("test/repo", "Blocked task", "", "test", "blk-1")
@@ -716,7 +716,7 @@ async fn multi_repo_task_isolation() {
     use orch::store::TaskStatus;
 
     let tmp = temp_db("multi-repo");
-    let store = Arc::new(TaskStore::open(&tmp).await.expect("open store"));
+    let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     store
         .create_internal("repo-a/project", "Task A", "", "test", "a-1")
