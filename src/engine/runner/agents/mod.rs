@@ -7,6 +7,8 @@
 
 pub mod claude;
 pub mod codex;
+pub mod kimi;
+pub mod minimax;
 pub mod opencode;
 
 use crate::parser::AgentResponse;
@@ -410,7 +412,9 @@ pub trait AgentRunner: Send + Sync {
 /// Get the appropriate AgentRunner implementation for an agent name.
 pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
     match agent_name {
-        "claude" | "kimi" | "minimax" => Box::new(claude::ClaudeRunner::new(agent_name)),
+        "claude" => Box::new(claude::ClaudeRunner::new(agent_name)),
+        "kimi" => Box::new(kimi::KimiClaudeRunner::new()),
+        "minimax" => Box::new(minimax::MiniMaxClaudeRunner::new(agent_name)),
         "codex" => Box::new(codex::CodexRunner),
         "opencode" => Box::new(opencode::OpenCodeRunner::new()),
         // Unknown agents fall back to Claude-compatible parsing
