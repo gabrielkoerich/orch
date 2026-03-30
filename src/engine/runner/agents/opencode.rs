@@ -133,16 +133,19 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
     let full = texts.join("");
     if let Some(json) = extract_json_object(&full) {
         // Be conservative: only accept a full-json payload if it looks like a
-        // structured task response / routing decision. This avoids returning
-        // unrelated JSON fragments that happen to appear in prose and causing
-        // false-positive parse failures upstream.
-        let lower = json.to_ascii_lowercase();
-        if lower.contains("\"executor\"")
-            || lower.contains("\"status\"")
-            || lower.contains("\"complexity\"")
-            || lower.contains("\"decision\"")
-        {
-            return Some(json);
+        // structured task response / routing decision. Parse the JSON and
+        // inspect top-level keys rather than using substring matches which can
+        // trigger on values or unrelated text.
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
+            if let Some(obj) = val.as_object() {
+                if obj.contains_key("executor")
+                    || obj.contains_key("status")
+                    || obj.contains_key("complexity")
+                    || obj.contains_key("decision")
+                {
+                    return Some(json);
+                }
+            }
         }
         // Otherwise fall through and try per-event heuristics below
     }
@@ -150,13 +153,20 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
     for text in texts.iter().rev() {
         let trimmed = text.trim();
         if let Some(json) = extract_json_object(trimmed) {
-            if json.contains("status") || json.contains("executor") {
-                return Some(json);
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
+                if let Some(obj) = val.as_object() {
+                    if obj.contains_key("executor") || obj.contains_key("status") {
+                        return Some(json);
+                    }
+                }
             }
         }
+        // As a conservative fallback, if the trimmed chunk contains a '{' and
+        // looks like it mentions routing keys, return it. We keep this branch
+        // minimal to avoid accidental acceptance of unrelated log blobs.
         if trimmed.contains('{')
-            && (trimmed.contains("status")
-                || trimmed.contains("executor")
+            && (trimmed.contains("executor")
+                || trimmed.contains("status")
                 || trimmed.contains("complexity"))
         {
             return Some(text.clone());
