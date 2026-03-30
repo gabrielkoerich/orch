@@ -739,6 +739,17 @@ pub(crate) mod patterns {
     /// Default assumed timeout duration when we only have the exit code.
     const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
+    /// How many bytes from the end of combined stdout+stderr we scan for
+    /// transient rate-limit / usage-limit patterns.
+    ///
+    /// Rationale: real CLI error messages (rate limits, HTTP 429s) almost
+    /// always appear at the end of the process output. Scanning only the tail
+    /// avoids false-positives from agent work product (code, diffs, commit
+    /// messages) which may mention "quota", "limit", etc. 3000 bytes is a
+    /// conservative window large enough to capture multi-line error dumps but
+    /// small enough to exclude most long-form agent outputs.
+    const RATE_LIMIT_SCAN_TAIL_BYTES: usize = 3000;
+
     /// Run all pattern detectors against combined stdout+stderr.
     /// Returns the first matching AgentError, or a generic Unknown.
     pub fn classify_from_text(exit_code: i32, text: &str) -> AgentError {
@@ -766,8 +777,13 @@ pub(crate) mod patterns {
         // Only scan the tail of the combined output for rate limit patterns.
         // The full output may contain agent work product (code, diffs, commit
         // messages) that incidentally mentions rate-limiting keywords. Real
-        // CLI rate-limit errors appear at the end of the output.
-        if let Some(e) = detect_rate_limit(safe_tail(text, 3000).as_str()) {
+        // CLI rate-limit errors appear at the end of the output. Scan a
+        // bounded tail (`RATE_LIMIT_SCAN_TAIL_BYTES`) to reduce false
+        // positives. Also, do not consider plain success envelopes (e.g.
+        // `is_error=false` handled earlier in agent-specific parsing) as
+        // errors — callers should only invoke classify_from_text when the
+        // process indicates failure.
+        if let Some(e) = detect_rate_limit(safe_tail(text, RATE_LIMIT_SCAN_TAIL_BYTES).as_str()) {
             return e;
         }
         if let Some(e) = detect_network_error(text) {
