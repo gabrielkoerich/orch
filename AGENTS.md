@@ -437,6 +437,15 @@ Issue #1286 was closed as invalid — it proposed special-casing copilot model f
 
 If you believe the generic system has a bug (e.g., cooldowns not being applied, silence not detected), file an issue about the **generic mechanism**, not about a specific model.
 
+### Pre-emptive Routability and Circuit-Breaker Behavior
+
+The router implements a small set of pre-emptive checks to avoid invoking agents that are very likely to fail. These checks are an optimization on top of the generic cooldown system — they do not introduce a separate special-case recovery path.
+
+- Pre-emptive routability: before routing, the router evaluates agent routing weights and cooldown state; agents whose weight has decayed below `router.skip_limited_threshold` or that are in agent/model cooldown are skipped so the router doesn't attempt obvious failures.
+- Circuit-breaker for credit exhaustion: when `out_of_credits` or `org_level_disabled` events are recorded, the cooldown system applies extended durations (hours) for affected agents/models to prevent repeated futile retries.
+- Integration: all cooldown state and weight decay are managed by `src/engine/cooldown.rs` and the router queries that state via `is_agent_in_cooldown`/`is_model_in_cooldown` and `AgentWeights`. This keeps the failure-recovery logic centralized and auditable.
+
+
 ### Migrations are immutable — NEVER modify existing migration files
 
 Once a migration file has been applied to any database, its checksum is locked by SQLx. Modifying an existing migration file changes the checksum, causing `sqlx::migrate!()` to fail on every startup — breaking the service completely.
