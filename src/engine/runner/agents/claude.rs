@@ -124,15 +124,12 @@ impl ClaudeRunner {
         // Extract duration
         let duration_ms = envelope.get("duration_ms").and_then(|v| v.as_u64());
 
-        // Parse the inner result text into AgentResponse
-        let response = parser::parse(result_text).map_err(|_| {
-            // Check if result_text itself contains error signals
-            if let Some(e) = super::patterns::detect_rate_limit(result_text) {
-                return e;
-            }
-            AgentError::InvalidResponse {
-                raw: result_text.to_string(),
-            }
+        // Parse the inner result text into AgentResponse.
+        // Do NOT check for rate limits here — result_text is agent work product
+        // (summary, code descriptions) when is_error=false. Rate-limit keywords
+        // in work product cause false positives (see issue #1292).
+        let response = parser::parse(result_text).map_err(|_| AgentError::InvalidResponse {
+            raw: result_text.to_string(),
         })?;
 
         Ok(ParsedResponse {
@@ -680,6 +677,35 @@ mod tests {
 
         let err = runner().parse_response(raw).unwrap_err();
         assert!(matches!(err, AgentError::RateLimit { .. }));
+    }
+
+    #[test]
+    fn parse_envelope_no_false_positive_from_work_product_result() {
+        // Regression test for issue #1292: when is_error=false but the result
+        // text contains rate-limit keywords (agent describing work it did),
+        // parse_response must NOT return a RateLimit error.
+        let result_body = serde_json::json!({
+            "status": "needs_review",
+            "summary": "Added detect_rate_limit helper and quota exceeded handling",
+            "accomplished": ["fn detect_rate_limit", "quota patterns for billing cycle"],
+            "remaining": [],
+            "files": []
+        })
+        .to_string();
+        // Wrap in an envelope but make it unparseable as AgentResponse by
+        // embedding rate-limit prose instead of JSON — simulates the agent
+        // returning a plain-text summary with rate-limit keywords.
+        let raw = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1000,"result":"Added detect_rate_limit and quota exceeded patterns","usage":{"input_tokens":10,"output_tokens":5}}"#.to_string();
+        // result text is plain prose containing rate-limit keywords; parser::parse
+        // will fail, and the old code would have returned RateLimit — fix ensures
+        // it returns InvalidResponse instead.
+        let err = runner().parse_response(&raw).unwrap_err();
+        assert!(
+            !matches!(err, AgentError::RateLimit { .. }),
+            "work product in result field must not trigger rate limit, got: {err:?}"
+        );
+        // Drop the unused variable
+        let _ = result_body;
     }
 
     #[test]
