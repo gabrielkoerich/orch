@@ -333,18 +333,12 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
         tracing::debug!(raw = date_str, "could not parse retry-at date");
     }
 
-    // "billing cycle" / "next cycle" / "quota" without a specific date → cooldown 24 hours.
-    if lower.contains("billing cycle")
-        || lower.contains("next cycle")
-        || lower.contains("quota will be refreshed")
-        || lower.contains("usage limit")
-        || lower.contains("quota exceeded")
-    {
-        let twenty_four_hours = chrono::Utc::now().timestamp() + 24 * 60 * 60;
-        tracing::info!("detected billing cycle limit — cooldown for 24 hours");
-        return Some(twenty_four_hours);
-    }
-
+    // Without a specific "try again at" date, return None and let the caller
+    // use its default cooldown (30 min agent / 1 hour model).  Only codex
+    // provides exact retry dates in its rate-limit messages; other agents
+    // (claude, opencode, kimi, minimax) have temporary limits that clear
+    // within minutes.  A blanket 24 h fallback here caused false billing-
+    // cycle cooldowns on agents that don't have billing cycles (#1292).
     None
 }
 
@@ -441,16 +435,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_at_billing_cycle_sets_24h_cooldown() {
+    fn parse_retry_at_billing_cycle_without_date_returns_none() {
+        // Without a specific "try again at" date, parse_retry_at should return
+        // None so callers use their default cooldown (30m agent / 1h model).
         let msg = "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle. Upgrade to get more.";
-        let ts = parse_retry_at(msg);
-        assert!(ts.is_some(), "billing cycle message should set a cooldown");
-        let now = chrono::Utc::now().timestamp();
-        let remaining = ts.unwrap() - now;
-        // Should be ~24 hours (86400s), allow ±5s for test execution time
         assert!(
-            remaining > 86395 && remaining <= 86400,
-            "billing cycle cooldown should be ~24 hours, got {remaining}s"
+            parse_retry_at(msg).is_none(),
+            "billing cycle without date should return None"
         );
     }
 

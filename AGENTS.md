@@ -421,6 +421,22 @@ If a config change is needed, describe the required change in the issue body or 
 
 Issues #1261 and #1172 were caused by agents modifying config files without permission.
 
+### Cooldown and failure recovery is generic — do not special-case models or agents
+
+The cooldown system (`src/engine/cooldown.rs`) and failure recovery (`src/engine/sync.rs`) are designed to handle **all** agent and model failures generically:
+
+- Agent failures → 30-minute agent cooldown → router picks a different agent
+- Model failures → 1-hour model cooldown → router picks a different model
+- Rate limits with "try again at" → cooldown set to that exact timestamp
+- Silence detection → model cooldown + short agent cooldown → re-route
+- Billing cycle exhaustion → 24h cooldown (or vendor-specified date)
+
+**Do not file issues to add special handling for specific models or agents** (e.g., "copilot models need longer cooldowns", "add fallback for kimi rate limits"). If a model silently fails, the existing silence detection + cooldown handles it. If a model is rate-limited, `parse_retry_at` handles it. If all models for an agent are cooled, the router picks a different agent.
+
+Issue #1286 was closed as invalid — it proposed special-casing copilot model failures when the generic system already handles them.
+
+If you believe the generic system has a bug (e.g., cooldowns not being applied, silence not detected), file an issue about the **generic mechanism**, not about a specific model.
+
 ### No external endpoints
 
 Orch is an internal tool running on a local machine with no external network access. There are no publicly reachable HTTP/webhook endpoints. The webhook receiver in the config exists but only works when the machine happens to be reachable (rare). GitHub polling fallback is the default mode.
