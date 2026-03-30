@@ -164,7 +164,24 @@ pub(crate) fn extract_stream_json_result_text(raw: &str) -> Result<String, Agent
         return Err(AgentError::InvalidResponse { raw: String::new() });
     }
 
-    let envelope_text = find_ndjson_result_line(trimmed).unwrap_or(trimmed);
+    // Prefer the final result envelope, but guard against the case where the
+    // runner emits a leading `system init` event and no result line was found.
+    // find_ndjson_result_line will return the last line with `"type":"result"`.
+    let envelope_line_opt = find_ndjson_result_line(trimmed);
+
+    // If there was no explicit result line, try the opencode-style extractor
+    // which scans NDJSON lines for text/result payloads (and skips system/init
+    // envelopes). This covers wrappers that emit a non-result JSON envelope
+    // followed by a text event containing the real payload.
+    if envelope_line_opt.is_none() {
+        if let Some(fallback) =
+            crate::engine::runner::agents::opencode::extract_router_text(trimmed)
+        {
+            return Ok(fallback);
+        }
+    }
+
+    let envelope_text = envelope_line_opt.unwrap_or(trimmed);
     let parsed_json: serde_json::Value =
         serde_json::from_str(envelope_text).map_err(|_| AgentError::InvalidResponse {
             raw: envelope_text.to_string(),
@@ -177,6 +194,16 @@ pub(crate) fn extract_stream_json_result_text(raw: &str) -> Result<String, Agent
         })?;
 
     if envelope.get("type").and_then(|v| v.as_str()) != Some("result") {
+        // If the only JSON envelope found is a non-result (eg. system/init),
+        // try to find any subsequent lines with text/result content. This
+        // handles wrappers that emit an init envelope then the real result
+        // in a following event.
+        if let Some(fallback) =
+            crate::engine::runner::agents::opencode::extract_router_text(trimmed)
+        {
+            return Ok(fallback);
+        }
+
         return Ok(trimmed.to_string());
     }
 
@@ -996,6 +1023,26 @@ mod tests {
             matches!(err, AgentError::RateLimit { .. }),
             "expected RateLimit, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn extract_stream_json_fallbacks_to_opencode_extractor_on_leading_init() {
+        // Some Claude wrappers emit a leading system/init envelope and then
+        // place the real JSON payload inside an assistant message content array
+        // (no final "type":"result" line). Ensure our extractor falls back
+        // to the opencode-style NDJSON scanner and returns the inner JSON.
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            "\n",
+            // The inner JSON must be escaped inside the outer JSON string
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"{\"status\":\"done\",\"summary\":\"fallback\",\"accomplished\":[],\"remaining\":[],\"files\":[]}"}]}}"#,
+        );
+
+        let text = extract_stream_json_result_text(raw).expect("should fallback and extract JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).expect("extracted text must be JSON");
+        assert_eq!(parsed["status"], "done");
+        assert_eq!(parsed["summary"], "fallback");
     }
 
     /// Claude stream-json error (is_error=true, auth): extract_text propagates Auth.

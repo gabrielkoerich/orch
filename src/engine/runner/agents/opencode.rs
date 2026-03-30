@@ -57,16 +57,35 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
     for event in events {
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-        // OpenCode emits several shapes across versions.
-        // We intentionally restrict extraction to event/part types that represent
-        // assistant text output (not tool I/O).
-        if event_type == "text" || event_type == "message" {
+        // OpenCode emits several shapes across versions. Also scan assistant
+        // messages coming from Claude-like wrappers which use `type: "assistant"`
+        // with a `message.content` array containing text items.
+        // We intentionally restrict extraction to event/part/message types that
+        // represent assistant text output (not tool I/O).
+        if event_type == "text" || event_type == "message" || event_type == "assistant" {
             if let Some(part) = event.get("part") {
                 texts.extend(extract_text_from_part(part));
             }
+
+            // Handle opencode `text` events that put text at top-level
             if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
                 texts.push(text.to_string());
             }
+
+            // Handle Claude-like assistant messages: message.content -> [{type:"text", text:...}]
+            if let Some(message) = event.get("message") {
+                if let Some(items) = message.get("content").and_then(|v| v.as_array()) {
+                    for item in items {
+                        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if item_type == "text" {
+                            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                texts.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
             continue;
         }
 
@@ -79,7 +98,35 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
         }
     }
 
+    // If we found no text-like events, try to look for a terminal `result` event
+    // which some opencode builds emit. Prefer the last result event (newest).
     if texts.is_empty() {
+        for event in events.iter().rev() {
+            if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
+                // Ignore system/init envelopes
+                if event_type == "system" {
+                    continue;
+                }
+            }
+
+            if let Some(result) = event.get("result") {
+                // If result is a string, return it; if object/array return its JSON
+                if let Some(s) = result.as_str() {
+                    return Some(s.to_string());
+                }
+                if result.is_object() || result.is_array() {
+                    return Some(result.to_string());
+                }
+            }
+
+            // Some events include direct text payloads outside of `part`
+            if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
+                if !text.trim().is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+
         return None;
     }
 
@@ -170,6 +217,22 @@ mod router_text_tests {
             text.contains("executor"),
             "extracted text should include JSON"
         );
+    }
+
+    #[test]
+    fn extract_router_text_ignores_leading_system_init() {
+        // Early opencode wrappers may emit a system/init envelope before the
+        // actual text/result event. Ensure the extractor skips the init envelope
+        // and returns the real JSON payload from the subsequent text event.
+        let raw = r#"{"type":"system","subtype":"init","cwd":"/"}
+{"type":"text","timestamp":2,"text":"{\"executor\":\"opencode\",\"complexity\":\"medium\",\"reason\":\"ndjson\"}"}
+{"type":"step_finish","timestamp":3}"#;
+
+        let text = extract_router_text(raw).expect("should extract text even with leading init");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).expect("extracted text must be JSON");
+        assert_eq!(parsed["executor"], "opencode");
+        assert_eq!(parsed["complexity"], "medium");
     }
 }
 
