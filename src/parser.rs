@@ -351,11 +351,15 @@ fn map_generic_response(val: &serde_json::Value) -> anyhow::Result<AgentResponse
         .or_else(|| extract_u64(obj.get("tokens_output")))
         .or_else(|| extract_usage_tokens(obj.get("usage"), false));
 
-    // Extract delegations
-    let delegations = obj
-        .get("delegations")
-        .and_then(|v| serde_json::from_value::<Vec<Delegation>>(v.clone()).ok())
-        .unwrap_or_default();
+    // Extract delegations. If the `delegations` field is present but malformed,
+    // return an error instead of silently ignoring it so callers can surface
+    // and debug malformed agent output.
+    let delegations = if let Some(v) = obj.get("delegations") {
+        serde_json::from_value::<Vec<Delegation>>(v.clone())
+            .with_context(|| format!("invalid delegations field: {}", v))?
+    } else {
+        Vec::new()
+    };
 
     Ok(AgentResponse {
         status,
