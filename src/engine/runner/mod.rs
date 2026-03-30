@@ -376,6 +376,35 @@ impl TaskRunner {
         )
         .await;
 
+        // Silence detection (tick phase1b) may have already reset this task to New
+        // and killed the tmux session. If so, skip all fallback/review processing
+        // to avoid spurious needs_review cycles.
+        if let Some(task) = store::opt_store_get_task(&self.store, &self.repo, task_id).await {
+            if task.status == crate::store::TaskStatus::New {
+                tracing::debug!(
+                    task_id,
+                    "task already reset to New by silence detection — skipping fallback"
+                );
+                // Kill the tmux session in case silence detection missed it
+                let _ = tmux.kill_session(&tmux_session).await;
+                return Ok(Some(RunExecution {
+                    status: "new".to_string(),
+                    exit_code: Some(session_output.exit_code),
+                    audit: RunAudit {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        parsed_response: String::new(),
+                        outcome: String::new(),
+                        error: String::new(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_cost_usd: 0.0,
+                        duration_secs: 0.0,
+                    },
+                }));
+            }
+        }
+
         // Log raw output for debugging agent failures
         let stdout_len = session_output.raw_stdout.len();
         let stderr_len = session_output.raw_stderr.len();
