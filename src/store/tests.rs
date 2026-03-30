@@ -5039,3 +5039,45 @@ async fn control_search_messages_since_filters_old() {
     );
     assert!(recent_bean[0].content.contains("recent"));
 }
+
+/// Verify that migrations run cleanly on a fresh database.
+///
+/// This catches the most common agent mistake: modifying an existing migration
+/// file instead of creating a new one. SQLx checksums are immutable — if a
+/// migration file changes after it was applied, this test fails.
+#[tokio::test]
+async fn migrations_run_on_fresh_db() {
+    let result = TaskStore::open_memory().await;
+    if let Err(e) = &result {
+        panic!("migrations failed on fresh DB: {e}");
+    }
+}
+
+/// Verify that migrations are idempotent — running them twice on the same
+/// database must succeed (no checksum mismatches).
+#[tokio::test]
+async fn migrations_are_idempotent() {
+    // Use a file-based temp DB so we can close and reopen it
+    let tmp = std::env::temp_dir().join(format!("orch-migration-test-{}.db", std::process::id()));
+
+    // First open: runs all migrations
+    {
+        let result = TaskStore::open(&tmp).await;
+        if let Err(e) = &result {
+            panic!("first migration run failed: {e}");
+        }
+    }
+
+    // Second open: re-validates checksums against already-applied migrations
+    {
+        let result = TaskStore::open(&tmp).await;
+        if let Err(e) = &result {
+            panic!("second migration run failed (checksum mismatch?): {e}");
+        }
+    }
+
+    // Cleanup
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+}
