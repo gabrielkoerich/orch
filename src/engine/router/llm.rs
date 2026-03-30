@@ -221,6 +221,52 @@ pub(super) struct LlmRouter {
     skills_catalog: std::sync::Mutex<Option<String>>,
 }
 
+/// Scan a skills directory for skill subdirectories containing SKILL.md files.
+/// Returns a JSON array of skills with id and name, or None if the directory
+/// is not accessible or contains no valid skills.
+///
+/// This function is synchronous and should only be called from within a
+/// `tokio::task::spawn_blocking` context to avoid blocking the async reactor.
+fn scan_skills_directory(skills_dir: &std::path::Path) -> Option<String> {
+    if !skills_dir.exists() {
+        return None;
+    }
+
+    let mut skills = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(skills_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let file_name = path.file_name().unwrap_or_default();
+            let skill_id = file_name.to_string_lossy().into_owned();
+
+            let skill_file = path.join("SKILL.md");
+            if !skill_file.exists() {
+                continue;
+            }
+
+            let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
+            let name = content
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("# ")
+                .to_string();
+
+            skills.push(serde_json::json!({"id": skill_id, "name": name}));
+        }
+    }
+
+    if skills.is_empty() {
+        return None;
+    }
+
+    serde_json::to_string(&skills).ok()
+}
+
 impl LlmRouter {
     pub fn new() -> Self {
         Self {
@@ -248,9 +294,10 @@ impl LlmRouter {
             anyhow::bail!("no agent CLIs found in PATH");
         }
 
-        // Build the routing prompt
-        let prompt =
-            self.build_routing_prompt(task, available_agents, router_agent, &config.weights)?;
+        // Build the routing prompt (async; offload blocking work inside)
+        let prompt = self
+            .build_routing_prompt(task, available_agents, router_agent, &config.weights)
+            .await?;
 
         // Save prompt and response to per-task routing dir for debugging
         let routing_dir = crate::home::task_dir(repo, &task.id.0)
@@ -368,7 +415,7 @@ impl LlmRouter {
     }
 
     /// Build the routing prompt from the template.
-    fn build_routing_prompt(
+    async fn build_routing_prompt(
         &self,
         task: &ExternalTask,
         available_agents: &[String],
@@ -397,8 +444,11 @@ impl LlmRouter {
         // Build labels string
         let labels = task.labels.join(", ");
 
-        // Load skills catalog if available
-        let skills_catalog = self.load_skills_catalog();
+        // Load skills catalog if available — perform blocking FS work off the async reactor.
+        let skills_catalog = match self.load_skills_catalog().await {
+            Ok(s) => s,
+            Err(_) => "[]".to_string(),
+        };
 
         // Simple template substitution
         let prompt = template
@@ -425,81 +475,57 @@ impl LlmRouter {
 
     /// Load skills catalog from skills.yml or skills directory.
     /// Cached after first load to avoid blocking I/O in async context.
-    fn load_skills_catalog(&self) -> String {
-        // Check cache first
+    async fn load_skills_catalog(&self) -> anyhow::Result<String> {
+        // Check cache first (quick lock, drop immediately)
         if let Ok(cache) = self.skills_catalog.lock() {
             if let Some(ref catalog) = *cache {
-                return catalog.clone();
+                return Ok(catalog.clone());
             }
         }
 
-        // Load and cache
-        let catalog = self.load_skills_catalog_uncached();
+        // Offload uncached loading to blocking thread pool to avoid blocking the Tokio reactor.
+        // Clone any data we need to avoid capturing &self across thread boundary.
+        let skills_dir_opt: Option<PathBuf> = match std::env::var("ORCH_HOME") {
+            Ok(orch_home) => Some(PathBuf::from(orch_home).join("skills")),
+            Err(_) => None,
+        };
+
+        let catalog = tokio::task::spawn_blocking(move || -> String {
+            // Try skills.yml in current directory
+            if let Ok(content) = std::fs::read_to_string("skills.yml") {
+                if let Ok(yaml) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                    if let Some(skills) = yaml.get("skills") {
+                        if let Ok(json) = serde_json::to_string(skills) {
+                            return json;
+                        }
+                    }
+                }
+            }
+
+            // Try ORCH_HOME/skills directory
+            if let Some(skills_dir) = skills_dir_opt.as_ref() {
+                if let Some(catalog) = scan_skills_directory(skills_dir) {
+                    return catalog;
+                }
+            }
+
+            // Try ~/.orch/skills
+            if let Ok(skills_dir) = crate::home::skills_dir() {
+                if let Some(catalog) = scan_skills_directory(&skills_dir) {
+                    return catalog;
+                }
+            }
+
+            "[]".to_string()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
 
         if let Ok(mut cache) = self.skills_catalog.lock() {
             *cache = Some(catalog.clone());
         }
 
-        catalog
-    }
-
-    fn load_skills_catalog_uncached(&self) -> String {
-        // Try ORCH_HOME/skills directory
-        if let Ok(orch_home) = std::env::var("ORCH_HOME") {
-            let skills_dir = PathBuf::from(orch_home).join("skills");
-            if let Ok(catalog) = self.build_skills_catalog_from_dir(&skills_dir) {
-                return catalog;
-            }
-        }
-
-        // Try ~/.orch/skills
-        if let Ok(skills_dir) = crate::home::skills_dir() {
-            if let Ok(catalog) = self.build_skills_catalog_from_dir(&skills_dir) {
-                return catalog;
-            }
-        }
-
-        // Return empty array as default
-        "[]".to_string()
-    }
-
-    /// Build skills catalog from a directory.
-    fn build_skills_catalog_from_dir(&self, dir: &PathBuf) -> anyhow::Result<String> {
-        if !dir.exists() {
-            anyhow::bail!("skills directory does not exist");
-        }
-
-        let mut skills = Vec::new();
-
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                let skill_id = path.file_name().unwrap_or_default().to_string_lossy();
-                let skill_file = path.join("SKILL.md");
-
-                if skill_file.exists() {
-                    // Read SKILL.md for metadata
-                    let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
-
-                    // Extract name from first line (title)
-                    let name = content
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .trim_start_matches("# ")
-                        .to_string();
-
-                    skills.push(serde_json::json!({
-                        "id": skill_id,
-                        "name": name,
-                    }));
-                }
-            }
-        }
-
-        Ok(serde_json::to_string(&skills)?)
+        Ok(catalog)
     }
 
     /// Call the specified router LLM to classify the task.

@@ -86,9 +86,16 @@ pub enum WeightSignal {
 /// Read the agent's output file, trying multiple locations.
 ///
 /// Checks per-task attempt directory first, then legacy flat paths.
-pub fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> String {
+pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> String {
     // Primary: explicit output file (already points to attempt dir)
-    if let Ok(content) = std::fs::read_to_string(primary_path) {
+    if let Some(content) = tokio::task::spawn_blocking({
+        let p = primary_path.to_path_buf();
+        move || std::fs::read_to_string(p)
+    })
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    {
         if !content.is_empty() {
             return content;
         }
@@ -98,16 +105,31 @@ pub fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> Strin
     if let Ok(task_dir) = crate::home::task_dir(repo, task_id) {
         let attempts_dir = task_dir.join("attempts");
         if attempts_dir.is_dir() {
-            let mut attempt_nums: Vec<u32> = std::fs::read_dir(&attempts_dir)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
-                .collect();
+            let mut attempt_nums: Vec<u32> = tokio::task::spawn_blocking({
+                let a = attempts_dir.clone();
+                move || {
+                    std::fs::read_dir(&a)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
+                        .collect::<Vec<u32>>()
+                }
+            })
+            .await
+            .unwrap_or_default();
+
             attempt_nums.sort_unstable_by(|a, b| b.cmp(a)); // newest first
             for n in attempt_nums {
                 let p = attempts_dir.join(n.to_string()).join("output.json");
-                if let Ok(content) = std::fs::read_to_string(&p) {
+                if let Some(content) = tokio::task::spawn_blocking({
+                    let p = p.clone();
+                    move || std::fs::read_to_string(p)
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                {
                     if !content.is_empty() {
                         tracing::info!(task_id, path = %p.display(), "read output from attempt dir");
                         return content;
@@ -132,7 +154,14 @@ pub fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> Strin
     }
 
     for path in &fallbacks {
-        if let Ok(content) = std::fs::read_to_string(path) {
+        if let Some(content) = tokio::task::spawn_blocking({
+            let p = path.clone();
+            move || std::fs::read_to_string(p)
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        {
             if !content.is_empty() {
                 tracing::info!(task_id, path = %path.display(), "read output from legacy fallback");
                 return content;

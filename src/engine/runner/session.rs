@@ -93,38 +93,47 @@ pub async fn run_agent_session(
         attempt_dir,
         orch_home,
         elapsed_since_session_start,
-    );
+    )
+    .await;
     (tmux, session, output)
 }
 
-fn collect_output(
+async fn collect_output(
     task_id: &str,
     invocation: &agent::AgentInvocation,
     attempt_dir: &Path,
     orch_home: &Path,
     elapsed_secs: u64,
 ) -> SessionOutput {
-    // Read exit code — check per-task attempt dir first, fall back to legacy
-    let exit_code: i32 = {
-        let attempt_exit = attempt_dir.join("exit.txt");
-        let legacy_exit = crate::home::state_file(&format!("exit-{task_id}.txt"))
-            .unwrap_or_else(|_| orch_home.join("state").join(format!("exit-{task_id}.txt")));
+    // Compute exit code on blocking pool
+    let attempt_exit = attempt_dir.join("exit.txt");
+    let legacy_exit = crate::home::state_file(&format!("exit-{task_id}.txt"))
+        .unwrap_or_else(|_| orch_home.join("state").join(format!("exit-{task_id}.txt")));
 
+    let exit_code: i32 = (tokio::task::spawn_blocking(move || {
         std::fs::read_to_string(&attempt_exit)
             .or_else(|_| std::fs::read_to_string(&legacy_exit))
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(-1)
-    };
+    })
+    .await)
+        .unwrap_or(-1);
 
-    // Read raw output + stderr
-    let raw_stdout = response::read_output_file(task_id, &invocation.output_file, &invocation.repo);
+    // Read raw output (offloaded inside read_output_file) and stderr (blocking read offloaded)
+    let raw_stdout =
+        response::read_output_file(task_id, &invocation.output_file, &invocation.repo).await;
 
     let stderr_path_attempt = attempt_dir.join("stderr.txt");
     let stderr_path_legacy = crate::home::state_file(&format!("stderr-{task_id}.txt"))
         .unwrap_or_else(|_| PathBuf::from(format!("/tmp/stderr-{task_id}.txt")));
-    let raw_stderr = std::fs::read_to_string(&stderr_path_attempt)
-        .or_else(|_| std::fs::read_to_string(&stderr_path_legacy))
+
+    let raw_stderr: String = (tokio::task::spawn_blocking(move || {
+        std::fs::read_to_string(&stderr_path_attempt)
+            .or_else(|_| std::fs::read_to_string(&stderr_path_legacy))
+            .unwrap_or_default()
+    })
+    .await)
         .unwrap_or_default();
 
     SessionOutput {
