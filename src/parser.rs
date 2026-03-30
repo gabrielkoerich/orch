@@ -101,9 +101,45 @@ pub fn parse(raw: &str) -> anyhow::Result<AgentResponse> {
 /// Extract the first JSON code block from markdown.
 fn extract_json_block(text: &str) -> Option<String> {
     let start = text.find("```json")?;
-    let content_start = text[start..].find('\n')? + start + 1;
-    let end = text[content_start..].find("```")? + content_start;
-    Some(text[content_start..end].to_string())
+    let fence_end = start + "```json".len();
+    let remainder = &text[fence_end..];
+
+    // Find key positions after the opening fence
+    let newline_pos = remainder.find('\n');
+    let closing_fence_pos = remainder.find("```");
+    let json_start_pos = remainder.find(['{', '[']);
+
+    // If there's no closing fence, we can't extract a block.
+    let closing_fence_pos = closing_fence_pos?;
+
+    // Decide fenced vs inline using a robust heuristic:
+    // - If a JSON delimiter ('{' or '[') appears before the first newline, treat as inline
+    //   (this preserves inline JSON that contains internal newlines).
+    // - Otherwise, if the closing fence appears before the first newline (or there is no newline),
+    //   treat as inline (JSON is on the same line as the fence).
+    // - Otherwise, treat as a standard fenced block where content starts after the first newline.
+    let first_nl = newline_pos.unwrap_or(usize::MAX);
+
+    let is_inline = match json_start_pos {
+        Some(js) if js < first_nl => true,
+        _ => closing_fence_pos < first_nl,
+    };
+
+    if is_inline {
+        // Inline: content is between the first non-whitespace after the fence and the closing fence
+        let content_start = remainder
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map_or(fence_end, |(idx, _)| fence_end + idx);
+        let end = fence_end + closing_fence_pos;
+        Some(text[content_start..end].to_string())
+    } else {
+        // Fenced block: content begins after the first newline and ends at the closing fence
+        let nl = newline_pos?;
+        let content_start = fence_end + nl + 1;
+        let end = fence_end + closing_fence_pos;
+        Some(text[content_start..end].to_string())
+    }
 }
 
 /// Fields that indicate a JSON blob is an AgentResponse (higher score = better match).
@@ -494,6 +530,64 @@ Thanks"#;
         let text = "prefix\n```json\n{\"key\":\"value\"}\n```\nsuffix";
         let block = extract_json_block(text).unwrap();
         assert_eq!(block, "{\"key\":\"value\"}\n");
+    }
+
+    #[test]
+    fn extract_json_block_inline_fence() {
+        let text = "prefix\n```json{\"key\":\"value\"}```\nsuffix";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, "{\"key\":\"value\"}");
+    }
+
+    #[test]
+    fn extract_json_block_with_info_string() {
+        let text = "prefix\n```json some-meta\n{\"key\":\"value\"}\n```\nsuffix";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, "{\"key\":\"value\"}\n");
+    }
+
+    #[test]
+    fn extract_json_block_with_info_string_and_whitespace() {
+        let text = "prefix\n```json   some-meta   \n{\"key\":\"value\"}\n```\nsuffix";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, "{\"key\":\"value\"}\n");
+    }
+
+    #[test]
+
+    fn extract_json_block_inline_with_internal_newline() {
+        // Inline JSON that contains a newline inside the JSON value
+        let text = "prefix\n```json{\"key\":\"value\\nwith newline\"}```\nsuffix";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, r#"{"key":"value\nwith newline"}"#);
+    }
+
+    #[test]
+    fn extract_json_block_inline_with_whitespace_newline() {
+        // Inline JSON that contains a newline as whitespace between key and value
+        let text = "prefix\n```json{\"key\":\n\"value\"}```\nsuffix";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, "{\"key\":\n\"value\"}");
+    }
+
+    #[test]
+    fn extract_json_block_missing_closing_fence() {
+        let text = "prefix\n```json{\"key\":\"value\"}\n";
+        assert!(extract_json_block(text).is_none());
+    }
+
+    #[test]
+    fn extract_json_block_array_inline() {
+        let text = "prefix\n```json[1,2,3]```\nsuffix";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, "[1,2,3]");
+    }
+
+    #[test]
+    fn extract_json_block_multiple_fences() {
+        let text = "prefix\n```json{\"first\":1}``` middle\n```json{\"second\":2}``` suffix";
+        let block = extract_json_block(text).unwrap();
+        assert_eq!(block, "{\"first\":1}");
     }
 
     #[test]
