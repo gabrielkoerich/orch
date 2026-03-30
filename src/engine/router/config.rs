@@ -2,6 +2,39 @@
 
 use std::collections::HashMap;
 
+/// Minimum healthy agents threshold for graceful degradation.
+/// When healthy agents fall below this number, dispatch switches to sequential mode.
+pub fn min_healthy_agents_threshold() -> usize {
+    crate::config::get("dispatch.min_healthy_agents")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+}
+
+/// Base delay in milliseconds between dispatches in sequential (degraded) mode.
+pub fn sequential_dispatch_delay_ms() -> u64 {
+    crate::config::get("dispatch.sequential_delay_ms")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
+}
+
+/// Base delay in milliseconds for exponential backoff between fallback retries.
+pub fn retry_base_delay_ms() -> u64 {
+    crate::config::get("dispatch.retry_base_delay_ms")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000)
+}
+
+/// Maximum delay in milliseconds for exponential backoff between fallback retries.
+pub fn retry_max_delay_ms() -> u64 {
+    crate::config::get("dispatch.retry_max_delay_ms")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120_000)
+}
+
 /// Default agents to check in PATH.
 ///
 /// All 5 agents are listed, but availability is checked at runtime via

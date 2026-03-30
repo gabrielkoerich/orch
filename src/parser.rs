@@ -554,7 +554,6 @@ Thanks"#;
     }
 
     #[test]
-
     fn extract_json_block_inline_with_internal_newline() {
         // Inline JSON that contains a newline inside the JSON value
         let text = "prefix\n```json{\"key\":\"value\\nwith newline\"}```\nsuffix";

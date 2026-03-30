@@ -11,6 +11,62 @@ use crate::store::TaskStore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+const JITTER_FACTOR: f64 = 0.3;
+
+/// Calculate exponential backoff with jitter for fallback retries.
+/// Uses retry count from the reroute chain to determine the delay.
+///
+/// Delay = min(base * 2^retry_count, max) * (1 + jitter)
+pub(crate) fn calculate_backoff_delay(retry_count: usize) -> u64 {
+    let base_delay = crate::engine::router::config::retry_base_delay_ms();
+    let max_delay = crate::engine::router::config::retry_max_delay_ms();
+
+    // Exponential: base * 2^retry_count
+    let exponential = base_delay * (2_u64.saturating_pow(retry_count as u32));
+    let capped = exponential.min(max_delay);
+
+    // Add jitter: ±30% using a simple hash-based approach
+    let jitter_range = (capped as f64 * JITTER_FACTOR) as u64;
+    // Use current time micros for simple randomization
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    let jitter = now % (jitter_range * 2 + 1);
+
+    capped + jitter
+}
+
+/// Wait with exponential backoff before retrying with a fallback agent.
+/// Returns the delay applied in milliseconds.
+pub async fn wait_for_fallback_backoff(
+    task_id: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> u64 {
+    // Get retry count from reroute chain
+    let chain = get_reroute_chain(task_id, store, repo).await;
+    let retry_count = if chain.is_empty() {
+        0
+    } else {
+        chain.split(',').count()
+    };
+
+    let delay = calculate_backoff_delay(retry_count);
+
+    if delay > 0 {
+        tracing::debug!(
+            task_id,
+            retry_count = retry_count,
+            delay_ms = delay,
+            "fallback backoff: waiting before retry"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+
+    delay
+}
+
 /// Outcome signal for the engine to update router weights.
 ///
 /// Returned by the task runner so the engine can feed rate limit and
@@ -231,6 +287,10 @@ pub async fn handle_failover(
             ],
         )
         .await;
+
+        // Apply exponential backoff with jitter before retry
+        wait_for_fallback_backoff(task_id, store, repo).await;
+
         return "new".to_string();
     }
 
