@@ -104,6 +104,11 @@ pub struct RouterConfig {
     ///     kimi: 0.02
     /// ```
     pub weights: HashMap<String, f64>,
+    /// If an agent's routing weight falls below this threshold, consider it
+    /// degraded and skip it during proactive routing decisions. Value in
+    /// `0.0..=1.0` where `1.0` means never skip and `0.0` skips only when
+    /// weight is exactly zero (practically never). Default: `0.3`.
+    pub skip_limited_threshold: f64,
 }
 
 /// Parse an `agent:model` pool entry string, splitting on the first colon.
@@ -156,6 +161,7 @@ impl Default for RouterConfig {
             // exist for a particular agent (e.g. anthropic/ prefixed models for opencode).
             model_map: HashMap::new(),
             weighted_round_robin: false,
+            skip_limited_threshold: 0.3,
         }
     }
 }

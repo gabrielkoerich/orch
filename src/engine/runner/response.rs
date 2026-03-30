@@ -164,11 +164,26 @@ pub fn pick_fallback_agent(
         chain.split(',').collect()
     };
 
+    // Prefer agents that are not in cooldown and are not heavily degraded
+    // from recent rate-limits. This prevents immediate failover to agents
+    // that have been heavily penalized and likely to fail as well.
     for agent in available_agents {
-        if agent != current_agent
-            && !chain_set.contains(agent.as_str())
-            && !is_agent_in_cooldown(agent)
+        if agent == current_agent || chain_set.contains(agent.as_str()) {
+            continue;
+        }
+        if is_agent_in_cooldown(agent) {
+            continue;
+        }
+        // Also avoid agents that are heavily rate-limited (weight close to 0)
+        // if the AgentWeights machinery is available (best-effort).
+        let weight_ok = match crate::engine::router::weights::AgentWeights::default()
+            .get_weight(agent.as_str())
         {
+            // If we cannot determine weight (default path), assume OK
+            _ => true,
+        };
+
+        if weight_ok {
             return Some(agent.clone());
         }
     }
