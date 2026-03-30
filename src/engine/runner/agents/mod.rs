@@ -763,7 +763,11 @@ pub(crate) mod patterns {
         if let Some(e) = detect_context_overflow(text) {
             return e;
         }
-        if let Some(e) = detect_rate_limit(text) {
+        // Only scan the tail of the combined output for rate limit patterns.
+        // The full output may contain agent work product (code, diffs, commit
+        // messages) that incidentally mentions rate-limiting keywords. Real
+        // CLI rate-limit errors appear at the end of the output.
+        if let Some(e) = detect_rate_limit(safe_tail(text, 3000).as_str()) {
             return e;
         }
         if let Some(e) = detect_network_error(text) {
@@ -947,6 +951,37 @@ mod tests {
     fn classify_from_text_worktree_missing() {
         let err = patterns::classify_from_text(1, "worktree directory does not exist: /tmp/wt");
         assert!(matches!(err, AgentError::AgentFailed { .. }));
+    }
+
+    #[test]
+    fn classify_from_text_no_false_positive_from_work_product() {
+        // Regression test for issue #1292: agent output containing rate-limit
+        // keywords in code/diffs must not be misclassified as a rate limit error.
+        let work_product = "Added `is_copilot_model(model) -> bool` helper\n\
+             - Added copilot quota patterns to `parse_retry_at`\n\
+             fn detect_rate_limit(text: &str) -> Option<AgentError> {\n\
+             quota exceeded handling for billing cycle\n"
+            .repeat(50); // ~200 lines of work product — well over 3000 chars
+        let actual_error = "\nerror: command not found: cargo\n";
+        let text = format!("{work_product}{actual_error}");
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            !matches!(err, AgentError::RateLimit { .. }),
+            "work product keywords must not trigger rate limit, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_still_detects_real_rate_limit_at_tail() {
+        // A real rate-limit error printed at the end of the output must still
+        // be detected, even if work product precedes it.
+        let padding = "normal agent work output ".repeat(100);
+        let text = format!("{padding}\nError: rate limit exceeded (429 Too Many Requests)\n");
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            matches!(err, AgentError::RateLimit { .. }),
+            "real rate limit at tail must be detected, got: {err:?}"
+        );
     }
 
     #[test]
