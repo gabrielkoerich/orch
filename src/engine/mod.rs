@@ -384,6 +384,10 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                     if let Err(e) =
                         rebase_worktree_on_origin_main(&worktree_dir, &default_branch).await
                     {
+                        // If rebase failed we already made efforts to stash and
+                        // restore changes safely. Log the error and reset the
+                        // task as before. The worktree removal path is used
+                        // to avoid leaving corrupted worktrees around.
                         tracing::warn!(repo = %engine.repo, task_id = %task_id, err = %e, "startup rebase failed, resetting task");
                         abort_worktree_rebase(&worktree_dir).await;
                         let keep_remote = task.pr_number.is_some();
