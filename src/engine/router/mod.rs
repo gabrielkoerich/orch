@@ -267,8 +267,7 @@ impl Router {
 
     fn agent_is_routable(&self, agent: &str, complexity: &str) -> bool {
         // If the agent is unavailable or in cooldown, it's not routable.
-        if !self.is_agent_available(agent) || crate::engine::cooldown::is_agent_in_cooldown(agent)
-        {
+        if !self.is_agent_available(agent) || crate::engine::cooldown::is_agent_in_cooldown(agent) {
             return false;
         }
 
@@ -278,7 +277,11 @@ impl Router {
         if self.config.weighted_round_robin {
             let weight = self.weights.get_weight(agent);
             if weight < self.config.skip_limited_threshold {
-                tracing::debug!(agent, weight, "agent considered degraded by weight threshold, skipping");
+                tracing::debug!(
+                    agent,
+                    weight,
+                    "agent considered degraded by weight threshold, skipping"
+                );
                 return false;
             }
         }
@@ -483,66 +486,66 @@ impl Router {
                 // Label target is cooled or lacked model; fall through to standard routing.
             }
 
-             let complexity = strategies::extract_complexity_from_labels(&task.labels);
+            let complexity = strategies::extract_complexity_from_labels(&task.labels);
 
-             // Check if any agents have available models for this complexity
-             let candidates = self.available_agents_for_complexity(&complexity);
-             if candidates.is_empty() {
-                 self.wait_for_cooldown(Some(&complexity)).await?;
-                 continue;
-             }
+            // Check if any agents have available models for this complexity
+            let candidates = self.available_agents_for_complexity(&complexity);
+            if candidates.is_empty() {
+                self.wait_for_cooldown(Some(&complexity)).await?;
+                continue;
+            }
 
-             // 2. Weighted round-robin — capacity-based selection
-             if self.config.weighted_round_robin {
-                 return strategies::route_via_weighted_round_robin(
-                     &candidates,
-                     &self.weights,
-                     &self.config,
-                     task,
-                     &mut self.last_agent,
-                 );
-             }
+            // 2. Weighted round-robin — capacity-based selection
+            if self.config.weighted_round_robin {
+                return strategies::route_via_weighted_round_robin(
+                    &candidates,
+                    &self.weights,
+                    &self.config,
+                    task,
+                    &mut self.last_agent,
+                );
+            }
 
-             // 3. Round-robin mode — use stateful round-robin
-             if self.config.mode == "round_robin" {
-                 tracing::debug!(task_id = %task.id.0, "routing via round-robin mode");
-                 return strategies::route_via_round_robin_stateful(
-                     &candidates,
-                     &self.config,
-                     task,
-                     &mut self.rr_index,
-                     &mut self.last_agent,
-                 );
-             }
+            // 3. Round-robin mode — use stateful round-robin
+            if self.config.mode == "round_robin" {
+                tracing::debug!(task_id = %task.id.0, "routing via round-robin mode");
+                return strategies::route_via_round_robin_stateful(
+                    &candidates,
+                    &self.config,
+                    task,
+                    &mut self.rr_index,
+                    &mut self.last_agent,
+                );
+            }
 
-             // 3. LLM-based routing with retry tracking
-             let route_attempts = self.get_route_attempts(&task.id.0, store, repo).await;
+            // 3. LLM-based routing with retry tracking
+            let route_attempts = self.get_route_attempts(&task.id.0, store, repo).await;
 
-             if route_attempts >= self.config.max_route_attempts {
-                 tracing::warn!(
-                     task_id = %task.id.0,
-                     attempts = route_attempts,
-                     max = self.config.max_route_attempts,
-                     "max LLM route attempts reached, falling back to round-robin"
-                 );
-                 let candidates = self.available_agents_for_complexity(&complexity);
-                 if candidates.is_empty() {
-                     self.wait_for_cooldown(Some(&complexity)).await?;
-                     continue;
-                 }
-                 return strategies::route_via_round_robin_stateful(
-                     &candidates,
-                     &self.config,
-                     task,
-                     &mut self.rr_index,
-                     &mut self.last_agent,
-                 );
-             }
+            if route_attempts >= self.config.max_route_attempts {
+                tracing::warn!(
+                    task_id = %task.id.0,
+                    attempts = route_attempts,
+                    max = self.config.max_route_attempts,
+                    "max LLM route attempts reached, falling back to round-robin"
+                );
+                let candidates = self.available_agents_for_complexity(&complexity);
+                if candidates.is_empty() {
+                    self.wait_for_cooldown(Some(&complexity)).await?;
+                    continue;
+                }
+                return strategies::route_via_round_robin_stateful(
+                    &candidates,
+                    &self.config,
+                    task,
+                    &mut self.rr_index,
+                    &mut self.last_agent,
+                );
+            }
 
-             // Log routing start (before await)
-             tracing::debug!(task_id = %task.id.0, "starting LLM routing");
+            // Log routing start (before await)
+            tracing::debug!(task_id = %task.id.0, "starting LLM routing");
 
-              match self.route_with_llm(task, repo).await {
+            match self.route_with_llm(task, repo).await {
                 Ok(result) => {
                     let candidates = self.available_agents_for_complexity(&result.complexity);
                     if candidates.is_empty() {
@@ -605,21 +608,21 @@ impl Router {
                     );
                     return Ok(result);
                 }
-                 Err(e) => {
-                     if let Some(err) = e.downcast_ref::<AllCooledError>() {
-                         let scope = match err {
-                             AllCooledError::Agents(scope) => scope.as_str(),
-                             AllCooledError::Models(scope) => scope.as_str(),
-                         };
-                         tracing::warn!(scope = %scope, "router cooldown gate tripped");
-                         let scope_opt = if scope == "all agents" {
-                             None
-                         } else {
-                             Some(scope)
-                         };
-                         self.wait_for_cooldown(scope_opt).await?;
-                         continue;
-                     }
+                Err(e) => {
+                    if let Some(err) = e.downcast_ref::<AllCooledError>() {
+                        let scope = match err {
+                            AllCooledError::Agents(scope) => scope.as_str(),
+                            AllCooledError::Models(scope) => scope.as_str(),
+                        };
+                        tracing::warn!(scope = %scope, "router cooldown gate tripped");
+                        let scope_opt = if scope == "all agents" {
+                            None
+                        } else {
+                            Some(scope)
+                        };
+                        self.wait_for_cooldown(scope_opt).await?;
+                        continue;
+                    }
 
                     let new_attempts = route_attempts + 1;
                     self.set_route_attempts(&task.id.0, new_attempts, store, repo)
@@ -704,28 +707,28 @@ impl Router {
         }
     }
 
-     /// Route using LLM classification with pool round-robin.
-     ///
-     /// Iterates through `router_pool` (skipping cooled entries) until one succeeds.
-     /// On full exhaustion, tries the configured fallback. If the fallback also fails,
-     /// returns the last error (the caller falls back to round-robin agent selection).
-     async fn route_with_llm(
-         &mut self,
-         task: &ExternalTask,
-         repo: &str,
-     ) -> anyhow::Result<RouteResult> {
-         // Filter out cooled agents so the LLM only sees available ones.
-         // Fall back to the full list if all agents are cooled.
-         // Cloned to avoid borrow conflict with &mut self in the loop.
-         let uncooled_agents: Vec<String> = self
-             .available_agents
-             .iter()
-             .filter(|a| !crate::engine::cooldown::is_agent_in_cooldown(a))
-             .cloned()
-             .collect();
-         if uncooled_agents.is_empty() {
-             return Err(AllCooledError::Agents("all agents".to_string()).into());
-         }
+    /// Route using LLM classification with pool round-robin.
+    ///
+    /// Iterates through `router_pool` (skipping cooled entries) until one succeeds.
+    /// On full exhaustion, tries the configured fallback. If the fallback also fails,
+    /// returns the last error (the caller falls back to round-robin agent selection).
+    async fn route_with_llm(
+        &mut self,
+        task: &ExternalTask,
+        repo: &str,
+    ) -> anyhow::Result<RouteResult> {
+        // Filter out cooled agents so the LLM only sees available ones.
+        // Fall back to the full list if all agents are cooled.
+        // Cloned to avoid borrow conflict with &mut self in the loop.
+        let uncooled_agents: Vec<String> = self
+            .available_agents
+            .iter()
+            .filter(|a| !crate::engine::cooldown::is_agent_in_cooldown(a))
+            .cloned()
+            .collect();
+        if uncooled_agents.is_empty() {
+            return Err(AllCooledError::Agents("all agents".to_string()).into());
+        }
         let llm_agents = uncooled_agents;
 
         let pool = self.router_pool.clone();
