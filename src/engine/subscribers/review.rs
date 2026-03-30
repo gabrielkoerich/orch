@@ -102,6 +102,28 @@ pub fn spawn(
                         continue;
                     };
 
+                    // If every known agent is currently in cooldown, wait until the
+                    // earliest cooldown expires before attempting to dispatch the
+                    // review. This prevents burning review attempts against
+                    // rate-limited agents.
+                    {
+                        let agents = router.read().await.available_agents.clone();
+                        let all_cooled = agents
+                            .iter()
+                            .all(|a| crate::engine::cooldown::is_agent_in_cooldown(a));
+                        if all_cooled && !agents.is_empty() {
+                            let now = chrono::Utc::now().timestamp();
+                            let wait_secs = agents
+                                .iter()
+                                .filter_map(|a| crate::engine::cooldown::cooldown_until(a))
+                                .min()
+                                .map(|until| ((until - now).max(1)) as u64)
+                                .unwrap_or(crate::engine::cooldown::AGENT_COOLDOWN_SECS as u64);
+                            tracing::info!(task_id, wait_secs, "all agents cooled — delaying review until cooldown expires");
+                            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                        }
+                    }
+
                     // Try to acquire a semaphore permit.
                     let permit = match semaphore.clone().try_acquire_owned() {
                         Ok(p) => p,
