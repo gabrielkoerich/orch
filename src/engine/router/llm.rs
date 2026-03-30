@@ -221,6 +221,52 @@ pub(super) struct LlmRouter {
     skills_catalog: std::sync::Mutex<Option<String>>,
 }
 
+/// Scan a skills directory for skill subdirectories containing SKILL.md files.
+/// Returns a JSON array of skills with id and name, or None if the directory
+/// is not accessible or contains no valid skills.
+///
+/// This function is synchronous and should only be called from within a
+/// `tokio::task::spawn_blocking` context to avoid blocking the async reactor.
+fn scan_skills_directory(skills_dir: &std::path::Path) -> Option<String> {
+    if !skills_dir.exists() {
+        return None;
+    }
+
+    let mut skills = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(skills_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let file_name = path.file_name().unwrap_or_default();
+            let skill_id = file_name.to_string_lossy().into_owned();
+
+            let skill_file = path.join("SKILL.md");
+            if !skill_file.exists() {
+                continue;
+            }
+
+            let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
+            let name = content
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("# ")
+                .to_string();
+
+            skills.push(serde_json::json!({"id": skill_id, "name": name}));
+        }
+    }
+
+    if skills.is_empty() {
+        return None;
+    }
+
+    serde_json::to_string(&skills).ok()
+}
+
 impl LlmRouter {
     pub fn new() -> Self {
         Self {
@@ -439,15 +485,12 @@ impl LlmRouter {
 
         // Offload uncached loading to blocking thread pool to avoid blocking the Tokio reactor.
         // Clone any data we need to avoid capturing &self across thread boundary.
-        // The uncached loader only needs paths and env; we'll call it via an owned closure
-        // that takes ownership of a PathBuf for the ORCH_HOME/skills path if present.
         let skills_dir_opt: Option<PathBuf> = match std::env::var("ORCH_HOME") {
             Ok(orch_home) => Some(PathBuf::from(orch_home).join("skills")),
             Err(_) => None,
         };
 
         let catalog = tokio::task::spawn_blocking(move || -> String {
-            // Re-implement the uncached loading logic here in the blocking thread without capturing self.
             // Try skills.yml in current directory
             if let Ok(content) = std::fs::read_to_string("skills.yml") {
                 if let Ok(yaml) = serde_yml::from_str::<serde_yml::Value>(&content) {
@@ -461,77 +504,15 @@ impl LlmRouter {
 
             // Try ORCH_HOME/skills directory
             if let Some(skills_dir) = skills_dir_opt.as_ref() {
-                if skills_dir.exists() {
-                    let mut skills = Vec::new();
-                    if let Ok(entries) = std::fs::read_dir(skills_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if !path.is_dir() {
-                                continue;
-                            }
-
-                            let file_name = path.file_name().unwrap_or_default();
-                            let skill_id = file_name.to_string_lossy().into_owned();
-
-                            let skill_file = path.join("SKILL.md");
-                            if !skill_file.exists() {
-                                continue;
-                            }
-
-                            let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
-                            let name = content
-                                .lines()
-                                .next()
-                                .unwrap_or("")
-                                .trim_start_matches("# ")
-                                .to_string();
-
-                            skills.push(serde_json::json!({"id": skill_id, "name": name}));
-                        }
-                    }
-                    if !skills.is_empty() {
-                        if let Ok(json) = serde_json::to_string(&skills) {
-                            return json;
-                        }
-                    }
+                if let Some(catalog) = scan_skills_directory(skills_dir) {
+                    return catalog;
                 }
             }
 
             // Try ~/.orch/skills
             if let Ok(skills_dir) = crate::home::skills_dir() {
-                if skills_dir.exists() {
-                    let mut skills = Vec::new();
-                    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if !path.is_dir() {
-                                continue;
-                            }
-
-                            let file_name = path.file_name().unwrap_or_default();
-                            let skill_id = file_name.to_string_lossy().into_owned();
-
-                            let skill_file = path.join("SKILL.md");
-                            if !skill_file.exists() {
-                                continue;
-                            }
-
-                            let content = std::fs::read_to_string(&skill_file).unwrap_or_default();
-                            let name = content
-                                .lines()
-                                .next()
-                                .unwrap_or("")
-                                .trim_start_matches("# ")
-                                .to_string();
-
-                            skills.push(serde_json::json!({"id": skill_id, "name": name}));
-                        }
-                    }
-                    if !skills.is_empty() {
-                        if let Ok(json) = serde_json::to_string(&skills) {
-                            return json;
-                        }
-                    }
+                if let Some(catalog) = scan_skills_directory(&skills_dir) {
+                    return catalog;
                 }
             }
 
