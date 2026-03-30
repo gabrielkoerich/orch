@@ -443,19 +443,7 @@ impl LlmRouter {
         catalog
     }
 
-    /// Load skills catalog without caching (internal implementation).
     fn load_skills_catalog_uncached(&self) -> String {
-        // Try skills.yml in current directory
-        if let Ok(content) = std::fs::read_to_string("skills.yml") {
-            if let Ok(yaml) = serde_yml::from_str::<serde_yml::Value>(&content) {
-                if let Some(skills) = yaml.get("skills") {
-                    if let Ok(json) = serde_json::to_string(skills) {
-                        return json;
-                    }
-                }
-            }
-        }
-
         // Try ORCH_HOME/skills directory
         if let Ok(orch_home) = std::env::var("ORCH_HOME") {
             let skills_dir = PathBuf::from(orch_home).join("skills");

@@ -804,7 +804,12 @@ async fn skills_sync() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let skills_base = crate::home::skills_dir()?;
+    // `crate::home::skills_dir()` performs blocking filesystem operations
+    // (creates directories as needed). Run it on the blocking thread pool so
+    // the async reactor isn't blocked.
+    let skills_base = tokio::task::spawn_blocking(crate::home::skills_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
     let git_timeout = std::time::Duration::from_secs(60);
 
     for skill in skills {
@@ -817,7 +822,13 @@ async fn skills_sync() -> anyhow::Result<()> {
         let repo_dir = skills_base.join(&skill.repo);
         let repo_url = format!("https://github.com/{}.git", skill.repo);
 
-        if repo_dir.exists() {
+        // Use async metadata check instead of `Path::exists()` to avoid
+        // performing blocking syscall on the reactor thread.
+        let repo_exists = tokio::fs::metadata(&repo_dir)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if repo_exists {
             // Pull latest changes with timeout
             tracing::debug!(repo = %skill.repo, "pulling skill repo");
             let pull_result = tokio::time::timeout(
@@ -850,7 +861,7 @@ async fn skills_sync() -> anyhow::Result<()> {
             let parent = repo_dir
                 .parent()
                 .ok_or_else(|| anyhow::anyhow!("skill repo path has no parent directory"))?;
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
             let repo_dir_str = repo_dir
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("skill repo path is not valid UTF-8"))?;
