@@ -500,6 +500,113 @@ fn extract_usage(
     (None, None)
 }
 
+/// Extract a structured `AgentResult` from Claude/Kimi/MiniMax NDJSON output.
+///
+/// Finds the last `"type":"result"` line in the NDJSON stream and extracts:
+/// - `result` text (the inner content)
+/// - `is_error` flag
+/// - token usage from `usage` or `modelUsage`
+/// - `duration_ms`
+///
+/// If no `type:result` line exists (common with MiniMax), falls back to
+/// extracting the last assistant text message from the stream.
+///
+/// Returns `None` only if the input contains no recognizable NDJSON events.
+pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
+    let trimmed = ndjson.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Try to find the result envelope first
+    if let Some(result_line) = find_ndjson_result_line(trimmed) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result_line) {
+            if let Some(envelope) = parsed.as_object() {
+                let is_error = envelope
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let result_text = envelope
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let (input_tokens, output_tokens) = extract_usage(envelope);
+                let duration_ms = envelope.get("duration_ms").and_then(|v| v.as_u64());
+
+                let cost_usd = envelope
+                    .get("costUSD")
+                    .or_else(|| envelope.get("cost_usd"))
+                    .and_then(|v| v.as_f64());
+
+                return Some(super::AgentResult {
+                    is_error,
+                    result_text,
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    duration_ms,
+                });
+            }
+        }
+    }
+
+    // Fallback for MiniMax/Kimi: extract last assistant text message
+    let mut last_text = None;
+    let mut input_tokens = None;
+    let mut output_tokens = None;
+
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if val.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        // Extract text from content array
+        if let Some(content) = val
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        {
+            for item in content {
+                if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                        let t = text.trim();
+                        if !t.is_empty() {
+                            last_text = Some(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        // Extract usage (take max, as Claude reports cumulative)
+        if let Some(usage) = val.get("message").and_then(|m| m.get("usage")) {
+            if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                input_tokens = Some(input_tokens.unwrap_or(0u64).max(inp));
+            }
+            if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                output_tokens = Some(output_tokens.unwrap_or(0u64).max(out));
+            }
+        }
+    }
+
+    last_text.map(|text| super::AgentResult {
+        is_error: false,
+        result_text: text,
+        input_tokens,
+        output_tokens,
+        cost_usd: None,
+        duration_ms: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,5 +1172,67 @@ mod tests {
     fn extract_text_empty_input_returns_empty_ok() {
         let text = runner().extract_text("").unwrap();
         assert!(text.is_empty());
+    }
+
+    // ── find_claude_result ──────────────────────────────────────
+
+    #[test]
+    fn find_claude_result_success_with_tokens() {
+        let ndjson = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"decision\":\"approve\",\"notes\":\"LGTM\"}","usage":{"input_tokens":1500,"output_tokens":200},"duration_ms":5000}"#,
+        );
+        let result = find_claude_result(ndjson).expect("should find result");
+        assert!(!result.is_error);
+        assert!(result.result_text.contains("approve"));
+        assert_eq!(result.input_tokens, Some(1500));
+        assert_eq!(result.output_tokens, Some(200));
+        assert_eq!(result.duration_ms, Some(5000));
+    }
+
+    #[test]
+    fn find_claude_result_error_flag() {
+        let ndjson = r#"{"type":"result","subtype":"error","is_error":true,"result":"rate limit exceeded","usage":{}}"#;
+        let result = find_claude_result(ndjson).expect("should find result");
+        assert!(result.is_error);
+        assert!(result.result_text.contains("rate limit"));
+    }
+
+    #[test]
+    fn find_claude_result_empty_returns_none() {
+        assert!(find_claude_result("").is_none());
+        assert!(find_claude_result("   ").is_none());
+    }
+
+    #[test]
+    fn find_claude_result_no_result_line_falls_back_to_assistant() {
+        // MiniMax/Kimi pattern: no type:result, just assistant messages
+        let ndjson = concat!(
+            r#"{"type":"system","subtype":"init","model":"MiniMax-M2.7"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"analysis complete"}],"usage":{"input_tokens":800,"output_tokens":150}}}"#,
+        );
+        let result = find_claude_result(ndjson).expect("should fall back to assistant text");
+        assert!(!result.is_error);
+        assert_eq!(result.result_text, "analysis complete");
+        assert_eq!(result.input_tokens, Some(800));
+        assert_eq!(result.output_tokens, Some(150));
+    }
+
+    #[test]
+    fn find_claude_result_plain_text_returns_none() {
+        // Plain text (not NDJSON) should return None
+        assert!(find_claude_result("just some plain text output").is_none());
+    }
+
+    #[test]
+    fn find_claude_result_model_usage() {
+        let ndjson = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","modelUsage":{"claude-sonnet-4-20250514":{"inputTokens":5000,"outputTokens":1000}},"duration_ms":3000}"#;
+        let result = find_claude_result(ndjson).expect("should extract modelUsage");
+        assert_eq!(result.input_tokens, Some(5000));
+        assert_eq!(result.output_tokens, Some(1000));
     }
 }

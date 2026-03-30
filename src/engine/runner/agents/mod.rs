@@ -103,6 +103,41 @@ impl PermissionRules {
     }
 }
 
+/// Structured result from per-agent NDJSON extraction.
+///
+/// Each agent emits a different NDJSON format. The per-agent `find_result`
+/// functions parse agent-specific envelopes and return a unified `AgentResult`
+/// so callers (review pipeline, response handler) don't need format knowledge.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields read by tests and future phases
+pub struct AgentResult {
+    /// Whether the agent reported an error (e.g. `is_error: true` in Claude).
+    pub is_error: bool,
+    /// The extracted result text (inner content, stripped of envelope).
+    pub result_text: String,
+    /// Input tokens consumed (if reported by the agent).
+    pub input_tokens: Option<u64>,
+    /// Output tokens consumed (if reported by the agent).
+    pub output_tokens: Option<u64>,
+    /// Total cost in USD (if reported by the agent).
+    pub cost_usd: Option<f64>,
+    /// Wall-clock duration in milliseconds (if reported by the agent).
+    pub duration_ms: Option<u64>,
+}
+
+/// Dispatch to the appropriate per-agent result extractor.
+///
+/// Returns `None` if no structured result could be found in the output
+/// (e.g. plain text, empty output, or unrecognized format).
+pub fn find_agent_result(agent: &str, ndjson: &str) -> Option<AgentResult> {
+    match agent {
+        "claude" | "kimi" | "minimax" => claude::find_claude_result(ndjson),
+        "opencode" => opencode::find_opencode_result(ndjson),
+        "codex" => codex::find_codex_result(ndjson),
+        _ => claude::find_claude_result(ndjson),
+    }
+}
+
 /// Parsed response from an agent, including metadata extracted from the
 /// agent-specific output envelope.
 #[derive(Debug, Clone)]

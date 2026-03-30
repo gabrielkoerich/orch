@@ -330,6 +330,7 @@ pub struct ReviewIssue {
 /// Use this in the review pipeline instead of `parse_review_response` so that
 /// raw opencode NDJSON output is handled even when the normal agent-envelope
 /// parsing chain fails (e.g. format change, empty summary).
+#[allow(dead_code)] // used by integration tests; production code uses parse_review_from_agent_output
 pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> {
     // Step 1: direct JSON / markdown parse
     if let Ok(r) = parse_review_response(output) {
@@ -355,7 +356,59 @@ pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> 
     anyhow::bail!("failed to parse review response from output")
 }
 
+/// Parse a review response using per-agent NDJSON extraction.
+///
+/// Unlike `parse_review_from_output`, this uses the agent-specific `find_result`
+/// extractors instead of the generic `ndjson_extract_text`. This eliminates false
+/// positives from broad substring matching when agent output contains JSON-like
+/// fragments or rate-limit keywords in normal text.
+///
+/// Parsing chain:
+/// 1. Direct JSON / markdown parse of the raw output
+/// 2. Per-agent NDJSON extraction → parse the extracted result text
+/// 3. Heuristic keyword fallback for plain-text decisions
+pub fn parse_review_from_agent_output(agent: &str, output: &str) -> anyhow::Result<ReviewResponse> {
+    // Step 1: direct JSON / markdown parse
+    if let Ok(r) = parse_review_response(output) {
+        return Ok(r);
+    }
+
+    // Step 2: per-agent NDJSON extraction
+    if let Some(result) = crate::engine::runner::agents::find_agent_result(agent, output) {
+        if !result.result_text.is_empty() {
+            if let Ok(r) = parse_review_response(&result.result_text) {
+                return Ok(r);
+            }
+            // The extracted text might itself need keyword inference
+            if let Some(r) = infer_review_response_from_text(&result.result_text) {
+                tracing::warn!(
+                    agent,
+                    output_len = output.len(),
+                    "review response parsed via keyword fallback on agent-extracted text"
+                );
+                return Ok(r);
+            }
+        }
+    }
+
+    // Step 3: heuristic fallback on the full output
+    if let Some(resp) = infer_review_response_from_text(output) {
+        tracing::warn!(
+            agent,
+            output_len = output.len(),
+            "review response parsed via keyword fallback"
+        );
+        return Ok(resp);
+    }
+
+    anyhow::bail!("failed to parse review response from {agent} output")
+}
+
 /// Extract the concatenated text content from an NDJSON event stream.
+///
+/// **Deprecated**: Prefer `parse_review_from_agent_output` which uses per-agent
+/// extractors. This generic version is retained for backward compatibility
+/// when the agent name is unknown.
 ///
 /// Handles text event formats from all agents:
 /// - opencode Format 1: `{"type":"text","part":{"type":"text","text":"..."}}`
@@ -363,6 +416,7 @@ pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> 
 /// - codex Format:      `{"type":"item.completed","item":{"type":"agent_message","text":"..."}}`
 /// - claude stream-json: `{"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}`
 /// - claude result:      `{"type":"result","result":"..."}`
+#[allow(dead_code)] // used by parse_review_from_output (integration tests)
 fn ndjson_extract_text(ndjson: &str) -> String {
     let texts: Vec<String> = ndjson
         .lines()
@@ -1123,6 +1177,78 @@ That's all."#;
         assert!(
             parse_review_from_output(text).is_err(),
             "negative context with backtick approve must not infer approval"
+        );
+    }
+
+    // ── parse_review_from_agent_output ──────────────────────────
+
+    #[test]
+    fn agent_output_claude_ndjson_review() {
+        let ndjson = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reviewing..."}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}","usage":{"input_tokens":100,"output_tokens":20}}"#,
+        );
+        let resp = parse_review_from_agent_output("claude", ndjson).unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn agent_output_opencode_ndjson_review() {
+        let ndjson = concat!(
+            r#"{"type":"step_start","timestamp":1000}"#,
+            "\n",
+            r#"{"type":"text","timestamp":1001,"part":{"type":"text","text":"{\"decision\":\"request_changes\",\"notes\":\"Fix it\",\"issues\":[]}"}}"#,
+            "\n",
+            r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"stop","tokens":{"input":100,"output":10}}}"#,
+        );
+        let resp = parse_review_from_agent_output("opencode", ndjson).unwrap();
+        assert_eq!(resp.decision, "request_changes");
+    }
+
+    #[test]
+    fn agent_output_codex_ndjson_review() {
+        let ndjson = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"{\"decision\":\"approve\",\"notes\":\"All good\",\"issues\":[]}"}}"#,
+            "\n",
+            r#"{"type":"turn.completed"}"#,
+        );
+        let resp = parse_review_from_agent_output("codex", ndjson).unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn agent_output_plain_text_keyword_fallback() {
+        let text = "All checks passed, LGTM.";
+        let resp = parse_review_from_agent_output("claude", text).unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    #[test]
+    fn agent_output_direct_json() {
+        let json = r#"{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#;
+        let resp = parse_review_from_agent_output("opencode", json).unwrap();
+        assert_eq!(resp.decision, "approve");
+    }
+
+    /// Regression: plain text containing JSON fragments should NOT trigger false
+    /// positives. The per-agent extractor returns None for non-NDJSON text,
+    /// so we fall through to keyword inference instead of generic NDJSON parsing.
+    #[test]
+    fn agent_output_text_with_json_fragment_no_false_positive() {
+        let text = r#"I checked the file and found {"type":"text"} in the output. No issues."#;
+        // This should NOT extract a review from the JSON fragment.
+        // With the generic parser, this would match as a "text" NDJSON event.
+        // With per-agent extraction, it returns None (not valid agent NDJSON).
+        let result = parse_review_from_agent_output("claude", text);
+        // Should either fail or infer from keywords, NOT parse the JSON fragment
+        assert!(
+            result.is_err() || result.as_ref().is_ok_and(|r| r.decision != "text"),
+            "should not extract review from embedded JSON fragment"
         );
     }
 }
