@@ -935,53 +935,114 @@ async fn skills_sync() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Inspect router & cooldown state and emit a warning + persisted metric when
-/// three or more agents are concurrently degraded.
+/// Per-agent degradation detail collected during the alerting check.
+struct DegradedAgentDetail {
+    /// Agent name (e.g. "claude", "codex").
+    agent: String,
+    /// Reason the agent is degraded: the stored cooldown reason when the agent
+    /// itself is in cooldown, or `"no_available_model"` when all model pools
+    /// are individually cooled.
+    reason: String,
+    /// Models that are individually in cooldown for this agent, deduped across
+    /// all complexity tiers.
+    cooled_models: Vec<String>,
+}
+
+/// Inspect router & cooldown state and emit metrics every tick.
+///
+/// - `metrics:orch.agents_degraded.count` is written on every call with the
+///   current number of degraded agents (0 when healthy).
+/// - When `count >= 3` a WARN log is emitted with full dimensions (agent
+///   names, cooled models, cooldown reasons) and a dedicated alert metric
+///   `metrics:orch.agents_degraded.alert` is set to `"1"`. The alert is
+///   cleared to `"0"` when the count drops below the threshold.
 async fn emit_degraded_agents_if_needed(
     router: &crate::engine::router::Router,
     store: Option<&Arc<TaskStore>>,
 ) {
-    // Complexity tiers to check for configured models. If an agent has no
-    // available model across all tiers, treat it as degraded.
+    // Complexity tiers to check for configured models.
     const COMPLEXITIES: &[&str] = &["simple", "medium", "complex", "review"];
 
-    let mut degraded: Vec<String> = Vec::new();
+    let mut details: Vec<DegradedAgentDetail> = Vec::new();
+
     for agent in &router.available_agents {
         let agent_in_cd = crate::engine::cooldown::is_agent_in_cooldown(agent);
 
-        // Determine if the agent has any available model across complexities.
-        let mut has_model = false;
+        // Collect individually cooled models across all complexity tiers (deduped).
+        let mut cooled_models: Vec<String> = Vec::new();
+        let mut seen_models = std::collections::HashSet::new();
         for comp in COMPLEXITIES {
-            if router
-                .config
-                .has_available_model_for_complexity(agent, comp)
-            {
-                has_model = true;
-                break;
+            if let Some(pool) = router.config.model_pool_for_complexity(agent, comp) {
+                for model in pool {
+                    if seen_models.insert(model.clone())
+                        && crate::engine::cooldown::is_model_in_cooldown(agent, &model)
+                    {
+                        cooled_models.push(model);
+                    }
+                }
             }
         }
 
+        // An agent is degraded if it is in agent-level cooldown OR has no
+        // available (non-cooled) model across any complexity tier.
+        let has_model = COMPLEXITIES.iter().any(|comp| {
+            router
+                .config
+                .has_available_model_for_complexity(agent, comp)
+        });
+
         if agent_in_cd || !has_model {
-            degraded.push(agent.clone());
+            let reason = if agent_in_cd {
+                crate::engine::cooldown::cooldown_reason(agent)
+                    .unwrap_or_else(|| "agent_cooldown".to_string())
+            } else {
+                "no_available_model".to_string()
+            };
+            details.push(DegradedAgentDetail {
+                agent: agent.clone(),
+                reason,
+                cooled_models,
+            });
         }
     }
 
-    let count = degraded.len();
+    let count = details.len();
+
+    // Always persist the count metric so operators can scrape it every tick,
+    // including when the count is 0.
+    kv_set_prefer_store(
+        &store,
+        "metrics:orch.agents_degraded.count",
+        &count.to_string(),
+    )
+    .await;
+
     if count >= 3 {
+        // Build structured dimension strings for the log.
+        let degraded_agents: Vec<&str> = details.iter().map(|d| d.agent.as_str()).collect();
+        let cooled_models_dim: Vec<String> = details
+            .iter()
+            .filter(|d| !d.cooled_models.is_empty())
+            .map(|d| format!("{}:[{}]", d.agent, d.cooled_models.join(",")))
+            .collect();
+        let reasons_dim: Vec<String> = details
+            .iter()
+            .map(|d| format!("{}={}", d.agent, d.reason))
+            .collect();
+
         tracing::warn!(
             degraded_count = count,
-            degraded_agents = ?degraded,
+            degraded_agents = ?degraded_agents,
+            cooled_models = %cooled_models_dim.join("; "),
+            cooldown_reasons = %reasons_dim.join("; "),
             "multi-agent degradation detected"
         );
 
-        // Persist a machine-readable metric to the KV store as a pragmatic
-        // fallback until a centralized metrics client is present.
-        kv_set_prefer_store(
-            &store,
-            "metrics:orch.degraded_agents.count",
-            &count.to_string(),
-        )
-        .await;
+        // Dedicated alert metric: "1" while the threshold is exceeded.
+        kv_set_prefer_store(&store, "metrics:orch.agents_degraded.alert", "1").await;
+    } else {
+        // Clear the alert metric when healthy.
+        kv_set_prefer_store(&store, "metrics:orch.agents_degraded.alert", "0").await;
     }
 }
 
@@ -2203,24 +2264,62 @@ mod tests {
         // Create a router and set deterministic available agents
         let mut router = Router::new(RouterConfig::default());
         router.available_agents = vec![
-            "agent-a".to_string(),
-            "agent-b".to_string(),
-            "agent-c".to_string(),
-            "agent-d".to_string(),
+            "test-agent-3a".to_string(),
+            "test-agent-3b".to_string(),
+            "test-agent-3c".to_string(),
+            "test-agent-3d".to_string(),
         ];
 
         // Place three agents into cooldown (in-memory only)
-        crate::engine::cooldown::set_agent_cooldown("agent-a", 3600);
-        crate::engine::cooldown::set_agent_cooldown("agent-b", 3600);
-        crate::engine::cooldown::set_agent_cooldown("agent-c", 3600);
+        crate::engine::cooldown::set_agent_cooldown("test-agent-3a", 3600);
+        crate::engine::cooldown::set_agent_cooldown("test-agent-3b", 3600);
+        crate::engine::cooldown::set_agent_cooldown("test-agent-3c", 3600);
 
-        // Call the helper and assert KV metric written
+        // Call the helper and assert KV metrics written
         emit_degraded_agents_if_needed(&router, Some(&store)).await;
 
-        let val = store
-            .kv_get("metrics:orch.degraded_agents.count")
+        // Count metric always written
+        let count_val = store
+            .kv_get("metrics:orch.agents_degraded.count")
             .await
             .unwrap();
-        assert_eq!(val.as_deref(), Some("3"));
+        assert_eq!(count_val.as_deref(), Some("3"));
+
+        // Alert metric set to "1" when threshold crossed
+        let alert_val = store
+            .kv_get("metrics:orch.agents_degraded.alert")
+            .await
+            .unwrap();
+        assert_eq!(alert_val.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn emit_degraded_agents_clears_alert_when_below_threshold() {
+        use crate::engine::router::{Router, RouterConfig};
+
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+
+        let mut router = Router::new(RouterConfig::default());
+        router.available_agents = vec!["test-agent-2a".to_string(), "test-agent-2b".to_string()];
+
+        // Place only two agents into cooldown — below the threshold of 3
+        crate::engine::cooldown::set_agent_cooldown("test-agent-2a", 3600);
+        crate::engine::cooldown::set_agent_cooldown("test-agent-2b", 3600);
+
+        emit_degraded_agents_if_needed(&router, Some(&store)).await;
+
+        // Count metric still written (always-emit)
+        let count_val = store
+            .kv_get("metrics:orch.agents_degraded.count")
+            .await
+            .unwrap();
+        assert_eq!(count_val.as_deref(), Some("2"));
+
+        // Alert metric cleared (set to "0") — no WARN should fire
+        let alert_val = store
+            .kv_get("metrics:orch.agents_degraded.alert")
+            .await
+            .unwrap();
+        assert_eq!(alert_val.as_deref(), Some("0"));
     }
 }
