@@ -104,30 +104,40 @@ fn extract_json_block(text: &str) -> Option<String> {
     let fence_end = start + "```json".len();
     let remainder = &text[fence_end..];
 
-    // Find the position of the first newline after the opening fence
+    // Find key positions after the opening fence
     let newline_pos = remainder.find('\n');
-    // Find the position of the first opening JSON delimiter after the fence
+    let closing_fence_pos = remainder.find("```");
     let json_start_pos = remainder.find(['{', '[']);
 
-    // Determine if this is a fenced block (newline before JSON start) or inline (JSON starts before newline)
-    let is_fenced = match (newline_pos, json_start_pos) {
-        (Some(nl), Some(js)) => nl < js,
-        (Some(_), None) => true, // newline but no JSON start? still fenced (maybe invalid)
-        (None, _) => false,      // no newline -> inline
+    // If there's no closing fence, we can't extract a block.
+    let closing_fence_pos = closing_fence_pos?;
+
+    // Decide fenced vs inline using a robust heuristic:
+    // - If a JSON delimiter ('{' or '[') appears before the first newline, treat as inline
+    //   (this preserves inline JSON that contains internal newlines).
+    // - Otherwise, if the closing fence appears before the first newline (or there is no newline),
+    //   treat as inline (JSON is on the same line as the fence).
+    // - Otherwise, treat as a standard fenced block where content starts after the first newline.
+    let first_nl = newline_pos.unwrap_or(usize::MAX);
+
+    let is_inline = match json_start_pos {
+        Some(js) if js < first_nl => true,
+        _ => closing_fence_pos < first_nl,
     };
 
-    if is_fenced {
-        // Fenced block: JSON starts after the newline (skip info string if any)
-        let content_start = fence_end + newline_pos? + 1;
-        let end = text[content_start..].find("```")? + content_start;
-        Some(text[content_start..end].to_string())
-    } else {
-        // Inline block: JSON starts at first non-whitespace after fence (or at fence_end)
+    if is_inline {
+        // Inline: content is between the first non-whitespace after the fence and the closing fence
         let content_start = remainder
             .char_indices()
             .find(|(_, ch)| !ch.is_whitespace())
             .map_or(fence_end, |(idx, _)| fence_end + idx);
-        let end = text[content_start..].find("```")? + content_start;
+        let end = fence_end + closing_fence_pos;
+        Some(text[content_start..end].to_string())
+    } else {
+        // Fenced block: content begins after the first newline and ends at the closing fence
+        let nl = newline_pos?;
+        let content_start = fence_end + nl + 1;
+        let end = fence_end + closing_fence_pos;
         Some(text[content_start..end].to_string())
     }
 }
