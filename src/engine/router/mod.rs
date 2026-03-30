@@ -84,14 +84,12 @@ pub struct Router {
 #[derive(Debug)]
 enum AllCooledError {
     Agents(String),
-    Models(String),
 }
 
 impl std::fmt::Display for AllCooledError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AllCooledError::Agents(scope) => write!(f, "all agents in cooldown for {}", scope),
-            AllCooledError::Models(scope) => write!(f, "all models in cooldown for {}", scope),
         }
     }
 }
@@ -612,7 +610,6 @@ impl Router {
                     if let Some(err) = e.downcast_ref::<AllCooledError>() {
                         let scope = match err {
                             AllCooledError::Agents(scope) => scope.as_str(),
-                            AllCooledError::Models(scope) => scope.as_str(),
                         };
                         tracing::warn!(scope = %scope, "router cooldown gate tripped");
                         let scope_opt = if scope == "all agents" {
