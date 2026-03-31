@@ -542,15 +542,118 @@ pub async fn create_pr_if_needed(
     // Always use the short task title for the PR title (summary goes in body)
     let pr_title = title;
 
-    // Create PR using GhHttp API
-    let url = gh
-        .create_pr(repo, pr_title, &body, branch, base_branch)
-        .await
-        .map_err(PrCreateError::ApiError)?;
+    // Create PR using GhHttp API with exponential backoff retry for transient 5xx errors.
+    const MAX_RETRIES: u32 = 3;
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut created_url: Option<String> = None;
+
+    for attempt in 1..=MAX_RETRIES {
+        match gh
+            .create_pr(repo, pr_title, &body, branch, base_branch)
+            .await
+        {
+            Ok(u) => {
+                created_url = Some(u);
+                break;
+            }
+            Err(e) => {
+                let err_str = format!("{e}");
+                if is_transient_github_error(&err_str) && attempt < MAX_RETRIES {
+                    let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                    tracing::warn!(
+                        task_id,
+                        attempt,
+                        delay_secs = delay.as_secs(),
+                        error = %e,
+                        "transient GitHub API error during PR creation — retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                last_error = Some(e);
+            }
+        }
+    }
+
+    let url = match created_url {
+        Some(u) => u,
+        None => {
+            let e = last_error.unwrap();
+            let err_str = format!("{e}");
+            // For transient 5xx errors, GitHub may have created the PR despite returning
+            // an error (e.g. 502 after the write succeeded). Re-check for an existing PR
+            // before propagating the failure so we don't orphan the PR from the task.
+            if is_transient_github_error(&err_str) {
+                tracing::warn!(
+                    task_id,
+                    error = %e,
+                    "transient GitHub API error after all retries — checking if PR was actually created"
+                );
+                match gh.get_pr_number(repo, branch).await {
+                    Ok(Some(pr_number)) => {
+                        tracing::info!(
+                            task_id,
+                            pr = pr_number,
+                            "PR was created despite transient errors — recovering"
+                        );
+                        append_pr_footer_if_missing(&gh, repo, pr_number, task_id, agent, model)
+                            .await;
+                        match gh.get_pr(repo, pr_number).await {
+                            Ok(pr) => pr.html_url,
+                            Err(get_err) => {
+                                tracing::warn!(
+                                    task_id,
+                                    error = %get_err,
+                                    "failed to fetch PR URL after transient-error recovery"
+                                );
+                                return Err(PrCreateError::ApiError(e));
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            task_id,
+                            "PR was not created after all retries — propagating original error"
+                        );
+                        return Err(PrCreateError::ApiError(e));
+                    }
+                    Err(check_err) => {
+                        tracing::warn!(
+                            task_id,
+                            error = %check_err,
+                            "failed to verify PR existence after transient error retries — propagating original error"
+                        );
+                        return Err(PrCreateError::ApiError(e));
+                    }
+                }
+            } else {
+                return Err(PrCreateError::ApiError(e));
+            }
+        }
+    };
 
     tracing::info!(task_id, pr_url = %url, "created PR via GhHttp API");
 
     Ok(url)
+}
+
+/// Returns true if the error string indicates a transient GitHub API failure
+/// (HTTP 5xx), where the PR may have been created despite the error response.
+fn is_transient_github_error(err_str: &str) -> bool {
+    extract_github_http_status(err_str)
+        .map(|s| (500..600).contains(&s))
+        .unwrap_or(false)
+}
+
+/// Extract the HTTP status code from a GhHttp error string.
+///
+/// GhHttp formats errors as: `"GitHub API POST https://... failed (NNN): body"`
+/// This parses the numeric status code from that format.
+fn extract_github_http_status(err_str: &str) -> Option<u16> {
+    let marker = "failed (";
+    let start = err_str.find(marker)? + marker.len();
+    let rest = &err_str[start..];
+    let end = rest.find(')')?;
+    rest[..end].parse().ok()
 }
 
 /// Append the Orch attribution footer to an existing PR body if not already present.
@@ -777,5 +880,41 @@ mod tests {
         assert!(push_needs_rebase(
             "push rejected because the remote contains work"
         ));
+    }
+
+    #[test]
+    fn extract_github_http_status_parses_ghhttp_error_format() {
+        let err =
+            "GitHub API POST https://api.github.com/repos/foo/bar/pulls failed (502): Bad Gateway";
+        assert_eq!(extract_github_http_status(err), Some(502));
+
+        let err500 = "GitHub API POST https://api.github.com/repos/foo/bar/pulls failed (500): Internal Server Error";
+        assert_eq!(extract_github_http_status(err500), Some(500));
+
+        let err422 = "GitHub API POST https://api.github.com/repos/foo/bar/pulls failed (422): Unprocessable Entity";
+        assert_eq!(extract_github_http_status(err422), Some(422));
+
+        let not_github = "some other error";
+        assert_eq!(extract_github_http_status(not_github), None);
+    }
+
+    #[test]
+    fn is_transient_github_error_matches_5xx_only() {
+        let err502 =
+            "GitHub API POST https://api.github.com/repos/foo/bar/pulls failed (502): Bad Gateway";
+        assert!(is_transient_github_error(err502));
+
+        let err503 = "GitHub API POST https://api.github.com/repos/foo/bar/pulls failed (503): Service Unavailable";
+        assert!(is_transient_github_error(err503));
+
+        let err422 = "GitHub API POST https://api.github.com/repos/foo/bar/pulls failed (422): Unprocessable Entity";
+        assert!(!is_transient_github_error(err422));
+
+        let err404 =
+            "GitHub API POST https://api.github.com/repos/foo/bar/pulls failed (404): Not Found";
+        assert!(!is_transient_github_error(err404));
+
+        let not_github = "connection refused";
+        assert!(!is_transient_github_error(not_github));
     }
 }

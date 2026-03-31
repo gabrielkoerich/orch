@@ -403,12 +403,14 @@ pub async fn handle_success(
         );
         "blocked"
     } else if resp.status == "done" && !has_pr && has_pushed {
-        // Push succeeded but PR creation failed — review gate will find commits and create the PR.
+        // Push succeeded but PR creation failed after retries. Re-dispatch so another
+        // agent attempt will push and create the PR (the worktree branch already exists,
+        // so the next run will detect the existing branch and create the PR).
         tracing::warn!(
             task_id,
-            "agent done, commits pushed, but PR creation failed — routing to review gate"
+            "agent done, commits pushed, but PR creation failed — re-dispatching as routed"
         );
-        "needs_review"
+        "routed"
     } else if resp.status == "done" && !has_pr && !task_id.starts_with("internal:") {
         // Agent claimed done but produced no code changes on an external task.
         // Use a dedicated circuit-breaker counter persisted in the store so
