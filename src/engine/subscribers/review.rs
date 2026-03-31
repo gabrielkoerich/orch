@@ -375,8 +375,44 @@ pub fn spawn(
                                     }
                                 }
                             }
-                            Ok(ReviewDecision::Approve) | Ok(ReviewDecision::Skipped) => {
-                                crate::store::store_reset_counters(
+                            Ok(ReviewDecision::Approve) => {
+                                // On approval we clear transient failure counters
+                                // but preserve the `review_cycles` counter which
+                                // tracks how many times the PR has requested
+                                // changes and is used as a circuit-breaker.
+                                crate::store::store_reset_failure_counters(
+                                    &Some(store_c.clone()),
+                                    &repo_s,
+                                    &tid,
+                                )
+                                .await;
+
+                                // Ensure approved PRs do not re-enter the review loop
+                                // when `auto_close_task_on_approval` is disabled.
+                                // The review gate normally marks Done when appropriate
+                                // but being defensive here prevents event-driven
+                                // re-dispatch races from leaving the task in InReview.
+                                let auto_close = crate::config::get("workflow.auto_close_task_on_approval")
+                                    .or_else(|_| crate::config::get("workflow.auto_close"))
+                                    .or_else(|_| crate::config::get("workflow.auto_merge"))
+                                    .map(|v| v.eq_ignore_ascii_case("true"))
+                                    .unwrap_or(false);
+
+                                if !auto_close {
+                                    tracing::info!(task_id = tid, "approval received (auto_close disabled) — marking task Done to avoid re-review");
+                                    if let Err(e) = task_manager_c
+                                        .update_task_status(&ExternalId(tid.clone()), Status::Done)
+                                        .await
+                                    {
+                                        tracing::warn!(task_id = %tid, err = %e, "failed to set Done after approval; task may still be InReview");
+                                    }
+                                }
+                                ReviewOutcome::Ok
+                            }
+                            Ok(ReviewDecision::Skipped) => {
+                                // Skipped indicates there's nothing to review (no PR etc.).
+                                // Clear transient failure counters but preserve review_cycles.
+                                crate::store::store_reset_failure_counters(
                                     &Some(store_c.clone()),
                                     &repo_s,
                                     &tid,

@@ -387,6 +387,78 @@ pub(crate) async fn review_open_prs(
             continue;
         }
 
+        // If the PR is fully approved but auto-close is disabled, we still
+        // want to advance the task state so it doesn't get repeatedly
+        // re-reviewed. Replicate the non-merging path from the review gate:
+        // if already merged -> mark Done; if merge conflicts -> handle
+        // conflict retries; otherwise mark Done (leave PR open for human merge).
+        if (all_approved || comment_approved)
+            && !comment_changes_requested
+            && !any_changes_requested
+        {
+            let already_merged = match gh.is_pr_merged(repo, &branch).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
+                    continue;
+                }
+            };
+
+            if already_merged {
+                tracing::info!(task_id, branch = %branch, "PR already merged, marking done (auto_close disabled)");
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::Done)
+                    .await
+                {
+                    tracing::warn!(task_id, err = %e, "failed to update status to done");
+                }
+            } else {
+                let pr_details = gh.get_pr(repo, pr_number).await;
+                let is_conflicting = pr_details
+                    .as_ref()
+                    .map(|pr| pr.mergeable == Some(false))
+                    .unwrap_or(false);
+
+                if is_conflicting {
+                    let retries = stored_task.merge_conflict_retries as u64;
+                    if retries >= MAX_MERGE_CONFLICT_RETRIES {
+                        tracing::error!(task_id, pr_number, retries, "PR approved but merge conflict retry limit reached — blocking for human review (auto_close disabled)");
+                        if let Err(e) = task_manager
+                            .update_task_status(&task.id, Status::Blocked)
+                            .await
+                        {
+                            tracing::warn!(task_id, err = %e, "failed to set Blocked");
+                        }
+                        continue;
+                    }
+                    tracing::info!(task_id, pr_number, retries, "PR approved but has merge conflicts — re-triggering review agent to rebase (auto_close disabled)");
+                    store_increment(
+                        &Some(Arc::clone(store)),
+                        repo,
+                        task_id,
+                        "merge_conflict_retries",
+                    )
+                    .await;
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::NeedsReview)
+                        .await
+                    {
+                        tracing::warn!(task_id, err = %e, "failed to set NeedsReview for conflict retry");
+                    }
+                    continue;
+                }
+
+                tracing::info!(task_id, pr_number, comment_approved, "PR approved (auto_close disabled) — marking task done and leaving PR open for human merge");
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::Done)
+                    .await
+                {
+                    tracing::warn!(task_id, err = %e, "failed to update task status to done");
+                }
+            }
+            continue;
+        }
+
         // Process reviews that request changes
         if !any_changes_requested && !comment_changes_requested {
             continue;
