@@ -934,6 +934,17 @@ pub(crate) async fn review_and_merge(
 
     let stderr = std::fs::read_to_string(review_attempt_dir.join("stderr.txt")).unwrap_or_default();
 
+    // Extract token usage from the raw output so we can track review agent costs.
+    let agent_token_usage = {
+        let ar = runner::agents::find_agent_result(&review_agent, &raw_output);
+        RunTokenUsage {
+            input_tokens: ar.as_ref().and_then(|r| r.input_tokens).unwrap_or(0) as i64,
+            output_tokens: ar.as_ref().and_then(|r| r.output_tokens).unwrap_or(0) as i64,
+            total_cost_usd: ar.as_ref().and_then(|r| r.cost_usd).unwrap_or(0.0),
+            duration_secs: 0.0,
+        }
+    };
+
     // Check the NDJSON result event for is_error flag.
     // Agents like kimi return exit 0 but is_error:true in the result event.
     let result_is_error = raw_output
@@ -980,7 +991,7 @@ pub(crate) async fn review_and_merge(
                     parsed: "",
                     outcome: "failed",
                     error: &err.to_string(),
-                    tokens: RunTokenUsage::default(),
+                    tokens: agent_token_usage,
                 })
                 .await;
         }
@@ -1026,7 +1037,7 @@ pub(crate) async fn review_and_merge(
                         parsed: "",
                         outcome: "failed",
                         error: &format!("agent error: {e}"),
-                        tokens: RunTokenUsage::default(),
+                        tokens: agent_token_usage,
                     })
                     .await;
             }
@@ -1074,7 +1085,7 @@ pub(crate) async fn review_and_merge(
                                         parsed: &text_for_review,
                                         outcome: "failed",
                                         error: &format!("parse error: {combined_error}"),
-                                        tokens: RunTokenUsage::default(),
+                                        tokens: agent_token_usage,
                                     })
                                     .await;
                             }
@@ -1100,7 +1111,7 @@ pub(crate) async fn review_and_merge(
                                 parsed: &text_for_review,
                                 outcome: "failed",
                                 error: &format!("parse error: {e}"),
-                                tokens: RunTokenUsage::default(),
+                                tokens: agent_token_usage,
                             })
                             .await;
                     }
@@ -1299,9 +1310,27 @@ pub(crate) async fn review_and_merge(
                 parsed: &text_for_review,
                 outcome,
                 error,
-                tokens: RunTokenUsage::default(),
+                tokens: agent_token_usage,
             })
             .await;
+    }
+
+    // Store token usage on the task so `orch cost` reflects review agent spend.
+    if let Some(sid) = store_id {
+        if agent_token_usage.input_tokens > 0 || agent_token_usage.output_tokens > 0 {
+            let model = review_model.as_deref().unwrap_or("haiku");
+            if let Err(e) = store
+                .store_tokens(
+                    sid,
+                    agent_token_usage.input_tokens,
+                    agent_token_usage.output_tokens,
+                    model,
+                )
+                .await
+            {
+                tracing::warn!(task_id = task.id.0, ?e, "failed to store review agent token usage");
+            }
+        }
     }
 
     // 15. Check for push failures before acting on the decision.
