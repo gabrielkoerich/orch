@@ -211,6 +211,61 @@ pub fn spawn(
                             Block,
                             Ok,
                         }
+
+                        // Re-check agent cooldowns inside the spawned task. A concurrent
+                        // review that ran between the outer dispatch check and now may have
+                        // set a cooldown — bail early rather than burning a review run
+                        // against a rate-limited agent.
+                        let pre_check_all_cooled = {
+                            let agents = router_c.read().await.available_agents.clone();
+                            !agents.is_empty()
+                                && agents
+                                    .iter()
+                                    .all(|a| crate::engine::cooldown::is_agent_in_cooldown(a))
+                        };
+                        if pre_check_all_cooled {
+                            tracing::info!(
+                                task_id = tid,
+                                "all agents cooled at review spawn time — deferring without running agent"
+                            );
+                            // Fall through to RateLimited outcome handling below, which
+                            // waits for the cooldown to expire and resets to NeedsReview.
+                            crate::store::set_review_session_expected(
+                                &store_c,
+                                &repo_s,
+                                &tid,
+                                false,
+                            )
+                            .await;
+                            let wait_secs = {
+                                let agents = router_c.read().await.available_agents.clone();
+                                let now = chrono::Utc::now().timestamp();
+                                agents
+                                    .iter()
+                                    .filter_map(|a| crate::engine::cooldown::cooldown_until(a))
+                                    .min()
+                                    .map(|until| ((until - now).max(1)) as u64)
+                                    .unwrap_or(crate::engine::cooldown::AGENT_COOLDOWN_SECS as u64)
+                            };
+                            tracing::info!(
+                                task_id = tid,
+                                wait_secs,
+                                "pre-check: deferring review retry due to agent rate limit cooldown"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                            if let Err(e) = task_manager_c
+                                .update_task_status(
+                                    &ExternalId(tid.clone()),
+                                    Status::NeedsReview,
+                                )
+                                .await
+                            {
+                                tracing::error!(task_id = %tid, err = %e, "pre-check: update_task_status(NeedsReview) failed — task may be stuck in InReview");
+                            }
+                            drop(permit);
+                            return;
+                        }
+
                         let outcome = match review_and_merge(
                             &task,
                             &backend_c,
