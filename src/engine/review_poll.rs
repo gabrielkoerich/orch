@@ -5,16 +5,14 @@
 //! are requested.
 
 use crate::backends::{ExternalBackend, Status};
+use crate::config;
 use crate::engine::auto_merge::{dedup_reviews, handle_review_changes, MAX_MERGE_CONFLICT_RETRIES};
 use crate::engine::tasks::TaskManager;
 use crate::engine::EngineConfig;
 use crate::github::http::GhHttp;
 use crate::github::types::{GitHubReviewComment, PullRequestReview};
 use crate::store::TaskStore;
-use crate::store::{
-    opt_store_get_task, store_increment, store_reset_counters, store_reset_failure_counters,
-    store_set,
-};
+use crate::store::{opt_store_get_task, store_increment, store_reset_failure_counters, store_set};
 use std::sync::Arc;
 
 /// Review open PRs - re-dispatch agent to address review feedback.
@@ -138,14 +136,68 @@ pub(crate) async fn review_open_prs(
                         tracing::warn!(task_id, err = %e, "failed to update status to done");
                     }
                 } else {
-                    tracing::warn!(task_id, branch = %branch, "in_review but no open PR — re-dispatching");
-                    if let Err(e) = task_manager
-                        .update_task_status(&task.id, Status::Routed)
-                        .await
-                    {
-                        tracing::warn!(task_id, err = %e, "failed to update status to routed");
+                    // No PR and not merged — re-route with circuit breaker to prevent loops.
+                    // Use a dedicated counter persisted in the store so repeated reroutes
+                    // across separate runs are counted. This prevents tasks from looping
+                    // indefinitely through in_review → routed → in_progress → needs_review
+                    // cycles.
+                    let max_reroutes: u32 = config::get("workflow.max_reroute_attempts")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .or_else(|| {
+                            config::get("workflow.max_attempts")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                        })
+                        .unwrap_or(3);
+
+                    let reroutes =
+                        store_increment(&Some(Arc::clone(store)), repo, task_id, "no_pr_reroutes")
+                            .await;
+
+                    if reroutes as u32 >= max_reroutes {
+                        tracing::error!(
+                            task_id,
+                            reroutes,
+                            max_reroutes,
+                            "reached max reroute attempts for in_review no-PR — blocking for human review"
+                        );
+                        // Clear agent/model and record an explanatory last_error
+                        let msg = format!(
+                            "no PR or code changes after {}/{} reroute attempts",
+                            reroutes, max_reroutes
+                        );
+                        store_set(
+                            &Some(Arc::clone(store)),
+                            repo,
+                            task_id,
+                            &[
+                                ("agent", serde_json::json!(null)),
+                                ("model", serde_json::json!(null)),
+                                ("last_error", serde_json::json!(msg)),
+                            ],
+                        )
+                        .await;
+                        if let Err(e) = task_manager
+                            .update_task_status(&task.id, Status::Blocked)
+                            .await
+                        {
+                            tracing::warn!(task_id, err = %e, "failed to update status to blocked");
+                        }
                     } else {
-                        store_reset_counters(&Some(Arc::clone(store)), repo, task_id).await;
+                        tracing::warn!(
+                            task_id,
+                            branch = %branch,
+                            reroutes,
+                            max_reroutes,
+                            "in_review but no open PR — re-dispatching"
+                        );
+                        if let Err(e) = task_manager
+                            .update_task_status(&task.id, Status::Routed)
+                            .await
+                        {
+                            tracing::warn!(task_id, err = %e, "failed to update status to routed");
+                        }
                     }
                 }
                 continue;
