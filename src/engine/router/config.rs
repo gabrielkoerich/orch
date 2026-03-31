@@ -127,9 +127,11 @@ pub struct RouterConfig {
     /// ```
     pub weights: HashMap<String, f64>,
     /// If an agent's routing weight falls below this threshold, consider it
-    /// degraded and skip it during proactive routing decisions. Value in
-    /// `0.0..=1.0` where `1.0` means never skip and `0.0` skips only when
-    /// weight is exactly zero (practically never). Default: `0.3`.
+    /// degraded and skip it during proactive routing decisions. Only evaluated
+    /// when `weighted_round_robin` is enabled. Value in `0.0..=1.0` where `1.0`
+    /// means never skip and `0.0` skips only when weight is exactly zero
+    /// (practically never). Set in `config.yml` under
+    /// `router.skip_limited_threshold`. Default: `0.3`.
     pub skip_limited_threshold: f64,
 }
 
@@ -314,6 +316,14 @@ impl RouterConfig {
                 if let Ok(w) = val.parse::<f64>() {
                     config.weights.insert(agent.clone(), w.max(0.0));
                 }
+            }
+        }
+
+        // Parse skip_limited_threshold
+        if let Ok(val) = crate::config::get("router.skip_limited_threshold") {
+            if let Ok(threshold) = val.parse::<f64>() {
+                // Clamp to valid range [0.0, 1.0]
+                config.skip_limited_threshold = threshold.clamp(0.0, 1.0);
             }
         }
 

@@ -79,6 +79,9 @@ pub struct Router {
     pub(crate) router_pool: Vec<(String, String)>,
     /// Current round-robin index into router_pool
     pub(crate) pool_index: usize,
+    /// Total number of times an agent was skipped due to weight-threshold decay.
+    /// Monotonically increasing; read with `Relaxed` ordering for observability.
+    pub weight_skipped_total: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug)]
@@ -125,6 +128,7 @@ impl Router {
             review_rr_index: 0,
             router_pool,
             pool_index: 0,
+            weight_skipped_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -299,17 +303,20 @@ impl Router {
             tracing::debug!(agent, "agent skipped: degraded (pre-emptive health check)");
             return false;
         }
-        // If weighted routing is used, consider the agent degraded when its
-        // weight has decayed below the configured threshold. This avoids
-        // proactively routing to agents that recently hit many rate limits.
+        // When weighted routing is enabled, also skip agents whose weight has
+        // decayed below the threshold. This avoids routing to agents that have
+        // recently hit many rate limits but are not yet in formal cooldown.
         if self.config.weighted_round_robin {
             let weight = self.weights.get_weight(agent);
             if weight < self.config.skip_limited_threshold {
                 tracing::debug!(
                     agent,
-                    weight,
-                    "agent considered degraded by weight threshold, skipping"
+                    %weight,
+                    threshold = %self.config.skip_limited_threshold,
+                    "agent skipped: weight below threshold"
                 );
+                self.weight_skipped_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return false;
             }
         }
@@ -324,11 +331,35 @@ impl Router {
     }
 
     fn available_agents_for_complexity(&self, complexity: &str) -> Vec<String> {
-        self.available_agents
+        let routable: Vec<String> = self
+            .available_agents
             .iter()
             .filter(|agent| self.agent_is_routable(agent, complexity))
             .cloned()
-            .collect()
+            .collect();
+
+        // Warn when the majority of agents are unavailable due to weight decay or
+        // degradation — this signals a systemic problem that warrants attention.
+        let skipped = self.available_agents.len().saturating_sub(routable.len());
+        if skipped >= 3 {
+            let skipped_agents: Vec<&str> = self
+                .available_agents
+                .iter()
+                .filter(|a| !routable.contains(a))
+                .map(String::as_str)
+                .collect();
+            tracing::warn!(
+                skipped_count = skipped,
+                skipped_agents = ?skipped_agents,
+                weight_skipped_total = self
+                    .weight_skipped_total
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                complexity,
+                "3+ agents simultaneously skipped due to weight-decay or degradation"
+            );
+        }
+
+        routable
     }
 
     /// Count of healthy (routable) agents for a given complexity.
@@ -973,6 +1004,7 @@ mod tests {
     };
     use super::*;
     use crate::backends::{ExternalId, ExternalTask};
+    use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     // Test-only delegates so tests can call router.parse_llm_response() and
@@ -1468,6 +1500,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            weight_skipped_total: std::sync::atomic::AtomicU64::new(0),
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -1503,6 +1536,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            weight_skipped_total: std::sync::atomic::AtomicU64::new(0),
         };
 
         let task = create_test_task("1", "Test", vec!["agent:claude".to_string()]);
@@ -1559,6 +1593,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            weight_skipped_total: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Reload — should re-read config and remain valid
@@ -1849,6 +1884,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            weight_skipped_total: std::sync::atomic::AtomicU64::new(0),
         };
 
         let task = create_test_task("1", "Test task", vec![]);
@@ -1890,6 +1926,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            weight_skipped_total: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Label override should take precedence over weighted routing
@@ -1948,6 +1985,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            weight_skipped_total: std::sync::atomic::AtomicU64::new(0),
         };
 
         let a1 = router.next_round_robin_agent(&[]).unwrap();
@@ -1979,6 +2017,7 @@ Hope that helps!"#;
             review_rr_index: 0,
             router_pool: vec![],
             pool_index: 0,
+            weight_skipped_total: std::sync::atomic::AtomicU64::new(0),
         };
 
         assert!(router.last_agent.is_none());
@@ -2270,5 +2309,303 @@ Hope that helps!"#;
 
         // Cleanup
         crate::engine::cooldown::clear_agent_degraded(agent);
+    }
+
+    #[test]
+    fn test_skip_threshold_filters_low_weight_agents() {
+        // Weight threshold only applies when weighted_round_robin is enabled.
+        let config = RouterConfig {
+            skip_limited_threshold: 0.5,
+            weighted_round_robin: true,
+            ..Default::default()
+        };
+
+        // Set up test agents with different weights
+        let mut weights = AgentWeights::default();
+        weights.states.insert(
+            "high_weight_agent".to_string(),
+            RateLimitState {
+                weight: 0.8,
+                ..Default::default()
+            },
+        );
+        weights.states.insert(
+            "medium_weight_agent".to_string(),
+            RateLimitState {
+                weight: 0.5,
+                ..Default::default()
+            },
+        );
+        weights.states.insert(
+            "low_weight_agent".to_string(),
+            RateLimitState {
+                weight: 0.3,
+                ..Default::default()
+            },
+        );
+        weights.states.insert(
+            "very_low_weight_agent".to_string(),
+            RateLimitState {
+                weight: 0.1,
+                ..Default::default()
+            },
+        );
+
+        let mut router = Router::new(config);
+        router.weights = weights;
+        router.available_agents = vec![
+            "high_weight_agent".to_string(),
+            "medium_weight_agent".to_string(),
+            "low_weight_agent".to_string(),
+            "very_low_weight_agent".to_string(),
+        ];
+
+        router
+            .config
+            .model_map
+            .insert("medium".to_string(), HashMap::new());
+        router
+            .config
+            .model_map
+            .get_mut("medium")
+            .unwrap()
+            .insert("high_weight_agent".to_string(), vec!["model-a".to_string()]);
+        router.config.model_map.get_mut("medium").unwrap().insert(
+            "medium_weight_agent".to_string(),
+            vec!["model-b".to_string()],
+        );
+        router
+            .config
+            .model_map
+            .get_mut("medium")
+            .unwrap()
+            .insert("low_weight_agent".to_string(), vec!["model-c".to_string()]);
+        router.config.model_map.get_mut("medium").unwrap().insert(
+            "very_low_weight_agent".to_string(),
+            vec!["model-d".to_string()],
+        );
+
+        // Agents at or above threshold are routable; below threshold are skipped.
+        assert!(router.agent_is_routable("high_weight_agent", "medium"));
+        assert!(router.agent_is_routable("medium_weight_agent", "medium")); // weight == threshold: not skipped
+        assert!(!router.agent_is_routable("low_weight_agent", "medium")); // 0.3 < 0.5
+        assert!(!router.agent_is_routable("very_low_weight_agent", "medium")); // 0.1 < 0.5
+    }
+
+    #[test]
+    fn test_skip_threshold_not_applied_when_weighted_rr_disabled() {
+        // When weighted_round_robin is false, the weight threshold must NOT filter agents.
+        let config = RouterConfig {
+            skip_limited_threshold: 0.9, // very high threshold
+            weighted_round_robin: false, // explicitly disabled
+            ..Default::default()
+        };
+
+        let mut weights = AgentWeights::default();
+        weights.states.insert(
+            "low_weight_agent".to_string(),
+            RateLimitState {
+                weight: 0.1,
+                ..Default::default()
+            },
+        );
+
+        let mut router = Router::new(config);
+        router.weights = weights;
+        router.available_agents = vec!["low_weight_agent".to_string()];
+
+        router
+            .config
+            .model_map
+            .insert("medium".to_string(), HashMap::new());
+        router
+            .config
+            .model_map
+            .get_mut("medium")
+            .unwrap()
+            .insert("low_weight_agent".to_string(), vec!["model-a".to_string()]);
+
+        // Even though weight (0.1) < threshold (0.9), the agent is still routable
+        // because weighted_round_robin is off.
+        assert!(router.agent_is_routable("low_weight_agent", "medium"));
+    }
+
+    #[test]
+    fn test_skip_threshold_with_is_agent_degraded_precedence() {
+        // is_agent_degraded() check fires before the weight threshold, so a
+        // degraded agent is always excluded regardless of its weight value.
+        let config = RouterConfig {
+            skip_limited_threshold: 0.5,
+            weighted_round_robin: true,
+            ..Default::default()
+        };
+
+        let mut weights = AgentWeights::default();
+        weights.states.insert(
+            "test_agent".to_string(),
+            RateLimitState {
+                weight: 0.8,
+                ..Default::default()
+            }, // above threshold
+        );
+
+        let mut router = Router::new(config);
+        router.weights = weights;
+        router.available_agents = vec!["test_agent".to_string()];
+
+        router
+            .config
+            .model_map
+            .insert("medium".to_string(), HashMap::new());
+        router
+            .config
+            .model_map
+            .get_mut("medium")
+            .unwrap()
+            .insert("test_agent".to_string(), vec!["model-a".to_string()]);
+
+        // Routable when healthy.
+        assert!(router.agent_is_routable("test_agent", "medium"));
+
+        // Degradation takes precedence — skipped even though weight > threshold.
+        crate::engine::cooldown::mark_agent_degraded("test_agent");
+        assert!(!router.agent_is_routable("test_agent", "medium"));
+
+        crate::engine::cooldown::clear_agent_degraded("test_agent");
+    }
+
+    #[test]
+    fn test_all_agents_below_threshold_yields_empty_candidate_pool() {
+        // When all agents fall below the weight threshold, available_agents_for_complexity
+        // returns an empty vec (caller falls back to cooldown-wait path).
+        let config = RouterConfig {
+            skip_limited_threshold: 0.5,
+            weighted_round_robin: true,
+            ..Default::default()
+        };
+
+        let mut weights = AgentWeights::default();
+        weights.states.insert(
+            "agent_a".to_string(),
+            RateLimitState {
+                weight: 0.4,
+                ..Default::default()
+            },
+        );
+        weights.states.insert(
+            "agent_b".to_string(),
+            RateLimitState {
+                weight: 0.35,
+                ..Default::default()
+            },
+        );
+        weights.states.insert(
+            "agent_c".to_string(),
+            RateLimitState {
+                weight: 0.3,
+                ..Default::default()
+            },
+        );
+
+        let mut router = Router::new(config);
+        router.weights = weights;
+        router.available_agents = vec![
+            "agent_a".to_string(),
+            "agent_b".to_string(),
+            "agent_c".to_string(),
+        ];
+
+        router
+            .config
+            .model_map
+            .insert("medium".to_string(), HashMap::new());
+        router
+            .config
+            .model_map
+            .get_mut("medium")
+            .unwrap()
+            .insert("agent_a".to_string(), vec!["model-a".to_string()]);
+        router
+            .config
+            .model_map
+            .get_mut("medium")
+            .unwrap()
+            .insert("agent_b".to_string(), vec!["model-b".to_string()]);
+        router
+            .config
+            .model_map
+            .get_mut("medium")
+            .unwrap()
+            .insert("agent_c".to_string(), vec!["model-c".to_string()]);
+
+        let candidates = router.available_agents_for_complexity("medium");
+        assert!(
+            candidates.is_empty(),
+            "all three agents are below threshold"
+        );
+    }
+
+    #[test]
+    fn test_config_default_skip_limited_threshold() {
+        // Default value is 0.3 — reasonable for most deployments.
+        let config = RouterConfig::default();
+        assert!(
+            (config.skip_limited_threshold - 0.3).abs() < f64::EPSILON,
+            "default skip_limited_threshold should be 0.3"
+        );
+        // Default does not enable weighted_round_robin, so the threshold is
+        // inactive until the operator opts in.
+        assert!(!config.weighted_round_robin);
+    }
+
+    #[test]
+    fn test_weight_skipped_total_increments_on_skip() {
+        // Verify the counter increments each time an agent is skipped due to weight.
+        let config = RouterConfig {
+            skip_limited_threshold: 0.5,
+            weighted_round_robin: true,
+            ..Default::default()
+        };
+
+        let mut weights = AgentWeights::default();
+        weights.states.insert(
+            "heavy_agent".to_string(),
+            RateLimitState {
+                weight: 0.2,
+                ..Default::default()
+            },
+        );
+
+        let mut router = Router::new(config);
+        router.weights = weights;
+        router.available_agents = vec!["heavy_agent".to_string()];
+
+        router
+            .config
+            .model_map
+            .insert("medium".to_string(), HashMap::new());
+        router
+            .config
+            .model_map
+            .get_mut("medium")
+            .unwrap()
+            .insert("heavy_agent".to_string(), vec!["model-x".to_string()]);
+
+        let before = router
+            .weight_skipped_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // Each call to agent_is_routable that hits the weight guard increments the counter.
+        assert!(!router.agent_is_routable("heavy_agent", "medium"));
+        assert!(!router.agent_is_routable("heavy_agent", "medium"));
+
+        let after = router
+            .weight_skipped_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            2,
+            "counter should increment once per skipped routing check"
+        );
     }
 }

@@ -236,9 +236,19 @@ router:
     - node
     - npm
     - bun
-  default_skills:          # skills always included
+    default_skills:          # skills always included
     - gh
     - git-worktree
+```
+  Skip agents with routing weight below this threshold (0.0-1.0).
+  Agents with weight < threshold are skipped in routing candidate selection.
+  This prevents cascading failures when multiple agents degrade simultaneously.
+  
+  Set in `config.yml` under `router.skip_limited_threshold`:
+  ```yaml
+  router:
+    skip_limited_threshold: 0.3
+  ```
 ```
 
 ### Routing Logic

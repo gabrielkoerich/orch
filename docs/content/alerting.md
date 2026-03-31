@@ -100,3 +100,68 @@ Or poll the KV metric directly:
 sqlite3 ~/.orch/orch.db \
   "SELECT value FROM kv WHERE key = 'metrics:orch.agents_degraded.alert';"
 ```
+
+---
+
+## Weight-Threshold Skip Alert (weighted_round_robin mode)
+
+When `router.weighted_round_robin` is enabled, the router also applies a configurable weight-threshold guard. Agents whose routing weight has decayed below `router.skip_limited_threshold` (default `0.3`) are skipped before any cooldown check is performed. This is a **pre-emptive** signal: the agent has not yet entered formal cooldown but is performing poorly.
+
+### What it measures
+
+Each call to `agent_is_routable()` that rejects an agent due to weight-decay increments an in-memory counter (`weight_skipped_total`). When 3 or more agents are simultaneously excluded from the candidate pool (due to weight decay **or** formal degradation), a `WARN`-level log is emitted:
+
+| Field | Example | Description |
+|-------|---------|-------------|
+| `skipped_count` | `3` | Number of agents excluded from this routing decision |
+| `skipped_agents` | `["claude", "codex", "kimi"]` | Names of excluded agents |
+| `weight_skipped_total` | `42` | Cumulative weight-skip counter since last restart |
+| `complexity` | `"medium"` | Complexity tier being routed |
+
+Example log line:
+
+```json
+{
+  "level": "WARN",
+  "message": "3+ agents simultaneously skipped due to weight-decay or degradation",
+  "skipped_count": 3,
+  "skipped_agents": ["claude", "codex", "kimi"],
+  "weight_skipped_total": 42,
+  "complexity": "medium"
+}
+```
+
+### Suggested alert thresholds
+
+| Condition | Severity | Suggested action |
+|-----------|----------|-----------------|
+| `skipped_count >= 1` | Debug | Normal; one agent recovering from rate limits |
+| `skipped_count >= 2` | Info | Monitor; reduced pool but still dispatching |
+| `skipped_count >= 3` | **Warn / Alert** | Systemic rate-limiting; investigate upstream quotas |
+| `weight_skipped_total` growing rapidly | Warning | Agents are hitting rate limits frequently; consider reducing task throughput |
+
+### Grafana Loki example
+
+```yaml
+- alert: OrchWeightThresholdSkip
+  expr: |
+    count_over_time(
+      {job="orch"} |= "3+ agents simultaneously skipped due to weight-decay or degradation" [5m]
+    ) > 0
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: "3+ orch agents skipped due to weight-decay"
+    description: "Check skipped_agents and weight_skipped_total fields for details."
+```
+
+### Configuration
+
+```yaml
+router:
+  weighted_round_robin: true   # must be enabled for this guard to activate
+  skip_limited_threshold: 0.3  # agents below this weight are skipped
+```
+
+Set `skip_limited_threshold: 0.0` to disable the guard while keeping weighted routing active.

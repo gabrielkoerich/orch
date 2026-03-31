@@ -35,6 +35,10 @@ router:
   # Agents that return 429/rate limit errors get reduced routing weight,
   # which gradually recovers as rate limit windows expire.
   weighted_round_robin: false
+  # When weighted_round_robin is enabled, skip agents whose routing weight
+  # has decayed below this threshold. Range: 0.0–1.0. Default: 0.3.
+  # 0.0 disables the guard; 1.0 skips every agent that is not at full weight.
+  # skip_limited_threshold: 0.3
   # Agents to discover in PATH (checked at startup)
   agents:
     - claude
