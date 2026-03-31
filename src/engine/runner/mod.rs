@@ -382,17 +382,26 @@ impl TaskRunner {
         )
         .await;
 
-        // If silence detection (tick phase1b) already reset this task to `New` while the
+        // If silence detection (tick phase1b) already rerouted this task while the
         // session was running, skip all fallback/review processing. Without this check the
         // runner would call `fallback::handle_error` on the empty output, exhaust fallback
-        // agents, and mark the task `needs_review` — overwriting the `New` status and
-        // triggering a spurious review cycle before `review.rs::ensure_pr_exists` finally
-        // re-routes back to `New`.
+        // agents, and mark the task `needs_review` — overwriting the rerouted status and
+        // triggering a spurious review cycle.
+        // Silence detection now sets Routed (with fallback agent) or NeedsReview (no fallback).
+        // Check for both, plus New for backward compatibility.
         if let Some(stored) = store::opt_store_get_task(&self.store, &self.repo, task_id).await {
-            if stored.status == crate::store::TaskStatus::New {
+            let silence_reset = matches!(
+                stored.status,
+                crate::store::TaskStatus::New
+                    | crate::store::TaskStatus::Routed
+                    | crate::store::TaskStatus::NeedsReview
+            );
+            if silence_reset {
+                let status_str = stored.status.as_str();
                 tracing::info!(
                     task_id,
-                    "task already reset to New by silence detection — skipping fallback processing"
+                    status = status_str,
+                    "task already reset by silence detection — skipping fallback processing"
                 );
                 session::cleanup_session(task_id, &tmux, &tmux_session).await;
                 let silence_err = agents::patterns::classify_from_text(0, "silence detected");
@@ -401,17 +410,17 @@ impl TaskRunner {
                 let audit = self
                     .build_run_audit(RunAuditInput {
                         task_id,
-                        status: "new",
+                        status: status_str,
                         parse_result: &silence_parse,
                         raw_stdout: &session_output.raw_stdout,
                         raw_stderr: &session_output.raw_stderr,
                         started_at,
-                        error_override: Some("silence detection reset task to New".to_string()),
+                        error_override: Some(format!("silence detection set task to {status_str}")),
                         elapsed_secs: session_output.elapsed_secs,
                     })
                     .await;
                 return Ok(Some(RunExecution {
-                    status: "new".to_string(),
+                    status: status_str.to_string(),
                     exit_code: Some(session_output.exit_code),
                     audit,
                 }));
@@ -824,7 +833,8 @@ impl TaskRunner {
         // reroutes can happen for timeouts, auth errors, missing tools, etc.
         let is_rate_limited =
             last_error.contains("usage limit") || last_error.contains("rate limit");
-        let weight_signal = if status == "new" && is_rate_limited {
+        let is_rerouted = status == "new" || status == "routed";
+        let weight_signal = if is_rerouted && is_rate_limited {
             WeightSignal::RateLimited {
                 agent: agent_name.clone(),
             }
@@ -891,9 +901,9 @@ impl TaskRunner {
             }
         }
 
-        // If task was rerouted (status=new after run), update GitHub agent label
+        // If task was rerouted (status=routed or new after run), update GitHub agent label
         // so the router doesn't re-route back to the same failed agent.
-        if status == "new" && !is_internal_id(task_id) {
+        if is_rerouted && !is_internal_id(task_id) {
             let new_agent = self.get_field(task_id, "agent").await.unwrap_or_default();
             if !new_agent.is_empty() && new_agent != agent_name {
                 // Remove old agent label, ensure new one exists, then add it.
@@ -939,7 +949,8 @@ impl TaskRunner {
             "in_review" => Status::InReview,
             "blocked" => Status::Blocked,
             "needs_review" => Status::NeedsReview,
-            "new" => Status::New, // Rerouted
+            "routed" => Status::Routed, // Rerouted (agent/model already set)
+            "new" => Status::New,       // Legacy reroute path
             _ => Status::NeedsReview,
         };
         // Store-first: update SQLite (must succeed), then mirror to backend.
@@ -1660,7 +1671,7 @@ mod tests {
     // ── weight signal logic ───────────────────────────────────────────────────
 
     fn weight_signal_for(status: &str, is_rate_limited: bool, agent: &str) -> WeightSignal {
-        if status == "new" && is_rate_limited {
+        if (status == "new" || status == "routed") && is_rate_limited {
             WeightSignal::RateLimited {
                 agent: agent.to_string(),
             }
