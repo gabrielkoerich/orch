@@ -265,10 +265,6 @@ async fn auto_unblock_blocked_tasks(
             continue;
         }
 
-        if task.auto_unblock_count >= 3 {
-            continue;
-        }
-
         let dispatch_key = format!("{}/{}", repo, task.external_id.clone().unwrap_or_default());
         {
             let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
@@ -324,6 +320,14 @@ async fn auto_unblock_blocked_tasks(
         } else {
             task.auto_unblock_count
         };
+
+        // Gate on attempt count using the effective count — if the reason changed, the
+        // counter was reset above so cooldown_count is 0 and a new reason always gets a
+        // fresh attempt regardless of how many times the old reason fired.
+        if cooldown_count >= 3 {
+            continue;
+        }
+
         if !auto_unblock_cooldown_elapsed(cooldown_count, &task.auto_unblock_last_at) {
             continue;
         }
