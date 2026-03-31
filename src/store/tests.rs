@@ -3482,6 +3482,29 @@ async fn kv_multiple_keys() {
     assert_eq!(store.kv_get("b").await.unwrap(), Some("2".to_string()));
 }
 
+#[tokio::test]
+async fn kv_increment_missing_starts_at_one() {
+    let store = TaskStore::open_memory().await.unwrap();
+    assert_eq!(store.kv_increment("counter").await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn kv_increment_existing_adds_one() {
+    let store = TaskStore::open_memory().await.unwrap();
+    assert_eq!(store.kv_increment("counter").await.unwrap(), 1);
+    assert_eq!(store.kv_increment("counter").await.unwrap(), 2);
+    assert_eq!(store.kv_increment("counter").await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn kv_increment_independent_keys() {
+    let store = TaskStore::open_memory().await.unwrap();
+    assert_eq!(store.kv_increment("a").await.unwrap(), 1);
+    assert_eq!(store.kv_increment("b").await.unwrap(), 1);
+    assert_eq!(store.kv_increment("a").await.unwrap(), 2);
+    assert_eq!(store.kv_get("b").await.unwrap(), Some("1".to_string()));
+}
+
 // ── Task Metrics ─────────────────────────────────────────────────
 
 #[tokio::test]

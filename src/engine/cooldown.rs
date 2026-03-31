@@ -180,16 +180,7 @@ async fn read_and_increment_failure_count(
 ) -> u32 {
     let kv_key = format!("{FAILURE_COUNT_PREFIX}{key}");
     if let Some(store) = store_opt {
-        let count: u32 = store
-            .kv_get(&kv_key)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let new_count = count.saturating_add(1);
-        let _ = store.kv_set(&kv_key, &new_count.to_string()).await;
-        new_count
+        store.kv_increment(&kv_key).await.unwrap_or(1)
     } else {
         1
     }

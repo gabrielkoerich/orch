@@ -22,6 +22,25 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Atomically increment an integer counter in the KV store, inserting it as 1 if absent.
+    ///
+    /// Executes a single SQL statement (`INSERT … ON CONFLICT … DO UPDATE`) so concurrent
+    /// callers cannot race — SQLite's serialised write lock ensures the read-modify-write is
+    /// indivisible.  Returns the new value after the increment.
+    pub async fn kv_increment(&self, key: &str) -> anyhow::Result<u32> {
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO kv (key, value, updated_at) VALUES (?1, '1', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+             ON CONFLICT(key) DO UPDATE
+               SET value = CAST(value AS INTEGER) + 1,
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             RETURNING CAST(value AS INTEGER)",
+        )
+        .bind(key)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0.max(1) as u32)
+    }
+
     /// List all (key, value) pairs where the key starts with `prefix`.
     pub async fn kv_list_prefix(&self, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
         let pattern = format!("{prefix}%");
