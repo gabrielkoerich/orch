@@ -1261,4 +1261,202 @@ mod tests {
             "agent with rate limit count < threshold should not be degraded"
         );
     }
+
+    // ---- Exponential backoff integration tests ----
+
+    #[tokio::test]
+    async fn repeated_agent_failures_escalate_backoff() {
+        let store = test_store().await;
+        {
+            let mut slot = cooldown_store().lock().unwrap();
+            *slot = Some(store.clone());
+        }
+
+        let agent = "test_escalation_agent";
+
+        // First failure: should be ~5 min (BACKOFF_BASE_SECS)
+        record_agent_failure_with_message(agent, "").await;
+        let remaining_1 = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("should have cooldown");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        assert!(
+            (BACKOFF_BASE_SECS - 5..=BACKOFF_BASE_SECS + 5).contains(&remaining_1),
+            "first failure should be ~5 min, got {remaining_1}s"
+        );
+
+        // Clear the cooldown (but NOT failure count) to allow the next set_cooldown to apply
+        {
+            let mut map = cooldowns().lock().unwrap();
+            map.remove(agent);
+        }
+
+        // Second failure: should be ~15 min (5 * 3)
+        record_agent_failure_with_message(agent, "").await;
+        let remaining_2 = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("should have cooldown");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        assert!(
+            remaining_2 >= BACKOFF_BASE_SECS * 3 - 5,
+            "second failure should be ~15 min, got {remaining_2}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_agent_success_resets_backoff() {
+        let store = test_store().await;
+        {
+            let mut slot = cooldown_store().lock().unwrap();
+            *slot = Some(store.clone());
+        }
+
+        let agent = "test_success_reset_agent";
+        let model = "test_model";
+
+        // Accumulate 3 failures to escalate the backoff
+        for _ in 0..3 {
+            let _ = read_and_increment_failure_count(&Some(store.clone()), agent).await;
+        }
+        // Verify count is 3
+        let kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
+        let count: u32 = store
+            .kv_get(&kv_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // Success should reset to 0
+        record_agent_success(agent, model).await;
+
+        let count_after: u32 = store
+            .kv_get(&kv_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(count_after, 0, "success should reset failure count to 0");
+
+        // Model-specific count should also be reset
+        let model_kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}:{model}");
+        let model_count: u32 = store
+            .kv_get(&model_kv_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            model_count, 0,
+            "success should reset model failure count to 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_cooldown_resets_failure_counts() {
+        let store = test_store().await;
+        {
+            let mut slot = cooldown_store().lock().unwrap();
+            *slot = Some(store.clone());
+        }
+
+        let agent = "test_clear_fc_agent";
+
+        // Accumulate failures
+        for _ in 0..5 {
+            let _ = read_and_increment_failure_count(&Some(store.clone()), agent).await;
+        }
+        // Set a cooldown so clear_cooldown has something to clear
+        set_agent_cooldown(agent, 3600);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Verify failure count is 5
+        let kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
+        let count: u32 = store
+            .kv_get(&kv_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 5);
+
+        // Clear the cooldown
+        clear_cooldown(agent, &store).await;
+
+        // Failure count should be reset to 0
+        let count_after: u32 = store
+            .kv_get(&kv_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            count_after, 0,
+            "clear_cooldown should reset failure count to 0"
+        );
+
+        // Cooldown should be removed
+        assert!(
+            !is_agent_in_cooldown(agent),
+            "agent should not be in cooldown after clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_all_cooldowns_resets_all_failure_counts() {
+        let store = test_store().await;
+        {
+            let mut slot = cooldown_store().lock().unwrap();
+            *slot = Some(store.clone());
+        }
+
+        let agents = ["test_clear_all_a", "test_clear_all_b"];
+        for agent in &agents {
+            let _ = read_and_increment_failure_count(&Some(store.clone()), agent).await;
+            set_agent_cooldown(agent, 3600);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        clear_cooldown("*", &store).await;
+
+        for agent in &agents {
+            assert!(!is_agent_in_cooldown(agent));
+            let kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
+            let count: u32 = store
+                .kv_get(&kv_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "clear --all should reset failure count for {agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_backoff_saturates_on_large_counts() {
+        // Very large count should not overflow, just hit the cap
+        assert_eq!(
+            compute_backoff(100, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS),
+            BACKOFF_MAX_SECS
+        );
+        assert_eq!(compute_backoff(u32::MAX, 300, 14400), 14400);
+    }
+
+    #[test]
+    fn compute_backoff_zero_base_returns_zero() {
+        assert_eq!(compute_backoff(1, 0, 14400), 0);
+        assert_eq!(compute_backoff(5, 0, 14400), 0);
+    }
 }
