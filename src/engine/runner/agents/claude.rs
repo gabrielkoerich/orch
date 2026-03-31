@@ -703,8 +703,16 @@ mod tests {
             .parse_response(&raw)
             .expect("plain-text work product must synthesize successfully");
         // Tokens must be preserved from the envelope (issue #1377)
-        assert_eq!(parsed.input_tokens, Some(10), "input_tokens must be preserved");
-        assert_eq!(parsed.output_tokens, Some(5), "output_tokens must be preserved");
+        assert_eq!(
+            parsed.input_tokens,
+            Some(10),
+            "input_tokens must be preserved"
+        );
+        assert_eq!(
+            parsed.output_tokens,
+            Some(5),
+            "output_tokens must be preserved"
+        );
     }
 
     #[test]
