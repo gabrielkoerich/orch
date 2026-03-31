@@ -114,7 +114,7 @@ pub async fn handle_success(
     let mut has_pr = false;
     let mut has_pushed = false;
     let mut has_commits = false;
-    if resp.status == "done" || resp.status == "in_progress" {
+    if resp.status == "done" || resp.status == "in_progress" || resp.status == "needs_review" {
         if let Err(e) =
             git_ops::auto_commit(&wt.work_dir, task_id, task_title, agent_name, new_attempts).await
         {
