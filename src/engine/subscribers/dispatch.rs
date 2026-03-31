@@ -41,6 +41,7 @@ pub fn spawn(
                     // Delegate to existing dispatch logic.
                     // The dispatching set guard inside tick_dispatch_tasks
                     // prevents double-dispatch if the tick loop also picks this up.
+                    let router_guard = router_arc.read().await;
                     if let Err(e) = crate::engine::tick::tick_dispatch_tasks(
                         &backend,
                         &tmux,
@@ -50,7 +51,7 @@ pub fn spawn(
                         &semaphore,
                         &task_manager,
                         &weight_tx,
-                        &router_arc,
+                        &router_guard,
                         &dispatching,
                         &store,
                     )

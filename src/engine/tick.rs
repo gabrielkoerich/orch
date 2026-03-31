@@ -22,7 +22,7 @@ use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, Semaphore};
 
 use super::EngineConfig;
 use crate::store::{review_session_expected, set_review_session_expected};
@@ -686,7 +686,7 @@ pub(crate) async fn tick_dispatch_tasks(
     semaphore: &Arc<Semaphore>,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
-    router_arc: &Arc<RwLock<Router>>,
+    router: &Router,
     dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
@@ -715,7 +715,7 @@ pub(crate) async fn tick_dispatch_tasks(
 
     // Check if we are in degraded mode (fewer than threshold healthy agents)
     let threshold = crate::engine::router::config::min_healthy_agents_threshold();
-    let healthy_count = router_arc.read().await.healthy_agent_count("simple");
+    let healthy_count = router.healthy_agent_count("simple");
     let is_degraded = healthy_count < threshold;
 
     if is_degraded {
@@ -1059,7 +1059,6 @@ pub(crate) async fn tick(
     config: &EngineConfig,
     jobs_path: &std::path::PathBuf,
     router: &mut Router,
-    router_arc: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
     dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -1079,7 +1078,7 @@ pub(crate) async fn tick(
         semaphore,
         task_manager,
         weight_tx,
-        router_arc,
+        router,
         dispatching,
         store,
     )
@@ -1646,6 +1645,75 @@ mod tests {
             task.status,
             crate::store::TaskStatus::New,
             "internal task should reset to New"
+        );
+    }
+
+    // ── tick_dispatch_tasks: deadlock regression test (#1361) ──────────────
+
+    /// Regression test for #1361: tick_dispatch_tasks previously accepted
+    /// `&Arc<RwLock<Router>>` and called `router_arc.read().await` internally.
+    /// The main loop already held a write lock on the same RwLock, so the read
+    /// could never be acquired — guaranteed deadlock on every tick with routed
+    /// tasks.
+    ///
+    /// The fix changed the signature to accept `&Router` directly (the caller
+    /// already has the dereferenced guard), eliminating the lock re-acquisition.
+    ///
+    /// This test verifies the function completes within 2 seconds when the
+    /// caller holds the write lock — the old code would deadlock here.
+    #[tokio::test]
+    async fn dispatch_does_not_deadlock_under_write_lock() {
+        use crate::engine::router::Router;
+        use tokio::sync::RwLock;
+
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let semaphore = Arc::new(Semaphore::new(4));
+        let (weight_tx, _weight_rx) = mpsc::channel(16);
+        let dispatching = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let transport = Arc::new(Transport::new());
+        let capture = Arc::new(CaptureService::new(transport));
+
+        let router_config = crate::engine::router::RouterConfig::default();
+        let router = Router::new(router_config);
+        let router_arc = Arc::new(RwLock::new(router));
+
+        // Simulate what the main loop does: hold a write lock, then call
+        // tick_dispatch_tasks. The function now takes &Router (dereferenced
+        // from the guard), so no lock re-acquisition occurs.
+        let write_guard = router_arc.write().await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tick_dispatch_tasks(
+                &backend,
+                &tmux,
+                "owner/repo",
+                &Arc::new(crate::engine::runner::TaskRunner::new(
+                    "owner/repo".to_string(),
+                )),
+                &capture,
+                &semaphore,
+                &task_manager,
+                &weight_tx,
+                &write_guard,
+                &dispatching,
+                &store,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "tick_dispatch_tasks deadlocked! It tried to acquire a read lock \
+             on router_arc while a write lock was already held (issue #1361)"
         );
     }
 }
