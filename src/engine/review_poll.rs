@@ -298,6 +298,28 @@ pub(crate) async fn review_open_prs(
                             retries,
                             "PR approved but merge conflict retry limit reached — blocking for human review"
                         );
+                        store_set(
+                            &Some(Arc::clone(store)),
+                            repo,
+                            task_id,
+                            &[
+                                (
+                                    "block_reason",
+                                    serde_json::json!(format!(
+                                        "merge conflict retry limit ({}) reached",
+                                        MAX_MERGE_CONFLICT_RETRIES
+                                    )),
+                                ),
+                                (
+                                    "last_error",
+                                    serde_json::json!(format!(
+                                        "PR approved but has unresolved merge conflicts after {} retries",
+                                        retries
+                                    )),
+                                ),
+                            ],
+                        )
+                        .await;
                         if let Err(e) = task_manager
                             .update_task_status(&task.id, Status::Blocked)
                             .await

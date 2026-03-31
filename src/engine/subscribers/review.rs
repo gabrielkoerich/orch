@@ -8,7 +8,7 @@ use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::repo_context::REPO_CONTEXT;
-use crate::store::{opt_store_get_task, TaskStatus, TaskStore};
+use crate::store::{opt_store_get_task, store_set, TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -208,7 +208,7 @@ pub fn spawn(
                         enum ReviewOutcome {
                             Reset,
                             RateLimited,
-                            Block,
+                            Block(String),
                             Ok,
                         }
 
@@ -283,7 +283,9 @@ pub fn spawn(
                                     reason,
                                     "review gate blocked after repeated failures — marking task blocked"
                                 );
-                                ReviewOutcome::Block
+                                ReviewOutcome::Block(format!(
+                                    "review gate blocked after repeated failures: {reason}"
+                                ))
                             }
                             Ok(ReviewDecision::Failed(reason)) => {
                                 // Rate-limit failures are not real review failures — don't count
@@ -316,7 +318,9 @@ pub fn spawn(
                                             failures,
                                             "review agent failed too many times — blocking task"
                                         );
-                                        ReviewOutcome::Block
+                                        ReviewOutcome::Block(format!(
+                                            "review agent failed {failures} times: {reason}"
+                                        ))
                                     } else {
                                         tracing::error!(
                                             task_id = tid,
@@ -357,7 +361,9 @@ pub fn spawn(
                                             failures,
                                             "review_and_merge failed too many times — blocking task"
                                         );
-                                        ReviewOutcome::Block
+                                        ReviewOutcome::Block(format!(
+                                            "review_and_merge failed {failures} times: {reason}"
+                                        ))
                                     } else {
                                         tracing::error!(
                                             task_id = tid,
@@ -463,7 +469,20 @@ pub fn spawn(
                                     tracing::error!(task_id = %tid, err = %e, "update_task_status(NeedsReview) failed after rate limit backoff — task may be stuck in InReview");
                                 }
                             }
-                            ReviewOutcome::Block => {
+                            ReviewOutcome::Block(reason) => {
+                                store_set(
+                                    &Some(store_c.clone()),
+                                    &repo_s,
+                                    &tid,
+                                    &[
+                                        (
+                                            "block_reason",
+                                            serde_json::json!("review agent blocked — exceeded failure threshold"),
+                                        ),
+                                        ("last_error", serde_json::json!(reason)),
+                                    ],
+                                )
+                                .await;
                                 if let Err(e) = task_manager_c
                                     .update_task_status(
                                         &ExternalId(tid.clone()),

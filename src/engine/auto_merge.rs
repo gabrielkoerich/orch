@@ -907,6 +907,25 @@ pub(crate) async fn handle_review_changes(
             );
             return Ok(());
         }
+        store_set(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            &[
+                (
+                    "block_reason",
+                    serde_json::json!(format!("max review cycles ({}) exceeded", max_cycles)),
+                ),
+                (
+                    "last_error",
+                    serde_json::json!(format!(
+                        "review agent requested changes {} times — escalated to human review",
+                        review_cycles
+                    )),
+                ),
+            ],
+        )
+        .await;
         let escalation = format!(
             "🔍 Review agent requested changes after {} cycles. Escalating to human.\n\n**Review Notes:**\n{}",
             review_cycles, notes
