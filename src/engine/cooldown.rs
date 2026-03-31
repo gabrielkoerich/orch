@@ -38,6 +38,9 @@ pub const BACKOFF_MAX_SECS: i64 = 4 * 60 * 60;
 /// Base backoff for credit exhaustion (out_of_credits): 1 hour.
 pub const CREDIT_BACKOFF_BASE_SECS: i64 = 60 * 60;
 
+/// Base backoff for org-level disabling: 2 hours.
+pub const ORG_BACKOFF_BASE_SECS: i64 = 2 * 60 * 60;
+
 /// Maximum backoff for credit exhaustion and org-level disabling: 8 hours.
 pub const CREDIT_BACKOFF_MAX_SECS: i64 = 8 * 60 * 60;
 
@@ -165,6 +168,9 @@ pub fn compute_backoff(count: u32, base: i64, max: i64) -> i64 {
 }
 
 /// Read the failure count for a key from KV, increment it, write it back, and return the new count.
+///
+/// Always increments — the backoff formula's `max` parameter prevents the
+/// cooldown duration from growing beyond the cap, so unbounded counts are safe.
 ///
 /// Returns 1 when the store is unavailable (unit-test contexts without a store).
 async fn read_and_increment_failure_count(
@@ -317,7 +323,7 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
     let (base, max) = match reason {
         CreditExhaustionReason::OutOfCredits => (CREDIT_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS),
         CreditExhaustionReason::OrgLevelDisabled => {
-            (CREDIT_BACKOFF_BASE_SECS * 2, CREDIT_BACKOFF_MAX_SECS)
+            (ORG_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS)
         }
         CreditExhaustionReason::BillingCycleExhausted => unreachable!(),
     };
@@ -476,8 +482,9 @@ pub fn list_all_cooldowns() -> Vec<(String, i64, String)> {
 
 /// Clear a specific cooldown by key, or all cooldowns when `key == "*"`.
 ///
-/// Removes from the in-memory map and writes a past timestamp to KV so the
-/// entry is not reloaded on the next service restart.
+/// Removes from the in-memory map, writes a past timestamp to KV, and resets
+/// the corresponding `failure_count:` entries so the next failure starts
+/// backoff from the base duration.
 pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
     if key == "*" {
         let keys: Vec<String> = {
@@ -489,8 +496,14 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
         for k in &keys {
             let kv_key = format!("{KV_PREFIX}{k}");
             let _ = store.kv_set(&kv_key, "0").await;
+            // Reset failure count so backoff restarts from base.
+            let fc_key = format!("{FAILURE_COUNT_PREFIX}{k}");
+            let _ = store.kv_set(&fc_key, "0").await;
         }
-        tracing::info!(count = keys.len(), "cleared all cooldowns");
+        tracing::info!(
+            count = keys.len(),
+            "cleared all cooldowns and failure counts"
+        );
     } else {
         {
             let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
@@ -498,12 +511,18 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
         }
         let kv_key = format!("{KV_PREFIX}{key}");
         let _ = store.kv_set(&kv_key, "0").await;
-        tracing::info!(key, "cleared cooldown");
+        // Reset failure count so backoff restarts from base.
+        let fc_key = format!("{FAILURE_COUNT_PREFIX}{key}");
+        let _ = store.kv_set(&fc_key, "0").await;
+        tracing::info!(key, "cleared cooldown and failure count");
     }
 }
 
 /// Set a cooldown with a specific expiry timestamp. Persists to KV.
-fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) {
+///
+/// Returns `true` if the cooldown was applied, `false` if an existing longer
+/// cooldown prevented the update (never-shorten rule).
+fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) -> bool {
     {
         let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = map.get(key) {
@@ -511,7 +530,7 @@ fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) {
             // retry window (e.g., generic rate limit) from overriding a longer
             // billing-cycle cooldown.
             if existing.cooldown_until >= cooldown_until {
-                return;
+                return false;
             }
         }
         map.insert(
@@ -539,6 +558,7 @@ fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) {
             tracing::debug!(kv_key, "skipping KV cooldown persist (no Tokio runtime)");
         }
     }
+    true
 }
 
 /// Check if a key is currently in cooldown.
@@ -1027,9 +1047,9 @@ mod tests {
             let entry = map.get(agent).expect("cooldown entry should exist");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
-        // First failure: base = 2h (CREDIT_BACKOFF_BASE_SECS * 2)
+        // First failure: base = 2h (ORG_BACKOFF_BASE_SECS)
         assert!(
-            remaining >= CREDIT_BACKOFF_BASE_SECS * 2 - 5,
+            remaining >= ORG_BACKOFF_BASE_SECS - 5,
             "first org-level disabled cooldown should be ~2 hours, got {remaining}s"
         );
         assert!(
@@ -1066,8 +1086,8 @@ mod tests {
         );
         // OrgLevelDisabled first failure: 2h base
         assert_eq!(
-            compute_backoff(1, CREDIT_BACKOFF_BASE_SECS * 2, CREDIT_BACKOFF_MAX_SECS),
-            CREDIT_BACKOFF_BASE_SECS * 2
+            compute_backoff(1, ORG_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS),
+            ORG_BACKOFF_BASE_SECS
         );
         // BillingCycleExhausted: flat 24h
         assert_eq!(BILLING_CYCLE_COOLDOWN_SECS, 24 * 60 * 60);

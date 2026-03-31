@@ -66,12 +66,13 @@ Example log line (JSON mode):
 
 | Reason string | Cause | Typical duration |
 |---------------|-------|-----------------|
-| `agent_error` | Repeated agent failures | 30 min |
-| `model_error` | Specific model failure | 1 h |
+| `agent_error` | Repeated agent failures | 5 min → 15 min → 45 min → 2 h → 4 h (cap) |
+| `model_error` | Specific model failure | 5 min → 15 min → 45 min → 2 h → 4 h (cap) |
 | `silence_agent_cooldown` | Agent produced no output | 2 min |
 | `silence_detected` | Model silently exited (model-level) | 30 min–4 h |
-| `credit_exhaustion_out_of_credits` | Per-model credit exhaustion | 6 h |
-| `credit_exhaustion_org_level_disabled` | Org billing disabled | 12 h |
+| `credit_exhaustion_out_of_credits` | Per-model credit exhaustion | 1 h → 3 h → 8 h (cap) |
+| `credit_exhaustion_org_level_disabled` | Org billing disabled | 2 h → 6 h → 8 h (cap) |
+| `billing_cycle_exhausted` | Monthly billing cycle quota | 24 h (flat, no backoff) |
 | `persisted` | Cooldown loaded from previous run | Remaining original duration |
 
 ### Pagerduty / Alertmanager example
