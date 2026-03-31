@@ -1249,6 +1249,14 @@ impl GhHttp {
         Ok(())
     }
 
+    /// Reopen a closed GitHub issue.
+    pub async fn reopen_issue(&self, repo: &str, number: &str) -> anyhow::Result<()> {
+        let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}");
+        let payload = serde_json::json!({ "state": "open" });
+        self.patch_json_raw(&url, &payload).await?;
+        Ok(())
+    }
+
     /// Check if a user is a collaborator.
     pub async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
         Self::proactive_throttle_rest().await;

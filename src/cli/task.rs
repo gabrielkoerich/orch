@@ -934,6 +934,106 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reopen a done/blocked task atomically:
+/// 1. Update SQLite status → New
+/// 2. Reset failure counters
+/// 3. Reopen GitHub issue (if external)
+/// 4. Sync GitHub labels to status:new
+/// 5. Link PR number if branch has a PR
+pub async fn reopen(id: &str) -> anyhow::Result<()> {
+    use crate::backends::github::GitHubBackend;
+    use crate::backends::ExternalBackend;
+    use crate::github::http::GhHttp;
+    use crate::store::TaskStatus;
+
+    let repo =
+        config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
+    let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
+    let gh = GhHttp::new()?;
+
+    // Resolve the task in the store
+    let (store_id, task) = if let Some(ref s) = store {
+        if let Some(stripped) = id.strip_prefix("internal:") {
+            let parsed = stripped
+                .parse::<i64>()
+                .with_context(|| format!("internal task id '{}' is not numeric", stripped))?;
+            if let Ok(Some(sid)) = s.resolve_task_id(&repo, id).await {
+                let task = s.get(sid).await?;
+                (sid, task)
+            } else {
+                anyhow::bail!("internal task '{}' not found", parsed);
+            }
+        } else if let Ok(parsed) = id.parse::<i64>() {
+            if let Ok(task) = s.get(parsed).await {
+                if task.origin == "internal" {
+                    (parsed, task)
+                } else if let Ok(Some(sid)) = s.resolve_task_id(&repo, id).await {
+                    let task = s.get(sid).await?;
+                    (sid, task)
+                } else {
+                    anyhow::bail!("task '{}' not found in store", id);
+                }
+            } else if let Ok(Some(sid)) = s.resolve_task_id(&repo, id).await {
+                let task = s.get(sid).await?;
+                (sid, task)
+            } else {
+                anyhow::bail!("task '{}' not found", id);
+            }
+        } else {
+            anyhow::bail!("invalid task id: {}", id);
+        }
+    } else {
+        anyhow::bail!("could not open task store");
+    };
+
+    let s = store.as_ref().unwrap();
+
+    // 1. Reset failure counters
+    let ext_id_str = task
+        .external_id
+        .clone()
+        .unwrap_or_else(|| format!("internal:{}", task.id));
+    crate::store::store_reset_counters(&store, &repo, &ext_id_str).await;
+
+    // 2. Update SQLite status → New
+    s.update_status(store_id, TaskStatus::New).await?;
+
+    // 3 & 4. For external tasks: reopen issue + sync labels
+    if task.origin != "internal" {
+        if let Some(ref ext_id) = task.external_id {
+            // Reopen the GitHub issue
+            if let Err(e) = gh.reopen_issue(&repo, ext_id).await {
+                eprintln!("warning: failed to reopen GitHub issue: {}", e);
+            }
+
+            // Sync labels to status:new
+            let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
+            if let Err(e) = backend
+                .update_status(&crate::backends::ExternalId(ext_id.clone()), Status::New)
+                .await
+            {
+                eprintln!("warning: failed to sync labels: {}", e);
+            }
+        }
+    }
+
+    // 5. Link PR number if branch has a PR and pr_number is not set
+    if task.pr_number.is_none() && !task.branch.is_empty() {
+        if let Ok(Some(pr_num)) = gh.get_pr_number(&repo, &task.branch).await {
+            let _ = s
+                .set_fields(store_id, &[("pr_number", serde_json::json!(pr_num as i64))])
+                .await;
+            println!("Linked PR #{} from branch '{}'", pr_num, task.branch);
+        }
+    }
+
+    println!(
+        "Reopened task #{} (status → new, counters reset, will be re-routed)",
+        id
+    );
+    Ok(())
+}
+
 /// Attach to a running agent's tmux session.
 pub fn attach(id: &str) -> anyhow::Result<()> {
     let tmux = TmuxManager::new();

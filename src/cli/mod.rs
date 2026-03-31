@@ -2,6 +2,7 @@ pub mod chat;
 pub mod cooldown;
 pub mod cost;
 pub mod dashboard;
+pub mod doctor;
 pub mod events;
 pub mod job;
 pub mod ndjson;

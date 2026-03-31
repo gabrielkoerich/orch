@@ -350,6 +350,12 @@ enum Commands {
         #[command(subcommand)]
         action: WebhookAction,
     },
+    /// Diagnose state inconsistencies between SQLite and GitHub
+    Doctor {
+        /// Attempt automatic repairs for fixable issues
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -515,6 +521,11 @@ enum TaskAction {
     /// Watch a task's status changes in real-time
     Watch {
         /// Task ID
+        id: String,
+    },
+    /// Reopen a done/blocked task (resets status, reopens GitHub issue, syncs labels)
+    Reopen {
+        /// Task ID (e.g. "1234" or "internal:8")
         id: String,
     },
 }
@@ -757,6 +768,9 @@ async fn main() -> anyhow::Result<()> {
             TaskAction::Watch { id } => {
                 cli::events::stream(None, Some(&id)).await?;
             }
+            TaskAction::Reopen { id } => {
+                cli::task::reopen(&id).await?;
+            }
         },
         Commands::Job { action } => match action {
             JobAction::List => {
@@ -881,6 +895,9 @@ async fn main() -> anyhow::Result<()> {
                 cli::webhook::status()?;
             }
         },
+        Commands::Doctor { fix } => {
+            cli::doctor::run(fix).await?;
+        }
     }
 
     Ok(())
