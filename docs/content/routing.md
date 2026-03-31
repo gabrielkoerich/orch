@@ -76,3 +76,12 @@ model_map:
 ```
 
 The routing prompt is in `prompts/route.md`. The router only classifies — it never touches code or files.
+
+## Pre-emptive Routability
+
+The router performs a pre-emptive routability check before attempting to invoke agents or the router LLM. This does two things:
+
+- It excludes agents that are currently in cooldown or have been marked degraded by the health check (rate-limit signals). These checks are authoritative — if an agent is degraded, it will be skipped regardless of weight.
+- When `router.weighted_round_robin` is enabled, an additional weight-based threshold (`router.skip_limited_threshold`) is applied after the degraded check. Agents whose routing weight has decayed below this threshold are skipped proactively to avoid sending work to recently rate-limited agents. This weight-based exclusion only layers on top of existing cooldown/degraded logic and does not replace it.
+
+Configure the threshold in your `config.yml` under `router.skip_limited_threshold` (default: `0.3`).
