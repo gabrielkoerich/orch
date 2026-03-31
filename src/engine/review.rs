@@ -23,6 +23,7 @@ fn review_started_comment(review_agent: &str, review_model: &str) -> String {
 
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::cmd::CommandErrorContext;
+use crate::config;
 use crate::engine::auto_merge::{attribution_footer, auto_merge_pr, handle_review_changes};
 use crate::engine::runner;
 use crate::engine::runner::worktree;
@@ -499,14 +500,83 @@ async fn ensure_pr_exists(
                     return Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Skipped));
                 }
 
+                // No PR and no commits — agent either failed or completed a read-only task.
+                // Use a dedicated circuit-breaker counter persisted in the store so
+                // repeated reroutes across separate runs are counted. This prevents
+                // internal tasks from looping new→in_progress→needs_review→new indefinitely.
+                // Prefer a dedicated config key `workflow.max_reroute_attempts` (fallback to
+                // `workflow.max_attempts` for backwards compatibility).
+                let max_reroutes: u32 = config::get("workflow.max_reroute_attempts")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .or_else(|| {
+                        config::get("workflow.max_attempts")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                    })
+                    .unwrap_or(3);
+
                 tracing::warn!(
                     task_id = task.id.0,
                     branch = %branch_name,
                     reason = %reason,
                     "no PR and no commits — re-routing for retry"
                 );
-                if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
-                    tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+
+                // Atomically increment the persistent reroute counter and decide.
+                let reroutes =
+                    store_increment(&Some(Arc::clone(store)), repo, &task.id.0, "no_pr_reroutes")
+                        .await;
+
+                if reroutes as u32 >= max_reroutes {
+                    tracing::error!(
+                        task_id = task.id.0,
+                        reroutes,
+                        max_reroutes,
+                        "reached max reroute attempts for no-pr-result — blocking for human review"
+                    );
+                    // Clear agent/model and record an explanatory last_error
+                    let msg = format!(
+                        "no PR or code changes after {}/{} reroute attempts",
+                        reroutes, max_reroutes
+                    );
+                    store_set(
+                        &Some(Arc::clone(store)),
+                        repo,
+                        &task.id.0,
+                        &[
+                            ("agent", serde_json::json!(null)),
+                            ("model", serde_json::json!(null)),
+                            ("last_error", serde_json::json!(msg)),
+                        ],
+                    )
+                    .await;
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::Blocked)
+                        .await
+                    {
+                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
+                    }
+                } else {
+                    // Clear agent/model so router picks a different one and note the
+                    // fact that this attempt produced no PR or code changes.
+                    store_set(
+                        &Some(Arc::clone(store)),
+                        repo,
+                        &task.id.0,
+                        &[
+                            ("agent", serde_json::json!(null)),
+                            ("model", serde_json::json!(null)),
+                            (
+                                "last_error",
+                                serde_json::json!("no PR or code changes produced"),
+                            ),
+                        ],
+                    )
+                    .await;
+                    if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
+                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
+                    }
                 }
                 Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Skipped))
             }
