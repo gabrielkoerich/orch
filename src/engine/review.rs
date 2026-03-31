@@ -1328,7 +1328,11 @@ pub(crate) async fn review_and_merge(
                 )
                 .await
             {
-                tracing::warn!(task_id = task.id.0, ?e, "failed to store review agent token usage");
+                tracing::warn!(
+                    task_id = task.id.0,
+                    ?e,
+                    "failed to store review agent token usage"
+                );
             }
         }
     }
