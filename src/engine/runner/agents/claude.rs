@@ -132,7 +132,7 @@ impl ClaudeRunner {
             Ok(r) => r,
             Err(_) => {
                 // Structured parse failed — try plain-text synthesis.
-                // Preserve already-extracted tokens rather than discarding them.
+                // Preserve already-extracted tokens rather than discarding them (issue #1387).
                 super::synthesize_response_from_text(result_text).ok_or_else(|| {
                     AgentError::InvalidResponse {
                         raw: result_text.to_string(),
@@ -164,76 +164,116 @@ impl ClaudeRunner {
     }
 }
 
+/// Helper: extract error from a JSON object if it is a `type:result` envelope
+/// with `is_error=true`. Uses pattern detection for proper error classification
+/// (auth, rate limit, context overflow) rather than always returning AgentFailed.
+fn extract_error_from_envelope(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    raw: &str,
+) -> Option<AgentError> {
+    if obj.get("type").and_then(|v| v.as_str()) == Some("result")
+        && obj
+            .get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        let result_text = obj.get("result").and_then(|v| v.as_str()).unwrap_or("");
+        let combined = format!("{result_text} {raw}");
+        if let Some(e) = super::patterns::detect_auth_error(&combined) {
+            return Some(e);
+        }
+        if let Some(e) = super::patterns::detect_rate_limit(&combined) {
+            return Some(e);
+        }
+        if let Some(e) = super::patterns::detect_context_overflow(&combined) {
+            return Some(e);
+        }
+        return Some(AgentError::AgentFailed {
+            message: result_text.to_string(),
+        });
+    }
+    None
+}
+
+/// Helper: scan NDJSON lines in `text` for a `type:result` envelope with
+/// `is_error=true` and extract the error message. Returns `None` if no error
+/// envelope is found.
+fn detect_error_envelope(text: &str) -> Option<AgentError> {
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(obj) = val.as_object() {
+                if let Some(err) = extract_error_from_envelope(obj, line) {
+                    return Some(err);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn extract_stream_json_result_text(raw: &str) -> Result<String, AgentError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(AgentError::InvalidResponse { raw: String::new() });
     }
 
-    // Prefer the final result envelope, but guard against the case where the
-    // runner emits a leading `system init` event and no result line was found.
-    // find_ndjson_result_line will return the last line with `"type":"result"`.
-    let envelope_line_opt = find_ndjson_result_line(trimmed);
+    // Prefer the final result envelope whose result field is valid JSON.
+    // This skips outer-session plain-text summaries (issue #1387).
+    let envelope_line_opt = find_ndjson_result_line(trimmed).map(|(line, _)| line);
 
-    // If there was no explicit result line, try the opencode-style extractor
-    // which scans NDJSON lines for text/result payloads (and skips system/init
-    // envelopes). This covers wrappers that emit a non-result JSON envelope
-    // followed by a text event containing the real payload.
-    if envelope_line_opt.is_none() {
-        if let Some(fallback) =
-            crate::engine::runner::agents::opencode::extract_router_text(trimmed)
-        {
-            return Ok(fallback);
+    if let Some(line) = envelope_line_opt {
+        // Parse the found result line.
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(obj) = parsed.as_object() {
+                // Check is_error FIRST.
+                if let Some(err) = extract_error_from_envelope(obj, line) {
+                    return Err(err);
+                }
+                // Extract result text from the JSON object.
+                if let Some(result) = obj.get("result") {
+                    if let Some(text) = result.as_str() {
+                        return Ok(text.to_string());
+                    }
+                    if result.is_object() || result.is_array() {
+                        return Ok(result.to_string());
+                    }
+                }
+            }
+        }
+        // Not an error, but result field is not extractable: fall through to fallback.
+    }
+
+    // No JSON result line found (or it wasn't an error). Try opencode-style
+    // text extraction which scans NDJSON for text/result events.
+    if let Some(fallback) = crate::engine::runner::agents::opencode::extract_router_text(trimmed) {
+        return Ok(fallback);
+    }
+
+    // No opencode-style text found. Try parsing the whole trimmed string as a
+    // single JSON object (handles `--output-format json` plain output).
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(obj) = parsed.as_object() {
+            // Check for error envelope in the single-line JSON.
+            if let Some(err) = extract_error_from_envelope(obj, trimmed) {
+                return Err(err);
+            }
+            // Extract result text from the JSON object.
+            if let Some(result) = obj.get("result") {
+                if let Some(text) = result.as_str() {
+                    return Ok(text.to_string());
+                }
+                if result.is_object() || result.is_array() {
+                    return Ok(result.to_string());
+                }
+            }
+            return Ok(trimmed.to_string());
         }
     }
 
-    let envelope_text = envelope_line_opt.unwrap_or(trimmed);
-    let parsed_json: serde_json::Value =
-        serde_json::from_str(envelope_text).map_err(|_| AgentError::InvalidResponse {
-            raw: envelope_text.to_string(),
-        })?;
-
-    let envelope = parsed_json
-        .as_object()
-        .ok_or_else(|| AgentError::InvalidResponse {
-            raw: envelope_text.to_string(),
-        })?;
-
-    if envelope.get("type").and_then(|v| v.as_str()) != Some("result") {
-        // If the only JSON envelope found is a non-result (eg. system/init),
-        // try to find any subsequent lines with text/result content. This
-        // handles wrappers that emit an init envelope then the real result
-        // in a following event.
-        if let Some(fallback) =
-            crate::engine::runner::agents::opencode::extract_router_text(trimmed)
-        {
-            return Ok(fallback);
-        }
-
-        return Ok(trimmed.to_string());
-    }
-
-    if envelope
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        let msg = envelope
-            .get("result")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        return Err(AgentError::AgentFailed {
-            message: msg.to_string(),
-        });
-    }
-
-    if let Some(result) = envelope.get("result") {
-        if let Some(text) = result.as_str() {
-            return Ok(text.to_string());
-        }
-        if result.is_object() || result.is_array() {
-            return Ok(result.to_string());
-        }
+    // Not valid JSON at all. Before returning raw text, scan for error envelopes
+    // (handles the case where find_ndjson_result_line skipped error-only output).
+    if let Some(err) = detect_error_envelope(trimmed) {
+        return Err(err);
     }
 
     Ok(trimmed.to_string())
@@ -246,53 +286,11 @@ impl AgentRunner for ClaudeRunner {
     }
 
     fn extract_text(&self, raw: &str) -> Result<String, super::AgentError> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
+        // Empty input: return empty string (not an error), matching historical behavior.
+        if raw.trim().is_empty() {
             return Ok(String::new());
         }
-
-        // For NDJSON (stream-json format): find the final "type":"result" line.
-        let envelope_str = find_ndjson_result_line(trimmed).unwrap_or(trimmed);
-        let Ok(parsed_json) = serde_json::from_str::<serde_json::Value>(envelope_str) else {
-            // Not a recognizable JSON envelope — return raw text as-is.
-            return Ok(trimmed.to_string());
-        };
-
-        let Some(envelope) = parsed_json.as_object() else {
-            return Ok(trimmed.to_string());
-        };
-
-        if envelope.get("type").and_then(|v| v.as_str()) != Some("result") {
-            return Ok(trimmed.to_string());
-        }
-
-        let is_error = envelope
-            .get("is_error")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let result_text = envelope
-            .get("result")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if is_error {
-            let combined = format!("{result_text} {envelope_str}");
-            if let Some(e) = super::patterns::detect_auth_error(&combined) {
-                return Err(e);
-            }
-            if let Some(e) = super::patterns::detect_rate_limit(&combined) {
-                return Err(e);
-            }
-            if let Some(e) = super::patterns::detect_context_overflow(&combined) {
-                return Err(e);
-            }
-            return Err(super::AgentError::AgentFailed {
-                message: result_text.to_string(),
-            });
-        }
-
-        Ok(result_text.to_string())
+        extract_stream_json_result_text(raw)
     }
 
     fn build_command(
@@ -355,11 +353,23 @@ impl AgentRunner for ClaudeRunner {
             return Err(AgentError::InvalidResponse { raw: String::new() });
         }
 
-        // For NDJSON (--output-format stream-json): find the last line whose JSON
-        // has "type":"result" — that is the final envelope. For a single-line JSON
-        // blob (--output-format json backward compat) this also finds it correctly.
-        if let Some(result_line) = find_ndjson_result_line(trimmed) {
-            return self.parse_envelope(result_line);
+        // For NDJSON (--output-format stream-json): find the best result line and its
+        // token count. For single-line JSON (--output-format json), returns None.
+        if let Some((result_line, tokens)) = find_ndjson_result_line(trimmed) {
+            let result = self.parse_envelope(result_line)?;
+            // If the envelope parse preserved meaningful tokens, use those.
+            // Otherwise, fall back to the tokens from find_ndjson_result_line
+            // (which selected the best result line by token count — issue #1387).
+            let input_tokens = result.input_tokens.or(tokens.map(|(i, _)| i));
+            let output_tokens = result.output_tokens.or(tokens.map(|(_, o)| o));
+            if input_tokens != result.input_tokens || output_tokens != result.output_tokens {
+                return Ok(ParsedResponse {
+                    input_tokens,
+                    output_tokens,
+                    ..result
+                });
+            }
+            return Ok(result);
         }
 
         // Fallback: treat the whole string as the envelope (e.g. pretty-printed JSON)
@@ -438,24 +448,120 @@ fn translate_allowed_tools(
     tools
 }
 
-/// Find the last NDJSON line whose JSON contains `"type": "result"`.
+/// Find the best NDJSON result line and its token usage.
 ///
-/// Used to extract the final result event from Claude `--output-format stream-json`
-/// output. Returns `None` if no such line is found (e.g. pretty-printed single JSON).
-pub(crate) fn find_ndjson_result_line(text: &str) -> Option<&str> {
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .rev()
-        .find(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .and_then(|v| {
-                    v.get("type")
-                        .and_then(|t| t.as_str())
-                        .map(|t| t == "result")
-                })
-                .unwrap_or(false)
-        })
+/// Returns `(line, tokens)` where `tokens` is `Some((input, output))` or `None`
+/// if no usage data was found.
+///
+/// Selection priority:
+/// 1. JSON result fields (object/array or string that parses as JSON) — always preferred
+/// 2. Among plain-text results: the one with the most total tokens (preferring actual
+///    work over outer-session confirmation summaries)
+/// 3. Error results (is_error=true) — included even with no tokens, so the caller can
+///    classify them properly
+///
+/// This skips outer-session plain-text summaries in favor of inner task results
+/// with meaningful token counts (issue #1387).
+pub(crate) fn find_ndjson_result_line(text: &str) -> Option<(&str, Option<(u64, u64)>)> {
+    let lines: Vec<_> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    // Pass 1: find a result line with a JSON result field.
+    // JSON results are always preferred (inner task delegate output).
+    for line in lines.iter().rev() {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(obj) = val.as_object() {
+                if obj.get("type").and_then(|t| t.as_str()) == Some("result") {
+                    if let Some(result) = obj.get("result") {
+                        let is_json_result = match result {
+                            serde_json::Value::Object(_) | serde_json::Value::Array(_) => true,
+                            serde_json::Value::String(s) => {
+                                serde_json::from_str::<serde_json::Value>(s).is_ok()
+                            }
+                            _ => false,
+                        };
+                        if is_json_result {
+                            let tokens = extract_result_tokens(obj);
+                            return Some((line, tokens));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 2: no JSON result found — choose the plain-text result with the most tokens.
+    // This handles outer-session confirmation summaries (e.g. "Already retrieved the result")
+    // vs. actual work summaries: prefer the one with more tokens.
+    // Error results (is_error=true) are included even with zero tokens, so the caller
+    // can classify them properly.
+    let mut best_line: Option<&str> = None;
+    let mut best_total = 0u64;
+
+    for line in &lines {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(obj) = val.as_object() {
+                if obj.get("type").and_then(|t| t.as_str()) == Some("result") {
+                    let tokens = extract_result_tokens(obj);
+                    let total = tokens.map(|(i, o)| i.saturating_add(o)).unwrap_or(0);
+                    if total >= best_total {
+                        best_total = total;
+                        best_line = Some(*line);
+                    }
+                }
+            }
+        }
+    }
+
+    best_line.map(|line| (line, extract_result_tokens_from_line(line)))
+}
+
+/// Extract input/output token counts from a parsed result envelope object.
+fn extract_result_tokens(obj: &serde_json::Map<String, serde_json::Value>) -> Option<(u64, u64)> {
+    // Try top-level `usage` first.
+    if let Some(usage) = obj.get("usage").and_then(|v| v.as_object()) {
+        let input = usage.get("input_tokens").and_then(|v| v.as_u64());
+        let output = usage.get("output_tokens").and_then(|v| v.as_u64());
+        if let (Some(i), Some(o)) = (input, output) {
+            return Some((i, o));
+        }
+    }
+    // Try modelUsage (aggregated across models).
+    if let Some(model_usage) = obj.get("modelUsage").and_then(|v| v.as_object()) {
+        let mut total_input = 0u64;
+        let mut total_output = 0u64;
+        let mut found = false;
+        for (_model_name, model_stats) in model_usage {
+            if let Some(stats) = model_stats.as_object() {
+                if let Some(i) = stats
+                    .get("inputTokens")
+                    .or_else(|| stats.get("input_tokens"))
+                    .and_then(|v| v.as_u64())
+                {
+                    total_input += i;
+                    found = true;
+                }
+                if let Some(o) = stats
+                    .get("outputTokens")
+                    .or_else(|| stats.get("output_tokens"))
+                    .and_then(|v| v.as_u64())
+                {
+                    total_output += o;
+                    found = true;
+                }
+            }
+        }
+        if found {
+            return Some((total_input, total_output));
+        }
+    }
+    None
+}
+
+/// Extract token counts from a raw NDJSON result line string.
+fn extract_result_tokens_from_line(line: &str) -> Option<(u64, u64)> {
+    let val = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let obj = val.as_object()?;
+    extract_result_tokens(obj)
 }
 
 /// Extract input/output tokens from the Claude envelope's usage objects.
@@ -508,13 +614,17 @@ fn extract_usage(
 
 /// Extract a structured `AgentResult` from Claude/Kimi/MiniMax NDJSON output.
 ///
-/// Finds the last `"type":"result"` line in the NDJSON stream and extracts:
+/// Finds the last `"type":"result"` line whose `result` field contains valid JSON.
+/// This skips outer-session plain-text summaries (issue #1387) and finds the
+/// actual task-delegate result with structured JSON.
+///
+/// Extracts:
 /// - `result` text (the inner content)
 /// - `is_error` flag
 /// - token usage from `usage` or `modelUsage`
 /// - `duration_ms`
 ///
-/// If no `type:result` line exists (common with MiniMax), falls back to
+/// If no JSON result line exists (common with MiniMax), falls back to
 /// extracting the last assistant text message from the stream.
 ///
 /// Returns `None` only if the input contains no recognizable NDJSON events.
@@ -525,7 +635,7 @@ pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
     }
 
     // Try to find the result envelope first
-    if let Some(result_line) = find_ndjson_result_line(trimmed) {
+    if let Some((result_line, _tokens)) = find_ndjson_result_line(trimmed) {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result_line) {
             if let Some(envelope) = parsed.as_object() {
                 let is_error = envelope
@@ -1267,5 +1377,210 @@ mod tests {
         let result = find_claude_result(ndjson).expect("should extract modelUsage");
         assert_eq!(result.input_tokens, Some(5000));
         assert_eq!(result.output_tokens, Some(1000));
+    }
+
+    // ── Regression tests for issue #1387 ──────────────────────────────────────
+
+    /// Regression test: when an NDJSON stream has multiple type:result lines —
+    /// one with JSON in the result field (inner task delegate) and one with
+    /// plain text (outer session summary) — find_ndjson_result_line must
+    /// skip the plain-text one and return the JSON one.
+    #[test]
+    fn find_ndjson_result_line_skips_plain_text_result() {
+        // Build test NDJSON using serde_json to avoid string-escaping confusion.
+        let inner_result = serde_json::json!({"status": "done", "summary": "fix applied"});
+        let json_result_line = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "duration_ms": 273044,
+            "result": inner_result.to_string(),
+            "usage": {"input_tokens": 12, "output_tokens": 1577}
+        })
+        .to_string();
+        let plain_result_line = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "duration_ms": 2352,
+            "result": "All 2352 tests passed.",
+            "usage": {"input_tokens": 3, "output_tokens": 16}
+        })
+        .to_string();
+        // Concatenate without using concat! to avoid string-escaping headaches.
+        let mut ndjson = json_result_line.clone();
+        ndjson.push('\n');
+        ndjson.push_str(r#"{"type":"system","subtype":"task_notification"}"#);
+        ndjson.push('\n');
+        ndjson.push_str(r#"{"type":"system","subtype":"init"}"#);
+        ndjson.push('\n');
+        ndjson.push_str(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"summary here"}]}}"#,
+        );
+        ndjson.push('\n');
+        ndjson.push_str(&plain_result_line);
+
+        let line = find_ndjson_result_line(&ndjson)
+            .expect("should find a result line")
+            .0;
+        // Must be the JSON result (inner), not the plain-text one (outer).
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).expect("returned line must be valid JSON");
+        let result_val = parsed.get("result").expect("result field must exist");
+        assert!(
+            result_val.is_string(),
+            "result field must be a JSON string (not plain text), got: {result_val}"
+        );
+        let result_str = result_val.as_str().unwrap();
+        assert!(
+            result_str.starts_with('{'),
+            "result must be JSON (object), got: {result_str}"
+        );
+        assert!(
+            !result_str.contains("All 2352 tests passed"),
+            "must NOT return outer plain-text result: {result_str}"
+        );
+    }
+
+    /// Regression test: when BOTH result lines have plain-text results (no JSON),
+    /// find_ndjson_result_line must return the one with more tokens — not the last.
+    /// This is the actual task 1384 scenario: inner result has 12+1577 tokens,
+    /// outer confirmation has 3+16 tokens. Must pick the inner one (issue #1387).
+    #[test]
+    fn find_ndjson_result_line_prefers_more_tokens_on_plain_text() {
+        // Build NDJSON where both results are plain text.
+        let inner_result_line = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "duration_ms": 273044,
+            "result": "All 2352 tests pass. The fix is clean and correct.",
+            "usage": {"input_tokens": 12, "output_tokens": 1577}
+        })
+        .to_string();
+        let outer_result_line = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "duration_ms": 2352,
+            "result": "Already retrieved the result — all 2352 tests passed.",
+            "usage": {"input_tokens": 3, "output_tokens": 16}
+        })
+        .to_string();
+
+        // Inner result FIRST, outer result LAST (the actual task 1384 ordering).
+        let ndjson = format!(
+            "{0}\n{1}\n{2}",
+            inner_result_line, r#"{"type":"system","subtype":"init"}"#, outer_result_line
+        );
+
+        let (line, tokens) = find_ndjson_result_line(&ndjson).expect("should find a result line");
+
+        // Must return the inner result (more tokens), not the outer one.
+        assert!(
+            line.contains("The fix is clean"),
+            "expected inner result (more tokens), got: {line}"
+        );
+        // Tokens must match the inner result.
+        assert_eq!(
+            tokens,
+            Some((12, 1577)),
+            "tokens must be from the inner result"
+        );
+    }
+
+    /// Regression test: when parse_response encounters plain-text results
+    /// and falls back to synthesis, tokens from the envelope must be preserved.
+    #[test]
+    fn parse_response_preserves_tokens_on_synthesis_fallback() {
+        // Both results are plain text (no JSON in result field).
+        // parse_response should synthesize but preserve the envelope tokens.
+        let ndjson = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":273044,"result":"All 2352 tests pass. The fix is clean and correct.","usage":{"input_tokens":12,"output_tokens":1577}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"init"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":2352,"result":"Already retrieved the result — all 2352 tests passed.","usage":{"input_tokens":3,"output_tokens":16}}"#,
+        );
+
+        let parsed = runner()
+            .parse_response(ndjson)
+            .expect("should parse successfully");
+
+        // Must preserve tokens from the inner (higher-token) result.
+        assert_eq!(
+            parsed.input_tokens,
+            Some(12),
+            "input_tokens must be preserved (not lost on synthesis fallback)"
+        );
+        assert_eq!(
+            parsed.output_tokens,
+            Some(1577),
+            "output_tokens must be preserved (not lost on synthesis fallback)"
+        );
+    }
+
+    #[test]
+    fn parse_response_uses_inner_json_result_preserving_tokens() {
+        // Simulates task 1384: outer session says "tests passed" (plain text),
+        // but inner task delegate result is JSON with tokens.
+        let ndjson = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":273044,"result":"{\"status\":\"done\",\"summary\":\"fix applied\",\"accomplished\":[\"fix\"],\"remaining\":[],\"files\":[]}","usage":{"input_tokens":12,"output_tokens":1577}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"tests passed"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":2352,"result":"All 2352 tests passed.","usage":{"input_tokens":3,"output_tokens":16}}"#,
+        );
+
+        let parsed = runner()
+            .parse_response(ndjson)
+            .expect("should parse successfully");
+
+        // Must use the inner JSON result (fix applied), not outer plain text.
+        assert_eq!(
+            parsed.response.status, "done",
+            "expected inner JSON result status, got: {:?}",
+            parsed.response.status
+        );
+        assert_eq!(
+            parsed.response.summary.as_str(),
+            "fix applied",
+            "expected inner JSON result summary, got: {:?}",
+            parsed.response.summary
+        );
+        // Tokens must be from the inner result with tokens, not the outer plain-text one.
+        assert_eq!(
+            parsed.input_tokens,
+            Some(12),
+            "input_tokens must be from inner result (not outer plain-text result)"
+        );
+        assert_eq!(
+            parsed.output_tokens,
+            Some(1577),
+            "output_tokens must be from inner result (not outer plain-text result)"
+        );
+    }
+
+    /// Regression test: when find_ndjson_result_line returns None (no JSON
+    /// result found), extract_stream_json_result_text must fall back to
+    /// opencode-style text extraction, not return raw NDJSON.
+    #[test]
+    fn extract_text_falls_back_to_opencode_style_when_no_json_result() {
+        // An NDJSON stream with no type:result at all — just a text event.
+        let ndjson = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"s1"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"All tasks complete"}]}}"#,
+        );
+
+        let text = runner().extract_text(ndjson).expect("should extract text");
+        // Must extract the assistant message text, not raw NDJSON.
+        assert!(
+            text.contains("All tasks complete"),
+            "expected extracted assistant text, got: {text}"
+        );
+        assert!(!text.contains("type"), "must not return raw NDJSON: {text}");
     }
 }
