@@ -97,11 +97,12 @@ pub async fn handle_error(
                     ],
                 )
                 .await;
-                // Skip normal failover — we're retrying same agent with different model
-                // Apply backoff to pace retries
+                // Skip normal failover — we're retrying same agent with different model.
+                // Use "routed" (not "new") since agent/model are already stored;
+                // this avoids a redundant LLM re-routing cycle.
                 response::wait_for_fallback_backoff(task_id, store, repo).await;
                 return Ok(ErrorHandleResult::EarlyReturn {
-                    status: "new".to_string(),
+                    status: "routed".to_string(),
                 });
             }
             (
@@ -144,6 +145,7 @@ pub async fn handle_error(
         ),
         agents::AgentError::NetworkError { message } => {
             // Transient connectivity failure — retry same agent, no reroute chain update.
+            // Use "routed" so it re-dispatches without a full re-routing cycle.
             let msg = format!("{agent_name} network error: {message}");
             store::store_set(
                 store,
@@ -155,7 +157,7 @@ pub async fn handle_error(
             // Apply backoff to pace retries
             response::wait_for_fallback_backoff(task_id, store, repo).await;
             return Ok(ErrorHandleResult::EarlyReturn {
-                status: "new".to_string(),
+                status: "routed".to_string(),
             });
         }
         agents::AgentError::Unknown { exit_code, message } => {
@@ -214,10 +216,11 @@ pub async fn handle_error(
                             ],
                         )
                         .await;
-                        // Apply backoff to pace retries
+                        // Apply backoff to pace retries.
+                        // Use "routed" since agent/model are already stored.
                         response::wait_for_fallback_backoff(task_id, store, repo).await;
                         return Ok(ErrorHandleResult::EarlyReturn {
-                            status: "new".to_string(),
+                            status: "routed".to_string(),
                         });
                     }
                 }
@@ -311,7 +314,7 @@ pub async fn handle_error(
                 )
                 .await;
                 return Ok(ErrorHandleResult::EarlyReturn {
-                    status: "new".to_string(),
+                    status: "routed".to_string(),
                 });
             }
         }
@@ -430,8 +433,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "new"),
-            "expected EarlyReturn{{status: new}} for simple complexity — free model should be tried first"
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "routed"),
+            "expected EarlyReturn{{status: routed}} for simple complexity — free model should be tried first"
         );
     }
 
@@ -461,8 +464,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "new"),
-            "expected EarlyReturn{{status: new}} for unknown complexity — free model should be tried first"
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "routed"),
+            "expected EarlyReturn{{status: routed}} for unknown complexity — free model should be tried first"
         );
     }
 

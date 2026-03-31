@@ -245,7 +245,7 @@ impl RetryableError {
 }
 
 /// Handle failover for any retryable error type.
-/// Returns the resulting status string: "new" if rerouted, "needs_review" otherwise.
+/// Returns the resulting status string: "routed" if rerouted, "needs_review" otherwise.
 ///
 /// Note: DB recording of rate limit events is handled by the caller (mod.rs)
 /// which has async context. This function only handles store state + cooldowns.
@@ -327,10 +327,12 @@ pub async fn handle_failover(
         )
         .await;
 
-        // Apply exponential backoff with jitter before retry
+        // Apply exponential backoff with jitter before retry.
+        // Return "routed" (not "new") since agent/model are already stored;
+        // this skips the LLM re-routing cycle and preserves progress.
         wait_for_fallback_backoff(task_id, store, repo).await;
 
-        return "new".to_string();
+        return "routed".to_string();
     }
 
     // No fallback available

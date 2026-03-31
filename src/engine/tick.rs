@@ -148,7 +148,7 @@ pub(crate) async fn tick_detect_silent_agents(
             model = %model_name,
             grace_secs = config.silence_grace_period,
             cooldown_secs = config.silence_cooldown,
-            "agent silent since session start — killing session, cooling down model + agent, re-routing"
+            "agent silent since session start — killing session, cooling down model + agent, failing over"
         );
 
         // 1. Kill the tmux session
@@ -195,10 +195,51 @@ pub(crate) async fn tick_detect_silent_agents(
             );
         }
 
-        // 4. Clear routing state and reset to New for re-routing.
-        // Preserve route_attempts so the router knows this task has been routed before
-        // and can fall back to round-robin after max_route_attempts failures.
+        // 4. Pick a fallback agent and set to Routed (not New) to preserve progress.
+        // Setting to New would clear routing state and trigger a full LLM re-routing
+        // cycle, losing intermediate context. Routed skips re-routing and re-dispatches
+        // directly with the chosen fallback agent.
         let task_eid = ExternalId(task_id.clone());
+
+        // Build available agents list and reroute chain for failover
+        let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
+            .iter()
+            .filter(|a| crate::cmd_cache::command_exists(a))
+            .map(|s| s.to_string())
+            .collect();
+        let chain = crate::engine::runner::response::get_reroute_chain(
+            &task_id,
+            &Some(Arc::clone(store)),
+            repo,
+        )
+        .await;
+        let chain = crate::engine::runner::response::update_reroute_chain(
+            &task_id,
+            &agent_name,
+            &chain,
+            &Some(Arc::clone(store)),
+            repo,
+        )
+        .await;
+
+        let (next_status, next_agent) = if let Some(fallback) =
+            crate::engine::runner::response::pick_fallback_agent(&agent_name, &chain, &available)
+        {
+            tracing::info!(
+                task_id,
+                from = %agent_name,
+                to = %fallback,
+                "silence detection: failover to different agent, setting routed"
+            );
+            (Status::Routed, Some(fallback))
+        } else {
+            tracing::warn!(
+                task_id,
+                "silence detection: no fallback agents available, marking needs_review"
+            );
+            (Status::NeedsReview, None)
+        };
+
         if use_backend {
             if let Some(ref st) = store_task {
                 for label in &st.labels {
@@ -208,27 +249,61 @@ pub(crate) async fn tick_detect_silent_agents(
                 }
             }
         }
-        store::store_set(
-            &Some(Arc::clone(store)),
-            repo,
-            &task_id,
-            &[
-                ("agent", serde_json::Value::Null),
-                ("model", serde_json::Value::Null),
-            ],
-        )
-        .await;
+
+        if let Some(ref fallback) = next_agent {
+            store::store_set(
+                &Some(Arc::clone(store)),
+                repo,
+                &task_id,
+                &[
+                    ("agent", serde_json::json!(fallback)),
+                    ("model", serde_json::json!("")),
+                    (
+                        "last_error",
+                        serde_json::json!(format!(
+                            "silence detected after {}s, rerouted from {} to {}",
+                            config.silence_grace_period, agent_name, fallback
+                        )),
+                    ),
+                ],
+            )
+            .await;
+        } else {
+            store::store_set(
+                &Some(Arc::clone(store)),
+                repo,
+                &task_id,
+                &[
+                    ("agent", serde_json::Value::Null),
+                    ("model", serde_json::Value::Null),
+                    (
+                        "last_error",
+                        serde_json::json!(format!(
+                            "silence detected after {}s, no fallback agents available",
+                            config.silence_grace_period
+                        )),
+                    ),
+                ],
+            )
+            .await;
+        }
+
         if let Err(e) = task_manager
-            .update_task_status(&task_eid, Status::New)
+            .update_task_status(&task_eid, next_status)
             .await
         {
-            tracing::warn!(task_id, ?e, "failed to reset silent task status");
+            tracing::warn!(task_id, ?e, "failed to update silent task status");
             continue;
         }
 
         // 5. Post a comment explaining what happened
+        let action = if let Some(ref fallback) = next_agent {
+            format!("failing over to {fallback}")
+        } else {
+            "marking needs_review (no fallback agents)".to_string()
+        };
         let comment = format!(
-            "[{}] agent silent for {}s since session start — killed session, cooled down model `{}:{}` for {}s{}, agent `{}` for {}s, re-routing task{}",
+            "[{}] agent silent for {}s since session start — killed session, cooled down model `{}:{}` for {}s{}, agent `{}` for {}s, {}{}",
             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
             config.silence_grace_period,
             agent_name,
@@ -237,6 +312,7 @@ pub(crate) async fn tick_detect_silent_agents(
             extended_note,
             agent_name,
             crate::engine::cooldown::SILENCE_AGENT_COOLDOWN_SECS,
+            action,
             crate::engine::orch_footer(),
         );
         if use_backend {
@@ -1641,10 +1717,16 @@ mod tests {
         );
 
         let task = store.get(internal_id).await.unwrap();
-        assert_eq!(
-            task.status,
-            crate::store::TaskStatus::New,
-            "internal task should reset to New"
+        // Silence detection now uses failover: if a fallback agent is found → Routed,
+        // otherwise → NeedsReview. Either is acceptable; the key invariant is that the
+        // task is no longer InProgress.
+        assert!(
+            matches!(
+                task.status,
+                crate::store::TaskStatus::Routed | crate::store::TaskStatus::NeedsReview
+            ),
+            "internal task should be routed to fallback or needs_review, got {:?}",
+            task.status
         );
     }
 
