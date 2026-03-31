@@ -128,9 +128,18 @@ impl ClaudeRunner {
         // Do NOT check for rate limits here — result_text is agent work product
         // (summary, code descriptions) when is_error=false. Rate-limit keywords
         // in work product cause false positives (see issue #1292).
-        let response = parser::parse(result_text).map_err(|_| AgentError::InvalidResponse {
-            raw: result_text.to_string(),
-        })?;
+        let response = match parser::parse(result_text) {
+            Ok(r) => r,
+            Err(_) => {
+                // Structured parse failed — try plain-text synthesis.
+                // Preserve already-extracted tokens rather than discarding them.
+                super::synthesize_response_from_text(result_text).ok_or_else(|| {
+                    AgentError::InvalidResponse {
+                        raw: result_text.to_string(),
+                    }
+                })?
+            }
+        };
 
         Ok(ParsedResponse {
             response,
@@ -684,28 +693,26 @@ mod tests {
         // Regression test for issue #1292: when is_error=false but the result
         // text contains rate-limit keywords (agent describing work it did),
         // parse_response must NOT return a RateLimit error.
-        let result_body = serde_json::json!({
-            "status": "needs_review",
-            "summary": "Added detect_rate_limit helper and quota exceeded handling",
-            "accomplished": ["fn detect_rate_limit", "quota patterns for billing cycle"],
-            "remaining": [],
-            "files": []
-        })
-        .to_string();
-        // Wrap in an envelope but make it unparseable as AgentResponse by
-        // embedding rate-limit prose instead of JSON — simulates the agent
-        // returning a plain-text summary with rate-limit keywords.
+        //
+        // Fix for issue #1377: when parser::parse fails on plain-text output,
+        // synthesize_response_from_text is tried and tokens are preserved.
         let raw = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1000,"result":"Added detect_rate_limit and quota exceeded patterns","usage":{"input_tokens":10,"output_tokens":5}}"#.to_string();
-        // result text is plain prose containing rate-limit keywords; parser::parse
-        // will fail, and the old code would have returned RateLimit — fix ensures
-        // it returns InvalidResponse instead.
-        let err = runner().parse_response(&raw).unwrap_err();
-        assert!(
-            !matches!(err, AgentError::RateLimit { .. }),
-            "work product in result field must not trigger rate limit, got: {err:?}"
+        // Plain-text result with rate-limit keywords: parser::parse fails, but
+        // synthesis succeeds — result must be Ok (tokens preserved) not RateLimit.
+        let parsed = runner()
+            .parse_response(&raw)
+            .expect("plain-text work product must synthesize successfully");
+        // Tokens must be preserved from the envelope (issue #1377)
+        assert_eq!(
+            parsed.input_tokens,
+            Some(10),
+            "input_tokens must be preserved"
         );
-        // Drop the unused variable
-        let _ = result_body;
+        assert_eq!(
+            parsed.output_tokens,
+            Some(5),
+            "output_tokens must be preserved"
+        );
     }
 
     #[test]
