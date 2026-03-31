@@ -543,14 +543,78 @@ pub async fn create_pr_if_needed(
     let pr_title = title;
 
     // Create PR using GhHttp API
-    let url = gh
+    let create_result = gh
         .create_pr(repo, pr_title, &body, branch, base_branch)
-        .await
-        .map_err(PrCreateError::ApiError)?;
+        .await;
+
+    let url = match create_result {
+        Ok(url) => url,
+        Err(e) => {
+            let err_str = format!("{e}");
+            // For transient 5xx errors, GitHub may have created the PR despite
+            // returning an error (e.g. 502 Bad Gateway after writing the PR).
+            // Re-check for an existing PR before propagating the failure so we
+            // don't orphan the PR from the task.
+            if is_transient_github_error(&err_str) {
+                tracing::warn!(
+                    task_id,
+                    error = %e,
+                    "transient GitHub API error during PR creation — checking if PR was actually created"
+                );
+                match gh.get_pr_number(repo, branch).await {
+                    Ok(Some(pr_number)) => {
+                        tracing::info!(
+                            task_id,
+                            pr = pr_number,
+                            "PR was created despite transient error — recovering"
+                        );
+                        append_pr_footer_if_missing(&gh, repo, pr_number, task_id, agent, model)
+                            .await;
+                        match gh.get_pr(repo, pr_number).await {
+                            Ok(pr) => pr.html_url,
+                            Err(get_err) => {
+                                tracing::warn!(
+                                    task_id,
+                                    error = %get_err,
+                                    "failed to fetch PR URL after transient-error recovery"
+                                );
+                                return Err(PrCreateError::ApiError(e));
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            task_id,
+                            "PR was not created despite transient error — propagating original error"
+                        );
+                        return Err(PrCreateError::ApiError(e));
+                    }
+                    Err(check_err) => {
+                        tracing::warn!(
+                            task_id,
+                            error = %check_err,
+                            "failed to verify PR existence after transient error — propagating original error"
+                        );
+                        return Err(PrCreateError::ApiError(e));
+                    }
+                }
+            } else {
+                return Err(PrCreateError::ApiError(e));
+            }
+        }
+    };
 
     tracing::info!(task_id, pr_url = %url, "created PR via GhHttp API");
 
     Ok(url)
+}
+
+/// Returns true if the error string indicates a transient GitHub API failure
+/// (HTTP 5xx), where the PR may have been created despite the error response.
+fn is_transient_github_error(err_str: &str) -> bool {
+    // Match the error format produced by GhHttp: "GitHub API POST ... failed (5XX): ..."
+    // This covers 500, 502, 503, 504, etc.
+    err_str.contains("failed (5")
 }
 
 /// Append the Orch attribution footer to an existing PR body if not already present.

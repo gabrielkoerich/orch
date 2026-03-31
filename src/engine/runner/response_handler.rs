@@ -403,7 +403,9 @@ pub async fn handle_success(
         );
         "blocked"
     } else if resp.status == "done" && !has_pr && has_pushed {
-        // Push succeeded but PR creation failed — review gate will find commits and create the PR.
+        // Push succeeded but PR creation failed (non-422 error, e.g. transient 5xx after
+        // recovery check found no PR). Route to review gate so it can find the PR if it
+        // was actually created by GitHub, or re-dispatch if it was not.
         tracing::warn!(
             task_id,
             "agent done, commits pushed, but PR creation failed — routing to review gate"
