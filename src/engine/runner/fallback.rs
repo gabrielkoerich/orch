@@ -45,9 +45,18 @@ pub async fn handle_error(
     // Map AgentError to RetryableError for the existing handle_failover()
     let (retryable, error_msg) = match agent_err {
         agents::AgentError::RateLimit { message, .. } => {
-            // Check for credit exhaustion - these require longer agent-wide cooldowns
+            // Check for credit exhaustion - these require longer agent-wide cooldowns.
+            // For all other rate limits, record the agent-level cooldown immediately so
+            // the router can observe it before any concurrent tasks start their runs.
+            // handle_failover() also records the cooldown later, but setting it here
+            // means the in-memory map is updated right away — without this, concurrent
+            // dispatches that check cooldowns between now and handle_failover() will
+            // see no cooldown and waste another run against the same rate-limited agent.
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
                 crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+            } else {
+                crate::engine::cooldown::record_agent_failure_with_message(agent_name, message)
+                    .await;
             }
             (
                 response::RetryableError::UsageLimit,
@@ -405,6 +414,48 @@ mod tests {
         ) -> anyhow::Result<tokio::process::Command> {
             anyhow::bail!("not implemented")
         }
+    }
+
+    /// Verify that a generic (non-credit-exhaustion) rate limit error sets the agent
+    /// cooldown immediately in `handle_error()`, before `handle_failover()` is called.
+    ///
+    /// This prevents concurrent dispatches from starting new runs against the same
+    /// rate-limited agent while the first task is still in its error-handling path.
+    #[tokio::test]
+    async fn rate_limit_sets_agent_cooldown_immediately() {
+        let runner = MockRunner { free: vec![] };
+        let agent = "test-agent-1371-early-cooldown";
+
+        // Confirm no cooldown before the error.
+        assert!(
+            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            "agent should not be in cooldown before handle_error"
+        );
+
+        let err = AgentError::RateLimit {
+            message: "429 Too Many Requests".to_string(),
+        };
+
+        // Run handle_error — no store so handle_failover will find no agents and return Continue.
+        let _result = handle_error(
+            "test-1371-a",
+            &err,
+            agent,
+            &runner,
+            Some("sonnet"),
+            Some("medium"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        // Cooldown must be set immediately after handle_error returns, not deferred.
+        assert!(
+            crate::engine::cooldown::is_agent_in_cooldown(agent),
+            "agent should be in cooldown immediately after handle_error for RateLimit"
+        );
     }
 
     #[tokio::test]
