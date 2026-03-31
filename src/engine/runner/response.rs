@@ -34,7 +34,7 @@ pub(crate) fn calculate_backoff_delay(retry_count: usize) -> u64 {
         .as_micros() as u64;
     let jitter = now % (jitter_range * 2 + 1);
 
-    capped + jitter
+    capped.saturating_sub(jitter_range) + jitter
 }
 
 /// Wait with exponential backoff before retrying with a fallback agent.
@@ -809,6 +809,29 @@ pub async fn store_failure_memory(
 mod tests {
     use super::*;
     use crate::engine::runner::agents::{patterns, AgentError};
+
+    #[test]
+    fn calculate_backoff_delay_jitter_is_centered() {
+        // Run many samples and verify the range is [0.7*capped, 1.3*capped].
+        // We can't control `now` directly, but calling the function many times
+        // exercises different microsecond values and lets us check bounds.
+        let base = crate::engine::router::config::retry_base_delay_ms();
+        let max = crate::engine::router::config::retry_max_delay_ms();
+
+        // retry_count=0 → exponential = base, capped = base (assuming base < max)
+        let capped = base.min(max);
+        let jitter_range = (capped as f64 * JITTER_FACTOR) as u64;
+        let lo = capped.saturating_sub(jitter_range);
+        let hi = capped + jitter_range;
+
+        for _ in 0..200 {
+            let delay = calculate_backoff_delay(0);
+            assert!(
+                delay >= lo && delay <= hi,
+                "delay {delay} out of expected range [{lo}, {hi}]"
+            );
+        }
+    }
 
     #[test]
     fn retryable_type_str_returns_correct_labels() {
