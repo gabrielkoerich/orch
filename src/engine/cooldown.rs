@@ -61,8 +61,9 @@ pub enum CreditExhaustionReason {
 /// Short agent cooldown applied on silence detection (120 seconds).
 ///
 /// Forces the router to pick a different agent immediately on re-route,
-/// without long-term blocking. The model cooldown (30 min) keeps the dead
-/// model out while this short cooldown just breaks the same-agent loop.
+/// without long-term blocking. The model cooldown (exponential, starting at
+/// 5 min) keeps the dead model out while this short cooldown just breaks
+/// the same-agent loop.
 pub const SILENCE_AGENT_COOLDOWN_SECS: u64 = 120;
 
 /// Silence detections before applying an extended cooldown (rolling window).
@@ -365,8 +366,8 @@ pub fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64) {
 ///
 /// Used by silence detection to temporarily block the whole agent so the
 /// router picks a different one on re-route. Unlike `record_agent_failure`
-/// (30 min), this uses a short duration (typically 120s) — just enough to
-/// force one re-route cycle to a different agent.
+/// (exponential backoff), this uses a short duration (typically 120s) —
+/// just enough to force one re-route cycle to a different agent.
 pub fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
     let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
     set_cooldown(agent_name, cooldown_until, "silence_agent_cooldown");
@@ -730,7 +731,7 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
     }
 
     // Without a specific "try again at" date, return None and let the caller
-    // use its default cooldown (30 min agent / 1 hour model).  Only codex
+    // use its default cooldown (exponential backoff).  Only codex
     // provides exact retry dates in its rate-limit messages; other agents
     // (claude, opencode, kimi, minimax) have temporary limits that clear
     // within minutes.  A blanket 24 h fallback here caused false billing-
@@ -883,7 +884,7 @@ mod tests {
         set_agent_cooldown(agent, SILENCE_AGENT_COOLDOWN_SECS);
         assert!(is_agent_in_cooldown(agent));
 
-        // Verify it's a short cooldown (120s), not the long one (30 min)
+        // Verify it's a short cooldown (120s), not the exponential backoff one
         let map = cooldowns().lock().unwrap();
         let entry = map.get(agent).expect("should have cooldown entry");
         let now = chrono::Utc::now().timestamp();
