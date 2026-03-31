@@ -306,6 +306,11 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Manage agent and model cooldowns
+    Cooldown {
+        #[command(subcommand)]
+        action: CooldownAction,
+    },
     /// Show cost tracking and token usage
     Cost {
         /// Task ID to show cost for
@@ -344,6 +349,20 @@ enum Commands {
     Webhook {
         #[command(subcommand)]
         action: WebhookAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CooldownAction {
+    /// List all active agent and model cooldowns
+    List,
+    /// Clear a specific cooldown or all cooldowns
+    Clear {
+        /// Key to clear (e.g. "claude" or "claude:sonnet")
+        key: Option<String>,
+        /// Clear all active cooldowns
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -818,6 +837,14 @@ async fn main() -> anyhow::Result<()> {
             }
             ProjectAction::List => {
                 cli::project_list()?;
+            }
+        },
+        Commands::Cooldown { action } => match action {
+            CooldownAction::List => {
+                cli::cooldown::list().await?;
+            }
+            CooldownAction::Clear { key, all } => {
+                cli::cooldown::clear(key, all).await?;
             }
         },
         Commands::Cost {

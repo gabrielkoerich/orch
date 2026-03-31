@@ -47,7 +47,7 @@ pub async fn handle_error(
         agents::AgentError::RateLimit { message, .. } => {
             // Check for credit exhaustion - these require longer agent-wide cooldowns
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
-                crate::engine::cooldown::record_credit_exhaustion(agent_name, reason);
+                crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
             }
             (
                 response::RetryableError::UsageLimit,
@@ -57,7 +57,7 @@ pub async fn handle_error(
         agents::AgentError::Auth { message } => {
             // Check for credit exhaustion in auth errors (billing-related)
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
-                crate::engine::cooldown::record_credit_exhaustion(agent_name, reason);
+                crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
             }
             (
                 response::RetryableError::AuthError,
@@ -73,8 +73,8 @@ pub async fn handle_error(
             format!("missing tool: {tool}"),
         ),
         agents::AgentError::ModelUnavailable { model, .. } => {
-            // Record model-specific cooldown (1 hour ban)
-            response::record_model_failure(agent_name, model);
+            // Record model-specific cooldown with exponential backoff
+            response::record_model_failure(agent_name, model).await;
 
             // Try next model before switching agent
             let models = agent_runner.available_models();

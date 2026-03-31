@@ -964,7 +964,8 @@ pub(crate) async fn review_and_merge(
                 runner::response::record_agent_failure_with_message(
                     &review_agent,
                     &err.to_string(),
-                );
+                )
+                .await;
             }
             _ => {}
         }
@@ -1010,7 +1011,8 @@ pub(crate) async fn review_and_merge(
                     runner::response::record_agent_failure_with_message(
                         &review_agent,
                         &e.to_string(),
-                    );
+                    )
+                    .await;
                 }
                 _ => {}
             }

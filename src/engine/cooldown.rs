@@ -16,17 +16,36 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Default cooldown duration for failed agents (30 minutes).
+/// Default fallback cooldown for agents when no store is available: 30 minutes.
+///
+/// Used in contexts that need a concrete duration and cannot compute exponential
+/// backoff (e.g. computing how long to wait before retrying when a cooldown
+/// expiry timestamp is unknown). New code should use [`BACKOFF_BASE_SECS`] instead.
 pub const AGENT_COOLDOWN_SECS: i64 = 30 * 60;
 
-/// Default cooldown duration for model-specific failures (1 hour).
+/// Default fallback cooldown for models when no store is available: 1 hour.
+///
+/// Used in contexts that need a concrete duration. New code should use
+/// [`BACKOFF_BASE_SECS`] instead.
 pub const MODEL_COOLDOWN_SECS: i64 = 60 * 60;
 
-/// Cooldown duration for credit exhaustion (out_of_credits) - 6 hours.
-pub const CREDIT_EXHAUSTION_COOLDOWN_SECS: i64 = 6 * 60 * 60;
+/// Base backoff for generic agent/model failures: 5 minutes.
+pub const BACKOFF_BASE_SECS: i64 = 5 * 60;
 
-/// Cooldown duration for org-level disabling (org_level_disabled) - 12 hours.
-pub const ORG_LEVEL_DISABLED_COOLDOWN_SECS: i64 = 12 * 60 * 60;
+/// Maximum backoff for generic agent/model failures: 4 hours.
+pub const BACKOFF_MAX_SECS: i64 = 4 * 60 * 60;
+
+/// Base backoff for credit exhaustion (out_of_credits): 1 hour.
+pub const CREDIT_BACKOFF_BASE_SECS: i64 = 60 * 60;
+
+/// Base backoff for org-level disabling: 2 hours.
+pub const ORG_BACKOFF_BASE_SECS: i64 = 2 * 60 * 60;
+
+/// Maximum backoff for credit exhaustion and org-level disabling: 8 hours.
+pub const CREDIT_BACKOFF_MAX_SECS: i64 = 8 * 60 * 60;
+
+/// Flat cooldown for billing cycle exhaustion: 24 hours (calendar event, no backoff).
+pub const BILLING_CYCLE_COOLDOWN_SECS: i64 = 24 * 60 * 60;
 
 /// Credit exhaustion reason detected from error message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,23 +54,16 @@ pub enum CreditExhaustionReason {
     OutOfCredits,
     /// Organization-level disabling (org_level_disabled).
     OrgLevelDisabled,
-}
-
-impl CreditExhaustionReason {
-    /// Returns the cooldown duration for this reason.
-    pub fn cooldown_secs(&self) -> i64 {
-        match self {
-            CreditExhaustionReason::OutOfCredits => CREDIT_EXHAUSTION_COOLDOWN_SECS,
-            CreditExhaustionReason::OrgLevelDisabled => ORG_LEVEL_DISABLED_COOLDOWN_SECS,
-        }
-    }
+    /// Monthly billing cycle exhaustion — 24h flat cooldown (no backoff).
+    BillingCycleExhausted,
 }
 
 /// Short agent cooldown applied on silence detection (120 seconds).
 ///
 /// Forces the router to pick a different agent immediately on re-route,
-/// without long-term blocking. The model cooldown (30 min) keeps the dead
-/// model out while this short cooldown just breaks the same-agent loop.
+/// without long-term blocking. The model cooldown (exponential, starting at
+/// 5 min) keeps the dead model out while this short cooldown just breaks
+/// the same-agent loop.
 pub const SILENCE_AGENT_COOLDOWN_SECS: u64 = 120;
 
 /// Silence detections before applying an extended cooldown (rolling window).
@@ -68,6 +80,9 @@ const KV_PREFIX: &str = "cooldown:";
 
 /// KV key prefix for rolling silence counters.
 const SILENCE_COUNT_PREFIX: &str = "silence_count:";
+
+/// KV key prefix for per-agent and per-agent:model failure counts (drives exponential backoff).
+const FAILURE_COUNT_PREFIX: &str = "failure_count:";
 
 struct CooldownEntry {
     /// Unix timestamp when the cooldown expires.
@@ -133,14 +148,83 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
     }
 }
 
+/// Compute exponential backoff duration using base-3 growth.
+///
+/// Returns `min(base * 3^(count-1), max)` for count >= 1.
+/// For count == 0 or 1 (first failure), returns `base`.
+///
+/// | count | base=300s | result |
+/// |-------|-----------|--------|
+/// | 0     | 300       | 300    |
+/// | 1     | 300       | 300    |
+/// | 2     | 300       | 900    |
+/// | 3     | 300       | 2700   |
+/// | 4     | 300       | 8100 → capped |
+pub fn compute_backoff(count: u32, base: i64, max: i64) -> i64 {
+    if count <= 1 {
+        return base;
+    }
+    let factor = 3_i64.saturating_pow(count.saturating_sub(1));
+    base.saturating_mul(factor).min(max)
+}
+
+/// Read the failure count for a key from KV, increment it, write it back, and return the new count.
+///
+/// Always increments — the backoff formula's `max` parameter prevents the
+/// cooldown duration from growing beyond the cap, so unbounded counts are safe.
+///
+/// Returns 1 when the store is unavailable (unit-test contexts without a store).
+async fn read_and_increment_failure_count(
+    store_opt: &Option<Arc<crate::store::TaskStore>>,
+    key: &str,
+) -> u32 {
+    let kv_key = format!("{FAILURE_COUNT_PREFIX}{key}");
+    if let Some(store) = store_opt {
+        let count: u32 = store
+            .kv_get(&kv_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let new_count = count.saturating_add(1);
+        let _ = store.kv_set(&kv_key, &new_count.to_string()).await;
+        new_count
+    } else {
+        1
+    }
+}
+
+/// Reset failure counts for an agent and agent:model combo after a successful run.
+///
+/// Call this from the runner's success path so that the next failure starts
+/// backoff from the base duration again, not from wherever it left off.
+pub async fn record_agent_success(agent_name: &str, model: &str) {
+    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    if let Some(store) = store_opt {
+        let agent_key = format!("{FAILURE_COUNT_PREFIX}{agent_name}");
+        let model_key = format!("{FAILURE_COUNT_PREFIX}{agent_name}:{model}");
+        let _ = store.kv_set(&agent_key, "0").await;
+        let _ = store.kv_set(&model_key, "0").await;
+    }
+}
+
 /// Record that an agent has failed and should be temporarily avoided.
 ///
-/// If `error_message` contains "try again at {date}", the cooldown is set
-/// to that date. Otherwise uses the default 30-minute cooldown.
-pub fn record_agent_failure_with_message(agent_name: &str, error_message: &str) {
-    let cooldown_until = parse_retry_at(error_message)
-        .unwrap_or_else(|| chrono::Utc::now().timestamp() + AGENT_COOLDOWN_SECS);
+/// Applies exponential backoff based on the agent's failure count in KV.
+/// If `error_message` contains "try again at {date}", that vendor date is used
+/// instead of the computed backoff (vendor dates are always authoritative).
+pub async fn record_agent_failure_with_message(agent_name: &str, error_message: &str) {
+    // Vendor-specified retry date takes priority over backoff.
+    if let Some(cooldown_until) = parse_retry_at(error_message) {
+        set_cooldown(agent_name, cooldown_until, "agent_error");
+        return;
+    }
 
+    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    let count = read_and_increment_failure_count(&store_opt, agent_name).await;
+    let cooldown_until = chrono::Utc::now().timestamp()
+        + compute_backoff(count, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS);
     set_cooldown(agent_name, cooldown_until, "agent_error");
 }
 
@@ -180,6 +264,21 @@ pub fn detect_credit_exhaustion(error_message: &str) -> Option<CreditExhaustionR
         return Some(CreditExhaustionReason::OrgLevelDisabled);
     }
 
+    // Billing cycle exhaustion: monthly quota reset — check before generic quota
+    // patterns because "monthly quota exceeded" would otherwise match "quota exceeded".
+    let billing_cycle_patterns = [
+        "billing cycle",
+        "quota refreshed next cycle",
+        "monthly quota",
+        "quota will be refreshed",
+        "next billing cycle",
+        "refreshed in the next cycle",
+    ];
+
+    if billing_cycle_patterns.iter().any(|p| lower.contains(p)) {
+        return Some(CreditExhaustionReason::BillingCycleExhausted);
+    }
+
     if lower.contains("out of credits")
         || lower.contains("outofcredits")
         || lower.contains("insufficient funds")
@@ -195,30 +294,61 @@ pub fn detect_credit_exhaustion(error_message: &str) -> Option<CreditExhaustionR
 
 /// Record an agent-level cooldown for credit exhaustion.
 ///
-/// This applies a longer cooldown (6h for out_of_credits, 12h for org_level_disabled)
-/// across ALL models for the given agent, not just the specific model that failed.
-/// This prevents repeated wasted attempts when the entire org or billing account is disabled.
-pub fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustionReason) {
-    let cooldown_until = chrono::Utc::now().timestamp() + reason.cooldown_secs();
+/// Applies exponential backoff based on the agent's failure count.
+/// `BillingCycleExhausted` is a calendar event — flat 24h cooldown, no escalation.
+/// For other reasons, the backoff starts at 1h (out_of_credits) or 2h (org_level_disabled)
+/// and caps at 8h to prevent multi-day lockouts when credits can be refilled at any time.
+pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustionReason) {
     let reason_str = match reason {
         CreditExhaustionReason::OutOfCredits => "credit_exhaustion_out_of_credits",
         CreditExhaustionReason::OrgLevelDisabled => "credit_exhaustion_org_level_disabled",
+        CreditExhaustionReason::BillingCycleExhausted => "billing_cycle_exhausted",
     };
+
+    // Billing cycle exhaustion is a calendar event — flat 24h, backoff is meaningless.
+    if reason == CreditExhaustionReason::BillingCycleExhausted {
+        let cooldown_until = chrono::Utc::now().timestamp() + BILLING_CYCLE_COOLDOWN_SECS;
+        set_cooldown(agent_name, cooldown_until, reason_str);
+        tracing::warn!(
+            agent = agent_name,
+            reason = reason_str,
+            cooldown_secs = BILLING_CYCLE_COOLDOWN_SECS,
+            "billing cycle exhausted: applying 24h flat cooldown"
+        );
+        return;
+    }
+
+    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    let count = read_and_increment_failure_count(&store_opt, agent_name).await;
+
+    let (base, max) = match reason {
+        CreditExhaustionReason::OutOfCredits => (CREDIT_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS),
+        CreditExhaustionReason::OrgLevelDisabled => {
+            (ORG_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS)
+        }
+        CreditExhaustionReason::BillingCycleExhausted => unreachable!(),
+    };
+    let cooldown_secs = compute_backoff(count, base, max);
+    let cooldown_until = chrono::Utc::now().timestamp() + cooldown_secs;
     set_cooldown(agent_name, cooldown_until, reason_str);
     tracing::warn!(
         agent = agent_name,
         reason = reason_str,
-        cooldown_secs = reason.cooldown_secs(),
-        "credit exhaustion detected: applying agent-wide cooldown"
+        attempt = count,
+        cooldown_secs,
+        "credit exhaustion detected: applying exponential agent-wide cooldown"
     );
 }
 
 /// Record that a specific agent+model combo has failed.
 ///
-/// Persisted to KV so it survives restarts.
-pub fn record_model_failure(agent_name: &str, model: &str) {
+/// Applies exponential backoff based on the model's failure count in KV.
+pub async fn record_model_failure(agent_name: &str, model: &str) {
     let key = format!("{agent_name}:{model}");
-    let cooldown_until = chrono::Utc::now().timestamp() + MODEL_COOLDOWN_SECS;
+    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    let count = read_and_increment_failure_count(&store_opt, &key).await;
+    let cooldown_until = chrono::Utc::now().timestamp()
+        + compute_backoff(count, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS);
     set_cooldown(&key, cooldown_until, "model_error");
 }
 
@@ -236,8 +366,8 @@ pub fn set_model_cooldown(agent_name: &str, model: &str, duration_secs: u64) {
 ///
 /// Used by silence detection to temporarily block the whole agent so the
 /// router picks a different one on re-route. Unlike `record_agent_failure`
-/// (30 min), this uses a short duration (typically 120s) — just enough to
-/// force one re-route cycle to a different agent.
+/// (exponential backoff), this uses a short duration (typically 120s) —
+/// just enough to force one re-route cycle to a different agent.
 pub fn set_agent_cooldown(agent_name: &str, duration_secs: u64) {
     let cooldown_until = chrono::Utc::now().timestamp() + duration_secs as i64;
     set_cooldown(agent_name, cooldown_until, "silence_agent_cooldown");
@@ -335,8 +465,65 @@ pub fn cooldown_reason(key: &str) -> Option<String> {
     })
 }
 
+/// Return all currently active cooldowns as `(key, cooldown_until_unix, reason)`.
+///
+/// Reads from the in-memory map only — always fast, no async needed.
+/// Expired entries are filtered out. Used by `orch cooldown list`.
+pub fn list_all_cooldowns() -> Vec<(String, i64, String)> {
+    let now = chrono::Utc::now().timestamp();
+    let map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    let mut result: Vec<(String, i64, String)> = map
+        .iter()
+        .filter(|(_, entry)| now < entry.cooldown_until)
+        .map(|(key, entry)| (key.clone(), entry.cooldown_until, entry.reason.clone()))
+        .collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+/// Clear a specific cooldown by key, or all cooldowns when `key == "*"`.
+///
+/// Removes from the in-memory map, writes a past timestamp to KV, and resets
+/// the corresponding `failure_count:` entries so the next failure starts
+/// backoff from the base duration.
+pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
+    if key == "*" {
+        let keys: Vec<String> = {
+            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            let keys: Vec<String> = map.keys().cloned().collect();
+            map.clear();
+            keys
+        };
+        for k in &keys {
+            let kv_key = format!("{KV_PREFIX}{k}");
+            let _ = store.kv_set(&kv_key, "0").await;
+            // Reset failure count so backoff restarts from base.
+            let fc_key = format!("{FAILURE_COUNT_PREFIX}{k}");
+            let _ = store.kv_set(&fc_key, "0").await;
+        }
+        tracing::info!(
+            count = keys.len(),
+            "cleared all cooldowns and failure counts"
+        );
+    } else {
+        {
+            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            map.remove(key);
+        }
+        let kv_key = format!("{KV_PREFIX}{key}");
+        let _ = store.kv_set(&kv_key, "0").await;
+        // Reset failure count so backoff restarts from base.
+        let fc_key = format!("{FAILURE_COUNT_PREFIX}{key}");
+        let _ = store.kv_set(&fc_key, "0").await;
+        tracing::info!(key, "cleared cooldown and failure count");
+    }
+}
+
 /// Set a cooldown with a specific expiry timestamp. Persists to KV.
-fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) {
+///
+/// Returns `true` if the cooldown was applied, `false` if an existing longer
+/// cooldown prevented the update (never-shorten rule).
+fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) -> bool {
     {
         let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = map.get(key) {
@@ -344,7 +531,7 @@ fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) {
             // retry window (e.g., generic rate limit) from overriding a longer
             // billing-cycle cooldown.
             if existing.cooldown_until >= cooldown_until {
-                return;
+                return false;
             }
         }
         map.insert(
@@ -372,6 +559,7 @@ fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) {
             tracing::debug!(kv_key, "skipping KV cooldown persist (no Tokio runtime)");
         }
     }
+    true
 }
 
 /// Check if a key is currently in cooldown.
@@ -543,7 +731,7 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
     }
 
     // Without a specific "try again at" date, return None and let the caller
-    // use its default cooldown (30 min agent / 1 hour model).  Only codex
+    // use its default cooldown (exponential backoff).  Only codex
     // provides exact retry dates in its rate-limit messages; other agents
     // (claude, opencode, kimi, minimax) have temporary limits that clear
     // within minutes.  A blanket 24 h fallback here caused false billing-
@@ -612,8 +800,9 @@ mod tests {
             *slot = Some(store.clone());
         }
 
-        record_model_failure("testagent_persist", "testmodel_persist");
+        record_model_failure("testagent_persist", "testmodel_persist").await;
 
+        // set_cooldown persists via tokio::spawn — yield to let the task complete.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let kv_key = format!("{KV_PREFIX}testagent_persist:testmodel_persist");
@@ -654,16 +843,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn agent_cooldown_persists_to_kv() {
+    #[tokio::test]
+    async fn agent_cooldown_persists_to_kv() {
         // Agent-level cooldowns should also go through set_cooldown which persists
         let agent = "test_agent_persist_check";
-        record_agent_failure_with_message(agent, "");
+        record_agent_failure_with_message(agent, "").await;
         assert!(is_agent_in_cooldown(agent));
     }
 
-    #[test]
-    fn cooldown_never_shortens() {
+    #[tokio::test]
+    async fn cooldown_never_shortens() {
         let agent = "test_agent_no_shorten";
         set_agent_cooldown(agent, 24 * 60 * 60);
         let initial = {
@@ -674,7 +863,7 @@ mod tests {
         };
 
         // Shorter cooldown attempt should not override the existing one.
-        record_agent_failure_with_message(agent, "rate limit");
+        record_agent_failure_with_message(agent, "rate limit").await;
         let after = {
             let map = cooldowns().lock().unwrap();
             map.get(agent)
@@ -695,7 +884,7 @@ mod tests {
         set_agent_cooldown(agent, SILENCE_AGENT_COOLDOWN_SECS);
         assert!(is_agent_in_cooldown(agent));
 
-        // Verify it's a short cooldown (120s), not the long one (30 min)
+        // Verify it's a short cooldown (120s), not the exponential backoff one
         let map = cooldowns().lock().unwrap();
         let entry = map.get(agent).expect("should have cooldown entry");
         let now = chrono::Utc::now().timestamp();
@@ -822,12 +1011,12 @@ mod tests {
         assert!(detect_credit_exhaustion("you've hit your usage limit").is_none());
     }
 
-    #[test]
-    fn record_credit_exhaustion_applies_agent_cooldown() {
+    #[tokio::test]
+    async fn record_credit_exhaustion_applies_agent_cooldown() {
         let agent = "test_credit_exhaust_agent";
         assert!(!is_agent_in_cooldown(agent));
 
-        record_credit_exhaustion(agent, CreditExhaustionReason::OutOfCredits);
+        record_credit_exhaustion(agent, CreditExhaustionReason::OutOfCredits).await;
         assert!(is_agent_in_cooldown(agent));
 
         let remaining = {
@@ -835,18 +1024,47 @@ mod tests {
             let entry = map.get(agent).expect("cooldown entry should exist");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
+        // First failure: base = 1h
         assert!(
-            remaining >= CREDIT_EXHAUSTION_COOLDOWN_SECS - 5,
-            "credit exhaustion cooldown should be ~6 hours, got {remaining}s"
+            remaining >= CREDIT_BACKOFF_BASE_SECS - 5,
+            "first out_of_credits cooldown should be ~1 hour, got {remaining}s"
+        );
+        assert!(
+            remaining <= CREDIT_BACKOFF_MAX_SECS,
+            "cooldown should not exceed cap of 8h, got {remaining}s"
         );
     }
 
-    #[test]
-    fn record_credit_exhaustion_org_level_applies_longer_cooldown() {
+    #[tokio::test]
+    async fn record_credit_exhaustion_org_level_applies_longer_cooldown() {
         let agent = "test_org_disabled_agent";
         assert!(!is_agent_in_cooldown(agent));
 
-        record_credit_exhaustion(agent, CreditExhaustionReason::OrgLevelDisabled);
+        record_credit_exhaustion(agent, CreditExhaustionReason::OrgLevelDisabled).await;
+        assert!(is_agent_in_cooldown(agent));
+
+        let remaining = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("cooldown entry should exist");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        // First failure: base = 2h (ORG_BACKOFF_BASE_SECS)
+        assert!(
+            remaining >= ORG_BACKOFF_BASE_SECS - 5,
+            "first org-level disabled cooldown should be ~2 hours, got {remaining}s"
+        );
+        assert!(
+            remaining <= CREDIT_BACKOFF_MAX_SECS,
+            "cooldown should not exceed cap of 8h, got {remaining}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_credit_exhaustion_billing_cycle_applies_24h() {
+        let agent = "test_billing_cycle_agent";
+        assert!(!is_agent_in_cooldown(agent));
+
+        record_credit_exhaustion(agent, CreditExhaustionReason::BillingCycleExhausted).await;
         assert!(is_agent_in_cooldown(agent));
 
         let remaining = {
@@ -855,21 +1073,25 @@ mod tests {
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
         assert!(
-            remaining >= ORG_LEVEL_DISABLED_COOLDOWN_SECS - 5,
-            "org-level disabled cooldown should be ~12 hours, got {remaining}s"
+            remaining >= BILLING_CYCLE_COOLDOWN_SECS - 5,
+            "billing cycle cooldown should be ~24 hours, got {remaining}s"
         );
     }
 
     #[test]
-    fn credit_exhaustion_reason_cooldown_durations() {
+    fn credit_exhaustion_backoff_constants() {
+        // OutOfCredits first failure: 1h base
         assert_eq!(
-            CreditExhaustionReason::OutOfCredits.cooldown_secs(),
-            CREDIT_EXHAUSTION_COOLDOWN_SECS
+            compute_backoff(1, CREDIT_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS),
+            CREDIT_BACKOFF_BASE_SECS
         );
+        // OrgLevelDisabled first failure: 2h base
         assert_eq!(
-            CreditExhaustionReason::OrgLevelDisabled.cooldown_secs(),
-            ORG_LEVEL_DISABLED_COOLDOWN_SECS
+            compute_backoff(1, ORG_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS),
+            ORG_BACKOFF_BASE_SECS
         );
+        // BillingCycleExhausted: flat 24h
+        assert_eq!(BILLING_CYCLE_COOLDOWN_SECS, 24 * 60 * 60);
     }
 
     // ---- Degraded-agent tracking tests ----
@@ -890,7 +1112,7 @@ mod tests {
         let agent = "test_refresh_cooled";
 
         // Put agent in cooldown
-        record_agent_failure_with_message(agent, "");
+        record_agent_failure_with_message(agent, "").await;
         assert!(is_agent_in_cooldown(agent));
 
         // model_checker always returns true (agent has models)
@@ -969,6 +1191,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compute_backoff_grows_exponentially() {
+        // count=0 or 1: base
+        assert_eq!(compute_backoff(0, 300, 14400), 300);
+        assert_eq!(compute_backoff(1, 300, 14400), 300);
+        // count=2: base * 3
+        assert_eq!(compute_backoff(2, 300, 14400), 900);
+        // count=3: base * 9
+        assert_eq!(compute_backoff(3, 300, 14400), 2700);
+        // count=4: base * 27 = 8100 < 14400
+        assert_eq!(compute_backoff(4, 300, 14400), 8100);
+        // count=5: base * 81 = 24300 → capped at 14400
+        assert_eq!(compute_backoff(5, 300, 14400), 14400);
+    }
+
+    #[test]
+    fn detect_credit_exhaustion_billing_cycle() {
+        assert_eq!(
+            detect_credit_exhaustion("billing cycle"),
+            Some(CreditExhaustionReason::BillingCycleExhausted)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("quota refreshed next cycle"),
+            Some(CreditExhaustionReason::BillingCycleExhausted)
+        );
+        assert_eq!(
+            detect_credit_exhaustion(
+                "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle."
+            ),
+            Some(CreditExhaustionReason::BillingCycleExhausted)
+        );
+        assert_eq!(
+            detect_credit_exhaustion("monthly quota exceeded"),
+            Some(CreditExhaustionReason::BillingCycleExhausted)
+        );
+    }
+
+    #[test]
+    fn detect_credit_exhaustion_overage_takes_priority_over_billing_cycle() {
+        // A message containing both overage and billing cycle language should resolve
+        // to OrgLevelDisabled/OutOfCredits (detected first) not BillingCycleExhausted.
+        let msg = "overageDisabledReason: org_level_disabled for billing cycle";
+        assert_eq!(
+            detect_credit_exhaustion(msg),
+            Some(CreditExhaustionReason::OrgLevelDisabled)
+        );
+    }
+
     #[tokio::test]
     async fn refresh_degraded_agents_below_threshold_not_degraded() {
         let store = test_store().await;
@@ -990,5 +1260,203 @@ mod tests {
             !is_agent_degraded(agent),
             "agent with rate limit count < threshold should not be degraded"
         );
+    }
+
+    // ---- Exponential backoff integration tests ----
+
+    #[tokio::test]
+    async fn repeated_agent_failures_escalate_backoff() {
+        let store = test_store().await;
+        {
+            let mut slot = cooldown_store().lock().unwrap();
+            *slot = Some(store.clone());
+        }
+
+        let agent = "test_escalation_agent";
+
+        // First failure: should be ~5 min (BACKOFF_BASE_SECS)
+        record_agent_failure_with_message(agent, "").await;
+        let remaining_1 = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("should have cooldown");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        assert!(
+            (BACKOFF_BASE_SECS - 5..=BACKOFF_BASE_SECS + 5).contains(&remaining_1),
+            "first failure should be ~5 min, got {remaining_1}s"
+        );
+
+        // Clear the cooldown (but NOT failure count) to allow the next set_cooldown to apply
+        {
+            let mut map = cooldowns().lock().unwrap();
+            map.remove(agent);
+        }
+
+        // Second failure: should be ~15 min (5 * 3)
+        record_agent_failure_with_message(agent, "").await;
+        let remaining_2 = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("should have cooldown");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        assert!(
+            remaining_2 >= BACKOFF_BASE_SECS * 3 - 5,
+            "second failure should be ~15 min, got {remaining_2}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_agent_success_resets_backoff() {
+        let store = test_store().await;
+        {
+            let mut slot = cooldown_store().lock().unwrap();
+            *slot = Some(store.clone());
+        }
+
+        let agent = "test_success_reset_agent";
+        let model = "test_model";
+
+        // Accumulate 3 failures to escalate the backoff
+        for _ in 0..3 {
+            let _ = read_and_increment_failure_count(&Some(store.clone()), agent).await;
+        }
+        // Verify count is 3
+        let kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
+        let count: u32 = store
+            .kv_get(&kv_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // Success should reset to 0
+        record_agent_success(agent, model).await;
+
+        let count_after: u32 = store
+            .kv_get(&kv_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(count_after, 0, "success should reset failure count to 0");
+
+        // Model-specific count should also be reset
+        let model_kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}:{model}");
+        let model_count: u32 = store
+            .kv_get(&model_kv_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            model_count, 0,
+            "success should reset model failure count to 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_cooldown_resets_failure_counts() {
+        let store = test_store().await;
+        {
+            let mut slot = cooldown_store().lock().unwrap();
+            *slot = Some(store.clone());
+        }
+
+        let agent = "test_clear_fc_agent";
+
+        // Accumulate failures
+        for _ in 0..5 {
+            let _ = read_and_increment_failure_count(&Some(store.clone()), agent).await;
+        }
+        // Set a cooldown so clear_cooldown has something to clear
+        set_agent_cooldown(agent, 3600);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Verify failure count is 5
+        let kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
+        let count: u32 = store
+            .kv_get(&kv_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 5);
+
+        // Clear the cooldown
+        clear_cooldown(agent, &store).await;
+
+        // Failure count should be reset to 0
+        let count_after: u32 = store
+            .kv_get(&kv_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            count_after, 0,
+            "clear_cooldown should reset failure count to 0"
+        );
+
+        // Cooldown should be removed
+        assert!(
+            !is_agent_in_cooldown(agent),
+            "agent should not be in cooldown after clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_all_cooldowns_resets_all_failure_counts() {
+        let store = test_store().await;
+        {
+            let mut slot = cooldown_store().lock().unwrap();
+            *slot = Some(store.clone());
+        }
+
+        let agents = ["test_clear_all_a", "test_clear_all_b"];
+        for agent in &agents {
+            let _ = read_and_increment_failure_count(&Some(store.clone()), agent).await;
+            set_agent_cooldown(agent, 3600);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        clear_cooldown("*", &store).await;
+
+        for agent in &agents {
+            assert!(!is_agent_in_cooldown(agent));
+            let kv_key = format!("{FAILURE_COUNT_PREFIX}{agent}");
+            let count: u32 = store
+                .kv_get(&kv_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "clear --all should reset failure count for {agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_backoff_saturates_on_large_counts() {
+        // Very large count should not overflow, just hit the cap
+        assert_eq!(
+            compute_backoff(100, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS),
+            BACKOFF_MAX_SECS
+        );
+        assert_eq!(compute_backoff(u32::MAX, 300, 14400), 14400);
+    }
+
+    #[test]
+    fn compute_backoff_zero_base_returns_zero() {
+        assert_eq!(compute_backoff(1, 0, 14400), 0);
+        assert_eq!(compute_backoff(5, 0, 14400), 0);
     }
 }
