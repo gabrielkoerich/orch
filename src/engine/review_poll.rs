@@ -162,6 +162,22 @@ pub(crate) async fn review_open_prs(
                             max_reroutes,
                             "reached max reroute attempts for in_review no-PR — blocking for human review"
                         );
+                        // Clear agent/model and record an explanatory last_error
+                        let msg = format!(
+                            "no PR or code changes after {}/{} reroute attempts",
+                            reroutes, max_reroutes
+                        );
+                        store_set(
+                            &Some(Arc::clone(store)),
+                            repo,
+                            task_id,
+                            &[
+                                ("agent", serde_json::json!(null)),
+                                ("model", serde_json::json!(null)),
+                                ("last_error", serde_json::json!(msg)),
+                            ],
+                        )
+                        .await;
                         if let Err(e) = task_manager
                             .update_task_status(&task.id, Status::Blocked)
                             .await
