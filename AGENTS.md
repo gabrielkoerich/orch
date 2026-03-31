@@ -423,13 +423,18 @@ Issues #1261 and #1172 were caused by agents modifying config files without perm
 
 ### Cooldown and failure recovery is generic — do not special-case models or agents
 
-The cooldown system (`src/engine/cooldown.rs`) and failure recovery (`src/engine/sync.rs`) are designed to handle **all** agent and model failures generically:
+The cooldown system (`src/engine/cooldown.rs`) and failure recovery (`src/engine/sync.rs`) are designed to handle **all** agent and model failures generically.
 
-- Agent failures → 30-minute agent cooldown → router picks a different agent
-- Model failures → 1-hour model cooldown → router picks a different model
-- Rate limits with "try again at" → cooldown set to that exact timestamp
-- Silence detection → model cooldown + short agent cooldown → re-route
-- Billing cycle exhaustion → 24h cooldown (or vendor-specified date)
+All cooldowns are **persisted to SQLite KV** (`cooldown:{key}`) so they survive service restarts. Failure counts are stored separately (`failure_count:{key}`) to drive exponential backoff.
+
+- Agent failures → exponential backoff starting at 5 min, capping at 4h → router picks a different agent
+- Model failures → exponential backoff starting at 5 min, capping at 4h → router picks a different model
+- Rate limits with "try again at" → cooldown set to that vendor-specified timestamp (always authoritative)
+- Silence detection → model cooldown + short 120s agent cooldown → re-route
+- Credit exhaustion (`out_of_credits`) → exponential from 1h, capping at 8h
+- Org-level disabling (`org_level_disabled`) → exponential from 2h, capping at 8h
+- Billing cycle exhaustion → flat 24h (calendar event; backoff is meaningless)
+- On successful completion → failure counts reset via `record_agent_success()` so next failure starts from base again
 
 **Exception for pre-emptive routability checks**: The router performs proactive checks to skip agents/models that are likely to fail based on routing weight decay and cooldown states. This is not considered special-casing because it uses the same generic cooldown system and weight decay mechanisms that feed into the routing decision process.
 
@@ -438,6 +443,8 @@ The cooldown system (`src/engine/cooldown.rs`) and failure recovery (`src/engine
 Issue #1286 was closed as invalid — it proposed special-casing copilot model failures when the generic system already handles them.
 
 If you believe the generic system has a bug (e.g., cooldowns not being applied, silence not detected), file an issue about the **generic mechanism**, not about a specific model.
+
+**The exponential backoff approach is settled — do not replace it with flat cooldowns or per-agent special cases.** The formula `min(base * 3^(attempt-1), max)` is in `compute_backoff()`. Failure counts are persisted in `failure_count:{key}` KV keys. Incremental improvements (e.g. tuning constants, adding decay windows, improving reset logic) are welcome as proposals, but the base mechanism must not be reverted.
 
 #### Pre-emptive Routability and Circuit-Breaker Behavior
 
@@ -463,7 +470,8 @@ These mechanisms integrate with the generic cooldown system as follows:
 - `router.refresh_health(&store)` — called each tick; delegates to `cooldown::refresh_degraded_agents()` which queries the `rate_limits` table and updates the in-memory degraded set
 - `router.agent_is_routable(agent, complexity)` — guards all routing paths; returns `false` when `cooldown::is_agent_in_cooldown(agent)` or `cooldown::is_agent_degraded(agent)` is true; additionally skips agents whose `AgentWeights::get_weight` has fallen below `router.skip_limited_threshold` when `weighted_round_robin` is enabled
 - `router.available_agents_for_complexity(complexity)` — filters `available_agents` through `agent_is_routable`; used by round-robin, weighted, and LLM routing paths
-- `cooldown::record_credit_exhaustion(agent, reason)` — applies 6 h (`out_of_credits`) or 12 h (`org_level_disabled`) agent cooldown, which causes `is_agent_in_cooldown` to return true on next check
+- `cooldown::record_credit_exhaustion(agent, reason)` — applies exponential agent-wide cooldown (1h→8h for `out_of_credits`, 2h→8h for `org_level_disabled`, flat 24h for `billing_cycle_exhausted`)
+- `cooldown::record_agent_success(agent, model)` — called by the runner on success; resets `failure_count:*` KV keys so the next failure restarts backoff from the base duration
 - `weights.get_weight(agent)` (in `AgentWeights`) — used by weighted-round-robin; decays on each `record_rate_limit` call and recovers toward 1.0 over time
 - `router.skip_limited_threshold` (`RouterConfig`) — weight threshold below which an agent is considered too degraded for proactive routing; default `0.3`; only evaluated when `weighted_round_robin` is enabled
 
