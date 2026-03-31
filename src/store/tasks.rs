@@ -1244,13 +1244,21 @@ impl TaskStore {
                     |e| tracing::warn!(error = %e, "corrupt delegations JSON, defaulting to empty"),
                 )
                 .unwrap_or_default(),
-            auto_unblock_count: row.get("auto_unblock_count"),
-            auto_unblock_last_at: row.get("auto_unblock_last_at"),
-            auto_unblock_last_reason: row.get("auto_unblock_last_reason"),
-            ci_recovery_count: row.get("ci_recovery_count"),
-            no_code_reroutes: row.get("no_code_reroutes"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
+            // Some deployments may be running databases that haven't had
+            // the most recent migrations applied. Use `try_get` with
+            // sensible defaults for recently-added columns so a missing
+            // column doesn't cause a panic in the sqlx row accessor.
+            auto_unblock_count: row.try_get::<i32, _>("auto_unblock_count").unwrap_or(0),
+            auto_unblock_last_at: row
+                .try_get::<String, _>("auto_unblock_last_at")
+                .unwrap_or_default(),
+            auto_unblock_last_reason: row
+                .try_get::<String, _>("auto_unblock_last_reason")
+                .unwrap_or_default(),
+            ci_recovery_count: row.try_get::<i32, _>("ci_recovery_count").unwrap_or(0),
+            no_code_reroutes: row.try_get::<i32, _>("no_code_reroutes").unwrap_or(0),
+            created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
+            updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
         })
     }
     pub async fn ensure_external_task(
