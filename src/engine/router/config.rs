@@ -513,8 +513,8 @@ mod tests {
         CWD_MUTEX.get_or_init(|| Mutex::new(()))
     }
 
-    #[test]
-    fn model_for_complexity_returns_none_when_all_models_cooled() {
+    #[tokio::test]
+    async fn model_for_complexity_returns_none_when_all_models_cooled() {
         let mut config = RouterConfig::default();
         // Inject a two-model pool for a unique agent name to avoid cross-test pollution
         config
@@ -530,8 +530,10 @@ mod tests {
             );
 
         // Put both models into cooldown
-        crate::engine::cooldown::record_model_failure("testagent_allcooled", "cooldown-model-a");
-        crate::engine::cooldown::record_model_failure("testagent_allcooled", "cooldown-model-b");
+        crate::engine::cooldown::record_model_failure("testagent_allcooled", "cooldown-model-a")
+            .await;
+        crate::engine::cooldown::record_model_failure("testagent_allcooled", "cooldown-model-b")
+            .await;
 
         let result = config.model_for_complexity("testagent_allcooled", "complex", "task-0");
         assert!(
@@ -540,8 +542,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn model_for_complexity_returns_none_when_single_model_cooled() {
+    #[tokio::test]
+    async fn model_for_complexity_returns_none_when_single_model_cooled() {
         let mut config = RouterConfig::default();
         config
             .model_map
@@ -555,7 +557,8 @@ mod tests {
         crate::engine::cooldown::record_model_failure(
             "testagent_singlecooled",
             "single-cooled-model",
-        );
+        )
+        .await;
 
         let result = config.model_for_complexity("testagent_singlecooled", "complex", "task-0");
         assert!(

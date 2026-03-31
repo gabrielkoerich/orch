@@ -293,7 +293,7 @@ pub async fn handle_failover(
         // If this was a timeout, ensure the agent is placed into cooldown
         // so the router's round-robin avoids it for a while.
         if matches!(error_type, RetryableError::Timeout) {
-            record_agent_failure_with_message(agent_name, error_message);
+            record_agent_failure_with_message(agent_name, error_message).await;
         }
         return "needs_review".to_string();
     }
@@ -311,7 +311,7 @@ pub async fn handle_failover(
         // Record agent failure for cooldown tracking
         // Skip cooldown for MissingTooling — it's permanent, not transient
         if !matches!(error_type, RetryableError::MissingTooling) {
-            record_agent_failure_with_message(agent_name, error_message);
+            record_agent_failure_with_message(agent_name, error_message).await;
         }
 
         let msg = format!("{error_message}, rerouted to {next}");
@@ -339,7 +339,7 @@ pub async fn handle_failover(
     // Record agent failure for cooldown tracking
     // Skip cooldown for MissingTooling — it's permanent, not transient
     if !matches!(error_type, RetryableError::MissingTooling) {
-        record_agent_failure_with_message(agent_name, error_message);
+        record_agent_failure_with_message(agent_name, error_message).await;
     }
 
     let msg = format!("{error_message}, no fallback agents");
@@ -883,12 +883,12 @@ mod tests {
 
     // ── Cooldown tests ────────────────────────────────────────────
 
-    #[test]
-    fn record_and_check_agent_cooldown() {
+    #[tokio::test]
+    async fn record_and_check_agent_cooldown() {
         // Use unique names to avoid interference from other tests
         let agent = "test_cooldown_agent_1";
         assert!(!is_agent_in_cooldown(agent));
-        record_agent_failure_with_message(agent, "");
+        record_agent_failure_with_message(agent, "").await;
         assert!(is_agent_in_cooldown(agent));
     }
 
@@ -897,16 +897,16 @@ mod tests {
         let agent = "test_cooldown_agent_2";
         let model = "test_model_x";
         assert!(!is_model_in_cooldown(agent, model));
-        record_model_failure(agent, model);
+        record_model_failure(agent, model).await;
         assert!(is_model_in_cooldown(agent, model));
         // Different model should not be in cooldown
         assert!(!is_model_in_cooldown(agent, "other_model"));
     }
 
-    #[test]
-    fn clear_expired_does_not_remove_fresh_entries() {
+    #[tokio::test]
+    async fn clear_expired_does_not_remove_fresh_entries() {
         let agent = "test_cooldown_agent_3";
-        record_agent_failure_with_message(agent, "");
+        record_agent_failure_with_message(agent, "").await;
         clear_expired_cooldowns();
         // Should still be in cooldown (just recorded)
         assert!(is_agent_in_cooldown(agent));

@@ -819,7 +819,7 @@ impl Router {
                         error = %e,
                         "pool entry failed, recording cooldown and trying next"
                     );
-                    crate::engine::runner::response::record_model_failure(agent, model_str);
+                    crate::engine::runner::response::record_model_failure(agent, model_str).await;
                     last_err = Some(e);
                     self.advance_pool_index_after_attempt(idx, n);
                 }
@@ -868,7 +868,8 @@ impl Router {
                         error = %e,
                         "fallback router LLM also failed"
                     );
-                    crate::engine::runner::response::record_model_failure(&fb_agent, fb_model_str);
+                    crate::engine::runner::response::record_model_failure(&fb_agent, fb_model_str)
+                        .await;
                     last_err = Some(e);
                 }
             }
@@ -1163,8 +1164,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn model_pool_selection_skips_cooled() {
+    #[tokio::test]
+    async fn model_pool_selection_skips_cooled() {
         use crate::engine::cooldown::{is_model_in_cooldown, record_model_failure};
         use std::collections::HashMap;
 
@@ -1184,7 +1185,7 @@ mod tests {
         assert!(m == Some("model-a".to_string()) || m == Some("model-b".to_string()));
 
         // Cool model-a
-        record_model_failure("opencode", "model-a");
+        record_model_failure("opencode", "model-a").await;
         assert!(is_model_in_cooldown("opencode", "model-a"));
 
         // Now only model-b should be returned
@@ -1199,7 +1200,7 @@ mod tests {
         }
 
         // Cool model-b too — now all models are cooled
-        record_model_failure("opencode", "model-b");
+        record_model_failure("opencode", "model-b").await;
         // All cooled → return None so the caller can fall back to a different agent
         let fallback = config.model_for_complexity("opencode", "simple", "task-fallback");
         assert_eq!(fallback, None);

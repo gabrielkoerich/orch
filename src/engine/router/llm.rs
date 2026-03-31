@@ -562,7 +562,7 @@ impl LlmRouter {
                         model = model.unwrap_or("default"),
                         "router LLM rate limited — adding to cooldown"
                     );
-                    crate::engine::runner::response::record_model_failure(agent, model_str);
+                    crate::engine::runner::response::record_model_failure(agent, model_str).await;
                     anyhow::bail!("router LLM rate limited: {agent}:{model_str}");
                 }
                 let stdout_preview = &stdout[..stdout.len().min(500)];

@@ -833,6 +833,8 @@ impl TaskRunner {
             || status == "in_progress"
             || status == "in_review"
         {
+            // Reset exponential backoff counters so the next failure starts fresh.
+            crate::engine::cooldown::record_agent_success(&agent_name, model.unwrap_or("")).await;
             WeightSignal::Success {
                 agent: agent_name.clone(),
             }
