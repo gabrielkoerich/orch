@@ -307,6 +307,11 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
             "changes committed",
             "commit created",
             "the commit",
+            // Agent completion phrases (regression: #1362/#1363)
+            "the fix is complete",
+            "fix is working",
+            "all tests pass",
+            "tests pass.",
         ]
         .iter()
         .any(|needle| lower.contains(needle))
@@ -1133,6 +1138,44 @@ mod tests {
         assert_eq!(
             response.status, "needs_review",
             "\"not committed\" should not match \"committed\""
+        );
+    }
+
+    // ── Regression: #1362/#1363 — agent text misclassified as needs_review ──
+
+    #[test]
+    fn synthesize_response_marks_done_for_fix_is_complete() {
+        // Exact agent output from task 30203 (issue #1363).
+        // "The fix is complete" was misclassified as needs_review because
+        // the pattern list had "completed" but not "complete".
+        let response = synthesize_response_from_text(
+            "All 73 cooldown tests pass. The fix is complete.\n\n\
+             **Summary of changes:**\n\n\
+             1. **`src/store/kv.rs`** — Added `kv_increment()` method that uses a single \
+             `INSERT … ON CONFLICT … DO UPDATE … RETURNING` SQL statement.",
+        )
+        .unwrap();
+        assert_eq!(
+            response.status, "done",
+            "\"The fix is complete\" must be classified as done, not needs_review"
+        );
+    }
+
+    #[test]
+    fn synthesize_response_marks_done_for_tests_pass_fix_working() {
+        // Exact agent output from task 30204 (issue #1362).
+        // "All tests pass. The fix is clean and working." was misclassified
+        // as needs_review because none of the looks_done patterns matched.
+        let response = synthesize_response_from_text(
+            "All tests pass. The fix is clean and working.\n\n\
+             **Summary of changes** to `src/engine/runner/response.rs:37`:\n\n\
+             - **Before:** `capped + jitter` → range `[capped, 1.6*capped]`\n\
+             - **After:** `capped.saturating_sub(jitter_range) + jitter` → range `[0.7*capped, 1.3*capped]`",
+        )
+        .unwrap();
+        assert_eq!(
+            response.status, "done",
+            "\"All tests pass. The fix is clean and working.\" must be classified as done"
         );
     }
 
