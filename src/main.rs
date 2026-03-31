@@ -355,6 +355,9 @@ enum Commands {
         /// Attempt automatic repairs for fixable issues
         #[arg(long)]
         fix: bool,
+        /// Show what --fix would do without applying changes
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -895,8 +898,8 @@ async fn main() -> anyhow::Result<()> {
                 cli::webhook::status()?;
             }
         },
-        Commands::Doctor { fix } => {
-            cli::doctor::run(fix).await?;
+        Commands::Doctor { fix, dry_run } => {
+            cli::doctor::run(fix, dry_run).await?;
         }
     }
 
