@@ -376,7 +376,15 @@ pub fn spawn(
                                 }
                             }
                             Ok(ReviewDecision::Approve) | Ok(ReviewDecision::Skipped) => {
-                                crate::store::store_reset_counters(
+                                // On approval or skip we want to clear transient failure
+                                // counters (per-attempt noise) but preserve the
+                                // `review_cycles` counter which tracks how many
+                                // times the PR has requested changes and is used
+                                // as a circuit-breaker. Resetting all counters
+                                // here (including `review_cycles`) enabled an
+                                // approval loop when `auto_close_task_on_approval`
+                                // is disabled — keep only the failure counters.
+                                crate::store::store_reset_failure_counters(
                                     &Some(store_c.clone()),
                                     &repo_s,
                                     &tid,
