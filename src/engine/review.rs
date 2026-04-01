@@ -572,9 +572,13 @@ async fn ensure_pr_exists(
                 }
 
                 // Atomically increment the persistent reroute counter and decide.
-                let reroutes =
-                    store_increment(&Some(Arc::clone(store)), repo, &task.id.0, "no_pr_reroutes")
-                        .await;
+                let reroutes = store_increment(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    "no_code_reroutes",
+                )
+                .await;
 
                 if reroutes as u32 >= max_reroutes {
                     tracing::error!(
