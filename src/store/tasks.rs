@@ -559,6 +559,24 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
+    /// List internal tasks with a specific source value (origin = 'internal' AND source = ?).
+    /// More efficient than `list_all_internal` + in-memory filter when only a subset is needed.
+    pub async fn list_internal_by_source(
+        &self,
+        repo: &str,
+        source: &str,
+    ) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(
+            "SELECT * FROM tasks WHERE repo = ? AND origin = 'internal' AND source = ? ORDER BY created_at DESC",
+        )
+        .bind(repo)
+        .bind(source)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
     /// List all external tasks for a repo (origin != 'internal').
     pub async fn list_all_external(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
@@ -1331,6 +1349,57 @@ impl TaskStore {
         .await?;
 
         rows.iter().map(Self::row_to_run).collect()
+    }
+
+    /// Get all runs for a batch of task IDs in a single query, grouped by task ID.
+    /// Returns an empty map if `task_ids` is empty.
+    pub async fn get_runs_batch(
+        &self,
+        task_ids: &[i64],
+    ) -> anyhow::Result<std::collections::HashMap<i64, Vec<TaskRun>>> {
+        if task_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = task_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY task_id ASC, attempt ASC, run_type ASC"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in task_ids {
+            query = query.bind(*id);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        let mut result: std::collections::HashMap<i64, Vec<TaskRun>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let run = Self::row_to_run(row)?;
+            result.entry(run.task_id).or_default().push(run);
+        }
+        Ok(result)
+    }
+
+    /// Get multiple tasks by ID in a single query, returning a map from task ID to Task.
+    /// Returns an empty map if `ids` is empty.
+    pub async fn get_batch(
+        &self,
+        ids: &[i64],
+    ) -> anyhow::Result<std::collections::HashMap<i64, Task>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!("SELECT * FROM tasks WHERE id IN ({placeholders})");
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(*id);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        let mut result = std::collections::HashMap::new();
+        for row in &rows {
+            let task = Self::row_to_task(row)?;
+            result.insert(task.id, task);
+        }
+        Ok(result)
     }
 
     /// Get the last run of a specific type for a task.

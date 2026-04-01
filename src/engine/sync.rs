@@ -251,6 +251,10 @@ async fn auto_unblock_blocked_tasks(
         return Ok(());
     }
 
+    // Batch-load all runs for blocked tasks in a single query instead of N individual queries.
+    let task_ids: Vec<i64> = blocked.iter().map(|t| t.id).collect();
+    let mut runs_by_task = store.get_runs_batch(&task_ids).await.unwrap_or_default();
+
     for task in blocked {
         if task.block_reason.is_some() {
             continue;
@@ -273,7 +277,7 @@ async fn auto_unblock_blocked_tasks(
             }
         }
 
-        let runs = store.get_runs(task.id).await.unwrap_or_default();
+        let runs = runs_by_task.remove(&task.id).unwrap_or_default();
         let relevant_runs: Vec<_> = runs
             .into_iter()
             .filter(|r| r.run_type == "agent" || r.run_type == "review")
@@ -335,62 +339,31 @@ async fn auto_unblock_blocked_tasks(
         // Always increment after cooldown check. When reason changed, count was reset to 0
         // above — incrementing after that gives count=1 (first time with this new reason).
         // When reason is the same, increment advances from current count for exponential backoff.
-        let do_increment = true;
-
-        if failures.contains(&FailureCategory::MaxAttempts) {
-            let _ = store
-                .set_fields(
-                    task.id,
-                    &[
-                        ("attempts", serde_json::json!(0)),
-                        ("route_attempts", serde_json::json!(0)),
-                    ],
-                )
-                .await;
-        }
-
-        if has_review_failure {
-            let _ = store
-                .set_fields(
-                    task.id,
-                    &[
-                        ("review_agent_failures", serde_json::json!(0)),
-                        ("review_invocations", serde_json::json!(0)),
-                    ],
-                )
-                .await;
-        }
-
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        if do_increment {
-            if let Err(e) = store.increment(task.id, "auto_unblock_count").await {
-                tracing::warn!(task_id = task.id, err = %e, "failed to increment auto_unblock_count");
-                continue;
-            }
-        }
-        if let Err(e) = store
-            .set_fields(
-                task.id,
-                &[
-                    ("auto_unblock_last_at", serde_json::json!(now)),
-                    ("auto_unblock_last_reason", serde_json::json!(reason_key)),
-                ],
-            )
-            .await
-        {
-            tracing::warn!(task_id = task.id, err = %e, "failed to set auto_unblock_last_at — skipping unblock");
+        if let Err(e) = store.increment(task.id, "auto_unblock_count").await {
+            tracing::warn!(task_id = task.id, err = %e, "failed to increment auto_unblock_count");
             continue;
         }
 
-        let _ = store
-            .set_fields(
-                task.id,
-                &[
-                    ("agent", serde_json::Value::Null),
-                    ("model", serde_json::Value::Null),
-                ],
-            )
-            .await;
+        // Combine all remaining field updates into a single set_fields call.
+        let mut fields: Vec<(&str, serde_json::Value)> = vec![
+            ("auto_unblock_last_at", serde_json::json!(now)),
+            ("auto_unblock_last_reason", serde_json::json!(reason_key)),
+            ("agent", serde_json::Value::Null),
+            ("model", serde_json::Value::Null),
+        ];
+        if failures.contains(&FailureCategory::MaxAttempts) {
+            fields.push(("attempts", serde_json::json!(0)));
+            fields.push(("route_attempts", serde_json::json!(0)));
+        }
+        if has_review_failure {
+            fields.push(("review_agent_failures", serde_json::json!(0)));
+            fields.push(("review_invocations", serde_json::json!(0)));
+        }
+        if let Err(e) = store.set_fields(task.id, &fields).await {
+            tracing::warn!(task_id = task.id, err = %e, "failed to set auto_unblock fields — skipping unblock");
+            continue;
+        }
 
         let ext_id = task
             .external_id
@@ -534,6 +507,14 @@ pub(crate) async fn sync_tick(
             }
             tasks
         };
+        // Fetch all live tmux sessions once instead of one subprocess call per task.
+        let live_sessions: std::collections::HashSet<String> = tmux
+            .list_sessions()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         for task in in_review_tasks {
             // Skip tasks currently being processed by the main tick (dispatch + review flow).
             let dispatch_key = format!("{}/{}", repo, task.id.0);
@@ -575,7 +556,7 @@ pub(crate) async fn sync_tick(
 
             let review_task_id = format!("{}-review", task.id.0);
             let review_session = tmux.session_name(repo, &review_task_id);
-            if tmux.session_exists(&review_session).await {
+            if live_sessions.contains(&review_session) {
                 // Review agent is still alive — skip.
                 continue;
             }
@@ -785,12 +766,12 @@ async fn scan_mentions(
     };
 
     // Get existing mention tasks across ALL statuses to avoid duplicates.
+    // Uses a SQL-filtered query instead of loading all internal tasks.
     let existing_mentions: std::collections::HashSet<String> = if let Some(s) = store {
-        s.list_all_internal(repo)
+        s.list_internal_by_source(repo, "mention")
             .await
             .unwrap_or_default()
             .into_iter()
-            .filter(|t| t.source == "mention")
             .map(|t| t.source_id.clone())
             .collect()
     } else {
@@ -1123,33 +1104,39 @@ pub(crate) async fn ingest_external_tasks(
         }
     }
 
-    // 3. Upsert into the store.
+    // 3. Upsert into the store, collecting store IDs for batch status check.
+    let mut id_status_pairs: Vec<(i64, crate::backends::Status)> = Vec::new();
     for (task, status) in &all_tasks {
         match store.ensure_external_task(repo, task).await {
             Ok(store_id) => {
-                // Only sync status from backend → store for NEW tasks (first ingest).
-                // Once a task exists in the store, its status is authoritative —
-                // re-ingestion must not overwrite store-first status changes
-                // (e.g., store has Routed but GitHub still shows New labels).
-                if let Some(status) = status {
-                    if let Ok(existing) = store.get(store_id).await {
-                        if existing.status == crate::store::TaskStatus::New {
-                            let db_status = crate::engine::tasks::status_to_task_status(*status);
-                            if db_status != crate::store::TaskStatus::New {
-                                if let Err(e) = store.update_status(store_id, db_status).await {
-                                    tracing::debug!(
-                                        task_id = task.id.0,
-                                        ?e,
-                                        "ingest: status sync failed"
-                                    );
-                                }
-                            }
-                        }
-                    }
+                if let Some(s) = status {
+                    id_status_pairs.push((store_id, *s));
                 }
             }
             Err(e) => {
                 tracing::debug!(task_id = task.id.0, ?e, "ingest: upsert failed");
+            }
+        }
+    }
+
+    // Batch-fetch all upserted tasks in a single query, then sync status for NEW tasks.
+    // Only sync status from backend → store for NEW tasks (first ingest).
+    // Once a task exists in the store, its status is authoritative —
+    // re-ingestion must not overwrite store-first status changes
+    // (e.g., store has Routed but GitHub still shows New labels).
+    if !id_status_pairs.is_empty() {
+        let all_ids: Vec<i64> = id_status_pairs.iter().map(|(id, _)| *id).collect();
+        let existing_map = store.get_batch(&all_ids).await.unwrap_or_default();
+        for (store_id, status) in id_status_pairs {
+            if let Some(existing) = existing_map.get(&store_id) {
+                if existing.status == crate::store::TaskStatus::New {
+                    let db_status = crate::engine::tasks::status_to_task_status(status);
+                    if db_status != crate::store::TaskStatus::New {
+                        if let Err(e) = store.update_status(store_id, db_status).await {
+                            tracing::debug!(?e, "ingest: status sync failed");
+                        }
+                    }
+                }
             }
         }
     }
