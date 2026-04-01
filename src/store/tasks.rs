@@ -577,6 +577,18 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
+    /// List all active (non-done) tasks for a repo.
+    pub async fn list_active(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(
+            "SELECT * FROM tasks WHERE repo = ? AND status != 'done' ORDER BY created_at DESC",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
     /// List all external tasks for a repo (origin != 'internal').
     pub async fn list_all_external(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
