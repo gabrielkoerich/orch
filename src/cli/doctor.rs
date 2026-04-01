@@ -6,7 +6,9 @@ use crate::github::http::GhHttp;
 use crate::store::{Task, TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// What kind of automatic repair can be applied to a finding.
@@ -86,21 +88,53 @@ pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
         }
     };
 
+    // Spinner: show progress on stderr while checks run (erase with \r on done).
+    let spinner_running = Arc::new(AtomicBool::new(true));
+    let spinner_flag = spinner_running.clone();
+    let spinner_thread = std::thread::spawn(move || {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let mut i = 0usize;
+        while spinner_flag.load(Ordering::Relaxed) {
+            eprint!("\r{} Running orch doctor…", frames[i % frames.len()]);
+            let _ = std::io::stderr().flush();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            i += 1;
+        }
+        eprint!("\r");
+        let _ = std::io::stderr().flush();
+    });
+
+    let result = run_checks(fix, dry_run, &repos, &store, &gh, &tmux).await;
+
+    spinner_running.store(false, Ordering::Relaxed);
+    let _ = spinner_thread.join();
+
+    result
+}
+
+async fn run_checks(
+    fix: bool,
+    dry_run: bool,
+    repos: &[String],
+    store: &Arc<TaskStore>,
+    gh: &GhHttp,
+    tmux: &TmuxManager,
+) -> anyhow::Result<()> {
     let mut all_findings: Vec<Finding> = Vec::new();
 
-    for repo in &repos {
+    for repo in repos {
         let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
         let mut findings: Vec<Finding> = Vec::new();
 
-        let all_tasks = store.list_all(repo).await?;
-
-        // Only check done tasks updated within the last 7 days — older done tasks
-        // are stable and don't warrant GitHub API calls on every doctor run.
+        // Only load active tasks + done tasks from the last 7 days — avoids
+        // fetching hundreds of historical done tasks on every run.
         let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
         let cutoff_str = cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let all_tasks = store.list_for_doctor(repo, &cutoff_str).await?;
+
         let recent_done_tasks: Vec<_> = all_tasks
             .iter()
-            .filter(|t| t.status == TaskStatus::Done && t.updated_at.as_str() > cutoff_str.as_str())
+            .filter(|t| t.status == TaskStatus::Done)
             .collect();
         let active_tasks: Vec<_> = all_tasks
             .iter()
@@ -144,7 +178,7 @@ pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
             if task.pr_number.is_none() && task.external_id.is_none() {
                 continue;
             }
-            check_done_no_merged_pr(task, &gh, &pr_states, &mut findings, repo).await;
+            check_done_no_merged_pr(task, gh, &pr_states, &mut findings, repo).await;
         }
 
         // 2. Done tasks with dirty worktrees (recent only — filesystem check, fast)
@@ -178,7 +212,7 @@ pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
 
         // 6. Stale in_progress tasks (no tmux session)
         for task in &in_progress_tasks {
-            check_stale_in_progress(task, repo, &tmux, &mut findings).await;
+            check_stale_in_progress(task, repo, tmux, &mut findings).await;
         }
 
         // 7. Orphaned worktrees (needs all tasks to match worktree paths to owners)
@@ -191,7 +225,7 @@ pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
 
         // 9. Dead review sessions
         for task in &in_review_tasks {
-            check_dead_review_session(task, repo, &tmux, &mut findings).await;
+            check_dead_review_session(task, repo, tmux, &mut findings).await;
         }
 
         if repos.len() > 1 && !findings.is_empty() {
@@ -214,7 +248,7 @@ pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
                 errors,
                 warnings,
             );
-            apply_fixes(&findings, &store, repo, &backend, &gh, dry_run).await?;
+            apply_fixes(&findings, store, repo, &backend, gh, dry_run).await?;
         }
 
         all_findings.extend(findings);

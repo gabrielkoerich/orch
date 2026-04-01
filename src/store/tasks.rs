@@ -614,6 +614,19 @@ impl TaskStore {
         .is_some()
     }
 
+    /// List tasks for `orch doctor`: active tasks + done tasks updated since `cutoff_str`.
+    /// Much cheaper than `list_all` on repos with many historical done tasks.
+    pub async fn list_for_doctor(&self, repo: &str, cutoff_str: &str) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(
+            "SELECT * FROM tasks WHERE repo = ? AND (status != 'done' OR updated_at >= ?) ORDER BY created_at DESC",
+        )
+        .bind(repo)
+        .bind(cutoff_str)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
     /// List all tasks for a repo, ordered by creation time descending.
     pub async fn list_all(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query("SELECT * FROM tasks WHERE repo = ? ORDER BY created_at DESC")
