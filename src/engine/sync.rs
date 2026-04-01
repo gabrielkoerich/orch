@@ -851,91 +851,113 @@ async fn skills_sync() -> anyhow::Result<()> {
     let skills_base = crate::home::skills_dir()?;
     let git_timeout = std::time::Duration::from_secs(60);
 
-    for skill in skills {
-        // Validate repo format to prevent path traversal
-        if skill.repo.contains("..") || skill.repo.matches('/').count() != 1 {
-            tracing::warn!(repo = %skill.repo, "invalid skill repo format, expected 'owner/repo'");
-            continue;
-        }
+    // Run all skill git operations concurrently — each is fully independent.
+    // Wall-clock time drops from N × timeout to max(timeout).
+    let futs: Vec<_> = skills
+        .into_iter()
+        .map(|skill| sync_one_skill(skill, skills_base.clone(), git_timeout))
+        .collect();
+    futures::future::join_all(futs).await;
 
-        let repo_dir = skills_base.join(&skill.repo);
-        let repo_url = format!("https://github.com/{}.git", skill.repo);
+    Ok(())
+}
 
-        // Use async metadata check instead of `Path::exists()` to avoid
-        // performing blocking syscall on the reactor thread.
-        let repo_exists = tokio::fs::metadata(&repo_dir)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        if repo_exists {
-            // Pull latest changes with timeout
-            tracing::debug!(repo = %skill.repo, "pulling skill repo");
-            let pull_result = tokio::time::timeout(
-                git_timeout,
-                Command::new("git")
-                    .args(["pull", "--ff-only", "--prune"])
-                    .current_dir(&repo_dir)
-                    .output_with_context(),
-            )
-            .await;
+/// Sync a single skill repository: `git pull` if it exists, `git clone` otherwise.
+///
+/// All errors are logged via `tracing::warn!` so that one failing skill does not
+/// prevent the others from being updated.
+async fn sync_one_skill(
+    skill: crate::config::SkillConfig,
+    skills_base: std::path::PathBuf,
+    git_timeout: std::time::Duration,
+) {
+    // Validate repo format to prevent path traversal
+    if skill.repo.contains("..") || skill.repo.matches('/').count() != 1 {
+        tracing::warn!(repo = %skill.repo, "invalid skill repo format, expected 'owner/repo'");
+        return;
+    }
 
-            match pull_result {
-                Ok(Ok(output)) if !output.status.success() => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!(repo = %skill.repo, err = %stderr, "git pull failed");
-                }
-                Ok(Ok(_)) => {
-                    tracing::debug!(repo = %skill.repo, "skill repo updated");
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(repo = %skill.repo, err = %e, "git pull error");
-                }
-                Err(_) => {
-                    tracing::warn!(repo = %skill.repo, "git pull timed out after 60s");
-                }
+    let repo_dir = skills_base.join(&skill.repo);
+    let repo_url = format!("https://github.com/{}.git", skill.repo);
+
+    // Use async metadata check instead of `Path::exists()` to avoid
+    // performing blocking syscall on the reactor thread.
+    let repo_exists = tokio::fs::metadata(&repo_dir)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+
+    if repo_exists {
+        // Pull latest changes with timeout
+        tracing::debug!(repo = %skill.repo, "pulling skill repo");
+        let pull_result = tokio::time::timeout(
+            git_timeout,
+            Command::new("git")
+                .args(["pull", "--ff-only", "--prune"])
+                .current_dir(&repo_dir)
+                .output_with_context(),
+        )
+        .await;
+
+        match pull_result {
+            Ok(Ok(output)) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(repo = %skill.repo, err = %stderr, "git pull failed");
             }
-        } else {
-            // Clone the repository (shallow for efficiency)
-            tracing::debug!(repo = %skill.repo, "cloning skill repo");
-            let parent = repo_dir
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("skill repo path has no parent directory"))?;
-            std::fs::create_dir_all(parent)?;
-            let repo_dir_str = repo_dir
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("skill repo path is not valid UTF-8"))?;
+            Ok(Ok(_)) => {
+                tracing::debug!(repo = %skill.repo, "skill repo updated");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(repo = %skill.repo, err = %e, "git pull error");
+            }
+            Err(_) => {
+                tracing::warn!(repo = %skill.repo, "git pull timed out after 60s");
+            }
+        }
+    } else {
+        // Clone the repository (shallow for efficiency)
+        tracing::debug!(repo = %skill.repo, "cloning skill repo");
+        let Some(parent) = repo_dir.parent() else {
+            tracing::warn!(repo = %skill.repo, "skill repo path has no parent directory");
+            return;
+        };
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            tracing::warn!(repo = %skill.repo, err = %e, "failed to create parent dir for skill");
+            return;
+        }
+        let Some(repo_dir_str) = repo_dir.to_str() else {
+            tracing::warn!(repo = %skill.repo, "skill repo path is not valid UTF-8");
+            return;
+        };
 
-            let clone_result = tokio::time::timeout(
-                git_timeout,
-                Command::new("git")
-                    .args(["clone", "--depth", "1", &repo_url, repo_dir_str])
-                    .output_with_context(),
-            )
-            .await;
+        let clone_result = tokio::time::timeout(
+            git_timeout,
+            Command::new("git")
+                .args(["clone", "--depth", "1", &repo_url, repo_dir_str])
+                .output_with_context(),
+        )
+        .await;
 
-            match clone_result {
-                Ok(Ok(output)) if !output.status.success() => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!(repo = %skill.repo, err = %stderr, "git clone failed");
-                    // Clean up partial clone to allow retry on next tick
-                    let _ = tokio::fs::remove_dir_all(&repo_dir).await;
-                }
-                Ok(Ok(_)) => {
-                    tracing::info!(repo = %skill.repo, "skill repo cloned");
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(repo = %skill.repo, err = %e, "git clone error");
-                    let _ = tokio::fs::remove_dir_all(&repo_dir).await;
-                }
-                Err(_) => {
-                    tracing::warn!(repo = %skill.repo, "git clone timed out after 60s");
-                    let _ = tokio::fs::remove_dir_all(&repo_dir).await;
-                }
+        match clone_result {
+            Ok(Ok(output)) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(repo = %skill.repo, err = %stderr, "git clone failed");
+                // Clean up partial clone to allow retry on next tick
+                let _ = tokio::fs::remove_dir_all(&repo_dir).await;
+            }
+            Ok(Ok(_)) => {
+                tracing::info!(repo = %skill.repo, "skill repo cloned");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(repo = %skill.repo, err = %e, "git clone error");
+                let _ = tokio::fs::remove_dir_all(&repo_dir).await;
+            }
+            Err(_) => {
+                tracing::warn!(repo = %skill.repo, "git clone timed out after 60s");
+                let _ = tokio::fs::remove_dir_all(&repo_dir).await;
             }
         }
     }
-
-    Ok(())
 }
 
 /// Per-agent degradation detail collected during the alerting check.
