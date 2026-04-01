@@ -578,8 +578,17 @@ async fn handle_dispatch(
             let interaction_type = data["type"].as_u64().unwrap_or(0);
             if interaction_type == 3 {
                 // MESSAGE_COMPONENT
-                let interaction_id = data["id"].as_str().unwrap_or("").to_string();
-                let interaction_token = data["token"].as_str().unwrap_or("").to_string();
+                let Some(interaction_id) = data["id"].as_str().filter(|s| !s.is_empty()) else {
+                    tracing::warn!("ignoring INTERACTION_CREATE with missing id");
+                    return Ok(());
+                };
+                let Some(interaction_token) = data["token"].as_str().filter(|s| !s.is_empty())
+                else {
+                    tracing::warn!("ignoring INTERACTION_CREATE with missing token");
+                    return Ok(());
+                };
+                let interaction_id = interaction_id.to_string();
+                let interaction_token = interaction_token.to_string();
                 let custom_id = data["data"]["custom_id"].as_str().unwrap_or("").to_string();
                 let inter_channel_id = data["channel_id"].as_str().unwrap_or("").to_string();
                 let author = data["member"]["user"]["username"]
@@ -594,12 +603,15 @@ async fn handle_dispatch(
                     interaction_id, interaction_token
                 );
                 let http_client = client.clone();
-                let _ = http_client
+                if let Err(e) = http_client
                     .post(&callback_url)
                     .header("Content-Type", "application/json")
                     .json(&serde_json::json!({ "type": 6 }))
                     .send()
-                    .await;
+                    .await
+                {
+                    tracing::warn!(interaction_id, error = %e, "failed to acknowledge Discord interaction");
+                }
 
                 let incoming = IncomingMessage {
                     channel: "discord".to_string(),
