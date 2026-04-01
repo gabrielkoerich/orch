@@ -1221,6 +1221,23 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
+    /// Return external IDs of tasks whose worktrees have already been cleaned.
+    ///
+    /// Used by `cleanup_done_worktrees` to skip already-cleaned tasks without
+    /// issuing one `resolve_task_id + get` per task (N+1 elimination).
+    pub async fn cleaned_external_ids(
+        &self,
+        repo: &str,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT external_id FROM tasks WHERE repo = ? AND worktree_cleaned = 1")
+                .bind(repo)
+                .fetch_all(&self.pool)
+                .await?;
+
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     // ---------------------------------------------------------------
     // Task Runs (audit trail)
     // ---------------------------------------------------------------

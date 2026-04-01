@@ -228,14 +228,13 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
         "checking all terminal tasks for cleanup"
     );
 
+    // Prefetch all cleaned external IDs in one query instead of N+1 per-task lookups.
+    let already_cleaned = store.cleaned_external_ids(repo).await.unwrap_or_default();
+
     let mut cleaned_any = false;
     for task_id in &task_ids {
-        // Skip if already cleaned
-        let worktree_cleaned = store::opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
-            .await
-            .map(|t| t.worktree_cleaned)
-            .unwrap_or(false);
-        if worktree_cleaned {
+        // Skip if already cleaned (checked via prefetched set).
+        if already_cleaned.contains(task_id) {
             continue;
         }
 
@@ -795,21 +794,47 @@ pub(crate) async fn check_merged_prs(
     store: &Arc<TaskStore>,
     task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
+    // Build a branch map from store tasks before converting to ExternalTask,
+    // so we don't need N+1 opt_store_get_task calls later to re-fetch branches.
+    let mut branch_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
     // Read from the store first; fall back to backend if the store has no data.
-    let in_review_tasks = if store.has_external_tasks(repo).await {
-        store
+    let has_store = store.has_external_tasks(repo).await;
+    let in_review_tasks: Vec<ExternalTask> = if has_store {
+        let store_tasks = store
             .list_external_by_status(repo, crate::store::TaskStatus::InReview)
-            .await?
+            .await?;
+        for t in &store_tasks {
+            if !t.branch.is_empty() {
+                let ext_id = t
+                    .external_id
+                    .clone()
+                    .unwrap_or_else(|| format!("internal:{}", t.id));
+                branch_map.insert(ext_id, t.branch.clone());
+            }
+        }
+        store_tasks
             .iter()
             .map(crate::engine::tasks::store_task_to_external)
             .collect()
     } else {
         backend.list_by_status(Status::InReview).await?
     };
-    let needs_review_tasks = if store.has_external_tasks(repo).await {
-        store
+    let needs_review_tasks: Vec<ExternalTask> = if has_store {
+        let store_tasks = store
             .list_external_by_status(repo, crate::store::TaskStatus::NeedsReview)
-            .await?
+            .await?;
+        for t in &store_tasks {
+            if !t.branch.is_empty() {
+                let ext_id = t
+                    .external_id
+                    .clone()
+                    .unwrap_or_else(|| format!("internal:{}", t.id));
+                branch_map.insert(ext_id, t.branch.clone());
+            }
+        }
+        store_tasks
             .iter()
             .map(crate::engine::tasks::store_task_to_external)
             .collect()
@@ -842,20 +867,26 @@ pub(crate) async fn check_merged_prs(
     );
 
     // Collect (task_id, branch) pairs — skip tasks with no branch recorded.
+    // Use the pre-built branch map; fall back to store lookup only for tasks
+    // not in the map (e.g. internal tasks, backend fallback path).
     let mut task_branches: Vec<(String, String)> = Vec::new();
-    for task in &all_review_tasks {
-        let task_id = task.id.0.clone();
-        let branch = match store::opt_store_get_task(&Some(Arc::clone(store)), repo, &task_id)
-            .await
-            .map(|t| t.branch)
-        {
-            Some(b) if !b.is_empty() => b,
-            _ => {
-                tracing::debug!(task_id, "no branch info, skipping PR check");
-                continue;
+    for task in all_review_tasks {
+        let task_id = &task.id.0;
+        let branch = if let Some(b) = branch_map.get(task_id) {
+            b.clone()
+        } else {
+            match store::opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
+                .await
+                .map(|t| t.branch)
+            {
+                Some(b) if !b.is_empty() => b,
+                _ => {
+                    tracing::debug!(task_id, "no branch info, skipping PR check");
+                    continue;
+                }
             }
         };
-        task_branches.push((task_id, branch));
+        task_branches.push((task_id.clone(), branch));
     }
 
     if task_branches.is_empty() {
