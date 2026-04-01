@@ -352,6 +352,9 @@ enum Commands {
     },
     /// Diagnose state inconsistencies between SQLite and GitHub
     Doctor {
+        /// Run a full (expensive) audit including historical done tasks
+        #[arg(long)]
+        full: bool,
         /// Attempt automatic repairs for fixable issues
         #[arg(long)]
         fix: bool,
@@ -898,8 +901,8 @@ async fn main() -> anyhow::Result<()> {
                 cli::webhook::status()?;
             }
         },
-        Commands::Doctor { fix, dry_run } => {
-            cli::doctor::run(fix, dry_run).await?;
+        Commands::Doctor { full, fix, dry_run } => {
+            cli::doctor::run(full, fix, dry_run).await?;
         }
     }
 
