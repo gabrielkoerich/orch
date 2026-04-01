@@ -223,23 +223,18 @@ impl TaskManager {
                 tasks.push(Task::External(t));
             }
         } else if let Some(source) = &filter.source {
-            // Only source filter — query all internal tasks from store
+            // Only source filter — query internal tasks by source directly in SQL
             if let Some(ref store) = self.store {
-                let all_internal = store.list_all_internal(&self.repo).await?;
-                for t in all_internal {
-                    if t.source == *source {
-                        tasks.push(Task::Internal(t));
-                    }
+                let by_source = store.list_internal_by_source(&self.repo, source).await?;
+                for t in by_source {
+                    tasks.push(Task::Internal(t));
                 }
             }
         } else {
-            // No filters — return all active tasks (exclude done)
+            // No filters — return all active tasks (exclude done) via SQL WHERE
             if let Some(ref store) = self.store {
-                let all_tasks = store.list_all(&self.repo).await?;
-                for t in all_tasks {
-                    if t.status == TaskStatus::Done {
-                        continue;
-                    }
+                let active_tasks = store.list_active(&self.repo).await?;
+                for t in active_tasks {
                     if t.origin == "internal" {
                         tasks.push(Task::Internal(t));
                     } else {
@@ -263,7 +258,7 @@ impl TaskManager {
     pub async fn list_all_external_tasks(&self) -> anyhow::Result<Vec<ExternalTask>> {
         if let Some(ref store) = self.store {
             let tasks = store.list_all_external(&self.repo).await?;
-            if store.has_external_tasks(&self.repo).await {
+            if !tasks.is_empty() {
                 return Ok(tasks.iter().map(store_task_to_external).collect());
             }
         }
@@ -280,7 +275,9 @@ impl TaskManager {
         if let Some(ref store) = self.store {
             let db_status = status_to_task_status(status);
             let external = store.list_external_by_status(&self.repo, db_status).await?;
-            if store.has_external_tasks(&self.repo).await {
+            // Use the fetched results when non-empty; only check the sentinel when empty
+            // (empty could mean "no tasks with this status" OR "store not yet synced").
+            if !external.is_empty() || store.has_external_tasks(&self.repo).await {
                 let external: Vec<ExternalTask> =
                     external.iter().map(store_task_to_external).collect();
                 return Ok(external);
@@ -295,8 +292,11 @@ impl TaskManager {
     pub async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
         if let Some(ref store) = self.store {
             let all_new = store.list_routable(&self.repo).await?;
+            // Check if any external (non-internal) tasks are in the result — if so
+            // the store has external tasks and we can skip the has_external_tasks query.
+            let has_external_new = all_new.iter().any(|t| t.origin != "internal");
             let tasks: Vec<ExternalTask> = all_new.iter().map(store_task_to_external).collect();
-            if store.has_external_tasks(&self.repo).await {
+            if has_external_new || store.has_external_tasks(&self.repo).await {
                 return Ok(tasks);
             }
         }
@@ -323,7 +323,7 @@ impl TaskManager {
         // Read pre-update snapshot from the store (old_status + context fields).
         // This must happen BEFORE any store.update_status() call so we capture
         // the previous state for the event.
-        let pre_snapshot = self.read_task_snapshot(&id.0).await;
+        let (pre_snapshot, snapshot_store_id) = self.read_task_snapshot(&id.0).await;
 
         if is_internal_id(&id.0) {
             // Internal tasks: store is the single source of truth
@@ -331,9 +331,7 @@ impl TaskManager {
                 .store
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("store required for internal task status update"))?;
-            let store_id = store
-                .resolve_task_id(&self.repo, &id.0)
-                .await?
+            let store_id = snapshot_store_id
                 .ok_or_else(|| anyhow::anyhow!("internal task {} not found in store", id.0))?;
             if task_status != TaskStatus::Blocked {
                 store.set_block_reason(store_id, None).await?;
@@ -347,7 +345,7 @@ impl TaskManager {
         // External tasks: store-first, then mirror to backend.
         // SQLite is the source of truth; backend sync is best-effort.
         if let Some(ref store) = self.store {
-            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &id.0).await {
+            if let Some(store_id) = snapshot_store_id {
                 if task_status != TaskStatus::Blocked {
                     store.set_block_reason(store_id, None).await?;
                 }
@@ -383,16 +381,14 @@ impl TaskManager {
         duration_seconds: Option<f64>,
     ) -> anyhow::Result<()> {
         let task_status = status_to_task_status(status);
-        let pre_snapshot = self.read_task_snapshot(&id.0).await;
+        let (pre_snapshot, snapshot_store_id) = self.read_task_snapshot(&id.0).await;
 
         if is_internal_id(&id.0) {
             let store = self
                 .store
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("store required for internal task status update"))?;
-            let store_id = store
-                .resolve_task_id(&self.repo, &id.0)
-                .await?
+            let store_id = snapshot_store_id
                 .ok_or_else(|| anyhow::anyhow!("internal task {} not found in store", id.0))?;
             store.update_status(store_id, task_status).await?;
             self.publish_event(id, status, &pre_snapshot, duration_seconds);
@@ -400,7 +396,7 @@ impl TaskManager {
         }
 
         if let Some(ref store) = self.store {
-            if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, &id.0).await {
+            if let Some(store_id) = snapshot_store_id {
                 store.update_status(store_id, task_status).await?;
             }
         }
@@ -420,19 +416,20 @@ impl TaskManager {
     }
 
     /// Read the current task snapshot from the store for event enrichment.
-    /// Returns `None` fields gracefully when store is unavailable or task not found.
-    async fn read_task_snapshot(&self, task_id: &str) -> TaskSnapshot {
+    /// Returns `(snapshot, store_id)` — store_id is `Some` when the task was found,
+    /// so callers can reuse it for subsequent store operations without a second lookup.
+    async fn read_task_snapshot(&self, task_id: &str) -> (TaskSnapshot, Option<i64>) {
         let Some(ref store) = self.store else {
-            return TaskSnapshot::default();
+            return (TaskSnapshot::default(), None);
         };
         let store_id = match store.resolve_task_id(&self.repo, task_id).await {
             Ok(Some(id)) => id,
-            _ => return TaskSnapshot::default(),
+            _ => return (TaskSnapshot::default(), None),
         };
         match store.get(store_id).await {
             Ok(task) => {
                 let duration_seconds = store.latest_task_metric_duration(task_id).await;
-                TaskSnapshot {
+                let snapshot = TaskSnapshot {
                     old_status: Some(task.status.as_str().to_string()),
                     agent: task.agent.clone(),
                     model: task.model.clone(),
@@ -458,9 +455,10 @@ impl TaskManager {
                         Some(task.summary.clone())
                     },
                     duration_seconds,
-                }
+                };
+                (snapshot, Some(store_id))
             }
-            Err(_) => TaskSnapshot::default(),
+            Err(_) => (TaskSnapshot::default(), None),
         }
     }
 
