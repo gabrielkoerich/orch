@@ -1183,6 +1183,65 @@ impl GhHttp {
         Ok(result)
     }
 
+    /// Batch-fetch state and labels for multiple GitHub issues in a single GraphQL request.
+    ///
+    /// Returns a map of issue number (as string) → `(state, labels)` where state is
+    /// lowercase ("open" / "closed") to match the REST API convention used elsewhere.
+    pub async fn batch_get_issue_states(
+        &self,
+        repo: &str,
+        issue_numbers: &[u64],
+    ) -> anyhow::Result<std::collections::HashMap<String, (String, Vec<String>)>> {
+        if issue_numbers.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+
+        let aliases: String = issue_numbers
+            .iter()
+            .map(|n| {
+                format!("issue{n}: issue(number: {n}) {{ state labels {{ nodes {{ name }} }} }}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let query = format!(
+            r#"{{ "query": "{{ repository(owner: \"{owner}\", name: \"{name}\") {{ {aliases} }} }}" }}"#
+        );
+
+        let resp = self.graphql(&query).await?;
+        let repo_data = resp
+            .pointer("/data/repository")
+            .ok_or_else(|| anyhow::anyhow!("missing /data/repository in GraphQL response"))?;
+
+        let mut result = std::collections::HashMap::new();
+        for n in issue_numbers {
+            if let Some(issue) = repo_data.get(format!("issue{n}")) {
+                let state = issue
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("UNKNOWN")
+                    .to_lowercase();
+                let labels: Vec<String> = issue
+                    .pointer("/labels/nodes")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|l| {
+                                l.get("name").and_then(|nm| nm.as_str()).map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                result.insert(n.to_string(), (state, labels));
+            }
+        }
+        Ok(result)
+    }
+
     /// Get the required status check contexts for a branch.
     pub async fn get_required_status_check_contexts(
         &self,
