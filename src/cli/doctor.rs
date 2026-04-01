@@ -94,9 +94,17 @@ pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
 
         let all_tasks = store.list_all(repo).await?;
 
-        let done_tasks: Vec<_> = all_tasks
+        // Only check done tasks updated within the last 7 days — older done tasks
+        // are stable and don't warrant GitHub API calls on every doctor run.
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+        let cutoff_str = cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let recent_done_tasks: Vec<_> = all_tasks
             .iter()
-            .filter(|t| t.status == TaskStatus::Done)
+            .filter(|t| t.status == TaskStatus::Done && t.updated_at.as_str() > cutoff_str.as_str())
+            .collect();
+        let active_tasks: Vec<_> = all_tasks
+            .iter()
+            .filter(|t| t.status != TaskStatus::Done)
             .collect();
         let in_progress_tasks: Vec<_> = all_tasks
             .iter()
@@ -107,59 +115,76 @@ pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
             .filter(|t| t.status == TaskStatus::InReview)
             .collect();
 
-        // 1. Done tasks with no merged PR
-        for task in &done_tasks {
+        // Batch-fetch all PR states needed for checks 1 and 8 in a single GraphQL call.
+        let pr_numbers_to_fetch: Vec<u64> = {
+            let mut nums: Vec<u64> = recent_done_tasks
+                .iter()
+                .filter(|t| !(t.origin == "internal" && t.external_id.is_none()))
+                .filter_map(|t| t.pr_number.map(|n| n as u64))
+                .chain(
+                    active_tasks
+                        .iter()
+                        .filter_map(|t| t.pr_number.map(|n| n as u64)),
+                )
+                .collect();
+            nums.sort_unstable();
+            nums.dedup();
+            nums
+        };
+        let pr_states = gh
+            .batch_get_pr_states(repo, &pr_numbers_to_fetch)
+            .await
+            .unwrap_or_default();
+
+        // 1. Done tasks with no merged PR (recent only — skip internal no-PR tasks)
+        for task in &recent_done_tasks {
             if task.origin == "internal" && task.external_id.is_none() {
                 continue;
             }
-            check_done_no_merged_pr(task, &gh, &store, repo, &mut findings).await;
-        }
-
-        // 2. Done tasks with dirty worktrees (uncommitted changes)
-        for task in &done_tasks {
-            check_dirty_worktree(task, &store, repo, &mut findings).await;
-        }
-
-        // 3. Done tasks with unpushed commits
-        for task in &done_tasks {
-            check_unpushed_commits(task, &store, repo, &mut findings).await;
-        }
-
-        // 4. Closed GitHub issues with non-done SQLite status (and vice versa)
-        for task in &all_tasks {
-            if task.origin == "internal" {
+            if task.pr_number.is_none() && task.external_id.is_none() {
                 continue;
             }
-            check_issue_status_mismatch(task, &backend, &store, repo, &mut findings).await;
+            check_done_no_merged_pr(task, &gh, &pr_states, &mut findings, repo).await;
         }
 
-        // 5. Label/status mismatch
-        for task in &all_tasks {
-            if task.origin == "internal" {
-                continue;
-            }
-            check_label_mismatch(task, &backend, &store, repo, &mut findings).await;
+        // 2. Done tasks with dirty worktrees (recent only — filesystem check, fast)
+        for task in &recent_done_tasks {
+            check_dirty_worktree(task, &mut findings);
+        }
+
+        // 3. Done tasks with unpushed commits (recent only — filesystem check, fast)
+        for task in &recent_done_tasks {
+            check_unpushed_commits(task, &mut findings);
+        }
+
+        // 4+5. Issue status and label checks (active external tasks only).
+        // Fetch each issue individually — GitHub doesn't expose a clean batch
+        // endpoint for arbitrary issue numbers via REST. TODO: migrate to GraphQL.
+        let external_active: Vec<_> = active_tasks
+            .iter()
+            .filter(|t| t.origin != "internal")
+            .collect();
+        for task in &external_active {
+            check_issue_status_mismatch(task, &backend, &mut findings).await;
+            check_label_mismatch(task, &backend, &mut findings).await;
         }
 
         // 6. Stale in_progress tasks (no tmux session)
         for task in &in_progress_tasks {
-            check_stale_in_progress(task, repo, &tmux, &store, &mut findings).await;
+            check_stale_in_progress(task, repo, &tmux, &mut findings).await;
         }
 
-        // 7. Orphaned worktrees
-        check_orphaned_worktrees(&all_tasks, &store, repo, &mut findings).await;
+        // 7. Orphaned worktrees (needs all tasks to match worktree paths to owners)
+        check_orphaned_worktrees(&all_tasks, &mut findings).await;
 
-        // 8. PR merged but task not done
-        for task in &all_tasks {
-            if task.status == TaskStatus::Done {
-                continue;
-            }
-            check_pr_merged_not_done(task, &gh, &store, repo, &mut findings).await;
+        // 8. PR merged but task not done (active tasks only — uses batched pr_states)
+        for task in &active_tasks {
+            check_pr_merged_not_done(task, &pr_states, &mut findings);
         }
 
         // 9. Dead review sessions
         for task in &in_review_tasks {
-            check_dead_review_session(task, repo, &tmux, &store, &mut findings).await;
+            check_dead_review_session(task, repo, &tmux, &mut findings).await;
         }
 
         if repos.len() > 1 && !findings.is_empty() {
@@ -222,47 +247,49 @@ pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
 }
 
 /// Check 1: Done task with no merged PR.
+/// `pr_states` is a pre-fetched cache of pr_number → (merged, state).
 async fn check_done_no_merged_pr(
     task: &Task,
     gh: &GhHttp,
-    store: &Arc<TaskStore>,
-    repo: &str,
+    pr_states: &std::collections::HashMap<u64, (bool, String)>,
     findings: &mut Vec<Finding>,
+    repo: &str,
 ) {
     let task_label = task_label(task);
-    let store_id = match resolve_store_id(store, repo, task).await {
-        Some(id) => id,
-        None => return,
-    };
+    let store_id = task.id;
 
     match task.pr_number {
         Some(pr_num) => {
-            // PR exists — check if it's merged
-            match gh.get_pr(repo, pr_num as u64).await {
-                Ok(pr) => {
-                    if pr.merged != Some(true) {
+            // Use cached state; fall back to live fetch if missing (e.g. new PR since batch)
+            let (merged, state) = if let Some(s) = pr_states.get(&(pr_num as u64)) {
+                s.clone()
+            } else {
+                match gh.get_pr(repo, pr_num as u64).await {
+                    Ok(pr) => (pr.merged.unwrap_or(false), pr.state),
+                    Err(e) => {
                         findings.push(Finding {
-                            severity: Severity::Error,
+                            severity: Severity::Warning,
                             task_id: task_label,
                             message: format!(
-                                "done but PR #{} is {} (not merged)",
-                                pr_num, pr.state
+                                "done with PR #{} but failed to fetch PR: {}",
+                                pr_num, e
                             ),
-                            fix: FixAction::LinkPrAndReopen {
-                                store_id,
-                                pr_number: pr_num as u64,
-                            },
+                            fix: FixAction::None,
                         });
+                        return;
                     }
                 }
-                Err(e) => {
-                    findings.push(Finding {
-                        severity: Severity::Warning,
-                        task_id: task_label,
-                        message: format!("done with PR #{} but failed to fetch PR: {}", pr_num, e),
-                        fix: FixAction::None,
-                    });
-                }
+            };
+            if !merged {
+                findings.push(Finding {
+                    severity: Severity::Error,
+                    task_id: task_label,
+                    message: format!("done but PR #{} is {} (not merged)", pr_num, state),
+                    fix: FixAction::LinkPrAndReopen {
+                        store_id,
+                        pr_number: pr_num as u64,
+                    },
+                });
             }
         }
         None => {
@@ -389,12 +416,7 @@ fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
 }
 
 /// Check 2: Done task with dirty worktree (uncommitted changes).
-async fn check_dirty_worktree(
-    task: &Task,
-    store: &Arc<TaskStore>,
-    repo: &str,
-    findings: &mut Vec<Finding>,
-) {
+fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
     if task.worktree.is_empty() || task.worktree_cleaned {
         return;
     }
@@ -406,9 +428,8 @@ async fn check_dirty_worktree(
         .args(["status", "--porcelain"])
         .current_dir(wt)
         .output();
-    match output {
-        Ok(out) if !out.stdout.is_empty() => {
-            let store_id = resolve_store_id(store, repo, task).await;
+    if let Ok(out) = output {
+        if !out.stdout.is_empty() {
             findings.push(Finding {
                 severity: Severity::Error,
                 task_id: task_label(task),
@@ -416,22 +437,14 @@ async fn check_dirty_worktree(
                     "done but worktree has uncommitted changes: {}",
                     task.worktree
                 ),
-                fix: store_id
-                    .map(|id| FixAction::CommitPushCreatePr { store_id: id })
-                    .unwrap_or(FixAction::None),
+                fix: FixAction::CommitPushCreatePr { store_id: task.id },
             });
         }
-        _ => {}
     }
 }
 
 /// Check 3: Done task with unpushed commits.
-async fn check_unpushed_commits(
-    task: &Task,
-    store: &Arc<TaskStore>,
-    repo: &str,
-    findings: &mut Vec<Finding>,
-) {
+fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
     if task.worktree.is_empty() || task.worktree_cleaned || task.branch.is_empty() {
         return;
     }
@@ -443,10 +456,9 @@ async fn check_unpushed_commits(
         .args(["log", &format!("origin/{}..HEAD", task.branch), "--oneline"])
         .current_dir(wt)
         .output();
-    match output {
-        Ok(out) if !out.stdout.is_empty() => {
+    if let Ok(out) = output {
+        if !out.stdout.is_empty() {
             let count = out.stdout.iter().filter(|&&b| b == b'\n').count();
-            let store_id = resolve_store_id(store, repo, task).await;
             findings.push(Finding {
                 severity: Severity::Error,
                 task_id: task_label(task),
@@ -454,12 +466,9 @@ async fn check_unpushed_commits(
                     "done but {} unpushed commit(s) in worktree: {}",
                     count, task.worktree
                 ),
-                fix: store_id
-                    .map(|id| FixAction::PushCreatePr { store_id: id })
-                    .unwrap_or(FixAction::None),
+                fix: FixAction::PushCreatePr { store_id: task.id },
             });
         }
-        _ => {}
     }
 }
 
@@ -467,8 +476,6 @@ async fn check_unpushed_commits(
 async fn check_issue_status_mismatch(
     task: &Task,
     backend: &Arc<dyn ExternalBackend>,
-    store: &Arc<TaskStore>,
-    repo: &str,
     findings: &mut Vec<Finding>,
 ) {
     let ext_id = match &task.external_id {
@@ -486,7 +493,6 @@ async fn check_issue_status_mismatch(
     let task_blocked = task.status == TaskStatus::Blocked;
 
     if issue_closed && !task_done && !task_blocked {
-        let store_id = resolve_store_id(store, repo, task).await;
         findings.push(Finding {
             severity: Severity::Error,
             task_id: task_label(task),
@@ -494,19 +500,14 @@ async fn check_issue_status_mismatch(
                 "GitHub issue is closed but SQLite status is '{}'",
                 task.status.as_str()
             ),
-            fix: store_id
-                .map(|id| FixAction::ReopenIssue { store_id: id })
-                .unwrap_or(FixAction::None),
+            fix: FixAction::ReopenIssue { store_id: task.id },
         });
     } else if !issue_closed && task_done {
-        let store_id = resolve_store_id(store, repo, task).await;
         findings.push(Finding {
             severity: Severity::Warning,
             task_id: task_label(task),
             message: "SQLite status is 'done' but GitHub issue is still open".to_string(),
-            fix: store_id
-                .map(|id| FixAction::CloseIssue { store_id: id })
-                .unwrap_or(FixAction::None),
+            fix: FixAction::CloseIssue { store_id: task.id },
         });
     }
 }
@@ -515,8 +516,6 @@ async fn check_issue_status_mismatch(
 async fn check_label_mismatch(
     task: &Task,
     backend: &Arc<dyn ExternalBackend>,
-    store: &Arc<TaskStore>,
-    repo: &str,
     findings: &mut Vec<Finding>,
 ) {
     let ext_id = match &task.external_id {
@@ -547,7 +546,6 @@ async fn check_label_mismatch(
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let store_id = resolve_store_id(store, repo, task).await;
         findings.push(Finding {
             severity: Severity::Warning,
             task_id: task_label(task),
@@ -556,9 +554,7 @@ async fn check_label_mismatch(
                 task.status.as_str(),
                 actual
             ),
-            fix: store_id
-                .map(|id| FixAction::SyncLabels { store_id: id })
-                .unwrap_or(FixAction::None),
+            fix: FixAction::SyncLabels { store_id: task.id },
         });
     }
 }
@@ -568,7 +564,6 @@ async fn check_stale_in_progress(
     task: &Task,
     repo: &str,
     tmux: &TmuxManager,
-    store: &Arc<TaskStore>,
     findings: &mut Vec<Finding>,
 ) {
     let task_id_str = match &task.external_id {
@@ -577,7 +572,6 @@ async fn check_stale_in_progress(
     };
     let session = tmux.session_name(repo, &task_id_str);
     if !tmux.session_exists(&session).await {
-        let store_id = resolve_store_id(store, repo, task).await;
         findings.push(Finding {
             severity: Severity::Error,
             task_id: task_label(task),
@@ -585,20 +579,13 @@ async fn check_stale_in_progress(
                 "status is 'in_progress' but no tmux session '{}' found",
                 session
             ),
-            fix: store_id
-                .map(|id| FixAction::ResetToRouted { store_id: id })
-                .unwrap_or(FixAction::None),
+            fix: FixAction::ResetToRouted { store_id: task.id },
         });
     }
 }
 
 /// Check 7: Orphaned worktrees.
-async fn check_orphaned_worktrees(
-    all_tasks: &[Task],
-    store: &Arc<TaskStore>,
-    repo: &str,
-    findings: &mut Vec<Finding>,
-) {
+async fn check_orphaned_worktrees(all_tasks: &[Task], findings: &mut Vec<Finding>) {
     let worktrees_dir = match crate::home::worktrees_dir() {
         Ok(d) => d,
         Err(_) => return,
@@ -647,14 +634,11 @@ async fn check_orphaned_worktrees(
                                 fix: FixAction::None,
                             });
                         } else {
-                            let store_id = resolve_store_id(store, repo, task).await;
                             findings.push(Finding {
                                 severity: Severity::Warning,
                                 task_id: task_label(task),
                                 message: format!("done but worktree not cleaned up: {}", wt_path),
-                                fix: store_id
-                                    .map(|id| FixAction::CleanWorktree { store_id: id })
-                                    .unwrap_or(FixAction::None),
+                                fix: FixAction::CleanWorktree { store_id: task.id },
                             });
                         }
                     }
@@ -674,12 +658,10 @@ async fn check_orphaned_worktrees(
     }
 }
 
-/// Check 8: PR merged but task not done.
-async fn check_pr_merged_not_done(
+/// Check 8: PR merged but task not done (uses pre-fetched pr_states cache).
+fn check_pr_merged_not_done(
     task: &Task,
-    gh: &GhHttp,
-    store: &Arc<TaskStore>,
-    repo: &str,
+    pr_states: &std::collections::HashMap<u64, (bool, String)>,
     findings: &mut Vec<Finding>,
 ) {
     let pr_num = match task.pr_number {
@@ -687,9 +669,8 @@ async fn check_pr_merged_not_done(
         None => return,
     };
 
-    match gh.get_pr(repo, pr_num).await {
-        Ok(pr) if pr.merged == Some(true) => {
-            let store_id = resolve_store_id(store, repo, task).await;
+    if let Some((merged, _)) = pr_states.get(&pr_num) {
+        if *merged {
             findings.push(Finding {
                 severity: Severity::Error,
                 task_id: task_label(task),
@@ -698,12 +679,9 @@ async fn check_pr_merged_not_done(
                     pr_num,
                     task.status.as_str()
                 ),
-                fix: store_id
-                    .map(|id| FixAction::MarkDoneFromMergedPr { store_id: id })
-                    .unwrap_or(FixAction::None),
+                fix: FixAction::MarkDoneFromMergedPr { store_id: task.id },
             });
         }
-        _ => {}
     }
 }
 
@@ -712,7 +690,6 @@ async fn check_dead_review_session(
     task: &Task,
     repo: &str,
     tmux: &TmuxManager,
-    store: &Arc<TaskStore>,
     findings: &mut Vec<Finding>,
 ) {
     if !task.review_session_expected {
@@ -725,7 +702,6 @@ async fn check_dead_review_session(
     let review_task_id = format!("{}-review", task_id_str);
     let session = tmux.session_name(repo, &review_task_id);
     if !tmux.session_exists(&session).await {
-        let store_id = resolve_store_id(store, repo, task).await;
         findings.push(Finding {
             severity: Severity::Error,
             task_id: task_label(task),
@@ -733,9 +709,7 @@ async fn check_dead_review_session(
                 "status is 'in_review' with review_session_expected but no review session '{}' found",
                 session
             ),
-            fix: store_id
-                .map(|id| FixAction::ResetDeadReview { store_id: id })
-                .unwrap_or(FixAction::None),
+            fix: FixAction::ResetDeadReview { store_id: task.id },
         });
     }
 }

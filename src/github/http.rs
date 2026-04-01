@@ -1078,6 +1078,54 @@ impl GhHttp {
         self.get_json(&url).await
     }
 
+    /// Fetch the merged/state for multiple PRs in a single GraphQL query.
+    ///
+    /// Returns a map of pr_number → (merged, state).
+    /// PRs that fail to fetch are silently omitted from the result.
+    pub async fn batch_get_pr_states(
+        &self,
+        repo: &str,
+        pr_numbers: &[u64],
+    ) -> anyhow::Result<std::collections::HashMap<u64, (bool, String)>> {
+        if pr_numbers.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+
+        // Build GraphQL aliases: pr123: pullRequest(number: 123) { merged state }
+        let aliases: String = pr_numbers
+            .iter()
+            .map(|n| format!("pr{n}: pullRequest(number: {n}) {{ merged state }}"))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+
+        let query = format!(
+            r#"{{ "query": "{{ repository(owner: \"{owner}\", name: \"{name}\") {{ {aliases} }} }}" }}"#
+        );
+
+        let resp = self.graphql(&query).await?;
+        let repo_data = resp
+            .pointer("/data/repository")
+            .ok_or_else(|| anyhow::anyhow!("missing /data/repository in GraphQL response"))?;
+
+        let mut result = std::collections::HashMap::new();
+        for n in pr_numbers {
+            if let Some(pr) = repo_data.get(format!("pr{n}")) {
+                let merged = pr.get("merged").and_then(|v| v.as_bool()).unwrap_or(false);
+                let state = pr
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("UNKNOWN")
+                    .to_lowercase();
+                result.insert(*n, (merged, state));
+            }
+        }
+        Ok(result)
+    }
+
     /// Get the required status check contexts for a branch.
     pub async fn get_required_status_check_contexts(
         &self,
