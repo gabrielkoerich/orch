@@ -124,9 +124,9 @@ impl TaskStore {
 
         use sqlx::Row;
         Ok((
-            row.get::<i64, _>("total_input"),
-            row.get::<i64, _>("total_output"),
-            row.get::<f64, _>("total_cost"),
+            row.try_get::<i64, _>("total_input").unwrap_or(0),
+            row.try_get::<i64, _>("total_output").unwrap_or(0),
+            row.try_get::<f64, _>("total_cost").unwrap_or(0.0),
         ))
     }
 
@@ -146,8 +146,8 @@ impl TaskStore {
         use sqlx::Row;
         let mut map = std::collections::HashMap::new();
         for row in &rows {
-            let status: String = row.get("status");
-            let count: i64 = row.get("cnt");
+            let status: String = row.try_get("status").unwrap_or_default();
+            let count: i64 = row.try_get("cnt").unwrap_or(0);
             map.insert(status, count);
         }
         Ok(map)
@@ -184,7 +184,7 @@ impl TaskStore {
     .bind(metric.total_cost_usd)
     .fetch_one(&self.pool)
     .await?;
-        Ok(row.get("id"))
+        Ok(row.try_get("id").unwrap_or(0))
     }
 
     /// Get aggregated metrics for the last 24 hours.
@@ -232,10 +232,10 @@ impl TaskStore {
         let agent_stats: Vec<AgentStat> = agent_rows
             .iter()
             .map(|row| {
-                let total: i64 = row.get("total");
-                let success: i64 = row.get("success_count");
+                let total: i64 = row.try_get("total").unwrap_or(0);
+                let success: i64 = row.try_get("success_count").unwrap_or(0);
                 AgentStat {
-                    agent: row.get("agent"),
+                    agent: row.try_get("agent").unwrap_or_default(),
                     total_runs: total,
                     success_count: success,
                     success_rate: if total > 0 {
@@ -340,10 +340,10 @@ impl TaskStore {
         let agent_stats: Vec<AgentStat> = agent_rows
             .iter()
             .map(|row| {
-                let total: i64 = row.get("total");
-                let success: i64 = row.get("success_count");
+                let total: i64 = row.try_get("total").unwrap_or(0);
+                let success: i64 = row.try_get("success_count").unwrap_or(0);
                 AgentStat {
-                    agent: row.get("agent"),
+                    agent: row.try_get("agent").unwrap_or_default(),
                     total_runs: total,
                     success_count: success,
                     success_rate: if total > 0 {
@@ -397,12 +397,12 @@ impl TaskStore {
         Ok(CostSummary {
             periods: vec![CostPeriod {
                 label: "24h".to_string(),
-                input_tokens: row.get("input_tokens"),
-                output_tokens: row.get("output_tokens"),
-                input_cost_usd: row.get("input_cost_usd"),
-                output_cost_usd: row.get("output_cost_usd"),
-                total_cost_usd: row.get("total_cost_usd"),
-                task_count: row.get("task_count"),
+                input_tokens: row.try_get("input_tokens").unwrap_or(0),
+                output_tokens: row.try_get("output_tokens").unwrap_or(0),
+                input_cost_usd: row.try_get("input_cost_usd").unwrap_or(0.0),
+                output_cost_usd: row.try_get("output_cost_usd").unwrap_or(0.0),
+                total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
+                task_count: row.try_get("task_count").unwrap_or(0),
             }],
         })
     }
@@ -428,7 +428,7 @@ impl TaskStore {
         .bind(task_id)
         .fetch_one(&self.pool)
         .await?;
-        Ok(row.get("id"))
+        Ok(row.try_get("id").unwrap_or(0))
     }
 
     /// Count recent rate limit events per agent within the given window (in hours).
@@ -456,8 +456,8 @@ impl TaskStore {
 
         let mut map = std::collections::HashMap::new();
         for row in &rows {
-            let agent: String = row.get("agent");
-            let cnt: i64 = row.get("cnt");
+            let agent: String = row.try_get("agent").unwrap_or_default();
+            let cnt: i64 = row.try_get("cnt").unwrap_or(0);
             map.insert(agent, cnt);
         }
         Ok(map)
@@ -478,10 +478,10 @@ impl TaskStore {
         Ok(rows
             .iter()
             .map(|row| SlowTaskInfo {
-                task_id: row.get("task_id"),
-                agent: row.get("agent"),
-                complexity: row.get("complexity"),
-                duration_seconds: row.get("duration_seconds"),
+                task_id: row.try_get("task_id").unwrap_or_default(),
+                agent: row.try_get("agent").unwrap_or_default(),
+                complexity: row.try_get("complexity").unwrap_or(None),
+                duration_seconds: row.try_get("duration_seconds").unwrap_or(0.0),
             })
             .collect())
     }
@@ -503,8 +503,8 @@ impl TaskStore {
         Ok(rows
             .iter()
             .map(|row| ErrorStat {
-                error_type: row.get("error_type"),
-                count: row.get("count"),
+                error_type: row.try_get("error_type").unwrap_or(None),
+                count: row.try_get("count").unwrap_or(0),
             })
             .collect())
     }
@@ -556,12 +556,12 @@ impl TaskStore {
             let row = sqlx::query(query).fetch_one(&self.pool).await?;
             periods.push(CostPeriod {
                 label: label.to_string(),
-                input_tokens: row.get("input_tokens"),
-                output_tokens: row.get("output_tokens"),
-                input_cost_usd: row.get("input_cost_usd"),
-                output_cost_usd: row.get("output_cost_usd"),
-                total_cost_usd: row.get("total_cost_usd"),
-                task_count: row.get("task_count"),
+                input_tokens: row.try_get("input_tokens").unwrap_or(0),
+                output_tokens: row.try_get("output_tokens").unwrap_or(0),
+                input_cost_usd: row.try_get("input_cost_usd").unwrap_or(0.0),
+                output_cost_usd: row.try_get("output_cost_usd").unwrap_or(0.0),
+                total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
+                task_count: row.try_get("task_count").unwrap_or(0),
             });
         }
 
@@ -586,11 +586,11 @@ impl TaskStore {
         Ok(rows
             .iter()
             .map(|row| CostByGroup {
-                name: row.get("name"),
-                input_tokens: row.get("input_tokens"),
-                output_tokens: row.get("output_tokens"),
-                total_cost_usd: row.get("total_cost_usd"),
-                task_count: row.get("task_count"),
+                name: row.try_get("name").unwrap_or_default(),
+                input_tokens: row.try_get("input_tokens").unwrap_or(0),
+                output_tokens: row.try_get("output_tokens").unwrap_or(0),
+                total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
+                task_count: row.try_get("task_count").unwrap_or(0),
             })
             .collect())
     }
@@ -613,11 +613,11 @@ impl TaskStore {
         Ok(rows
             .iter()
             .map(|row| CostByGroup {
-                name: row.get("name"),
-                input_tokens: row.get("input_tokens"),
-                output_tokens: row.get("output_tokens"),
-                total_cost_usd: row.get("total_cost_usd"),
-                task_count: row.get("task_count"),
+                name: row.try_get("name").unwrap_or_default(),
+                input_tokens: row.try_get("input_tokens").unwrap_or(0),
+                output_tokens: row.try_get("output_tokens").unwrap_or(0),
+                total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
+                task_count: row.try_get("task_count").unwrap_or(0),
             })
             .collect())
     }
@@ -658,10 +658,10 @@ impl TaskStore {
         Ok(rows
             .iter()
             .map(|row| HighReviewCycleTask {
-                external_id: row.get("external_id"),
-                agent: row.get("agent"),
-                review_cycles: row.get("review_cycles"),
-                title: row.get("title"),
+                external_id: row.try_get("external_id").unwrap_or(None),
+                agent: row.try_get("agent").unwrap_or(None),
+                review_cycles: row.try_get("review_cycles").unwrap_or(0),
+                title: row.try_get("title").unwrap_or_default(),
             })
             .collect())
     }

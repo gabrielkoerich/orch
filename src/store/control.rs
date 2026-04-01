@@ -76,7 +76,7 @@ impl TaskStore {
     .bind(cost_usd)
     .fetch_one(&self.pool)
     .await?;
-        Ok(row.get("id"))
+        Ok(row.try_get("id").unwrap_or(0))
     }
 
     /// List the most recent control messages for a session (chronological order).
@@ -183,24 +183,27 @@ impl TaskStore {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.iter().map(|r| r.get::<String, _>("summary")).collect())
+        Ok(rows
+            .iter()
+            .map(|r| r.try_get::<String, _>("summary").unwrap_or_default())
+            .collect())
     }
 
     fn row_to_control_message(row: &sqlx::sqlite::SqliteRow) -> ControlMessage {
         use sqlx::Row;
         ControlMessage {
-            id: row.get("id"),
-            session_id: row.get("session_id"),
-            role: row.get("role"),
-            channel: row.get("channel"),
-            channel_thread: row.get("channel_thread"),
-            content: row.get("content"),
-            summary: row.get("summary"),
-            model: row.get("model"),
-            agent: row.get("agent"),
-            tokens_used: row.get("tokens_used"),
-            cost_usd: row.get("cost_usd"),
-            created_at: row.get("created_at"),
+            id: row.try_get("id").unwrap_or(0),
+            session_id: row.try_get("session_id").unwrap_or_default(),
+            role: row.try_get("role").unwrap_or_default(),
+            channel: row.try_get("channel").unwrap_or_default(),
+            channel_thread: row.try_get("channel_thread").unwrap_or(None),
+            content: row.try_get("content").unwrap_or_default(),
+            summary: row.try_get("summary").unwrap_or(None),
+            model: row.try_get("model").unwrap_or(None),
+            agent: row.try_get("agent").unwrap_or(None),
+            tokens_used: row.try_get("tokens_used").unwrap_or(None),
+            cost_usd: row.try_get("cost_usd").unwrap_or(None),
+            created_at: row.try_get("created_at").unwrap_or_default(),
         }
     }
 }
