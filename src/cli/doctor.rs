@@ -379,7 +379,7 @@ fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
         return FixAction::None;
     }
     let wt = Path::new(&task.worktree);
-    if !wt.exists() {
+    if !wt.exists() || !wt.join(".git").exists() {
         return FixAction::None;
     }
 
@@ -428,7 +428,7 @@ fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
         return;
     }
     let wt = Path::new(&task.worktree);
-    if !wt.exists() {
+    if !wt.exists() || !wt.join(".git").exists() {
         return;
     }
     let output = std::process::Command::new("git")
@@ -456,7 +456,7 @@ fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
         return;
     }
     let wt = Path::new(&task.worktree);
-    if !wt.exists() {
+    if !wt.exists() || !wt.join(".git").exists() {
         return;
     }
     let output = std::process::Command::new("git")
@@ -726,6 +726,9 @@ async fn check_dead_review_session(
 
 /// Check if a worktree has uncommitted changes or unpushed commits.
 fn worktree_has_work(wt: &Path, branch: &str) -> bool {
+    if !wt.join(".git").exists() {
+        return false;
+    }
     let has_dirty = std::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(wt)
