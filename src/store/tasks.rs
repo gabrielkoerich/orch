@@ -593,6 +593,18 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
+    /// Return the distinct repo slugs present in the tasks table.
+    pub async fn distinct_repos(&self) -> anyhow::Result<Vec<String>> {
+        let rows =
+            sqlx::query("SELECT DISTINCT repo FROM tasks WHERE repo IS NOT NULL AND repo != ''")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("repo").ok())
+            .collect())
+    }
+
     /// List all active (non-done) tasks across all repos.
     ///
     /// Used by the CLI when no project context is available (e.g. running from

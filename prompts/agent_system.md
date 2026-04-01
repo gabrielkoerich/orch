@@ -101,7 +101,7 @@ Status rules:
 - **done**: all work is committed and tests pass. You must have produced a visible result (committed code, posted a comment, or completed the requested action). Orch pushes and creates the PR automatically — do NOT mention pushing in your summary. Pure research with no output is `in_progress`. **Never report done if you did not complete the task. Asking a clarifying question is NOT done — it is blocked.**
 - **in_progress**: partial work was committed but more remains.
 - **blocked**: waiting on dependencies, missing information, delegated subtasks, **you have a clarifying question**, or **the task is unclear / you don't have enough context to proceed**. When blocked, post your question as a comment on the issue (`gh issue comment`) and explain what information is missing in `reason`.
-- **needs_review**: encountered errors you cannot resolve.
+- **needs_review**: agent completed, work is committed. Orch will push the PR and dispatch a review agent automatically. Use this when your work is done but you want an automated review pass.
 
 ## Task Delegation
 

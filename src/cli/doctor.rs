@@ -65,118 +65,157 @@ impl Severity {
 }
 
 /// Run all diagnostic checks and print findings.
+///
+/// When called outside a project directory (no `.orch.yml`), runs across all
+/// repos found in the store. When called inside a project, scopes to that repo.
 pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
-    let repo =
-        config::get_current_repo().context("'repo' not set — ensure .orch.yml has gh.repo")?;
     let store = Arc::new(crate::cli::init_store().await?);
     let gh = GhHttp::new()?;
-    let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
     let tmux = TmuxManager::new();
 
-    let mut findings: Vec<Finding> = Vec::new();
-
-    // Load all tasks from the store for the current repo.
-    let all_tasks = store.list_all(&repo).await?;
-
-    let done_tasks: Vec<_> = all_tasks
-        .iter()
-        .filter(|t| t.status == TaskStatus::Done)
-        .collect();
-    let in_progress_tasks: Vec<_> = all_tasks
-        .iter()
-        .filter(|t| t.status == TaskStatus::InProgress)
-        .collect();
-    let in_review_tasks: Vec<_> = all_tasks
-        .iter()
-        .filter(|t| t.status == TaskStatus::InReview)
-        .collect();
-
-    // 1. Done tasks with no merged PR
-    for task in &done_tasks {
-        if task.origin == "internal" && task.external_id.is_none() {
-            continue;
+    // Resolve repos to check: current project if available, otherwise all repos in store.
+    let repos: Vec<String> = match config::get_current_repo() {
+        Ok(repo) => vec![repo],
+        Err(_) => {
+            let all = store.distinct_repos().await?;
+            if all.is_empty() {
+                println!("No tasks found in store.");
+                return Ok(());
+            }
+            all
         }
-        check_done_no_merged_pr(task, &gh, &store, &repo, &mut findings).await;
-    }
+    };
 
-    // 2. Done tasks with dirty worktrees (uncommitted changes)
-    for task in &done_tasks {
-        check_dirty_worktree(task, &store, &repo, &mut findings).await;
-    }
+    let mut all_findings: Vec<Finding> = Vec::new();
 
-    // 3. Done tasks with unpushed commits
-    for task in &done_tasks {
-        check_unpushed_commits(task, &store, &repo, &mut findings).await;
-    }
+    for repo in &repos {
+        let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
+        let mut findings: Vec<Finding> = Vec::new();
 
-    // 4. Closed GitHub issues with non-done SQLite status (and vice versa)
-    for task in &all_tasks {
-        if task.origin == "internal" {
-            continue;
+        let all_tasks = store.list_all(repo).await?;
+
+        let done_tasks: Vec<_> = all_tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Done)
+            .collect();
+        let in_progress_tasks: Vec<_> = all_tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::InProgress)
+            .collect();
+        let in_review_tasks: Vec<_> = all_tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::InReview)
+            .collect();
+
+        // 1. Done tasks with no merged PR
+        for task in &done_tasks {
+            if task.origin == "internal" && task.external_id.is_none() {
+                continue;
+            }
+            check_done_no_merged_pr(task, &gh, &store, repo, &mut findings).await;
         }
-        check_issue_status_mismatch(task, &backend, &store, &repo, &mut findings).await;
-    }
 
-    // 5. Label/status mismatch
-    for task in &all_tasks {
-        if task.origin == "internal" {
-            continue;
+        // 2. Done tasks with dirty worktrees (uncommitted changes)
+        for task in &done_tasks {
+            check_dirty_worktree(task, &store, repo, &mut findings).await;
         }
-        check_label_mismatch(task, &backend, &store, &repo, &mut findings).await;
-    }
 
-    // 6. Stale in_progress tasks (no tmux session)
-    for task in &in_progress_tasks {
-        check_stale_in_progress(task, &repo, &tmux, &store, &mut findings).await;
-    }
-
-    // 7. Orphaned worktrees
-    check_orphaned_worktrees(&all_tasks, &store, &repo, &mut findings).await;
-
-    // 8. PR merged but task not done
-    for task in &all_tasks {
-        if task.status == TaskStatus::Done {
-            continue;
+        // 3. Done tasks with unpushed commits
+        for task in &done_tasks {
+            check_unpushed_commits(task, &store, repo, &mut findings).await;
         }
-        check_pr_merged_not_done(task, &gh, &store, &repo, &mut findings).await;
+
+        // 4. Closed GitHub issues with non-done SQLite status (and vice versa)
+        for task in &all_tasks {
+            if task.origin == "internal" {
+                continue;
+            }
+            check_issue_status_mismatch(task, &backend, &store, repo, &mut findings).await;
+        }
+
+        // 5. Label/status mismatch
+        for task in &all_tasks {
+            if task.origin == "internal" {
+                continue;
+            }
+            check_label_mismatch(task, &backend, &store, repo, &mut findings).await;
+        }
+
+        // 6. Stale in_progress tasks (no tmux session)
+        for task in &in_progress_tasks {
+            check_stale_in_progress(task, repo, &tmux, &store, &mut findings).await;
+        }
+
+        // 7. Orphaned worktrees
+        check_orphaned_worktrees(&all_tasks, &store, repo, &mut findings).await;
+
+        // 8. PR merged but task not done
+        for task in &all_tasks {
+            if task.status == TaskStatus::Done {
+                continue;
+            }
+            check_pr_merged_not_done(task, &gh, &store, repo, &mut findings).await;
+        }
+
+        // 9. Dead review sessions
+        for task in &in_review_tasks {
+            check_dead_review_session(task, repo, &tmux, &store, &mut findings).await;
+        }
+
+        if repos.len() > 1 && !findings.is_empty() {
+            println!("\n=== {} ===", repo);
+        }
+
+        // Apply per-repo fixes immediately so store_id lookups are in scope.
+        if (fix || dry_run) && !findings.is_empty() {
+            let errors = findings
+                .iter()
+                .filter(|f| matches!(f.severity, Severity::Error))
+                .count();
+            let warnings = findings.len() - errors;
+            for f in &findings {
+                println!("[{}] #{}: {}", f.severity.symbol(), f.task_id, f.message);
+            }
+            println!(
+                "\nFound {} issue(s): {} error(s), {} warning(s)",
+                findings.len(),
+                errors,
+                warnings,
+            );
+            apply_fixes(&findings, &store, repo, &backend, &gh, dry_run).await?;
+        }
+
+        all_findings.extend(findings);
     }
 
-    // 9. Dead review sessions
-    for task in &in_review_tasks {
-        check_dead_review_session(task, &repo, &tmux, &store, &mut findings).await;
-    }
-
-    // Print results
-    if findings.is_empty() {
+    if all_findings.is_empty() {
         println!("No issues found. All task state is consistent.");
         return Ok(());
     }
 
-    let errors = findings
-        .iter()
-        .filter(|f| matches!(f.severity, Severity::Error))
-        .count();
-    let warnings = findings
-        .iter()
-        .filter(|f| matches!(f.severity, Severity::Warning))
-        .count();
+    // If we didn't already print+fix per-repo above (non-fix mode), print summary now.
+    if !fix && !dry_run {
+        let errors = all_findings
+            .iter()
+            .filter(|f| matches!(f.severity, Severity::Error))
+            .count();
+        let warnings = all_findings.len() - errors;
 
-    for f in &findings {
-        println!("[{}] #{}: {}", f.severity.symbol(), f.task_id, f.message);
-    }
+        for f in &all_findings {
+            println!("[{}] #{}: {}", f.severity.symbol(), f.task_id, f.message);
+        }
 
-    println!(
-        "\nFound {} issue(s): {} error(s), {} warning(s)",
-        findings.len(),
-        errors,
-        warnings,
-    );
+        println!(
+            "\nFound {} issue(s): {} error(s), {} warning(s)",
+            all_findings.len(),
+            errors,
+            warnings,
+        );
 
-    if fix || dry_run {
-        apply_fixes(&findings, &store, &repo, &backend, &gh, dry_run).await?;
-    } else if errors > 0 {
-        println!("\nRun `orch doctor --fix` to attempt automatic repairs.");
-        println!("Run `orch doctor --dry-run` to preview what --fix would do.");
+        if errors > 0 {
+            println!("\nRun `orch doctor --fix` to attempt automatic repairs.");
+            println!("Run `orch doctor --dry-run` to preview what --fix would do.");
+        }
     }
 
     Ok(())
