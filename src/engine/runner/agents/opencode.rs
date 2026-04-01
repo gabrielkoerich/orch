@@ -38,19 +38,6 @@ pub struct OpenCodeRunner {
     free_models_cache: Mutex<Option<(Vec<String>, std::time::Instant)>>,
 }
 
-pub(crate) fn parse_ndjson_events(raw: &str) -> Vec<serde_json::Value> {
-    raw.lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| match serde_json::from_str(line) {
-            Ok(val) => Some(val),
-            Err(e) => {
-                tracing::debug!(line, error = %e, "opencode: skipping unparseable NDJSON line");
-                None
-            }
-        })
-        .collect()
-}
-
 pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String> {
     let mut texts = Vec::new();
 
@@ -224,7 +211,7 @@ fn extract_json_object(text: &str) -> Option<String> {
 }
 
 pub(crate) fn extract_router_text(raw: &str) -> Option<String> {
-    let events = parse_ndjson_events(raw.trim());
+    let events = super::parse_ndjson(raw.trim());
     if events.is_empty() {
         return None;
     }
@@ -270,11 +257,6 @@ impl OpenCodeRunner {
         Self {
             free_models_cache: Mutex::new(None),
         }
-    }
-
-    /// Parse NDJSON stream into events.
-    fn parse_ndjson(&self, raw: &str) -> Vec<serde_json::Value> {
-        parse_ndjson_events(raw)
     }
 
     /// Extract text from `text` events.
@@ -395,7 +377,7 @@ impl AgentRunner for OpenCodeRunner {
             return Ok(String::new());
         }
 
-        let events = self.parse_ndjson(trimmed);
+        let events = super::parse_ndjson(trimmed);
         if events.is_empty() {
             return Ok(trimmed.to_string());
         }
@@ -466,7 +448,7 @@ printf '%s\n' '{permission_json}' > .orch-opencode/opencode/opencode.json || {{ 
             return Err(AgentError::InvalidResponse { raw: String::new() });
         }
 
-        let events = self.parse_ndjson(trimmed);
+        let events = super::parse_ndjson(trimmed);
 
         if events.is_empty() {
             // Maybe direct JSON
@@ -512,7 +494,7 @@ printf '%s\n' '{permission_json}' > .orch-opencode/opencode/opencode.json || {{ 
 
     fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError {
         // Try parsing NDJSON events from stdout for structured errors
-        let events = self.parse_ndjson(stdout);
+        let events = super::parse_ndjson(stdout);
         if let Some(err) = self.detect_error(&events) {
             return err;
         }
@@ -730,7 +712,7 @@ fn discover_free_models() -> Vec<String> {
 ///
 /// Returns `None` only if no parseable NDJSON events are found.
 pub fn find_opencode_result(ndjson: &str) -> Option<super::AgentResult> {
-    let events = parse_ndjson_events(ndjson.trim());
+    let events = super::parse_ndjson(ndjson.trim());
     if events.is_empty() {
         return None;
     }

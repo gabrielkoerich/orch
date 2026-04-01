@@ -485,6 +485,76 @@ pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
     }
 }
 
+/// Parse an NDJSON stream into a list of JSON values.
+///
+/// Shared by all agents that emit NDJSON output (Codex, OpenCode, etc.).
+/// Lines that are empty or unparseable are silently skipped with a debug log.
+pub(crate) fn parse_ndjson(raw: &str) -> Vec<serde_json::Value> {
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| match serde_json::from_str(line) {
+            Ok(val) => Some(val),
+            Err(e) => {
+                tracing::debug!(line, error = %e, "skipping unparseable NDJSON line");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Generate a complete, delegating `AgentRunner` impl for a wrapper struct.
+///
+/// Use this for runner types that delegate every `AgentRunner` method to an
+/// inner field (e.g., `KimiClaudeRunner → MiniMaxClaudeRunner`).
+///
+/// ```ignore
+/// delegate_agent_runner!(KimiClaudeRunner, inner);
+/// ```
+macro_rules! delegate_agent_runner {
+    ($runner:ty, $inner:ident) => {
+        impl AgentRunner for $runner {
+            #[cfg(test)]
+            fn name(&self) -> &str {
+                self.$inner.name()
+            }
+
+            fn build_command(
+                &self,
+                model: Option<&str>,
+                timeout_cmd: &str,
+                sys_file: &str,
+                msg_file: &str,
+                permissions: &PermissionRules,
+            ) -> String {
+                self.$inner
+                    .build_command(model, timeout_cmd, sys_file, msg_file, permissions)
+            }
+
+            fn parse_response(&self, raw: &str) -> Result<ParsedResponse, AgentError> {
+                self.$inner.parse_response(raw)
+            }
+
+            fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
+                self.$inner.extract_text(raw)
+            }
+
+            fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError {
+                self.$inner.classify_error(exit_code, stdout, stderr)
+            }
+
+            fn router_command(
+                &self,
+                prompt: &str,
+                model: Option<&str>,
+            ) -> anyhow::Result<tokio::process::Command> {
+                self.$inner.router_command(prompt, model)
+            }
+        }
+    };
+}
+
+pub(crate) use delegate_agent_runner;
+
 /// Shared error pattern detection utilities used by multiple agent runners.
 pub(crate) mod patterns {
     use super::AgentError;
