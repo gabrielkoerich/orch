@@ -805,7 +805,23 @@ impl GhHttp {
             Self::maybe_record_graphql_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub GraphQL failed ({status}): {text}");
         }
-        Ok(serde_json::from_str(&text)?)
+        let json: serde_json::Value = serde_json::from_str(&text)?;
+        // GraphQL always returns 200 even for errors; check the errors field explicitly.
+        if let Some(errors) = json.get("errors").and_then(|e| e.as_array()) {
+            if !errors.is_empty() {
+                let messages: Vec<&str> = errors
+                    .iter()
+                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                    .collect();
+                if json.get("data").is_none() || json["data"].is_null() {
+                    // No data at all — surface the errors as a proper error.
+                    anyhow::bail!("GitHub GraphQL errors: {}", messages.join("; "));
+                }
+                // Partial data alongside errors — log and continue.
+                tracing::warn!(errors = ?messages, "GitHub GraphQL returned partial errors");
+            }
+        }
+        Ok(json)
     }
 
     // ── Public API (mirrors GhCli) ───────────────────────────────
@@ -1147,9 +1163,10 @@ impl GhHttp {
             format!(r#"{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}"#);
 
         let resp = self.graphql(&query).await?;
-        let repo_data = resp
-            .pointer("/data/repository")
-            .ok_or_else(|| anyhow::anyhow!("missing /data/repository in GraphQL response"))?;
+        let repo_data = resp.pointer("/data/repository").ok_or_else(|| {
+            let preview: String = resp.to_string().chars().take(500).collect();
+            anyhow::anyhow!("missing /data/repository in GraphQL response: {}", preview)
+        })?;
 
         let mut result = std::collections::HashMap::new();
         for (i, branch) in branches.iter().enumerate() {
