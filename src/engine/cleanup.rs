@@ -422,7 +422,9 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 "stored worktree path no longer exists on disk — marking cleaned"
             );
             if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-                let _ = store.mark_cleaned(store_id).await;
+                if let Err(e) = store.mark_cleaned(store_id).await {
+                    tracing::warn!(task_id, err = %e, "failed to mark worktree cleaned in store — will retry");
+                }
             }
         }
         return Ok(false);
@@ -517,7 +519,9 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
         // If resolve_task_id returns None the task is not (or no longer) in
         // the store; that is fine — we already did the on-disk work.
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-            let _ = store.mark_cleaned(store_id).await;
+            if let Err(e) = store.mark_cleaned(store_id).await {
+                tracing::warn!(task_id, err = %e, "failed to mark worktree cleaned in store — will retry");
+            }
         }
     }
 
