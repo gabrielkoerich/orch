@@ -1339,10 +1339,3 @@ fn task_status_to_backend_status(status: TaskStatus) -> crate::backends::Status 
     }
 }
 
-/// Resolve the internal store ID for a task. Always goes through the store
-/// to ensure we have the correct mapping, never trusting task_label directly
-/// as an external ID for backend calls.
-async fn resolve_store_id(store: &Arc<TaskStore>, repo: &str, task: &Task) -> Option<i64> {
-    let label = task_label(task);
-    store.resolve_task_id(repo, &label).await.ok().flatten()
-}
