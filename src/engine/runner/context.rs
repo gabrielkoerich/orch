@@ -13,10 +13,10 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask};
 use crate::cmd::CommandErrorContext;
 use crate::store;
 use crate::store::TaskStore;
+use futures::future::join_all;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::process::Command;
-use futures::future::join_all;
 
 /// All assembled context for a task execution.
 pub struct TaskContext {
@@ -80,10 +80,7 @@ pub async fn build_parent_context(
     // Get sibling tasks — fetch remote task objects and store summaries in parallel
     if let Ok(siblings) = backend.get_sub_issues(&ExternalId(parent_id)).await {
         // Filter out self early
-        let siblings: Vec<ExternalId> = siblings
-            .into_iter()
-            .filter(|s| s.0 != task.id.0)
-            .collect();
+        let siblings: Vec<ExternalId> = siblings.into_iter().filter(|s| s.0 != task.id.0).collect();
 
         if !siblings.is_empty() {
             ctx.push_str("## Sibling Tasks\n\n");

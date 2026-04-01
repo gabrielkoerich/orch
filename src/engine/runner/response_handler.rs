@@ -371,7 +371,10 @@ pub async fn handle_success(
         .map(|t| t.last_error)
         .unwrap_or_default();
 
-    let push_failed = resp.status == "done" && !has_pushed && has_commits && stored_last_error.contains("push failed");
+    let push_failed = resp.status == "done"
+        && !has_pushed
+        && has_commits
+        && stored_last_error.contains("push failed");
 
     let final_status = if push_failed {
         // Use atomic increment helper to avoid a read-increment-write race.
