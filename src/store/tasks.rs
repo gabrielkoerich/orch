@@ -976,6 +976,215 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Batch-update fields for multiple tasks in a single transaction.
+    ///
+    /// Each entry is `(id, updates)` where `updates` is a slice of `(column, value)` pairs.
+    /// Skips entries with empty update slices.
+    #[allow(dead_code)] // provided for callers that update many tasks at once
+    pub async fn batch_set_fields(
+        &self,
+        updates: &[(i64, &[(&str, serde_json::Value)])],
+    ) -> anyhow::Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        // Allowlist matches set_fields
+        const ALLOWED: &[&str] = &[
+            "agent",
+            "model",
+            "complexity",
+            "route_reason",
+            "agent_profile",
+            "selected_skills",
+            "route_attempts",
+            "attempts",
+            "branch",
+            "worktree",
+            "worktree_cleaned",
+            "summary",
+            "last_error",
+            "parent_id",
+            "block_reason",
+            "pr_number",
+            "pr_review_context",
+            "last_review_ts",
+            "last_comment_review_ts",
+            "merge_conflict_retries",
+            "ci_merge_failures",
+            "pr_create_failures",
+            "push_failures",
+            "review_agent_failures",
+            "review_cycles",
+            "review_invocations",
+            "review_session_expected",
+            "input_tokens",
+            "output_tokens",
+            "input_cost_usd",
+            "output_cost_usd",
+            "total_cost_usd",
+            "model_reroute_chain",
+            "limit_reroute_chain",
+            "budget_warning",
+            "budget_exceeded",
+            "memory",
+            "delegations",
+            "source",
+            "source_id",
+            "labels",
+            "auto_unblock_count",
+            "auto_unblock_last_at",
+            "auto_unblock_last_reason",
+            "ci_recovery_count",
+            "no_code_reroutes",
+        ];
+
+        for (_, entry_updates) in updates {
+            for (col, _) in *entry_updates {
+                anyhow::ensure!(
+                    ALLOWED.contains(col),
+                    "column {col} is not in the update allowlist"
+                );
+            }
+        }
+
+        let mut tx = self.pool.begin().await?;
+        for (id, entry_updates) in updates {
+            if entry_updates.is_empty() {
+                continue;
+            }
+            let mut set_parts = Vec::new();
+            let mut values: Vec<Option<String>> = Vec::new();
+            for (col, val) in *entry_updates {
+                set_parts.push(format!("{col} = ?"));
+                match val {
+                    serde_json::Value::String(s) => values.push(Some(s.clone())),
+                    serde_json::Value::Number(n) => values.push(Some(n.to_string())),
+                    serde_json::Value::Bool(b) => {
+                        values.push(Some(if *b { "1" } else { "0" }.to_string()));
+                    }
+                    serde_json::Value::Null => values.push(None),
+                    other => values.push(Some(serde_json::to_string(other)?)),
+                }
+            }
+            set_parts.push("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_string());
+            let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
+            let mut query = sqlx::query(&sql);
+            for v in &values {
+                query = query.bind(v.as_deref());
+            }
+            query = query.bind(*id);
+            query.execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Batch-increment a field for multiple tasks in a single transaction.
+    ///
+    /// Each entry is `(id, field)`. All fields must be in the incrementable allowlist.
+    #[allow(dead_code)] // provided for callers that increment counters for many tasks at once
+    pub async fn batch_increment(&self, entries: &[(i64, &str)]) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        const INCREMENTABLE: &[&str] = &[
+            "attempts",
+            "route_attempts",
+            "merge_conflict_retries",
+            "ci_merge_failures",
+            "pr_create_failures",
+            "push_failures",
+            "review_agent_failures",
+            "review_cycles",
+            "review_invocations",
+            "auto_unblock_count",
+            "ci_recovery_count",
+            "no_code_reroutes",
+        ];
+
+        for (_, field) in entries {
+            anyhow::ensure!(
+                INCREMENTABLE.contains(field),
+                "field {field} is not incrementable"
+            );
+        }
+
+        let mut tx = self.pool.begin().await?;
+        for (id, field) in entries {
+            let sql = format!(
+                "UPDATE tasks SET {field} = {field} + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
+            );
+            sqlx::query(&sql).bind(*id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reset transient failure/retry counters for multiple tasks in a single transaction.
+    ///
+    /// Preserves `review_cycles` and `ci_merge_failures` (same semantics as
+    /// [`reset_failure_counters`]).
+    #[allow(dead_code)] // provided for callers that reset counters for many tasks at once
+    pub async fn batch_reset_failure_counters(&self, ids: &[i64]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // Build WHERE id IN (?, ?, ...) placeholders
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "UPDATE tasks SET
+            attempts = 0,
+            route_attempts = 0,
+            review_agent_failures = 0,
+            review_invocations = 0,
+            merge_conflict_retries = 0,
+            pr_create_failures = 0,
+            push_failures = 0,
+            review_session_expected = 0,
+            auto_unblock_count = 0,
+            auto_unblock_last_at = '',
+            auto_unblock_last_reason = '',
+            ci_recovery_count = 0,
+            no_code_reroutes = 0,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         WHERE id IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(*id);
+        }
+        query.execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Mark multiple tasks' worktrees as cleaned in a single transaction.
+    ///
+    /// Appends a `branch_delete` activity event for each task.
+    #[allow(dead_code)] // provided for callers that clean many worktrees at once
+    pub async fn batch_mark_cleaned(&self, ids: &[i64]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "UPDATE tasks SET worktree_cleaned = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(*id);
+        }
+        query.execute(&self.pool).await?;
+        // Append activity for each task (must be done individually — activity is per-task JSON)
+        let details = serde_json::json!({ "worktree_cleaned": true });
+        for id in ids {
+            self.append_activity(*id, "branch_delete", None, None, None, None, Some(&details))
+                .await?;
+        }
+        Ok(())
+    }
+
     /// List tasks that are done/blocked with worktrees that haven't been cleaned.
     #[allow(dead_code)]
     pub async fn list_cleanable(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
