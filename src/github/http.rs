@@ -899,6 +899,7 @@ impl GhHttp {
     }
 
     /// List issues filtered by a label (paginated).
+    #[allow(dead_code)]
     pub async fn list_issues(&self, repo: &str, label: &str) -> anyhow::Result<Vec<GitHubIssue>> {
         self.list_issues_with_state(repo, label, "open").await
     }
@@ -929,6 +930,7 @@ impl GhHttp {
     /// List closed issues updated since `since` (ISO 8601), filtered by label.
     ///
     /// Used for dedup checks — prevents re-creating issues that were recently closed.
+    #[allow(dead_code)]
     pub async fn list_issues_closed_since(
         &self,
         repo: &str,

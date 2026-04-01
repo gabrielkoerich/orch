@@ -254,6 +254,7 @@ pub trait ExternalBackend: Send + Sync {
     /// Used for deduplication before creating issues. The `label` parameter
     /// narrows the search to issues with a specific label.
     /// Default returns `false` (no dedup for backends that don't support it).
+    #[allow(dead_code)]
     async fn has_open_issue_with_title(&self, _title: &str, _label: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
