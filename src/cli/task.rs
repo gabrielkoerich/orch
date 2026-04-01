@@ -13,6 +13,7 @@ use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use futures::future::join_all;
 use std::sync::Arc;
 
 /// Format a timestamp as a human-readable age (e.g. "5m", "2h", "3d").
@@ -805,11 +806,20 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
         let blocked = backend.list_by_status(Status::Blocked).await?;
         let needs_review = backend.list_by_status(Status::NeedsReview).await?;
 
-        let mut external_count = 0;
-        for task in blocked.iter().chain(needs_review.iter()) {
-            store::store_reset_counters(&store, &repo, &task.id.0).await;
-            update_status_store_first(&store, &backend, &repo, &task.id, Status::New).await?;
-            external_count += 1;
+        let tasks_to_unblock: Vec<_> = blocked.iter().chain(needs_review.iter()).collect();
+        let external_count = tasks_to_unblock.len();
+        let ext_futs = tasks_to_unblock.into_iter().map(|task| {
+            let store = store.clone();
+            let backend = backend.clone();
+            let repo = repo.clone();
+            let id = task.id.clone();
+            async move {
+                store::store_reset_counters(&store, &repo, &id.0).await;
+                update_status_store_first(&store, &backend, &repo, &id, Status::New).await
+            }
+        });
+        for result in join_all(ext_futs).await {
+            result?;
         }
 
         let mut internal_count = 0;
@@ -822,14 +832,27 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
                 .list_internal_by_status(&repo, TaskStatus::NeedsReview)
                 .await
                 .unwrap_or_default();
-            for task in internal_blocked.iter().chain(internal_needs_review.iter()) {
+            let tasks_internal: Vec<_> = internal_blocked
+                .iter()
+                .chain(internal_needs_review.iter())
+                .collect();
+            internal_count = tasks_internal.len();
+            let int_futs = tasks_internal.into_iter().map(|task| {
+                let store = store.clone();
+                let s = s.clone();
+                let repo = repo.clone();
                 let ext_id = task
                     .external_id
                     .clone()
                     .unwrap_or_else(|| format!("internal:{}", task.id));
-                store::store_reset_counters(&store, &repo, &ext_id).await;
-                s.update_status(task.id, TaskStatus::New).await?;
-                internal_count += 1;
+                let task_id = task.id;
+                async move {
+                    store::store_reset_counters(&store, &repo, &ext_id).await;
+                    s.update_status(task_id, TaskStatus::New).await
+                }
+            });
+            for result in join_all(int_futs).await {
+                result?;
             }
         }
 
@@ -1065,12 +1088,21 @@ pub async fn live() -> anyhow::Result<()> {
     println!("{:<30} {:<15} {:<10} ACTIVE", "SESSION", "TASK", "AGENT");
     println!("{}", "-".repeat(70));
 
-    for session in &sessions {
-        let active = tmux.is_session_active(&session.name).await;
-        let agent = store::opt_store_get_task(&store, &repo, &session.task_id)
-            .await
-            .and_then(|t| t.agent)
-            .unwrap_or_default();
+    let active_map = tmux.batch_session_active().await;
+    let agent_futs = sessions.iter().map(|session| {
+        let store = store.clone();
+        let repo = repo.clone();
+        let task_id = session.task_id.clone();
+        async move {
+            store::opt_store_get_task(&store, &repo, &task_id)
+                .await
+                .and_then(|t| t.agent)
+                .unwrap_or_default()
+        }
+    });
+    let agents = join_all(agent_futs).await;
+    for (session, agent) in sessions.iter().zip(agents.iter()) {
+        let active = active_map.get(&session.name).copied().unwrap_or(false);
         println!(
             "{:<30} {:<15} {:<10} {}",
             session.name,

@@ -201,6 +201,29 @@ impl TmuxManager {
         }
     }
 
+    /// Get pane_dead status for all sessions in a single tmux call.
+    ///
+    /// Returns a map from session name → alive (true = alive, false = dead/missing).
+    /// Uses `list-panes -a` to avoid one subprocess per session.
+    pub async fn batch_session_active(&self) -> HashMap<String, bool> {
+        let output = Command::new("tmux")
+            .args(["list-panes", "-a", "-F", "#{session_name} #{pane_dead}"])
+            .output()
+            .await;
+        let mut map = HashMap::new();
+        if let Ok(o) = output {
+            if o.status.success() {
+                for line in String::from_utf8_lossy(&o.stdout).lines() {
+                    let mut parts = line.trim().splitn(2, ' ');
+                    if let (Some(session), Some(dead)) = (parts.next(), parts.next()) {
+                        map.insert(session.to_string(), dead.trim() == "0");
+                    }
+                }
+            }
+        }
+        map
+    }
+
     /// List all orch-prefixed sessions with metadata.
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
         let output = Command::new("tmux")
