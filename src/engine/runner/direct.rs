@@ -67,6 +67,31 @@ pub async fn run_direct(
     timeout: Duration,
     work_dir: &str,
 ) -> Result<DirectResult> {
+    run_direct_with_session(
+        agent,
+        model,
+        system_prompt,
+        message,
+        timeout,
+        work_dir,
+        None,
+    )
+    .await
+}
+
+/// Run an agent one-shot with an optional `--session-id` for conversation continuity.
+///
+/// For claude-compatible agents (claude, kimi, minimax), appends `--session-id <uuid>`
+/// so the agent resumes prior conversation state. Other agents ignore the parameter.
+pub async fn run_direct_with_session(
+    agent: &str,
+    model: Option<&str>,
+    system_prompt: &str,
+    message: &str,
+    timeout: Duration,
+    work_dir: &str,
+    session_id: Option<&str>,
+) -> Result<DirectResult> {
     let sys_file = format!("{work_dir}/system.md");
     let msg_file = format!("{work_dir}/message.txt");
 
@@ -77,7 +102,18 @@ pub async fn run_direct(
     let permissions = PermissionRules::default();
     let timeout_cmd = format!("timeout {}", timeout.as_secs());
 
-    let shell_cmd = runner.build_command(model, &timeout_cmd, &sys_file, &msg_file, &permissions);
+    let mut shell_cmd =
+        runner.build_command(model, &timeout_cmd, &sys_file, &msg_file, &permissions);
+
+    // Append --session-id for claude-compatible agents that support conversation continuity
+    if let Some(sid) = session_id {
+        if matches!(agent, "claude" | "kimi" | "minimax") {
+            // Insert --session-id before the stdin redirect (< "msg_file")
+            if let Some(pos) = shell_cmd.rfind("< \"") {
+                shell_cmd.insert_str(pos, &format!("--session-id {sid} \\\n  "));
+            }
+        }
+    }
 
     run_shell_command(&shell_cmd, work_dir, timeout, agent).await
 }

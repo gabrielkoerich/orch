@@ -17,7 +17,7 @@ pub async fn interactive(session_id: &str) -> anyhow::Result<()> {
     };
 
     println!("orch control session ({agent}:{model}){session_label}");
-    println!("Type /model, /agent, /session, /kill to manage. Ctrl+C to exit.");
+    println!("Type /model, /agent to manage. Ctrl+C to exit.");
     println!("---");
 
     let stdin = io::stdin();
