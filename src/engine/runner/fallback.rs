@@ -114,6 +114,51 @@ pub async fn handle_error(
                     status: "routed".to_string(),
                 });
             }
+
+            // No other standard models available — try free models for simple tasks
+            let is_simple = matches!(complexity, None | Some("simple"));
+            if is_simple {
+                let free = agent_runner.free_models();
+                if !free.is_empty() {
+                    let tried_models: String = store::opt_store_get_task(store, repo, task_id)
+                        .await
+                        .map(|t| t.model_reroute_chain)
+                        .unwrap_or_default();
+                    let tried_set: std::collections::HashSet<&str> =
+                        tried_models.split(',').filter(|s| !s.is_empty()).collect();
+                    if let Some(next_free) = free.iter().find(|m| {
+                        m.as_str() != current_model
+                            && m.as_str() != model
+                            && !tried_set.contains(m.as_str())
+                            && !response::is_model_in_cooldown(agent_name, m)
+                    }) {
+                        tracing::info!(task_id, model = %next_free, "retrying with free model after model unavailable");
+                        let new_tried = if tried_models.is_empty() {
+                            next_free.clone()
+                        } else {
+                            format!("{tried_models},{next_free}")
+                        };
+                        let msg =
+                            format!("model {model} unavailable, trying free model {next_free}");
+                        store::store_set(
+                            store,
+                            repo,
+                            task_id,
+                            &[
+                                ("model", serde_json::json!(next_free.to_string())),
+                                ("model_reroute_chain", serde_json::json!(new_tried)),
+                                ("last_error", serde_json::json!(msg)),
+                            ],
+                        )
+                        .await;
+                        response::wait_for_fallback_backoff(task_id, store, repo).await;
+                        return Ok(ErrorHandleResult::EarlyReturn {
+                            status: "routed".to_string(),
+                        });
+                    }
+                }
+            }
+
             (
                 response::RetryableError::Failed,
                 format!("model {model} unavailable"),

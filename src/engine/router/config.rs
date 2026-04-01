@@ -412,6 +412,31 @@ impl RouterConfig {
         }
     }
 
+    /// Check if a model identifier looks syntactically valid.
+    /// Rejects empty strings, strings ending with slash, and strings with whitespace.
+    fn is_valid_model_identifier(model: &str) -> bool {
+        if model.is_empty() {
+            return false;
+        }
+        // Reject trailing slash (e.g., "opus/")
+        if model.ends_with('/') {
+            return false;
+        }
+        // Reject whitespace
+        if model.chars().any(char::is_whitespace) {
+            return false;
+        }
+        // Optionally, ensure that if there is a slash, both parts are non-empty
+        if let Some(slash_pos) = model.find('/') {
+            let before = &model[..slash_pos];
+            let after = &model[slash_pos + 1..];
+            if before.is_empty() || after.is_empty() {
+                return false;
+            }
+        }
+        true
+    }
+
     fn expanded_model_pool(&self, agent: &str, complexity: &str) -> Option<Vec<String>> {
         let pool = self.model_map.get(complexity)?.get(agent)?;
         if pool.is_empty() {
@@ -424,14 +449,19 @@ impl RouterConfig {
         for model in pool {
             if model == "opencode:free" {
                 has_free = true;
-            } else {
+            } else if Self::is_valid_model_identifier(model) {
                 expanded_pool.push(model.clone());
+            } else {
+                tracing::debug!(agent, model, "skipping invalid model identifier in config");
             }
         }
 
         if has_free {
             expanded_pool.extend(Self::discover_free_opencode_models());
         }
+
+        // Also filter out invalid discovered free models (should be valid but just in case)
+        expanded_pool.retain(|m| Self::is_valid_model_identifier(m));
 
         Some(expanded_pool)
     }
@@ -473,9 +503,18 @@ impl RouterConfig {
         // Random starting index — varies per task_id to distribute across the pool
         let start =
             crate::engine::router::selection::simple_hash_index_for(expanded_pool.len(), task_id);
-        // Walk the pool from start, skipping cooled models
+        // Walk the pool from start, skipping cooled and invalid models
         for i in 0..expanded_pool.len() {
             let model = &expanded_pool[(start + i) % expanded_pool.len()];
+            // Safety check: skip invalid identifiers (should already be filtered)
+            if !Self::is_valid_model_identifier(model) {
+                tracing::debug!(
+                    agent,
+                    model,
+                    "invalid model identifier slipped through validation"
+                );
+                continue;
+            }
             if !crate::engine::cooldown::is_model_in_cooldown(agent, model) {
                 return Some(model.clone());
             }
