@@ -253,19 +253,19 @@ pub(crate) async fn tick_detect_silent_agents(
             }
         }
 
-        if let Some(ref fallback) = next_agent {
+        if next_agent.is_some() {
             store::store_set(
                 &Some(Arc::clone(store)),
                 repo,
                 &task_id,
                 &[
-                    ("agent", serde_json::json!(fallback)),
+                    ("agent", serde_json::json!("")),
                     ("model", serde_json::json!("")),
                     (
                         "last_error",
                         serde_json::json!(format!(
-                            "silence detected after {}s, rerouted from {} to {}",
-                            config.silence_grace_period, agent_name, fallback
+                            "silence detected after {}s, clearing agent/model for re-route",
+                            config.silence_grace_period
                         )),
                     ),
                 ],

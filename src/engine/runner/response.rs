@@ -314,13 +314,13 @@ pub async fn handle_failover(
             record_agent_failure_with_message(agent_name, error_message).await;
         }
 
-        let msg = format!("{error_message}, rerouted to {next}");
+        let msg = format!("{error_message}, clearing agent/model for re-route");
         store::store_set(
             store,
             repo,
             task_id,
             &[
-                ("agent", serde_json::json!(next)),
+                ("agent", serde_json::json!("")),
                 ("model", serde_json::json!("")),
                 ("last_error", serde_json::json!(msg)),
             ],
@@ -328,8 +328,8 @@ pub async fn handle_failover(
         .await;
 
         // Apply exponential backoff with jitter before retry.
-        // Return "routed" (not "new") since agent/model are already stored;
-        // this skips the LLM re-routing cycle and preserves progress.
+        // Return "routed" so the router re-selects a compatible agent+model
+        // from scratch via model_for_complexity() + model_map in config.
         wait_for_fallback_backoff(task_id, store, repo).await;
 
         return "routed".to_string();
