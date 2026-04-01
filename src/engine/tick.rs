@@ -243,7 +243,10 @@ pub(crate) async fn tick_detect_silent_agents(
         if use_backend {
             if let Some(ref st) = store_task {
                 for label in &st.labels {
-                    if label.starts_with("agent:") || label.starts_with("complexity:") {
+                    if label.starts_with("agent:")
+                        || label.starts_with("complexity:")
+                        || label.starts_with("model:")
+                    {
                         backend.remove_label(&task_eid, label).await.ok();
                     }
                 }
@@ -381,9 +384,9 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 "recovering stuck task: no session found — reclaiming early → new"
             );
         }
-        // Remove stale agent label so the LLM router re-routes properly
+        // Remove stale agent/model labels so the LLM router re-routes properly
         for label in &task.labels {
-            if label.starts_with("agent:") {
+            if label.starts_with("agent:") || label.starts_with("model:") {
                 backend.remove_label(&task.id, label).await.ok();
             }
         }
@@ -667,11 +670,14 @@ pub(crate) async fn tick_route_tasks(
                         );
                     }
                 } else {
-                    // Add agent and complexity labels (additive — does not remove existing labels)
-                    let labels = vec![
+                    // Add agent, complexity, and model labels (additive — does not remove existing labels)
+                    let mut labels = vec![
                         format!("agent:{}", result.agent),
                         format!("complexity:{}", result.complexity),
                     ];
+                    if let Some(ref model) = result.model {
+                        labels.push(format!("model:{model}"));
+                    }
                     if let Err(e) = backend.set_labels(&task.id, &labels).await {
                         tracing::warn!(task_id = task.id.0, ?e, "failed to set routing labels");
                     }
