@@ -5135,3 +5135,140 @@ async fn recent_rate_limit_counts_groups_by_agent() {
     assert_eq!(counts.get("codex"), Some(&1));
     assert_eq!(counts.get("opencode"), None);
 }
+
+// ---------------------------------------------------------------------------
+// Batch methods
+// ---------------------------------------------------------------------------
+
+async fn make_task(store: &TaskStore) -> i64 {
+    store
+        .create(&NewTask {
+            external_id: None,
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Batch test".to_string(),
+            body: "".to_string(),
+            source: "manual".to_string(),
+            source_id: "".to_string(),
+            author: "".to_string(),
+            url: "".to_string(),
+            labels: vec![],
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn batch_set_fields_updates_multiple_tasks() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id1 = make_task(&store).await;
+    let id2 = make_task(&store).await;
+
+    let updates1: &[(&str, serde_json::Value)] = &[("summary", serde_json::json!("first"))];
+    let updates2: &[(&str, serde_json::Value)] = &[("summary", serde_json::json!("second"))];
+    store
+        .batch_set_fields(&[(id1, updates1), (id2, updates2)])
+        .await
+        .unwrap();
+
+    let t1 = store.get(id1).await.unwrap();
+    let t2 = store.get(id2).await.unwrap();
+    assert_eq!(t1.summary, "first");
+    assert_eq!(t2.summary, "second");
+}
+
+#[tokio::test]
+async fn batch_set_fields_empty_is_noop() {
+    let store = TaskStore::open_memory().await.unwrap();
+    store.batch_set_fields(&[]).await.unwrap();
+}
+
+#[tokio::test]
+async fn batch_set_fields_rejects_disallowed_column() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = make_task(&store).await;
+    let updates: &[(&str, serde_json::Value)] = &[("status", serde_json::json!("done"))];
+    let err = store.batch_set_fields(&[(id, updates)]).await;
+    assert!(err.is_err());
+}
+
+#[tokio::test]
+async fn batch_increment_multiple_tasks() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id1 = make_task(&store).await;
+    let id2 = make_task(&store).await;
+
+    store
+        .batch_increment(&[(id1, "attempts"), (id2, "attempts"), (id1, "attempts")])
+        .await
+        .unwrap();
+
+    let t1 = store.get(id1).await.unwrap();
+    let t2 = store.get(id2).await.unwrap();
+    assert_eq!(t1.attempts, 2);
+    assert_eq!(t2.attempts, 1);
+}
+
+#[tokio::test]
+async fn batch_increment_rejects_disallowed_field() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id = make_task(&store).await;
+    let err = store.batch_increment(&[(id, "review_cycles_bad")]).await;
+    assert!(err.is_err());
+}
+
+#[tokio::test]
+async fn batch_reset_failure_counters_preserves_review_cycles() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id1 = make_task(&store).await;
+    let id2 = make_task(&store).await;
+
+    for id in [id1, id2] {
+        store.increment(id, "attempts").await.unwrap();
+        store.increment(id, "review_cycles").await.unwrap();
+        store.increment(id, "ci_merge_failures").await.unwrap();
+        store.increment(id, "merge_conflict_retries").await.unwrap();
+    }
+
+    store
+        .batch_reset_failure_counters(&[id1, id2])
+        .await
+        .unwrap();
+
+    for id in [id1, id2] {
+        let t = store.get(id).await.unwrap();
+        assert_eq!(t.attempts, 0);
+        assert_eq!(t.merge_conflict_retries, 0);
+        assert_eq!(t.review_cycles, 1, "review_cycles must be preserved");
+        assert_eq!(
+            t.ci_merge_failures, 1,
+            "ci_merge_failures must be preserved"
+        );
+    }
+}
+
+#[tokio::test]
+async fn batch_reset_failure_counters_empty_is_noop() {
+    let store = TaskStore::open_memory().await.unwrap();
+    store.batch_reset_failure_counters(&[]).await.unwrap();
+}
+
+#[tokio::test]
+async fn batch_mark_cleaned_sets_flag() {
+    let store = TaskStore::open_memory().await.unwrap();
+    let id1 = make_task(&store).await;
+    let id2 = make_task(&store).await;
+
+    store.batch_mark_cleaned(&[id1, id2]).await.unwrap();
+
+    let t1 = store.get(id1).await.unwrap();
+    let t2 = store.get(id2).await.unwrap();
+    assert!(t1.worktree_cleaned);
+    assert!(t2.worktree_cleaned);
+}
+
+#[tokio::test]
+async fn batch_mark_cleaned_empty_is_noop() {
+    let store = TaskStore::open_memory().await.unwrap();
+    store.batch_mark_cleaned(&[]).await.unwrap();
+}
