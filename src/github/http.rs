@@ -1155,7 +1155,7 @@ impl GhHttp {
             .map(|(i, branch)| {
                 let escaped = branch.replace('\\', "\\\\").replace('"', "\\\"");
                 format!(
-                    r#"b{i}: pullRequests(headRefName: \"{escaped}\", states: [MERGED], last: 1) {{ nodes {{ merged }} }}"#
+                    r#"b{i}: pullRequests(headRefName: "{escaped}", states: [MERGED], last: 1) {{ nodes {{ merged }} }}"#
                 )
             })
             .collect::<Vec<_>>()
