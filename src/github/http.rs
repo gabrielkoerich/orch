@@ -1139,9 +1139,8 @@ impl GhHttp {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let query = format!(
-            r#"{{ "query": "{{ repository(owner: \"{owner}\", name: \"{name}\") {{ {aliases} }} }}" }}"#
-        );
+        let query =
+            format!(r#"{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}"#);
 
         let resp = self.graphql(&query).await?;
         let repo_data = resp
@@ -1320,9 +1319,8 @@ impl GhHttp {
                 .collect::<Vec<_>>()
                 .join("\n  ");
 
-            let query = format!(
-                r#"{{ "query": "{{ repository(owner: \"{owner}\", name: \"{name}\") {{ {aliases} }} }}" }}"#
-            );
+            let query =
+                format!(r#"{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}"#);
 
             let resp = self.graphql(&query).await?;
             let repo_data = resp
@@ -1370,9 +1368,8 @@ impl GhHttp {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let query = format!(
-            r#"{{ "query": "{{ repository(owner: \"{owner}\", name: \"{name}\") {{ {aliases} }} }}" }}"#
-        );
+        let query =
+            format!(r#"{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}"#);
 
         let resp = self.graphql(&query).await?;
         let repo_data = resp
