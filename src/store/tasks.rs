@@ -321,7 +321,7 @@ impl TaskStore {
     .fetch_one(&self.pool)
     .await?;
 
-        Ok(row.get("id"))
+        Ok(row.try_get("id").unwrap_or(0))
     }
 
     /// Create an internal task, returning its auto-generated ID.
@@ -412,7 +412,7 @@ impl TaskStore {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(row.get("id"))
+        Ok(row.try_get("id").unwrap_or(0))
     }
 
     // ---------------------------------------------------------------
@@ -425,9 +425,9 @@ impl TaskStore {
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
-        let from_status: String = previous.get("status");
-        let agent: Option<String> = previous.get("agent");
-        let model: Option<String> = previous.get("model");
+        let from_status: String = previous.try_get("status").unwrap_or_default();
+        let agent: Option<String> = previous.try_get("agent").unwrap_or(None);
+        let model: Option<String> = previous.try_get("model").unwrap_or(None);
         let sql = if status == TaskStatus::Blocked {
             "UPDATE tasks SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?"
         } else if status == TaskStatus::NeedsReview {
@@ -460,9 +460,9 @@ impl TaskStore {
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
-        let from_status: String = previous.get("status");
-        let agent: Option<String> = previous.get("agent");
-        let model: Option<String> = previous.get("model");
+        let from_status: String = previous.try_get("status").unwrap_or_default();
+        let agent: Option<String> = previous.try_get("agent").unwrap_or(None);
+        let model: Option<String> = previous.try_get("model").unwrap_or(None);
         sqlx::query(
             "UPDATE tasks SET status = 'new', branch = '', worktree = '', worktree_cleaned = 0, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
         )
@@ -797,7 +797,7 @@ impl TaskStore {
 
         let row = sqlx::query(&sql).bind(id).fetch_one(&self.pool).await?;
 
-        Ok(row.get("val"))
+        Ok(row.try_get("val").unwrap_or(0))
     }
 
     /// Reset all failure/retry counters to zero.
@@ -915,7 +915,7 @@ impl TaskStore {
             .fetch_one(&mut *tx)
             .await?;
 
-        let memory_str: String = row.get("memory");
+        let memory_str: String = row.try_get("memory").unwrap_or_default();
         let mut memory: Vec<MemoryEntry> = serde_json::from_str(&memory_str)
             .inspect_err(
                 |e| tracing::warn!(task_id = id, error = %e, "corrupt memory JSON, resetting"),
@@ -943,7 +943,7 @@ impl TaskStore {
             .fetch_one(&self.pool)
             .await?;
 
-        let memory_str: String = row.get("memory");
+        let memory_str: String = row.try_get("memory").unwrap_or_default();
         let mut memory: Vec<MemoryEntry> = serde_json::from_str(&memory_str)
             .inspect_err(|e| tracing::warn!(task_id = id, error = %e, "corrupt memory JSON"))
             .unwrap_or_default();
@@ -1288,7 +1288,7 @@ impl TaskStore {
         .fetch_one(&self.pool)
         .await?;
 
-        let run_id = row.get("id");
+        let run_id = row.try_get("id").unwrap_or(0);
         let event_type = match run.run_type {
             "review" => "review_start",
             _ => "dispatch",
@@ -1342,10 +1342,10 @@ impl TaskStore {
         .execute(&self.pool)
         .await?;
         if let Some(run_ctx) = run_ctx {
-            let task_id: i64 = run_ctx.get("task_id");
-            let run_type: String = run_ctx.get("run_type");
-            let agent: String = run_ctx.get("agent");
-            let model: String = run_ctx.get("model");
+            let task_id: i64 = run_ctx.try_get("task_id").unwrap_or(0);
+            let run_type: String = run_ctx.try_get("run_type").unwrap_or_default();
+            let agent: String = run_ctx.try_get("agent").unwrap_or_default();
+            let model: String = run_ctx.try_get("model").unwrap_or_default();
             if run.outcome == "timeout" {
                 self.append_activity(
                     task_id,
@@ -1502,18 +1502,18 @@ impl TaskStore {
     // ---------------------------------------------------------------
 
     fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Task> {
-        let status_str: String = row.get("status");
-        let labels_str: String = row.get("labels");
-        let memory_str: String = row.get("memory");
-        let delegations_str: String = row.get("delegations");
+        let status_str: String = row.try_get("status").unwrap_or_default();
+        let labels_str: String = row.try_get("labels").unwrap_or_default();
+        let memory_str: String = row.try_get("memory").unwrap_or_default();
+        let delegations_str: String = row.try_get("delegations").unwrap_or_default();
 
         Ok(Task {
-            id: row.get("id"),
-            external_id: row.get("external_id"),
-            repo: row.get("repo"),
-            origin: row.get("origin"),
-            title: row.get("title"),
-            body: row.get("body"),
+            id: row.try_get("id").unwrap_or(0),
+            external_id: row.try_get("external_id").unwrap_or(None),
+            repo: row.try_get("repo").unwrap_or_default(),
+            origin: row.try_get("origin").unwrap_or_default(),
+            title: row.try_get("title").unwrap_or_default(),
+            body: row.try_get("body").unwrap_or_default(),
             status: TaskStatus::from_str(&status_str).unwrap_or_else(|| {
                 tracing::warn!(
                     status = status_str,
@@ -1521,54 +1521,54 @@ impl TaskStore {
                 );
                 TaskStatus::New
             }),
-            source: row.get("source"),
-            source_id: row.get("source_id"),
-            author: row.get("author"),
-            url: row.get("url"),
+            source: row.try_get("source").unwrap_or_default(),
+            source_id: row.try_get("source_id").unwrap_or_default(),
+            author: row.try_get("author").unwrap_or_default(),
+            url: row.try_get("url").unwrap_or_default(),
             labels: serde_json::from_str(&labels_str)
                 .inspect_err(
                     |e| tracing::warn!(error = %e, "corrupt labels JSON, defaulting to empty"),
                 )
                 .unwrap_or_default(),
-            agent: row.get("agent"),
-            model: row.get("model"),
-            complexity: row.get("complexity"),
-            route_reason: row.get("route_reason"),
-            agent_profile: row.get("agent_profile"),
-            selected_skills: row.get("selected_skills"),
-            route_attempts: row.get("route_attempts"),
-            attempts: row.get("attempts"),
-            branch: row.get("branch"),
-            worktree: row.get("worktree"),
-            worktree_cleaned: row.get::<i32, _>("worktree_cleaned") != 0,
-            summary: row.get("summary"),
-            last_error: row.get("last_error"),
-            parent_id: row.get("parent_id"),
-            block_reason: row.get("block_reason"),
-            pr_number: row.get("pr_number"),
-            pr_review_context: row.get("pr_review_context"),
-            last_review_ts: row.get("last_review_ts"),
-            last_comment_review_ts: row.get("last_comment_review_ts"),
-            merge_conflict_retries: row.get("merge_conflict_retries"),
-            ci_merge_failures: row.get("ci_merge_failures"),
-            pr_create_failures: row.get("pr_create_failures"),
+            agent: row.try_get("agent").unwrap_or(None),
+            model: row.try_get("model").unwrap_or(None),
+            complexity: row.try_get("complexity").unwrap_or_default(),
+            route_reason: row.try_get("route_reason").unwrap_or_default(),
+            agent_profile: row.try_get("agent_profile").unwrap_or_default(),
+            selected_skills: row.try_get("selected_skills").unwrap_or_default(),
+            route_attempts: row.try_get("route_attempts").unwrap_or(0),
+            attempts: row.try_get("attempts").unwrap_or(0),
+            branch: row.try_get("branch").unwrap_or_default(),
+            worktree: row.try_get("worktree").unwrap_or_default(),
+            worktree_cleaned: row.try_get::<i32, _>("worktree_cleaned").unwrap_or(0) != 0,
+            summary: row.try_get("summary").unwrap_or_default(),
+            last_error: row.try_get("last_error").unwrap_or_default(),
+            parent_id: row.try_get("parent_id").unwrap_or(None),
+            block_reason: row.try_get("block_reason").unwrap_or(None),
+            pr_number: row.try_get("pr_number").unwrap_or(None),
+            pr_review_context: row.try_get("pr_review_context").unwrap_or_default(),
+            last_review_ts: row.try_get("last_review_ts").unwrap_or_default(),
+            last_comment_review_ts: row.try_get("last_comment_review_ts").unwrap_or_default(),
+            merge_conflict_retries: row.try_get("merge_conflict_retries").unwrap_or(0),
+            ci_merge_failures: row.try_get("ci_merge_failures").unwrap_or(0),
+            pr_create_failures: row.try_get("pr_create_failures").unwrap_or(0),
             push_failures: row.try_get::<i32, _>("push_failures").unwrap_or(0),
-            review_agent_failures: row.get("review_agent_failures"),
-            review_cycles: row.get("review_cycles"),
+            review_agent_failures: row.try_get("review_agent_failures").unwrap_or(0),
+            review_cycles: row.try_get("review_cycles").unwrap_or(0),
             review_invocations: row.try_get::<i32, _>("review_invocations").unwrap_or(0),
             review_session_expected: row
                 .try_get::<i32, _>("review_session_expected")
                 .unwrap_or(0)
                 != 0,
-            input_tokens: row.get("input_tokens"),
-            output_tokens: row.get("output_tokens"),
-            input_cost_usd: row.get("input_cost_usd"),
-            output_cost_usd: row.get("output_cost_usd"),
-            total_cost_usd: row.get("total_cost_usd"),
-            model_reroute_chain: row.get("model_reroute_chain"),
-            limit_reroute_chain: row.get("limit_reroute_chain"),
-            budget_warning: row.get("budget_warning"),
-            budget_exceeded: row.get::<i32, _>("budget_exceeded") != 0,
+            input_tokens: row.try_get("input_tokens").unwrap_or(0),
+            output_tokens: row.try_get("output_tokens").unwrap_or(0),
+            input_cost_usd: row.try_get("input_cost_usd").unwrap_or(0.0),
+            output_cost_usd: row.try_get("output_cost_usd").unwrap_or(0.0),
+            total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
+            model_reroute_chain: row.try_get("model_reroute_chain").unwrap_or_default(),
+            limit_reroute_chain: row.try_get("limit_reroute_chain").unwrap_or_default(),
+            budget_warning: row.try_get("budget_warning").unwrap_or_default(),
+            budget_exceeded: row.try_get::<i32, _>("budget_exceeded").unwrap_or(0) != 0,
             memory: serde_json::from_str(&memory_str)
                 .inspect_err(
                     |e| tracing::warn!(error = %e, "corrupt memory JSON, defaulting to empty"),
@@ -1646,41 +1646,41 @@ impl TaskStore {
 
     fn row_to_run(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskRun> {
         Ok(TaskRun {
-            id: row.get("id"),
-            task_id: row.get("task_id"),
-            attempt: row.get("attempt"),
-            run_type: row.get("run_type"),
-            agent: row.get("agent"),
-            model: row.get("model"),
-            command: row.get("command"),
-            prompt: row.get("prompt"),
-            env_vars: row.get("env_vars"),
-            exit_code: row.get("exit_code"),
-            stdout: row.get("stdout"),
-            stderr: row.get("stderr"),
-            parsed_response: row.get("parsed_response"),
-            outcome: row.get("outcome"),
-            error: row.get("error"),
-            input_tokens: row.get("input_tokens"),
-            output_tokens: row.get("output_tokens"),
-            total_cost_usd: row.get("total_cost_usd"),
-            duration_secs: row.get("duration_secs"),
-            started_at: row.get("started_at"),
-            completed_at: row.get("completed_at"),
+            id: row.try_get("id").unwrap_or(0),
+            task_id: row.try_get("task_id").unwrap_or(0),
+            attempt: row.try_get("attempt").unwrap_or(0),
+            run_type: row.try_get("run_type").unwrap_or_default(),
+            agent: row.try_get("agent").unwrap_or_default(),
+            model: row.try_get("model").unwrap_or_default(),
+            command: row.try_get("command").unwrap_or_default(),
+            prompt: row.try_get("prompt").unwrap_or_default(),
+            env_vars: row.try_get("env_vars").unwrap_or_default(),
+            exit_code: row.try_get("exit_code").unwrap_or(None),
+            stdout: row.try_get("stdout").unwrap_or_default(),
+            stderr: row.try_get("stderr").unwrap_or_default(),
+            parsed_response: row.try_get("parsed_response").unwrap_or_default(),
+            outcome: row.try_get("outcome").unwrap_or_default(),
+            error: row.try_get("error").unwrap_or_default(),
+            input_tokens: row.try_get("input_tokens").unwrap_or(0),
+            output_tokens: row.try_get("output_tokens").unwrap_or(0),
+            total_cost_usd: row.try_get("total_cost_usd").unwrap_or(0.0),
+            duration_secs: row.try_get("duration_secs").unwrap_or(0.0),
+            started_at: row.try_get("started_at").unwrap_or_default(),
+            completed_at: row.try_get("completed_at").unwrap_or(None),
         })
     }
 
     fn row_to_activity(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskActivity> {
-        let details_str: String = row.get("details");
+        let details_str: String = row.try_get("details").unwrap_or_else(|_| "{}".to_string());
         Ok(TaskActivity {
-            id: row.get("id"),
-            task_id: row.get("task_id"),
-            timestamp: row.get("timestamp"),
-            event_type: row.get("event_type"),
-            from_status: row.get("from_status"),
-            to_status: row.get("to_status"),
-            agent: row.get("agent"),
-            model: row.get("model"),
+            id: row.try_get("id").unwrap_or(0),
+            task_id: row.try_get("task_id").unwrap_or(0),
+            timestamp: row.try_get("timestamp").unwrap_or_default(),
+            event_type: row.try_get("event_type").unwrap_or_default(),
+            from_status: row.try_get("from_status").unwrap_or(None),
+            to_status: row.try_get("to_status").unwrap_or(None),
+            agent: row.try_get("agent").unwrap_or(None),
+            model: row.try_get("model").unwrap_or(None),
             details: serde_json::from_str(&details_str).unwrap_or_else(|_| serde_json::json!({})),
         })
     }
