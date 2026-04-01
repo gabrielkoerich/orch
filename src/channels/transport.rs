@@ -132,8 +132,6 @@ impl Transport {
         }
     }
 
-
-
     /// Clear any cached last_output for a task.
     ///
     /// When a task is rebound to a new tmux session (retry) the previous
