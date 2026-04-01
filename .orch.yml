@@ -27,6 +27,7 @@ jobs:
       - **Security** - unsafe shell usage, secret leakage in logs/errors, unchecked external input, path handling bugs
       - **Technical debt** - fragile abstractions, duplicated logic in similar paths, inconsistencies that increase bug risk
       - **Test gaps** - untested error paths, regressions, concurrency behavior, prompt behavior, and boundary conditions
+      - **Inefficiencies** - Audit and refactor codebase for unnecessary SQL queries, serial API calls, and O(n) inefficiencies.
       - **Code quality** - prefer `use` imports for functions, types, and traits instead of fully qualified module paths, even for a single call, unless module context or a name collision makes that worse; keep idiomatic Rust, consistent formatting, and clear variable names
       - **Unnecessary complexity** - over-engineered abstractions, redundant indirection layers, features that duplicate existing functionality, overly clever code that could be simpler, multiple code paths that could be unified. The system is already complex — every review should ask "can this be simpler?"
 
@@ -36,7 +37,7 @@ jobs:
 
       Use `gh issue create --title "..." --body "..." --label "bug"` to create issues. Orch will sync and dispatch them.
 
-      - Maximum 2-3 issues. Fewer is better.
+      - Maximum 3-5 issues. Fewer is better.
       - Each issue MUST include: file path, line numbers, what's wrong, and what the fix should be.
       - Trace symptoms to root causes. ONE issue per root cause.
       - Do NOT create issues about `src/github/token.rs` or the agent runner — settled.
@@ -132,7 +133,7 @@ jobs:
 
       If you find operational problems (stuck tasks, recurring failures, error patterns), create issues with `gh issue create --title "..." --body "..." --label "bug"`.
 
-      - Maximum 3-5 issues. Only for operational problems found during this review.
+      - Maximum 2-3 issues. Only for operational problems found during this review.
       - Do NOT duplicate issues that already exist (`gh issue list --state open`).
       - Do NOT create feature/improvement issues — that's the development job's responsibility.
 
