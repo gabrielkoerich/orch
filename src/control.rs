@@ -52,10 +52,6 @@ pub struct ModelSpec {
 pub enum ControlCommand {
     Model(Option<String>),
     Agent(Option<String>),
-    /// Kill the persistent tmux session.
-    Kill,
-    /// Show persistent session info.
-    Session,
 }
 
 fn default_model_for_agent(agent: &str) -> &'static str {
@@ -81,8 +77,6 @@ pub fn parse_control_command(message: &str) -> Option<ControlCommand> {
         "agent" => Some(ControlCommand::Agent(
             (!args.is_empty()).then(|| args.to_string()),
         )),
-        "kill" => Some(ControlCommand::Kill),
-        "session" => Some(ControlCommand::Session),
         _ => None,
     }
 }
@@ -387,52 +381,31 @@ fn format_switched_spec(spec: &ModelSpec) -> String {
     format!("Switched to **{}:{}** (validated)", spec.agent, spec.model)
 }
 
-async fn handle_control_command(
-    store: &TaskStore,
-    session_id: &str,
-    command: ControlCommand,
-) -> Result<String> {
+async fn handle_control_command(store: &TaskStore, command: ControlCommand) -> Result<String> {
     match command {
         ControlCommand::Model(None) => Ok(format_current_spec(&get_current_spec(store).await)),
         ControlCommand::Model(Some(new_spec)) => {
             let spec = parse_model_spec(&new_spec);
             validate_model(&spec).await?;
             set_model_spec(store, &spec).await?;
-            // Kill persistent session so next message starts a fresh one with new model
-            let _ = crate::chat_session::kill_session(session_id).await;
             Ok(format_switched_spec(&spec))
         }
         ControlCommand::Agent(None) => Ok(format_current_spec(&get_current_spec(store).await)),
         ControlCommand::Agent(Some(agent)) => {
             validate_agent(&agent)?;
             let spec = set_agent_spec(store, &agent).await?;
-            // Kill persistent session so next message starts a fresh one with new agent
-            let _ = crate::chat_session::kill_session(session_id).await;
             Ok(format_switched_spec(&spec))
         }
-        ControlCommand::Kill => {
-            let killed = crate::chat_session::kill_session(session_id).await?;
-            if killed {
-                Ok("Persistent session killed. Next message will start a new one.".to_string())
-            } else {
-                Ok("No active persistent session.".to_string())
-            }
-        }
-        ControlCommand::Session => match crate::chat_session::session_info(session_id).await {
-            Some(info) => Ok(format!("Persistent session: {info}")),
-            None => Ok("No active persistent session. Next message will create one.".to_string()),
-        },
     }
 }
 
 /// Handle a control-session command if present.
 pub async fn maybe_handle_control_command(
     store: &TaskStore,
-    session_id: &str,
     message: &str,
 ) -> Result<Option<String>> {
     Ok(match parse_control_command(message) {
-        Some(command) => Some(handle_control_command(store, session_id, command).await?),
+        Some(command) => Some(handle_control_command(store, command).await?),
         None => None,
     })
 }
@@ -545,40 +518,6 @@ pub async fn invoke_agent(
     })
 }
 
-/// Invoke an agent via a persistent tmux session.
-///
-/// Reuses an existing session if available, creating a new one on first call.
-/// Much faster (~2s) than one-shot invocation (~15-20s) for subsequent messages.
-///
-/// Falls back to one-shot invocation if the persistent session fails.
-pub async fn invoke_agent_persistent(
-    session_id: &str,
-    agent: &str,
-    model: &str,
-    system_prompt: &str,
-    message: &str,
-) -> Result<InvokeResult> {
-    let dir = prepare_temp_dir().await?;
-    let sys_file = format!("{dir}/system.md");
-    tokio::fs::write(&sys_file, system_prompt).await?;
-
-    match crate::chat_session::send_persistent(session_id, agent, model, &sys_file, message).await {
-        Ok(response) => Ok(InvokeResult {
-            text: response.text,
-            input_tokens: response.input_tokens,
-            output_tokens: response.output_tokens,
-        }),
-        Err(e) => {
-            tracing::warn!(
-                session_id,
-                error = %e,
-                "persistent session failed — falling back to one-shot"
-            );
-            invoke_agent(agent, model, system_prompt, message).await
-        }
-    }
-}
-
 /// High-level entry point: process a user message and return the assistant response.
 ///
 /// Handles `/model` and `/agent` commands, assembles context, invokes the agent,
@@ -591,7 +530,7 @@ pub async fn send_message(
     message: &str,
 ) -> Result<String> {
     // Handle control commands — don't store as messages.
-    if let Some(response) = maybe_handle_control_command(store, session_id, message).await? {
+    if let Some(response) = maybe_handle_control_command(store, message).await? {
         return Ok(response);
     }
 
@@ -632,9 +571,8 @@ pub async fn send_message(
     // Prepend live state to user message so the LLM sees it directly
     let full_message = format!("{}\n\n---\n\n{}", ctx.state, message);
 
-    // Invoke agent via persistent session (falls back to one-shot on failure)
-    let result =
-        invoke_agent_persistent(session_id, &agent, &model, &ctx.system, &full_message).await?;
+    // Invoke agent one-shot via bash -c (stateless process, stateful database)
+    let result = invoke_agent(&agent, &model, &ctx.system, &full_message).await?;
 
     // Parse response for summary and memory tags
     let parsed = parse_response(&result.text);
@@ -887,11 +825,8 @@ mod tests {
                 "opencode:deepseek-r1".to_string()
             )))
         );
-        assert_eq!(parse_control_command("/kill"), Some(ControlCommand::Kill));
-        assert_eq!(
-            parse_control_command("/session"),
-            Some(ControlCommand::Session)
-        );
+        assert_eq!(parse_control_command("/kill"), None);
+        assert_eq!(parse_control_command("/session"), None);
     }
 
     #[tokio::test]
@@ -951,7 +886,7 @@ mod tests {
         set_agent(&store, "claude").await.unwrap();
 
         // Try switching to an unknown agent — should fail
-        let result = maybe_handle_control_command(&store, "default", "/agent bogusagent").await;
+        let result = maybe_handle_control_command(&store, "/agent bogusagent").await;
         assert!(result.is_err(), "should reject unknown agent");
         assert!(result.unwrap_err().to_string().contains("unknown agent"));
 
