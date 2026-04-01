@@ -1236,6 +1236,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     tracing::warn!(
                         remaining_secs = remaining.as_secs(),
                         rate_limit_hits = m.hits,
+                        five_xx_hits = m.five_xx_hits,
                         proactive_throttles = m.proactive_throttles,
                         wait_secs_total = m.wait_secs,
                         rest_remaining = ?m.rest_remaining,

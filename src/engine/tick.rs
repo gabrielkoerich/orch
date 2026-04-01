@@ -639,6 +639,17 @@ pub(crate) async fn tick_route_tasks(
     repo: &str,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase3a.route").entered();
+    // Global GitHub 5xx circuit breaker — skip routing during sustained GitHub outages
+    // to avoid routing-heavy retry storms. Tasks will remain in 'new' status and be
+    // retried when the circuit closes.
+    if crate::engine::cooldown::is_github_circuit_open() {
+        let remaining = crate::engine::cooldown::github_circuit_remaining_secs();
+        tracing::info!(
+            remaining_secs = remaining,
+            "GitHub 5xx circuit breaker open — skipping routing phase"
+        );
+        return Ok(());
+    }
     let new_tasks = task_manager.list_routable().await?;
     let routable: Vec<&ExternalTask> = new_tasks
         .iter()
