@@ -1006,8 +1006,39 @@ async fn apply_fixes(
                         fixed += 1;
                     }
                     Err(e) => {
-                        eprintln!("  fix failed for #{}: PR creation failed: {}", f.task_id, e);
-                        skipped += 1;
+                        // PR creation failed — it may be a transient server error. Re-check GitHub
+                        // for an existing PR for the branch and link it if found.
+                        eprintln!(
+                            "  PR creation error for #{}: {}. Re-checking for existing PR...",
+                            f.task_id, e
+                        );
+                        match gh.get_pr_number(repo, &task.branch).await {
+                            Ok(Some(pr_num)) => {
+                                let _ = store
+                                    .set_fields(
+                                        *store_id,
+                                        &[("pr_number", serde_json::json!(pr_num as i64))],
+                                    )
+                                    .await;
+                                reopen_and_set_needs_review(
+                                    store, *store_id, &task, backend, gh, repo,
+                                )
+                                .await;
+                                println!(
+                                    "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
+                                    f.task_id, pr_num
+                                );
+                                fixed += 1;
+                            }
+                            Ok(None) => {
+                                eprintln!("  fix failed for #{}: PR creation failed and no PR found for branch", f.task_id);
+                                skipped += 1;
+                            }
+                            Err(err2) => {
+                                eprintln!("  fix failed for #{}: PR creation failed: {}; and PR lookup failed: {}", f.task_id, e, err2);
+                                skipped += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -1052,8 +1083,37 @@ async fn apply_fixes(
                         fixed += 1;
                     }
                     Err(e) => {
-                        eprintln!("  fix failed for #{}: PR creation failed: {}", f.task_id, e);
-                        skipped += 1;
+                        eprintln!(
+                            "  PR creation error for #{}: {}. Re-checking for existing PR...",
+                            f.task_id, e
+                        );
+                        match gh.get_pr_number(repo, &task.branch).await {
+                            Ok(Some(pr_num)) => {
+                                let _ = store
+                                    .set_fields(
+                                        *store_id,
+                                        &[("pr_number", serde_json::json!(pr_num as i64))],
+                                    )
+                                    .await;
+                                reopen_and_set_needs_review(
+                                    store, *store_id, &task, backend, gh, repo,
+                                )
+                                .await;
+                                println!(
+                                    "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
+                                    f.task_id, pr_num
+                                );
+                                fixed += 1;
+                            }
+                            Ok(None) => {
+                                eprintln!("  fix failed for #{}: PR creation failed and no PR found for branch", f.task_id);
+                                skipped += 1;
+                            }
+                            Err(err2) => {
+                                eprintln!("  fix failed for #{}: PR creation failed: {}; and PR lookup failed: {}", f.task_id, e, err2);
+                                skipped += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -1086,8 +1146,37 @@ async fn apply_fixes(
                         fixed += 1;
                     }
                     Err(e) => {
-                        eprintln!("  fix failed for #{}: PR creation failed: {}", f.task_id, e);
-                        skipped += 1;
+                        eprintln!(
+                            "  PR creation error for #{}: {}. Re-checking for existing PR...",
+                            f.task_id, e
+                        );
+                        match gh.get_pr_number(repo, &task.branch).await {
+                            Ok(Some(pr_num)) => {
+                                let _ = store
+                                    .set_fields(
+                                        *store_id,
+                                        &[("pr_number", serde_json::json!(pr_num as i64))],
+                                    )
+                                    .await;
+                                reopen_and_set_needs_review(
+                                    store, *store_id, &task, backend, gh, repo,
+                                )
+                                .await;
+                                println!(
+                                    "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
+                                    f.task_id, pr_num
+                                );
+                                fixed += 1;
+                            }
+                            Ok(None) => {
+                                eprintln!("  fix failed for #{}: PR creation failed and no PR found for branch", f.task_id);
+                                skipped += 1;
+                            }
+                            Err(err2) => {
+                                eprintln!("  fix failed for #{}: PR creation failed: {}; and PR lookup failed: {}", f.task_id, e, err2);
+                                skipped += 1;
+                            }
+                        }
                     }
                 }
             }
