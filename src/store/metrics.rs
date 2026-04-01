@@ -64,6 +64,7 @@ pub struct ErrorStat {
 
 /// Task with high review cycle count (persistent review loop).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct HighReviewCycleTask {
     pub external_id: Option<String>,
     pub agent: Option<String>,
@@ -100,6 +101,7 @@ pub struct CostByGroup {
 }
 
 /// Build the week-scoped KV key for the self-improvement counter.
+#[allow(dead_code)]
 fn self_improvement_key() -> String {
     let now = Utc::now();
     format!(
@@ -636,6 +638,7 @@ impl TaskStore {
     }
 
     /// Get count of self-improvement issues created this week.
+    #[allow(dead_code)]
     pub async fn count_self_improvement_issues_7d(&self) -> anyhow::Result<i64> {
         let key = self_improvement_key();
         let count = self.kv_get(&key).await?;
@@ -643,6 +646,7 @@ impl TaskStore {
     }
 
     /// Get tasks with high review cycle counts (persistent review loops) from the last 7 days.
+    #[allow(dead_code)]
     pub async fn get_high_review_cycle_tasks_7d(&self) -> anyhow::Result<Vec<HighReviewCycleTask>> {
         let rows = sqlx::query(
             "SELECT external_id, agent, review_cycles, title
@@ -668,6 +672,7 @@ impl TaskStore {
 
     /// Increment the self-improvement issue counter for the current week.
     /// Uses a single atomic SQL statement to avoid TOCTOU race conditions.
+    #[allow(dead_code)]
     pub async fn increment_self_improvement_counter(&self) -> anyhow::Result<()> {
         let key = self_improvement_key();
         sqlx::query(
