@@ -436,14 +436,32 @@ pub(crate) async fn sync_tick(
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
 
+    // Global GitHub 5xx circuit breaker — skip non-critical background work
+    // during sustained GitHub outages to reduce churn and wasted API calls.
+    let gh_circuit_open = crate::engine::cooldown::is_github_circuit_open();
+
+    if gh_circuit_open {
+        let remaining = crate::engine::cooldown::github_circuit_remaining_secs();
+        tracing::debug!(
+            remaining_secs = remaining,
+            "GitHub 5xx circuit breaker open — skipping non-critical sync work"
+        );
+        // Persist circuit breaker state as a metric for operators.
+        kv_set_prefer_store(&Some(store), "metrics:orch.github_5xx_circuit.open", "1").await;
+    } else {
+        kv_set_prefer_store(&Some(store), "metrics:orch.github_5xx_circuit.open", "0").await;
+    }
+
     // 0. Ingest all active external tasks into the unified store.
     //    This ensures the store has data for tasks created before dual-write was added.
-    if let Err(e) = ingest_external_tasks(backend, repo, store).await {
-        tracing::debug!(err = %e, "external task ingest failed");
+    if !gh_circuit_open {
+        if let Err(e) = ingest_external_tasks(backend, repo, store).await {
+            tracing::debug!(err = %e, "external task ingest failed");
+        }
     }
 
     // 1. Cleanup worktrees for done tasks (background — must not block routing/dispatch)
-    {
+    if !gh_circuit_open {
         let backend = Arc::clone(backend);
         let repo = repo.to_string();
         let task_manager = Arc::clone(task_manager);
@@ -456,18 +474,26 @@ pub(crate) async fn sync_tick(
     }
 
     // 2. Check for merged PRs (in_review → done)
-    if let Err(e) = check_merged_prs(backend, repo, store, task_manager).await {
-        tracing::warn!(err = %e, "PR merge check failed");
+    if !gh_circuit_open {
+        if let Err(e) = check_merged_prs(backend, repo, store, task_manager).await {
+            tracing::warn!(err = %e, "PR merge check failed");
+        }
     }
 
     // 3. Scan for @mentions
-    if let Err(e) = scan_mentions(backend, Some(store), repo).await {
-        tracing::warn!(err = %e, "mention scan failed");
+    if !gh_circuit_open {
+        if let Err(e) = scan_mentions(backend, Some(store), repo).await {
+            tracing::warn!(err = %e, "mention scan failed");
+        }
     }
 
     // 4. Review open PRs (parse review comments, create follow-ups)
-    if let Err(e) = review_open_prs(backend, repo, config, task_manager, store, dispatching).await {
-        tracing::warn!(err = %e, "PR review failed");
+    if !gh_circuit_open {
+        if let Err(e) =
+            review_open_prs(backend, repo, config, task_manager, store, dispatching).await
+        {
+            tracing::warn!(err = %e, "PR review failed");
+        }
     }
 
     // 5. Detect stale InReview tasks and recover them.

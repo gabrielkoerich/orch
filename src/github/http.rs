@@ -188,6 +188,8 @@ static METRIC_RATE_LIMIT_HITS: AtomicU64 = AtomicU64::new(0);
 static METRIC_PROACTIVE_THROTTLES: AtomicU64 = AtomicU64::new(0);
 /// Total seconds spent waiting due to proactive throttle or hard backoff.
 static METRIC_WAIT_SECS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total 5xx server error responses received (REST + GraphQL).
+static METRIC_5XX_HITS: AtomicU64 = AtomicU64::new(0);
 
 // ── Shared token resolver ────────────────────────────────────────────
 
@@ -315,6 +317,16 @@ impl GhHttp {
                 rl.record_success();
             }
         }
+        // Detect 5xx server errors for the global circuit breaker.
+        let status = resp.status();
+        if status.is_server_error() {
+            METRIC_5XX_HITS.fetch_add(1, Ordering::Relaxed);
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::spawn(async move {
+                    crate::engine::cooldown::record_github_5xx().await;
+                });
+            }
+        }
     }
 
     fn record_graphql_response(resp: &Response) {
@@ -324,6 +336,16 @@ impl GhHttp {
                 rl.record_rate_limit();
             } else if resp.status().is_success() {
                 rl.record_success();
+            }
+        }
+        // Detect 5xx server errors for the global circuit breaker.
+        let status = resp.status();
+        if status.is_server_error() {
+            METRIC_5XX_HITS.fetch_add(1, Ordering::Relaxed);
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::spawn(async move {
+                    crate::engine::cooldown::record_github_5xx().await;
+                });
             }
         }
     }
@@ -2250,6 +2272,8 @@ pub struct RateLimitMetrics {
     pub rest_remaining: Option<u32>,
     /// Current GraphQL remaining quota (None if not yet observed).
     pub graphql_remaining: Option<u32>,
+    /// Total 5xx server error responses received (REST + GraphQL combined).
+    pub five_xx_hits: u64,
 }
 
 /// Return a snapshot of GitHub API rate-limit metrics.
@@ -2262,6 +2286,7 @@ pub fn rate_limit_metrics() -> RateLimitMetrics {
         wait_secs: METRIC_WAIT_SECS_TOTAL.load(Ordering::Relaxed),
         rest_remaining,
         graphql_remaining,
+        five_xx_hits: METRIC_5XX_HITS.load(Ordering::Relaxed),
     }
 }
 

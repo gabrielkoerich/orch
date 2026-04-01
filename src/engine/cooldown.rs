@@ -143,6 +143,23 @@ pub async fn init_cooldown_store(store: Arc<crate::store::TaskStore>) {
         }
     }
 
+    // Load GitHub 5xx circuit breaker state if it was persisted before restart.
+    if let Ok(Some(raw)) = store.kv_get("cooldown:github:5xx").await {
+        if let Ok(cooldown_until) = raw.parse::<i64>() {
+            let now = chrono::Utc::now().timestamp();
+            if now < cooldown_until {
+                if let Ok(mut open) = github_5xx_circuit_open().lock() {
+                    *open = Some(cooldown_until);
+                    let remaining = cooldown_until - now;
+                    tracing::warn!(
+                        remaining_secs = remaining,
+                        "GitHub 5xx circuit breaker restored from KV (still open)"
+                    );
+                }
+            }
+        }
+    }
+
     if let Ok(mut slot) = cooldown_store().lock() {
         *slot = Some(store);
     }
@@ -671,6 +688,160 @@ pub fn clear_expired_cooldowns() {
     let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
     let now = chrono::Utc::now().timestamp();
     map.retain(|_key, entry| now < entry.cooldown_until);
+}
+
+// ---------------------------------------------------------------------------
+// GitHub 5xx circuit breaker
+// ---------------------------------------------------------------------------
+
+/// Sliding window for counting GitHub 5xx errors (seconds).
+const GITHUB_5XX_WINDOW_SECS: i64 = 120;
+
+/// Number of 5xx errors within the window to trip the circuit breaker.
+const GITHUB_5XX_THRESHOLD: usize = 5;
+
+/// Duration the circuit breaker stays open after tripping (seconds).
+const GITHUB_5XX_COOLDOWN_SECS: i64 = 180;
+
+/// Global sliding window of 5xx error timestamps.
+fn github_5xx_timestamps() -> &'static Mutex<Vec<i64>> {
+    static TS: OnceLock<Mutex<Vec<i64>>> = OnceLock::new();
+    TS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Whether the GitHub 5xx circuit breaker is currently open (tripped).
+fn github_5xx_circuit_open() -> &'static Mutex<Option<i64>> {
+    static OPEN: OnceLock<Mutex<Option<i64>>> = OnceLock::new();
+    OPEN.get_or_init(|| Mutex::new(None))
+}
+
+/// Record a GitHub 5xx server error and trip the circuit breaker if the
+/// sliding window threshold is exceeded.
+///
+/// Emits a single high-level log entry when the circuit transitions to open.
+pub async fn record_github_5xx() {
+    let now = chrono::Utc::now().timestamp();
+    let window_start = now - GITHUB_5XX_WINDOW_SECS;
+
+    let should_trip = {
+        let mut ts = github_5xx_timestamps()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ts.retain(|t| *t >= window_start);
+        ts.push(now);
+        ts.len() >= GITHUB_5XX_THRESHOLD
+    };
+
+    if should_trip {
+        let cooldown_until = {
+            let mut open = github_5xx_circuit_open()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if open.is_none() {
+                let cd = now + GITHUB_5XX_COOLDOWN_SECS;
+                *open = Some(cd);
+                tracing::warn!(
+                    errors_in_window = GITHUB_5XX_THRESHOLD,
+                    window_secs = GITHUB_5XX_WINDOW_SECS,
+                    cooldown_secs = GITHUB_5XX_COOLDOWN_SECS,
+                    "GitHub 5xx circuit breaker OPEN — throttling non-critical work"
+                );
+                Some(cd)
+            } else {
+                None
+            }
+        };
+        // Persist to KV (outside the mutex lock so the future is Send).
+        if let Some(cd) = cooldown_until {
+            let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+            if let Some(store) = store_opt {
+                let _ = store.kv_set("cooldown:github:5xx", &cd.to_string()).await;
+            }
+        }
+        // Clear the sliding window after tripping so we don't re-trip immediately
+        let mut ts = github_5xx_timestamps()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ts.clear();
+    }
+}
+
+/// Check if the GitHub 5xx circuit breaker is currently open.
+///
+/// When open, non-critical background work (cleanup, polling, mention scans)
+/// should be skipped. Critical operations (PR creation) should still attempt
+/// with their existing exponential backoff.
+///
+/// Automatically recovers (logs a recovery message) when the cooldown expires.
+pub fn is_github_circuit_open() -> bool {
+    // Check the dedicated in-memory circuit flag first. If present, honour it
+    // and perform auto-recovery when it expires (logging once on close).
+    {
+        let mut open = github_5xx_circuit_open()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(until) = *open {
+            let now = chrono::Utc::now().timestamp();
+            if now >= until {
+                *open = None;
+                tracing::info!("GitHub 5xx circuit breaker CLOSED — resuming normal operations");
+                return false;
+            }
+            return true;
+        }
+    }
+
+    // If the dedicated flag is not set, consult the generic cooldown map so
+    // callers see a consistent view regardless of which code path set the
+    // persisted cooldown (e.g. send_with_retries -> set_agent_cooldown).
+    if let Some(until) = cooldown_until("github:5xx") {
+        // Populate the dedicated in-memory flag so future checks and the
+        // auto-recovery path go through the same code and logging.
+        let mut open = github_5xx_circuit_open()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if open.is_none() {
+            *open = Some(until);
+            let now = chrono::Utc::now().timestamp();
+            if now < until {
+                let remaining = until - now;
+                tracing::warn!(
+                    remaining_secs = remaining,
+                    "GitHub 5xx circuit breaker OPEN (discovered via generic cooldown) — throttling non-critical work"
+                );
+            }
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Returns the remaining seconds of the GitHub 5xx circuit breaker cooldown,
+/// or 0 if the circuit is closed.
+pub fn github_circuit_remaining_secs() -> u64 {
+    // Prefer the dedicated in-memory value when present.
+    {
+        let open = github_5xx_circuit_open()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(until) = *open {
+            let now = chrono::Utc::now().timestamp();
+            if now < until {
+                return (until - now) as u64;
+            }
+            return 0;
+        }
+    }
+
+    // Fall back to the generic cooldown map if the dedicated flag isn't set.
+    if let Some(until) = cooldown_until("github:5xx") {
+        let now = chrono::Utc::now().timestamp();
+        if now < until {
+            return (until - now) as u64;
+        }
+    }
+    0
 }
 
 /// Parse a "try again at {date}" or "try again after {time}" from an error message.
@@ -1449,5 +1620,148 @@ mod tests {
     fn compute_backoff_zero_base_returns_zero() {
         assert_eq!(compute_backoff(1, 0, 14400), 0);
         assert_eq!(compute_backoff(5, 0, 14400), 0);
+    }
+
+    // ---- GitHub 5xx circuit breaker tests ----
+
+    #[tokio::test]
+    async fn github_circuit_stays_closed_below_threshold() {
+        // Reset circuit breaker state
+        {
+            let mut open = github_5xx_circuit_open().lock().unwrap();
+            *open = None;
+            let mut ts = github_5xx_timestamps().lock().unwrap();
+            ts.clear();
+        }
+
+        // Record fewer errors than threshold
+        for _ in 0..GITHUB_5XX_THRESHOLD - 1 {
+            record_github_5xx().await;
+        }
+
+        assert!(
+            !is_github_circuit_open(),
+            "circuit should stay closed below threshold"
+        );
+        assert_eq!(github_circuit_remaining_secs(), 0);
+    }
+
+    #[tokio::test]
+    async fn github_circuit_trips_at_threshold() {
+        // Reset circuit breaker state
+        {
+            let mut open = github_5xx_circuit_open().lock().unwrap();
+            *open = None;
+            let mut ts = github_5xx_timestamps().lock().unwrap();
+            ts.clear();
+        }
+
+        // Record exactly threshold errors
+        for _ in 0..GITHUB_5XX_THRESHOLD {
+            record_github_5xx().await;
+        }
+
+        assert!(is_github_circuit_open(), "circuit should trip at threshold");
+        assert!(
+            github_circuit_remaining_secs() > 0,
+            "remaining should be > 0 when open"
+        );
+        assert!(
+            github_circuit_remaining_secs() <= GITHUB_5XX_COOLDOWN_SECS as u64,
+            "remaining should not exceed cooldown duration"
+        );
+
+        // Clean up
+        {
+            let mut open = github_5xx_circuit_open().lock().unwrap();
+            *open = None;
+        }
+    }
+
+    #[tokio::test]
+    async fn github_circuit_cannot_double_trip() {
+        // Reset circuit breaker state
+        {
+            let mut open = github_5xx_circuit_open().lock().unwrap();
+            *open = None;
+            let mut ts = github_5xx_timestamps().lock().unwrap();
+            ts.clear();
+        }
+
+        // Trip the circuit
+        for _ in 0..GITHUB_5XX_THRESHOLD {
+            record_github_5xx().await;
+        }
+        assert!(is_github_circuit_open());
+
+        let first_remaining = github_circuit_remaining_secs();
+
+        // More 5xx errors should NOT reset the cooldown (never-shorten)
+        for _ in 0..GITHUB_5XX_THRESHOLD {
+            record_github_5xx().await;
+        }
+
+        let second_remaining = github_circuit_remaining_secs();
+        assert!(
+            second_remaining <= first_remaining,
+            "additional errors should not extend cooldown"
+        );
+
+        // Clean up
+        {
+            let mut open = github_5xx_circuit_open().lock().unwrap();
+            *open = None;
+        }
+    }
+
+    #[tokio::test]
+    async fn github_circuit_recovers_after_cooldown() {
+        // Reset circuit breaker state
+        {
+            let mut open = github_5xx_circuit_open().lock().unwrap();
+            *open = None;
+            let mut ts = github_5xx_timestamps().lock().unwrap();
+            ts.clear();
+        }
+
+        // Set the circuit to an expired cooldown
+        {
+            let mut open = github_5xx_circuit_open().lock().unwrap();
+            *open = Some(chrono::Utc::now().timestamp() - 1);
+        }
+
+        // Should be closed now (auto-recovery)
+        assert!(
+            !is_github_circuit_open(),
+            "circuit should auto-recover after cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_circuit_sliding_window_ages_out() {
+        // Reset circuit breaker state
+        {
+            let mut open = github_5xx_circuit_open().lock().unwrap();
+            *open = None;
+            let mut ts = github_5xx_timestamps().lock().unwrap();
+            ts.clear();
+        }
+
+        // Record errors that are outside the window
+        {
+            let mut ts = github_5xx_timestamps().lock().unwrap();
+            let old = chrono::Utc::now().timestamp() - GITHUB_5XX_WINDOW_SECS - 10;
+            for _ in 0..GITHUB_5XX_THRESHOLD {
+                ts.push(old);
+            }
+        }
+
+        // A new error should clear old ones and not trip the circuit
+        record_github_5xx().await;
+
+        assert!(
+            !is_github_circuit_open(),
+            "old errors outside window should not trip circuit"
+        );
     }
 }
