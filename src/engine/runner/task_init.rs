@@ -146,7 +146,35 @@ pub async fn prepare_task(
 
     let model_name = model
         .map(String::from)
-        .or_else(|| route_result.as_ref().and_then(|r| r.model.clone()));
+        .or_else(|| route_result.as_ref().and_then(|r| r.model.clone()))
+        .or_else(|| {
+            // Reroute path: agent was set but model was left empty.
+            // Resolve a compatible model from the agent + complexity tier.
+            route_result.as_ref().and_then(|r| {
+                let cfg = crate::engine::router::RouterConfig::default();
+                cfg.model_for_complexity(&agent_name, &r.complexity, task_id)
+            })
+        });
+
+    // Safety log: detect agent-model namespace mismatches at dispatch time.
+    if let Some(ref m) = model_name {
+        if agent_name == "claude" && (m.starts_with("github-copilot/") || m.starts_with("openai/"))
+        {
+            tracing::error!(
+                agent = agent_name,
+                model = m,
+                task_id,
+                "agent-model mismatch: claude dispatched with non-anthropic model"
+            );
+        } else if agent_name == "codex" && m.starts_with("anthropic/") {
+            tracing::error!(
+                agent = agent_name,
+                model = m,
+                task_id,
+                "agent-model mismatch: codex dispatched with anthropic model"
+            );
+        }
+    }
 
     let complexity = route_result.as_ref().map(|r| r.complexity.clone());
 

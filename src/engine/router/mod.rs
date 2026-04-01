@@ -951,7 +951,14 @@ pub async fn get_route_result(
     };
 
     let reason = task.route_reason.clone();
-    let model = task.model.clone().filter(|m| !m.is_empty());
+    let model = task.model.clone().filter(|m| !m.is_empty()).or_else(|| {
+        // Reroute path: agent was set but model was left empty ("").
+        // Resolve a compatible model from the agent + complexity tier
+        // to prevent dispatching incompatible agent-model combinations
+        // (e.g., claude with github-copilot/gpt-5-mini).
+        let cfg = crate::engine::router::RouterConfig::default();
+        cfg.model_for_complexity(&agent, &complexity, task_id)
+    });
 
     Ok(RouteResult {
         agent,
