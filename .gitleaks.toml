@@ -15,3 +15,6 @@ description = "security.rs contains fake API key patterns in #[cfg(test)] for le
 paths = [
   '''^src/security\.rs$''',
 ]
+# gitleaks 8.24.x (CI) doesn't suppress findings via paths alone in single-commit
+# diff mode (--log-opts=-1). The regex ensures the allowlist works on all versions.
+regex = '''ghp_[A-Z]{26}[a-z]{25}'''
