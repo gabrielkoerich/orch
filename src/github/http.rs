@@ -816,6 +816,16 @@ impl GhHttp {
             .collect())
     }
 
+    /// List open pull requests (paginated) using the REST pulls endpoint.
+    /// Returns raw JSON values for flexibility in callers.
+    pub async fn list_open_pulls(&self, repo: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let url = format!("{GITHUB_API}/repos/{repo}/pulls");
+        let all: Vec<serde_json::Value> = self
+            .get_all_pages(&url, &[("state", "open"), ("per_page", "100")])
+            .await?;
+        Ok(all)
+    }
+
     /// List all issues (open and closed, no label filter, paginated).
     ///
     /// This is more efficient than making separate calls for open and closed.

@@ -70,7 +70,7 @@ impl Severity {
 ///
 /// When called outside a project directory (no `.orch.yml`), runs across all
 /// repos found in the store. When called inside a project, scopes to that repo.
-pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
+pub async fn run(full: bool, fix: bool, dry_run: bool) -> anyhow::Result<()> {
     let store = Arc::new(crate::cli::init_store().await?);
     let gh = GhHttp::new()?;
     let tmux = TmuxManager::new();
@@ -104,7 +104,7 @@ pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
         let _ = std::io::stderr().flush();
     });
 
-    let result = run_checks(fix, dry_run, &repos, &store, &gh, &tmux).await;
+    let result = run_checks(full, fix, dry_run, &repos, &store, &gh, &tmux).await;
 
     spinner_running.store(false, Ordering::Relaxed);
     let _ = spinner_thread.join();
@@ -113,6 +113,7 @@ pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
 }
 
 async fn run_checks(
+    full: bool,
     fix: bool,
     dry_run: bool,
     repos: &[String],
@@ -125,107 +126,247 @@ async fn run_checks(
     for repo in repos {
         let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
         let mut findings: Vec<Finding> = Vec::new();
+        if full {
+            // Existing expensive path: load active + recent done tasks and batch GraphQL queries.
+            // Only load active tasks + done tasks from the last 7 days — avoids
+            // fetching hundreds of historical done tasks on every run.
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+            let cutoff_str = cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            let all_tasks = store.list_for_doctor(repo, &cutoff_str).await?;
 
-        // Only load active tasks + done tasks from the last 7 days — avoids
-        // fetching hundreds of historical done tasks on every run.
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
-        let cutoff_str = cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let all_tasks = store.list_for_doctor(repo, &cutoff_str).await?;
-
-        let recent_done_tasks: Vec<_> = all_tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Done)
-            .collect();
-        let active_tasks: Vec<_> = all_tasks
-            .iter()
-            .filter(|t| t.status != TaskStatus::Done)
-            .collect();
-        let in_progress_tasks: Vec<_> = all_tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::InProgress)
-            .collect();
-        let in_review_tasks: Vec<_> = all_tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::InReview)
-            .collect();
-
-        // Batch-fetch all PR states needed for checks 1 and 8 in a single GraphQL call.
-        let pr_numbers_to_fetch: Vec<u64> = {
-            let mut nums: Vec<u64> = recent_done_tasks
+            let recent_done_tasks: Vec<_> = all_tasks
                 .iter()
-                .filter(|t| !(t.origin == "internal" && t.external_id.is_none()))
-                .filter_map(|t| t.pr_number.map(|n| n as u64))
-                .chain(
-                    active_tasks
-                        .iter()
-                        .filter_map(|t| t.pr_number.map(|n| n as u64)),
-                )
+                .filter(|t| t.status == TaskStatus::Done)
                 .collect();
-            nums.sort_unstable();
-            nums.dedup();
-            nums
-        };
-        let pr_states = gh
-            .batch_get_pr_states(repo, &pr_numbers_to_fetch)
-            .await
-            .unwrap_or_default();
+            let active_tasks: Vec<_> = all_tasks
+                .iter()
+                .filter(|t| t.status != TaskStatus::Done)
+                .collect();
+            let in_progress_tasks: Vec<_> = all_tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::InProgress)
+                .collect();
+            let in_review_tasks: Vec<_> = all_tasks
+                .iter()
+                .filter(|t| t.status == TaskStatus::InReview)
+                .collect();
 
-        // 1. Done tasks with no merged PR (recent only — skip internal no-PR tasks)
-        for task in &recent_done_tasks {
-            if task.origin == "internal" && task.external_id.is_none() {
-                continue;
+            // Batch-fetch all PR states needed for checks 1 and 8 in a single GraphQL call.
+            let pr_numbers_to_fetch: Vec<u64> = {
+                let mut nums: Vec<u64> = recent_done_tasks
+                    .iter()
+                    .filter(|t| !(t.origin == "internal" && t.external_id.is_none()))
+                    .filter_map(|t| t.pr_number.map(|n| n as u64))
+                    .chain(
+                        active_tasks
+                            .iter()
+                            .filter_map(|t| t.pr_number.map(|n| n as u64)),
+                    )
+                    .collect();
+                nums.sort_unstable();
+                nums.dedup();
+                nums
+            };
+            let pr_states = gh
+                .batch_get_pr_states(repo, &pr_numbers_to_fetch)
+                .await
+                .unwrap_or_default();
+
+            // 1. Done tasks with no merged PR (recent only — skip internal no-PR tasks)
+            for task in &recent_done_tasks {
+                if task.origin == "internal" && task.external_id.is_none() {
+                    continue;
+                }
+                if task.pr_number.is_none() && task.external_id.is_none() {
+                    continue;
+                }
+                check_done_no_merged_pr(task, gh, &pr_states, &mut findings, repo).await;
             }
-            if task.pr_number.is_none() && task.external_id.is_none() {
-                continue;
+
+            // 2. Done tasks with dirty worktrees (recent only — filesystem check, fast)
+            for task in &recent_done_tasks {
+                check_dirty_worktree(task, &mut findings);
             }
-            check_done_no_merged_pr(task, gh, &pr_states, &mut findings, repo).await;
-        }
 
-        // 2. Done tasks with dirty worktrees (recent only — filesystem check, fast)
-        for task in &recent_done_tasks {
-            check_dirty_worktree(task, &mut findings);
-        }
+            // 3. Done tasks with unpushed commits (recent only — filesystem check, fast)
+            for task in &recent_done_tasks {
+                check_unpushed_commits(task, &mut findings);
+            }
 
-        // 3. Done tasks with unpushed commits (recent only — filesystem check, fast)
-        for task in &recent_done_tasks {
-            check_unpushed_commits(task, &mut findings);
-        }
+            // 4+5. Issue status and label checks (active external tasks only).
+            // Batch-fetch all issue states and labels in a single GraphQL call.
+            let external_active: Vec<_> = active_tasks
+                .iter()
+                .filter(|t| t.origin != "internal")
+                .collect();
+            let issue_numbers: Vec<u64> = external_active
+                .iter()
+                .filter_map(|t| t.external_id.as_deref().and_then(|id| id.parse().ok()))
+                .collect();
+            let issue_states = gh
+                .batch_get_issue_states(repo, &issue_numbers)
+                .await
+                .unwrap_or_default();
+            for task in &external_active {
+                check_issue_status_mismatch(task, &issue_states, &mut findings);
+                check_label_mismatch(task, &issue_states, &mut findings);
+            }
 
-        // 4+5. Issue status and label checks (active external tasks only).
-        // Batch-fetch all issue states and labels in a single GraphQL call.
-        let external_active: Vec<_> = active_tasks
-            .iter()
-            .filter(|t| t.origin != "internal")
-            .collect();
-        let issue_numbers: Vec<u64> = external_active
-            .iter()
-            .filter_map(|t| t.external_id.as_deref().and_then(|id| id.parse().ok()))
-            .collect();
-        let issue_states = gh
-            .batch_get_issue_states(repo, &issue_numbers)
-            .await
-            .unwrap_or_default();
-        for task in &external_active {
-            check_issue_status_mismatch(task, &issue_states, &mut findings);
-            check_label_mismatch(task, &issue_states, &mut findings);
-        }
+            // 6. Stale in_progress tasks (no tmux session)
+            for task in &in_progress_tasks {
+                check_stale_in_progress(task, repo, tmux, &mut findings).await;
+            }
 
-        // 6. Stale in_progress tasks (no tmux session)
-        for task in &in_progress_tasks {
-            check_stale_in_progress(task, repo, tmux, &mut findings).await;
-        }
+            // 7. Orphaned worktrees (needs all tasks to match worktree paths to owners)
+            check_orphaned_worktrees(&all_tasks, &mut findings).await;
 
-        // 7. Orphaned worktrees (needs all tasks to match worktree paths to owners)
-        check_orphaned_worktrees(&all_tasks, &mut findings).await;
+            // 8. PR merged but task not done (active tasks only — uses batched pr_states)
+            for task in &active_tasks {
+                check_pr_merged_not_done(task, &pr_states, &mut findings);
+            }
 
-        // 8. PR merged but task not done (active tasks only — uses batched pr_states)
-        for task in &active_tasks {
-            check_pr_merged_not_done(task, &pr_states, &mut findings);
-        }
+            // 9. Dead review sessions
+            for task in &in_review_tasks {
+                check_dead_review_session(task, repo, tmux, &mut findings).await;
+            }
+        } else {
+            // Fast path: only consider active (non-done) tasks and open PRs via REST.
+            let active_tasks = store.list_active(repo).await?;
 
-        // 9. Dead review sessions
-        for task in &in_review_tasks {
-            check_dead_review_session(task, repo, tmux, &mut findings).await;
+            // Fetch open PRs for the repo (paginated REST call)
+            let open_prs: Vec<serde_json::Value> =
+                gh.list_open_pulls(repo).await.unwrap_or_default();
+
+            // Build lookup maps: pr_number -> pr, head_ref -> pr
+            let mut pr_by_number: std::collections::HashMap<u64, serde_json::Value> =
+                std::collections::HashMap::new();
+            let mut pr_by_head: std::collections::HashMap<String, serde_json::Value> =
+                std::collections::HashMap::new();
+            for pr in &open_prs {
+                if let Some(n) = pr.get("number").and_then(|v| v.as_u64()) {
+                    pr_by_number.insert(n, pr.clone());
+                }
+                if let Some(head) = pr.pointer("/head/ref").and_then(|v| v.as_str()) {
+                    pr_by_head.insert(head.to_string(), pr.clone());
+                }
+            }
+
+            // Active tasks: perform lightweight checks
+            let mut external_issue_numbers: Vec<u64> = Vec::new();
+            for task in &active_tasks {
+                // Stale in_progress
+                if task.status == TaskStatus::InProgress {
+                    check_stale_in_progress(task, repo, tmux, &mut findings).await;
+                }
+
+                // Dead review sessions
+                if task.status == TaskStatus::InReview {
+                    check_dead_review_session(task, repo, tmux, &mut findings).await;
+                }
+
+                // PR merged check for tasks that have a PR recorded — make one REST call per active task (few)
+                if let Some(pr_num) = task.pr_number {
+                    match gh.get_pr(repo, pr_num as u64).await {
+                        Ok(pr) => {
+                            if pr.merged.unwrap_or(false) {
+                                findings.push(Finding {
+                                    severity: Severity::Error,
+                                    task_id: task_label(task),
+                                    message: format!(
+                                        "PR #{} is merged but task status is '{}'",
+                                        pr_num,
+                                        task.status.as_str()
+                                    ),
+                                    fix: FixAction::MarkDoneFromMergedPr { store_id: task.id },
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            // Ignore transient failures in fast path; the full path will surface them.
+                        }
+                    }
+                } else if !task.branch.is_empty() {
+                    // If task has a branch, check if there's an open PR for it
+                    if let Some(pr) = pr_by_head.get(&task.branch) {
+                        // PR exists and is open — link PR (warning) unless already linked
+                        if task.pr_number.is_none() {
+                            if let Some(n) = pr.get("number").and_then(|v| v.as_u64()) {
+                                findings.push(Finding {
+                                    severity: Severity::Warning,
+                                    task_id: task_label(task),
+                                    message: format!(
+                                        "branch '{}' has open PR #{} not linked in store",
+                                        task.branch, n
+                                    ),
+                                    fix: FixAction::LinkPr {
+                                        store_id: task.id,
+                                        pr_number: n,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Collect external issue numbers for batch issue checks
+                if task.origin != "internal" {
+                    if let Some(ext) = &task.external_id {
+                        if let Ok(n) = ext.parse::<u64>() {
+                            external_issue_numbers.push(n);
+                        }
+                    }
+                }
+            }
+
+            // Batch issue state/label checks for external active tasks
+            let issue_states = gh
+                .batch_get_issue_states(repo, &external_issue_numbers)
+                .await
+                .unwrap_or_default();
+            for task in &active_tasks {
+                if task.origin != "internal" {
+                    check_issue_status_mismatch(task, &issue_states, &mut findings);
+                    check_label_mismatch(task, &issue_states, &mut findings);
+                }
+            }
+
+            // Orphaned PRs: open PRs that don't match any active task by number or head ref
+            for pr in &open_prs {
+                let pr_num = pr.get("number").and_then(|v| v.as_u64());
+                let head = pr
+                    .pointer("/head/ref")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let mut owned = false;
+                if let Some(n) = pr_num {
+                    for t in &active_tasks {
+                        if let Some(pn) = t.pr_number {
+                            if pn as u64 == n {
+                                owned = true;
+                                break;
+                            }
+                        }
+                        if !t.branch.is_empty() && Some(t.branch.clone()) == head {
+                            owned = true;
+                            break;
+                        }
+                    }
+                }
+                if !owned {
+                    let num_str = pr_num
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    findings.push(Finding {
+                        severity: Severity::Warning,
+                        task_id: format!("pr:{}", num_str),
+                        message: format!("open PR with no active task: #{}", num_str),
+                        fix: FixAction::None,
+                    });
+                }
+            }
+
+            // Orphaned worktrees relative to active tasks only
+            check_orphaned_worktrees(&active_tasks, &mut findings).await;
         }
 
         if repos.len() > 1 && !findings.is_empty() {
