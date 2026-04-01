@@ -1307,18 +1307,6 @@ impl GhHttp {
         self.get_all_pages(&url, &[("per_page", "100")]).await
     }
 
-    /// Get all review comments for a PR.
-    pub async fn get_pr_comments(
-        &self,
-        repo: &str,
-        pr_number: u64,
-    ) -> anyhow::Result<Vec<GitHubReviewComment>> {
-        self.get_json(&format!(
-            "{GITHUB_API}/repos/{repo}/pulls/{pr_number}/comments"
-        ))
-        .await
-    }
-
     /// Get the committer timestamp for a specific commit SHA.
     ///
     /// Returns an ISO-8601 string, e.g. `"2024-01-15T12:00:00Z"`.
@@ -1897,6 +1885,109 @@ impl GhHttp {
         Ok(())
     }
 
+    /// Fetch reviews, review comments, and issue comments for multiple PRs in a
+    /// single GraphQL query instead of 4–5 REST calls per PR.
+    ///
+    /// Returns a map of `pr_number → PrReviewBatchData`.
+    /// PRs missing from the response are omitted from the result.
+    pub async fn batch_fetch_pr_review_data(
+        &self,
+        repo: &str,
+        pr_numbers: &[u64],
+    ) -> anyhow::Result<std::collections::HashMap<u64, PrReviewBatchData>> {
+        if pr_numbers.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+
+        // Build one GraphQL alias per PR number.
+        let aliases: String = pr_numbers
+            .iter()
+            .map(|&n| build_pr_review_alias(n))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let query =
+            format!(r#"{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}"#);
+
+        let resp = self.graphql(&query).await?;
+        let repo_data = resp
+            .pointer("/data/repository")
+            .ok_or_else(|| anyhow::anyhow!("missing /data/repository in GraphQL response"))?;
+
+        let mut result = std::collections::HashMap::new();
+        for &n in pr_numbers {
+            let Some(pr_data) = repo_data.get(format!("pr{n}")) else {
+                continue;
+            };
+
+            let merged = pr_data
+                .get("merged")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mergeable = match pr_data.get("mergeable").and_then(|v| v.as_str()) {
+                Some("MERGEABLE") => Some(true),
+                Some("CONFLICTING") => Some(false),
+                _ => None, // UNKNOWN or missing
+            };
+
+            let reviews: Vec<GitHubReview> = pr_data
+                .pointer("/reviews/nodes")
+                .and_then(|v| v.as_array())
+                .map(|nodes| nodes.iter().filter_map(parse_graphql_review).collect())
+                .unwrap_or_default();
+
+            let review_comments: Vec<GitHubReviewComment> = pr_data
+                .pointer("/reviewThreads/nodes")
+                .and_then(|v| v.as_array())
+                .map(|threads| {
+                    threads
+                        .iter()
+                        .filter_map(|thread| {
+                            thread
+                                .pointer("/comments/nodes")
+                                .and_then(|v| v.as_array())
+                                .map(|nodes| {
+                                    nodes
+                                        .iter()
+                                        .filter_map(parse_graphql_review_comment)
+                                        .collect::<Vec<_>>()
+                                })
+                        })
+                        .flatten()
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let issue_comments: Vec<GitHubComment> = pr_data
+                .pointer("/comments/nodes")
+                .and_then(|v| v.as_array())
+                .map(|nodes| {
+                    nodes
+                        .iter()
+                        .filter_map(parse_graphql_issue_comment)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            result.insert(
+                n,
+                PrReviewBatchData {
+                    merged,
+                    mergeable,
+                    reviews,
+                    review_comments,
+                    issue_comments,
+                },
+            );
+        }
+
+        Ok(result)
+    }
+
     /// Check the latest automated review comment on a PR.
     pub async fn get_automated_review_status(
         &self,
@@ -2009,6 +2100,179 @@ pub fn status_label_color(label: &str) -> &'static str {
         "status:needs_review" => "e4e669",
         _ => "c5def5",
     }
+}
+
+// ── Batch GraphQL helpers ─────────────────────────────────────────────
+
+/// Data fetched for one PR by [`GhHttp::batch_fetch_pr_review_data`].
+#[derive(Debug, Clone, Default)]
+pub struct PrReviewBatchData {
+    /// True when the pull request was merged.
+    pub merged: bool,
+    /// `Some(true)` = MERGEABLE, `Some(false)` = CONFLICTING, `None` = UNKNOWN.
+    pub mergeable: Option<bool>,
+    /// All reviews submitted on the PR.
+    pub reviews: Vec<GitHubReview>,
+    /// All inline review comments (from all review threads).
+    pub review_comments: Vec<GitHubReviewComment>,
+    /// All issue-level comments on the PR.
+    pub issue_comments: Vec<GitHubComment>,
+}
+
+/// Build a GraphQL alias fragment for one pull request, fetching all data
+/// needed by the review poll loop in a single batch request.
+fn build_pr_review_alias(n: u64) -> String {
+    format!(
+        r#"pr{n}: pullRequest(number: {n}) {{
+  merged
+  mergeable
+  reviews(first: 50) {{
+    nodes {{
+      databaseId
+      author {{ login }}
+      body
+      state
+      url
+      submittedAt
+      commit {{ oid }}
+    }}
+  }}
+  reviewThreads(first: 50) {{
+    nodes {{
+      comments(first: 20) {{
+        nodes {{
+          databaseId
+          author {{ login }}
+          body
+          path
+          line
+          originalLine
+          commit {{ oid }}
+          originalCommit {{ oid }}
+          url
+          createdAt
+          updatedAt
+          replyTo {{ databaseId }}
+          diffHunk
+        }}
+      }}
+    }}
+  }}
+  comments(first: 50) {{
+    nodes {{
+      databaseId
+      author {{ login }}
+      body
+      createdAt
+      url
+    }}
+  }}
+}}"#
+    )
+}
+
+fn parse_graphql_review(node: &serde_json::Value) -> Option<GitHubReview> {
+    use super::types::GitHubUser;
+    Some(GitHubReview {
+        id: node.get("databaseId").and_then(|v| v.as_u64())?,
+        user: GitHubUser {
+            login: node
+                .pointer("/author/login")
+                .and_then(|v| v.as_str())?
+                .to_string(),
+        },
+        body: node.get("body").and_then(|v| v.as_str()).map(String::from),
+        state: node.get("state").and_then(|v| v.as_str())?.to_string(),
+        html_url: node.get("url").and_then(|v| v.as_str()).map(String::from),
+        submitted_at: node
+            .get("submittedAt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        commit_id: node
+            .pointer("/commit/oid")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    })
+}
+
+fn parse_graphql_review_comment(node: &serde_json::Value) -> Option<GitHubReviewComment> {
+    use super::types::GitHubUser;
+    Some(GitHubReviewComment {
+        id: node.get("databaseId").and_then(|v| v.as_u64())?,
+        user: GitHubUser {
+            login: node
+                .pointer("/author/login")
+                .and_then(|v| v.as_str())?
+                .to_string(),
+        },
+        body: node.get("body").and_then(|v| v.as_str())?.to_string(),
+        path: node
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        line: node.get("line").and_then(|v| v.as_u64()).map(|v| v as u32),
+        original_line: node
+            .get("originalLine")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        commit_id: node
+            .pointer("/commit/oid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        original_commit_id: node
+            .pointer("/originalCommit/oid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        html_url: node
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        created_at: node
+            .get("createdAt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        updated_at: node
+            .get("updatedAt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        in_reply_to_id: node.pointer("/replyTo/databaseId").and_then(|v| v.as_u64()),
+        diff_hunk: node
+            .get("diffHunk")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    })
+}
+
+fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment> {
+    use super::types::GitHubUser;
+    Some(GitHubComment {
+        id: node.get("databaseId").and_then(|v| v.as_u64())?,
+        body: node.get("body").and_then(|v| v.as_str())?.to_string(),
+        user: GitHubUser {
+            login: node
+                .pointer("/author/login")
+                .and_then(|v| v.as_str())?
+                .to_string(),
+        },
+        created_at: node
+            .get("createdAt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        updated_at: node
+            .get("updatedAt")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        html_url: node.get("url").and_then(|v| v.as_str()).map(String::from),
+        issue_url: None,
+    })
 }
 
 #[cfg(test)]

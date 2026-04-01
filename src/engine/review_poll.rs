@@ -3,6 +3,23 @@
 //! Extracted from `engine/review.rs`. Monitors tasks in `InReview` status,
 //! checks for human review feedback, and re-dispatches agents when changes
 //! are requested.
+//!
+//! ## Batching strategy
+//!
+//! Instead of making 4–5 individual REST calls per in-review task, the loop
+//! is split into phases:
+//!
+//! 1. Validate tasks and load stored data (no API calls).
+//! 2. Resolve missing PR numbers concurrently via REST (rare after first tick).
+//! 3. Handle tasks with no open PR (merged / reroute logic).
+//! 4. Fetch all PR review data in **one** GraphQL query for all tasks at once.
+//! 5. Build a collaborator cache from batch issue comments (unique users only).
+//! 6. Process each task using the pre-fetched batch data.
+//!
+//! With N in-review tasks the call count drops from ~5N REST calls to:
+//! - M `get_pr_number` REST calls (M ≈ 0 after first tick per task)
+//! - 1 GraphQL batch call
+//! - K `is_collaborator` REST calls (K = unique automated-review users ≪ N)
 
 use crate::backends::{ExternalBackend, Status};
 use crate::config;
@@ -10,9 +27,10 @@ use crate::engine::auto_merge::{dedup_reviews, handle_review_changes, MAX_MERGE_
 use crate::engine::tasks::TaskManager;
 use crate::engine::EngineConfig;
 use crate::github::http::GhHttp;
-use crate::github::types::{GitHubReviewComment, PullRequestReview};
+use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview};
 use crate::store::TaskStore;
 use crate::store::{opt_store_get_task, store_increment, store_reset_failure_counters, store_set};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Review open PRs - re-dispatch agent to address review feedback.
@@ -66,6 +84,18 @@ pub(crate) async fn review_open_prs(
 
     let gh = GhHttp::new()?;
 
+    // ─── Phase 1: Validate tasks and separate by PR number availability ───────
+
+    struct ReadyTask {
+        task: crate::backends::ExternalTask,
+        stored: crate::store::Task,
+        branch: String,
+        /// `Some` = already stored in DB, `None` = needs REST lookup.
+        pr_number: Option<u64>,
+    }
+
+    let mut ready_tasks: Vec<ReadyTask> = Vec::new();
+
     for task in in_review_tasks {
         let task_id = &task.id.0;
 
@@ -82,8 +112,8 @@ pub(crate) async fn review_open_prs(
             }
         }
 
-        let stored_task = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id).await;
-        let stored_task = match stored_task {
+        let stored = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id).await;
+        let stored = match stored {
             Some(t) => t,
             None => {
                 tracing::warn!(
@@ -100,7 +130,7 @@ pub(crate) async fn review_open_prs(
             }
         };
 
-        let branch = if stored_task.branch.is_empty() {
+        let branch = if stored.branch.is_empty() {
             tracing::warn!(
                 task_id,
                 "in_review task has no branch info — setting needs_review"
@@ -113,102 +143,212 @@ pub(crate) async fn review_open_prs(
             }
             continue;
         } else {
-            stored_task.branch.clone()
+            stored.branch.clone()
         };
 
-        // Get PR number from branch
-        let pr_number = match gh.get_pr_number(repo, &branch).await {
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                let merged = match gh.is_pr_merged(repo, &branch).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
-                        continue;
-                    }
-                };
-                if merged {
-                    tracing::info!(task_id, branch = %branch, "PR already merged, marking done");
+        let stored_pr_number = stored.pr_number.map(|n| n as u64);
+        ready_tasks.push(ReadyTask {
+            task,
+            stored,
+            branch,
+            pr_number: stored_pr_number,
+        });
+    }
+
+    if ready_tasks.is_empty() {
+        return Ok(());
+    }
+
+    // ─── Phase 2: Resolve PR numbers for tasks that don't have one stored ─────
+    // Collect branch strings for tasks that need a PR number lookup so we can
+    // run the REST calls concurrently without borrowing `ready_tasks`.
+
+    let lookup_indices: Vec<usize> = ready_tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| if t.pr_number.is_none() { Some(i) } else { None })
+        .collect();
+
+    if !lookup_indices.is_empty() {
+        let branches: Vec<String> = lookup_indices
+            .iter()
+            .map(|&i| ready_tasks[i].branch.clone())
+            .collect();
+
+        let pr_number_results =
+            futures::future::join_all(branches.iter().map(|b| gh.get_pr_number(repo, b))).await;
+
+        for (&task_idx, result) in lookup_indices.iter().zip(pr_number_results.iter()) {
+            let task_id = ready_tasks[task_idx].task.id.0.clone();
+            let branch = ready_tasks[task_idx].branch.clone();
+            match result {
+                Ok(Some(n)) => {
+                    ready_tasks[task_idx].pr_number = Some(*n);
+                    store_set(
+                        &Some(Arc::clone(store)),
+                        repo,
+                        &task_id,
+                        &[("pr_number", serde_json::json!(*n as i64))],
+                    )
+                    .await;
+                }
+                Ok(None) => {
+                    // No open PR — handled in phase 3.
+                }
+                Err(e) => {
+                    tracing::warn!(task_id, branch = %branch, err = %e, "failed to get PR number");
+                }
+            }
+        }
+    }
+
+    // ─── Phase 3: Handle tasks with no open PR ────────────────────────────────
+    // Split ready_tasks into those with a PR number and those without.
+
+    let mut tasks_with_pr: Vec<ReadyTask> = Vec::new();
+
+    for task_info in ready_tasks {
+        let Some(pr_number) = task_info.pr_number else {
+            // No open PR — check if merged, then reroute or block.
+            let task_id = &task_info.task.id.0;
+            let branch = &task_info.branch;
+            let merged = match gh.is_pr_merged(repo, branch).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
+                    continue;
+                }
+            };
+            if merged {
+                tracing::info!(task_id, branch = %branch, "PR already merged, marking done");
+                if let Err(e) = task_manager
+                    .update_task_status(&task_info.task.id, Status::Done)
+                    .await
+                {
+                    tracing::warn!(task_id, err = %e, "failed to update status to done");
+                }
+            } else {
+                let max_reroutes: u32 = config::get("workflow.max_reroute_attempts")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .or_else(|| {
+                        config::get("workflow.max_attempts")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                    })
+                    .unwrap_or(3);
+
+                let reroutes =
+                    store_increment(&Some(Arc::clone(store)), repo, task_id, "no_pr_reroutes")
+                        .await;
+
+                if reroutes as u32 >= max_reroutes {
+                    tracing::error!(
+                        task_id,
+                        reroutes,
+                        max_reroutes,
+                        "reached max reroute attempts for in_review no-PR — blocking for human review"
+                    );
+                    let msg = format!(
+                        "no PR or code changes after {}/{} reroute attempts",
+                        reroutes, max_reroutes
+                    );
+                    store_set(
+                        &Some(Arc::clone(store)),
+                        repo,
+                        task_id,
+                        &[
+                            ("agent", serde_json::json!(null)),
+                            ("model", serde_json::json!(null)),
+                            ("last_error", serde_json::json!(msg)),
+                        ],
+                    )
+                    .await;
                     if let Err(e) = task_manager
-                        .update_task_status(&task.id, Status::Done)
+                        .update_task_status(&task_info.task.id, Status::Blocked)
                         .await
                     {
-                        tracing::warn!(task_id, err = %e, "failed to update status to done");
+                        tracing::warn!(task_id, err = %e, "failed to update status to blocked");
                     }
                 } else {
-                    // No PR and not merged — re-route with circuit breaker to prevent loops.
-                    // Use a dedicated counter persisted in the store so repeated reroutes
-                    // across separate runs are counted. This prevents tasks from looping
-                    // indefinitely through in_review → routed → in_progress → needs_review
-                    // cycles.
-                    let max_reroutes: u32 = config::get("workflow.max_reroute_attempts")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .or_else(|| {
-                            config::get("workflow.max_attempts")
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                        })
-                        .unwrap_or(3);
-
-                    let reroutes =
-                        store_increment(&Some(Arc::clone(store)), repo, task_id, "no_pr_reroutes")
-                            .await;
-
-                    if reroutes as u32 >= max_reroutes {
-                        tracing::error!(
-                            task_id,
-                            reroutes,
-                            max_reroutes,
-                            "reached max reroute attempts for in_review no-PR — blocking for human review"
-                        );
-                        // Clear agent/model and record an explanatory last_error
-                        let msg = format!(
-                            "no PR or code changes after {}/{} reroute attempts",
-                            reroutes, max_reroutes
-                        );
-                        store_set(
-                            &Some(Arc::clone(store)),
-                            repo,
-                            task_id,
-                            &[
-                                ("agent", serde_json::json!(null)),
-                                ("model", serde_json::json!(null)),
-                                ("last_error", serde_json::json!(msg)),
-                            ],
-                        )
-                        .await;
-                        if let Err(e) = task_manager
-                            .update_task_status(&task.id, Status::Blocked)
-                            .await
-                        {
-                            tracing::warn!(task_id, err = %e, "failed to update status to blocked");
-                        }
-                    } else {
-                        tracing::warn!(
-                            task_id,
-                            branch = %branch,
-                            reroutes,
-                            max_reroutes,
-                            "in_review but no open PR — re-dispatching"
-                        );
-                        if let Err(e) = task_manager
-                            .update_task_status(&task.id, Status::Routed)
-                            .await
-                        {
-                            tracing::warn!(task_id, err = %e, "failed to update status to routed");
-                        }
+                    tracing::warn!(
+                        task_id,
+                        branch = %branch,
+                        reroutes,
+                        max_reroutes,
+                        "in_review but no open PR — re-dispatching"
+                    );
+                    if let Err(e) = task_manager
+                        .update_task_status(&task_info.task.id, Status::Routed)
+                        .await
+                    {
+                        tracing::warn!(task_id, err = %e, "failed to update status to routed");
                     }
                 }
-                continue;
             }
-            Err(e) => {
-                tracing::warn!(task_id, branch = %branch, err = %e, "failed to get PR number");
-                continue;
-            }
+            continue;
         };
 
-        // Store PR number for follow-up tasks
+        tasks_with_pr.push(ReadyTask {
+            pr_number: Some(pr_number),
+            ..task_info
+        });
+    }
+
+    if tasks_with_pr.is_empty() {
+        return Ok(());
+    }
+
+    // ─── Phase 4: Batch GraphQL fetch — one call for all in-review PRs ────────
+
+    let pr_numbers: Vec<u64> = tasks_with_pr.iter().filter_map(|t| t.pr_number).collect();
+
+    let batch = match gh.batch_fetch_pr_review_data(repo, &pr_numbers).await {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                pr_count = pr_numbers.len(),
+                "batch PR review fetch failed, skipping this tick"
+            );
+            return Ok(());
+        }
+    };
+
+    // ─── Phase 5: Build collaborator cache from batch issue comments ──────────
+    // Collect unique user logins that appear in automated review comments so
+    // we can verify collaborator status with a single pass instead of one REST
+    // call per task.
+
+    let mut unique_users: std::collections::HashSet<String> = Default::default();
+    for data in batch.values() {
+        for c in &data.issue_comments {
+            if c.body.starts_with("## Automated Review") {
+                unique_users.insert(c.user.login.clone());
+            }
+        }
+    }
+
+    let collab_logins: Vec<String> = unique_users.into_iter().collect();
+    let collab_results =
+        futures::future::join_all(collab_logins.iter().map(|u| gh.is_collaborator(repo, u))).await;
+    let collab_cache: HashMap<String, bool> = collab_logins
+        .into_iter()
+        .zip(collab_results.into_iter())
+        .map(|(u, r)| (u, r.unwrap_or(false)))
+        .collect();
+
+    // ─── Phase 6: Process each task using batch data ──────────────────────────
+
+    for task_info in tasks_with_pr {
+        let task = &task_info.task;
+        let stored_task = &task_info.stored;
+        let task_id = &task.id.0;
+        let pr_number = task_info
+            .pr_number
+            .expect("tasks_with_pr always have pr_number");
+
+        // Persist PR number (idempotent if already stored).
         store_set(
             &Some(Arc::clone(store)),
             repo,
@@ -217,29 +357,25 @@ pub(crate) async fn review_open_prs(
         )
         .await;
 
-        // Get the last processed review timestamp to avoid re-processing the same reviews
+        let batch_data = match batch.get(&pr_number) {
+            Some(d) => d,
+            None => {
+                tracing::warn!(
+                    task_id,
+                    pr_number,
+                    "PR not in batch data, skipping this tick"
+                );
+                continue;
+            }
+        };
+
         let last_review_ts = stored_task.last_review_ts.clone();
 
-        // Fetch PR reviews
-        let reviews = match gh.get_pr_reviews(repo, pr_number).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(task_id, pr_number, err = %e, "failed to get PR reviews");
-                continue;
-            }
-        };
-
-        // Get all review comments for this PR
-        let all_comments = match gh.get_pr_comments(repo, pr_number).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(task_id, pr_number, err = %e, "failed to get PR comments");
-                continue;
-            }
-        };
+        let reviews = &batch_data.reviews;
+        let all_comments = &batch_data.review_comments;
 
         // Deduplicate reviews: keep only the latest per reviewer.
-        let deduped_reviews = dedup_reviews(&reviews);
+        let deduped_reviews = dedup_reviews(reviews);
 
         let any_changes_requested = deduped_reviews
             .values()
@@ -247,28 +383,20 @@ pub(crate) async fn review_open_prs(
         let all_approved =
             !deduped_reviews.is_empty() && deduped_reviews.values().all(|r| r.state == "APPROVED");
 
-        // Also check automated review comments on the PR (comment-based review workflow).
-        let automated_review = gh
-            .get_automated_review_status(repo, pr_number)
-            .await
-            .unwrap_or(None);
-
+        // Determine automated review status from batch issue comments + collaborator cache.
+        let automated_review =
+            automated_review_from_comments(&batch_data.issue_comments, &collab_cache, pr_number);
         let comment_approved = automated_review.as_deref() == Some("approve");
         let comment_changes_requested = automated_review.as_deref() == Some("changes_requested");
 
-        // Handle fully-approved PRs
+        // Handle fully-approved PRs (auto-close enabled).
         if (all_approved || comment_approved)
             && auto_close_task
             && !comment_changes_requested
             && !any_changes_requested
         {
-            let already_merged = match gh.is_pr_merged(repo, &branch).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
-                    continue;
-                }
-            };
+            // Use batch data instead of a separate is_pr_merged REST call.
+            let already_merged = batch_data.merged;
 
             if already_merged {
                 tracing::info!(
@@ -283,11 +411,8 @@ pub(crate) async fn review_open_prs(
                     tracing::warn!(task_id, err = %e, "failed to update task status to done");
                 }
             } else {
-                let pr_details = gh.get_pr(repo, pr_number).await;
-                let is_conflicting = pr_details
-                    .as_ref()
-                    .map(|pr| pr.mergeable == Some(false))
-                    .unwrap_or(false);
+                // Use batch data instead of a separate get_pr REST call.
+                let is_conflicting = batch_data.mergeable == Some(false);
 
                 if is_conflicting {
                     let retries = stored_task.merge_conflict_retries as u64;
@@ -345,7 +470,11 @@ pub(crate) async fn review_open_prs(
                         .update_task_status(&task.id, Status::NeedsReview)
                         .await
                     {
-                        tracing::warn!(task_id, err = %e, "failed to set NeedsReview for conflict retry");
+                        tracing::warn!(
+                            task_id,
+                            err = %e,
+                            "failed to set NeedsReview for conflict retry"
+                        );
                     }
                     continue;
                 }
@@ -365,8 +494,8 @@ pub(crate) async fn review_open_prs(
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
                 if let Err(e) = crate::engine::auto_merge::auto_merge_pr(
-                    &task,
-                    &branch,
+                    task,
+                    &task_info.branch,
                     backend,
                     repo,
                     &task_agent,
@@ -387,25 +516,16 @@ pub(crate) async fn review_open_prs(
             continue;
         }
 
-        // If the PR is fully approved but auto-close is disabled, we still
-        // want to advance the task state so it doesn't get repeatedly
-        // re-reviewed. Replicate the non-merging path from the review gate:
-        // if already merged -> mark Done; if merge conflicts -> handle
-        // conflict retries; otherwise mark Done (leave PR open for human merge).
+        // If the PR is fully approved but auto-close is disabled, advance the
+        // task state so it doesn't get repeatedly re-reviewed.
         if (all_approved || comment_approved)
             && !comment_changes_requested
             && !any_changes_requested
         {
-            let already_merged = match gh.is_pr_merged(repo, &branch).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
-                    continue;
-                }
-            };
+            let already_merged = batch_data.merged;
 
             if already_merged {
-                tracing::info!(task_id, branch = %branch, "PR already merged, marking done (auto_close disabled)");
+                tracing::info!(task_id, branch = %task_info.branch, "PR already merged, marking done (auto_close disabled)");
                 if let Err(e) = task_manager
                     .update_task_status(&task.id, Status::Done)
                     .await
@@ -413,11 +533,7 @@ pub(crate) async fn review_open_prs(
                     tracing::warn!(task_id, err = %e, "failed to update status to done");
                 }
             } else {
-                let pr_details = gh.get_pr(repo, pr_number).await;
-                let is_conflicting = pr_details
-                    .as_ref()
-                    .map(|pr| pr.mergeable == Some(false))
-                    .unwrap_or(false);
+                let is_conflicting = batch_data.mergeable == Some(false);
 
                 if is_conflicting {
                     let retries = stored_task.merge_conflict_retries as u64;
@@ -443,7 +559,11 @@ pub(crate) async fn review_open_prs(
                         .update_task_status(&task.id, Status::NeedsReview)
                         .await
                     {
-                        tracing::warn!(task_id, err = %e, "failed to set NeedsReview for conflict retry");
+                        tracing::warn!(
+                            task_id,
+                            err = %e,
+                            "failed to set NeedsReview for conflict retry"
+                        );
                     }
                     continue;
                 }
@@ -459,12 +579,12 @@ pub(crate) async fn review_open_prs(
             continue;
         }
 
-        // Process reviews that request changes
+        // Process reviews that request changes.
         if !any_changes_requested && !comment_changes_requested {
             continue;
         }
 
-        // Build review context for re-dispatch
+        // Build review context for re-dispatch.
         let mut review_context = String::new();
         let mut latest_review_ts = last_review_ts.clone();
 
@@ -476,7 +596,7 @@ pub(crate) async fn review_open_prs(
                 latest_review_ts = review.submitted_at.clone();
             }
 
-            // Skip if we've already processed this review
+            // Skip if we've already processed this review.
             if !last_review_ts.is_empty() && review.submitted_at <= last_review_ts {
                 continue;
             }
@@ -525,35 +645,33 @@ pub(crate) async fn review_open_prs(
             }
         }
 
-        // Also include comment-based review feedback.
+        // Also include comment-based review feedback from batch issue comments.
         // Collect the new comment timestamp but do NOT persist it yet — we only
         // save it after handle_review_changes() succeeds so that a transient
         // failure does not silently drop the review on the next poll.
         let mut new_comment_review_ts: Option<String> = None;
         if comment_changes_requested {
             let last_comment_ts = stored_task.last_comment_review_ts.clone();
-            if let Ok(comments) = gh.list_comments(repo, &pr_number.to_string()).await {
-                for c in comments.iter().rev() {
-                    if c.body
-                        .starts_with("## Automated Review \u{2014} Changes Requested")
-                    {
-                        if !last_comment_ts.is_empty() && c.created_at <= last_comment_ts {
-                            break;
-                        }
-                        let body: String = c.body.lines().skip(1).collect::<Vec<_>>().join("\n");
-                        review_context.push_str("### Automated Review (Changes Requested)\n\n");
-                        review_context.push_str(&body);
-                        review_context.push('\n');
-
-                        // Capture the timestamp; persist only on success below.
-                        new_comment_review_ts = Some(c.created_at.clone());
+            for c in batch_data.issue_comments.iter().rev() {
+                if c.body
+                    .starts_with("## Automated Review \u{2014} Changes Requested")
+                {
+                    if !last_comment_ts.is_empty() && c.created_at <= last_comment_ts {
                         break;
                     }
+                    let body: String = c.body.lines().skip(1).collect::<Vec<_>>().join("\n");
+                    review_context.push_str("### Automated Review (Changes Requested)\n\n");
+                    review_context.push_str(&body);
+                    review_context.push('\n');
+
+                    // Capture the timestamp; persist only on success below.
+                    new_comment_review_ts = Some(c.created_at.clone());
+                    break;
                 }
             }
         }
 
-        // Cap review context to avoid oversized values
+        // Cap review context to avoid oversized values.
         const MAX_REVIEW_CONTEXT_BYTES: usize = 16 * 1024;
         if review_context.len() > MAX_REVIEW_CONTEXT_BYTES {
             let mut boundary = MAX_REVIEW_CONTEXT_BYTES;
@@ -588,7 +706,7 @@ pub(crate) async fn review_open_prs(
                 .unwrap_or(2);
 
             if let Err(e) = handle_review_changes(
-                &task,
+                task,
                 &review_context,
                 &[],
                 backend,
@@ -637,4 +755,38 @@ pub(crate) async fn review_open_prs(
     }
 
     Ok(())
+}
+
+/// Determine automated review status from batch-fetched issue comments.
+///
+/// Mirrors the logic of `get_automated_review_status` but operates on
+/// pre-fetched comments and a pre-built collaborator cache instead of making
+/// additional REST calls.
+fn automated_review_from_comments(
+    issue_comments: &[GitHubComment],
+    collab_cache: &HashMap<String, bool>,
+    pr_number: u64,
+) -> Option<String> {
+    for c in issue_comments.iter().rev() {
+        if !c.body.starts_with("## Automated Review") {
+            continue;
+        }
+        if !collab_cache.get(&c.user.login).copied().unwrap_or(false) {
+            tracing::warn!(
+                user = %c.user.login,
+                pr_number,
+                "ignoring automated review comment from non-collaborator"
+            );
+            continue;
+        }
+        let first_line = c.body.lines().next().unwrap_or("");
+        return if first_line.contains("Automated Review \u{2014} Approve") {
+            Some("approve".to_string())
+        } else if first_line.contains("Automated Review \u{2014} Changes Requested") {
+            Some("changes_requested".to_string())
+        } else {
+            None
+        };
+    }
+    None
 }
