@@ -36,6 +36,7 @@ use crate::store::{opt_store_get_task, set_review_session_expected, store_increm
 use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -618,6 +619,11 @@ pub(crate) async fn review_and_merge(
         .with_context(|| format!("store lookup failed for task {}", task.id.0))?;
 
     let store_id: Option<i64> = stored_task.as_ref().map(|t| t.id);
+    // Snapshot push-failure state from the stored task so we can clear it after a
+    // successful push without an extra store load.
+    let had_prev_push_failure = stored_task
+        .as_ref()
+        .is_some_and(|t| t.last_error.contains("push failed"));
     // Increment a per-invocation counter so every review agent run gets a unique
     // attempt directory, regardless of whether a previous attempt failed without
     // producing a `request_changes` decision (which is the only time review_cycles
@@ -747,23 +753,21 @@ pub(crate) async fn review_and_merge(
     );
 
     // 5. Pick review agent via round-robin, excluding the agent that did the work
-    let task_agent = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
-        .await
-        .and_then(|t| t.agent)
+    let task_agent = stored_task
+        .as_ref()
+        .and_then(|t| t.agent.clone())
         .unwrap_or_default();
     let (review_agent, review_model) = {
         // Exclude the task agent AND any agents that previously failed review
         // for this task, so we don't retry the same broken agent.
-        let mut exclude_list: Vec<String> = Vec::new();
+        let mut exclude_set: HashSet<String> = HashSet::new();
         if !task_agent.is_empty() {
-            exclude_list.push(task_agent.clone());
+            exclude_set.insert(task_agent.clone());
         }
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task.id.0).await {
             if let Ok(failed) = store.previous_review_agents(store_id).await {
                 for agent in failed {
-                    if !exclude_list.contains(&agent) {
-                        exclude_list.push(agent);
-                    }
+                    exclude_set.insert(agent);
                 }
             }
         }
@@ -772,13 +776,13 @@ pub(crate) async fn review_and_merge(
         // model pool is currently cooled (model_for_complexity -> None).
         // If all agents are exhausted, fall back to the first candidate and
         // allow a None model (caller treats empty model as unspecified).
-        let mut tried_agents: Vec<String> = Vec::new();
+        let mut tried_agents: HashSet<String> = HashSet::new();
         let mut chosen_agent: Option<String> = None;
         let mut chosen_model: Option<String> = None;
         let available_count = r.available_agents.len().max(1);
         loop {
             // Build a temporary exclude slice for the round-robin helper.
-            let tmp_exclude_refs: Vec<&str> = exclude_list.iter().map(|s| s.as_str()).collect();
+            let tmp_exclude_refs: Vec<&str> = exclude_set.iter().map(|s| s.as_str()).collect();
             let agent = match r.next_round_robin_agent(&tmp_exclude_refs) {
                 Some(a) => a,
                 None => break,
@@ -788,7 +792,7 @@ pub(crate) async fn review_and_merge(
             if tried_agents.contains(&agent) {
                 break;
             }
-            tried_agents.push(agent.clone());
+            tried_agents.insert(agent.clone());
 
             let model = r.config.model_for_complexity(&agent, "review", &task.id.0);
             if model.is_some() {
@@ -798,11 +802,9 @@ pub(crate) async fn review_and_merge(
             }
 
             // Model pool for this agent is exhausted/cooled — exclude and retry
-            if !exclude_list.contains(&agent) {
-                exclude_list.push(agent.clone());
-            }
+            exclude_set.insert(agent);
             // If we've excluded all known agents, stop searching
-            if exclude_list.len() >= available_count {
+            if exclude_set.len() >= available_count {
                 break;
             }
         }
@@ -812,7 +814,7 @@ pub(crate) async fn review_and_merge(
         let (agent, model) = if let Some(a) = chosen_agent {
             (a, chosen_model)
         } else {
-            let final_exclude_refs: Vec<&str> = exclude_list.iter().map(|s| s.as_str()).collect();
+            let final_exclude_refs: Vec<&str> = exclude_set.iter().map(|s| s.as_str()).collect();
             let fallback_agent = r
                 .next_round_robin_agent(&final_exclude_refs)
                 .unwrap_or_else(|| "claude".to_string());
@@ -1253,12 +1255,7 @@ pub(crate) async fn review_and_merge(
                 })),
             )
             .await;
-            if opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
-                .await
-                .map(|t| t.last_error)
-                .unwrap_or_default()
-                .contains("push failed")
-            {
+            if had_prev_push_failure {
                 store_set(
                     &Some(Arc::clone(store)),
                     repo,
@@ -1408,11 +1405,10 @@ pub(crate) async fn review_and_merge(
     }
 
     // 15. Check for push failures before acting on the decision.
-    let has_push_failure = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0)
-        .await
-        .map(|t| t.last_error)
-        .unwrap_or_default()
-        .contains("push failed");
+    // Push either succeeded (reaching here) or returned early with Failed; if it
+    // succeeded and cleared a previous failure, had_prev_push_failure captures that.
+    // Either way the current push did not fail, so has_push_failure is false.
+    let has_push_failure = false;
 
     // 16. Handle the decision
     match decision {
