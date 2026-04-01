@@ -356,6 +356,7 @@ async fn auto_unblock_blocked_tasks(
             fields.push(("attempts", serde_json::json!(0)));
             fields.push(("route_attempts", serde_json::json!(0)));
         }
+        fields.push(("no_code_reroutes", serde_json::json!(0)));
         if has_review_failure {
             fields.push(("review_agent_failures", serde_json::json!(0)));
             fields.push(("review_invocations", serde_json::json!(0)));

@@ -259,7 +259,7 @@ pub(crate) async fn review_open_prs(
                 }
 
                 let reroutes =
-                    store_increment(&Some(Arc::clone(store)), repo, task_id, "no_pr_reroutes")
+                    store_increment(&Some(Arc::clone(store)), repo, task_id, "no_code_reroutes")
                         .await;
 
                 if reroutes as u32 >= max_reroutes {
