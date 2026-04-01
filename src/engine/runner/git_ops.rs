@@ -638,7 +638,17 @@ pub async fn create_pr_if_needed(
 
 /// Returns true if the error string indicates a transient GitHub API failure
 /// (HTTP 5xx), where the PR may have been created despite the error response.
-fn is_transient_github_error(err_str: &str) -> bool {
+pub(crate) fn is_transient_github_error(err_str: &str) -> bool {
+    // Treat transport/send failures and explicit GhHttp server-error messages
+    // as transient. Older callers relied on parsing the "failed (NNN)" pattern
+    // to detect 5xx — keep that, but also recognize the newer wrappers.
+    if err_str.contains("HTTP send failed") {
+        return true;
+    }
+    if err_str.contains("GitHub API server error") {
+        return true;
+    }
+
     extract_github_http_status(err_str)
         .map(|s| (500..600).contains(&s))
         .unwrap_or(false)

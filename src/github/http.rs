@@ -14,6 +14,7 @@ use super::types::{
     GitHubCheckRun, GitHubComment, GitHubIssue, GitHubPullRequest, GitHubReview,
     GitHubReviewComment,
 };
+use crate::engine::cooldown as engine_cooldown;
 use reqwest::{header, Client, Response, StatusCode};
 use serde::Serialize;
 use std::sync::{
@@ -373,20 +374,150 @@ impl GhHttp {
         }
     }
 
+    /// Generic send wrapper that retries on 5xx server errors with exponential
+    /// backoff and sets a short-lived circuit-breaker in KV when retries fail.
+    async fn send_with_retries<F>(
+        &self,
+        mut make_req: F,
+        is_graphql: bool,
+    ) -> anyhow::Result<Response>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
+        // Circuit-breaker: if set, fail fast to avoid wasting work.
+        if engine_cooldown::is_agent_in_cooldown("github:5xx") {
+            if let Some(until) = engine_cooldown::cooldown_until("github:5xx") {
+                let now = chrono::Utc::now().timestamp();
+                let remaining = if until > now { until - now } else { 0 };
+                anyhow::bail!(
+                    "GitHub API transient 5xx circuit-breaker active for {}s",
+                    remaining
+                );
+            } else {
+                anyhow::bail!("GitHub API transient 5xx circuit-breaker active");
+            }
+        }
+
+        // Configurable retry params (defaults chosen conservatively)
+        let attempts = crate::config::get("gh.5xx.retry_attempts")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3);
+        let base_secs = crate::config::get("gh.5xx.base_backoff_seconds")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1);
+        let max_secs = crate::config::get("gh.5xx.max_backoff_seconds")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let circuit_cooldown_secs = crate::config::get("gh.5xx.circuit_breaker_cooldown_seconds")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(300);
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..attempts {
+            let req = make_req();
+            let resp_result = req.send().await;
+
+            match resp_result {
+                Ok(resp) => {
+                    // Record rate-limit state depending on REST vs GraphQL
+                    if is_graphql {
+                        Self::record_graphql_response(&resp);
+                    } else {
+                        Self::record_response(&resp);
+                    }
+
+                    // If server error, treat as transient and retry
+                    if resp.status().is_server_error() {
+                        let status = resp.status();
+                        let headers = resp.headers().clone();
+                        let body = resp.text().await.unwrap_or_default();
+                        let req_id = headers
+                            .get("x-github-request-id")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("<none>");
+                        let snippet: String = body.chars().take(400).collect();
+                        tracing::warn!(
+                            status = %status,
+                            request_id = %req_id,
+                            attempt,
+                            "GitHub server error (5xx) — attempt {attempt}: {snippet}"
+                        );
+
+                        last_err = Some(anyhow::anyhow!(
+                            "GitHub API server error ({status}) request_id={}: {}",
+                            req_id,
+                            snippet
+                        ));
+
+                        if attempt + 1 < attempts {
+                            // Exponential backoff (2^attempt * base), capped
+                            let mut backoff = base_secs.saturating_mul(2u64.pow(attempt));
+                            if backoff > max_secs {
+                                backoff = max_secs;
+                            }
+                            // Add small linear jitter to avoid synchronized retries
+                            let jitter_ms = attempt as u64 * 100;
+                            let sleep_dur = Duration::from_secs(backoff)
+                                + Duration::from_millis(jitter_ms.min(1000));
+                            tokio::time::sleep(sleep_dur).await;
+                            continue;
+                        }
+                        // Exhausted attempts — set circuit-breaker and break so last_err is read
+                        tracing::warn!(
+                            "GitHub API 5xx persisted after {} attempts — setting circuit-breaker for {}s",
+                            attempts,
+                            circuit_cooldown_secs
+                        );
+                        engine_cooldown::set_agent_cooldown("github:5xx", circuit_cooldown_secs);
+                        break;
+                    }
+
+                    // Non-5xx response — return it for caller to handle success/failure
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    // Network/transport error — treat as transient like 5xx
+                    tracing::warn!(err = %e, attempt, "HTTP send failed, will retry if attempts remain");
+                    last_err = Some(anyhow::anyhow!("HTTP send failed: {}", e));
+                    if attempt + 1 < attempts {
+                        let backoff = base_secs.saturating_mul(2u64.pow(attempt));
+                        let sleep_dur = Duration::from_secs(backoff)
+                            + Duration::from_millis((attempt as u64 * 100).min(1000));
+                        tokio::time::sleep(sleep_dur).await;
+                        continue;
+                    }
+                    // Exhausted attempts — set circuit-breaker and break so last_err is read
+                    tracing::warn!(
+                        "HTTP send failed after {} attempts — setting circuit-breaker",
+                        attempts
+                    );
+                    engine_cooldown::set_agent_cooldown("github:5xx", circuit_cooldown_secs);
+                    break;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("unexpected send_with_retries failure")))
+    }
+
     /// GET request, returns deserialized JSON.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
-        let resp = self
-            .client
-            .get(url)
-            .header(header::AUTHORIZATION, auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-        Self::record_response(&resp);
+        // Use send_with_retries to handle transient 5xx/network failures
+        let make_req = || {
+            self.client
+                .get(url)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        };
+        let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -401,15 +532,14 @@ impl GhHttp {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
-        let resp = self
-            .client
-            .get(url)
-            .header(header::AUTHORIZATION, auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-        Self::record_response(&resp);
+        let make_req = || {
+            self.client
+                .get(url)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        };
+        let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -428,16 +558,15 @@ impl GhHttp {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
-        let resp = self
-            .client
-            .get(url)
-            .query(query)
-            .header(header::AUTHORIZATION, auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-        Self::record_response(&resp);
+        let make_req = || {
+            self.client
+                .get(url)
+                .query(query)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        };
+        let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -452,16 +581,15 @@ impl GhHttp {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
-        let resp = self
-            .client
-            .post(url)
-            .json(body)
-            .header(header::AUTHORIZATION, auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-        Self::record_response(&resp);
+        let make_req = || {
+            self.client
+                .post(url)
+                .json(body)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        };
+        let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -486,16 +614,15 @@ impl GhHttp {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
-        let resp = self
-            .client
-            .patch(url)
-            .json(body)
-            .header(header::AUTHORIZATION, auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-        Self::record_response(&resp);
+        let make_req = || {
+            self.client
+                .patch(url)
+                .json(body)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        };
+        let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -510,15 +637,14 @@ impl GhHttp {
         Self::proactive_throttle_rest().await;
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
-        let resp = self
-            .client
-            .delete(url)
-            .header(header::AUTHORIZATION, auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-        Self::record_response(&resp);
+        let make_req = || {
+            self.client
+                .delete(url)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        };
+        let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
         if !status.is_success() && status != StatusCode::NOT_FOUND {
             let body = resp.text().await.unwrap_or_default();
@@ -564,8 +690,8 @@ impl GhHttp {
                     req = req.query(q);
                 }
 
-                let resp = req.send().await?;
-                Self::record_response(&resp);
+                let make_req = || req.try_clone().expect("request clone failed");
+                let resp = self.send_with_retries(make_req, false).await?;
                 let status = resp.status();
                 let next_from_headers = parse_link_next(resp.headers());
                 let content_type = resp
@@ -644,8 +770,9 @@ impl GhHttp {
             req = req.header(*k, *v);
         }
 
-        let resp = req.send().await?;
-        Self::record_graphql_response(&resp);
+        // Use send_with_retries wrapper for GraphQL (is_graphql = true)
+        let make_req = || req.try_clone().expect("graphql request clone failed");
+        let resp = self.send_with_retries(make_req, true).await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -1112,18 +1239,16 @@ impl GhHttp {
         };
 
         let auth = self.auth_header().await?;
-        let response = self
-            .client
-            .post(&url)
-            .header(header::AUTHORIZATION, auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header(header::USER_AGENT, "orch")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&payload)
-            .send()
-            .await?;
-
-        Self::record_response(&response);
+        let make_req = || {
+            self.client
+                .post(&url)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header(header::USER_AGENT, "orch")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .json(&payload)
+        };
+        let response = self.send_with_retries(make_req, false).await?;
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -1430,15 +1555,14 @@ impl GhHttp {
         Self::check_backoff()?;
         let url = format!("{GITHUB_API}/repos/{repo}/collaborators/{username}");
         let auth = self.auth_header().await?;
-        let resp = self
-            .client
-            .get(&url)
-            .header(header::AUTHORIZATION, auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-        Self::record_response(&resp);
+        let make_req = || {
+            self.client
+                .get(&url)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        };
+        let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
         if status == StatusCode::NO_CONTENT {
             Ok(true)
@@ -1673,16 +1797,15 @@ impl GhHttp {
         let url = format!("{GITHUB_API}/repos/{repo}/pulls/{pr_number}/merge");
         let payload = serde_json::json!({ "merge_method": "squash" });
         let auth = self.auth_header().await?;
-        let resp = self
-            .client
-            .put(&url)
-            .json(&payload)
-            .header(header::AUTHORIZATION, auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-        Self::record_response(&resp);
+        let make_req = || {
+            self.client
+                .put(&url)
+                .json(&payload)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        };
+        let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -1721,15 +1844,14 @@ impl GhHttp {
             r#"{{"query":"query {{ repository(owner:\"{owner}\", name:\"{repo_name}\") {{ pullRequest(number:{pr_number}) {{ id }} }} }}"}}"#
         );
         let auth = self.auth_header().await?;
-        let resp = self
+        let req = self
             .client
             .post(format!("{GITHUB_API}/graphql"))
             .body(query)
             .header(header::AUTHORIZATION, &auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .send()
-            .await?;
-        Self::record_response(&resp);
+            .header(header::ACCEPT, "application/vnd.github+json");
+        let make_req = || req.try_clone().expect("graphql request clone failed");
+        let resp = self.send_with_retries(make_req, true).await?;
         let body: serde_json::Value = resp.json().await?;
         let pr_id = body
             .pointer("/data/repository/pullRequest/id")
@@ -1741,15 +1863,14 @@ impl GhHttp {
         let mutation = format!(
             r#"{{"query":"mutation {{ enablePullRequestAutoMerge(input: {{pullRequestId: \"{pr_id}\", mergeMethod: SQUASH}}) {{ pullRequest {{ autoMergeRequest {{ enabledAt }} }} }} }}"}}"#
         );
-        let resp = self
+        let req = self
             .client
             .post(format!("{GITHUB_API}/graphql"))
             .body(mutation)
             .header(header::AUTHORIZATION, &auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .send()
-            .await?;
-        Self::record_response(&resp);
+            .header(header::ACCEPT, "application/vnd.github+json");
+        let make_req = || req.try_clone().expect("graphql request clone failed");
+        let resp = self.send_with_retries(make_req, true).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -1940,15 +2061,14 @@ impl GhHttp {
         // POST rerun — no body needed
         let rerun_url = format!("{GITHUB_API}/repos/{repo}/actions/runs/{run_id}/rerun");
         let auth = self.auth_header().await?;
-        let resp = self
-            .client
-            .post(&rerun_url)
-            .header(header::AUTHORIZATION, auth)
-            .header(header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await?;
-        Self::record_response(&resp);
+        let make_req = || {
+            self.client
+                .post(&rerun_url)
+                .header(header::AUTHORIZATION, auth.clone())
+                .header(header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        };
+        let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
