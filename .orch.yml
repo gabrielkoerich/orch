@@ -3,7 +3,7 @@ jobs:
   type: task
   schedule: '0 8,17,20 * * *'
   task:
-    title: 'Code review'
+    title: 'Code quality review'
     body: |
       You are a code quality reviewer. Focus on bugs, correctness, and reliability in EXISTING code. Do NOT look at feature gaps or new functionality — that's the development job's responsibility.
 
@@ -64,8 +64,9 @@ jobs:
       5. **Workflow and UX gaps** - inspect CLI flows, issue/PR automation, task routing, review loops, and status transitions. Look for missing affordances, confusing behavior, or repeated manual steps that should be automated.
       6. **Simplification and complexity reduction** - the system is already complex. Prioritize tasks that REMOVE code, merge duplicate paths, eliminate unnecessary abstractions, or simplify state machines. Three similar lines of code is better than a premature abstraction. Flag over-engineered areas where simpler approaches would work.
       7. **Performance** - look for measurable slow paths: repeated expensive work, unnecessary allocations/cloning, blocking work in async contexts, inefficient queries, or polling intervals that create needless churn.
-      8. **Architecture/documentation gaps** - read `docs/architecture.md`, `AGENTS.md`, and related docs for documented TODOs, drift between docs and implementation, or missing glue between components.
-      9. **Test coverage** - find missing tests for new features, key workflows, regressions, and important failure paths where better coverage would unlock safer development.
+      8. **Inefficiencies** - Audit and refactor codebase for unnecessary SQL queries, serial API calls, and O(n) inefficiencies.
+      9. **Architecture/documentation gaps** - read `docs/architecture.md`, `AGENTS.md`, and related docs for documented TODOs, drift between docs and implementation, or missing glue between components.
+      10. **Test coverage** - find missing tests for new features, key workflows, regressions, and important failure paths where better coverage would unlock safer development.
 
       ## Before creating tasks
 
@@ -131,7 +132,7 @@ jobs:
 
       If you find operational problems (stuck tasks, recurring failures, error patterns), create issues with `gh issue create --title "..." --body "..." --label "bug"`.
 
-      - Maximum 2-3 issues. Only for operational problems found during this review.
+      - Maximum 3-5 issues. Only for operational problems found during this review.
       - Do NOT duplicate issues that already exist (`gh issue list --state open`).
       - Do NOT create feature/improvement issues — that's the development job's responsibility.
 
