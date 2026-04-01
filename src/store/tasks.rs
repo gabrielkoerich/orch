@@ -1221,6 +1221,59 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
+    /// Return external IDs of tasks whose worktrees have already been cleaned.
+    ///
+    /// Used by `cleanup_done_worktrees` to skip already-cleaned tasks without
+    /// issuing one `resolve_task_id + get` per task (N+1 elimination).
+    pub async fn cleaned_external_ids(
+        &self,
+        repo: &str,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT external_id FROM tasks WHERE repo = ? AND worktree_cleaned = 1")
+                .bind(repo)
+                .fetch_all(&self.pool)
+                .await?;
+
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Batch-fetch runs for multiple task IDs in a single query.
+    ///
+    /// Returns a map of task_id → Vec<TaskRun>. Used by `auto_unblock_blocked_tasks`
+    /// to avoid N+1 `get_runs()` calls per blocked task.
+    pub async fn get_runs_for_tasks(
+        &self,
+        task_ids: &[i64],
+    ) -> anyhow::Result<std::collections::HashMap<i64, Vec<TaskRun>>> {
+        if task_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Build a comma-separated list of placeholders for the IN clause.
+        let placeholders: String = task_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT * FROM task_runs WHERE task_id IN ({}) ORDER BY attempt ASC, run_type ASC",
+            placeholders
+        );
+
+        let mut q = sqlx::query(&query);
+        for id in task_ids {
+            q = q.bind(id);
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
+
+        let mut map: std::collections::HashMap<i64, Vec<TaskRun>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let run = Self::row_to_run(row)?;
+            map.entry(run.task_id).or_default().push(run);
+        }
+
+        Ok(map)
+    }
+
     // ---------------------------------------------------------------
     // Task Runs (audit trail)
     // ---------------------------------------------------------------
