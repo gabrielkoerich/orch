@@ -1338,4 +1338,3 @@ fn task_status_to_backend_status(status: TaskStatus) -> crate::backends::Status 
         TaskStatus::NeedsReview => crate::backends::Status::NeedsReview,
     }
 }
-
