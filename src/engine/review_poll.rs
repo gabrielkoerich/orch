@@ -196,7 +196,14 @@ pub(crate) async fn review_open_prs(
                     // No open PR — handled in phase 3.
                 }
                 Err(e) => {
-                    tracing::warn!(task_id, branch = %branch, err = %e, "failed to get PR number");
+                    let e_str = format!("{e}");
+                    // If transient GitHub 5xx/transport error, skip incrementing counters
+                    // and let the task be retried on the next tick.
+                    if crate::engine::runner::git_ops::is_transient_github_error(&e_str) {
+                        tracing::warn!(task_id, branch = %branch, err = %e, "transient failure getting PR number; will retry later");
+                    } else {
+                        tracing::warn!(task_id, branch = %branch, err = %e, "failed to get PR number");
+                    }
                 }
             }
         }
@@ -215,6 +222,11 @@ pub(crate) async fn review_open_prs(
             let merged = match gh.is_pr_merged(repo, branch).await {
                 Ok(v) => v,
                 Err(e) => {
+                    let e_str = format!("{e}");
+                    if crate::engine::runner::git_ops::is_transient_github_error(&e_str) {
+                        tracing::warn!(task_id, branch = %branch, err = %e, "transient GitHub error checking merge status; will retry later");
+                        continue;
+                    }
                     tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
                     continue;
                 }
@@ -237,6 +249,14 @@ pub(crate) async fn review_open_prs(
                             .and_then(|s| s.parse().ok())
                     })
                     .unwrap_or(3);
+
+                // Avoid incrementing persistent reroute counters when the last
+                // store error indicates a transient GitHub 5xx/transport failure.
+                let last_error = task_info.stored.last_error.clone();
+                if crate::engine::runner::git_ops::is_transient_github_error(&last_error) {
+                    tracing::warn!(task_id, "transient GitHub error recorded in last_error; skipping persistent no_pr_reroutes increment and retrying later");
+                    continue;
+                }
 
                 let reroutes =
                     store_increment(&Some(Arc::clone(store)), repo, task_id, "no_pr_reroutes")

@@ -372,6 +372,26 @@ async fn ensure_pr_exists(
                                     stderr = %stderr,
                                     "failed to create missing PR — work may be stuck"
                                 );
+
+                                // If this was a transient GitHub 5xx or transport error,
+                                // do NOT increment the persistent pr_create_failures counter
+                                // (which would eventually block the task). Let the
+                                // engine retry later. Detect via git_ops::is_transient_github_error.
+                                if crate::engine::runner::git_ops::is_transient_github_error(
+                                    &stderr,
+                                ) {
+                                    tracing::warn!(
+                                        task_id = task.id.0,
+                                        branch = %branch_name,
+                                        "transient GitHub error creating PR; will retry later without incrementing persistent failure counter"
+                                    );
+                                    return Ok(EnsurePrResult::EarlyReturn(
+                                        ReviewDecision::Failed(format!(
+                                            "transient github error creating PR: {stderr}"
+                                        )),
+                                    ));
+                                }
+
                                 let failures = store_increment(
                                     &Some(Arc::clone(store)),
                                     repo,
@@ -396,6 +416,19 @@ async fn ensure_pr_exists(
                                     error = %e,
                                     "failed to run gh pr create"
                                 );
+                                let e_str = format!("{e}");
+                                if crate::engine::runner::git_ops::is_transient_github_error(&e_str)
+                                {
+                                    tracing::warn!(
+                                        task_id = task.id.0,
+                                        branch = %branch_name,
+                                        "transient GitHub error from gh CLI fallback; will retry later without incrementing persistent failure counter"
+                                    );
+                                    return Ok(EnsurePrResult::EarlyReturn(
+                                        ReviewDecision::Failed(format!("transient gh error: {e}")),
+                                    ));
+                                }
+
                                 let failures = store_increment(
                                     &Some(Arc::clone(store)),
                                     repo,
@@ -523,6 +556,20 @@ async fn ensure_pr_exists(
                     reason = %reason,
                     "no PR and no commits — re-routing for retry"
                 );
+
+                // If the last_error indicates a transient GitHub 5xx/transport error,
+                // do NOT increment the persistent reroute counter which would
+                // eventually block the task. Instead, retry later.
+                if crate::engine::runner::git_ops::is_transient_github_error(&last_error) {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        last_error = %last_error,
+                        "transient GitHub error recorded; skipping persistent no_pr_reroutes increment"
+                    );
+                    return Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
+                        format!("transient github error: {last_error}"),
+                    )));
+                }
 
                 // Atomically increment the persistent reroute counter and decide.
                 let reroutes =
