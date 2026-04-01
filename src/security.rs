@@ -117,6 +117,20 @@ fn build_leak_patterns(specs: &[LeakPatternSpec]) -> Vec<(&'static str, Regex, b
 static LEAK_PATTERNS: LazyLock<Vec<(&str, Regex, bool)>> =
     LazyLock::new(|| build_leak_patterns(LEAK_PATTERN_SPECS));
 
+/// Check if a trimmed line is a comment that should be skipped.
+///
+/// Skips lines that look like code comments explaining patterns:
+/// - `//` (C-style comments)
+/// - `#` (shell/Python comments)
+/// - `<!--` (HTML comments)
+/// - `* ` (markdown bullets)
+fn is_comment_line(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("<!--")
+        || trimmed.starts_with("* ")
+}
+
 /// Scan text for potential leaked secrets.
 ///
 /// Returns a list of matches with rule name, line number, and redacted preview.
@@ -125,13 +139,9 @@ pub fn scan(text: &str) -> Vec<LeakMatch> {
     let mut matches = Vec::new();
 
     for (line_num, line) in text.lines().enumerate() {
-        // Skip lines that look like code comments explaining patterns
         let trimmed = line.trim();
-        if trimmed.starts_with("//")
-            || trimmed.starts_with('#')
-            || trimmed.starts_with("<!--")
-            || trimmed.starts_with("* ")
-        {
+        // Skip lines that look like code comments explaining patterns
+        if is_comment_line(trimmed) {
             continue;
         }
 
@@ -167,23 +177,6 @@ pub fn scan(text: &str) -> Vec<LeakMatch> {
 /// Quick check: does this text contain any leaked secrets?
 pub fn has_leaks(text: &str) -> bool {
     !scan(text).is_empty()
-}
-
-/// Check only high-confidence patterns (fewer false positives).
-pub fn has_high_confidence_leaks(text: &str) -> bool {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("<!--") {
-            continue;
-        }
-
-        for (_rule, pattern, high_conf) in LEAK_PATTERNS.iter() {
-            if *high_conf && pattern.is_match(line) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Redact all detected secrets in text, replacing them with `[REDACTED:{rule}]`.
@@ -257,6 +250,13 @@ mod tests {
     fn clean_text_has_no_leaks() {
         let text = "This is normal agent output.\nFixed bug in parser.rs\nAll tests pass.";
         assert!(!has_leaks(text));
+    }
+
+    #[test]
+    fn ignores_markdown_bullets() {
+        let text = "* token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+        let matches = scan(text);
+        assert!(matches.is_empty());
     }
 
     #[test]
