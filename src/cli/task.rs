@@ -904,6 +904,61 @@ pub async fn unblock(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Kill tmux sessions and remove the worktree for a closed task.
+///
+/// Sessions are killed first (before worktree removal) so that the tmux-active
+/// guard in `cleanup_task_worktree_with_opts` does not skip the removal.
+/// Errors are logged but do not fail the close operation.
+async fn cleanup_sessions_and_worktree(
+    task_id: &str,
+    repo: &str,
+    store: &Option<Arc<crate::store::TaskStore>>,
+) {
+    let tmux = TmuxManager::new();
+
+    // Session names follow `orch-{project}-{task_id}` and optionally
+    // `orch-{project}-{task_id}-{suffix}` (e.g. `-review`).
+    // Build a pattern that matches the task_id as a complete dash-delimited segment.
+    let safe_id = task_id.replace(':', "-");
+    let pattern = format!("-{safe_id}");
+
+    match tmux.list_sessions().await {
+        Ok(sessions) => {
+            for sess in sessions {
+                let name = &sess.name;
+                if let Some(pos) = name.find(&pattern) {
+                    let after = &name[pos + pattern.len()..];
+                    if after.is_empty() || after.starts_with('-') {
+                        tracing::info!(
+                            session = name,
+                            task_id,
+                            "killing tmux session for closed task"
+                        );
+                        if let Err(e) = tmux.kill_session(name).await {
+                            tracing::warn!(session = name, err = %e, "failed to kill session on close");
+                        } else {
+                            println!("  killed session {name}");
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "could not list tmux sessions during close cleanup");
+        }
+    }
+
+    // Remove the worktree (sessions are already gone so the tmux guard won't block).
+    if let Some(ref s) = store {
+        match crate::engine::cleanup::cleanup_task_worktree(task_id, repo, s).await {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(task_id, err = %e, "worktree cleanup failed after task close");
+            }
+        }
+    }
+}
+
 /// Mark a task as done (without running an agent).
 pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
@@ -922,6 +977,7 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
             if let Ok(Some(store_id)) = s.resolve_task_id(&repo, id).await {
                 s.update_status(store_id, TaskStatus::Done).await?;
                 println!("Closed internal task #{} (marked done)", parsed);
+                cleanup_sessions_and_worktree(id, &repo, &store).await;
                 return Ok(());
             }
         }
@@ -935,6 +991,7 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
                 if task.origin == "internal" {
                     s.update_status(parsed, TaskStatus::Done).await?;
                     println!("Closed internal task #{} (marked done)", parsed);
+                    cleanup_sessions_and_worktree(id, &repo, &store).await;
                     return Ok(());
                 }
             }
@@ -954,6 +1011,7 @@ pub async fn close(id: &str, note: Option<&str>) -> anyhow::Result<()> {
 
     update_status_store_first(&store, &backend, &repo, &ext_id, Status::Done).await?;
     println!("Closed task #{} (marked done)", id);
+    cleanup_sessions_and_worktree(id, &repo, &store).await;
     Ok(())
 }
 
