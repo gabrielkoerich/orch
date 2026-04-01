@@ -158,15 +158,22 @@ pub async fn run(fix: bool, dry_run: bool) -> anyhow::Result<()> {
         }
 
         // 4+5. Issue status and label checks (active external tasks only).
-        // Fetch each issue individually — GitHub doesn't expose a clean batch
-        // endpoint for arbitrary issue numbers via REST. TODO: migrate to GraphQL.
+        // Batch-fetch all issue states and labels in a single GraphQL call.
         let external_active: Vec<_> = active_tasks
             .iter()
             .filter(|t| t.origin != "internal")
             .collect();
+        let issue_numbers: Vec<u64> = external_active
+            .iter()
+            .filter_map(|t| t.external_id.as_deref().and_then(|id| id.parse().ok()))
+            .collect();
+        let issue_states = gh
+            .batch_get_issue_states(repo, &issue_numbers)
+            .await
+            .unwrap_or_default();
         for task in &external_active {
-            check_issue_status_mismatch(task, &backend, &mut findings).await;
-            check_label_mismatch(task, &backend, &mut findings).await;
+            check_issue_status_mismatch(task, &issue_states, &mut findings);
+            check_label_mismatch(task, &issue_states, &mut findings);
         }
 
         // 6. Stale in_progress tasks (no tmux session)
@@ -473,9 +480,9 @@ fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
 }
 
 /// Check 4: Closed GitHub issue with non-done SQLite status (and vice versa).
-async fn check_issue_status_mismatch(
+fn check_issue_status_mismatch(
     task: &Task,
-    backend: &Arc<dyn ExternalBackend>,
+    issue_states: &std::collections::HashMap<String, (String, Vec<String>)>,
     findings: &mut Vec<Finding>,
 ) {
     let ext_id = match &task.external_id {
@@ -483,12 +490,12 @@ async fn check_issue_status_mismatch(
         None => return,
     };
 
-    let ext_task = match backend.get_task(&ExternalId(ext_id)).await {
-        Ok(t) => t,
-        Err(_) => return,
+    let (state, _labels) = match issue_states.get(&ext_id) {
+        Some(v) => v,
+        None => return,
     };
 
-    let issue_closed = ext_task.state == "closed";
+    let issue_closed = state == "closed";
     let task_done = task.status == TaskStatus::Done;
     let task_blocked = task.status == TaskStatus::Blocked;
 
@@ -513,9 +520,9 @@ async fn check_issue_status_mismatch(
 }
 
 /// Check 5: Label/status mismatch.
-async fn check_label_mismatch(
+fn check_label_mismatch(
     task: &Task,
-    backend: &Arc<dyn ExternalBackend>,
+    issue_states: &std::collections::HashMap<String, (String, Vec<String>)>,
     findings: &mut Vec<Finding>,
 ) {
     let ext_id = match &task.external_id {
@@ -523,18 +530,14 @@ async fn check_label_mismatch(
         None => return,
     };
 
-    let ext_task = match backend.get_task(&ExternalId(ext_id)).await {
-        Ok(t) => t,
-        Err(_) => return,
+    let (_state, labels) = match issue_states.get(&ext_id) {
+        Some(v) => v,
+        None => return,
     };
 
     let expected_label = format!("status:{}", task.status.as_str());
-    let has_expected = ext_task.labels.iter().any(|l| l == &expected_label);
-    let status_labels: Vec<_> = ext_task
-        .labels
-        .iter()
-        .filter(|l| l.starts_with("status:"))
-        .collect();
+    let has_expected = labels.iter().any(|l| l == &expected_label);
+    let status_labels: Vec<_> = labels.iter().filter(|l| l.starts_with("status:")).collect();
 
     if !has_expected {
         let actual = if status_labels.is_empty() {
@@ -596,6 +599,13 @@ async fn check_orphaned_worktrees(all_tasks: &[Task], findings: &mut Vec<Finding
         Err(_) => return,
     };
 
+    // Build a HashMap for O(1) worktree-path → task lookups instead of O(T) linear scan.
+    let task_by_worktree: std::collections::HashMap<&str, &Task> = all_tasks
+        .iter()
+        .filter(|t| !t.worktree.is_empty())
+        .map(|t| (t.worktree.as_str(), t))
+        .collect();
+
     for project_entry in project_dirs.flatten() {
         if !project_entry
             .file_type()
@@ -618,7 +628,7 @@ async fn check_orphaned_worktrees(all_tasks: &[Task], findings: &mut Vec<Finding
             }
             let wt_path = branch_entry.path().to_string_lossy().to_string();
 
-            let owning_task = all_tasks.iter().find(|t| t.worktree == wt_path);
+            let owning_task = task_by_worktree.get(wt_path.as_str()).copied();
 
             match owning_task {
                 Some(task) => {
