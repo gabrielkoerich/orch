@@ -19,11 +19,42 @@ Or equivalently:
 brew services restart orch
 ```
 
-## Unblocking tasks
+## Cooldowns and unblocking
 
 ```bash
-orch task unblock all
+orch cooldown list                  # list all active cooldowns
+orch cooldown clear <key>           # clear a cooldown (e.g., "claude", "kimi:opus")
+orch cooldown clear --all           # clear all active cooldowns
+orch task unblock all               # unblock blocked tasks
 ```
+
+## Manual issue closure cleanup
+
+**IMPORTANT:** When you manually close a GitHub issue, agents may still be working on it — tmux sessions and worktrees must be cleaned up or they'll interfere with future work.
+
+### Stale sessions to check for
+
+When closing issue `#NNNN`, look for:
+- **Agent sessions:** `orch-orch-NNNN-*` (e.g., `orch-orch-1455-review`)
+- **Chat sessions:** `orch-chat-*` (leftover from debugging)
+- **Review sessions:** `orch-orch-*-review`
+
+### Cleanup steps
+
+```bash
+# 1. List all orch tmux sessions
+tmux list-sessions | grep orch
+
+# 2. Kill the specific session(s)
+tmux kill-session -t orch-orch-NNNN-review
+tmux kill-session -t orch-chat-default
+
+# 3. Remove associated worktrees
+ls ~/.orch/worktrees/orch/ | grep -i "NNNN\|issue"
+rm -rf ~/.orch/worktrees/orch/gh-issue-NNNN-*
+```
+
+**Do not leave stale sessions/worktrees** — they consume resources and can interfere with new work on the same issue.
 
 ## Logs
 
@@ -528,13 +559,19 @@ An interactive conversational control plane. Talk to orch in natural language �
 
 ### How It Works
 
-Each message triggers a **one-shot agent invocation** with context assembled from SQLite. No long-running session — stateless process, stateful database.
+Uses **persistent agent sessions in tmux** for speed (~2s per message vs 15-20s cold start):
 
 ```
-message → store in SQLite → assemble context (live state + memories + summaries)
-  → invoke agent (build_command + parse_response from runner)
-  → parse <summary> tag → store response + tokens → return
+1. First message → spawn agent in orch-chat-{session_id} tmux session
+2. Subsequent messages → send-keys + pane capture diffing (~2s)
+3. Response extracted via line-count diff (before/after comparison)
+4. Session idle timeout (10 min) auto-kills inactive sessions
+5. Agent/model switch restarts session with new config
+
+Storage: context assembled from SQLite (live state + memories)
 ```
+
+All data persisted to `control_messages` table (history + summary + tokens + cost).
 
 ### CLI Usage
 

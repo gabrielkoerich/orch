@@ -365,7 +365,7 @@ fn build_interactive_command(agent: &str, model: &str, system_prompt_file: &str)
         "claude" | "kimi" | "minimax" => {
             // Claude Code interactive mode with system prompt
             format!(
-                "{agent} --model {model} --permission-mode bypassPermissions --append-system-prompt {system_prompt_file}"
+                "{agent} --model {model} --permission-mode bypassPermissions --append-system-prompt-file {system_prompt_file}"
             )
         }
         "codex" => {
