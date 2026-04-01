@@ -1165,9 +1165,35 @@ impl GhHttp {
             format!(r#"{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}"#);
 
         let resp = self.graphql(&query).await?;
+
+        // Surface GraphQL partial errors before checking data structure
+        if let Some(errors) = resp.get("errors").and_then(|e| e.as_array()) {
+            if !errors.is_empty() {
+                let messages: Vec<&str> = errors
+                    .iter()
+                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                    .collect();
+                tracing::warn!(
+                    repo,
+                    errors = ?messages,
+                    "GraphQL returned errors in batch PR merge check"
+                );
+            }
+        }
+
         let repo_data = resp.pointer("/data/repository").ok_or_else(|| {
-            let preview: String = resp.to_string().chars().take(500).collect();
-            anyhow::anyhow!("missing /data/repository in GraphQL response: {}", preview)
+            // Check for errors array to provide a more helpful error message
+            let error_msg = resp
+                .get("errors")
+                .and_then(|e| e.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("no error details");
+            anyhow::anyhow!(
+                "missing /data/repository in GraphQL response: {}",
+                error_msg
+            )
         })?;
 
         let mut result = std::collections::HashMap::new();
