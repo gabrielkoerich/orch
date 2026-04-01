@@ -949,6 +949,63 @@ impl GhHttp {
         Ok(merged_at.map(|v| !v.is_null()).unwrap_or(false))
     }
 
+    /// Batch-check whether the PR for each branch was merged via a single GraphQL query.
+    ///
+    /// Returns a map of branch → merged. Branches with no matching PR are omitted
+    /// (callers should treat missing entries as not merged).
+    pub async fn batch_is_pr_merged_by_branch(
+        &self,
+        repo: &str,
+        branches: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, bool>> {
+        if branches.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+
+        // Build one alias per branch using positional index to avoid GraphQL
+        // alias restrictions on branch names that contain non-identifier chars.
+        let aliases: String = branches
+            .iter()
+            .enumerate()
+            .map(|(i, branch)| {
+                let escaped = branch.replace('\\', "\\\\").replace('"', "\\\"");
+                format!(
+                    r#"b{i}: pullRequests(headRefName: \"{escaped}\", states: [MERGED], last: 1) {{ nodes {{ merged }} }}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let query = format!(
+            r#"{{ "query": "{{ repository(owner: \"{owner}\", name: \"{name}\") {{ {aliases} }} }}" }}"#
+        );
+
+        let resp = self.graphql(&query).await?;
+        let repo_data = resp
+            .pointer("/data/repository")
+            .ok_or_else(|| anyhow::anyhow!("missing /data/repository in GraphQL response"))?;
+
+        let mut result = std::collections::HashMap::new();
+        for (i, branch) in branches.iter().enumerate() {
+            let alias = format!("b{i}");
+            let merged = repo_data
+                .get(&alias)
+                .and_then(|v| v.get("nodes"))
+                .and_then(|nodes| nodes.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|node| node.get("merged"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            result.insert(branch.clone(), merged);
+        }
+
+        Ok(result)
+    }
+
     /// Get issue/PR comments since a given timestamp (paginated).
     pub async fn get_mentions(
         &self,

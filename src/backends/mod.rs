@@ -268,6 +268,29 @@ pub trait ExternalBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Check if PRs for the given branches have been merged, in a single batch.
+    ///
+    /// Returns a map of branch → merged. Backends that support batch queries
+    /// (e.g. via GraphQL) should override this; the default falls back to
+    /// serial `is_pr_merged` calls.
+    async fn batch_is_pr_merged(
+        &self,
+        branches: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, bool>> {
+        let mut result = std::collections::HashMap::new();
+        for branch in branches {
+            match self.is_pr_merged(branch).await {
+                Ok(merged) => {
+                    result.insert(branch.clone(), merged);
+                }
+                Err(e) => {
+                    tracing::warn!(branch, err = %e, "failed to check PR merge status");
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Get the authenticated user's username.
     ///
     /// Returns None by default (backends that don't support user identity).

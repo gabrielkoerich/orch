@@ -118,23 +118,27 @@ async fn reconcile_closed_tasks(
             "capping closed-issue reconciliation to avoid rate-limit exhaustion"
         );
     }
+    let mut futs = Vec::new();
     for task in needs_reconcile.iter().take(MAX_RECONCILE_PER_CYCLE) {
-        tracing::info!(
-            task_id = task.id.0,
-            labels = ?task.labels,
-            "closed issue with stale status label — reconciling to done and cleaning up"
-        );
-        if let Err(e) = task_manager
-            .update_task_status(&task.id, Status::Done)
-            .await
-        {
-            tracing::warn!(
-                task_id = task.id.0,
-                err = %e,
-                "failed to reconcile closed issue status to done"
+        let id = task.id.clone();
+        let task_id_str = task.id.0.clone();
+        let labels = task.labels.clone();
+        futs.push(async move {
+            tracing::info!(
+                task_id = task_id_str,
+                labels = ?labels,
+                "closed issue with stale status label — reconciling to done and cleaning up"
             );
-        }
+            if let Err(e) = task_manager.update_task_status(&id, Status::Done).await {
+                tracing::warn!(
+                    task_id = task_id_str,
+                    err = %e,
+                    "failed to reconcile closed issue status to done"
+                );
+            }
+        });
     }
+    futures::future::join_all(futs).await;
     task_ids.extend(
         needs_reconcile
             .iter()
@@ -837,11 +841,11 @@ pub(crate) async fn check_merged_prs(
         "checking review tasks for merged PRs"
     );
 
-    for task in all_review_tasks {
-        let task_id = &task.id.0;
-
-        // Get branch from store
-        let branch = match store::opt_store_get_task(&Some(Arc::clone(store)), repo, task_id)
+    // Collect (task_id, branch) pairs — skip tasks with no branch recorded.
+    let mut task_branches: Vec<(String, String)> = Vec::new();
+    for task in &all_review_tasks {
+        let task_id = task.id.0.clone();
+        let branch = match store::opt_store_get_task(&Some(Arc::clone(store)), repo, &task_id)
             .await
             .map(|t| t.branch)
         {
@@ -851,34 +855,43 @@ pub(crate) async fn check_merged_prs(
                 continue;
             }
         };
+        task_branches.push((task_id, branch));
+    }
 
-        // Check if PR is merged via the backend trait
-        match backend.is_pr_merged(&branch).await {
-            Ok(true) => {
-                tracing::info!(task_id, branch = %branch, "PR merged, marking task complete");
+    if task_branches.is_empty() {
+        return Ok(());
+    }
 
-                // Update status to done
-                let id = ExternalId(task_id.clone());
-                if let Err(e) = task_manager.update_task_status(&id, Status::Done).await {
-                    tracing::warn!(task_id, err = %e, "failed to update status to done");
-                    continue;
-                }
+    // Single GraphQL call for all branches — N REST calls → 1 GraphQL call.
+    let branches: Vec<String> = task_branches.iter().map(|(_, b)| b.clone()).collect();
+    let merged_map = match backend.batch_is_pr_merged(&branches).await {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(err = %e, "batch PR merge check failed, skipping tick");
+            return Ok(());
+        }
+    };
 
-                // Post comment
-                let comment = format!(
-                    "PR merged, marking task complete{}",
-                    crate::engine::orch_footer()
-                );
-                if let Err(e) = backend.post_comment(&id, &comment).await {
-                    tracing::warn!(task_id, err = %e, "failed to post comment");
-                }
-            }
-            Ok(false) => {
-                // PR not merged, continue
-            }
-            Err(e) => {
-                tracing::warn!(task_id, branch = %branch, err = %e, "failed to check PR merge status");
-            }
+    for (task_id, branch) in task_branches {
+        let is_merged = merged_map.get(&branch).copied().unwrap_or(false);
+        if !is_merged {
+            continue;
+        }
+
+        tracing::info!(task_id, branch = %branch, "PR merged, marking task complete");
+
+        let id = ExternalId(task_id.clone());
+        if let Err(e) = task_manager.update_task_status(&id, Status::Done).await {
+            tracing::warn!(task_id, err = %e, "failed to update status to done");
+            continue;
+        }
+
+        let comment = format!(
+            "PR merged, marking task complete{}",
+            crate::engine::orch_footer()
+        );
+        if let Err(e) = backend.post_comment(&id, &comment).await {
+            tracing::warn!(task_id, err = %e, "failed to post comment");
         }
     }
 
