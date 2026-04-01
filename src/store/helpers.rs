@@ -138,7 +138,9 @@ pub async fn store_reset_failure_counters(
 ) {
     if let Some(ref store) = store {
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-            let _ = store.reset_failure_counters(store_id).await;
+            if let Err(e) = store.reset_failure_counters(store_id).await {
+                tracing::warn!(task_id, err = %e, "failed to reset failure counters after review dispatch");
+            }
         }
     }
 }
