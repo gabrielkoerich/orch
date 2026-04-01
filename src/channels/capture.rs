@@ -186,40 +186,36 @@ impl CaptureService {
             };
 
             if let Some(buffer) = buffer {
-                // Prefer transport-backed PTY output if available (engine-managed PTYs)
-                let current_content = match self.transport.get_session_output(&buffer.task_id).await
-                {
-                    Some(s) => s,
-                    None => match tmux::capture_pane(&buffer.session).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            // Only fire "session ended" if the session was seen alive before.
-                            // Prevents false positives when the session is registered before
-                            // the tmux session is actually created (race between registration
-                            // and session creation).
-                            if buffer.seen_alive && tmux::is_session_dead(&buffer.session).await {
-                                tracing::info!(
-                                    task_id,
-                                    session = buffer.session,
-                                    "session ended, sending final chunk"
-                                );
-                                let chunk = OutputChunk {
-                                    content: String::new(),
-                                    is_final: true,
-                                };
-                                self.transport.push_output(&task_id, chunk).await;
-                                self.unregister_session(&task_id).await;
-                            } else {
-                                tracing::trace!(
-                                    task_id,
-                                    session = buffer.session,
-                                    ?e,
-                                    "capture failed (transient)"
-                                );
-                            }
-                            continue;
+                // Capture pane content directly via tmux
+                let current_content = match tmux::capture_pane(&buffer.session).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Only fire "session ended" if the session was seen alive before.
+                        // Prevents false positives when the session is registered before
+                        // the tmux session is actually created (race between registration
+                        // and session creation).
+                        if buffer.seen_alive && tmux::is_session_dead(&buffer.session).await {
+                            tracing::info!(
+                                task_id,
+                                session = buffer.session,
+                                "session ended, sending final chunk"
+                            );
+                            let chunk = OutputChunk {
+                                content: String::new(),
+                                is_final: true,
+                            };
+                            self.transport.push_output(&task_id, chunk).await;
+                            self.unregister_session(&task_id).await;
+                        } else {
+                            tracing::trace!(
+                                task_id,
+                                session = buffer.session,
+                                ?e,
+                                "capture failed (transient)"
+                            );
                         }
-                    },
+                        continue;
+                    }
                 };
 
                 let new_content = {

@@ -8,12 +8,10 @@
 //! Users can watch agent sessions in real-time from any connected channel,
 //! and even join/intervene by sending input through the transport.
 
-use super::{Channel, IncomingMessage, OutgoingMessage, OutputChunk};
+use super::{Channel, IncomingMessage, OutgoingMessage};
 use crate::cmd::CommandErrorContext;
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::time::{Duration, Interval};
 
 pub struct TmuxChannel {
     /// Shared transport for pushing output
@@ -38,15 +36,9 @@ impl Channel for TmuxChannel {
         let (_tx, rx) = tokio::sync::mpsc::channel(64);
         tracing::info!("tmux channel started");
 
-        // Spawn background capture loop if transport is configured
-        if let Some(transport) = &self.transport {
-            let transport = transport.clone();
-            tokio::spawn(async move {
-                if let Err(e) = capture_loop(transport).await {
-                    tracing::error!(?e, "tmux capture loop failed");
-                }
-            });
-        } else {
+        // Output streaming is handled by CaptureService now.
+        // The transport-backed capture loop has been removed to avoid duplicate output.
+        if self.transport.is_none() {
             tracing::warn!("tmux channel started without transport - output streaming disabled");
         }
 
@@ -131,115 +123,4 @@ pub async fn is_session_dead(session: &str) -> bool {
     }
 }
 
-/// Background loop that captures tmux output every 2 seconds for active sessions.
-///
-/// Runs continuously:
-/// 1. Lists all orch-* tmux sessions
-/// 2. Captures pane content for each session
-/// 3. Diffs against last capture to find new content
-/// 4. Pushes new content to transport for broadcasting
-async fn capture_loop(transport: Arc<crate::channels::transport::Transport>) -> anyhow::Result<()> {
-    let capture_interval = Duration::from_secs(2);
-    let mut ticker: Interval = tokio::time::interval(capture_interval);
-
-    // Track last captured content per session
-    let mut last_content: HashMap<String, String> = HashMap::new();
-
-    tracing::info!("tmux capture loop started");
-
-    loop {
-        ticker.tick().await;
-
-        // Get active sessions from transport (or fall back to listing all orch-* sessions)
-        let active_bindings = transport.active_sessions().await;
-        let sessions_to_capture: Vec<String> = if active_bindings.is_empty() {
-            // No active bindings - fall back to listing all orch sessions
-            match list_orch_sessions().await {
-                Ok(sessions) => sessions,
-                Err(e) => {
-                    tracing::debug!(?e, "failed to list tmux sessions");
-                    continue;
-                }
-            }
-        } else {
-            // Capture only sessions with active bindings
-            active_bindings
-                .iter()
-                .map(|b| b.tmux_session.clone())
-                .collect()
-        };
-
-        for session_name in sessions_to_capture {
-            // Extract task_id from session name (e.g., "orch-myproject-42" -> "42")
-            let task_id = session_name
-                .strip_prefix("orch-")
-                .and_then(|s| s.rsplit('-').next())
-                .unwrap_or(&session_name)
-                .to_string();
-
-            // Capture current pane content
-            match capture_pane(&session_name).await {
-                Ok(content) => {
-                    let last = last_content.get(&session_name);
-
-                    // Check if content changed
-                    if last.map(|s| s.as_str()) != Some(&content) {
-                        // Find the diff (new content since last capture)
-                        let _new_content = if let Some(last_content) = last {
-                            // Simple diff: content that appears after the last known content
-                            if let Some(pos) = content.find(last_content) {
-                                // Found previous content, take everything after it
-                                let _remaining = &content[pos + last_content.len()..];
-                                // Handle case where previous content appears multiple times
-                                // We want the content AFTER the last occurrence for accurate diffing
-                                content.len() - (pos + last_content.len())
-                            } else {
-                                // Content changed completely - just send the new content
-                                content.len()
-                            }
-                        } else {
-                            // First capture - send all content
-                            content.len()
-                        };
-
-                        // Extract new content properly
-                        let new_chunk = if let Some(last_content) = last {
-                            if let Some(pos) = content.rfind(last_content) {
-                                // Use rfind to find the LAST occurrence of last_content
-                                // This handles cases where content is repeated
-                                content[pos + last_content.len()..].to_string()
-                            } else {
-                                content.clone()
-                            }
-                        } else {
-                            // First capture - truncate to avoid sending too much
-                            let lines: Vec<&str> = content.lines().rev().take(50).collect();
-                            lines.into_iter().rev().collect::<Vec<_>>().join("\n")
-                        };
-
-                        if !new_chunk.trim().is_empty() {
-                            // Push to transport for broadcasting
-                            transport
-                                .push_output(
-                                    &task_id,
-                                    OutputChunk {
-                                        content: new_chunk,
-                                        is_final: false,
-                                    },
-                                )
-                                .await;
-                        }
-
-                        // Update last content
-                        last_content.insert(session_name.clone(), content);
-                    }
-                }
-                Err(e) => {
-                    // Session might have ended - remove from tracking
-                    tracing::debug!(session = %session_name, ?e, "capture failed");
-                    last_content.remove(&session_name);
-                }
-            }
-        }
-    }
-}
+// Capture loop removed — output streaming handled by CaptureService.

@@ -132,11 +132,7 @@ impl Transport {
         }
     }
 
-    /// Return the last seen output for a task, if any.
-    pub async fn get_session_output(&self, task_id: &str) -> Option<String> {
-        let last = self.last_output.read().await;
-        last.get(task_id).cloned()
-    }
+
 
     /// Clear any cached last_output for a task.
     ///
