@@ -295,7 +295,14 @@ enum Commands {
         details: bool,
     },
     /// Combined dashboard: tasks, sessions, recent activity
-    Dashboard,
+    Dashboard {
+        /// Show tasks across all projects (default when outside a project directory)
+        #[arg(long, short = 'g')]
+        global: bool,
+        /// Filter to a specific project (e.g. owner/repo or just repo name)
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// GitHub Projects V2 board management
     Board {
         #[command(subcommand)]
@@ -831,8 +838,8 @@ async fn main() -> anyhow::Result<()> {
             cli::metrics(details).await?;
         }
         // Combined dashboard view: tasks, sessions, recent activity
-        Commands::Dashboard => {
-            cli::dashboard::dashboard().await?;
+        Commands::Dashboard { global, project } => {
+            cli::dashboard::dashboard(global, project).await?;
         }
         Commands::Board { action } => match action {
             BoardAction::List => {
