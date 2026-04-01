@@ -24,9 +24,9 @@ mod tasks;
 pub use control::{parse_since_duration, ControlMessage, MemoryEntry};
 #[allow(unused_imports)]
 pub use helpers::{
-    get_cost_estimate, get_recent_memory, get_token_usage, get_total_tokens, opt_store_get_task,
-    review_session_expected, set_review_session_expected, store_increment, store_log_activity,
-    store_reset_counters, store_reset_failure_counters, store_set,
+    get_cost_estimate, get_recent_memory, get_token_summary, get_token_usage, get_total_tokens,
+    opt_store_get_task, review_session_expected, set_review_session_expected, store_increment,
+    store_log_activity, store_reset_counters, store_reset_failure_counters, store_set,
 };
 #[allow(unused_imports)]
 pub use jobs::JobState;

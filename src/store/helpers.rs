@@ -187,6 +187,32 @@ pub async fn get_total_tokens(store: &Option<Arc<TaskStore>>, repo: &str, task_i
     usage.total_tokens()
 }
 
+/// Get both total tokens and cost estimate in a single store read.
+pub async fn get_token_summary(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> (u64, CostEstimate) {
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
+            if let Ok(task) = s.get(store_id).await {
+                let usage = TokenUsage {
+                    input_tokens: task.input_tokens as u64,
+                    output_tokens: task.output_tokens as u64,
+                };
+                let total = usage.total_tokens();
+                let cost = CostEstimate {
+                    input_cost_usd: task.input_cost_usd,
+                    output_cost_usd: task.output_cost_usd,
+                    total_cost_usd: task.total_cost_usd,
+                };
+                return (total, cost);
+            }
+        }
+    }
+    (0, CostEstimate::default())
+}
+
 pub async fn get_recent_memory(
     store: &Option<Arc<TaskStore>>,
     repo: &str,

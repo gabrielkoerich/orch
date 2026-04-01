@@ -139,6 +139,7 @@ pub async fn handle_success(
                 "no commits ahead of default branch, skipping push + PR"
             );
             // Clear stale push failure from previous runs
+            // Load stored task once to inspect last_error (avoid repeated DB reads)
             let last_err = store::opt_store_get_task(store, repo, task_id)
                 .await
                 .map(|t| t.last_error)
@@ -364,13 +365,16 @@ pub async fn handle_success(
     // Track push failures — block after 3 consecutive failures
     // Check if push was attempted but failed: agent said done, tried to push, but has_pushed is still false
     // and last_error contains a push failure. Only count when there were commits to push.
-    let push_failed = resp.status == "done" && !has_pushed && has_commits && {
-        let last_err = store::opt_store_get_task(store, repo, task_id)
-            .await
-            .map(|t| t.last_error)
-            .unwrap_or_default();
-        last_err.contains("push failed")
-    };
+    // Read last_error once (reuse the value read earlier if available)
+    let stored_last_error = store::opt_store_get_task(store, repo, task_id)
+        .await
+        .map(|t| t.last_error)
+        .unwrap_or_default();
+
+    let push_failed = resp.status == "done"
+        && !has_pushed
+        && has_commits
+        && stored_last_error.contains("push failed");
 
     let final_status = if push_failed {
         // Use atomic increment helper to avoid a read-increment-write race.
@@ -503,6 +507,7 @@ pub async fn handle_success(
     if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
         let model = model_name.unwrap_or("haiku");
         if let Some(ref st) = store {
+            // Resolve store_id once and reuse
             if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
                 if let Err(e) = st
                     .store_tokens(store_id, input as i64, output as i64, model)
@@ -533,8 +538,8 @@ pub async fn handle_success(
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000);
 
-    let total_tokens = store::get_total_tokens(store, repo, task_id).await;
-    let cost = store::get_cost_estimate(store, repo, task_id).await;
+    // Query total tokens and cost estimate together (single DB read)
+    let (total_tokens, cost) = store::get_token_summary(store, repo, task_id).await;
     let warning_threshold = (max_tokens as f64 * 0.8) as u64;
 
     if total_tokens > max_tokens {
