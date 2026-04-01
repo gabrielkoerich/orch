@@ -16,6 +16,7 @@ use crate::store::TaskStore;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::process::Command;
+use futures::future::join_all;
 
 /// All assembled context for a task execution.
 pub struct TaskContext {
@@ -76,15 +77,29 @@ pub async fn build_parent_context(
         parent.id.0, parent.title, parent.body
     ));
 
-    // Get sibling tasks
+    // Get sibling tasks — fetch remote task objects and store summaries in parallel
     if let Ok(siblings) = backend.get_sub_issues(&ExternalId(parent_id)).await {
+        // Filter out self early
+        let siblings: Vec<ExternalId> = siblings
+            .into_iter()
+            .filter(|s| s.0 != task.id.0)
+            .collect();
+
         if !siblings.is_empty() {
             ctx.push_str("## Sibling Tasks\n\n");
-            for sib_id in &siblings {
-                if sib_id.0 == task.id.0 {
-                    continue; // Skip self
-                }
-                if let Ok(sib) = backend.get_task(sib_id).await {
+
+            // Fetch ExternalTask objects concurrently
+            let task_futs = siblings.iter().map(|id| backend.get_task(id));
+            let task_results = join_all(task_futs).await;
+
+            // Fetch store task records concurrently (may be None for missing tasks)
+            let store_futs = siblings
+                .iter()
+                .map(|id| store::opt_store_get_task(store, repo, &id.0));
+            let store_results = join_all(store_futs).await;
+
+            for (i, maybe_task_res) in task_results.into_iter().enumerate() {
+                if let Ok(sib) = maybe_task_res {
                     let status = sib
                         .labels
                         .iter()
@@ -93,17 +108,16 @@ pub async fn build_parent_context(
                         .unwrap_or_else(|| "unknown".to_string());
                     ctx.push_str(&format!("- #{} [{}]: {}\n", sib.id.0, status, sib.title));
 
-                    // Include summary if available
-                    if let Some(summary) = store::opt_store_get_task(store, repo, &sib.id.0)
-                        .await
-                        .map(|t| t.summary)
-                    {
+                    // Include summary if available from the store result at same index
+                    if let Some(Some(task_rec)) = store_results.get(i) {
+                        let summary = &task_rec.summary;
                         if !summary.is_empty() {
                             ctx.push_str(&format!("  Summary: {}\n", summary));
                         }
                     }
                 }
             }
+
             ctx.push('\n');
         }
     }
