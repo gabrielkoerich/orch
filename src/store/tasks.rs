@@ -1552,11 +1552,14 @@ impl TaskStore {
             merge_conflict_retries: row.get("merge_conflict_retries"),
             ci_merge_failures: row.get("ci_merge_failures"),
             pr_create_failures: row.get("pr_create_failures"),
-            push_failures: row.get("push_failures"),
+            push_failures: row.try_get::<i32, _>("push_failures").unwrap_or(0),
             review_agent_failures: row.get("review_agent_failures"),
             review_cycles: row.get("review_cycles"),
-            review_invocations: row.get("review_invocations"),
-            review_session_expected: row.get::<i32, _>("review_session_expected") != 0,
+            review_invocations: row.try_get::<i32, _>("review_invocations").unwrap_or(0),
+            review_session_expected: row
+                .try_get::<i32, _>("review_session_expected")
+                .unwrap_or(0)
+                != 0,
             input_tokens: row.get("input_tokens"),
             output_tokens: row.get("output_tokens"),
             input_cost_usd: row.get("input_cost_usd"),
