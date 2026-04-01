@@ -42,20 +42,6 @@ use crate::parser;
 pub struct CodexRunner;
 
 impl CodexRunner {
-    /// Parse an NDJSON stream from Codex into structured events.
-    fn parse_ndjson(&self, raw: &str) -> Vec<serde_json::Value> {
-        raw.lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| match serde_json::from_str(line) {
-                Ok(val) => Some(val),
-                Err(e) => {
-                    tracing::debug!(line, error = %e, "codex: skipping unparseable NDJSON line");
-                    None
-                }
-            })
-            .collect()
-    }
-
     /// Extract the agent's response text from NDJSON events.
     ///
     /// Looks for `item.completed` events with `item.type == "agent_message"`.
@@ -236,7 +222,7 @@ impl AgentRunner for CodexRunner {
             return Ok(String::new());
         }
 
-        let events = self.parse_ndjson(trimmed);
+        let events = super::parse_ndjson(trimmed);
         if events.is_empty() {
             return Ok(trimmed.to_string());
         }
@@ -304,7 +290,7 @@ impl AgentRunner for CodexRunner {
             return Err(AgentError::InvalidResponse { raw: String::new() });
         }
 
-        let events = self.parse_ndjson(trimmed);
+        let events = super::parse_ndjson(trimmed);
 
         if events.is_empty() {
             // Maybe it's direct JSON, not NDJSON
@@ -348,7 +334,7 @@ impl AgentRunner for CodexRunner {
 
     fn classify_error(&self, exit_code: i32, stdout: &str, stderr: &str) -> AgentError {
         // Try parsing NDJSON events from stdout for structured errors
-        let events = self.parse_ndjson(stdout);
+        let events = super::parse_ndjson(stdout);
         if let Some(err) = self.detect_error(&events) {
             return err;
         }
@@ -398,7 +384,7 @@ fn extract_quoted(text: &str, quote: char) -> Option<String> {
 /// Returns `None` only if no parseable NDJSON events are found.
 pub fn find_codex_result(ndjson: &str) -> Option<super::AgentResult> {
     let runner = CodexRunner;
-    let events = runner.parse_ndjson(ndjson.trim());
+    let events = super::parse_ndjson(ndjson.trim());
     if events.is_empty() {
         return None;
     }

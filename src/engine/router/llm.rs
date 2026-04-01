@@ -12,7 +12,7 @@
 //! - Loading and caching the skills catalog from disk
 
 use crate::backends::ExternalTask;
-use crate::engine::runner::agents::{claude, opencode, AgentError};
+use crate::engine::runner::agents::{self, claude, opencode, AgentError};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -678,7 +678,7 @@ impl LlmRouter {
     fn extract_agent_text(&self, agent: &str, raw: &str) -> anyhow::Result<String> {
         match agent {
             "opencode" => {
-                let events = opencode::parse_ndjson_events(raw.trim());
+                let events = agents::parse_ndjson(raw.trim());
                 if events.is_empty() {
                     // No parseable NDJSON lines — treat as plain text
                     Ok(raw.to_string())
