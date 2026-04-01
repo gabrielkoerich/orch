@@ -774,28 +774,68 @@ pub async fn record_github_5xx() {
 ///
 /// Automatically recovers (logs a recovery message) when the cooldown expires.
 pub fn is_github_circuit_open() -> bool {
-    let mut open = github_5xx_circuit_open()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(until) = *open {
-        let now = chrono::Utc::now().timestamp();
-        if now >= until {
-            *open = None;
-            tracing::info!("GitHub 5xx circuit breaker CLOSED — resuming normal operations");
-            return false;
+    // Check the dedicated in-memory circuit flag first. If present, honour it
+    // and perform auto-recovery when it expires (logging once on close).
+    {
+        let mut open = github_5xx_circuit_open()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(until) = *open {
+            let now = chrono::Utc::now().timestamp();
+            if now >= until {
+                *open = None;
+                tracing::info!("GitHub 5xx circuit breaker CLOSED — resuming normal operations");
+                return false;
+            }
+            return true;
+        }
+    }
+
+    // If the dedicated flag is not set, consult the generic cooldown map so
+    // callers see a consistent view regardless of which code path set the
+    // persisted cooldown (e.g. send_with_retries -> set_agent_cooldown).
+    if let Some(until) = cooldown_until("github:5xx") {
+        // Populate the dedicated in-memory flag so future checks and the
+        // auto-recovery path go through the same code and logging.
+        let mut open = github_5xx_circuit_open()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if open.is_none() {
+            *open = Some(until);
+            let now = chrono::Utc::now().timestamp();
+            if now < until {
+                let remaining = until - now;
+                tracing::warn!(
+                    remaining_secs = remaining,
+                    "GitHub 5xx circuit breaker OPEN (discovered via generic cooldown) — throttling non-critical work"
+                );
+            }
         }
         return true;
     }
+
     false
 }
 
 /// Returns the remaining seconds of the GitHub 5xx circuit breaker cooldown,
 /// or 0 if the circuit is closed.
 pub fn github_circuit_remaining_secs() -> u64 {
-    let open = github_5xx_circuit_open()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(until) = *open {
+    // Prefer the dedicated in-memory value when present.
+    {
+        let open = github_5xx_circuit_open()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(until) = *open {
+            let now = chrono::Utc::now().timestamp();
+            if now < until {
+                return (until - now) as u64;
+            }
+            return 0;
+        }
+    }
+
+    // Fall back to the generic cooldown map if the dedicated flag isn't set.
+    if let Some(until) = cooldown_until("github:5xx") {
         let now = chrono::Utc::now().timestamp();
         if now < until {
             return (until - now) as u64;
