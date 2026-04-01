@@ -1,8 +1,16 @@
 //! Control session — context assembly, one-shot agent invocation, response parsing.
 //!
 //! The control session provides an interactive ops assistant that assembles context
-//! from SQLite (memories, summaries, live state), invokes an agent CLI one-shot,
-//! and parses the response for summary extraction.
+//! from SQLite (memories, summaries, live state), invokes an agent CLI one-shot
+//! with `--session-id` for conversation continuity, and parses the response for
+//! summary extraction.
+//!
+//! ## Session continuity
+//!
+//! Each named session (e.g., "default", "ops") gets a UUID stored in SQLite KV
+//! (`control:session_id:{name}`). Claude-compatible agents (claude, kimi, minimax)
+//! receive `--session-id <uuid>` so they resume prior conversation state.
+//! The UUID is regenerated when the agent or model changes.
 //!
 //! ## Model selection
 //!
@@ -21,6 +29,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use sqlx::Row;
 use tokio::time::{timeout, Duration};
+use uuid::Uuid;
 
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -52,10 +61,6 @@ pub struct ModelSpec {
 pub enum ControlCommand {
     Model(Option<String>),
     Agent(Option<String>),
-    /// Kill the persistent tmux session.
-    Kill,
-    /// Show persistent session info.
-    Session,
 }
 
 fn default_model_for_agent(agent: &str) -> &'static str {
@@ -81,8 +86,6 @@ pub fn parse_control_command(message: &str) -> Option<ControlCommand> {
         "agent" => Some(ControlCommand::Agent(
             (!args.is_empty()).then(|| args.to_string()),
         )),
-        "kill" => Some(ControlCommand::Kill),
-        "session" => Some(ControlCommand::Session),
         _ => None,
     }
 }
@@ -398,30 +401,18 @@ async fn handle_control_command(
             let spec = parse_model_spec(&new_spec);
             validate_model(&spec).await?;
             set_model_spec(store, &spec).await?;
-            // Kill persistent session so next message starts a fresh one with new model
-            let _ = crate::chat_session::kill_session(session_id).await;
+            // Reset session UUID so next message starts a fresh conversation
+            reset_session_uuid(store, session_id).await?;
             Ok(format_switched_spec(&spec))
         }
         ControlCommand::Agent(None) => Ok(format_current_spec(&get_current_spec(store).await)),
         ControlCommand::Agent(Some(agent)) => {
             validate_agent(&agent)?;
             let spec = set_agent_spec(store, &agent).await?;
-            // Kill persistent session so next message starts a fresh one with new agent
-            let _ = crate::chat_session::kill_session(session_id).await;
+            // Reset session UUID so next message starts a fresh conversation
+            reset_session_uuid(store, session_id).await?;
             Ok(format_switched_spec(&spec))
         }
-        ControlCommand::Kill => {
-            let killed = crate::chat_session::kill_session(session_id).await?;
-            if killed {
-                Ok("Persistent session killed. Next message will start a new one.".to_string())
-            } else {
-                Ok("No active persistent session.".to_string())
-            }
-        }
-        ControlCommand::Session => match crate::chat_session::session_info(session_id).await {
-            Some(info) => Ok(format!("Persistent session: {info}")),
-            None => Ok("No active persistent session. Next message will create one.".to_string()),
-        },
     }
 }
 
@@ -545,38 +536,74 @@ pub async fn invoke_agent(
     })
 }
 
-/// Invoke an agent via a persistent tmux session.
+/// KV key for storing the session UUID for a named session.
+fn session_uuid_key(session_name: &str) -> String {
+    format!("control:session_id:{session_name}")
+}
+
+/// Get or create a session UUID for the given session name.
 ///
-/// Reuses an existing session if available, creating a new one on first call.
-/// Much faster (~2s) than one-shot invocation (~15-20s) for subsequent messages.
+/// On first call for a session, generates a new UUID and persists it to KV.
+/// Subsequent calls return the same UUID, giving agents conversation continuity
+/// via `--session-id`.
+pub async fn get_or_create_session_uuid(store: &TaskStore, session_name: &str) -> Result<String> {
+    let key = session_uuid_key(session_name);
+    if let Some(existing) = store.kv_get(&key).await? {
+        return Ok(existing);
+    }
+    let uuid = Uuid::new_v4().to_string();
+    store
+        .kv_set(&key, &uuid)
+        .await
+        .context("storing session UUID")?;
+    tracing::info!(session_name, uuid = %uuid, "created new chat session UUID");
+    Ok(uuid)
+}
+
+/// Reset the session UUID so the next message starts a fresh conversation.
 ///
-/// Falls back to one-shot invocation if the persistent session fails.
-pub async fn invoke_agent_persistent(
-    session_id: &str,
+/// Called when agent or model changes, since the new agent won't share
+/// the previous agent's session state. Generates a new UUID immediately.
+pub async fn reset_session_uuid(store: &TaskStore, session_name: &str) -> Result<()> {
+    let key = session_uuid_key(session_name);
+    let uuid = Uuid::new_v4().to_string();
+    store
+        .kv_set(&key, &uuid)
+        .await
+        .context("resetting session UUID")?;
+    tracing::info!(session_name, uuid = %uuid, "reset chat session UUID");
+    Ok(())
+}
+
+/// Invoke an agent one-shot with `--session-id` for conversation continuity.
+///
+/// For claude-compatible agents (claude, kimi, minimax), passes `--session-id <uuid>`
+/// so the agent resumes the prior conversation. Other agents get a plain one-shot call.
+pub async fn invoke_agent_with_session(
     agent: &str,
     model: &str,
-    system_prompt: &str,
+    context: &str,
     message: &str,
+    session_uuid: Option<&str>,
 ) -> Result<InvokeResult> {
     let dir = prepare_temp_dir().await?;
-    let sys_file = format!("{dir}/system.md");
-    tokio::fs::write(&sys_file, system_prompt).await?;
 
-    match crate::chat_session::send_persistent(session_id, agent, model, &sys_file, message).await {
-        Ok(response) => Ok(InvokeResult {
-            text: response.text,
-            input_tokens: response.input_tokens,
-            output_tokens: response.output_tokens,
-        }),
-        Err(e) => {
-            tracing::warn!(
-                session_id,
-                error = %e,
-                "persistent session failed — falling back to one-shot"
-            );
-            invoke_agent(agent, model, system_prompt, message).await
-        }
-    }
+    let result = crate::engine::runner::direct::run_direct_with_session(
+        agent,
+        Some(model),
+        context,
+        message,
+        AGENT_TIMEOUT,
+        &dir,
+        session_uuid,
+    )
+    .await?;
+
+    Ok(InvokeResult {
+        text: result.text,
+        input_tokens: result.input_tokens,
+        output_tokens: result.output_tokens,
+    })
 }
 
 /// High-level entry point: process a user message and return the assistant response.
@@ -632,9 +659,18 @@ pub async fn send_message(
     // Prepend live state to user message so the LLM sees it directly
     let full_message = format!("{}\n\n---\n\n{}", ctx.state, message);
 
-    // Invoke agent via persistent session (falls back to one-shot on failure)
-    let result =
-        invoke_agent_persistent(session_id, &agent, &model, &ctx.system, &full_message).await?;
+    // Get or create a session UUID for conversation continuity
+    let session_uuid = get_or_create_session_uuid(store, session_id).await?;
+
+    // Invoke agent one-shot with --session-id for conversation continuity
+    let result = invoke_agent_with_session(
+        &agent,
+        &model,
+        &ctx.system,
+        &full_message,
+        Some(&session_uuid),
+    )
+    .await?;
 
     // Parse response for summary and memory tags
     let parsed = parse_response(&result.text);
@@ -887,11 +923,8 @@ mod tests {
                 "opencode:deepseek-r1".to_string()
             )))
         );
-        assert_eq!(parse_control_command("/kill"), Some(ControlCommand::Kill));
-        assert_eq!(
-            parse_control_command("/session"),
-            Some(ControlCommand::Session)
-        );
+        assert_eq!(parse_control_command("/kill"), None);
+        assert_eq!(parse_control_command("/session"), None);
     }
 
     #[tokio::test]
@@ -1021,5 +1054,31 @@ mod tests {
         assert!(msg.cost_usd.is_some(), "cost_usd must be stored, not NULL");
         let stored = msg.cost_usd.unwrap();
         assert!(stored > 0.0, "stored cost must be positive");
+    }
+
+    #[tokio::test]
+    async fn session_uuid_created_and_stable() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let uuid1 = get_or_create_session_uuid(&store, "default").await.unwrap();
+        let uuid2 = get_or_create_session_uuid(&store, "default").await.unwrap();
+        assert_eq!(uuid1, uuid2, "same session should return same UUID");
+        assert_eq!(uuid1.len(), 36, "should be a valid UUID string");
+    }
+
+    #[tokio::test]
+    async fn session_uuid_differs_per_session() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let uuid_default = get_or_create_session_uuid(&store, "default").await.unwrap();
+        let uuid_ops = get_or_create_session_uuid(&store, "ops").await.unwrap();
+        assert_ne!(uuid_default, uuid_ops);
+    }
+
+    #[tokio::test]
+    async fn session_uuid_reset_creates_new() {
+        let store = TaskStore::open_memory().await.unwrap();
+        let uuid1 = get_or_create_session_uuid(&store, "default").await.unwrap();
+        reset_session_uuid(&store, "default").await.unwrap();
+        let uuid2 = get_or_create_session_uuid(&store, "default").await.unwrap();
+        assert_ne!(uuid1, uuid2, "reset should produce a new UUID");
     }
 }

@@ -15,7 +15,6 @@
 
 pub mod backends;
 pub mod channels;
-pub mod chat_session;
 pub mod cli;
 pub mod cmd;
 pub mod cmd_cache;
