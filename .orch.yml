@@ -262,28 +262,24 @@ jobs:
     agent: null
   enabled: true
   external: false
- - id: self-review
-   type: task
-   schedule: '0 10 * * 1'
-   task:
-     title: 'Self-review: analyze metrics and file improvement issues'
-     body: |
-       Analyze orch metrics from the last 7 days and file issues for patterns that need attention:
+- id: self-review
+  type: task
+  schedule: '0 2 * * 0'
+  task:
+    title: 'Self-review: analyze metrics and file improvement issues'
+    body: |
+      Analyze orch metrics from the last 7 days and file issues for patterns that need attention:
 
-       1. High failure rate agents (>50% failure rate with 3+ runs)
-       2. Recurring error patterns (same error type 2+ times)
-       3. Slow complex tasks (>10 min for complex tasks)
-       4. Persistent review loops (3+ tasks with 2+ review cycles)
+      1. High failure rate agents (>50% failure rate with 3+ runs)
+      2. Recurring error patterns (same error type 2+ times)
+      3. Slow complex tasks (>10 min for complex tasks)
+      4. Persistent review loops (3+ tasks with 2+ review cycles)
 
-       Use `orch task list`, `orch metrics`, and SQLite queries to gather data.
-       Only file issues if patterns are significant. Deduplicate against existing open issues.
-       Label issues: self-improvement, scheduled, automation.
-       Max 4 issues per run.
-     labels:
-       - self-improvement
-       - scheduled
-       - automation
-   enabled: true
-   external: false
+      Use `orch task list`, `orch metrics`, `orch doctor`, and SQLite queries to gather data.
+      Only file issues if patterns are significant. Deduplicate against existing open issues.
+      Label issues: self-improvement, scheduled, automation.
+      Max 4 issues per run.
+  enabled: true
+  external: false
 gh:
   repo: gabrielkoerich/orch
