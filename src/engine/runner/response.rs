@@ -175,7 +175,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
 // Cooldown tracking is implemented in `crate::engine::cooldown` (shared with the router).
 pub use crate::engine::cooldown::{
     clear_expired_cooldowns, is_agent_in_cooldown, is_model_in_cooldown,
-    record_agent_failure_with_message, record_model_failure,
+    record_agent_failure_with_message, record_model_failure, set_agent_cooldown,
 };
 
 /// Pick a fallback agent, avoiding agents already in the reroute chain and agents in cooldown.
@@ -313,6 +313,11 @@ pub async fn handle_failover(
         if !matches!(error_type, RetryableError::MissingTooling) {
             record_agent_failure_with_message(agent_name, error_message).await;
         }
+
+        // Apply brief 120s cooldown on the failed agent so the router skips it
+        // on the next routing attempt. This prevents the router from immediately
+        // re-selecting the same agent after clearing both agent and model (#1492).
+        set_agent_cooldown(agent_name, 120);
 
         let msg = format!("{error_message}, clearing agent/model for re-route");
         store::store_set(
