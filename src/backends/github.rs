@@ -374,6 +374,15 @@ impl ExternalBackend for GitHubBackend {
         self.gh.is_pr_merged(&self.repo, branch).await
     }
 
+    async fn batch_is_pr_merged(
+        &self,
+        branches: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, bool>> {
+        self.gh
+            .batch_is_pr_merged_by_branch(&self.repo, branches)
+            .await
+    }
+
     async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
         self.gh.get_whoami().await.map(Some)
     }
