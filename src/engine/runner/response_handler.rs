@@ -5,6 +5,7 @@
 //! Also owns `write_result_json` and the `safe_utf8_tail` utility.
 
 use crate::config;
+use crate::parser::AgentResponse;
 use crate::store;
 use crate::store::TaskStore;
 use std::path::Path;
@@ -376,6 +377,16 @@ pub async fn handle_success(
         && has_commits
         && stored_last_error.contains("push failed");
 
+    // Determine whether this external task can be marked done without a PR.
+    // External tasks with code-related labels must have a merged PR before
+    // reaching `done`. Tasks with non-code labels (from the allowlist) may
+    // be marked done directly.
+    let is_external = !task_id.starts_with("internal:");
+    let requires_pr = is_external
+        && !has_pr
+        && !resp.status.starts_with("needs_review")
+        && !is_non_code_task(&resp);
+
     let final_status = if push_failed {
         // Use atomic increment helper to avoid a read-increment-write race.
         let push_failures = store::store_increment(store, repo, task_id, "push_failures").await;
@@ -415,12 +426,13 @@ pub async fn handle_success(
             "agent done, commits pushed, but PR creation failed — re-dispatching as routed"
         );
         "routed"
-    } else if resp.status == "done" && !has_pr && !task_id.starts_with("internal:") {
-        // Agent claimed done but produced no code changes on an external task.
-        // Use a dedicated circuit-breaker counter persisted in the store so
-        // repeated reroutes across separate runs are counted. Prefer a
-        // dedicated config key `workflow.max_reroute_attempts` (fallback to
-        // `workflow.max_attempts` for backwards compatibility).
+    } else if resp.status == "done" && requires_pr {
+        // Agent claimed done but produced no code changes on an external task
+        // that requires a PR (has code-related labels). Use a dedicated
+        // circuit-breaker counter persisted in the store so repeated reroutes
+        // across separate runs are counted. Prefer a dedicated config key
+        // `workflow.max_reroute_attempts` (fallback to `workflow.max_attempts`
+        // for backwards compatibility).
         let max_reroutes: u32 = config::get("workflow.max_reroute_attempts")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -435,7 +447,7 @@ pub async fn handle_success(
             task_id,
             attempts = new_attempts,
             max_reroutes,
-            "agent reported done but produced no code changes on external task"
+            "agent reported done but produced no code changes on external task requiring PR"
         );
 
         // Atomically increment the persistent reroute counter and decide.
@@ -446,11 +458,11 @@ pub async fn handle_success(
                 task_id,
                 reroutes,
                 max_reroutes,
-                "reached max reroute attempts for no-code-result — blocking for human review"
+                "reached max reroute attempts for no-code-result on external task — blocking for human review"
             );
             // Clear agent/model and record an explanatory last_error
             let msg = format!(
-                "agent completed without code changes after {}/{} reroute attempts",
+                "agent completed without code changes after {}/{} reroute attempts on external task requiring PR",
                 reroutes, max_reroutes
             );
             store::store_set(
@@ -477,13 +489,23 @@ pub async fn handle_success(
                     ("model", serde_json::json!(null)),
                     (
                         "last_error",
-                        serde_json::json!("agent completed without code changes"),
+                        serde_json::json!(
+                            "agent completed without code changes on external task requiring PR"
+                        ),
                     ),
                 ],
             )
             .await;
             "new"
         }
+    } else if resp.status == "done" && !has_pr && is_external {
+        // External task with non-code labels (e.g. documentation, research) —
+        // allowed to be marked done without a PR.
+        tracing::info!(
+            task_id,
+            "external task with non-code labels reported done — marking done without PR"
+        );
+        "done"
     } else if resp.status == "done" && !has_pr {
         tracing::info!(
             task_id,
@@ -588,4 +610,134 @@ pub async fn handle_success(
     // Note: done → in_review transition is handled by the engine
     // after triggering the review agent (engine/mod.rs)
     Ok((final_status.to_string(), false))
+}
+
+/// Labels that indicate a task is non-code and can be marked done without a PR.
+/// If a task has ANY of these labels (and NO code-related labels), it may be
+/// marked `done` directly without requiring a merged PR.
+const NON_CODE_LABELS: &[&str] = &[
+    "documentation",
+    "docs",
+    "research",
+    "analysis",
+    "investigation",
+    "question",
+    "discussion",
+    "planning",
+    "design",
+    "review",
+    "audit",
+    "config-change",
+];
+
+/// Check if the response indicates a non-code task based on labels in the
+/// accomplished/remaining/summary text and delegations.
+///
+/// This is a heuristic — we check if the agent's output mentions non-code
+/// labels or if delegations suggest non-code work. The definitive check
+/// should come from GitHub issue labels, but those are not available in
+/// the response handler. This function provides a best-effort classification.
+///
+/// Returns `true` if the task appears to be non-code (can be done without PR).
+fn is_non_code_task(resp: &AgentResponse) -> bool {
+    // Check delegations for non-code indicators
+    for delegation in &resp.delegations {
+        let combined = format!("{} {}", delegation.title, delegation.body).to_lowercase();
+        if has_non_code_label(&combined) {
+            return true;
+        }
+    }
+
+    // Check accomplished items for non-code indicators
+    for item in &resp.accomplished {
+        let lower = item.to_lowercase();
+        if has_non_code_label(&lower) {
+            return true;
+        }
+    }
+
+    // Check summary for non-code indicators
+    let summary_lower = resp.summary.to_lowercase();
+    if has_non_code_label(&summary_lower) {
+        return true;
+    }
+
+    false
+}
+
+/// Check if text contains any non-code label as a substring.
+fn has_non_code_label(text: &str) -> bool {
+    NON_CODE_LABELS.iter().any(|label| text.contains(label))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::Delegation;
+
+    #[test]
+    fn test_has_non_code_label_detects_labels() {
+        assert!(has_non_code_label("updated documentation"));
+        assert!(has_non_code_label("research completed"));
+        assert!(has_non_code_label("analysis of the issue"));
+        assert!(has_non_code_label("design review done"));
+        assert!(has_non_code_label("planning session"));
+        assert!(!has_non_code_label("fixed the bug"));
+        assert!(!has_non_code_label("refactored the code"));
+    }
+
+    #[test]
+    fn test_is_non_code_task_with_delegations() {
+        let resp = AgentResponse {
+            status: "done".to_string(),
+            summary: "Delegated research tasks".to_string(),
+            accomplished: vec!["Analyzed requirements".to_string()],
+            remaining: vec![],
+            files: vec![],
+            error: None,
+            learnings: vec![],
+            delegations: vec![Delegation {
+                title: "Research architecture".to_string(),
+                body: "Investigate and document the new architecture".to_string(),
+                labels: vec![],
+            }],
+            input_tokens: None,
+            output_tokens: None,
+        };
+        assert!(is_non_code_task(&resp));
+    }
+
+    #[test]
+    fn test_is_non_code_task_with_accomplished() {
+        let resp = AgentResponse {
+            status: "done".to_string(),
+            summary: "Analysis complete".to_string(),
+            accomplished: vec!["Completed documentation review".to_string()],
+            remaining: vec![],
+            files: vec![],
+            error: None,
+            learnings: vec![],
+            delegations: vec![],
+            input_tokens: None,
+            output_tokens: None,
+        };
+        assert!(is_non_code_task(&resp));
+    }
+
+    #[test]
+    fn test_is_non_code_task_code_task() {
+        let resp = AgentResponse {
+            status: "done".to_string(),
+            summary: "Fixed authentication bug".to_string(),
+            accomplished: vec!["Patched auth.rs".to_string()],
+            remaining: vec![],
+            files: vec!["src/auth.rs".to_string()],
+            error: None,
+            learnings: vec![],
+            delegations: vec![],
+            input_tokens: None,
+            output_tokens: None,
+        };
+        assert!(!is_non_code_task(&resp));
+    }
 }
