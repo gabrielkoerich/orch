@@ -1102,7 +1102,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     review_session_expected(&engine.store, &engine.repo, &task.id.0).await;
                 let age_minutes = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
                     .map(|dt| (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_minutes())
-                    .unwrap_or(0);
+                    .unwrap_or(i64::MAX);
                 if !session_expected && age_minutes < 10 {
                     continue;
                 }
