@@ -313,3 +313,10 @@ jobs:
   external: false
 gh:
   repo: gabrielkoerich/orch
+  project_id: "PVT_kwHOAB49Hs4BOfcs"
+  project_status_field_id: "PVTSSF_lAHOAB49Hs4BOfcszg9LbX4"
+  project_status_map:
+    backlog: "f75ad846"
+    in_progress: "47fc9ee4"
+    review: "df73e18b"
+    done: 98236657
