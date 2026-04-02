@@ -679,7 +679,7 @@ impl LlmRouter {
         // succeeds, accept it; if it yields a known error envelope, surface
         // that error; otherwise treat as a true parse failure.
         match self.tolerant_reparse(response) {
-            Ok(Some(parsed)) => return Ok(parsed),
+            Ok(Some(parsed)) => Ok(parsed),
             Ok(None) => {
                 anyhow::bail!(
                     "could not parse LLM response as JSON: {}",
@@ -753,15 +753,20 @@ impl LlmRouter {
                         if depth == 0 {
                             // candidate from i..=j
                             if let Ok(candidate) = std::str::from_utf8(&bytes[i..=j]) {
-                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
+                                if let Ok(val) =
+                                    serde_json::from_str::<serde_json::Value>(candidate)
+                                {
                                     // If it's an error envelope, surface it
                                     if let Some(err) = detect_error_envelope(&val) {
                                         return Err(anyhow::anyhow!(err));
                                     }
                                     // Only accept if contains routing key
                                     if let Some(obj) = val.as_object() {
-                                        if obj.contains_key("executor") || obj.contains_key("agent") {
-                                            if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(candidate) {
+                                        if obj.contains_key("executor") || obj.contains_key("agent")
+                                        {
+                                            if let Ok(parsed) =
+                                                serde_json::from_str::<LlmRouteResponse>(candidate)
+                                            {
                                                 if !parsed.executor.trim().is_empty() {
                                                     return Ok(Some(parsed));
                                                 }
