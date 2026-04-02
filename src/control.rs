@@ -663,17 +663,35 @@ pub async fn send_message(
     let full_message = format!("{}\n\n---\n\n{}", ctx.state, message);
 
     // Get or create a session UUID for conversation continuity
-    let session_uuid = get_or_create_session_uuid(store, session_id).await?;
+    // We will retry once if the agent reports the session UUID is already in use
+    // (some agent CLIs reject reusing the same session ID across processes).
+    let mut session_uuid = get_or_create_session_uuid(store, session_id).await?;
+    let mut attempt = 0u8;
+    let result = loop {
+        attempt += 1;
+        let res = invoke_agent_with_session(
+            &agent,
+            &model,
+            &ctx.system,
+            &full_message,
+            Some(&session_uuid),
+        )
+        .await;
 
-    // Invoke agent one-shot with --session-id for conversation continuity
-    let result = invoke_agent_with_session(
-        &agent,
-        &model,
-        &ctx.system,
-        &full_message,
-        Some(&session_uuid),
-    )
-    .await?;
+        match res {
+            Ok(r) => break r,
+            Err(e) if attempt == 1 && e.to_string().to_lowercase().contains("already in use") => {
+                // Agent rejected the session UUID as already in use. Generate a new
+                // session UUID so the next invocation starts a fresh conversation.
+                tracing::warn!(session = %session_uuid, "agent rejected session id as already in use; regenerating session id and retrying");
+                reset_session_uuid(store, session_id).await?;
+                session_uuid = get_or_create_session_uuid(store, session_id).await?;
+                // retry once
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     // Parse response for summary and memory tags
     let parsed = parse_response(&result.text);
