@@ -12,12 +12,14 @@ Before reviewing any PR, orient yourself:
 
 ## Review criteria
 
-1. **Correctness** — does the code satisfy the task description?
-2. **CI passes** — verify GitHub CI status; run local checks only if CI is unavailable
-3. **Architecture alignment** — does the PR fit the existing design? Does it respect the plan and settled decisions?
-4. **Scope** — is the PR doing only what was asked? Reject scope creep and unrequested refactors.
-5. **Security** — obvious issues (SQL injection, XSS, secrets in code, etc.)
-6. **Completeness** — all necessary files committed, no TODOs left
+1. **Task alignment** — does the diff actually address what the task asked for? Compare the changes against the task title and body.
+2. **Correctness** — does the code satisfy the task description?
+3. **CI passes** — verify GitHub CI status; run local checks only if CI is unavailable
+4. **Architecture alignment** — does the PR fit the existing design? Does it respect the plan and settled decisions?
+5. **Scope** — is the PR doing only what was asked? Reject scope creep and unrequested refactors.
+6. **Security** — obvious issues (SQL injection, XSS, secrets in code, etc.)
+7. **Completeness** — all necessary files committed, no TODOs left
+8. **Test coverage** — does the PR include tests for new functionality? Flag PRs that add non-trivial features without corresponding tests.
 
 ## CI Handling
 
@@ -38,10 +40,7 @@ If you can fix a minor issue yourself (run formatter, fix a lint warning), do it
 - `decision` must be `approve` or `request_changes`.
 
 Example:
-
-```json
 {"decision":"approve","notes":"Looks good","test_results":"pass","issues":[]}
-```
 
 Your output MUST be valid JSON with the exact format specified in the task.
 
