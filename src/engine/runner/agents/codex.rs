@@ -376,6 +376,17 @@ fn extract_quoted(text: &str, quote: char) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Estimate output tokens from text length.
+///
+/// Codex does not report token usage in its NDJSON output. This provides
+/// a conservative estimate (~4 chars per token for English text) so that
+/// the token budget tracker can still catch runaway Codex sessions.
+fn estimate_output_tokens(text: &str) -> u64 {
+    // Conservative estimate: 4 bytes per token (accounts for multi-byte UTF-8)
+    let char_count = text.chars().count() as u64;
+    char_count / 4
+}
+
 /// Extract a structured `AgentResult` from Codex NDJSON output.
 ///
 /// Finds `item.completed` events with `type:agent_message` for the result text.
@@ -410,11 +421,19 @@ pub fn find_codex_result(ndjson: &str) -> Option<super::AgentResult> {
         return None;
     }
 
+    // Codex does not report token usage — estimate from output text length
+    // so the token budget tracker can still catch runaway sessions.
+    let output_tokens = if !is_error {
+        Some(estimate_output_tokens(&result_text))
+    } else {
+        None
+    };
+
     Some(super::AgentResult {
         is_error,
         result_text,
         input_tokens: None,
-        output_tokens: None,
+        output_tokens,
         cost_usd: None,
         duration_ms: None,
     })
@@ -777,5 +796,65 @@ mod tests {
         let result = find_codex_result(ndjson).expect("should find result");
         assert!(!result.is_error);
         assert_eq!(result.result_text, "All tests passed");
+    }
+
+    // ── Token estimation tests ──────────────────────────────────
+
+    #[test]
+    fn estimate_output_tokens_empty() {
+        assert_eq!(estimate_output_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_output_tokens_short_text() {
+        // "hello world" = 11 chars / 4 = 2 tokens (integer division)
+        assert_eq!(estimate_output_tokens("hello world"), 2);
+    }
+
+    #[test]
+    fn estimate_output_tokens_long_text() {
+        // 400 chars / 4 = 100 tokens
+        let text = "x".repeat(400);
+        assert_eq!(estimate_output_tokens(&text), 100);
+    }
+
+    #[test]
+    fn estimate_output_tokens_multibyte() {
+        // "日本語" = 3 chars / 4 = 0 tokens (integer division)
+        assert_eq!(estimate_output_tokens("日本語"), 0);
+        // 16 chars / 4 = 4 tokens
+        let text = "日本語日本語日本語日本語日本語日";
+        assert_eq!(estimate_output_tokens(text), 4);
+    }
+
+    #[test]
+    fn find_codex_result_estimates_output_tokens() {
+        let ndjson = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"Implemented the feature\",\"accomplished\":[\"Did it\"],\"remaining\":[],\"files\":[\"src/handler.rs\"]}"}}"#,
+            "\n",
+            r#"{"type":"turn.completed"}"#,
+        );
+        let result = find_codex_result(ndjson).expect("should find result");
+        assert!(!result.is_error);
+        // Output tokens should be estimated (not None)
+        assert!(result.output_tokens.is_some());
+        assert!(result.output_tokens.unwrap() > 0);
+    }
+
+    #[test]
+    fn find_codex_result_no_output_tokens_on_error() {
+        let ndjson = concat!(
+            r#"{"type":"error","message":"You've hit your usage limit"}"#,
+            "\n",
+            r#"{"type":"turn.failed","error":{"message":"usage limit"}}"#,
+        );
+        let result = find_codex_result(ndjson).expect("should find error result");
+        assert!(result.is_error);
+        // Error results should not have output token estimates
+        assert!(result.output_tokens.is_none());
     }
 }

@@ -111,6 +111,58 @@ pub async fn handle_success(
         "agent completed successfully"
     );
 
+    // Store token usage BEFORE the budget check so the cumulative total
+    // includes this run's tokens.
+    let input_tokens = parsed.input_tokens.or(resp.input_tokens);
+    let output_tokens = parsed.output_tokens.or(resp.output_tokens);
+    if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
+        let model = model_name.unwrap_or("haiku");
+        if let Some(ref st) = store {
+            if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
+                if let Err(e) = st
+                    .store_tokens(store_id, input as i64, output as i64, model)
+                    .await
+                {
+                    tracing::warn!(task_id, ?e, "failed to store token usage");
+                }
+            }
+        }
+    }
+
+    // Pre-budget check: abort before any git operations if the cumulative
+    // token budget has already been exceeded. This prevents wasted API calls
+    // (commit, push, PR creation) on tasks that have consumed too many tokens.
+    let max_tokens: u64 = config::get("max_tokens_per_task")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    let (total_tokens, cost) = store::get_token_summary(store, repo, task_id).await;
+
+    if total_tokens > max_tokens {
+        tracing::warn!(
+            task_id,
+            total_tokens,
+            max_tokens,
+            "token budget exceeded before git operations — aborting"
+        );
+        let budget_msg = format!(
+            "token budget exceeded: {}/{} tokens (${:.4})",
+            total_tokens, max_tokens, cost.total_cost_usd
+        );
+        store::store_set(
+            store,
+            repo,
+            task_id,
+            &[
+                ("last_error", serde_json::json!(budget_msg)),
+                ("budget_exceeded", serde_json::json!(true)),
+            ],
+        )
+        .await;
+        return Ok(("needs_review".to_string(), true));
+    }
+
     // Auto-commit, push, create PR
     let mut has_pr = false;
     let mut has_pushed = false;
@@ -522,23 +574,9 @@ pub async fn handle_success(
     )
     .await;
 
-    // Store token usage — prefer agent-parsed tokens, fall back to response
-    let input_tokens = parsed.input_tokens.or(resp.input_tokens);
-    let output_tokens = parsed.output_tokens.or(resp.output_tokens);
-    if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
-        let model = model_name.unwrap_or("haiku");
-        if let Some(ref st) = store {
-            // Resolve store_id once and reuse
-            if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
-                if let Err(e) = st
-                    .store_tokens(store_id, input as i64, output as i64, model)
-                    .await
-                {
-                    tracing::warn!(task_id, ?e, "failed to store token usage");
-                }
-            }
-        }
-    }
+    // Token usage was already stored at the top of this function (before
+    // the pre-budget check). Here we only check for the warning threshold
+    // on the cumulative total, since the hard cap was already enforced.
 
     // Store learnings for memory (for future retries)
     response::store_learnings_from_response(
@@ -553,38 +591,18 @@ pub async fn handle_success(
     )
     .await;
 
-    // Check token budget with warning thresholds
+    // Post-budget warning: the pre-check at the top of this function already
+    // aborts if the budget is exceeded. This second check only fires a warning
+    // if usage is approaching the limit (80% threshold).
     let max_tokens: u64 = config::get("max_tokens_per_task")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000);
 
-    // Query total tokens and cost estimate together (single DB read)
-    let (total_tokens, cost) = store::get_token_summary(store, repo, task_id).await;
     let warning_threshold = (max_tokens as f64 * 0.8) as u64;
+    let (total_tokens, cost) = store::get_token_summary(store, repo, task_id).await;
 
-    if total_tokens > max_tokens {
-        tracing::warn!(task_id, total_tokens, max_tokens, "exceeded token budget");
-        // Only override to needs_review if there's a PR to review;
-        // otherwise keep the already-computed final_status (e.g. "done" for
-        // read-only tasks with no code changes).
-        let budget_status = if has_pr { "needs_review" } else { final_status };
-        let budget_msg = format!(
-            "token budget exceeded: {}/{} tokens (${:.4})",
-            total_tokens, max_tokens, cost.total_cost_usd
-        );
-        store::store_set(
-            store,
-            repo,
-            task_id,
-            &[
-                ("last_error", serde_json::json!(budget_msg)),
-                ("budget_exceeded", serde_json::json!(true)),
-            ],
-        )
-        .await;
-        return Ok((budget_status.to_string(), true)); // signal early return to caller
-    } else if total_tokens > warning_threshold {
+    if total_tokens > warning_threshold {
         let pct = (total_tokens as f64 / max_tokens as f64 * 100.0) as u32;
         tracing::warn!(
             task_id,
@@ -829,5 +847,18 @@ mod tests {
             output_tokens: None,
         };
         assert!(!is_non_code_task(&resp));
+    }
+
+    #[test]
+    fn test_safe_utf8_tail_truncates_correctly() {
+        // Short string returned as-is
+        assert_eq!(safe_utf8_tail("hello", 100), "hello");
+        // Truncation at ASCII boundary
+        assert_eq!(safe_utf8_tail("abcdefghij", 5), "fghij");
+        // Truncation at multibyte boundary
+        let s = "日本語test";
+        let tail = safe_utf8_tail(s, 5);
+        assert!(std::str::from_utf8(tail.as_bytes()).is_ok());
+        assert!(s.ends_with(tail));
     }
 }

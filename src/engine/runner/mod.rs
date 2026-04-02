@@ -107,6 +107,8 @@ fn classify_run_error_type(last_error: &str) -> &'static str {
     if last_error.is_empty() {
         // No error: agent completed successfully and created a PR waiting for review
         "success"
+    } else if last_error.contains("token budget exceeded") {
+        "token_budget_exceeded"
     } else if last_error.contains("timeout") {
         "timeout"
     } else if last_error.contains("rate limit") || last_error.contains("usage limit") {
@@ -1352,6 +1354,10 @@ mod tests {
             ("clippy failed on warning", "ci_failure"),
             ("nextest run exited 1", "ci_failure"),
             ("test suite failed: 3 tests failed", "ci_failure"),
+            (
+                "token budget exceeded: 150000/100000 tokens",
+                "token_budget_exceeded",
+            ),
         ];
 
         for (input, expected) in cases {

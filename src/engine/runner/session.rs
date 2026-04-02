@@ -99,6 +99,40 @@ pub async fn run_agent_session(
     (tmux, session, output)
 }
 
+/// Maximum size of raw agent output to load into memory (512 KB).
+///
+/// Agents that produce outputs larger than this are considered to have
+/// gone runaway. The output is truncated to protect memory and prevent
+/// downstream parsing issues. The budget check in `handle_success` will
+/// catch excessive token usage before any git operations.
+const MAX_OUTPUT_SIZE_BYTES: usize = 512 * 1024;
+
+/// Read a file with a size limit. Returns the content truncated to
+/// `MAX_OUTPUT_SIZE_BYTES` if the file is larger.
+fn read_file_capped(path: &std::path::Path) -> String {
+    // Check file size before reading to avoid loading huge files.
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.len() > MAX_OUTPUT_SIZE_BYTES as u64 {
+            tracing::warn!(
+                path = %path.display(),
+                size_bytes = metadata.len(),
+                limit_bytes = MAX_OUTPUT_SIZE_BYTES,
+                "output file exceeds size limit, reading capped portion"
+            );
+            // Read only the first MAX_OUTPUT_SIZE_BYTES bytes.
+            let mut file = std::fs::File::open(path).ok();
+            let mut buf = Vec::with_capacity(MAX_OUTPUT_SIZE_BYTES);
+            if let Some(ref mut f) = file {
+                use std::io::Read;
+                let _ = f.take(MAX_OUTPUT_SIZE_BYTES as u64).read_to_end(&mut buf);
+            }
+            // Ensure valid UTF-8 by walking back to a char boundary.
+            return String::from_utf8_lossy(&buf).into_owned();
+        }
+    }
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
 async fn collect_output(
     task_id: &str,
     invocation: &agent::AgentInvocation,
@@ -121,21 +155,44 @@ async fn collect_output(
     .await)
         .unwrap_or(-1);
 
-    // Read raw output (offloaded inside read_output_file) and stderr (blocking read offloaded)
+    // Read raw output with size cap (offloaded inside read_output_file) and stderr (blocking read offloaded)
     let raw_stdout =
         response::read_output_file(task_id, &invocation.output_file, &invocation.repo).await;
+
+    // Enforce hard cap on stdout size after reading.
+    let raw_stdout = if raw_stdout.len() > MAX_OUTPUT_SIZE_BYTES {
+        tracing::warn!(
+            task_id,
+            stdout_bytes = raw_stdout.len(),
+            limit_bytes = MAX_OUTPUT_SIZE_BYTES,
+            "raw stdout exceeds size limit, truncating"
+        );
+        truncate_to_utf8_boundary(&raw_stdout, MAX_OUTPUT_SIZE_BYTES)
+    } else {
+        raw_stdout
+    };
 
     let stderr_path_attempt = attempt_dir.join("stderr.txt");
     let stderr_path_legacy = crate::home::state_file(&format!("stderr-{task_id}.txt"))
         .unwrap_or_else(|_| PathBuf::from(format!("/tmp/stderr-{task_id}.txt")));
 
     let raw_stderr: String = (tokio::task::spawn_blocking(move || {
-        std::fs::read_to_string(&stderr_path_attempt)
-            .or_else(|_| std::fs::read_to_string(&stderr_path_legacy))
-            .unwrap_or_default()
+        let s = read_file_capped(&stderr_path_attempt);
+        if s.is_empty() {
+            read_file_capped(&stderr_path_legacy)
+        } else {
+            s
+        }
     })
     .await)
         .unwrap_or_default();
+
+    // Enforce hard cap on stderr size after reading.
+    let raw_stderr = if raw_stderr.len() > MAX_OUTPUT_SIZE_BYTES {
+        truncate_to_utf8_boundary(&raw_stderr, MAX_OUTPUT_SIZE_BYTES)
+    } else {
+        raw_stderr
+    };
 
     SessionOutput {
         exit_code,
@@ -143,6 +200,19 @@ async fn collect_output(
         raw_stderr,
         elapsed_secs: Some(elapsed_secs),
     }
+}
+
+/// Truncate `s` to at most `max_bytes`, ensuring the result ends on a valid
+/// UTF-8 character boundary.
+fn truncate_to_utf8_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// Kill the tmux session if it still exists, and scrub secrets from the
@@ -159,4 +229,48 @@ pub async fn cleanup_session(task_id: &str, tmux: &TmuxManager, session: &str) {
     // could leave tokens in the global env — clean up defensively.
     tmux.unset_global_env("GH_TOKEN").await.ok();
     tmux.unset_global_env("GITHUB_TOKEN").await.ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_to_utf8_boundary_short_string() {
+        let s = "hello";
+        assert_eq!(truncate_to_utf8_boundary(s, 100), "hello");
+        assert_eq!(truncate_to_utf8_boundary(s, 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_utf8_boundary_ascii_truncation() {
+        let s = "abcdefghij";
+        assert_eq!(truncate_to_utf8_boundary(s, 5), "abcde");
+        assert_eq!(truncate_to_utf8_boundary(s, 0), "");
+    }
+
+    #[test]
+    fn truncate_to_utf8_boundary_multibyte() {
+        // "日本語" = 3 chars × 3 bytes = 9 bytes
+        let s = "日本語";
+        assert_eq!(truncate_to_utf8_boundary(s, 9), "日本語");
+        // 8 bytes lands in middle of last char — should walk back to 6
+        let truncated = truncate_to_utf8_boundary(s, 8);
+        assert_eq!(truncated, "日本");
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn truncate_to_utf8_boundary_mixed() {
+        let s = "hello日本語world";
+        let truncated = truncate_to_utf8_boundary(s, 8);
+        assert_eq!(truncated, "hello日");
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn max_output_size_constant() {
+        // Verify the constant is a reasonable size (512 KB)
+        assert_eq!(MAX_OUTPUT_SIZE_BYTES, 512 * 1024);
+    }
 }
