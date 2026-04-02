@@ -646,7 +646,8 @@ pub async fn create_pr_if_needed(
 }
 
 /// Returns true if the error string indicates a transient GitHub API failure
-/// (HTTP 5xx), where the PR may have been created despite the error response.
+/// (HTTP 5xx, network errors, DNS failures, TLS issues, rate limits), where
+/// the operation may succeed on retry.
 pub(crate) fn is_transient_github_error(err_str: &str) -> bool {
     // Treat transport/send failures and explicit GhHttp server-error messages
     // as transient. Older callers relied on parsing the "failed (NNN)" pattern
@@ -658,9 +659,68 @@ pub(crate) fn is_transient_github_error(err_str: &str) -> bool {
         return true;
     }
 
-    extract_github_http_status(err_str)
+    // Check for HTTP 5xx status codes
+    if extract_github_http_status(err_str)
         .map(|s| (500..600).contains(&s))
         .unwrap_or(false)
+    {
+        return true;
+    }
+
+    // Check for common network-level transient errors
+    let lower = err_str.to_lowercase();
+
+    // Connection and transport errors
+    if lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("connection refused")
+        || lower.contains("connection closed")
+        || lower.contains("transport error")
+    {
+        return true;
+    }
+
+    // Timeout errors
+    if lower.contains("timeout") {
+        return true;
+    }
+
+    // DNS resolution errors
+    if lower.contains("dns error")
+        || lower.contains("resolve")
+        || lower.contains("name resolution")
+        || lower.contains("no such host")
+    {
+        return true;
+    }
+
+    // TLS/SSL errors
+    if lower.contains("tls handshake")
+        || lower.contains("certificate")
+        || lower.contains("ssl error")
+    {
+        return true;
+    }
+
+    // Network unreachable errors
+    if lower.contains("network is unreachable")
+        || lower.contains("host unreachable")
+        || lower.contains("temporary failure")
+    {
+        return true;
+    }
+
+    // EOF errors (connection dropped mid-request)
+    if lower.contains("unexpected eof") || lower.contains("unexpected end of file") {
+        return true;
+    }
+
+    // Rate limit errors (transient with cooldown/retry)
+    if lower.contains("rate limit") || lower.contains("too many requests") {
+        return true;
+    }
+
+    false
 }
 
 /// Extract the HTTP status code from a GhHttp error string.
@@ -932,9 +992,77 @@ mod tests {
         let err404 =
             "GitHub API POST https://api.github.com/repos/foo/bar/pulls failed (404): Not Found";
         assert!(!is_transient_github_error(err404));
+    }
 
-        let not_github = "connection refused";
-        assert!(!is_transient_github_error(not_github));
+    #[test]
+    fn is_transient_github_error_matches_connection_errors() {
+        // Connection-related transient errors
+        assert!(is_transient_github_error("connection refused"));
+        assert!(is_transient_github_error("Connection reset by peer"));
+        assert!(is_transient_github_error("broken pipe"));
+        assert!(is_transient_github_error("connection closed unexpectedly"));
+        assert!(is_transient_github_error(
+            "transport error: connection lost"
+        ));
+    }
+
+    #[test]
+    fn is_transient_github_error_matches_dns_errors() {
+        // DNS resolution failures
+        assert!(is_transient_github_error("dns error: failed to lookup"));
+        assert!(is_transient_github_error("failed to resolve hostname"));
+        assert!(is_transient_github_error("name resolution failed"));
+        assert!(is_transient_github_error("no such host: api.github.com"));
+    }
+
+    #[test]
+    fn is_transient_github_error_matches_tls_errors() {
+        // TLS/SSL handshake failures
+        assert!(is_transient_github_error("tls handshake failed"));
+        assert!(is_transient_github_error("certificate verification failed"));
+        assert!(is_transient_github_error("ssl error: unknown ca"));
+    }
+
+    #[test]
+    fn is_transient_github_error_matches_network_unreachable() {
+        // Network unreachable errors
+        assert!(is_transient_github_error("network is unreachable"));
+        assert!(is_transient_github_error("host unreachable"));
+        assert!(is_transient_github_error(
+            "temporary failure in name resolution"
+        ));
+    }
+
+    #[test]
+    fn is_transient_github_error_matches_eof_errors() {
+        // EOF/connection dropped errors
+        assert!(is_transient_github_error("unexpected eof while reading"));
+        assert!(is_transient_github_error("unexpected end of file"));
+    }
+
+    #[test]
+    fn is_transient_github_error_matches_rate_limit() {
+        // Rate limit errors (transient with cooldown)
+        assert!(is_transient_github_error("rate limit exceeded"));
+        assert!(is_transient_github_error("429 Too Many Requests"));
+        assert!(is_transient_github_error("too many requests, retry later"));
+    }
+
+    #[test]
+    fn is_transient_github_error_matches_timeout() {
+        // Timeout errors
+        assert!(is_transient_github_error("operation timeout"));
+        assert!(is_transient_github_error("request timeout"));
+    }
+
+    #[test]
+    fn is_transient_github_error_rejects_non_transient() {
+        // Non-transient errors should not match
+        assert!(!is_transient_github_error("permission denied"));
+        assert!(!is_transient_github_error("file not found"));
+        assert!(!is_transient_github_error("invalid argument"));
+        assert!(!is_transient_github_error("authentication failed"));
+        assert!(!is_transient_github_error("bad credentials"));
     }
 
     #[tokio::test]
