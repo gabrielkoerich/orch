@@ -7,6 +7,7 @@ pub mod events;
 pub mod job;
 pub mod ndjson;
 pub mod service;
+pub mod session;
 pub mod stats;
 pub mod task;
 pub mod tree;
