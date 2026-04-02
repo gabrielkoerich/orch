@@ -671,11 +671,140 @@ impl LlmRouter {
             }
         }
 
-        // True parse failure: not valid JSON
-        anyhow::bail!(
-            "could not parse LLM response as JSON: {}",
-            &text[..text.len().min(200)]
-        )
+        // Final fallback: attempt a tolerant re-parse from the original raw
+        // response. This covers variants like fenced code blocks with a
+        // space after the fence ("``` json"), embedded JSON fragments that
+        // weren't picked up above, or NDJSON-like wrappers that can be
+        // conservatively scanned for JSON objects. If tolerant re-parse
+        // succeeds, accept it; if it yields a known error envelope, surface
+        // that error; otherwise treat as a true parse failure.
+        match self.tolerant_reparse(response) {
+            Ok(Some(parsed)) => Ok(parsed),
+            Ok(None) => {
+                anyhow::bail!(
+                    "could not parse LLM response as JSON: {}",
+                    &text[..text.len().min(200)]
+                )
+            }
+            Err(e) => anyhow::bail!("router LLM returned error payload: {e}"),
+        }
+    }
+
+    /// Attempt a tolerant re-parse of the raw response string.
+    ///
+    /// Returns:
+    /// - Ok(Some(LlmRouteResponse)) when a routing decision could be extracted
+    /// - Ok(None) when no usable routing decision was found
+    /// - Err(String) when a known error envelope was detected and should be surfaced
+    fn tolerant_reparse(&self, raw: &str) -> anyhow::Result<Option<LlmRouteResponse>> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+
+        // 1) Try to find fenced code blocks leniently. Accept variants like
+        //    "```json", "``` json", or plain "```". Try each block's
+        //    contents as JSON for LlmRouteResponse.
+        let mut idx = 0usize;
+        while let Some(start) = raw[idx..].find("```") {
+            let abs_start = idx + start;
+            // Skip the opening fence
+            let after = &raw[abs_start + 3..];
+            // Skip optional whitespace and optional "json" language tag
+            let after_trimmed = after.trim_start();
+            // Find the closing fence from after
+            if let Some(end_rel) = after_trimmed.find("```") {
+                let json_str = &after_trimmed[..end_rel].trim();
+                if !json_str.is_empty() {
+                    if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(json_str) {
+                        if !parsed.executor.trim().is_empty() {
+                            return Ok(Some(parsed));
+                        }
+                    }
+                    // Try parsing generic JSON to check for error envelopes
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if let Some(err) = detect_error_envelope(&val) {
+                            return Err(anyhow::anyhow!(err));
+                        }
+                    }
+                }
+                // Advance past this block
+                idx = abs_start + 3 + end_rel + 3;
+                continue;
+            } else {
+                // No matching end fence — break to avoid infinite loop
+                break;
+            }
+        }
+
+        // 2) Try to extract balanced JSON objects from the raw text. This is a
+        //    conservative scan that attempts to find top-level {...} fragments.
+        let bytes = raw.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'{' {
+                let mut depth = 0i32;
+                let mut j = i;
+                while j < bytes.len() {
+                    if bytes[j] == b'{' {
+                        depth += 1;
+                    } else if bytes[j] == b'}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            // candidate from i..=j
+                            if let Ok(candidate) = std::str::from_utf8(&bytes[i..=j]) {
+                                if let Ok(val) =
+                                    serde_json::from_str::<serde_json::Value>(candidate)
+                                {
+                                    // If it's an error envelope, surface it
+                                    if let Some(err) = detect_error_envelope(&val) {
+                                        return Err(anyhow::anyhow!(err));
+                                    }
+                                    // Only accept if contains routing key
+                                    if let Some(obj) = val.as_object() {
+                                        if obj.contains_key("executor") || obj.contains_key("agent")
+                                        {
+                                            if let Ok(parsed) =
+                                                serde_json::from_str::<LlmRouteResponse>(candidate)
+                                            {
+                                                if !parsed.executor.trim().is_empty() {
+                                                    return Ok(Some(parsed));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+
+        // 3) As a last-ditch attempt, try the opencode NDJSON extractor which
+        //    can pull JSON-like payloads out of NDJSON streams produced by
+        //    opencode/Claude wrappers.
+        if let Some(text) = opencode::extract_router_text(raw) {
+            let trimmed = text.trim();
+            if let Ok(parsed) = serde_json::from_str::<LlmRouteResponse>(trimmed) {
+                if !parsed.executor.trim().is_empty() {
+                    return Ok(Some(parsed));
+                }
+            }
+            // If it's valid JSON but an error envelope, surface it
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(err) = detect_error_envelope(&val) {
+                    return Err(anyhow::anyhow!(err));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     fn extract_agent_text(&self, agent: &str, raw: &str) -> anyhow::Result<String> {
