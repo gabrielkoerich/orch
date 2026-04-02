@@ -278,45 +278,102 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
     .iter()
     .any(|needle| lower.contains(needle));
 
-    let looks_done = !looks_negative
-        && ([
-            "no changes",
-            "nothing to",
-            "nothing to do",
-            "nothing to execute",
-            "no positions",
-            "no open positions",
-            "no trades",
-            "no trade",
-            "no action needed",
-            "completed",
-            // Action/issue completion phrases
-            "filed",
-            "filed issue",
-            "filed issues",
-            "created issue",
-            "created issues",
-            "opened issue",
-            "opened issues",
-            "issue created",
-            "issues created",
-            "issues filed",
-            "task created",
-            "posted comment",
-            "comment posted",
-            "changes committed",
-            "commit created",
-            "the commit",
-            // Agent completion phrases (regression: #1362/#1363)
-            "the fix is complete",
-            "fix is working",
-            "all tests pass",
-            "tests pass.",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
-            || contains_word(&lower, "done")
-            || contains_word(&lower, "committed"));
+    // Strong explicit completion phrases. These are high-confidence indicators
+    // that the agent performed an action (filed issues, created commits, etc.).
+    let explicit_done = [
+        "no changes",
+        "nothing to",
+        "nothing to do",
+        "nothing to execute",
+        "no positions",
+        "no open positions",
+        "no trades",
+        "no trade",
+        "no action needed",
+        "completed",
+        // Action/issue completion phrases
+        "filed",
+        "filed issue",
+        "filed issues",
+        "created issue",
+        "created issues",
+        "opened issue",
+        "opened issues",
+        "issue created",
+        "issues created",
+        "issues filed",
+        "task created",
+        "posted comment",
+        "comment posted",
+        "changes committed",
+        "commit created",
+        "the commit",
+        // Agent completion phrases (regression: #1362/#1363)
+        "the fix is complete",
+        "fix is working",
+        "all tests pass",
+        "tests pass.",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    // Conservative sentence-level heuristics for single-word signals like "done".
+    // Accept "done" only when it appears in a short, self-contained sentence
+    // without hedging language ("let me", "checking", "will", etc.). This
+    // reduces false-positives from exploratory prose that mentions "done"
+    // as part of a planning or investigatory sentence.
+    let mut done_confident = false;
+    for sentence in trimmed
+        .split(['.', '!', '?', '\n'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let s_lower = sentence.to_lowercase();
+        // short sentence heuristic
+        let word_count = sentence.split_whitespace().count();
+        let hedging = [
+            "let",
+            "let me",
+            "check",
+            "checking",
+            "will",
+            "i'll",
+            "i will",
+            "trying",
+            "try",
+            "investigat",
+            "maybe",
+            "could",
+            "should",
+            "might",
+            "if ",
+            "plan",
+            "planning",
+        ];
+        let contains_hedge = hedging.iter().any(|h| s_lower.contains(h));
+
+        if contains_word(&s_lower, "done") && word_count <= 8 && !contains_hedge {
+            done_confident = true;
+            break;
+        }
+
+        // Commit/concrete action heuristics: require explicit commit language
+        // rather than opportunistic mentions. Examples: "I've committed the changes",
+        // "changes committed", or "commit created".
+        if s_lower.contains("committed") || s_lower.contains("commit created") {
+            // Accept only if sentence also suggests the changes were actually written
+            if s_lower.contains("changes")
+                || s_lower.contains("i've")
+                || s_lower.contains("i have")
+                || s_lower.contains("the commit")
+            {
+                done_confident = true;
+                break;
+            }
+        }
+    }
+
+    let looks_done = !looks_negative && (explicit_done || done_confident);
 
     let looks_error = [
         "error:",
@@ -1191,6 +1248,22 @@ mod tests {
         let response =
             synthesize_response_from_text("I've committed the changes to the repository").unwrap();
         assert_eq!(response.status, "done");
+    }
+
+    #[test]
+    fn synthesize_response_rejects_exploratory_prose() {
+        // Regression test: ensure exploratory analysis that mentions "let me check"
+        // or planning language is NOT synthesized into a "done" completion.
+        let exploratory = "I explored the codebase and found several .expect()/.unwrap() uses.\n\nLet me check each occurrence directly and run the tests to be sure. I may commit fixes afterwards.";
+        let response = synthesize_response_from_text(exploratory).unwrap();
+        assert_eq!(
+            response.status, "needs_review",
+            "Exploratory prose must not be auto-marked done"
+        );
+        assert!(
+            response.error.is_some(),
+            "Exploratory plain text should surface an error note"
+        );
     }
 
     #[test]
