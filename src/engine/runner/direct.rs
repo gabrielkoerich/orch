@@ -67,7 +67,16 @@ pub async fn run_direct(
     timeout: Duration,
     work_dir: &str,
 ) -> Result<DirectResult> {
-    run_direct_with_session(agent, model, system_prompt, message, timeout, work_dir, None).await
+    run_direct_with_session(
+        agent,
+        model,
+        system_prompt,
+        message,
+        timeout,
+        work_dir,
+        None,
+    )
+    .await
 }
 
 /// Configuration for continuing an agent session.
