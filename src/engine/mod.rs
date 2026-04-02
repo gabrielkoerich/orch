@@ -1649,7 +1649,7 @@ mod tests {
             .register_session("owner/repo", &task_id, &session_name)
             .await;
         transport
-            .bind(&task_id, &session_name, "telegram", "12345")
+            .bind(&task_id, &session_name, "telegram", "12345", None)
             .await;
 
         // Spawn capture.run() which exits when session is unregistered
