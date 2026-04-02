@@ -462,54 +462,6 @@ pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> 
     anyhow::bail!("failed to parse review response from output")
 }
 
-/// Parse a review response using per-agent NDJSON extraction.
-///
-/// Unlike `parse_review_from_output`, this uses the agent-specific `find_result`
-/// extractors instead of the generic `ndjson_extract_text`. This eliminates false
-/// positives from broad substring matching when agent output contains JSON-like
-/// fragments or rate-limit keywords in normal text.
-///
-/// Parsing chain:
-/// 1. Direct JSON / markdown parse of the raw output
-/// 2. Per-agent NDJSON extraction → parse the extracted result text
-/// 3. Heuristic keyword fallback for plain-text decisions
-pub fn parse_review_from_agent_output(agent: &str, output: &str) -> anyhow::Result<ReviewResponse> {
-    // Step 1: direct JSON / markdown parse
-    if let Ok(r) = parse_review_response(output) {
-        return Ok(r);
-    }
-
-    // Step 2: per-agent NDJSON extraction
-    if let Some(result) = crate::engine::runner::agents::find_agent_result(agent, output) {
-        if !result.result_text.is_empty() {
-            if let Ok(r) = parse_review_response(&result.result_text) {
-                return Ok(r);
-            }
-            // The extracted text might itself need keyword inference
-            if let Some(r) = infer_review_response_from_text(&result.result_text) {
-                tracing::warn!(
-                    agent,
-                    output_len = output.len(),
-                    "review response parsed via keyword fallback on agent-extracted text"
-                );
-                return Ok(r);
-            }
-        }
-    }
-
-    // Step 3: heuristic fallback on the full output
-    if let Some(resp) = infer_review_response_from_text(output) {
-        tracing::warn!(
-            agent,
-            output_len = output.len(),
-            "review response parsed via keyword fallback"
-        );
-        return Ok(resp);
-    }
-
-    anyhow::bail!("failed to parse review response from {agent} output")
-}
-
 /// Extract the concatenated text content from an NDJSON event stream.
 ///
 /// **Deprecated**: Prefer `parse_review_from_agent_output` which uses per-agent
@@ -663,6 +615,13 @@ fn infer_review_response_from_text(text: &str) -> Option<ReviewResponse> {
     }
 
     None
+}
+
+/// Public entry point for keyword-based review response inference.
+///
+/// Used by `review.rs` when `parse_review_response` fails on the extracted text.
+pub fn infer_review_response(text: &str) -> Option<ReviewResponse> {
+    infer_review_response_from_text(text)
 }
 
 /// Extract the first valid JSON object from markdown code blocks.
@@ -1320,7 +1279,22 @@ That's all."#;
         );
     }
 
-    // ── parse_review_from_agent_output ──────────────────────────
+    // ── review parsing via find_agent_result + parse_review_response ────
+
+    /// Helper that mirrors the production path in review.rs:
+    /// find_agent_result → parse_review_response → infer_review_response.
+    fn parse_via_agent_path(agent: &str, output: &str) -> anyhow::Result<ReviewResponse> {
+        use crate::engine::runner::agents::find_agent_result;
+        let text = find_agent_result(agent, output)
+            .map(|r| r.result_text)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| output.to_string());
+        if let Ok(r) = parse_review_response(&text) {
+            return Ok(r);
+        }
+        infer_review_response_from_text(&text)
+            .ok_or_else(|| anyhow::anyhow!("failed to parse review response from {agent} output"))
+    }
 
     #[test]
     fn agent_output_claude_ndjson_review() {
@@ -1331,7 +1305,7 @@ That's all."#;
             "\n",
             r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}","usage":{"input_tokens":100,"output_tokens":20}}"#,
         );
-        let resp = parse_review_from_agent_output("claude", ndjson).unwrap();
+        let resp = parse_via_agent_path("claude", ndjson).unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
@@ -1344,7 +1318,7 @@ That's all."#;
             "\n",
             r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"stop","tokens":{"input":100,"output":10}}}"#,
         );
-        let resp = parse_review_from_agent_output("opencode", ndjson).unwrap();
+        let resp = parse_via_agent_path("opencode", ndjson).unwrap();
         assert_eq!(resp.decision, "request_changes");
     }
 
@@ -1357,21 +1331,21 @@ That's all."#;
             "\n",
             r#"{"type":"turn.completed"}"#,
         );
-        let resp = parse_review_from_agent_output("codex", ndjson).unwrap();
+        let resp = parse_via_agent_path("codex", ndjson).unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
     #[test]
     fn agent_output_plain_text_keyword_fallback() {
         let text = "All checks passed, LGTM.";
-        let resp = parse_review_from_agent_output("claude", text).unwrap();
+        let resp = parse_via_agent_path("claude", text).unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
     #[test]
     fn agent_output_direct_json() {
         let json = r#"{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#;
-        let resp = parse_review_from_agent_output("opencode", json).unwrap();
+        let resp = parse_via_agent_path("opencode", json).unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
@@ -1384,7 +1358,7 @@ That's all."#;
         // This should NOT extract a review from the JSON fragment.
         // With the generic parser, this would match as a "text" NDJSON event.
         // With per-agent extraction, it returns None (not valid agent NDJSON).
-        let result = parse_review_from_agent_output("claude", text);
+        let result = parse_via_agent_path("claude", text);
         // Should either fail or infer from keywords, NOT parse the JSON fragment
         assert!(
             result.is_err() || result.as_ref().is_ok_and(|r| r.decision != "text"),

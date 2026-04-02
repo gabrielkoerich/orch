@@ -1121,127 +1121,64 @@ pub(crate) async fn review_and_merge(
         return Ok(ReviewDecision::Failed(format!("agent error: {err}")));
     }
 
-    // Stage 1: strip the agent-specific output envelope to get the review text.
-    let mut text_for_review = match agent_runner.extract_text(&raw_output) {
-        Ok(text) if !text.is_empty() => text,
-        Ok(_) => {
+    // Step 1: extract the result event using per-agent extractors.
+    // This gives us the clean result text without any agent-specific NDJSON envelope.
+    // Note: is_error cases are already handled by the hard-failure block above.
+    let agent_result = runner::agents::find_agent_result(&review_agent, &raw_output);
+
+    // Step 2: get the text to parse — prefer the clean result_text from the
+    // per-agent extractor; fall back to raw output if extraction yielded nothing.
+    let text_for_review = agent_result
+        .map(|r| r.result_text)
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| {
             tracing::debug!(
                 task_id = task.id.0,
                 agent = %review_agent,
-                "review agent: empty text after envelope extraction, falling back to raw output"
+                "review agent: per-agent extractor returned no text, using raw output"
             );
             raw_output.clone()
-        }
+        });
+
+    // Step 3: parse once — no fallback needed because per-agent extractors
+    // guarantee we have the clean result text.
+    let review_response = match runner::response::parse_review_response(&text_for_review) {
+        Ok(r) => r,
         Err(e) => {
-            tracing::error!(task_id = task.id.0, error = %e, "review agent error");
-            match &e {
-                runner::agents::AgentError::RateLimit { .. }
-                | runner::agents::AgentError::Auth { .. } => {
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        agent = %review_agent,
-                        "review agent hit rate limit — adding to cooldown"
-                    );
-                    runner::response::record_agent_failure_with_message(
-                        &review_agent,
-                        &e.to_string(),
-                    )
-                    .await;
+            // Keyword heuristic fallback for plain-text decisions.
+            if let Some(r) = runner::response::infer_review_response(&text_for_review) {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    agent = %review_agent,
+                    "review response parsed via keyword fallback"
+                );
+                r
+            } else {
+                tracing::error!(
+                    task_id = task.id.0,
+                    error = %e,
+                    agent = %review_agent,
+                    output = %text_for_review.chars().take(300).collect::<String>(),
+                    "failed to parse review response"
+                );
+                if let Some(rid) = run_id {
+                    let _ = store
+                        .complete_run(&CompleteRun {
+                            run_id: rid,
+                            exit_code: Some(exit_code),
+                            stdout: &raw_output,
+                            stderr: &stderr,
+                            parsed: &text_for_review,
+                            outcome: "failed",
+                            error: &format!("parse error: {e}"),
+                            tokens: agent_token_usage,
+                        })
+                        .await;
                 }
-                _ => {}
+                return Ok(ReviewDecision::Failed(format!("parse error: {e}")));
             }
-            if let Some(rid) = run_id {
-                let _ = store
-                    .complete_run(&CompleteRun {
-                        run_id: rid,
-                        exit_code: Some(exit_code),
-                        stdout: &raw_output,
-                        stderr: &stderr,
-                        parsed: "",
-                        outcome: "failed",
-                        error: &format!("agent error: {e}"),
-                        tokens: agent_token_usage,
-                    })
-                    .await;
-            }
-            return Ok(ReviewDecision::Failed(format!("agent error: {e}")));
         }
     };
-
-    // Stage 2: parse the ReviewResponse from the extracted text.
-    // Use per-agent extraction to avoid false positives from generic NDJSON parsing.
-    let review_response =
-        match runner::response::parse_review_from_agent_output(&review_agent, &text_for_review) {
-            Ok(r) => r,
-            Err(e) => {
-                if raw_output != text_for_review {
-                    match runner::response::parse_review_from_agent_output(
-                        &review_agent,
-                        &raw_output,
-                    ) {
-                        Ok(r) => {
-                            tracing::warn!(
-                                task_id = task.id.0,
-                                error = %e,
-                                "review response parsed from raw output fallback"
-                            );
-                            text_for_review = raw_output.clone();
-                            r
-                        }
-                        Err(fallback_err) => {
-                            let combined_error = format!(
-                                "primary parse error: {e}; raw output parse error: {fallback_err}"
-                            );
-                            tracing::error!(
-                                task_id = task.id.0,
-                                error = %combined_error,
-                                output = %text_for_review.chars().take(300).collect::<String>(),
-                                "failed to parse review response"
-                            );
-                            if let Some(rid) = run_id {
-                                let _ = store
-                                    .complete_run(&CompleteRun {
-                                        run_id: rid,
-                                        exit_code: Some(exit_code),
-                                        stdout: &raw_output,
-                                        stderr: &stderr,
-                                        parsed: &text_for_review,
-                                        outcome: "failed",
-                                        error: &format!("parse error: {combined_error}"),
-                                        tokens: agent_token_usage,
-                                    })
-                                    .await;
-                            }
-                            return Ok(ReviewDecision::Failed(format!(
-                                "parse error: {combined_error}"
-                            )));
-                        }
-                    }
-                } else {
-                    tracing::error!(
-                        task_id = task.id.0,
-                        error = %e,
-                        output = %text_for_review.chars().take(300).collect::<String>(),
-                        "failed to parse review response"
-                    );
-                    if let Some(rid) = run_id {
-                        let _ = store
-                            .complete_run(&CompleteRun {
-                                run_id: rid,
-                                exit_code: Some(exit_code),
-                                stdout: &raw_output,
-                                stderr: &stderr,
-                                parsed: &text_for_review,
-                                outcome: "failed",
-                                error: &format!("parse error: {e}"),
-                                tokens: agent_token_usage,
-                            })
-                            .await;
-                    }
-                    return Ok(ReviewDecision::Failed(format!("parse error: {e}")));
-                }
-            }
-        };
 
     // 10. Build automated review comment for the PR (before moving fields)
     let review_notes_for_comment = review_response.notes.clone();
