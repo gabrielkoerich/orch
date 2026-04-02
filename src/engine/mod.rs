@@ -1072,6 +1072,11 @@ pub async fn serve() -> anyhow::Result<()> {
     let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
+    // In-memory guard to prevent double-spawn of auto-merge background tasks.
+    // Since review_open_prs runs every sync_tick (~10s) but CI polling can take
+    // up to 10 minutes, we track which tasks already have an auto-merge in flight.
+    let auto_merge_in_flight: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
+
     // Subscribe to config file changes for hot reload
     let mut config_rx = crate::config::subscribe();
 
@@ -1307,7 +1312,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         for engine in &project_engines {
                             let repo = engine.repo.clone();
                             REPO_CONTEXT.scope(repo, async {
-                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &config, &router, &engine.task_manager, &engine.store, &dispatching).await {
+                                if let Err(e) = sync::sync_tick(&engine.backend, &tmux, &engine.repo, &config, &router, &engine.task_manager, &engine.store, &dispatching, &auto_merge_in_flight).await {
                                     tracing::error!(repo = %engine.repo, ?e, "sync tick failed for project");
                                 }
                             }).await;

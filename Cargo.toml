@@ -86,6 +86,12 @@ base64 = "0.22"
 futures = "0.3"
 uuid = { version = "1.23.0", features = ["v4"] }
 
+# Concurrent hash set for in-flight auto-merge tracking
+dashmap = "6"
+
+# Scope guard for cleanup on task completion
+scopeguard = "1"
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"

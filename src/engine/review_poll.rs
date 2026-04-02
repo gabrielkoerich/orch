@@ -30,6 +30,7 @@ use crate::github::http::GhHttp;
 use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview};
 use crate::store::TaskStore;
 use crate::store::{opt_store_get_task, store_increment, store_reset_failure_counters, store_set};
+use dashmap::DashSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -45,6 +46,7 @@ pub(crate) async fn review_open_prs(
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
     dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
     // Get tasks that are in review (have open PRs).
     let mut in_review_tasks = {
@@ -517,36 +519,53 @@ pub(crate) async fn review_open_prs(
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
 
-                // Spawn auto-merge in background to avoid blocking sync_tick.
-                // The CI polling loop can take up to 10 minutes with backoff.
-                let task_clone = task.clone();
-                let branch_clone = task_info.branch.clone();
-                let backend_clone = Arc::clone(backend);
-                let repo_string = repo.to_string();
-                let task_manager_clone = Arc::clone(task_manager);
-                let store_clone = Arc::clone(store);
+                // Check if auto-merge is already in flight for this task.
+                // This prevents double-spawn since review_open_prs runs every sync_tick (~10s)
+                // but CI polling can take up to 10 minutes.
+                if auto_merge_in_flight.contains(task_id) {
+                    tracing::debug!(
+                        task_id,
+                        pr_number,
+                        "auto-merge already in flight, skipping spawn"
+                    );
+                } else {
+                    // Spawn auto-merge in background to avoid blocking sync_tick.
+                    // The CI polling loop can take up to 10 minutes with backoff.
+                    auto_merge_in_flight.insert(task_id.to_string());
+                    let task_clone = task.clone();
+                    let branch_clone = task_info.branch.clone();
+                    let backend_clone = Arc::clone(backend);
+                    let repo_string = repo.to_string();
+                    let task_manager_clone = Arc::clone(task_manager);
+                    let store_clone = Arc::clone(store);
+                    let in_flight_clone = Arc::clone(auto_merge_in_flight);
 
-                tokio::spawn(async move {
-                    if let Err(e) = crate::engine::auto_merge::auto_merge_pr(
-                        &task_clone,
-                        &branch_clone,
-                        &backend_clone,
-                        &repo_string,
-                        &task_agent,
-                        &task_model,
-                        &task_manager_clone,
-                        &store_clone,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            task_id = task_clone.id.0,
-                            pr_number,
-                            err = %e,
-                            "auto-merge failed, keeping task in_review for next tick"
-                        );
-                    }
-                });
+                    tokio::spawn(async move {
+                        let _guard = scopeguard::guard((), |_| {
+                            in_flight_clone.remove(&task_clone.id.0);
+                        });
+
+                        if let Err(e) = crate::engine::auto_merge::auto_merge_pr(
+                            &task_clone,
+                            &branch_clone,
+                            &backend_clone,
+                            &repo_string,
+                            &task_agent,
+                            &task_model,
+                            &task_manager_clone,
+                            &store_clone,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                task_id = task_clone.id.0,
+                                pr_number,
+                                err = %e,
+                                "auto-merge failed, keeping task in_review for next tick"
+                            );
+                        }
+                    });
+                }
             }
             continue;
         }
