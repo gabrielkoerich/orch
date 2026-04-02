@@ -371,6 +371,12 @@ impl Router {
     }
 
     async fn wait_for_cooldown(&self, complexity: Option<&str>) -> anyhow::Result<()> {
+        // If any cooldowns are present, return an error immediately so the
+        // caller (the tick loop) can skip this task and retry on the next tick.
+        // Sleeping inside the router blocks the entire tick loop for the
+        // cooldown duration which starves other tasks. The engine tick already
+        // retries every `tick_interval` (default 10s), so allow the tick loop
+        // to drive retries instead of sleeping here.
         let now = chrono::Utc::now().timestamp();
         let earliest = self.earliest_cooldown_until(complexity).ok_or_else(|| {
             anyhow::anyhow!("no cooldowns found while waiting for routing availability")
@@ -378,12 +384,15 @@ impl Router {
 
         let remaining = earliest.saturating_sub(now);
         if remaining > 0 {
+            let scope_str = complexity.unwrap_or("all agents").to_string();
             tracing::warn!(
                 remaining_secs = remaining,
-                scope = complexity.unwrap_or("all agents"),
-                "all agents/models cooled — waiting for cooldown to expire"
+                scope = %scope_str,
+                "all agents/models cooled — routing is unavailable until cooldown expires; failing fast to let tick retry"
             );
-            tokio::time::sleep(std::time::Duration::from_secs(remaining as u64)).await;
+            // Return a domain error indicating all candidates are cooled so the
+            // caller can handle it (tick will skip this task and retry later).
+            return Err(AllCooledError { scope: scope_str }.into());
         }
 
         Ok(())
