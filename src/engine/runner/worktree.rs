@@ -322,6 +322,35 @@ async fn resolve_branch_start_point(repo_root: &str, branch: &str, default_branc
     }
 }
 
+/// Validate that a worktree directory has a working gitdir link.
+///
+/// In a git worktree, `.git` is a file containing `gitdir: /path/to/.git/worktrees/<name>`.
+/// Returns `false` when the `.git` file is missing or points to a non-existent gitdir,
+/// indicating the worktree metadata is broken and the directory should be cleaned up.
+pub fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
+    let git_file = worktree_dir.join(".git");
+    if !git_file.exists() {
+        return false;
+    }
+    // In a linked worktree .git is a file; in the main repo it's a directory (always valid).
+    if git_file.is_dir() {
+        return true;
+    }
+    let content = match std::fs::read_to_string(&git_file) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    // Expected format: "gitdir: /absolute/path/to/.git/worktrees/<name>\n"
+    if let Some(gitdir_path) = content
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("gitdir: "))
+    {
+        return std::path::Path::new(gitdir_path.trim()).exists();
+    }
+    false
+}
+
 /// Check if a directory is a bare git repository.
 async fn is_bare_repo(dir: &Path) -> bool {
     let output = Command::new("git")
