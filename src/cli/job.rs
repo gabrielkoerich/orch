@@ -209,7 +209,7 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
 
         match matches.len() {
             0 => anyhow::bail!("job '{}' not found in any project", job_id),
-            1 => resolved = Some(matches.into_iter().next().unwrap()),
+            1 => resolved = matches.pop(),
             _ => {
                 let repos: Vec<&str> = matches.iter().map(|(r, _)| r.as_str()).collect();
                 anyhow::bail!(
@@ -223,7 +223,10 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
         }
     }
 
-    let (repo, job) = resolved.unwrap();
+    let (repo, job) = match resolved {
+        Some(r) => r,
+        None => anyhow::bail!("job '{}' not found", job_id),
+    };
 
     if !job.enabled {
         println!("Warning: job '{}' is disabled, running anyway", job_id);

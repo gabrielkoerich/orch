@@ -721,7 +721,11 @@ fn extract_review_response_object(text: &str) -> Option<ReviewResponse> {
                 '}' => {
                     depth -= 1;
                     if depth == 0 {
-                        let start_idx = start.unwrap();
+                        debug_assert!(
+                            start.is_some(),
+                            "start must be Some when depth returns to 0"
+                        );
+                        let start_idx = start.unwrap_or(0);
                         let candidate = &text[start_idx..=idx];
                         if let Ok(resp) = serde_json::from_str::<ReviewResponse>(candidate) {
                             return Some(resp);

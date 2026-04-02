@@ -716,7 +716,12 @@ impl GhHttp {
                     req = req.query(q);
                 }
 
-                let make_req = || req.try_clone().expect("request clone failed");
+                // try_clone returns None only for streaming bodies; REST API
+                // requests use JSON bodies which are always clonable.
+                let make_req = || {
+                    req.try_clone()
+                        .expect("request body must be clonable (JSON body expected)")
+                };
                 let resp = self.send_with_retries(make_req, false).await?;
                 let status = resp.status();
                 let next_from_headers = parse_link_next(resp.headers());
@@ -796,8 +801,13 @@ impl GhHttp {
             req = req.header(*k, *v);
         }
 
-        // Use send_with_retries wrapper for GraphQL (is_graphql = true)
-        let make_req = || req.try_clone().expect("graphql request clone failed");
+        // Use send_with_retries wrapper for GraphQL (is_graphql = true).
+        // try_clone returns None only for streaming bodies; GraphQL requests
+        // use JSON bodies which are always clonable.
+        let make_req = || {
+            req.try_clone()
+                .expect("graphql request body must be clonable (JSON body expected)")
+        };
         let resp = self.send_with_retries(make_req, true).await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -1918,7 +1928,10 @@ impl GhHttp {
             .body(query)
             .header(header::AUTHORIZATION, &auth)
             .header(header::ACCEPT, "application/vnd.github+json");
-        let make_req = || req.try_clone().expect("graphql request clone failed");
+        let make_req = || {
+            req.try_clone()
+                .expect("graphql request body must be clonable (JSON body expected)")
+        };
         let resp = self.send_with_retries(make_req, true).await?;
         let body: serde_json::Value = resp.json().await?;
         let pr_id = body
@@ -1937,7 +1950,10 @@ impl GhHttp {
             .body(mutation)
             .header(header::AUTHORIZATION, &auth)
             .header(header::ACCEPT, "application/vnd.github+json");
-        let make_req = || req.try_clone().expect("graphql request clone failed");
+        let make_req = || {
+            req.try_clone()
+                .expect("graphql request body must be clonable (JSON body expected)")
+        };
         let resp = self.send_with_retries(make_req, true).await?;
         let status = resp.status();
         if !status.is_success() {

@@ -71,7 +71,8 @@ pub fn expand_alias(s: &str) -> String {
         }
         "@daily" => {
             if param.contains(':') {
-                let (h, m) = param.split_once(':').unwrap();
+                // split_once is guaranteed because contains(':') returned true
+                let (h, m) = param.split_once(':').unwrap_or(("", ""));
                 let hour: u8 = h.parse().unwrap_or(0);
                 let min: u8 = m.parse().unwrap_or(0);
                 format!("{min} {hour} * * *")
@@ -90,7 +91,8 @@ pub fn expand_alias(s: &str) -> String {
         }
         "@yearly" => {
             if param.contains('-') {
-                let (m, d) = param.split_once('-').unwrap();
+                // split_once is guaranteed because contains('-') returned true
+                let (m, d) = param.split_once('-').unwrap_or(("", ""));
                 let month: u8 = m.parse().unwrap_or(1);
                 let dom: u8 = d.parse().unwrap_or(1);
                 format!("0 0 {dom} {month} *")

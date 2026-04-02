@@ -1067,7 +1067,10 @@ pub async fn reopen(id: &str) -> anyhow::Result<()> {
         anyhow::bail!("could not open task store");
     };
 
-    let s = store.as_ref().unwrap();
+    let s = match store.as_ref() {
+        Some(s) => s,
+        None => anyhow::bail!("task store unexpectedly None"),
+    };
 
     // 1. Reset failure counters
     let ext_id_str = task

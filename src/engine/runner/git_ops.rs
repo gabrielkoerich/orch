@@ -577,7 +577,9 @@ pub async fn create_pr_if_needed(
     let url = match created_url {
         Some(u) => u,
         None => {
-            let e = last_error.unwrap();
+            let e = last_error.unwrap_or_else(|| {
+                anyhow::anyhow!("PR creation failed after retries (no error captured)")
+            });
             let err_str = format!("{e}");
             // For transient 5xx errors, GitHub may have created the PR despite returning
             // an error (e.g. 502 after the write succeeded). Re-check for an existing PR
