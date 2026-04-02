@@ -665,9 +665,39 @@ fn is_non_code_task(resp: &AgentResponse) -> bool {
     false
 }
 
-/// Check if text contains any non-code label as a substring.
+/// Check if text contains any non-code label as a whole word (not a substring of another word).
+///
+/// Uses word-boundary matching: a label matches only when it is surrounded by
+/// non-alphanumeric characters (spaces, punctuation, start/end of string).
+/// This prevents false positives like "reviewed" matching "review", or
+/// "designing" matching "design".
 fn has_non_code_label(text: &str) -> bool {
-    NON_CODE_LABELS.iter().any(|label| text.contains(label))
+    NON_CODE_LABELS.iter().any(|label| {
+        let bytes = text.as_bytes();
+        let label_bytes = label.as_bytes();
+        let label_len = label_bytes.len();
+        let text_len = bytes.len();
+
+        if label_len > text_len {
+            return false;
+        }
+
+        // Slide a window of label_len across text looking for a whole-word match.
+        for start in 0..=(text_len - label_len) {
+            let end = start + label_len;
+            if &bytes[start..end] != label_bytes {
+                continue;
+            }
+            // Check that the character before the match is a word boundary.
+            let left_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+            // Check that the character after the match is a word boundary.
+            let right_ok = end == text_len || !bytes[end].is_ascii_alphanumeric();
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 #[cfg(test)]
@@ -677,6 +707,7 @@ mod tests {
 
     #[test]
     fn test_has_non_code_label_detects_labels() {
+        // Whole-word matches must be detected
         assert!(has_non_code_label("updated documentation"));
         assert!(has_non_code_label("research completed"));
         assert!(has_non_code_label("analysis of the issue"));
@@ -684,6 +715,66 @@ mod tests {
         assert!(has_non_code_label("planning session"));
         assert!(!has_non_code_label("fixed the bug"));
         assert!(!has_non_code_label("refactored the code"));
+    }
+
+    #[test]
+    fn test_has_non_code_label_no_false_positives_on_substrings() {
+        // Words that *contain* a label as a substring but are NOT the label itself.
+        // These must NOT match because the label is not a whole word.
+        assert!(!has_non_code_label("i reviewed the code and fixed the bug")); // "reviewed" ≠ "review"
+        assert!(!has_non_code_label("reviewed the implementation")); // "reviewed" ≠ "review"
+        assert!(!has_non_code_label("redesign of the module")); // "redesign" ≠ "design"
+        assert!(!has_non_code_label("designer wrote a component")); // "designer" ≠ "design"
+        assert!(!has_non_code_label("analyzing patterns in code")); // "analyzing" ≠ "analysis"
+        assert!(!has_non_code_label("investigations into root cause")); // "investigations" ≠ "investigation"
+
+        // Whole-word "docs" must still match
+        assert!(has_non_code_label("wrote docs for the feature"));
+        // Whole-word "review" must still match
+        assert!(has_non_code_label("code review complete"));
+        // Whole-word "design" must still match (it IS a standalone word here)
+        assert!(has_non_code_label("design phase finished"));
+        // Whole-word at start/end of string
+        assert!(has_non_code_label("research"));
+        assert!(has_non_code_label("audit"));
+    }
+
+    #[test]
+    fn test_is_non_code_task_no_false_positive_reviewed() {
+        // Agent says "I reviewed the code and fixed the bug" — this is code work, not a review task.
+        // "reviewed" contains "review" as a substring but is NOT a whole-word match.
+        let resp = AgentResponse {
+            status: "done".to_string(),
+            summary: "I reviewed the code and fixed the bug".to_string(),
+            accomplished: vec!["Patched the authentication module".to_string()],
+            remaining: vec![],
+            files: vec!["src/auth.rs".to_string()],
+            error: None,
+            learnings: vec![],
+            delegations: vec![],
+            input_tokens: None,
+            output_tokens: None,
+        };
+        assert!(!is_non_code_task(&resp));
+    }
+
+    #[test]
+    fn test_is_non_code_task_no_false_positive_analyzed() {
+        // "analyzed" contains "analysis" — wait, no: "analyzed" does NOT contain "analysis".
+        // But "analyzing" does not contain "analysis" either. This test covers "redesign"/"design".
+        let resp = AgentResponse {
+            status: "done".to_string(),
+            summary: "Redesigned the module's internal state machine".to_string(),
+            accomplished: vec!["Implemented state machine in state.rs".to_string()],
+            remaining: vec![],
+            files: vec!["src/state.rs".to_string()],
+            error: None,
+            learnings: vec![],
+            delegations: vec![],
+            input_tokens: None,
+            output_tokens: None,
+        };
+        assert!(!is_non_code_task(&resp));
     }
 
     #[test]
