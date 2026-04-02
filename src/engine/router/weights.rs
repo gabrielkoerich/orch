@@ -54,6 +54,8 @@ pub struct RateLimitState {
     pub recovery_jitter: Duration,
     /// How many consecutive rate limit hits.
     pub consecutive_hits: u32,
+    /// The configured base weight this agent should recover toward.
+    pub base_weight: f64,
 }
 
 impl Default for RateLimitState {
@@ -63,6 +65,7 @@ impl Default for RateLimitState {
             last_limited_at: None,
             recovery_jitter: Duration::ZERO,
             consecutive_hits: 0,
+            base_weight: DEFAULT_WEIGHT,
         }
     }
 }
@@ -76,10 +79,10 @@ impl RateLimitState {
         self.last_limited_at = Some(Instant::now());
     }
 
-    /// Record a successful completion — bump weight back toward 1.0.
+    /// Record a successful completion — bump weight back toward base_weight.
     pub fn record_success(&mut self) {
         self.consecutive_hits = 0;
-        self.weight = (self.weight + RECOVERY_RATE).min(DEFAULT_WEIGHT);
+        self.weight = (self.weight + RECOVERY_RATE).min(self.base_weight);
     }
 
     /// Tick recovery: if enough time has passed since the last limit (plus jitter), gradually restore.
@@ -87,8 +90,8 @@ impl RateLimitState {
         if let Some(last) = self.last_limited_at {
             let recovery_threshold = RECOVERY_DELAY + self.recovery_jitter;
             if last.elapsed() >= recovery_threshold {
-                self.weight = (self.weight + RECOVERY_RATE).min(DEFAULT_WEIGHT);
-                if self.weight >= DEFAULT_WEIGHT {
+                self.weight = (self.weight + RECOVERY_RATE).min(self.base_weight);
+                if self.weight >= self.base_weight {
                     self.last_limited_at = None;
                     self.recovery_jitter = Duration::ZERO;
                     self.consecutive_hits = 0;
@@ -97,9 +100,9 @@ impl RateLimitState {
         }
     }
 
-    /// Is this agent currently rate-limited (weight below full)?
+    /// Is this agent currently rate-limited (weight below its base weight)?
     pub fn is_limited(&self) -> bool {
-        self.weight < DEFAULT_WEIGHT
+        self.weight < self.base_weight
     }
 }
 
@@ -139,8 +142,10 @@ impl AgentWeights {
                 .entry(agent.clone())
                 .or_insert_with(|| RateLimitState {
                     weight: base,
+                    base_weight: base,
                     ..Default::default()
                 });
+            state.base_weight = base;
             // Update base weight if agent was already initialized (e.g. after config reload)
             // but only if the agent isn't currently rate-limited (don't override decay)
             if !state.is_limited() {
