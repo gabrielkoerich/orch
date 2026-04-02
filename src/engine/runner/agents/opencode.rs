@@ -124,10 +124,13 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
 
     let full = texts.join("");
     if let Some(json) = extract_json_object(&full) {
-        // Be conservative: only accept a full-json payload if it looks like a
-        // structured task response / routing decision. Parse the JSON and
-        // inspect top-level keys rather than using substring matches which can
-        // trigger on values or unrelated text.
+        // Prefer a full-json payload that parses as an AgentResponse.
+        if crate::parser::parse(&json).is_ok() {
+            return Some(json);
+        }
+
+        // Also accept JSON that looks like a router decision / agent envelope
+        // even when it's not a full AgentResponse (e.g. {"executor":"opencode"}).
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
             if let Some(obj) = val.as_object() {
                 if obj.contains_key("executor")
@@ -145,6 +148,15 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
     for text in texts.iter().rev() {
         let trimmed = text.trim();
         if let Some(json) = extract_json_object(trimmed) {
+            // Prefer JSON blobs that parse as AgentResponse. This allows
+            // accepting payloads that don't include routing keys but are
+            // nevertheless valid task responses.
+            if crate::parser::parse(&json).is_ok() {
+                return Some(json);
+            }
+
+            // Also accept routing-style JSON objects that don't match the
+            // AgentResponse schema (router decisions, etc.).
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
                 if let Some(obj) = val.as_object() {
                     if obj.contains_key("executor") || obj.contains_key("status") {
@@ -157,8 +169,14 @@ pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String
         // looks like it mentions routing keys, return it. We keep this branch
         // minimal to avoid accidental acceptance of unrelated log blobs.
         if trimmed.contains('{') {
-            // As a last-ditch conservative heuristic, only accept the chunk if
-            // it parses as JSON and the resulting object contains routing keys.
+            // As a last-ditch conservative heuristic, accept the chunk if it
+            // can be interpreted as a valid AgentResponse or if it contains
+            // routing keys. This avoids accepting unrelated log blobs while
+            // remaining tolerant of router-style payloads.
+            if crate::parser::parse(trimmed).is_ok() {
+                return Some(trimmed.to_string());
+            }
+
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
                 if let Some(obj) = val.as_object() {
                     if obj.contains_key("executor")
