@@ -973,13 +973,65 @@ pub(crate) async fn tick_dispatch_tasks(
 
         // Check if already running (has active session)
         let session_name = tmux.session_name(repo, &task.id.0);
-        if tmux.session_exists(&session_name).await {
-            tracing::warn!(
-                task_id = task.id.0,
-                session_name,
-                "task has existing tmux session, skipping dispatch"
-            );
-            continue; // dispatch_guard drops here, removing the key
+        let health = tmux.check_session_health(&session_name).await;
+
+        if health.exists {
+            if health.is_healthy() {
+                // Session is alive and well - skip dispatch
+                tracing::warn!(
+                    task_id = task.id.0,
+                    session_name,
+                    "task has active tmux session, skipping dispatch"
+                );
+                continue; // dispatch_guard drops here, removing the key
+            } else {
+                // Session exists but appears dead/orphaned - reclaim it
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let age_secs = health.age_secs(now);
+                let idle_secs = health.idle_secs(now);
+
+                tracing::warn!(
+                    task_id = task.id.0,
+                    session_name,
+                    pane_alive = health.pane_alive,
+                    age_secs = age_secs,
+                    idle_secs = idle_secs,
+                    "task has orphaned tmux session (dead pane), killing and reclaiming"
+                );
+
+                // Kill the orphaned session and allow dispatch to proceed
+                if let Err(e) = tmux.kill_session(&session_name).await {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        session_name,
+                        error = %e,
+                        "failed to kill orphaned tmux session, skipping dispatch"
+                    );
+                    continue; // dispatch_guard drops here
+                }
+
+                // Give tmux a moment to clean up
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                // Verify the session is actually gone
+                if tmux.session_exists(&session_name).await {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        session_name,
+                        "orphaned session still exists after kill, skipping dispatch"
+                    );
+                    continue; // dispatch_guard drops here
+                }
+
+                tracing::info!(
+                    task_id = task.id.0,
+                    session_name,
+                    "successfully reclaimed orphaned session, proceeding with dispatch"
+                );
+            }
         }
 
         // Try to acquire a slot
