@@ -390,8 +390,17 @@ pub async fn handle_success(
         // Use atomic increment helper to avoid a read-increment-write race.
         let push_failures = store::store_increment(store, repo, task_id, "push_failures").await;
 
-        // Clear agent so router picks a different one on reroute
-        store::store_set(store, repo, task_id, &[("agent", serde_json::json!(null))]).await;
+        // Clear agent and model so router picks a different one on reroute (#1604)
+        store::store_set(
+            store,
+            repo,
+            task_id,
+            &[
+                ("agent", serde_json::json!(null)),
+                ("model", serde_json::json!(null)),
+            ],
+        )
+        .await;
 
         if push_failures >= 3 {
             tracing::error!(
