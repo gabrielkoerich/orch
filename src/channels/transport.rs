@@ -40,17 +40,53 @@ pub struct SessionBinding {
     /// tmux session name (e.g. "orch-myproject-42")
     pub tmux_session: String,
     /// Channel threads connected to this session.
-    /// Key: "channel:thread_id" (e.g. "telegram:12345", "github:42")
+    ///
+    /// Each entry is a canonical conversation key produced by
+    /// [`conversation_key`].  The format is either:
+    ///   - `"channel:thread_id"` (no topic), or
+    ///   - `"channel:thread_id|topic_id"` (with topic/thread)
+    ///
+    /// Use [`parse_conversation_key`] to decompose a key back into its parts.
     pub connected_threads: Vec<String>,
     /// Broadcast sender for output streaming
     pub output_tx: broadcast::Sender<OutputChunk>,
+}
+
+/// Build a canonical conversation key that is unique per topic/thread when
+/// `topic_id` is present, and falls back to `channel:thread_id` otherwise.
+///
+/// Telegram and Discord encode the forum-topic / thread identity in `topic_id`
+/// while `thread_id` carries the parent chat / channel id.  Two different topics
+/// inside the same parent would share the same `"channel:thread_id"` key —
+/// causing bindings to collide.  Including `topic_id` in the key avoids that.
+///
+/// `|` is used as the topic separator because it cannot appear in Telegram or
+/// Discord snowflake IDs (they are numeric / alphanumeric).
+pub fn conversation_key(channel: &str, thread_id: &str, topic_id: Option<&str>) -> String {
+    match topic_id {
+        Some(tid) if !tid.is_empty() => format!("{channel}:{thread_id}|{tid}"),
+        _ => format!("{channel}:{thread_id}"),
+    }
+}
+
+/// Decompose a conversation key created by [`conversation_key`] back into
+/// `(channel, thread_id, topic_id)`.
+///
+/// Returns `None` if the key is malformed (no `':'` separator).
+pub fn parse_conversation_key(key: &str) -> Option<(&str, &str, Option<&str>)> {
+    let (channel, rest) = key.split_once(':')?;
+    let (thread_id, topic_id) = match rest.split_once('|') {
+        Some((tid, topic)) => (tid, Some(topic)),
+        None => (rest, None),
+    };
+    Some((channel, thread_id, topic_id))
 }
 
 /// The transport layer manages all session bindings and routes messages.
 pub struct Transport {
     /// Active session bindings, keyed by task_id
     bindings: Arc<RwLock<HashMap<String, SessionBinding>>>,
-    /// Reverse lookup: "channel:thread_id" → task_id
+    /// Reverse lookup: conversation_key → task_id
     thread_to_task: Arc<RwLock<HashMap<String, String>>>,
     /// Broadcast sender for task completion notifications
     notification_tx: broadcast::Sender<TaskNotification>,
@@ -70,8 +106,19 @@ impl Transport {
     }
 
     /// Bind a channel thread to a task's tmux session.
-    pub async fn bind(&self, task_id: &str, tmux_session: &str, channel: &str, thread_id: &str) {
-        let key = format!("{channel}:{thread_id}");
+    ///
+    /// `topic_id` should be set for topic-aware channels (Telegram forum topics,
+    /// Discord threads) so that bindings for different topics inside the same
+    /// parent chat / channel do not collide.
+    pub async fn bind(
+        &self,
+        task_id: &str,
+        tmux_session: &str,
+        channel: &str,
+        thread_id: &str,
+        topic_id: Option<&str>,
+    ) {
+        let key = conversation_key(channel, thread_id, topic_id);
         // Clear stale output before updating bindings to avoid holding
         // write lock across await points (deadlock risk).
         self.clear_output(task_id).await;
@@ -153,7 +200,7 @@ impl Transport {
     /// Route an incoming message to the appropriate handler.
     /// Returns the task_id if this message maps to an existing session.
     pub async fn route(&self, msg: &IncomingMessage) -> MessageRoute {
-        let key = format!("{}:{}", msg.channel, msg.thread_id);
+        let key = conversation_key(&msg.channel, &msg.thread_id, msg.topic_id.as_deref());
 
         // Check if this thread is bound to a task
         if let Some(task_id) = self.thread_to_task.read().await.get(&key) {
@@ -298,7 +345,7 @@ mod tests {
     async fn bind_and_route_to_session() {
         let transport = Transport::new();
         transport
-            .bind("42", "orch-myproject-42", "telegram", "12345")
+            .bind("42", "orch-myproject-42", "telegram", "12345", None)
             .await;
 
         let msg = IncomingMessage {
@@ -336,6 +383,151 @@ mod tests {
         match transport.route(&msg).await {
             MessageRoute::Command { raw } => assert_eq!(raw, "/status"),
             _ => panic!("expected Command"),
+        }
+    }
+
+    // ── conversation_key ──────────────────────────────────────────────────────
+
+    #[test]
+    fn conversation_key_without_topic() {
+        let key = conversation_key("telegram", "12345", None);
+        assert_eq!(key, "telegram:12345");
+    }
+
+    #[test]
+    fn conversation_key_with_topic() {
+        let key = conversation_key("telegram", "12345", Some("678"));
+        assert_eq!(key, "telegram:12345|678");
+    }
+
+    #[test]
+    fn conversation_key_empty_topic_treated_as_none() {
+        // An empty topic_id should produce the same key as None.
+        let key_empty = conversation_key("discord", "abc", Some(""));
+        let key_none = conversation_key("discord", "abc", None);
+        assert_eq!(key_empty, key_none);
+    }
+
+    // ── parse_conversation_key ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_key_without_topic() {
+        let (channel, thread_id, topic_id) =
+            parse_conversation_key("telegram:12345").expect("valid key");
+        assert_eq!(channel, "telegram");
+        assert_eq!(thread_id, "12345");
+        assert!(topic_id.is_none());
+    }
+
+    #[test]
+    fn parse_key_with_topic() {
+        let (channel, thread_id, topic_id) =
+            parse_conversation_key("telegram:12345|678").expect("valid key");
+        assert_eq!(channel, "telegram");
+        assert_eq!(thread_id, "12345");
+        assert_eq!(topic_id, Some("678"));
+    }
+
+    #[test]
+    fn parse_key_malformed_returns_none() {
+        assert!(parse_conversation_key("no-colon-here").is_none());
+    }
+
+    #[test]
+    fn conversation_key_round_trips() {
+        // Build a key and parse it back; values must match what went in.
+        for (ch, tid, topic) in [
+            ("telegram", "111", Some("222")),
+            ("discord", "abc", None),
+            ("slack", "x", Some("y")),
+        ] {
+            let key = conversation_key(ch, tid, topic);
+            let (ch2, tid2, topic2) = parse_conversation_key(&key).expect("round-trip valid");
+            assert_eq!(ch2, ch);
+            assert_eq!(tid2, tid);
+            assert_eq!(topic2, topic);
+        }
+    }
+
+    // ── topic collision prevention ────────────────────────────────────────────
+
+    /// Two different Telegram forum topics inside the same chat must bind to
+    /// different keys and not collide.
+    #[tokio::test]
+    async fn different_topics_do_not_collide() {
+        let transport = Transport::new();
+
+        // Task 10 is in topic 100 of chat 999
+        transport
+            .bind("10", "orch-proj-10", "telegram", "999", Some("100"))
+            .await;
+        // Task 20 is in topic 200 of the same chat 999
+        transport
+            .bind("20", "orch-proj-20", "telegram", "999", Some("200"))
+            .await;
+
+        let msg_topic_100 = IncomingMessage {
+            channel: "telegram".to_string(),
+            id: "m1".to_string(),
+            thread_id: "999".to_string(),
+            author: "user".to_string(),
+            body: "reply for task 10".to_string(),
+            timestamp: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+            topic_id: Some("100".to_string()),
+        };
+
+        let msg_topic_200 = IncomingMessage {
+            channel: "telegram".to_string(),
+            id: "m2".to_string(),
+            thread_id: "999".to_string(),
+            author: "user".to_string(),
+            body: "reply for task 20".to_string(),
+            timestamp: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+            topic_id: Some("200".to_string()),
+        };
+
+        match transport.route(&msg_topic_100).await {
+            MessageRoute::TaskSession { task_id } => assert_eq!(task_id, "10"),
+            other => panic!("expected TaskSession for task 10, got {other:?}"),
+        }
+
+        match transport.route(&msg_topic_200).await {
+            MessageRoute::TaskSession { task_id } => assert_eq!(task_id, "20"),
+            other => panic!("expected TaskSession for task 20, got {other:?}"),
+        }
+    }
+
+    /// A message arriving in a *different* topic must not be routed to a task
+    /// that was bound to another topic in the same chat.
+    #[tokio::test]
+    async fn wrong_topic_does_not_route_to_bound_task() {
+        let transport = Transport::new();
+
+        // Task 5 bound to topic 10 of chat 42
+        transport
+            .bind("5", "orch-proj-5", "telegram", "42", Some("10"))
+            .await;
+
+        // Message arrives in topic 99 of the same chat — should NOT route to task 5
+        let msg = IncomingMessage {
+            channel: "telegram".to_string(),
+            id: "m1".to_string(),
+            thread_id: "42".to_string(),
+            author: "user".to_string(),
+            body: "hello from a different topic".to_string(),
+            timestamp: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+            topic_id: Some("99".to_string()),
+        };
+
+        match transport.route(&msg).await {
+            MessageRoute::NewTask => {} // correct — not routed to task 5
+            MessageRoute::TaskSession { task_id } => {
+                panic!("should not have routed to task {task_id}")
+            }
+            other => panic!("unexpected route result: {other:?}"),
         }
     }
 }

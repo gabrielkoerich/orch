@@ -253,7 +253,7 @@ async fn create_and_announce_task(
             };
             let session_name = tmux.session_name(repo, &task_id);
             transport
-                .bind(&task_id, &session_name, channel, thread_id)
+                .bind(&task_id, &session_name, channel, thread_id, topic_id)
                 .await;
             capture
                 .register_session(repo, &task_id, &session_name)
@@ -447,7 +447,14 @@ pub(super) async fn handle_channel_message(
                 )
                 .await;
             } else if cmd_str.starts_with("/stream") {
-                let reply = handle_stream_command(&cmd_str, &channel, &thread_id, transport).await;
+                let reply = handle_stream_command(
+                    &cmd_str,
+                    &channel,
+                    &thread_id,
+                    msg_topic_id.as_deref(),
+                    transport,
+                )
+                .await;
                 send_channel_reply(
                     channels,
                     &channel,
@@ -842,6 +849,7 @@ pub(super) async fn handle_stream_command(
     cmd_str: &str,
     channel: &str,
     thread_id: &str,
+    topic_id: Option<&str>,
     transport: &Arc<Transport>,
 ) -> String {
     let parts: Vec<&str> = cmd_str.splitn(2, ' ').collect();
@@ -855,7 +863,7 @@ pub(super) async fn handle_stream_command(
         // Bind this channel/thread as an additional output target
         // The session name is retrieved from the existing binding
         transport
-            .bind(task_id, &binding.tmux_session, channel, thread_id)
+            .bind(task_id, &binding.tmux_session, channel, thread_id, topic_id)
             .await;
         format!("Streaming output from task `{task_id}` to this channel.")
     } else {

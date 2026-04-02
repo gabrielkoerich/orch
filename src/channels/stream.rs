@@ -9,7 +9,7 @@
 //! - Discord:  2 KB per message, 500 ms between sends
 //! - Slack:    4 KB per message, 200 ms between sends
 
-use crate::channels::transport::Transport;
+use crate::channels::transport::{parse_conversation_key, Transport};
 use crate::channels::{ChannelRegistry, OutgoingMessage};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,10 +63,15 @@ fn split_for_platform(content: &str, channel_name: &str) -> Vec<String> {
 }
 
 /// Send a message to a specific channel thread, finding the channel by name.
+///
+/// `topic_id` is forwarded to the channel so that topic-aware channels
+/// (Telegram forum topics, Discord threads) deliver the message to the
+/// correct sub-conversation rather than the parent chat/channel.
 async fn send_to_thread(
     channels: &Arc<ChannelRegistry>,
     channel_name: &str,
     thread_id: &str,
+    topic_id: Option<&str>,
     body: String,
 ) {
     for ch in channels.iter() {
@@ -76,7 +81,7 @@ async fn send_to_thread(
                 body,
                 reply_to: None,
                 metadata: serde_json::json!({}),
-                topic_id: None,
+                topic_id: topic_id.map(String::from),
             };
             if let Err(e) = ch.send(&msg).await {
                 tracing::warn!(channel = channel_name, thread_id, ?e, "stream: send failed");
@@ -130,10 +135,11 @@ pub async fn fanout_output(
                         let now = Instant::now();
 
                         for thread_key in &binding.connected_threads {
-                            let (ch_name, thread_id) = match thread_key.split_once(':') {
-                                Some(p) => p,
-                                None => continue,
-                            };
+                            let (ch_name, thread_id, topic_id) =
+                                match parse_conversation_key(thread_key) {
+                                    Some(p) => p,
+                                    None => continue,
+                                };
 
                             // Append new content to this thread's buffer
                             buffers
@@ -152,7 +158,10 @@ pub async fn fanout_output(
                                 if let Some(buffered) = buffers.remove(thread_key) {
                                     let parts = split_for_platform(&buffered, ch_name);
                                     for part in parts {
-                                        send_to_thread(&channels, ch_name, thread_id, part).await;
+                                        send_to_thread(
+                                            &channels, ch_name, thread_id, topic_id, part,
+                                        )
+                                        .await;
                                     }
                                     last_send.insert(ch_name.to_string(), now);
                                 }
@@ -169,13 +178,14 @@ pub async fn fanout_output(
                             if buffered.is_empty() {
                                 continue;
                             }
-                            let (ch_name, thread_id) = match thread_key.split_once(':') {
-                                Some(p) => p,
-                                None => continue,
-                            };
+                            let (ch_name, thread_id, topic_id) =
+                                match parse_conversation_key(&thread_key) {
+                                    Some(p) => p,
+                                    None => continue,
+                                };
                             let parts = split_for_platform(&buffered, ch_name);
                             for part in parts {
-                                send_to_thread(&channels, ch_name, thread_id, part).await;
+                                send_to_thread(&channels, ch_name, thread_id, topic_id, part).await;
                             }
                         }
                     }
@@ -203,7 +213,7 @@ pub async fn fanout_output(
             let now = Instant::now();
             let mut earliest = None::<Instant>;
             for thread_key in buffers.keys() {
-                if let Some((ch_name, _)) = thread_key.split_once(':') {
+                if let Some((ch_name, _, _)) = parse_conversation_key(thread_key) {
                     let rate = platform_rate(ch_name);
                     if let Some(last) = last_send.get(ch_name) {
                         let when = *last + rate;
@@ -237,10 +247,11 @@ pub async fn fanout_output(
                     let keys: Vec<String> = buffers.keys().cloned().collect();
                     for thread_key in keys {
                         if let Some(buffered) = buffers.remove(&thread_key) {
-                            let (ch_name, thread_id) = match thread_key.split_once(':') {
-                                Some(p) => p,
-                                None => continue,
-                            };
+                            let (ch_name, thread_id, topic_id) =
+                                match parse_conversation_key(&thread_key) {
+                                    Some(p) => p,
+                                    None => continue,
+                                };
                             let rate = platform_rate(ch_name);
                             let can_send = last_send
                                 .get(ch_name)
@@ -249,7 +260,8 @@ pub async fn fanout_output(
                             if can_send {
                                 let parts = split_for_platform(&buffered, ch_name);
                                 for part in parts {
-                                    send_to_thread(&channels, ch_name, thread_id, part).await;
+                                    send_to_thread(&channels, ch_name, thread_id, topic_id, part)
+                                        .await;
                                 }
                                 last_send.insert(ch_name.to_string(), now);
                             } else {
@@ -358,7 +370,7 @@ mod tests {
         // Bind a task to the channel:thread so fanout knows where to send
         let task_id = "fanout-test-task";
         transport
-            .bind(task_id, "orch-fanout-test", "telegram", "thread-1")
+            .bind(task_id, "orch-fanout-test", "telegram", "thread-1", None)
             .await;
 
         // Spawn the fanout_output task
@@ -413,6 +425,80 @@ mod tests {
         assert!(
             got,
             "fanout did not send expected outgoing message to test channel"
+        );
+    }
+
+    /// When a task is bound with a `topic_id`, the outgoing `OutgoingMessage`
+    /// forwarded by fanout must carry the same `topic_id` so that the channel
+    /// delivers the reply to the correct forum topic / thread.
+    #[tokio::test]
+    async fn fanout_forwards_topic_id() {
+        let transport = std::sync::Arc::new(Transport::new());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::channels::OutgoingMessage>(16);
+        let test_ch = TestChannel {
+            name: "telegram".to_string(),
+            tx,
+        };
+
+        let mut registry = crate::channels::ChannelRegistry::new();
+        registry.register(Box::new(test_ch));
+        let registry = std::sync::Arc::new(registry);
+
+        let task_id = "topic-forward-task";
+        // Bind with a specific topic_id
+        transport
+            .bind(
+                task_id,
+                "orch-topic-test",
+                "telegram",
+                "chat-111",
+                Some("topic-42"),
+            )
+            .await;
+
+        let transport_clone = transport.clone();
+        let registry_clone = registry.clone();
+        let task_id_str = task_id.to_string();
+        tokio::spawn(
+            async move { fanout_output(task_id_str, transport_clone, registry_clone).await },
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        transport
+            .push_output(
+                task_id,
+                crate::channels::OutputChunk {
+                    content: "topic reply".to_string(),
+                    is_final: true,
+                },
+            )
+            .await;
+
+        let mut got_topic = false;
+        for _ in 0..10 {
+            if let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), async {
+                    rx.recv().await
+                })
+                .await
+            {
+                if msg.body.contains("topic reply") {
+                    assert_eq!(
+                        msg.topic_id.as_deref(),
+                        Some("topic-42"),
+                        "outgoing message must carry the bound topic_id"
+                    );
+                    got_topic = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            got_topic,
+            "fanout did not forward topic_id in outgoing message"
         );
     }
 }
