@@ -54,7 +54,7 @@ use crate::engine::cleanup::remove_worktree_and_branch;
 use crate::engine::router::Router;
 use crate::engine::runner::worktree::{
     abort_worktree_rebase, list_project_worktrees, rebase_worktree_on_origin_main,
-    task_id_from_worktree_name,
+    task_id_from_worktree_name, validate_worktree_gitdir,
 };
 use crate::engine::tasks::TaskManager;
 use crate::github::http::{rate_limit_metrics, GhHttp};
@@ -342,15 +342,31 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
             tracing::warn!(repo = %engine.repo, err = %e, "startup git fetch origin failed, rebases may use stale refs");
         }
 
+        let mut orphans_removed: u32 = 0;
+        let mut invalid_removed: u32 = 0;
+        let mut cleaned: u32 = 0;
+        let mut valid_kept: u32 = 0;
+
         for worktree_dir in worktrees {
             let Some(name) = worktree_dir.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
 
+            // Validate gitdir link before doing anything else — a broken .git file
+            // means git commands on this worktree will fail with "not a git repository".
+            if !validate_worktree_gitdir(&worktree_dir) {
+                tracing::warn!(repo = %engine.repo, worktree = %worktree_dir.display(), "worktree has invalid or missing gitdir, removing");
+                remove_worktree_and_branch(name, &worktree_dir, Some(name), &repo_root_path, false)
+                    .await;
+                invalid_removed += 1;
+                continue;
+            }
+
             let Some(task_id) = task_id_from_worktree_name(name) else {
                 tracing::info!(repo = %engine.repo, worktree = %worktree_dir.display(), "orphan worktree without task id, removing");
                 remove_worktree_and_branch(name, &worktree_dir, Some(name), &repo_root_path, false)
                     .await;
+                orphans_removed += 1;
                 continue;
             };
 
@@ -364,6 +380,7 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                     false,
                 )
                 .await;
+                orphans_removed += 1;
                 continue;
             };
 
@@ -411,6 +428,9 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                                 crate::backends::Status::New,
                             )
                             .await;
+                        cleaned += 1;
+                    } else {
+                        valid_kept += 1;
                     }
                 }
                 _ => {
@@ -425,9 +445,19 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
                         keep_remote,
                     )
                     .await;
+                    cleaned += 1;
                 }
             }
         }
+
+        tracing::info!(
+            repo = %engine.repo,
+            orphans_removed,
+            invalid_removed,
+            cleaned,
+            valid_kept,
+            "worktree reconciliation: {orphans_removed} orphans removed, {invalid_removed} invalid removed, {cleaned} cleaned, {valid_kept} valid kept"
+        );
 
         // Prune stale .git/worktrees/ entries whose directories no longer exist.
         // This handles entries left behind by crashes or manual directory removal.
