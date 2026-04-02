@@ -374,7 +374,32 @@ mod tests {
 
     #[test]
     fn from_config_returns_none_when_not_configured() {
-        // In test environment, config won't have gh.project_id
-        assert!(ProjectSync::from_config().is_none());
+        // Isolate from both the repo's .orch.yml and the global ~/.orch/config.yml:
+        // 1. Change to a temp dir so project config lookup finds no .orch.yml
+        // 2. Point ORCH_HOME at a separate temp dir so the global config is not found
+        // 3. Clear the config cache so no previously-cached values are reused
+        let original_cwd = std::env::current_dir().unwrap();
+        let prev_orch_home = std::env::var("ORCH_HOME").ok();
+
+        let temp_cwd = tempfile::tempdir().unwrap();
+        let temp_orch_home = tempfile::tempdir().unwrap();
+        let orch_dir = temp_orch_home.path().join(".orch");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+
+        std::env::set_current_dir(temp_cwd.path()).unwrap();
+        std::env::set_var("ORCH_HOME", &orch_dir);
+        config::clear_test_cache();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(ProjectSync::from_config().is_none());
+        }));
+
+        std::env::set_current_dir(&original_cwd).unwrap();
+        if let Some(prev) = prev_orch_home {
+            std::env::set_var("ORCH_HOME", prev);
+        } else {
+            std::env::remove_var("ORCH_HOME");
+        }
+        result.unwrap();
     }
 }

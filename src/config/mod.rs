@@ -46,6 +46,16 @@ pub fn subscribe() -> broadcast::Receiver<PathBuf> {
     CHANGE_TX.subscribe()
 }
 
+/// Clear the entire config cache. Exposed for use by integration tests that
+/// need to run in an isolated config environment (e.g. a temp dir with no
+/// project `.orch.yml`).
+#[cfg(test)]
+pub fn clear_test_cache() {
+    if let Ok(mut cache) = CACHE.write() {
+        cache.clear();
+    }
+}
+
 /// Invalidate the cache entry for a specific config file
 /// and notify subscribers of the change.
 fn invalidate_cache(path: &PathBuf) {
