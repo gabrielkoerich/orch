@@ -190,9 +190,10 @@ fn parse_success_output(
                     agent = agent_name,
                     "parse failed, synthesizing response from plain text"
                 );
-                // Try to extract token metadata from the raw NDJSON output
-                // so cost tracking isn't lost for agents that return free-form text.
-                let agent_result = agents::find_agent_result(agent_name, &raw);
+                // Try to extract token metadata from the original raw NDJSON
+                // output (not the truncated/extracted text from the error), so
+                // cost tracking isn't lost for agents that return free-form text.
+                let agent_result = agents::find_agent_result(agent_name, raw_stdout);
                 let input_tokens = agent_result.as_ref().and_then(|r| r.input_tokens);
                 let output_tokens = agent_result.as_ref().and_then(|r| r.output_tokens);
                 let duration_ms = agent_result.as_ref().and_then(|r| r.duration_ms);
@@ -1766,5 +1767,91 @@ mod tests {
     fn weight_signal_none_for_unknown_status() {
         let signal = weight_signal_for("routed", false, "claude");
         assert!(matches!(signal, WeightSignal::None));
+    }
+
+    // ── parse_success_output token extraction ────────────────────────────────
+
+    /// Mock runner that always returns InvalidResponse with truncated text,
+    /// simulating what minimax/codex do when they can't parse structured JSON.
+    struct FailingMockRunner;
+
+    impl agents::AgentRunner for FailingMockRunner {
+        #[cfg(test)]
+        fn name(&self) -> &str {
+            "opencode"
+        }
+
+        fn build_command(
+            &self,
+            _model: Option<&str>,
+            _timeout_cmd: &str,
+            _sys_file: &str,
+            _msg_file: &str,
+            _permissions: &agents::PermissionRules,
+        ) -> String {
+            String::new()
+        }
+
+        fn parse_response(&self, raw: &str) -> Result<agents::ParsedResponse, agents::AgentError> {
+            // Simulate what minimax does: truncate to 300 chars
+            Err(agents::AgentError::InvalidResponse {
+                raw: raw.chars().take(30).collect(),
+            })
+        }
+
+        fn extract_text(&self, raw: &str) -> Result<String, agents::AgentError> {
+            Err(agents::AgentError::InvalidResponse {
+                raw: raw.to_string(),
+            })
+        }
+
+        fn classify_error(
+            &self,
+            exit_code: i32,
+            _stdout: &str,
+            _stderr: &str,
+        ) -> agents::AgentError {
+            agents::AgentError::Unknown {
+                exit_code,
+                message: "mock error".into(),
+            }
+        }
+
+        fn router_command(
+            &self,
+            _prompt: &str,
+            _model: Option<&str>,
+        ) -> anyhow::Result<tokio::process::Command> {
+            anyhow::bail!("not implemented for mock")
+        }
+    }
+
+    #[test]
+    fn parse_success_output_extracts_tokens_from_raw_stdout_not_error_raw() {
+        // OpenCode NDJSON output with token metadata in step_finish
+        let ndjson = r#"{"type":"text","timestamp":1,"part":{"type":"text","text":"Here is my response: {\"status\":\"done\",\"summary\":\"fixed\"}}"}}
+{"type":"step_finish","timestamp":2,"part":{"type":"step-finish","reason":"stop","cost":0,"tokens":{"total":95177,"input":94920,"output":257}}}"#;
+
+        let runner = FailingMockRunner;
+        let result = parse_success_output("1550", "opencode", &runner, ndjson);
+
+        // Should succeed (synthesized from text) with tokens preserved
+        let parsed = result.expect("should synthesize response from text");
+        assert_eq!(parsed.input_tokens, Some(94920));
+        assert_eq!(parsed.output_tokens, Some(257));
+    }
+
+    #[test]
+    fn parse_success_output_no_tokens_when_ndjson_has_none() {
+        // Plain text without token metadata
+        let text = "This is just a plain text response, not JSON at all.";
+
+        let runner = FailingMockRunner;
+        let result = parse_success_output("1551", "opencode", &runner, text);
+
+        // Should still synthesize a response, but without tokens
+        let parsed = result.expect("should synthesize response from text");
+        assert_eq!(parsed.input_tokens, None);
+        assert_eq!(parsed.output_tokens, None);
     }
 }
