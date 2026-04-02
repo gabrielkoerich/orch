@@ -11,6 +11,7 @@ use crate::store;
 use crate::store::store_log_activity;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::process::Command;
 
@@ -902,8 +903,12 @@ pub(crate) async fn check_merged_prs(
     let merged_map = match backend.batch_is_pr_merged(&branches).await {
         Ok(map) => map,
         Err(e) => {
-            tracing::warn!(err = %e, "batch PR merge check failed, skipping tick");
-            return Ok(());
+            tracing::warn!(
+                err = %e,
+                branch_count = branches.len(),
+                "batch PR merge check failed, retrying affected branches individually"
+            );
+            fallback_is_pr_merged_by_branch(backend, &branches).await
         }
     };
 
@@ -933,9 +938,37 @@ pub(crate) async fn check_merged_prs(
     Ok(())
 }
 
+async fn fallback_is_pr_merged_by_branch(
+    backend: &Arc<dyn ExternalBackend>,
+    branches: &[String],
+) -> HashMap<String, bool> {
+    let mut merged_map = HashMap::with_capacity(branches.len());
+
+    for branch in branches {
+        match backend.is_pr_merged(branch).await {
+            Ok(is_merged) => {
+                merged_map.insert(branch.clone(), is_merged);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    branch,
+                    err = %err,
+                    "fallback PR merge check failed for branch"
+                );
+            }
+        }
+    }
+
+    merged_map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{NewTask, TaskStore};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     // worktree_age_hours
 
@@ -1168,8 +1201,6 @@ mod tests {
     /// nothing was cleaned, so git pull should NOT be triggered.
     #[tokio::test]
     async fn cleanup_returns_false_when_nothing_to_clean() {
-        use crate::store::{NewTask, TaskStore};
-
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         // Create a done task with no worktree or branch fields set
@@ -1214,8 +1245,6 @@ mod tests {
     /// runs do not keep retrying (idempotency regression test for #1021).
     #[tokio::test]
     async fn cleanup_marks_cleaned_when_stored_path_is_gone() {
-        use crate::store::{NewTask, TaskStore};
-
         let tmp = tempfile::tempdir().unwrap();
         // A path that does NOT exist on disk.
         let stale_wt = tmp.path().join("stale-worktree");
@@ -1321,5 +1350,188 @@ mod tests {
             "remove_worktree_and_branch should return false when directory still exists"
         );
         assert!(fake_wt.exists(), "directory should still be on disk");
+    }
+
+    struct MergeCheckMockBackend {
+        batch_result: Mutex<anyhow::Result<HashMap<String, bool>>>,
+        single_results: HashMap<String, anyhow::Result<bool>>,
+        posted_comments: Arc<Mutex<Vec<(String, String)>>>,
+        single_checked_branches: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MergeCheckMockBackend {
+        fn with_batch_error(
+            error: anyhow::Error,
+            single_results: HashMap<String, anyhow::Result<bool>>,
+        ) -> Self {
+            Self {
+                batch_result: Mutex::new(Err(error)),
+                single_results,
+                posted_comments: Arc::new(Mutex::new(Vec::new())),
+                single_checked_branches: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExternalBackend for MergeCheckMockBackend {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn create_task(
+            &self,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn get_task(&self, _id: &ExternalId) -> anyhow::Result<ExternalTask> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn list_by_status(&self, _status: Status) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+
+        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+
+        async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()> {
+            self.posted_comments
+                .lock()
+                .unwrap()
+                .push((id.0.clone(), body.to_string()));
+            Ok(())
+        }
+
+        async fn set_labels(&self, _id: &ExternalId, _labels: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_label(&self, _id: &ExternalId, _label: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+
+        async fn create_sub_task(
+            &self,
+            _parent: &ExternalId,
+            _title: &str,
+            _body: &str,
+            _labels: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn is_pr_merged(&self, branch: &str) -> anyhow::Result<bool> {
+            self.single_checked_branches
+                .lock()
+                .unwrap()
+                .push(branch.to_string());
+            match self.single_results.get(branch) {
+                Some(Ok(is_merged)) => Ok(*is_merged),
+                Some(Err(err)) => Err(anyhow::anyhow!(err.to_string())),
+                None => Ok(false),
+            }
+        }
+
+        async fn batch_is_pr_merged(
+            &self,
+            _branches: &[String],
+        ) -> anyhow::Result<HashMap<String, bool>> {
+            match &*self.batch_result.lock().unwrap() {
+                Ok(map) => Ok(map.clone()),
+                Err(err) => Err(anyhow::anyhow!(err.to_string())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn check_merged_prs_falls_back_to_single_branch_checks_on_batch_error() {
+        let single_results = HashMap::from([
+            ("branch-1".to_string(), Ok(true)),
+            ("branch-2".to_string(), Ok(false)),
+        ]);
+        let backend = Arc::new(MergeCheckMockBackend::with_batch_error(
+            anyhow::anyhow!("missing /data/repository in GraphQL response: no error details"),
+            single_results,
+        ));
+        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task1 = store
+            .create(&NewTask {
+                external_id: Some("101".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Task 101".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(task1, crate::store::TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+        store
+            .set_fields(task1, &[("branch", serde_json::json!("branch-1"))])
+            .await
+            .unwrap();
+
+        let task2 = store
+            .create(&NewTask {
+                external_id: Some("102".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Task 102".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(task2, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+        store
+            .set_fields(task2, &[("branch", serde_json::json!("branch-2"))])
+            .await
+            .unwrap();
+
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend_dyn.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+
+        check_merged_prs(&backend_dyn, "owner/repo", &store, &task_manager)
+            .await
+            .unwrap();
+
+        let checked = backend.single_checked_branches.lock().unwrap().clone();
+        assert_eq!(
+            checked,
+            vec!["branch-2".to_string(), "branch-1".to_string()]
+        );
+
+        let updated_task1 = store.get(task1).await.unwrap();
+        let updated_task2 = store.get(task2).await.unwrap();
+        assert_eq!(updated_task1.status, crate::store::TaskStatus::Done);
+        assert_eq!(updated_task2.status, crate::store::TaskStatus::InReview);
+
+        let comments = backend.posted_comments.lock().unwrap().clone();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].0, "101");
+        assert!(comments[0].1.contains("PR merged, marking task complete"));
     }
 }

@@ -1191,6 +1191,13 @@ impl GhHttp {
             }
         }
 
+        Self::parse_batch_pr_merged_response(&resp, branches)
+    }
+
+    fn parse_batch_pr_merged_response(
+        resp: &serde_json::Value,
+        branches: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, bool>> {
         let repo_data = resp.pointer("/data/repository").ok_or_else(|| {
             // Check for errors array to provide a more helpful error message
             let error_msg = resp
@@ -2729,6 +2736,20 @@ mod tests {
         assert_eq!(GhHttp::combined_status_state(0, 0, 0, true), "pending");
         assert_eq!(GhHttp::combined_status_state(0, 0, 0, false), "success");
         assert_eq!(GhHttp::combined_status_state(3, 1, 0, true), "failure");
+    }
+
+    #[test]
+    fn batch_is_pr_merged_by_branch_errors_when_repository_data_missing() {
+        let resp = serde_json::json!({
+            "data": {},
+            "errors": [{ "message": "Something went wrong" }],
+        });
+
+        let err_text = GhHttp::parse_batch_pr_merged_response(&resp, &["branch".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err_text.contains("missing /data/repository in GraphQL response"));
+        assert!(err_text.contains("Something went wrong"));
     }
 
     #[test]
