@@ -240,6 +240,14 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
     let mut auth_failures = 0usize;
     let mut network_failures = 0usize;
 
+    // Initialize unified task store once — all project engines share the same SQLite file.
+    // Creating one pool here avoids N separate connection pools for the same database.
+    let store = Arc::new(TaskStore::open(&crate::store::default_db_path()?).await?);
+
+    // Load persisted model cooldowns and register store for future writes.
+    // Runs once here so the global cooldown store is not overwritten per project.
+    crate::engine::cooldown::init_cooldown_store(store.clone()).await;
+
     for (repo, project_dir) in projects {
         tracing::info!(repo = %repo, "initializing project engine");
 
@@ -273,13 +281,6 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
         }
         tracing::info!(repo = %repo, backend = backend.name(), "backend connected");
 
-        // Initialize unified task store (sqlx)
-        let store = Arc::new(TaskStore::open(&crate::store::default_db_path()?).await?);
-
-        // Load persisted model cooldowns and register store for future writes.
-        // Only needs to run once — all engines share the same SQLite file.
-        crate::engine::cooldown::init_cooldown_store(store.clone()).await;
-
         // Initialize task manager (with unified store)
         let task_manager = Arc::new(TaskManager::with_store(
             backend.clone(),
@@ -296,7 +297,7 @@ async fn init_project_engines() -> anyhow::Result<Vec<ProjectEngine>> {
             backend,
             task_manager,
             runner,
-            store,
+            store: store.clone(),
         });
     }
 
