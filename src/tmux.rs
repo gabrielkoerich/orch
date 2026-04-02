@@ -16,6 +16,7 @@ use tokio::process::Command;
 pub struct Session {
     pub name: String,
     pub task_id: String,
+    pub created_at: Option<u64>, // Unix timestamp from tmux #{session_created}
 }
 
 /// Manage tmux sessions for agent tasks.
@@ -224,10 +225,11 @@ impl TmuxManager {
         map
     }
 
-    /// List all orch-prefixed sessions with metadata.
+    /// List all orch-prefixed sessions with metadata including creation time.
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
+        // Get both name and creation timestamp in one call
         let output = Command::new("tmux")
-            .args(["list-sessions", "-F", "#{session_name}"])
+            .args(["list-sessions", "-F", "#{session_name} #{session_created}"])
             .output_with_context()
             .await?;
 
@@ -237,13 +239,95 @@ impl TmuxManager {
 
         let mut sessions = Vec::new();
         for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let name = line.trim().to_string();
+            let parts: Vec<&str> = line.trim().splitn(2, ' ').collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let name = parts[0].to_string();
+            let created_at = parts.get(1).and_then(|s| s.parse::<u64>().ok());
+
             if let Some(task_id) = self.task_id_from_session_name(&name) {
-                sessions.push(Session { name, task_id });
+                sessions.push(Session {
+                    name,
+                    task_id,
+                    created_at,
+                });
             }
         }
 
         Ok(sessions)
+    }
+
+    /// Kill all orch-prefixed sessions created before a given timestamp.
+    /// Returns the number of sessions killed.
+    pub async fn kill_stale_sessions(&self, before_timestamp: u64) -> anyhow::Result<usize> {
+        let sessions = self.list_sessions().await?;
+        let mut killed = 0;
+
+        for session in sessions {
+            let should_kill = match session.created_at {
+                Some(created) => created < before_timestamp,
+                // If we can't determine creation time, be conservative and don't kill
+                None => false,
+            };
+
+            if should_kill {
+                tracing::info!(
+                    session = %session.name,
+                    created_at = session.created_at,
+                    "killing stale tmux session from previous run"
+                );
+                if let Err(e) = self.kill_session(&session.name).await {
+                    tracing::warn!(session = %session.name, error = %e, "failed to kill stale session");
+                } else {
+                    killed += 1;
+                }
+            }
+        }
+
+        if killed > 0 {
+            tracing::info!(killed, "killed stale tmux sessions on startup");
+        }
+
+        Ok(killed)
+    }
+
+    /// Wait for multiple sessions to be fully dead (no longer exist).
+    /// Polls every `poll_interval` up to `timeout`.
+    /// Returns the number of sessions that were still alive after timeout.
+    pub async fn wait_for_sessions_dead(
+        &self,
+        sessions: &[String],
+        poll_interval: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> usize {
+        let start = std::time::Instant::now();
+        let mut remaining: std::collections::HashSet<String> = sessions.iter().cloned().collect();
+
+        while !remaining.is_empty() && start.elapsed() < timeout {
+            let mut to_remove = Vec::new();
+            for session in &remaining {
+                if !self.session_exists(session).await {
+                    to_remove.push(session.clone());
+                }
+            }
+            for session in to_remove {
+                remaining.remove(&session);
+            }
+            if !remaining.is_empty() {
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+
+        let still_alive = remaining.len();
+        if still_alive > 0 {
+            tracing::warn!(
+                still_alive,
+                sessions = ?remaining.iter().collect::<Vec<_>>(),
+                "tmux sessions did not terminate within timeout"
+            );
+        }
+        still_alive
     }
 
     /// Wait for a session to finish (pane process exits).

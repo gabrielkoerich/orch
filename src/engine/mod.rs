@@ -1518,17 +1518,39 @@ pub async fn serve() -> anyhow::Result<()> {
 
                 // Kill all orch-managed tmux sessions so stale sessions don't
                 // block dispatch after restart (session_exists check).
+                let mut killed_sessions = Vec::new();
                 if let Ok(sessions) = tmux.list_sessions().await {
-                    let mut killed = 0u32;
                     for session in &sessions {
                         if session.name.starts_with("orch-") {
-                            tmux.kill_session(&session.name).await.ok();
-                            killed += 1;
+                            if let Err(e) = tmux.kill_session(&session.name).await {
+                                tracing::warn!(session = %session.name, error = %e, "failed to kill tmux session");
+                            } else {
+                                killed_sessions.push(session.name.clone());
+                            }
                         }
                     }
-                    if killed > 0 {
-                        tracing::info!(killed, "killed orch tmux sessions on shutdown");
+                    if !killed_sessions.is_empty() {
+                        tracing::info!(killed = killed_sessions.len(), "killing orch tmux sessions on shutdown");
                     }
+                }
+
+                // Wait for sessions to actually die before exiting.
+                // Prevents race where process exits before tmux finishes cleanup.
+                if !killed_sessions.is_empty() {
+                    let still_alive = tmux
+                        .wait_for_sessions_dead(
+                            &killed_sessions,
+                            std::time::Duration::from_millis(100),
+                            std::time::Duration::from_secs(5),
+                        )
+                        .await;
+                    if still_alive > 0 {
+                        tracing::warn!(
+                            still_alive,
+                            "some tmux sessions did not terminate cleanly - they will be cleaned up on startup"
+                        );
+                    }
+                    tracing::info!(killed = killed_sessions.len() - still_alive, "confirmed tmux sessions terminated");
                 }
 
                 break;
