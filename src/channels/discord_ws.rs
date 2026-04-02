@@ -539,14 +539,24 @@ async fn handle_dispatch(
             tracing::info!("discord gateway: session resumed");
         }
         Some("MESSAGE_CREATE") => {
-            let msg_channel_id = data["channel_id"].as_str().unwrap_or("");
+            // Validate channel_id is present and non-empty — it's required for routing/replies.
+            let Some(msg_channel_id) = data["channel_id"].as_str().filter(|s| !s.is_empty()) else {
+                tracing::warn!("discord MESSAGE_CREATE missing channel_id, skipping");
+                return Ok(());
+            };
 
             // Skip messages from bots (avoid reacting to ourselves)
             if data["author"]["bot"].as_bool().unwrap_or(false) {
                 return Ok(());
             }
 
-            let id = data["id"].as_str().unwrap_or("").to_string();
+            // Validate message id is present and non-empty. If malformed, skip the event.
+            let Some(id_str) = data["id"].as_str().filter(|s| !s.is_empty()) else {
+                tracing::warn!("discord MESSAGE_CREATE missing message id, skipping");
+                return Ok(());
+            };
+
+            let id = id_str.to_string();
             let author = data["author"]["username"]
                 .as_str()
                 .unwrap_or("unknown")
