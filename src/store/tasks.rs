@@ -23,12 +23,14 @@ const TASK_COLS: &str = "id, external_id, repo, origin, title, body, status, \
     ci_recovery_count, no_code_reroutes, created_at, updated_at";
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
-const TASK_RUN_COLS: &str = "id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, \ \
-    exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, \ \
+const TASK_RUN_COLS: &str =
+    "id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, \
+    exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, \
     total_cost_usd, duration_secs, started_at, completed_at";
 
 /// Explicit column list for `SELECT` queries on the `task_activity` table.
-const TASK_ACTIVITY_COLS: &str = "id, task_id, timestamp, event_type, from_status, to_status, agent, model, details";
+const TASK_ACTIVITY_COLS: &str =
+    "id, task_id, timestamp, event_type, from_status, to_status, agent, model, details";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
