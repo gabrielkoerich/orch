@@ -706,22 +706,39 @@ pub(crate) async fn review_open_prs(
         let mut new_comment_review_ts: Option<String> = None;
         if comment_changes_requested {
             let last_comment_ts = stored_task.last_comment_review_ts.clone();
-            for c in batch_data.issue_comments.iter().rev() {
-                if c.body
+
+            // Defensive: ensure comments are processed in chronological order
+            // and find the newest matching automated changes-requested comment
+            // that is newer than the stored watermark.
+            let mut newest_match: Option<&crate::github::types::GitHubComment> = None;
+            for c in &batch_data.issue_comments {
+                if !c
+                    .body
                     .starts_with("## Automated Review \u{2014} Changes Requested")
                 {
-                    if !last_comment_ts.is_empty() && c.created_at <= last_comment_ts {
-                        break;
-                    }
-                    let body: String = c.body.lines().skip(1).collect::<Vec<_>>().join("\n");
-                    review_context.push_str("### Automated Review (Changes Requested)\n\n");
-                    review_context.push_str(&body);
-                    review_context.push('\n');
-
-                    // Capture the timestamp; persist only on success below.
-                    new_comment_review_ts = Some(c.created_at.clone());
-                    break;
+                    continue;
                 }
+                if !last_comment_ts.is_empty() && c.created_at <= last_comment_ts {
+                    continue;
+                }
+                match newest_match {
+                    None => newest_match = Some(c),
+                    Some(prev) => {
+                        if c.created_at > prev.created_at {
+                            newest_match = Some(c);
+                        }
+                    }
+                }
+            }
+
+            if let Some(c) = newest_match {
+                let body: String = c.body.lines().skip(1).collect::<Vec<_>>().join("\n");
+                review_context.push_str("### Automated Review (Changes Requested)\n\n");
+                review_context.push_str(&body);
+                review_context.push('\n');
+
+                // Capture the timestamp; persist only on success below.
+                new_comment_review_ts = Some(c.created_at.clone());
             }
         }
 
@@ -821,7 +838,9 @@ fn automated_review_from_comments(
     collab_cache: &HashMap<String, bool>,
     pr_number: u64,
 ) -> Option<String> {
-    for c in issue_comments.iter().rev() {
+    // Find the newest automated review comment authored by a collaborator.
+    let mut newest: Option<&GitHubComment> = None;
+    for c in issue_comments {
         if !c.body.starts_with("## Automated Review") {
             continue;
         }
@@ -833,14 +852,26 @@ fn automated_review_from_comments(
             );
             continue;
         }
+        match newest {
+            None => newest = Some(c),
+            Some(prev) => {
+                if c.created_at > prev.created_at {
+                    newest = Some(c);
+                }
+            }
+        }
+    }
+
+    if let Some(c) = newest {
         let first_line = c.body.lines().next().unwrap_or("");
-        return if first_line.contains("Automated Review \u{2014} Approve") {
+        if first_line.contains("Automated Review \u{2014} Approve") {
             Some("approve".to_string())
         } else if first_line.contains("Automated Review \u{2014} Changes Requested") {
             Some("changes_requested".to_string())
         } else {
             None
-        };
+        }
+    } else {
+        None
     }
-    None
 }

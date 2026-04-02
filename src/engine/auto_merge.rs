@@ -781,11 +781,23 @@ async fn branch_newer_than_last_review(
         }
     };
 
-    let last_review_date = comments
-        .iter()
-        .rev()
-        .find(|c| c.body.starts_with("## Automated Review"))
-        .map(|c| c.created_at.as_str());
+    // Defensive: find the latest automated review comment by created_at rather
+    // than relying on the iteration order returned by the API.
+    let mut latest: Option<&crate::github::types::GitHubComment> = None;
+    for c in &comments {
+        if !c.body.starts_with("## Automated Review") {
+            continue;
+        }
+        match latest {
+            None => latest = Some(c),
+            Some(prev) => {
+                if c.created_at > prev.created_at {
+                    latest = Some(c);
+                }
+            }
+        }
+    }
+    let last_review_date = latest.map(|c| c.created_at.as_str());
 
     match last_review_date {
         Some(review_date) => {
