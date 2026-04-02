@@ -19,6 +19,7 @@ use crate::store;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
+use dashmap::DashSet;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -434,6 +435,7 @@ pub(crate) async fn sync_tick(
     task_manager: &Arc<TaskManager>,
     store: &Arc<crate::store::TaskStore>,
     dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
 
@@ -490,8 +492,16 @@ pub(crate) async fn sync_tick(
 
     // 4. Review open PRs (parse review comments, create follow-ups)
     if !gh_circuit_open {
-        if let Err(e) =
-            review_open_prs(backend, repo, config, task_manager, store, dispatching).await
+        if let Err(e) = review_open_prs(
+            backend,
+            repo,
+            config,
+            task_manager,
+            store,
+            dispatching,
+            auto_merge_in_flight,
+        )
+        .await
         {
             tracing::warn!(err = %e, "PR review failed");
         }
@@ -1691,6 +1701,7 @@ mod tests {
         let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
         let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -1729,6 +1740,7 @@ mod tests {
             &task_manager,
             &store,
             &dispatching,
+            &auto_merge_in_flight,
         )
         .await
         .unwrap();
@@ -1753,6 +1765,7 @@ mod tests {
         let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
         let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -1786,6 +1799,7 @@ mod tests {
             &task_manager,
             &store,
             &dispatching,
+            &auto_merge_in_flight,
         )
         .await
         .unwrap();
