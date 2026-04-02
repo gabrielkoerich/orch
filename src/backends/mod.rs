@@ -249,6 +249,15 @@ pub trait ExternalBackend: Send + Sync {
         Ok(())
     }
 
+    /// Sync a task to the project board (if configured).
+    ///
+    /// Called when a task is first ingested to ensure it appears on the
+    /// project board immediately, not just when status changes later.
+    /// Default is a no-op; GitHub backend implements project board sync.
+    async fn sync_to_project(&self, _id: &ExternalId, _status: Status) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Check if an open issue with the given title already exists.
     ///
     /// Used for deduplication before creating issues. The `label` parameter
