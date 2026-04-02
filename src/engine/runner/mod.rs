@@ -190,11 +190,17 @@ fn parse_success_output(
                     agent = agent_name,
                     "parse failed, synthesizing response from plain text"
                 );
+                // Try to extract token metadata from the raw NDJSON output
+                // so cost tracking isn't lost for agents that return free-form text.
+                let agent_result = agents::find_agent_result(agent_name, &raw);
+                let input_tokens = agent_result.as_ref().and_then(|r| r.input_tokens);
+                let output_tokens = agent_result.as_ref().and_then(|r| r.output_tokens);
+                let duration_ms = agent_result.as_ref().and_then(|r| r.duration_ms);
                 Ok(agents::ParsedResponse {
                     response,
-                    input_tokens: None,
-                    output_tokens: None,
-                    duration_ms: None,
+                    input_tokens,
+                    output_tokens,
+                    duration_ms,
                 })
             } else {
                 Err(agents::AgentError::InvalidResponse { raw })
@@ -1297,6 +1303,37 @@ mod tests {
         let err = parse_success_output("123", "claude", &*runner, "").unwrap_err();
 
         assert!(matches!(err, agents::AgentError::InvalidResponse { .. }));
+    }
+
+    #[test]
+    fn parse_success_output_preserves_tokens_from_ndjson() {
+        // Simulates NDJSON output from --output-format stream-json where
+        // the result event contains token usage. parse_response fails on
+        // NDJSON (expects single JSON blob), but find_agent_result extracts
+        // tokens from the NDJSON envelope so cost tracking is preserved.
+        let ndjson = r#"{"type":"system","subtype":"init","session_id":"abc"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":100,"output_tokens":50}}}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":5000,"result":"All changes committed successfully","usage":{"input_tokens":1234,"output_tokens":567}}"#;
+        let runner = agents::get_runner("claude");
+        let parsed = parse_success_output("456", "claude", &*runner, ndjson).unwrap();
+
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(parsed.input_tokens, Some(1234));
+        assert_eq!(parsed.output_tokens, Some(567));
+        assert_eq!(parsed.duration_ms, Some(5000));
+    }
+
+    #[test]
+    fn parse_success_output_preserves_tokens_from_minimax_ndjson() {
+        // MiniMax/Kimi use assistant event fallback when there's no result event.
+        let ndjson = r#"{"type":"system","subtype":"init"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"No open positions."}],"usage":{"input_tokens":2000,"output_tokens":300}}}"#;
+        let runner = agents::get_runner("minimax");
+        let parsed = parse_success_output("789", "minimax", &*runner, ndjson).unwrap();
+
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(parsed.input_tokens, Some(2000));
+        assert_eq!(parsed.output_tokens, Some(300));
     }
 
     #[test]
