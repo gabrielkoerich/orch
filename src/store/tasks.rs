@@ -2,6 +2,26 @@ use super::*;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
+/// Explicit column list for `SELECT` queries on the `tasks` table.
+///
+/// Using `SELECT *` with `sqlx-sqlite`'s persistent prepared statements can
+/// cause OOB panics when the schema changes (new migration columns) because
+/// `sqlite3_column_count()` returns the updated count but the cached column
+/// metadata vector was built at prepare time. Explicit columns prevent the
+/// mismatch.
+const TASK_COLS: &str = "id, external_id, repo, origin, title, body, status, \
+    source, source_id, author, url, labels, agent, model, complexity, \
+    route_reason, agent_profile, selected_skills, route_attempts, attempts, \
+    branch, worktree, worktree_cleaned, summary, last_error, parent_id, \
+    block_reason, pr_number, pr_review_context, last_review_ts, \
+    last_comment_review_ts, merge_conflict_retries, ci_merge_failures, \
+    pr_create_failures, push_failures, review_agent_failures, review_cycles, \
+    review_invocations, review_session_expected, input_tokens, output_tokens, \
+    input_cost_usd, output_cost_usd, total_cost_usd, model_reroute_chain, \
+    limit_reroute_chain, budget_warning, budget_exceeded, memory, delegations, \
+    auto_unblock_count, auto_unblock_last_at, auto_unblock_last_reason, \
+    ci_recovery_count, no_code_reroutes, created_at, updated_at";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -361,7 +381,7 @@ impl TaskStore {
 
     /// Get a task by its internal ID.
     pub async fn get(&self, id: i64) -> anyhow::Result<Task> {
-        let row = sqlx::query("SELECT * FROM tasks WHERE id = ?")
+        let row = sqlx::query(&format!("SELECT {TASK_COLS} FROM tasks WHERE id = ?"))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -376,11 +396,13 @@ impl TaskStore {
         repo: &str,
         ext_id: &str,
     ) -> anyhow::Result<Option<Task>> {
-        let row = sqlx::query("SELECT * FROM tasks WHERE repo = ? AND external_id = ?")
-            .bind(repo)
-            .bind(ext_id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(&format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND external_id = ?"
+        ))
+        .bind(repo)
+        .bind(ext_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         match row {
             Some(r) => Ok(Some(Self::row_to_task(&r)?)),
@@ -497,9 +519,9 @@ impl TaskStore {
         repo: &str,
         status: TaskStatus,
     ) -> anyhow::Result<Vec<Task>> {
-        let rows = sqlx::query(
-            "SELECT * FROM tasks WHERE repo = ? AND status = ? ORDER BY created_at DESC",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND status = ? ORDER BY created_at DESC"
+        ))
         .bind(repo)
         .bind(status.as_str())
         .fetch_all(&self.pool)
@@ -515,7 +537,7 @@ impl TaskStore {
         status: TaskStatus,
     ) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            "SELECT * FROM tasks WHERE repo = ? AND origin != 'internal' AND status = ? ORDER BY created_at DESC",
+            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin != 'internal' AND status = ? ORDER BY created_at DESC"),
         )
         .bind(repo)
         .bind(status.as_str())
@@ -537,7 +559,7 @@ impl TaskStore {
         status: TaskStatus,
     ) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-        "SELECT * FROM tasks WHERE repo = ? AND origin = 'internal' AND status = ? ORDER BY created_at DESC",
+        &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin = 'internal' AND status = ? ORDER BY created_at DESC"),
     )
     .bind(repo)
     .bind(status.as_str())
@@ -550,7 +572,7 @@ impl TaskStore {
     /// List all internal tasks for a repo (origin = 'internal').
     pub async fn list_all_internal(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            "SELECT * FROM tasks WHERE repo = ? AND origin = 'internal' ORDER BY created_at DESC",
+            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin = 'internal' ORDER BY created_at DESC"),
         )
         .bind(repo)
         .fetch_all(&self.pool)
@@ -567,7 +589,7 @@ impl TaskStore {
         source: &str,
     ) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            "SELECT * FROM tasks WHERE repo = ? AND origin = 'internal' AND source = ? ORDER BY created_at DESC",
+            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin = 'internal' AND source = ? ORDER BY created_at DESC"),
         )
         .bind(repo)
         .bind(source)
@@ -580,7 +602,7 @@ impl TaskStore {
     /// List all active (non-done) tasks for a repo.
     pub async fn list_active(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            "SELECT * FROM tasks WHERE repo = ? AND status != 'done' ORDER BY created_at DESC",
+            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND status != 'done' ORDER BY created_at DESC"),
         )
         .bind(repo)
         .fetch_all(&self.pool)
@@ -592,7 +614,7 @@ impl TaskStore {
     /// List all external tasks for a repo (origin != 'internal').
     pub async fn list_all_external(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            "SELECT * FROM tasks WHERE repo = ? AND origin != 'internal' ORDER BY created_at DESC",
+            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND origin != 'internal' ORDER BY created_at DESC"),
         )
         .bind(repo)
         .fetch_all(&self.pool)
@@ -618,7 +640,7 @@ impl TaskStore {
     /// Much cheaper than `list_all` on repos with many historical done tasks.
     pub async fn list_for_doctor(&self, repo: &str, cutoff_str: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(
-            "SELECT * FROM tasks WHERE repo = ? AND (status != 'done' OR updated_at >= ?) ORDER BY created_at DESC",
+            &format!("SELECT {TASK_COLS} FROM tasks WHERE repo = ? AND (status != 'done' OR updated_at >= ?) ORDER BY created_at DESC"),
         )
         .bind(repo)
         .bind(cutoff_str)
@@ -629,10 +651,12 @@ impl TaskStore {
 
     /// List all tasks for a repo, ordered by creation time descending.
     pub async fn list_all(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
-        let rows = sqlx::query("SELECT * FROM tasks WHERE repo = ? ORDER BY created_at DESC")
-            .bind(repo)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE repo = ? ORDER BY created_at DESC"
+        ))
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(Self::row_to_task).collect()
     }
 
@@ -653,10 +677,11 @@ impl TaskStore {
     /// Used by the CLI when no project context is available (e.g. running from
     /// a worktree without a `.orch.yml`). Does not require a repo argument.
     pub async fn list_all_active_global(&self) -> anyhow::Result<Vec<Task>> {
-        let rows =
-            sqlx::query("SELECT * FROM tasks WHERE status != 'done' ORDER BY created_at DESC")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE status != 'done' ORDER BY created_at DESC"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(Self::row_to_task).collect()
     }
 
@@ -664,10 +689,12 @@ impl TaskStore {
     ///
     /// Used by the CLI fallback path when no project context is available.
     pub async fn list_all_by_status_global(&self, status: TaskStatus) -> anyhow::Result<Vec<Task>> {
-        let rows = sqlx::query("SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC")
-            .bind(status.as_str())
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(&format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE status = ? ORDER BY created_at DESC"
+        ))
+        .bind(status.as_str())
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(Self::row_to_task).collect()
     }
 
@@ -1231,14 +1258,14 @@ impl TaskStore {
     /// List tasks that are done/blocked with worktrees that haven't been cleaned.
     #[allow(dead_code)]
     pub async fn list_cleanable(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
-        let rows = sqlx::query(
-            "SELECT * FROM tasks
+        let rows = sqlx::query(&format!(
+            "SELECT {TASK_COLS} FROM tasks
          WHERE repo = ?
            AND worktree != ''
            AND worktree_cleaned = 0
            AND status IN ('done', 'blocked')
-         ORDER BY updated_at ASC",
-        )
+         ORDER BY updated_at ASC"
+        ))
         .bind(repo)
         .fetch_all(&self.pool)
         .await?;
@@ -1430,7 +1457,7 @@ impl TaskStore {
             return Ok(std::collections::HashMap::new());
         }
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let sql = format!("SELECT * FROM tasks WHERE id IN ({placeholders})");
+        let sql = format!("SELECT {TASK_COLS} FROM tasks WHERE id IN ({placeholders})");
         let mut query = sqlx::query(&sql);
         for id in ids {
             query = query.bind(*id);
