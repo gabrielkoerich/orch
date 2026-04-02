@@ -321,6 +321,14 @@ pub trait ExternalBackend: Send + Sync {
     async fn list_issue_comments(&self, _id: &ExternalId) -> anyhow::Result<Vec<Mention>> {
         Ok(vec![])
     }
+
+    /// Acknowledge a newly detected issue (e.g., add a reaction emoji).
+    ///
+    /// Called when an issue is first ingested into the store.
+    /// Default is a no-op; GitHub backend adds an eyes emoji reaction.
+    async fn acknowledge_issue(&self, _id: &ExternalId) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

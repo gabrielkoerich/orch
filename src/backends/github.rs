@@ -446,4 +446,8 @@ impl ExternalBackend for GitHubBackend {
             })
             .collect())
     }
+
+    async fn acknowledge_issue(&self, id: &ExternalId) -> anyhow::Result<()> {
+        self.gh.add_reaction(&self.repo, &id.0, "eyes").await
+    }
 }
