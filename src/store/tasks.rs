@@ -341,7 +341,8 @@ impl TaskStore {
     .fetch_one(&self.pool)
     .await?;
 
-        Ok(row.try_get("id").unwrap_or(0))
+        row.try_get("id")
+            .map_err(|e| anyhow::anyhow!("INSERT RETURNING id returned NULL or invalid: {e}"))
     }
 
     /// Create an internal task, returning its auto-generated ID.
@@ -434,7 +435,8 @@ impl TaskStore {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(row.try_get("id").unwrap_or(0))
+        row.try_get("id")
+            .map_err(|e| anyhow::anyhow!("INSERT RETURNING id returned NULL or invalid: {e}"))
     }
 
     // ---------------------------------------------------------------
@@ -1315,7 +1317,9 @@ impl TaskStore {
         .fetch_one(&self.pool)
         .await?;
 
-        let run_id = row.try_get("id").unwrap_or(0);
+        let run_id: i64 = row
+            .try_get("id")
+            .map_err(|e| anyhow::anyhow!("INSERT RETURNING id returned NULL or invalid: {e}"))?;
         let event_type = match run.run_type {
             "review" => "review_start",
             _ => "dispatch",
@@ -1535,7 +1539,9 @@ impl TaskStore {
         let delegations_str: String = row.try_get("delegations").unwrap_or_default();
 
         Ok(Task {
-            id: row.try_get("id").unwrap_or(0),
+            id: row
+                .try_get("id")
+                .map_err(|e| anyhow::anyhow!("task row missing id: {e}"))?,
             external_id: row.try_get("external_id").unwrap_or(None),
             repo: row.try_get("repo").unwrap_or_default(),
             origin: row.try_get("origin").unwrap_or_default(),
