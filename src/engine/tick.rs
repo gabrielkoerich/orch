@@ -1074,7 +1074,23 @@ pub(crate) async fn tick_dispatch_tasks(
         let store_for_spawn = store.clone();
 
         // Load routing result from store (stored during Phase 3a)
-        let route_result = get_route_result(store, repo, &task_id).await.ok();
+        let route_result = match get_route_result(store, repo, &task_id).await {
+            Ok(r) => Some(r),
+            Err(e) if e.to_string().contains("no agent field found") => {
+                tracing::warn!(
+                    task_id,
+                    "routed task missing agent — resetting to new for re-routing (#1604)"
+                );
+                if let Err(e2) = task_manager
+                    .update_task_status(&task_owned.id, Status::New)
+                    .await
+                {
+                    tracing::error!(task_id, error = %e2, "failed to reset task to new");
+                }
+                continue;
+            }
+            Err(_) => None,
+        };
 
         let repo_ctx = repo_owned.clone();
         tokio::spawn(REPO_CONTEXT.scope(repo_ctx, async move {

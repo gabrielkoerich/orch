@@ -354,8 +354,10 @@ pub async fn handle_failover(
         .await;
 
         // Apply exponential backoff with jitter before retry.
-        // Return "routed" so the router re-selects a compatible agent+model
-        // from scratch via model_for_complexity() + model_map in config.
+        // Return "new" (not "routed") so the task goes through Phase 3a routing
+        // again. This ensures the router actually re-selects a compatible agent+model
+        // via model_for_complexity() instead of bypassing routing and defaulting to
+        // claude in the dispatch loop (#1604).
         wait_for_fallback_backoff(task_id, store, repo).await;
 
         // Log reroute activity for successful failover
@@ -372,14 +374,14 @@ pub async fn handle_failover(
             task_id,
             "rerouted",
             Some("in_progress"),
-            Some("routed"),
+            Some("new"),
             Some(&next),
             None::<&str>,
             Some(&details),
         )
         .await;
 
-        return "routed".to_string();
+        return "new".to_string();
     }
 
     // No fallback available

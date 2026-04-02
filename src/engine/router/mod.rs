@@ -1091,6 +1091,33 @@ pub async fn get_route_result(
     let reason = task.route_reason.clone();
     let model = task.model.clone().filter(|m| !m.is_empty());
 
+    // Validate that the stored model is valid for the resolved agent.
+    // Agent-specific aliases (e.g. "opus") can leak across agents during
+    // failover, so we verify against the router's model pools (#1604).
+    let config = RouterConfig::from_config();
+    let model = model.filter(|m| {
+        let complexities = ["simple", "medium", "complex", "review"];
+        // Collect all model pools configured for this agent across complexity tiers.
+        let all_pools: Vec<Vec<String>> = complexities
+            .iter()
+            .filter_map(|comp| config.model_pool_for_complexity(&agent, comp))
+            .collect();
+        // If the agent has no model pools configured, we can't validate — pass through.
+        if all_pools.is_empty() {
+            return true;
+        }
+        let valid = all_pools.iter().any(|pool| pool.contains(m));
+        if !valid {
+            tracing::warn!(
+                task_id,
+                agent,
+                model = %m,
+                "discarding stale model: not in agent's model pools"
+            );
+        }
+        valid
+    });
+
     Ok(RouteResult {
         agent,
         model,
