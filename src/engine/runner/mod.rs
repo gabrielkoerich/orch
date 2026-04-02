@@ -370,6 +370,43 @@ impl TaskRunner {
             Err(e) => return Err(e),
         };
 
+        // Check token budget before proceeding
+        match task_init::check_token_budget(task_id, &self.repo, &self.store).await {
+            task_init::BudgetCheckOutcome::Proceed => {}
+            task_init::BudgetCheckOutcome::Exceeded {
+                total_tokens,
+                max_tokens,
+            } => {
+                tracing::warn!(
+                    task_id,
+                    total_tokens,
+                    max_tokens,
+                    "token budget exceeded - blocking task"
+                );
+                if let Some(b) = backend {
+                    let id = crate::backends::ExternalId(task_id.to_string());
+                    let _ = b
+                        .update_status(&id, crate::backends::Status::NeedsReview)
+                        .await;
+                }
+                return Ok(Some(RunExecution {
+                    status: "needs_review".to_string(),
+                    exit_code: None,
+                    audit: RunAudit {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        parsed_response: String::new(),
+                        outcome: "failed".to_string(),
+                        error: format!("token budget exceeded: {total_tokens}/{max_tokens}"),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_cost_usd: 0.0,
+                        duration_secs: 0.0,
+                    },
+                }));
+            }
+        }
+
         // Resolve project directory
         let project_dir = self.resolve_project_dir()?;
 
