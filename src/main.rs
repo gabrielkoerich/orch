@@ -368,6 +368,11 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Export task session output in human-readable format
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -388,6 +393,21 @@ enum CooldownAction {
 enum WebhookAction {
     /// Show webhook server health status
     Status,
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Export session output for a task in human-readable format
+    Export {
+        /// Task ID (e.g. "internal:8" or issue number)
+        task_id: String,
+        /// Attempt number (defaults to latest)
+        #[arg(long, short = 'a')]
+        attempt: Option<u32>,
+        /// Output format: markdown (default), json, raw
+        #[arg(long, short = 'f', default_value = "markdown")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -910,6 +930,19 @@ async fn main() -> anyhow::Result<()> {
         Commands::Doctor { full, fix, dry_run } => {
             cli::doctor::run(full, fix, dry_run).await?;
         }
+        Commands::Session { action } => match action {
+            SessionAction::Export {
+                task_id,
+                attempt,
+                format,
+            } => {
+                use crate::cli::session::ExportFormat;
+                let fmt = format
+                    .parse::<ExportFormat>()
+                    .unwrap_or(ExportFormat::Markdown);
+                cli::session::export(&task_id, attempt, fmt).await?;
+            }
+        },
     }
 
     Ok(())
