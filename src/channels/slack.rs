@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
+use std::time::Duration;
 
 pub struct SlackChannel {
     pub bot_token: String,
@@ -65,7 +66,10 @@ impl SlackChannel {
     pub fn new(bot_token: String, channel_id: Option<String>) -> Self {
         Self {
             bot_token,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("valid TLS config"),
             channel_id,
             last_ts: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }

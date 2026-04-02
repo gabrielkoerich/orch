@@ -58,7 +58,10 @@ impl DiscordGateway {
     pub fn new(token: String, channel_id: Option<String>, shard_id: u64, shard_count: u64) -> Self {
         Self {
             token,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("valid TLS config"),
             channel_id,
             shard_id,
             shard_count,

@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
+use std::time::Duration;
 
 pub struct TelegramChannel {
     pub token: String,
@@ -63,7 +64,10 @@ impl TelegramChannel {
     pub fn new(token: String, chat_id: Option<String>) -> Self {
         Self {
             token,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("valid TLS config"),
             chat_id,
             offset: std::sync::Arc::new(std::sync::Mutex::new(0)),
         }
