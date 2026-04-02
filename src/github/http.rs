@@ -2398,16 +2398,14 @@ impl GhHttp {
                 continue;
             }
             match self.is_collaborator(repo, &c.user.login).await {
-                Ok(true) => {
-                    match newest {
-                        None => newest = Some(c),
-                        Some(prev) => {
-                            if c.created_at > prev.created_at {
-                                newest = Some(c);
-                            }
+                Ok(true) => match newest {
+                    None => newest = Some(c),
+                    Some(prev) => {
+                        if c.created_at > prev.created_at {
+                            newest = Some(c);
                         }
                     }
-                }
+                },
                 Ok(false) => {
                     tracing::warn!(
                         user = %c.user.login,

@@ -712,7 +712,10 @@ pub(crate) async fn review_open_prs(
             // that is newer than the stored watermark.
             let mut newest_match: Option<&crate::github::types::GitHubComment> = None;
             for c in &batch_data.issue_comments {
-                if !c.body.starts_with("## Automated Review \u{2014} Changes Requested") {
+                if !c
+                    .body
+                    .starts_with("## Automated Review \u{2014} Changes Requested")
+                {
                     continue;
                 }
                 if !last_comment_ts.is_empty() && c.created_at <= last_comment_ts {
