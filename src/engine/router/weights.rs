@@ -221,8 +221,14 @@ impl AgentWeights {
             }
         }
 
-        // Rounding edge case — return last agent
-        Some(agents.last().unwrap().clone())
+        // Rounding edge case — return last agent (agents is guaranteed non-empty by caller)
+        debug_assert!(!agents.is_empty(), "agents must not be empty");
+        Some(
+            agents
+                .last()
+                .cloned()
+                .unwrap_or_else(|| String::from("unknown")),
+        )
     }
 
     /// Get the current weight for an agent.

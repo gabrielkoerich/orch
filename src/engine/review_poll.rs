@@ -364,9 +364,12 @@ pub(crate) async fn review_open_prs(
         let task = &task_info.task;
         let stored_task = &task_info.stored;
         let task_id = &task.id.0;
-        let pr_number = task_info
-            .pr_number
-            .expect("tasks_with_pr always have pr_number");
+        let Some(pr_number) = task_info.pr_number else {
+            // tasks_with_pr is constructed to only include items with pr_number,
+            // but guard defensively against future refactors.
+            tracing::warn!(task_id, "task in tasks_with_pr has no pr_number — skipping");
+            continue;
+        };
 
         // Persist PR number (idempotent if already stored).
         store_set(

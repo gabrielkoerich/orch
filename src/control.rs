@@ -23,7 +23,7 @@
 //! - opencode supports `opencode models` for listing available models
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -443,26 +443,29 @@ pub struct ParsedResponse {
     pub memories: Vec<MemoryEntry>,
 }
 
+static MEMORY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)<memory\s+key="([^"]+)">(.+?)</memory>"#).expect("valid memory regex")
+});
+
+static SUMMARY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?s)<summary>(.+?)</summary>"#).expect("valid summary regex"));
+
 /// Parse an agent response, extracting optional `<summary>` and `<memory>` tags.
 pub fn parse_response(raw: &str) -> ParsedResponse {
-    let memory_re =
-        Regex::new(r#"(?s)<memory\s+key="([^"]+)">(.+?)</memory>"#).expect("valid memory regex");
-
     let mut clean = raw.to_string();
-    let memories = memory_re
+    let memories = MEMORY_RE
         .captures_iter(raw)
         .map(|caps| MemoryEntry {
             key: caps[1].trim().to_string(),
             value: caps[2].trim().to_string(),
         })
         .collect::<Vec<_>>();
-    clean = memory_re.replace_all(&clean, "").to_string();
+    clean = MEMORY_RE.replace_all(&clean, "").to_string();
 
-    let summary_re = Regex::new(r#"(?s)<summary>(.+?)</summary>"#).expect("valid summary regex");
-    let summary = summary_re
+    let summary = SUMMARY_RE
         .captures(raw)
         .map(|caps| caps[1].trim().to_string());
-    clean = summary_re.replace_all(&clean, "").to_string();
+    clean = SUMMARY_RE.replace_all(&clean, "").to_string();
 
     ParsedResponse {
         clean_text: clean.trim().to_string(),

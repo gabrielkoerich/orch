@@ -10,7 +10,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
-static TRAILING_COMMA_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r",(\s*[}\]])").unwrap());
+static TRAILING_COMMA_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r",(\s*[}\]])").expect("trailing comma regex is valid"));
 
 /// Normalized agent response.
 #[derive(Debug, Clone, Serialize, Deserialize)]

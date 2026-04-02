@@ -577,7 +577,10 @@ async fn post_review_failure_comment(
     blocking: bool,
 ) {
     let pr_number = match opt_store_get_task(&Some(store.clone()), repo, task_id).await {
-        Some(t) if t.pr_number.is_some() => t.pr_number.unwrap(),
+        Some(t) => match t.pr_number {
+            Some(n) => n,
+            None => return, // No PR to comment on
+        },
         _ => return, // No PR to comment on
     };
 

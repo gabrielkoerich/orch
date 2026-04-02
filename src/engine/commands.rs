@@ -75,7 +75,7 @@ pub fn parse_command(body: &str) -> Option<OwnerCommand> {
     for line in body.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            let ch = trimmed.chars().next().unwrap();
+            let ch = trimmed.chars().next().unwrap_or('\0');
             match fence_char {
                 None => fence_char = Some(ch),
                 Some(c) if c == ch => fence_char = None,
