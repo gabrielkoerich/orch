@@ -61,6 +61,7 @@ rm -rf ~/.orch/worktrees/orch/gh-issue-NNNN-*
 - Service log: `~/.orch/state/orch.log`
 - Brew stdout: `/opt/homebrew/var/log/orch.log` (startup messages only)
 - Brew stderr: `/opt/homebrew/var/log/orch.error.log`
+- If you find any errors on ~/.orch/state/orch.error.log, first CHECK THE **LAST UPDATE DATE** of this log file. DO NOT REFILE issues if this log is stale.
 
 ## Live Session Streaming
 

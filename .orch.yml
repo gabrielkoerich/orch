@@ -72,7 +72,7 @@ jobs:
 
       - `git log --since="48 hours ago" --oneline` — don't file tasks for recent work
       - `gh issue list --state open` — don't duplicate existing issues
-      - `gh issue list --state closed --limit 20` — don't re-file resolved problems
+      - `gh issue list --state closed --limit 50` — don't re-file resolved problems
       - Read the `DO NOT TOUCH` sections in `AGENTS.md` — respect settled decisions
       - **Check existing code/schema before creating migration or feature tasks** - run `sqlite3 ~/.orch/orch.db ".tables"` and search with `rg` for existing implementations. Do NOT create tasks for things that already exist or are partially implemented unless the remaining gap is clear.
       - **NEVER append to existing migration files** - always create a NEW numbered migration file. Appending to already-applied migrations breaks existing databases.
@@ -155,7 +155,7 @@ jobs:
       2. Read the most recent post in `./docs/content/posts/` — current state
       3. Read today's morning review — what was planned, what got done
       4. `gh issue list --state open` — what's still pending
-      5. `gh issue list --state closed --limit 10` — what was resolved today
+      5. `gh issue list --state closed --limit 20` — what was resolved today
       6. Read `~/.claude/skills/orch/SKILL.md` — check for new learnings, patterns, and operational notes added during the day
 
       ## Analyze the day
@@ -248,7 +248,7 @@ jobs:
       ## Before starting
 
       - `gh issue list --state open` — don't duplicate existing issues
-      - `gh issue list --state closed --limit 20` — don't re-file resolved problems
+      - `gh issue list --state closed --limit 50` — don't re-file resolved problems
       - `git log --since="24 hours ago" --oneline` — check what was already fixed
       - Read `AGENTS.md` DO NOT TOUCH sections
 
@@ -276,6 +276,36 @@ jobs:
       4. Persistent review loops (3+ tasks with 2+ review cycles)
 
       Use `orch task list`, `orch metrics`, `orch doctor`, and SQLite queries to gather data.
+
+      File detailed issues (DO NOT fix code directly)
+
+      For each root cause, file a GitHub issue with `gh issue create`. Do NOT modify code yourself — the task pipeline handles implementation. Your job is analysis and documentation.
+
+      Each issue MUST include:
+      - **What you found** — the specific error, task IDs, log lines
+      - **Why it's happening** — root cause analysis with file paths and line numbers
+      - **Why it matters** — impact (how many tasks affected, how much time wasted)
+      - **Suggested fix** — concrete approach with files to change
+      - **Evidence** — actual error messages, SQL query results, log snippets
+
+      Use `gh issue create --title "bug: ..." --body "..." --label "bug"` for bugs and `--label "enhancement"` for improvements.
+
+      ## Before starting
+
+      - `gh issue list --state open` — don't duplicate existing issues
+      - `gh issue list --state closed --limit 50` — don't re-file resolved problems
+      - `git log --since="24 hours ago" --oneline` — check what was already fixed
+      - Read `AGENTS.md` DO NOT TOUCH defined sections
+      - If you find any errors on ~/.orch/state/orch.error.log, first CHECK THE LAST UPDATE DATE OF THIS LOG. DO NOT REFILE issues if this log is stale.
+
+      ## Rules
+
+      - Focus on ROOT CAUSES, not symptoms
+      - Always include the actual error message and task ID in issues
+      - Max 3 issues per run — prioritize by impact (looping tasks > one-off failures)
+      - Do NOT modify code, prompts, or config — only file issues
+      - Explain your reasoning: why you identified this as a problem, what data led you there
+
       Only file issues if patterns are significant. Deduplicate against existing open issues.
       Label issues: self-improvement, scheduled, automation.
       Max 4 issues per run.
