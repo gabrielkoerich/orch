@@ -72,24 +72,27 @@ impl Transport {
     /// Bind a channel thread to a task's tmux session.
     pub async fn bind(&self, task_id: &str, tmux_session: &str, channel: &str, thread_id: &str) {
         let key = format!("{channel}:{thread_id}");
-        let mut bindings = self.bindings.write().await;
-        let binding = bindings.entry(task_id.to_string()).or_insert_with(|| {
-            let (tx, _) = broadcast::channel(256);
-            SessionBinding {
-                tmux_session: tmux_session.to_string(),
-                connected_threads: Vec::new(),
-                output_tx: tx,
-            }
-        });
-        // Always update tmux_session — task retries get a new session
-        binding.tmux_session = tmux_session.to_string();
-        // When rebinding a task (retry/new tmux session), clear any cached
-        // last_output for the previous session so stale text is not replayed
-        // into the new attempt. Use the helper to centralize behavior.
+        // Clear stale output before updating bindings to avoid holding
+        // write lock across await points (deadlock risk).
         self.clear_output(task_id).await;
-        if !binding.connected_threads.contains(&key) {
-            binding.connected_threads.push(key.clone());
-        }
+        // Update bindings synchronously (no await while lock held)
+        {
+            let mut bindings = self.bindings.write().await;
+            let binding = bindings.entry(task_id.to_string()).or_insert_with(|| {
+                let (tx, _) = broadcast::channel(256);
+                SessionBinding {
+                    tmux_session: tmux_session.to_string(),
+                    connected_threads: Vec::new(),
+                    output_tx: tx,
+                }
+            });
+            // Always update tmux_session — task retries get a new session
+            binding.tmux_session = tmux_session.to_string();
+            if !binding.connected_threads.contains(&key) {
+                binding.connected_threads.push(key.clone());
+            }
+        } // bindings lock released here
+          // Update thread_to_task after releasing bindings lock
         self.thread_to_task
             .write()
             .await
