@@ -1094,16 +1094,19 @@ pub async fn get_route_result(
     // Validate that the stored model is valid for the resolved agent.
     // Agent-specific aliases (e.g. "opus") can leak across agents during
     // failover, so we verify against the router's model pools (#1604).
-    let config = RouterConfig::default();
+    let config = RouterConfig::from_config();
     let model = model.filter(|m| {
-        let valid = ["simple", "medium", "complex", "review"]
+        let complexities = ["simple", "medium", "complex", "review"];
+        // Collect all model pools configured for this agent across complexity tiers.
+        let all_pools: Vec<Vec<String>> = complexities
             .iter()
-            .any(|comp| {
-                config
-                    .model_pool_for_complexity(&agent, comp)
-                    .map(|pool| pool.contains(m))
-                    .unwrap_or(false)
-            });
+            .filter_map(|comp| config.model_pool_for_complexity(&agent, comp))
+            .collect();
+        // If the agent has no model pools configured, we can't validate — pass through.
+        if all_pools.is_empty() {
+            return true;
+        }
+        let valid = all_pools.iter().any(|pool| pool.contains(m));
         if !valid {
             tracing::warn!(
                 task_id,

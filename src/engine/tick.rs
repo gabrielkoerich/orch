@@ -1029,7 +1029,10 @@ pub(crate) async fn tick_dispatch_tasks(
                     task_id,
                     "routed task missing agent — resetting to new for re-routing (#1604)"
                 );
-                if let Err(e2) = task_manager.update_task_status(&task_owned.id, Status::New).await {
+                if let Err(e2) = task_manager
+                    .update_task_status(&task_owned.id, Status::New)
+                    .await
+                {
                     tracing::error!(task_id, error = %e2, "failed to reset task to new");
                 }
                 continue;
