@@ -681,7 +681,17 @@ pub(crate) async fn tick_route_tasks(
                         );
                     }
                 } else {
-                    // Add agent, complexity, and model labels (additive — does not remove existing labels)
+                    // Remove old agent/complexity/model labels to avoid duplicates on re-route
+                    for label in &task.labels {
+                        if label.starts_with("agent:")
+                            || label.starts_with("complexity:")
+                            || label.starts_with("model:")
+                        {
+                            backend.remove_label(&task.id, label).await.ok();
+                        }
+                    }
+
+                    // Add agent, complexity, and model labels
                     let mut labels = vec![
                         format!("agent:{}", result.agent),
                         format!("complexity:{}", result.complexity),
