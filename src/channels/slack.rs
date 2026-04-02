@@ -27,7 +27,7 @@ pub struct SlackChannel {
     pub client: Client,
     pub channel_id: Option<String>,
     /// Cursor tracking the latest message timestamp seen (Slack uses `ts` as cursor).
-    pub last_ts: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    pub last_ts: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -67,7 +67,7 @@ impl SlackChannel {
             bot_token,
             client: Client::new(),
             channel_id,
-            last_ts: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            last_ts: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -85,7 +85,7 @@ impl SlackChannel {
         ];
 
         {
-            let last = self.last_ts.lock().unwrap_or_else(|e| e.into_inner());
+            let last = self.last_ts.lock().await;
             if let Some(ref ts) = *last {
                 // `oldest` is exclusive — add a tiny epsilon to avoid re-fetching the last msg
                 params.push(("oldest", ts.clone()));
@@ -217,7 +217,7 @@ impl Channel for SlackChannel {
 
                     // Update last_ts to the maximum ts seen
                     {
-                        let mut last = last_ts.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut last = last_ts.lock().await;
                         if last.as_ref().is_none_or(|prev: &String| msg.ts > *prev) {
                             *last = Some(msg.ts.clone());
                         }

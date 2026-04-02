@@ -12,7 +12,7 @@ pub struct TelegramChannel {
     pub token: String,
     pub client: Client,
     pub chat_id: Option<String>,
-    pub offset: std::sync::Arc<std::sync::Mutex<i64>>,
+    pub offset: std::sync::Arc<tokio::sync::Mutex<i64>>,
 }
 
 #[derive(Deserialize)]
@@ -65,7 +65,7 @@ impl TelegramChannel {
             token,
             client: Client::new(),
             chat_id,
-            offset: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            offset: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
         }
     }
 
@@ -209,7 +209,7 @@ impl Channel for TelegramChannel {
         tokio::spawn(async move {
             loop {
                 let current_offset = {
-                    let off = offset.lock().unwrap_or_else(|e| e.into_inner());
+                    let off = offset.lock().await;
                     *off
                 };
 
@@ -227,7 +227,7 @@ impl Channel for TelegramChannel {
                 for update in updates {
                     // Update offset
                     {
-                        let mut off = offset.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut off = offset.lock().await;
                         if update.update_id + 1 > *off {
                             *off = update.update_id + 1;
                         }
