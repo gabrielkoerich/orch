@@ -89,8 +89,9 @@ pub fn write_result_json(
 
 /// Handle a successful agent response: commit, push, PR, delegations, tokens, budget.
 ///
-/// Returns `Ok((status, budget_exceeded))` where `status` is the final task status
-/// string and `budget_exceeded` is `true` if `run()` should return early.
+/// Returns `Ok((status, budget_exceeded, push_failed))` where `status` is the final task status
+/// string, `budget_exceeded` is `true` if `run()` should return early, and `push_failed`
+/// is `true` when a push was attempted but failed (for audit trail classification).
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_success(
     task_id: &str,
@@ -102,7 +103,7 @@ pub async fn handle_success(
     new_attempts: u32,
     repo: &str,
     store: &Option<Arc<TaskStore>>,
-) -> anyhow::Result<(String, bool)> {
+) -> anyhow::Result<(String, bool, bool)> {
     let resp = parsed.response;
     tracing::info!(
         task_id,
@@ -362,19 +363,18 @@ pub async fn handle_success(
     // If agent said "done", no PR, but has delegations — blocked on children.
     let has_delegations = !resp.delegations.is_empty();
 
-    // Track push failures — block after 3 consecutive failures
-    // Check if push was attempted but failed: agent said done, tried to push, but has_pushed is still false
-    // and last_error contains a push failure. Only count when there were commits to push.
+    // Track push failures — block after 3 consecutive failures.
+    // Check if push was attempted but failed: tried to push (has_commits),
+    // but has_pushed is still false and last_error contains a push failure.
+    // Applies regardless of agent-reported status — push failures must be
+    // surfaced so task_runs records them correctly and the task is rerouted.
     // Read last_error once (reuse the value read earlier if available)
     let stored_last_error = store::opt_store_get_task(store, repo, task_id)
         .await
         .map(|t| t.last_error)
         .unwrap_or_default();
 
-    let push_failed = resp.status == "done"
-        && !has_pushed
-        && has_commits
-        && stored_last_error.contains("push failed");
+    let push_failed = !has_pushed && has_commits && stored_last_error.contains("push failed");
 
     // Determine whether this external task can be marked done without a PR.
     // External tasks with code-related labels must have a merged PR before
@@ -592,7 +592,7 @@ pub async fn handle_success(
             ],
         )
         .await;
-        return Ok((budget_status.to_string(), true)); // signal early return to caller
+        return Ok((budget_status.to_string(), true, push_failed)); // signal early return to caller
     } else if total_tokens > warning_threshold {
         let pct = (total_tokens as f64 / max_tokens as f64 * 100.0) as u32;
         tracing::warn!(
@@ -617,7 +617,7 @@ pub async fn handle_success(
 
     // Note: done → in_review transition is handled by the engine
     // after triggering the review agent (engine/mod.rs)
-    Ok((final_status.to_string(), false))
+    Ok((final_status.to_string(), false, push_failed))
 }
 
 /// Labels that indicate a task is non-code and can be marked done without a PR.

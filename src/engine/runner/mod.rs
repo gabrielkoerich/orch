@@ -85,7 +85,11 @@ fn serialize_parsed_response(
 fn classify_run_outcome(
     status: &str,
     parse_result: &Result<agents::ParsedResponse, agents::AgentError>,
+    push_failed: bool,
 ) -> &'static str {
+    if push_failed {
+        return "push_failed";
+    }
     match parse_result {
         Err(agents::AgentError::Timeout { .. }) => "timeout",
         Err(agents::AgentError::RateLimit { .. }) => "rate_limit",
@@ -173,6 +177,7 @@ struct RunAuditInput<'a> {
     started_at: &'a chrono::DateTime<Utc>,
     error_override: Option<String>,
     elapsed_secs: Option<u64>,
+    push_failed: bool,
 }
 
 fn parse_success_output(
@@ -287,7 +292,8 @@ impl TaskRunner {
             stdout: input.raw_stdout.to_string(),
             stderr: input.raw_stderr.to_string(),
             parsed_response: serialize_parsed_response(input.parse_result, input.raw_stdout),
-            outcome: classify_run_outcome(input.status, input.parse_result).to_string(),
+            outcome: classify_run_outcome(input.status, input.parse_result, input.push_failed)
+                .to_string(),
             error,
             input_tokens,
             output_tokens,
@@ -424,6 +430,7 @@ impl TaskRunner {
                         started_at,
                         error_override: Some(format!("silence detection set task to {status_str}")),
                         elapsed_secs: session_output.elapsed_secs,
+                        push_failed: false,
                     })
                     .await;
                 return Ok(Some(RunExecution {
@@ -505,9 +512,9 @@ impl TaskRunner {
         );
 
         // Handle outcome: success or error recovery
-        let final_status = match parse_result {
+        let (final_status, _budget_exceeded, push_failed) = match parse_result {
             Ok(ref parsed) => {
-                let (status, budget_exceeded) = response_handler::handle_success(
+                let (status, budget_exceeded, push_failed) = response_handler::handle_success(
                     task_id,
                     parsed.clone(),
                     &init.wt,
@@ -532,6 +539,7 @@ impl TaskRunner {
                             started_at,
                             error_override: None,
                             elapsed_secs: session_output.elapsed_secs,
+                            push_failed,
                         })
                         .await;
                     return Ok(Some(RunExecution {
@@ -540,7 +548,7 @@ impl TaskRunner {
                         audit,
                     }));
                 }
-                status
+                (status, budget_exceeded, push_failed)
             }
             Err(ref agent_err) => {
                 match fallback::handle_error(
@@ -569,6 +577,7 @@ impl TaskRunner {
                                 started_at,
                                 error_override: Some(agent_err.to_string()),
                                 elapsed_secs: session_output.elapsed_secs,
+                                push_failed: false,
                             })
                             .await;
                         return Ok(Some(RunExecution {
@@ -577,7 +586,7 @@ impl TaskRunner {
                             audit,
                         }));
                     }
-                    fallback::ErrorHandleResult::Continue { status } => status,
+                    fallback::ErrorHandleResult::Continue { status } => (status, false, false),
                 }
             }
         };
@@ -588,7 +597,7 @@ impl TaskRunner {
         // For no-op done tasks (agent finished with no code changes and no PR),
         // clean up the worktree and branch immediately — tmux session is already
         // dead so the tmux guard won't block removal.
-        if final_status == "done" {
+        if final_status.as_str() == "done" {
             if let Some(ref st) = self.store {
                 if let Err(e) =
                     crate::engine::cleanup::cleanup_task_worktree(task_id, &self.repo, st).await
@@ -609,11 +618,12 @@ impl TaskRunner {
                 started_at,
                 error_override: None,
                 elapsed_secs: session_output.elapsed_secs,
+                push_failed,
             })
             .await;
 
         Ok(Some(RunExecution {
-            status: final_status,
+            status: final_status.to_string(),
             exit_code: Some(session_output.exit_code),
             audit,
         }))
