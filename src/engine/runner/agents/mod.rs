@@ -324,7 +324,7 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
     // as part of a planning or investigatory sentence.
     let mut done_confident = false;
     for sentence in trimmed
-        .split(|c: char| c == '.' || c == '!' || c == '?' || c == '\n')
+        .split(['.', '!', '?', '\n'])
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
