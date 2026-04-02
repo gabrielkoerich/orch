@@ -1212,10 +1212,17 @@ impl TaskStore {
         if ids.is_empty() {
             return Ok(());
         }
-        // Build WHERE id IN (?, ?, ...) placeholders
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let sql = format!(
-            "UPDATE tasks SET
+        // SQLite has a hard limit on host parameters (commonly 999). Chunk the
+        // IN-list into smaller batches to avoid exceeding the limit.
+        const CHUNK_SIZE: usize = 500;
+
+        let mut tx = self.pool.begin().await?;
+
+        for chunk in ids.chunks(CHUNK_SIZE) {
+            // Build WHERE id IN (?, ?, ...) placeholders for this chunk
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "UPDATE tasks SET
             attempts = 0,
             route_attempts = 0,
             review_agent_failures = 0,
@@ -1230,13 +1237,16 @@ impl TaskStore {
             ci_recovery_count = 0,
             no_code_reroutes = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-         WHERE id IN ({placeholders})"
-        );
-        let mut query = sqlx::query(&sql);
-        for id in ids {
-            query = query.bind(*id);
+         WHERE id IN ({placeholders})",
+            );
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(*id);
+            }
+            query.execute(&mut *tx).await?;
         }
-        query.execute(&self.pool).await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1248,21 +1258,45 @@ impl TaskStore {
         if ids.is_empty() {
             return Ok(());
         }
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let sql = format!(
-            "UPDATE tasks SET worktree_cleaned = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id IN ({placeholders})"
-        );
-        let mut query = sqlx::query(&sql);
-        for id in ids {
-            query = query.bind(*id);
+
+        // Chunk updates to avoid exceeding SQLite's parameter limit.
+        const CHUNK_SIZE: usize = 500;
+
+        let mut tx = self.pool.begin().await?;
+
+        for chunk in ids.chunks(CHUNK_SIZE) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "UPDATE tasks SET worktree_cleaned = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id IN ({placeholders})",
+            );
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(*id);
+            }
+            query.execute(&mut *tx).await?;
         }
-        query.execute(&self.pool).await?;
+
         // Append activity for each task (must be done individually — activity is per-task JSON)
+        // Insert using the same transaction to avoid connection pool exhaustion
+        // / deadlocks in tests.
         let details = serde_json::json!({ "worktree_cleaned": true });
+        let details_json = serde_json::to_string(&details)?;
         for id in ids {
-            self.append_activity(*id, "branch_delete", None, None, None, None, Some(&details))
-                .await?;
+            sqlx::query(
+                "INSERT INTO task_activity (task_id, event_type, from_status, to_status, agent, model, details) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(*id)
+            .bind("branch_delete")
+            .bind(None::<&str>)
+            .bind(None::<&str>)
+            .bind(None::<&str>)
+            .bind(None::<&str>)
+            .bind(details_json.as_str())
+            .execute(&mut *tx)
+            .await?;
         }
+
+        tx.commit().await?;
         Ok(())
     }
 
