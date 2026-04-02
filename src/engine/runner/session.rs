@@ -75,6 +75,7 @@ pub async fn run_agent_session(
         }
         Ok(Err(e)) => {
             tracing::error!(task_id, ?e, "error waiting for session");
+            let _ = tmux.kill_session(&session).await;
         }
         Err(_) => {
             tracing::error!(
