@@ -1416,10 +1416,10 @@ pub async fn serve() -> anyhow::Result<()> {
                             tracing::info!(tick = ?config.tick_interval, "tick interval updated");
                         }
 
-                        // Reload router config
+                        // Reload router config (async-safe: use reload_async to avoid blocking the runtime)
                         {
                             let mut router_guard = router.write().await;
-                            router_guard.reload();
+                            router_guard.reload_async().await;
                         }
 
                         tracing::info!(
@@ -1436,7 +1436,7 @@ pub async fn serve() -> anyhow::Result<()> {
                         interval = tokio::time::interval(config.tick_interval);
                         {
                             let mut router_guard = router.write().await;
-                            router_guard.reload();
+                            router_guard.reload_async().await;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {

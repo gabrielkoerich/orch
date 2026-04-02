@@ -135,30 +135,6 @@ impl Router {
         Self::new(RouterConfig::from_config())
     }
 
-    /// Reload router configuration from config files.
-    ///
-    /// Re-reads all router settings and re-discovers available agents.
-    /// Called when config files change on disk. Preserves existing agent weights.
-    pub fn reload(&mut self) {
-        let new_config = RouterConfig::from_config();
-        let new_agents = Self::discover_agents(&new_config.agents);
-        let new_pool = Self::expand_pool(&new_config);
-        tracing::info!(
-            mode = %new_config.mode,
-            agents = ?new_agents,
-            fallback = %new_config.fallback_executor,
-            weighted_rr = new_config.weighted_round_robin,
-            pool = ?new_pool,
-            "router reloaded"
-        );
-        self.config = new_config;
-        self.available_agents = new_agents.clone();
-        // Ensure new agents have weight entries (preserves existing weights)
-        self.weights.ensure_agents(&new_agents);
-        self.router_pool = new_pool;
-        self.pool_index = 0;
-    }
-
     /// Invalidate the skills catalog cache so the next routing call reloads from disk.
     ///
     /// Call this after `skills_sync()` writes new/updated skill files.
@@ -223,6 +199,64 @@ impl Router {
         expanded
     }
 
+    /// Async version of expand_pool which may query the opencode CLI without
+    /// blocking the Tokio runtime.
+    async fn expand_pool_async(config: &RouterConfig) -> Vec<(String, String)> {
+        let raw_pool = config.effective_pool();
+        let mut expanded: Vec<(String, String)> = Vec::new();
+
+        for entry in &raw_pool {
+            if entry == "opencode:free" {
+                let free_models = Self::discover_free_opencode_models_async().await;
+                if free_models.is_empty() {
+                    tracing::debug!("opencode:free expanded to nothing — skipping (async)");
+                } else {
+                    tracing::debug!(models = ?free_models, "opencode:free expanded (async)");
+                    for model in free_models {
+                        expanded.push(("opencode".to_string(), model));
+                    }
+                }
+            } else {
+                let (agent, model) = parse_pool_entry(entry);
+                expanded.push((agent, model));
+            }
+        }
+
+        if expanded.is_empty() {
+            // All entries were opencode:free and opencode isn't installed — use fallback
+            let (agent, model) = parse_pool_entry(&config.effective_fallback());
+            tracing::debug!(
+                agent = %agent, model = %model,
+                "pool empty after async expansion, using fallback as sole pool entry"
+            );
+            expanded.push((agent, model));
+        }
+
+        expanded
+    }
+
+    /// Async reload that uses async pool expansion to avoid blocking the runtime
+    /// when discovering opencode free models.
+    pub async fn reload_async(&mut self) {
+        let new_config = RouterConfig::from_config();
+        let new_agents = Self::discover_agents(&new_config.agents);
+        let new_pool = Self::expand_pool_async(&new_config).await;
+        tracing::info!(
+            mode = %new_config.mode,
+            agents = ?new_agents,
+            fallback = %new_config.fallback_executor,
+            weighted_rr = new_config.weighted_round_robin,
+            pool = ?new_pool,
+            "router reloaded (async)"
+        );
+        self.config = new_config;
+        self.available_agents = new_agents.clone();
+        // Ensure new agents have weight entries (preserves existing weights)
+        self.weights.ensure_agents(&new_agents);
+        self.router_pool = new_pool;
+        self.pool_index = 0;
+    }
+
     /// Run `opencode models` and return lines containing "free".
     ///
     /// This is a synchronous blocking call, intentionally used only at startup
@@ -254,6 +288,55 @@ impl Router {
             }
             Err(e) => {
                 tracing::debug!(error = %e, "failed to run opencode models");
+                vec![]
+            }
+        }
+    }
+
+    /// Async version of discover_free_opencode_models that runs the blocking
+    /// subprocess in spawn_blocking and applies a timeout to avoid stalling
+    /// the Tokio runtime. Returns an empty vec on error or timeout.
+    async fn discover_free_opencode_models_async() -> Vec<String> {
+        if !crate::cmd_cache::command_exists("opencode") {
+            tracing::debug!("opencode not in PATH — skipping free model discovery (async)");
+            return vec![];
+        }
+
+        // Spawn the blocking std::process::Command on a blocking thread pool
+        let handle = tokio::task::spawn_blocking(|| {
+            std::process::Command::new("opencode")
+                .args(["models"])
+                .output()
+        });
+
+        // Enforce a conservative timeout so a hanging CLI won't stall router reload
+        match tokio::time::timeout(std::time::Duration::from_secs(10), handle).await {
+            Ok(Ok(Ok(output))) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout
+                    .lines()
+                    .filter(|l| l.contains("free"))
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .map(|l| RouterConfig::normalize_model_identifier(&l))
+                    .collect()
+            }
+            Ok(Ok(Ok(output))) => {
+                tracing::debug!(status = ?output.status, "opencode models command failed (async)");
+                vec![]
+            }
+            Ok(Ok(Err(e))) => {
+                tracing::debug!(error = %e, "failed to run opencode models (async)");
+                vec![]
+            }
+            Ok(Err(join_err)) => {
+                tracing::debug!(error = %join_err, "opencode models spawn_blocking task panicked or was cancelled");
+                vec![]
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "timed out waiting for opencode models (async) — skipping free model discovery"
+                );
                 vec![]
             }
         }
@@ -1614,8 +1697,8 @@ Hope that helps!"#;
         assert!(warning.is_none());
     }
 
-    #[test]
-    fn router_reload_preserves_structure() {
+    #[tokio::test]
+    async fn router_reload_preserves_structure() {
         let config = RouterConfig::default();
         let agents = vec!["claude".to_string()];
         let mut weights = AgentWeights::default();
@@ -1633,7 +1716,7 @@ Hope that helps!"#;
         };
 
         // Reload — should re-read config and remain valid
-        router.reload();
+        router.reload_async().await;
 
         // After reload, mode should be a valid value (llm or round_robin)
         assert!(
@@ -2197,12 +2280,12 @@ Hope that helps!"#;
         assert!(!router.router_pool.is_empty());
     }
 
-    #[test]
-    fn reload_resets_pool_index() {
+    #[tokio::test]
+    async fn reload_resets_pool_index() {
         let config = RouterConfig::default();
         let mut router = Router::new(config);
         router.pool_index = 5;
-        router.reload();
+        router.reload_async().await;
         assert_eq!(router.pool_index, 0);
     }
 
