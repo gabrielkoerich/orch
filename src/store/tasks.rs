@@ -22,6 +22,16 @@ const TASK_COLS: &str = "id, external_id, repo, origin, title, body, status, \
     auto_unblock_count, auto_unblock_last_at, auto_unblock_last_reason, \
     ci_recovery_count, no_code_reroutes, created_at, updated_at";
 
+/// Explicit column list for `SELECT` queries on the `task_runs` table.
+const TASK_RUN_COLS: &str =
+    "id, task_id, attempt, run_type, agent, model, command, prompt, env_vars, \
+    exit_code, stdout, stderr, parsed_response, outcome, error, input_tokens, output_tokens, \
+    total_cost_usd, duration_secs, started_at, completed_at";
+
+/// Explicit column list for `SELECT` queries on the `task_activity` table.
+const TASK_ACTIVITY_COLS: &str =
+    "id, task_id, timestamp, event_type, from_status, to_status, agent, model, details";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -300,19 +310,17 @@ impl TaskStore {
     ) -> anyhow::Result<Vec<TaskActivity>> {
         let rows = if let Some(limit) = limit {
             let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-            sqlx::query(
-                "SELECT * FROM task_activity WHERE task_id = ?
-                 ORDER BY timestamp ASC, id ASC LIMIT ?",
-            )
+            sqlx::query(&format!(
+                "SELECT {TASK_ACTIVITY_COLS} FROM task_activity WHERE task_id = ? ORDER BY timestamp ASC, id ASC LIMIT ?"
+            ))
             .bind(task_id)
             .bind(limit_i64)
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query(
-                "SELECT * FROM task_activity WHERE task_id = ?
-                 ORDER BY timestamp ASC, id ASC",
-            )
+            sqlx::query(&format!(
+                "SELECT {TASK_ACTIVITY_COLS} FROM task_activity WHERE task_id = ? ORDER BY timestamp ASC, id ASC"
+            ))
             .bind(task_id)
             .fetch_all(&self.pool)
             .await?
@@ -1414,9 +1422,9 @@ impl TaskStore {
 
     /// Get all runs for a task, ordered by attempt.
     pub async fn get_runs(&self, task_id: i64) -> anyhow::Result<Vec<TaskRun>> {
-        let rows = sqlx::query(
-            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY attempt ASC, run_type ASC",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {TASK_RUN_COLS} FROM task_runs WHERE task_id = ? ORDER BY attempt ASC, run_type ASC"
+        ))
         .bind(task_id)
         .fetch_all(&self.pool)
         .await?;
@@ -1435,7 +1443,7 @@ impl TaskStore {
         }
         let placeholders = task_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let sql = format!(
-            "SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY task_id ASC, attempt ASC, run_type ASC"
+            "SELECT {TASK_RUN_COLS} FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY task_id ASC, attempt ASC, run_type ASC"
         );
         let mut query = sqlx::query(&sql);
         for id in task_ids {
@@ -1482,9 +1490,9 @@ impl TaskStore {
         task_id: i64,
         run_type: &str,
     ) -> anyhow::Result<Option<TaskRun>> {
-        let row = sqlx::query(
-        "SELECT * FROM task_runs WHERE task_id = ? AND run_type = ? ORDER BY attempt DESC LIMIT 1",
-    )
+        let row = sqlx::query(&format!(
+        "SELECT {TASK_RUN_COLS} FROM task_runs WHERE task_id = ? AND run_type = ? ORDER BY attempt DESC LIMIT 1"
+    ))
     .bind(task_id)
     .bind(run_type)
     .fetch_optional(&self.pool)
