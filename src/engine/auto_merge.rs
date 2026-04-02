@@ -164,26 +164,61 @@ pub(crate) async fn auto_merge_pr(
             // Treat a closed/merged PR as idempotent success rather than a
             // retryable failure so the review-agent failure counter is not
             // incremented when the work is already done.
-            let already_merged = gh.is_pr_merged(repo, branch).await.unwrap_or(false);
-            if already_merged {
-                tracing::info!(
-                    task_id = task.id.0,
-                    branch,
-                    "PR already merged — marking task done (idempotent)"
-                );
-                task_manager
-                    .update_task_status(&task.id, Status::Done)
-                    .await?;
-                if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+            match gh.get_closed_pr_state(repo, branch).await {
+                Ok(Some((true, _))) => {
+                    // PR was merged
+                    tracing::info!(
+                        task_id = task.id.0,
+                        branch,
+                        "PR already merged — marking task done (idempotent)"
+                    );
+                    task_manager
+                        .update_task_status(&task.id, Status::Done)
+                        .await?;
+                    if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            err = %e,
+                            "post-merge cleanup failed"
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(Some((false, state))) => {
+                    // PR exists but is closed without merge
+                    tracing::info!(
+                        task_id = task.id.0,
+                        branch,
+                        pr_state = %state,
+                        "PR was closed without merge — marking task done"
+                    );
+                    task_manager
+                        .update_task_status(&task.id, Status::Done)
+                        .await?;
+                    if let Err(e) = cleanup_task_worktree(&task.id.0, repo, store).await {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            err = %e,
+                            "post-close cleanup failed"
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(None) => {
+                    // No closed PR found either — this is a genuine error
+                    anyhow::bail!("no open PR found for branch {}", branch);
+                }
+                Err(e) => {
+                    // Error checking closed PR state — fail gracefully
                     tracing::warn!(
                         task_id = task.id.0,
+                        branch,
                         err = %e,
-                        "post-merge cleanup failed"
+                        "failed to check closed PR state"
                     );
+                    anyhow::bail!("no open PR found for branch {}", branch);
                 }
-                return Ok(());
             }
-            anyhow::bail!("no open PR found for branch {}", branch);
         }
     };
 

@@ -1157,6 +1157,45 @@ impl GhHttp {
         Ok(merged_at.map(|v| !v.is_null()).unwrap_or(false))
     }
 
+    /// Get the state of a closed PR for the given branch.
+    ///
+    /// Returns `Some((merged, state))` if a closed PR exists for the branch,
+    /// where `merged` indicates if it was merged and `state` is the PR state ("closed" or "merged").
+    /// Returns `None` if no closed PR exists for the branch.
+    pub async fn get_closed_pr_state(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> anyhow::Result<Option<(bool, String)>> {
+        let owner = repo
+            .split('/')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
+        let head = format!("{}:{}", owner, branch);
+
+        let url = format!("{GITHUB_API}/repos/{repo}/pulls");
+        let prs: Vec<serde_json::Value> = self
+            .get_with_query(
+                &url,
+                &[("head", &head), ("state", "closed"), ("per_page", "1")],
+            )
+            .await?;
+
+        if prs.is_empty() {
+            return Ok(None);
+        }
+
+        let merged_at = prs[0].get("merged_at");
+        let merged = merged_at.map(|v| !v.is_null()).unwrap_or(false);
+        let state = prs[0]
+            .get("state")
+            .and_then(|v| v.as_str())
+            .unwrap_or("closed")
+            .to_string();
+
+        Ok(Some((merged, state)))
+    }
+
     /// Batch-check whether the PR for each branch was merged via a single GraphQL query.
     ///
     /// Returns a map of branch → merged. Branches with no matching PR are omitted
