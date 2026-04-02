@@ -11,6 +11,81 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// Resolve the main git repository root for an orphaned worktree.
+///
+/// For orphaned worktrees, we cannot use `resolve_repo_root` because the worktree
+/// may belong to a different project than the current repo context. Instead, we
+/// derive the repo root from the worktree's `.git` file/directory.
+///
+/// A worktree's `.git` file contains a `gitdir:` pointer to the main repo's
+/// git directory (e.g., `/path/to/repo/.git/worktrees/<name>`). We extract this
+/// path and derive the repo root from it.
+async fn resolve_repo_root_for_orphaned_worktree(wt: &Path) -> anyhow::Result<String> {
+    // First, try to read the .git file in the worktree (it's a file for worktrees,
+    // not a directory)
+    let git_file = wt.join(".git");
+    if git_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&git_file) {
+            // Parse the gitdir: line
+            for line in content.lines() {
+                if let Some(gitdir) = line.strip_prefix("gitdir: ") {
+                    // gitdir points to something like /path/to/repo/.git/worktrees/<name>
+                    // The repo root is two levels up from here
+                    let gitdir_path = std::path::PathBuf::from(gitdir);
+                    if let Some(repo_root) = gitdir_path.parent().and_then(|p| p.parent()) {
+                        return Ok(repo_root.display().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: try to find the repo by looking at registered projects
+    // Extract the project name from the worktree path
+    // Worktree path format: ~/.orch/worktrees/<project>/<branch-name>
+    let worktrees_dir = crate::home::worktrees_dir()?;
+    if let Ok(relative) = wt.strip_prefix(&worktrees_dir) {
+        if let Some(project_name) = relative.components().next() {
+            let project_name = project_name.as_os_str().to_string_lossy();
+
+            // Look for a registered project with this name
+            if let Ok(paths) = config::get_project_paths() {
+                for path_str in &paths {
+                    let path = std::path::Path::new(path_str);
+                    if let Some(name) = path.file_name() {
+                        if name.to_string_lossy() == project_name {
+                            return Ok(path_str.clone());
+                        }
+                    }
+                }
+            }
+
+            // Try bare clone at ~/.orch/projects/<owner>/<project>.git
+            let parts: Vec<&str> = project_name.split('/').collect();
+            let bare = if parts.len() == 2 {
+                crate::home::projects_dir()
+                    .map(|d| d.join(parts[0]).join(format!("{}.git", parts[1])))
+                    .unwrap_or_default()
+            } else {
+                crate::home::projects_dir()
+                    .map(|d| {
+                        d.join("gabrielkoerich")
+                            .join(format!("{}.git", project_name))
+                    })
+                    .unwrap_or_default()
+            };
+            if bare.exists() {
+                return Ok(bare.display().to_string());
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "cannot resolve repo root for orphaned worktree at {} - tried .git file parsing and project lookup",
+        wt.display()
+    )
+}
+
 /// What kind of automatic repair can be applied to a finding.
 enum FixAction {
     /// Commit dirty worktree, push, create PR, reopen issue, set needs_review.
@@ -1405,9 +1480,14 @@ async fn apply_fixes(
                     continue;
                 }
 
-                match resolve_repo_root(repo).await {
+                // For orphaned worktrees, derive the repo root from the worktree path
+                // by examining the .git file/directory, since the worktree may belong to
+                // a different project than the current repo context.
+                let wt = Path::new(path);
+                let repo_root = resolve_repo_root_for_orphaned_worktree(wt).await;
+
+                match repo_root {
                     Ok(root) => {
-                        let wt = Path::new(path);
                         let removed = remove_worktree_and_branch(
                             &f.task_id,
                             wt,
