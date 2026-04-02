@@ -202,8 +202,12 @@ fn split_chunks(content: &str, max_bytes: usize) -> Vec<String> {
 
     while start < total {
         let mut end = (start + max_bytes).min(total);
-        while end < total && !content.is_char_boundary(end) {
-            end += 1;
+        while end > start && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            // Single char exceeds limit — advance one byte to avoid infinite loop
+            end = (start + 1).min(total);
         }
         chunks.push(content[start..end].to_string());
         start = end;

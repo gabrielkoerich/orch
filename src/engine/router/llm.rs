@@ -319,7 +319,10 @@ impl LlmRouter {
             router_agent,
             router_model = router_model.unwrap_or("default"),
             response_len = response.len(),
-            response_preview = %if response.len() > 500 { &response[..500] } else { &response },
+            response_preview = %{
+                let end = response.floor_char_boundary(500);
+                &response[..end]
+            },
             "LLM router raw response"
         );
 
@@ -565,8 +568,8 @@ impl LlmRouter {
                     crate::engine::runner::response::record_model_failure(agent, model_str).await;
                     anyhow::bail!("router LLM rate limited: {agent}:{model_str}");
                 }
-                let stdout_preview = &stdout[..stdout.len().min(500)];
-                let stderr_preview = &stderr[..stderr.len().min(500)];
+                let stdout_preview = &stdout[..stdout.floor_char_boundary(500)];
+                let stderr_preview = &stderr[..stderr.floor_char_boundary(500)];
                 tracing::warn!(stderr = %stderr_preview, stdout = %stdout_preview, "router LLM command failed");
                 anyhow::bail!("router LLM failed: {stderr}");
             }
