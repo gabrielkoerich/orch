@@ -1,6 +1,14 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+/// Explicit column list for `SELECT` queries on the `job_state` table.
+///
+/// Using `SELECT *` with `sqlx-sqlite`'s prepared statement cache can cause OOB
+/// panics when the schema changes (new migration columns) because the cached
+/// column metadata may not match the current table structure. Explicit columns
+/// prevent this mismatch.
+const JOB_STATE_COLS: &str = "repo, job_id, last_run, last_task_status, active_task_id";
+
 /// Runtime state for a scheduled job, stored in SQLite (not in .orch.yml).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct JobState {
@@ -17,14 +25,15 @@ impl TaskStore {
         repo: &str,
         job_id: &str,
     ) -> anyhow::Result<Option<JobState>> {
-        let row: Option<JobState> = sqlx::query_as(
-            "SELECT repo, job_id, last_run, last_task_status, active_task_id
-         FROM job_state WHERE repo = ? AND job_id = ?",
-        )
-        .bind(repo)
-        .bind(job_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let sql = format!(
+            "SELECT {} FROM job_state WHERE repo = ? AND job_id = ?",
+            JOB_STATE_COLS
+        );
+        let row: Option<JobState> = sqlx::query_as(&sql)
+            .bind(repo)
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row)
     }
 
@@ -50,13 +59,11 @@ impl TaskStore {
 
     /// List all job states for a repo.
     pub async fn list_job_states(&self, repo: &str) -> anyhow::Result<Vec<JobState>> {
-        let rows: Vec<JobState> = sqlx::query_as(
-            "SELECT repo, job_id, last_run, last_task_status, active_task_id
-         FROM job_state WHERE repo = ?",
-        )
-        .bind(repo)
-        .fetch_all(&self.pool)
-        .await?;
+        let sql = format!("SELECT {} FROM job_state WHERE repo = ?", JOB_STATE_COLS);
+        let rows: Vec<JobState> = sqlx::query_as(&sql)
+            .bind(repo)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows)
     }
 

@@ -7,6 +7,21 @@
 //! Uses sqlx for async SQLite access with file-based migrations.
 //!
 //! All task state, metrics, KV, and rate limits flow through this module.
+//!
+//! # Safety Warning: Never Use `SELECT *`
+//!
+//! Using `SELECT *` with `sqlx-sqlite`'s prepared statement cache can cause **OOB
+//! (out-of-bounds) panics** when the schema changes (e.g., new migration adds a column).
+//!
+//! The issue occurs because:
+//! 1. SQLite caches prepared statements with column metadata at prepare time
+//! 2. When a migration adds a new column, `sqlite3_column_count()` returns the updated count
+//! 3. The cached statement's column metadata vector was built with the old count
+//! 4. Accessing column index N when only N columns exist (0..N-1) causes a panic
+//!
+//! **Solution:** Always use explicit column lists via constants like `TASK_COLS`,
+//! `CONTROL_MESSAGE_COLS`, `JOB_STATE_COLS`, etc. See `tasks.rs` and `control.rs`
+//! for examples. CI will fail if `SELECT *` is detected in store files.
 
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
