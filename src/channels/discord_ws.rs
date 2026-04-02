@@ -602,8 +602,17 @@ async fn handle_dispatch(
                 };
                 let interaction_id = interaction_id.to_string();
                 let interaction_token = interaction_token.to_string();
-                let custom_id = data["data"]["custom_id"].as_str().unwrap_or("").to_string();
-                let inter_channel_id = data["channel_id"].as_str().unwrap_or("").to_string();
+                let Some(inter_channel_id) = data["channel_id"].as_str().filter(|s| !s.is_empty())
+                else {
+                    tracing::warn!("ignoring INTERACTION_CREATE with missing channel_id");
+                    return Ok(());
+                };
+                let inter_channel_id = inter_channel_id.to_string();
+                let custom_id = data["data"]["custom_id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("button_click")
+                    .to_string();
                 let author = data["member"]["user"]["username"]
                     .as_str()
                     .or_else(|| data["user"]["username"].as_str())
