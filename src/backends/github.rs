@@ -86,6 +86,35 @@ impl ExternalBackend for GitHubBackend {
             .await
     }
 
+    /// Sync a task to the GitHub Project board (if configured).
+    ///
+    /// Called when a task is first ingested to ensure it appears on the
+    /// project board immediately, not just when status changes later.
+    async fn sync_to_project(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+        // Only sync if project integration is configured
+        let project = match ProjectSync::from_config() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        // Fetch the issue to get its node_id
+        let issue = self.gh.get_issue(&self.repo, &id.0).await?;
+
+        // Get the node_id (required for project board operations)
+        let node_id = issue
+            .node_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("issue missing node_id"))?;
+
+        // Add to project board and set initial status
+        project
+            .sync_item_status(node_id, &status)
+            .await
+            .map_err(|e| anyhow::anyhow!("project board sync failed: {e}"))?;
+
+        Ok(())
+    }
+
     /// Override default update_status to add project board sync after label update.
     async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
         // Run the standard label-based status update (default trait impl logic)

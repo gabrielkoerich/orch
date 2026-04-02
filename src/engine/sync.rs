@@ -1146,6 +1146,20 @@ pub(crate) async fn ingest_external_tasks(
         }
     }
 
+    // Sync newly ingested tasks to project board (if backend supports it).
+    // This ensures new issues appear on the project board immediately,
+    // not just when their status changes later.
+    for (task, status) in &all_tasks {
+        let task_status = status.unwrap_or(Status::New);
+        if let Err(e) = backend.sync_to_project(&task.id, task_status).await {
+            tracing::debug!(
+                task_id = task.id.0,
+                err = %e,
+                "ingest: project board sync failed"
+            );
+        }
+    }
+
     // Batch-fetch all upserted tasks in a single query, then sync status for NEW tasks.
     // Only sync status from backend → store for NEW tasks (first ingest).
     // Once a task exists in the store, its status is authoritative —
