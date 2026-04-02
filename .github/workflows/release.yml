@@ -45,6 +45,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Check for SELECT * in store files
+        run: |
+          # Fail CI if any store file contains SELECT * (excluding comments)
+          # This prevents SQLite OOB panics when schema changes
+          # Filter out: // comments, /// doc comments, //! module docs (format: file.rs:line:// content)
+          MATCHES=$(grep -n 'SELECT \*' src/store/*.rs | grep -vE ':[0-9]+:\s*(//|///|//!|#|\*)' | grep -v 'COLUMN_COLS' || true)
+          if [ -n "$MATCHES" ]; then
+            echo "ERROR: Found SELECT * in src/store/ files. Use explicit column lists instead."
+            echo "Matches:"
+            echo "$MATCHES"
+            echo ""
+            echo "See TASK_COLS, CONTROL_MESSAGE_COLS, JOB_STATE_COLS for examples."
+            exit 1
+          fi
+          echo "✓ No SELECT * found in store files"
+
       - name: Run tests with coverage
         run: cargo llvm-cov nextest --lcov --output-path lcov.info
 
