@@ -3,6 +3,15 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
+/// Explicit column list for `SELECT` queries on the `control_messages` table.
+///
+/// Using `SELECT *` with `sqlx-sqlite`'s prepared statement cache can cause OOB
+/// panics when the schema changes (new migration columns) because the cached
+/// column metadata may not match the current table structure. Explicit columns
+/// prevent this mismatch.
+const CONTROL_MESSAGE_COLS: &str = "id, session_id, role, channel, channel_thread, \
+    content, summary, model, agent, tokens_used, cost_usd, created_at";
+
 /// A message in the control session conversation history.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // fields used by channel integration (Phase 2)
@@ -92,26 +101,26 @@ impl TaskStore {
     ) -> anyhow::Result<Vec<ControlMessage>> {
         // Subquery: get the N most recent, then re-sort chronologically
         let rows = if let Some(ts) = since {
-            sqlx::query(
-                "SELECT * FROM (
-                SELECT * FROM control_messages
+            sqlx::query(&format!(
+                "SELECT {CONTROL_MESSAGE_COLS} FROM (
+                SELECT {CONTROL_MESSAGE_COLS} FROM control_messages
                 WHERE session_id = ? AND created_at >= ?
                 ORDER BY created_at DESC, id DESC LIMIT ?
-            ) ORDER BY created_at ASC, id ASC",
-            )
+            ) ORDER BY created_at ASC, id ASC"
+            ))
             .bind(session_id)
             .bind(ts)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query(
-                "SELECT * FROM (
-                SELECT * FROM control_messages
+            sqlx::query(&format!(
+                "SELECT {CONTROL_MESSAGE_COLS} FROM (
+                SELECT {CONTROL_MESSAGE_COLS} FROM control_messages
                 WHERE session_id = ?
                 ORDER BY created_at DESC, id DESC LIMIT ?
-            ) ORDER BY created_at ASC, id ASC",
-            )
+            ) ORDER BY created_at ASC, id ASC"
+            ))
             .bind(session_id)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -139,11 +148,11 @@ impl TaskStore {
             .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let rows = if let Some(ts) = since {
-            sqlx::query(
-                "SELECT * FROM control_messages \
+            sqlx::query(&format!(
+                "SELECT {CONTROL_MESSAGE_COLS} FROM control_messages \
                  WHERE session_id = ? AND content LIKE ? ESCAPE '\\' AND created_at >= ? \
-                 ORDER BY created_at DESC LIMIT ?",
-            )
+                 ORDER BY created_at DESC LIMIT ?"
+            ))
             .bind(session_id)
             .bind(&pattern)
             .bind(ts)
@@ -151,11 +160,11 @@ impl TaskStore {
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query(
-                "SELECT * FROM control_messages \
+            sqlx::query(&format!(
+                "SELECT {CONTROL_MESSAGE_COLS} FROM control_messages \
                  WHERE session_id = ? AND content LIKE ? ESCAPE '\\' \
-                 ORDER BY created_at DESC LIMIT ?",
-            )
+                 ORDER BY created_at DESC LIMIT ?"
+            ))
             .bind(session_id)
             .bind(&pattern)
             .bind(limit)
