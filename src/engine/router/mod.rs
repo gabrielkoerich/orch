@@ -318,53 +318,13 @@ impl Router {
         discovered
     }
 
-    /// Async version of discover_free_opencode_models that runs the blocking
-    /// subprocess in spawn_blocking and applies a timeout to avoid stalling
-    /// the Tokio runtime. Returns an empty vec on error or timeout.
+    /// Async version of discover_free_opencode_models that delegates to the cached
+    /// sync function via spawn_blocking so the blocking subprocess call does not
+    /// stall the Tokio runtime. The sync function handles the 1-hour cache internally.
     async fn discover_free_opencode_models_async() -> Vec<String> {
-        if !crate::cmd_cache::command_exists("opencode") {
-            tracing::debug!("opencode not in PATH — skipping free model discovery (async)");
-            return vec![];
-        }
-
-        // Spawn the blocking std::process::Command on a blocking thread pool
-        let handle = tokio::task::spawn_blocking(|| {
-            std::process::Command::new("opencode")
-                .args(["models"])
-                .output()
-        });
-
-        // Enforce a conservative timeout so a hanging CLI won't stall router reload
-        match tokio::time::timeout(std::time::Duration::from_secs(10), handle).await {
-            Ok(Ok(Ok(output))) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout
-                    .lines()
-                    .filter(|l| l.contains("free"))
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .map(|l| RouterConfig::normalize_model_identifier(&l))
-                    .collect()
-            }
-            Ok(Ok(Ok(output))) => {
-                tracing::debug!(status = ?output.status, "opencode models command failed (async)");
-                vec![]
-            }
-            Ok(Ok(Err(e))) => {
-                tracing::debug!(error = %e, "failed to run opencode models (async)");
-                vec![]
-            }
-            Ok(Err(join_err)) => {
-                tracing::debug!(error = %join_err, "opencode models spawn_blocking task panicked or was cancelled");
-                vec![]
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "timed out waiting for opencode models (async) — skipping free model discovery"
-                );
-                vec![]
-            }
-        }
+        tokio::task::spawn_blocking(Self::discover_free_opencode_models)
+            .await
+            .unwrap_or_default()
     }
 
     /// Run the pre-emptive health check, refreshing the degraded-agent set.
