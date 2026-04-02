@@ -138,6 +138,13 @@ pub async fn auto_commit(
     if !commit.status.success() {
         let stderr = String::from_utf8_lossy(&commit.stderr);
         tracing::warn!(task_id, err = %stderr, "git commit failed");
+        // Unstage files so has_changes() sees them as unstaged on the next
+        // check and the workflow can retry the commit cleanly.
+        let _ = Command::new("git")
+            .args(["restore", "--staged", "."])
+            .current_dir(dir)
+            .output_with_context()
+            .await;
         return Ok(false);
     }
 
@@ -928,5 +935,142 @@ mod tests {
 
         let not_github = "connection refused";
         assert!(!is_transient_github_error(not_github));
+    }
+
+    #[tokio::test]
+    async fn auto_commit_unstages_files_on_commit_failure() {
+        // Create a temp git repo with one initial commit
+        let dir =
+            std::env::temp_dir().join(format!("orch_test_auto_commit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Init repo
+        let _ = Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        // Create initial file and commit
+        std::fs::write(dir.join("init.txt"), "init").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "init.txt"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .await;
+
+        // Create a new file (unstaged)
+        std::fs::write(dir.join("new_file.txt"), "content").unwrap();
+
+        // Verify has_changes sees it
+        assert!(has_changes(&dir).await);
+
+        // auto_commit should return false (no git user.email configured for this
+        // test repo would cause commit to fail if we hadn't set it, but we did —
+        // so this test verifies the happy path too).
+        // For this test, the commit should succeed since we set user.email/name.
+        let result = auto_commit(&dir, "1", "Test title", "test", 1).await;
+        assert!(result.unwrap());
+
+        // Verify no changes remain
+        assert!(!has_changes(&dir).await);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auto_commit_unstages_on_pre_commit_hook_failure() {
+        // Create a temp git repo where commit always fails (via pre-commit hook)
+        let dir =
+            std::env::temp_dir().join(format!("orch_test_auto_commit_hook_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Init repo
+        let _ = Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        // Create initial commit
+        std::fs::write(dir.join("init.txt"), "init").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "init.txt"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .await;
+
+        // Install a pre-commit hook that always fails
+        let hooks_dir = dir.join(".git/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(hooks_dir.join("pre-commit"), "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(hooks_dir.join("pre-commit"))
+                .unwrap()
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(hooks_dir.join("pre-commit"), perms).unwrap();
+        }
+
+        // Create a new file
+        std::fs::write(dir.join("staged_file.txt"), "content").unwrap();
+
+        // Verify has_changes sees it
+        assert!(has_changes(&dir).await);
+
+        // auto_commit should return false (pre-commit hook blocks it)
+        let result = auto_commit(&dir, "2", "Test title", "test", 1).await;
+        assert!(!result.unwrap());
+
+        // After commit failure, files should be unstaged — has_changes should
+        // still return true because the unstaged file is still there.
+        assert!(has_changes(&dir).await);
+
+        // Verify the file is NOT staged (git diff --cached --quiet should succeed)
+        let cached = Command::new("git")
+            .args(["diff", "--cached", "--quiet"])
+            .current_dir(&dir)
+            .status()
+            .await;
+        assert!(
+            cached.map(|s| s.success()).unwrap_or(false),
+            "files should be unstaged after commit failure"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
