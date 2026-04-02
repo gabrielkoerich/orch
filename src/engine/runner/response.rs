@@ -13,6 +13,55 @@ use std::sync::Arc;
 
 const JITTER_FACTOR: f64 = 0.3;
 
+/// Maximum output file size to read (10 MB).
+/// Prevents runaway outputs from consuming excessive memory.
+const MAX_OUTPUT_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Read a file with a size limit, returning truncated content if the file is too large.
+///
+/// This prevents runaway agent outputs from causing memory issues. If the file
+/// exceeds the limit, reads from the end of the file to capture the most recent
+/// output (which is typically where the result or error message is).
+fn read_file_with_limit<P: AsRef<Path>>(path: P, max_bytes: u64) -> anyhow::Result<String> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = path.as_ref();
+    let metadata = std::fs::metadata(path)?;
+
+    if !metadata.is_file() {
+        anyhow::bail!("not a file: {}", path.display());
+    }
+
+    let file_size = metadata.len();
+
+    // If file is within limits, read the whole thing
+    if file_size <= max_bytes {
+        return std::fs::read_to_string(path).map_err(|e| e.into());
+    }
+
+    // File is too large - read from the end to get the most recent output
+    let mut file = File::open(path)?;
+    let start_pos = file_size.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start_pos))?;
+
+    let mut buffer = Vec::with_capacity(max_bytes as usize);
+    file.read_to_end(&mut buffer)?;
+
+    // Try to convert to UTF-8, replacing invalid sequences
+    let content = String::from_utf8_lossy(&buffer);
+
+    // Log a warning about truncation
+    tracing::warn!(
+        path = %path.display(),
+        file_size = file_size,
+        max_bytes = max_bytes,
+        "output file truncated: exceeded size limit"
+    );
+
+    Ok(content.into_owned())
+}
+
 /// Calculate exponential backoff with jitter for fallback retries.
 /// Uses retry count from the reroute chain to determine the delay.
 ///
@@ -86,11 +135,12 @@ pub enum WeightSignal {
 /// Read the agent's output file, trying multiple locations.
 ///
 /// Checks per-task attempt directory first, then legacy flat paths.
+/// Output is truncated to `MAX_OUTPUT_SIZE_BYTES` to prevent runaway memory usage.
 pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) -> String {
     // Primary: explicit output file (already points to attempt dir)
     if let Some(content) = tokio::task::spawn_blocking({
         let p = primary_path.to_path_buf();
-        move || std::fs::read_to_string(p)
+        move || read_file_with_limit(p, MAX_OUTPUT_SIZE_BYTES)
     })
     .await
     .ok()
@@ -124,7 +174,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
                 let p = attempts_dir.join(n.to_string()).join("output.json");
                 if let Some(content) = tokio::task::spawn_blocking({
                     let p = p.clone();
-                    move || std::fs::read_to_string(p)
+                    move || read_file_with_limit(p, MAX_OUTPUT_SIZE_BYTES)
                 })
                 .await
                 .ok()
@@ -156,7 +206,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
     for path in &fallbacks {
         if let Some(content) = tokio::task::spawn_blocking({
             let p = path.clone();
-            move || std::fs::read_to_string(p)
+            move || read_file_with_limit(p, MAX_OUTPUT_SIZE_BYTES)
         })
         .await
         .ok()
@@ -1451,5 +1501,101 @@ That's all."#;
             parse_review_response(text).is_err(),
             "embedded JSON without 'decision' key should not parse as ReviewResponse"
         );
+    }
+
+    // ── read_file_with_limit tests ───────────────────────────────────────────
+
+    #[test]
+    fn read_file_with_limit_reads_small_file_completely() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("orch_test_small_{}.txt", std::process::id()));
+        let content = "Hello, World!";
+        std::fs::write(&file_path, content).unwrap();
+
+        let result = read_file_with_limit(&file_path, 1024);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), content);
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn read_file_with_limit_truncates_large_file() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("orch_test_large_{}.txt", std::process::id()));
+
+        // Create a file larger than the limit (100 bytes)
+        let large_content = "x".repeat(200);
+        std::fs::write(&file_path, &large_content).unwrap();
+
+        // Read with a 50-byte limit
+        let result = read_file_with_limit(&file_path, 50);
+        assert!(result.is_ok());
+
+        let read_content = result.unwrap();
+        // Should only read 50 bytes (the tail of the file)
+        assert_eq!(read_content.len(), 50);
+        assert_eq!(read_content, "x".repeat(50));
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn read_file_with_limit_handles_empty_file() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("orch_test_empty_{}.txt", std::process::id()));
+        std::fs::write(&file_path, "").unwrap();
+
+        let result = read_file_with_limit(&file_path, 1024);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "");
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn read_file_with_limit_handles_nonexistent_file() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("orch_test_nonexistent_xyz123.txt");
+
+        let result = read_file_with_limit(&file_path, 1024);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_file_with_limit_reads_exact_limit() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("orch_test_exact_{}.txt", std::process::id()));
+
+        // Create exactly 100 bytes
+        let content = "y".repeat(100);
+        std::fs::write(&file_path, &content).unwrap();
+
+        // Read with exactly 100-byte limit (should read all)
+        let result = read_file_with_limit(&file_path, 100);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 100);
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn read_file_with_limit_handles_unicode_truncation() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("orch_test_unicode_{}.txt", std::process::id()));
+
+        // Create content with multi-byte UTF-8 characters
+        let emoji = "🎉".repeat(100); // Each emoji is 4 bytes
+        std::fs::write(&file_path, &emoji).unwrap();
+
+        // Read with a limit that cuts into the emoji sequence
+        let result = read_file_with_limit(&file_path, 50);
+        assert!(result.is_ok());
+
+        let read_content = result.unwrap();
+        // from_utf8_lossy should handle invalid sequences
+        assert!(!read_content.is_empty());
+
+        let _ = std::fs::remove_file(&file_path);
     }
 }

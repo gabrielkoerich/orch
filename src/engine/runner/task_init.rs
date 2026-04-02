@@ -84,6 +84,91 @@ pub async fn check_guards(
     Ok(GuardOutcome::Proceed(attempts))
 }
 
+/// Outcome of the token budget check.
+#[derive(Debug, Clone)]
+pub enum BudgetCheckOutcome {
+    /// Budget is within limits; task can proceed.
+    Proceed,
+    /// Budget is exceeded; task should be blocked.
+    Exceeded { total_tokens: u64, max_tokens: u64 },
+}
+
+/// Check if the task has exceeded its token budget before running.
+///
+/// This is a pre-flight check to prevent wasting tokens on tasks that have
+/// already exceeded their budget. The budget is checked again after the run
+/// in `handle_success` to catch tasks that exceed budget during execution.
+pub async fn check_token_budget(
+    task_id: &str,
+    repo: &str,
+    store: &Option<Arc<TaskStore>>,
+) -> BudgetCheckOutcome {
+    let max_tokens: u64 = config::get("max_tokens_per_task")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    let (total_tokens, cost) = store::get_token_summary(store, repo, task_id).await;
+
+    if total_tokens > max_tokens {
+        tracing::warn!(
+            task_id,
+            total_tokens,
+            max_tokens,
+            "pre-run check: token budget already exceeded"
+        );
+        let budget_msg = format!(
+            "token budget exceeded: {}/{} tokens (${:.4})",
+            total_tokens, max_tokens, cost.total_cost_usd
+        );
+        store::store_set(
+            store,
+            repo,
+            task_id,
+            &[
+                ("last_error", serde_json::json!(budget_msg)),
+                ("budget_exceeded", serde_json::json!(true)),
+            ],
+        )
+        .await;
+        store::store_log_activity(
+            store,
+            repo,
+            task_id,
+            "budget_exceeded",
+            None,
+            None,
+            None::<&str>,
+            None::<&str>,
+            Some(&serde_json::json!({
+                "total_tokens": total_tokens,
+                "max_tokens": max_tokens,
+                "cost_usd": cost.total_cost_usd,
+            })),
+        )
+        .await;
+        return BudgetCheckOutcome::Exceeded {
+            total_tokens,
+            max_tokens,
+        };
+    }
+
+    // Warn at 80% threshold
+    let warning_threshold = (max_tokens as f64 * 0.8) as u64;
+    if total_tokens > warning_threshold {
+        let pct = (total_tokens as f64 / max_tokens as f64 * 100.0) as u32;
+        tracing::warn!(
+            task_id,
+            total_tokens,
+            max_tokens,
+            pct,
+            "pre-run check: approaching token budget"
+        );
+    }
+
+    BudgetCheckOutcome::Proceed
+}
+
 /// Build a minimal `ExternalTask` from store state for prompt building.
 pub async fn build_pseudo_task(
     task_id: &str,
