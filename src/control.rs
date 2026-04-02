@@ -549,10 +549,20 @@ fn session_uuid_key(session_name: &str) -> String {
 /// On first call for a session, generates a new UUID and persists it to KV.
 /// Subsequent calls return the same UUID, giving agents conversation continuity
 /// via `--session-id`.
-pub async fn get_or_create_session_uuid(store: &TaskStore, session_name: &str) -> Result<String> {
+/// Get or create a session UUID for the given session name.
+///
+/// On first call for a session, generates a new UUID and persists it to KV.
+/// Subsequent calls return the same UUID, giving agents conversation continuity
+/// via `--session-id` (new) or `--resume` (existing).
+///
+/// Returns `(uuid, is_new)` so callers know whether to create or resume the session.
+pub async fn get_or_create_session_uuid(
+    store: &TaskStore,
+    session_name: &str,
+) -> Result<(String, bool)> {
     let key = session_uuid_key(session_name);
     if let Some(existing) = store.kv_get(&key).await? {
-        return Ok(existing);
+        return Ok((existing, false));
     }
     let uuid = Uuid::new_v4().to_string();
     store
@@ -560,36 +570,43 @@ pub async fn get_or_create_session_uuid(store: &TaskStore, session_name: &str) -
         .await
         .context("storing session UUID")?;
     tracing::info!(session_name, uuid = %uuid, "created new chat session UUID");
-    Ok(uuid)
+    Ok((uuid, true))
 }
 
 /// Reset the session UUID so the next message starts a fresh conversation.
 ///
 /// Called when agent or model changes, since the new agent won't share
-/// the previous agent's session state. Generates a new UUID immediately.
+/// the previous agent's session state. Deletes the stored UUID so the next
+/// `get_or_create_session_uuid` call generates a fresh one.
 pub async fn reset_session_uuid(store: &TaskStore, session_name: &str) -> Result<()> {
     let key = session_uuid_key(session_name);
-    let uuid = Uuid::new_v4().to_string();
     store
-        .kv_set(&key, &uuid)
+        .kv_delete(&key)
         .await
         .context("resetting session UUID")?;
-    tracing::info!(session_name, uuid = %uuid, "reset chat session UUID");
+    tracing::info!(session_name, "reset chat session UUID");
     Ok(())
 }
 
-/// Invoke an agent one-shot with `--session-id` for conversation continuity.
+/// Invoke an agent one-shot with `--session-id` or `--resume` for conversation continuity.
 ///
 /// For claude-compatible agents (claude, kimi, minimax), passes `--session-id <uuid>`
-/// so the agent resumes the prior conversation. Other agents get a plain one-shot call.
+/// when creating a new session, or `--resume <uuid>` when continuing an existing one.
+/// Other agents get a plain one-shot call.
 pub async fn invoke_agent_with_session(
     agent: &str,
     model: &str,
     context: &str,
     message: &str,
     session_uuid: Option<&str>,
+    resume: bool,
 ) -> Result<InvokeResult> {
     let dir = prepare_temp_dir().await?;
+
+    let session = session_uuid.map(|sid| crate::engine::runner::direct::SessionContinuation {
+        session_id: sid,
+        resume,
+    });
 
     let result = crate::engine::runner::direct::run_direct_with_session(
         agent,
@@ -598,7 +615,7 @@ pub async fn invoke_agent_with_session(
         message,
         AGENT_TIMEOUT,
         &dir,
-        session_uuid,
+        session,
     )
     .await?;
 
@@ -663,15 +680,16 @@ pub async fn send_message(
     let full_message = format!("{}\n\n---\n\n{}", ctx.state, message);
 
     // Get or create a session UUID for conversation continuity
-    let session_uuid = get_or_create_session_uuid(store, session_id).await?;
+    let (session_uuid, is_new) = get_or_create_session_uuid(store, session_id).await?;
 
-    // Invoke agent one-shot with --session-id for conversation continuity
+    // Invoke agent one-shot with --session-id (new) or --resume (existing) for conversation continuity
     let result = invoke_agent_with_session(
         &agent,
         &model,
         &ctx.system,
         &full_message,
         Some(&session_uuid),
+        !is_new,
     )
     .await?;
 
@@ -1062,26 +1080,29 @@ mod tests {
     #[tokio::test]
     async fn session_uuid_created_and_stable() {
         let store = TaskStore::open_memory().await.unwrap();
-        let uuid1 = get_or_create_session_uuid(&store, "default").await.unwrap();
-        let uuid2 = get_or_create_session_uuid(&store, "default").await.unwrap();
+        let (uuid1, is_new1) = get_or_create_session_uuid(&store, "default").await.unwrap();
+        let (uuid2, is_new2) = get_or_create_session_uuid(&store, "default").await.unwrap();
         assert_eq!(uuid1, uuid2, "same session should return same UUID");
+        assert!(is_new1, "first call should be new");
+        assert!(!is_new2, "second call should be existing");
         assert_eq!(uuid1.len(), 36, "should be a valid UUID string");
     }
 
     #[tokio::test]
     async fn session_uuid_differs_per_session() {
         let store = TaskStore::open_memory().await.unwrap();
-        let uuid_default = get_or_create_session_uuid(&store, "default").await.unwrap();
-        let uuid_ops = get_or_create_session_uuid(&store, "ops").await.unwrap();
+        let (uuid_default, _) = get_or_create_session_uuid(&store, "default").await.unwrap();
+        let (uuid_ops, _) = get_or_create_session_uuid(&store, "ops").await.unwrap();
         assert_ne!(uuid_default, uuid_ops);
     }
 
     #[tokio::test]
     async fn session_uuid_reset_creates_new() {
         let store = TaskStore::open_memory().await.unwrap();
-        let uuid1 = get_or_create_session_uuid(&store, "default").await.unwrap();
+        let (uuid1, _) = get_or_create_session_uuid(&store, "default").await.unwrap();
         reset_session_uuid(&store, "default").await.unwrap();
-        let uuid2 = get_or_create_session_uuid(&store, "default").await.unwrap();
+        let (uuid2, is_new2) = get_or_create_session_uuid(&store, "default").await.unwrap();
         assert_ne!(uuid1, uuid2, "reset should produce a new UUID");
+        assert!(is_new2, "after reset should be new");
     }
 }

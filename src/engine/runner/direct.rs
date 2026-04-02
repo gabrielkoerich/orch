@@ -67,22 +67,21 @@ pub async fn run_direct(
     timeout: Duration,
     work_dir: &str,
 ) -> Result<DirectResult> {
-    run_direct_with_session(
-        agent,
-        model,
-        system_prompt,
-        message,
-        timeout,
-        work_dir,
-        None,
-    )
-    .await
+    run_direct_with_session(agent, model, system_prompt, message, timeout, work_dir, None).await
 }
 
-/// Run an agent one-shot with an optional `--session-id` for conversation continuity.
+/// Configuration for continuing an agent session.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionContinuation<'a> {
+    pub session_id: &'a str,
+    pub resume: bool,
+}
+
+/// Run an agent one-shot with an optional `--session-id` or `--resume` for conversation continuity.
 ///
 /// For claude-compatible agents (claude, kimi, minimax), appends `--session-id <uuid>`
-/// so the agent resumes prior conversation state. Other agents ignore the parameter.
+/// when starting a new session, or `--resume <uuid>` when continuing an existing session.
+/// Other agents ignore the parameter.
 pub async fn run_direct_with_session(
     agent: &str,
     model: Option<&str>,
@@ -90,7 +89,7 @@ pub async fn run_direct_with_session(
     message: &str,
     timeout: Duration,
     work_dir: &str,
-    session_id: Option<&str>,
+    session: Option<SessionContinuation<'_>>,
 ) -> Result<DirectResult> {
     let sys_file = format!("{work_dir}/system.md");
     let msg_file = format!("{work_dir}/message.txt");
@@ -105,12 +104,13 @@ pub async fn run_direct_with_session(
     let mut shell_cmd =
         runner.build_command(model, &timeout_cmd, &sys_file, &msg_file, &permissions);
 
-    // Append --session-id for claude-compatible agents that support conversation continuity
-    if let Some(sid) = session_id {
+    // Append --session-id (new) or --resume (existing) for claude-compatible agents
+    if let Some(s) = session {
         if matches!(agent, "claude" | "kimi" | "minimax") {
-            // Insert --session-id before the stdin redirect (< "msg_file")
+            let flag = if s.resume { "--resume" } else { "--session-id" };
+            // Insert flag before the stdin redirect (< "msg_file")
             if let Some(pos) = shell_cmd.rfind("< \"") {
-                shell_cmd.insert_str(pos, &format!("--session-id {sid} \\\n  "));
+                shell_cmd.insert_str(pos, &format!("{flag} {} \\\n  ", s.session_id));
             }
         }
     }

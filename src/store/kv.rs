@@ -41,6 +41,15 @@ impl TaskStore {
         Ok(row.0.max(1) as u32)
     }
 
+    /// Delete a key from the KV store.
+    pub async fn kv_delete(&self, key: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM kv WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// List all (key, value) pairs where the key starts with `prefix`.
     pub async fn kv_list_prefix(&self, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
         let pattern = format!("{prefix}%");
