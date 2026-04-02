@@ -454,10 +454,12 @@ impl RouterConfig {
         let mut has_free = false;
 
         for model in pool {
-            if model == "opencode:free" {
+            // Normalize the model identifier first to handle edge cases like trailing slashes
+            let normalized = Self::normalize_model_identifier(model);
+            if normalized == "opencode:free" {
                 has_free = true;
-            } else if Self::is_valid_model_identifier(model) {
-                expanded_pool.push(model.clone());
+            } else if Self::is_valid_model_identifier(&normalized) {
+                expanded_pool.push(normalized);
             } else {
                 tracing::debug!(agent, model, "skipping invalid model identifier in config");
             }
@@ -746,6 +748,45 @@ mod tests {
         assert!(
             !RouterConfig::is_valid_model_identifier("github-copilot/"),
             "model ending with slash after prefix should be invalid"
+        );
+    }
+
+    #[test]
+    fn model_for_complexity_normalizes_trailing_slash_from_pool() {
+        // Bug #1507: full path test - model identifiers with trailing slashes
+        // should be normalized (not dropped) when loading from model_map pool
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("complex".to_string())
+            .or_default()
+            .insert(
+                "testagent_trailing".to_string(),
+                vec![
+                    "opus/".to_string(),
+                    "sonnet//".to_string(),
+                    "github-copilot/gpt-5-mini/".to_string(),
+                ],
+            );
+
+        // Should return normalized "opus" instead of dropping it as invalid
+        let result = config.model_for_complexity("testagent_trailing", "complex", "task-0");
+        assert!(
+            result.is_some(),
+            "should return a model from pool with trailing slashes normalized, got None"
+        );
+        let model = result.unwrap();
+        // The model returned should be one of the normalized versions
+        assert!(
+            model == "opus" || model == "sonnet" || model == "github-copilot/gpt-5-mini",
+            "returned model should be normalized (no trailing slash), got: {}",
+            model
+        );
+        // Verify no trailing slashes in the returned model
+        assert!(
+            !model.ends_with('/'),
+            "returned model should not have trailing slash, got: {}",
+            model
         );
     }
 }
