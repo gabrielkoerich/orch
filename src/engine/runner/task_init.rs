@@ -52,7 +52,7 @@ pub async fn check_guards(
     // Guard: check if tmux session already exists (prevents duplicate dispatch)
     let tmux = TmuxManager::new();
     let session_name = tmux.session_name(repo, task_id);
-    if tmux.session_exists(&session_name).await {
+    if tmux.session_blocks_dispatch(&session_name).await {
         tracing::info!(
             task_id,
             session = %session_name,

@@ -26,39 +26,6 @@ pub struct TmuxManager {
     prefix: String,
 }
 
-/// Info about session health for dispatch decisions.
-#[derive(Debug, Clone)]
-pub struct SessionHealth {
-    pub exists: bool,
-    pub pane_alive: bool,
-    pub created_at: Option<u64>,
-    pub last_activity: Option<u64>,
-}
-
-impl SessionHealth {
-    /// Returns true if the session is healthy and should prevent dispatch.
-    pub fn is_healthy(&self) -> bool {
-        self.exists && self.pane_alive
-    }
-
-    /// Returns true if the session appears dead/orphaned and can be reclaimed.
-    #[allow(dead_code)]
-    pub fn is_orphaned(&self) -> bool {
-        self.exists && !self.pane_alive
-    }
-
-    /// Returns the session age in seconds, if creation time is available.
-    pub fn age_secs(&self, now: u64) -> Option<u64> {
-        self.created_at.map(|created| now.saturating_sub(created))
-    }
-
-    /// Returns the idle time in seconds since last activity, if available.
-    pub fn idle_secs(&self, now: u64) -> Option<u64> {
-        self.last_activity
-            .map(|activity| now.saturating_sub(activity))
-    }
-}
-
 impl TmuxManager {
     pub fn new() -> Self {
         Self {
@@ -207,62 +174,33 @@ impl TmuxManager {
         }
     }
 
-    /// Check comprehensive session health for dispatch decisions.
+    /// Check whether a session exists and still has a live pane process.
+    pub async fn session_is_running(&self, session: &str) -> bool {
+        self.session_exists(session).await && self.is_session_active(session).await
+    }
+
+    /// Return whether a session should block a new dispatch.
     ///
-    /// This checks:
-    /// - Session existence (via has-session)
-    /// - Pane liveness (pane_dead flag)
-    /// - Session creation time
-    /// - Last activity time
-    ///
-    /// Returns a SessionHealth struct with all info needed for dispatch decisions.
-    pub async fn check_session_health(&self, session: &str) -> SessionHealth {
-        // First check if session exists at all
-        let exists = self.session_exists(session).await;
-        if !exists {
-            return SessionHealth {
-                exists: false,
-                pane_alive: false,
-                created_at: None,
-                last_activity: None,
-            };
+    /// Dead tmux sessions with the same name are cleaned up eagerly so they do
+    /// not block reclaim/re-dispatch loops or cause `new-session` name collisions.
+    pub async fn session_blocks_dispatch(&self, session: &str) -> bool {
+        if !self.session_exists(session).await {
+            return false;
         }
 
-        // Get pane status, creation time, and activity in one call
-        let output = Command::new("tmux")
-            .args([
-                "list-panes",
-                "-t",
-                session,
-                "-F",
-                "#{pane_dead} #{session_created} #{session_activity}",
-            ])
-            .output_with_context()
-            .await;
-
-        match output {
-            Ok(o) if o.status.success() => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                let parts: Vec<&str> = stdout.split_whitespace().collect();
-
-                let pane_alive = parts.first().map(|&s| s == "0").unwrap_or(false);
-                let created_at = parts.get(1).and_then(|s| s.parse::<u64>().ok());
-                let last_activity = parts.get(2).and_then(|s| s.parse::<u64>().ok());
-
-                SessionHealth {
-                    exists: true,
-                    pane_alive,
-                    created_at,
-                    last_activity,
-                }
-            }
-            _ => SessionHealth {
-                exists: true,
-                pane_alive: false,
-                created_at: None,
-                last_activity: None,
-            },
+        if self.is_session_active(session).await {
+            return true;
         }
+
+        tracing::warn!(
+            session,
+            "found stale tmux session with dead pane; cleaning up"
+        );
+        if let Err(err) = self.kill_session(session).await {
+            tracing::debug!(session, error = %err, "failed to clean up stale tmux session");
+        }
+
+        false
     }
 
     /// Extract the task_id from a full session name.
@@ -721,6 +659,82 @@ mod tests {
 
         // Cleanup: kill the test session
         let _ = tmux.kill_session(&session).await;
+    }
+
+    #[tokio::test]
+    async fn session_blocks_dispatch_keeps_live_session() {
+        let tmux = TmuxManager::new();
+        let session = test_session_name();
+
+        let create_result = tokio::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
+            .output()
+            .await;
+
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+
+        assert!(tmux.session_blocks_dispatch(&session).await);
+        assert!(tmux.session_exists(&session).await);
+
+        let _ = tmux.kill_session(&session).await;
+    }
+
+    #[tokio::test]
+    async fn session_blocks_dispatch_cleans_dead_session() {
+        let tmux = TmuxManager::new();
+        let session = test_session_name();
+
+        let create_result = tokio::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session, "-c", "/tmp"])
+            .output()
+            .await;
+
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+
+        let set_option_result = tokio::process::Command::new("tmux")
+            .args(["set-option", "-t", &session, "remain-on-exit", "on"])
+            .output()
+            .await;
+        if !matches!(set_option_result, Ok(ref o) if o.status.success()) {
+            eprintln!("Skipping test: unable to set tmux remain-on-exit option");
+            let _ = tmux.kill_session(&session).await;
+            return;
+        }
+
+        let send_exit_result = tokio::process::Command::new("tmux")
+            .args(["send-keys", "-t", &session, "exit", "Enter"])
+            .output()
+            .await;
+        if !matches!(send_exit_result, Ok(ref o) if o.status.success()) {
+            eprintln!("Skipping test: unable to exit tmux pane");
+            let _ = tmux.kill_session(&session).await;
+            return;
+        }
+
+        // Poll until pane is dead (up to 2s) — fixed sleep is unreliable under load.
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !tmux.session_is_running(&session).await {
+                break;
+            }
+        }
+
+        assert!(tmux.session_exists(&session).await);
+        assert!(!tmux.session_is_running(&session).await);
+        assert!(!tmux.session_blocks_dispatch(&session).await);
+        assert!(!tmux.session_exists(&session).await);
     }
 
     // NOTE: No static test for GH_TOKEN handling here; behavior is enforced

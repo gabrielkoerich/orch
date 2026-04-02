@@ -118,7 +118,7 @@ async fn stuck_task_timing(
     parse_error_message: &'static str,
 ) -> Option<StuckTaskTiming> {
     let session_name = tmux.session_name(repo, session_task_id);
-    let has_session = tmux.session_exists(&session_name).await;
+    let has_session = tmux.session_is_running(&session_name).await;
     let threshold = if has_session {
         config.stuck_timeout
     } else {
@@ -973,65 +973,13 @@ pub(crate) async fn tick_dispatch_tasks(
 
         // Check if already running (has active session)
         let session_name = tmux.session_name(repo, &task.id.0);
-        let health = tmux.check_session_health(&session_name).await;
-
-        if health.exists {
-            if health.is_healthy() {
-                // Session is alive and well - skip dispatch
-                tracing::warn!(
-                    task_id = task.id.0,
-                    session_name,
-                    "task has active tmux session, skipping dispatch"
-                );
-                continue; // dispatch_guard drops here, removing the key
-            } else {
-                // Session exists but appears dead/orphaned - reclaim it
-                let now = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let age_secs = health.age_secs(now);
-                let idle_secs = health.idle_secs(now);
-
-                tracing::warn!(
-                    task_id = task.id.0,
-                    session_name,
-                    pane_alive = health.pane_alive,
-                    age_secs = age_secs,
-                    idle_secs = idle_secs,
-                    "task has orphaned tmux session (dead pane), killing and reclaiming"
-                );
-
-                // Kill the orphaned session and allow dispatch to proceed
-                if let Err(e) = tmux.kill_session(&session_name).await {
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        session_name,
-                        error = %e,
-                        "failed to kill orphaned tmux session, skipping dispatch"
-                    );
-                    continue; // dispatch_guard drops here
-                }
-
-                // Give tmux a moment to clean up
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                // Verify the session is actually gone
-                if tmux.session_exists(&session_name).await {
-                    tracing::warn!(
-                        task_id = task.id.0,
-                        session_name,
-                        "orphaned session still exists after kill, skipping dispatch"
-                    );
-                    continue; // dispatch_guard drops here
-                }
-
-                tracing::info!(
-                    task_id = task.id.0,
-                    session_name,
-                    "successfully reclaimed orphaned session, proceeding with dispatch"
-                );
-            }
+        if tmux.session_blocks_dispatch(&session_name).await {
+            tracing::warn!(
+                task_id = task.id.0,
+                session_name,
+                "task has existing tmux session, skipping dispatch"
+            );
+            continue; // dispatch_guard drops here, removing the key
         }
 
         // Try to acquire a slot
@@ -1921,6 +1869,81 @@ mod tests {
             "internal task should be routed to fallback or needs_review, got {:?}",
             task.status
         );
+    }
+
+    #[tokio::test]
+    async fn stuck_task_timing_treats_dead_session_as_missing() {
+        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let repo = "owner/repo";
+        let task_id = "internal:33498";
+        let session_name = tmux.session_name(repo, task_id);
+
+        let create_result = tokio::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session_name, "-c", "/tmp"])
+            .output()
+            .await;
+
+        match create_result {
+            Ok(o) if o.status.success() => {}
+            _ => {
+                eprintln!("Skipping test: tmux not available or failed to create test session");
+                return;
+            }
+        }
+
+        let set_option_result = tokio::process::Command::new("tmux")
+            .args(["set-option", "-t", &session_name, "remain-on-exit", "on"])
+            .output()
+            .await;
+        if !matches!(set_option_result, Ok(ref o) if o.status.success()) {
+            eprintln!("Skipping test: unable to set tmux remain-on-exit option");
+            let _ = tmux.kill_session(&session_name).await;
+            return;
+        }
+
+        let send_exit_result = tokio::process::Command::new("tmux")
+            .args(["send-keys", "-t", &session_name, "exit", "Enter"])
+            .output()
+            .await;
+        if !matches!(send_exit_result, Ok(ref o) if o.status.success()) {
+            eprintln!("Skipping test: unable to exit tmux pane");
+            let _ = tmux.kill_session(&session_name).await;
+            return;
+        }
+
+        // Poll until pane is dead (up to 2s) — fixed sleep is unreliable under load.
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !tmux.session_is_running(&session_name).await {
+                break;
+            }
+        }
+
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+        let updated_at = (chrono::Utc::now()
+            - chrono::Duration::seconds(config.no_session_stuck_timeout as i64 + 5))
+        .to_rfc3339();
+
+        let timing = stuck_task_timing(
+            &tmux,
+            repo,
+            task_id,
+            task_id,
+            &updated_at,
+            &config,
+            "parse failure",
+        )
+        .await
+        .expect("dead session should be treated as missing");
+
+        assert!(!timing.has_session);
+        assert_eq!(timing.threshold, config.no_session_stuck_timeout);
+
+        let _ = tmux.kill_session(&session_name).await;
     }
 
     // ── tick_dispatch_tasks: deadlock regression test (#1361) ──────────────
