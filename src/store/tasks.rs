@@ -9,7 +9,7 @@ use sqlx::Row;
 /// `sqlite3_column_count()` returns the updated count but the cached column
 /// metadata vector was built at prepare time. Explicit columns prevent the
 /// mismatch.
-const TASK_COLS: &str = "id, external_id, repo, origin, title, body, status, \
+pub const TASK_COLS: &str = "id, external_id, repo, origin, title, body, status, \
     source, source_id, author, url, labels, agent, model, complexity, \
     route_reason, agent_profile, selected_skills, route_attempts, attempts, \
     branch, worktree, worktree_cleaned, summary, last_error, parent_id, \
@@ -21,6 +21,9 @@ const TASK_COLS: &str = "id, external_id, repo, origin, title, body, status, \
     limit_reroute_chain, budget_warning, budget_exceeded, memory, delegations, \
     auto_unblock_count, auto_unblock_last_at, auto_unblock_last_reason, \
     ci_recovery_count, no_code_reroutes, created_at, updated_at";
+
+/// Number of columns in TASK_COLS (used for diagnostic verification).
+pub const TASK_COLS_COUNT: usize = 57;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str =
