@@ -295,6 +295,27 @@ pub async fn handle_failover(
         if matches!(error_type, RetryableError::Timeout) {
             record_agent_failure_with_message(agent_name, error_message).await;
         }
+
+        // Log reroute activity for exhausted agents
+        let details = serde_json::json!({
+            "failure_reason": error_type.type_str(),
+            "error_message": error_message,
+            "chain": chain,
+            "agents_exhausted": true,
+        });
+        crate::store::store_log_activity(
+            store,
+            repo,
+            task_id,
+            "rerouted",
+            Some("in_progress"),
+            Some("needs_review"),
+            None::<&str>,
+            None::<&str>,
+            Some(&details),
+        )
+        .await;
+
         return "needs_review".to_string();
     }
 
@@ -337,6 +358,27 @@ pub async fn handle_failover(
         // from scratch via model_for_complexity() + model_map in config.
         wait_for_fallback_backoff(task_id, store, repo).await;
 
+        // Log reroute activity for successful failover
+        let details = serde_json::json!({
+            "failure_reason": error_type.type_str(),
+            "error_message": error_message,
+            "from_agent": agent_name,
+            "to_agent": next,
+            "chain": chain,
+        });
+        crate::store::store_log_activity(
+            store,
+            repo,
+            task_id,
+            "rerouted",
+            Some("in_progress"),
+            Some("routed"),
+            Some(&next),
+            None::<&str>,
+            Some(&details),
+        )
+        .await;
+
         return "routed".to_string();
     }
 
@@ -357,6 +399,27 @@ pub async fn handle_failover(
         &[("last_error", serde_json::json!(msg))],
     )
     .await;
+
+    // Log reroute activity for no fallback available
+    let details = serde_json::json!({
+        "failure_reason": error_type.type_str(),
+        "error_message": error_message,
+        "chain": chain,
+        "no_fallback_available": true,
+    });
+    crate::store::store_log_activity(
+        store,
+        repo,
+        task_id,
+        "rerouted",
+        Some("in_progress"),
+        Some("needs_review"),
+        None::<&str>,
+        None::<&str>,
+        Some(&details),
+    )
+    .await;
+
     "needs_review".to_string()
 }
 

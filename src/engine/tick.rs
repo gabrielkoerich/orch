@@ -345,6 +345,26 @@ pub(crate) async fn tick_detect_silent_agents(
             continue;
         }
 
+        // Log reroute activity
+        let details = serde_json::json!({
+            "failure_reason": "agent_silence",
+            "silence_duration_secs": config.silence_grace_period,
+            "cooldown_applied": !agent_name.is_empty() && !model_name.is_empty(),
+            "fallback_available": next_agent.is_some(),
+        });
+        crate::store::store_log_activity(
+            &Some(Arc::clone(store)),
+            repo,
+            &task_id,
+            "rerouted",
+            Some("in_progress"),
+            Some(next_status.as_str()),
+            next_agent.as_deref(),
+            None,
+            Some(&details),
+        )
+        .await;
+
         // 5. Post a comment explaining what happened
         let action = if let Some(ref fallback) = next_agent {
             format!("failing over to {fallback}")
@@ -451,6 +471,26 @@ pub(crate) async fn tick_recover_stuck_tasks(
             tracing::warn!(task_id = task.id.0, ?e, "failed to reset stuck task status");
             continue;
         }
+
+        // Log reroute activity for stuck task recovery
+        let details = serde_json::json!({
+            "failure_reason": if timing.has_session { "stuck_with_session" } else { "stuck_no_session" },
+            "age_minutes": timing.age.num_minutes(),
+            "had_session": timing.has_session,
+        });
+        crate::store::store_log_activity(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            "rerouted",
+            Some("in_progress"),
+            Some("new"),
+            None::<&str>,
+            None::<&str>,
+            Some(&details),
+        )
+        .await;
+
         let reason = if timing.has_session {
             format!(
                 "timed out after {}m with active session (cleared agent for re-routing)",
@@ -604,6 +644,25 @@ pub(crate) async fn tick_recover_stuck_tasks(
         } else {
             set_review_session_expected(store, repo, &task.id.0, false).await;
         }
+
+        // Log activity for stuck in_review recovery
+        let details = serde_json::json!({
+            "failure_reason": "stuck_in_review",
+            "age_minutes": timing.age.num_minutes(),
+            "had_session": timing.has_session,
+        });
+        crate::store::store_log_activity(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            "rerouted",
+            Some("in_review"),
+            Some("needs_review"),
+            None::<&str>,
+            None::<&str>,
+            Some(&details),
+        )
+        .await;
         if let Err(e) = backend
             .post_comment(
                 &task.id,
