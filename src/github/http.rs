@@ -2314,13 +2314,18 @@ impl GhHttp {
                 _ => None, // UNKNOWN or missing
             };
 
-            let reviews: Vec<GitHubReview> = pr_data
+            let mut reviews: Vec<GitHubReview> = pr_data
                 .pointer("/reviews/nodes")
                 .and_then(|v| v.as_array())
                 .map(|nodes| nodes.iter().filter_map(parse_graphql_review).collect())
                 .unwrap_or_default();
 
-            let review_comments: Vec<GitHubReviewComment> = pr_data
+            // Ensure deterministic ordering by submitted timestamp (oldest -> newest).
+            // GraphQL connections do not guarantee a stable sort unless explicitly
+            // requested. Sort here so consumers can rely on chronological order.
+            reviews.sort_by(|a, b| a.submitted_at.cmp(&b.submitted_at));
+
+            let mut review_comments: Vec<GitHubReviewComment> = pr_data
                 .pointer("/reviewThreads/nodes")
                 .and_then(|v| v.as_array())
                 .map(|threads| {
@@ -2342,7 +2347,11 @@ impl GhHttp {
                 })
                 .unwrap_or_default();
 
-            let issue_comments: Vec<GitHubComment> = pr_data
+            // Sort inline review comments by created_at (oldest -> newest) so
+            // callers can process them deterministically.
+            review_comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+            let mut issue_comments: Vec<GitHubComment> = pr_data
                 .pointer("/comments/nodes")
                 .and_then(|v| v.as_array())
                 .map(|nodes| {
@@ -2352,6 +2361,12 @@ impl GhHttp {
                         .collect()
                 })
                 .unwrap_or_default();
+
+            // Sort issue-level comments by created_at (oldest -> newest). The
+            // review poll logic expects chronological ordering and may iterate
+            // in reverse to find the latest comments — so ensure a consistent
+            // ordering here regardless of GraphQL's default.
+            issue_comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
             result.insert(
                 n,
@@ -2376,15 +2391,22 @@ impl GhHttp {
     ) -> anyhow::Result<Option<String>> {
         let comments = self.list_comments(repo, &pr_number.to_string()).await?;
 
-        let mut latest: Option<&crate::github::types::GitHubComment> = None;
-        for c in comments.iter().rev() {
+        // Find the most recent automated review comment authored by a collaborator.
+        let mut newest: Option<&crate::github::types::GitHubComment> = None;
+        for c in &comments {
             if !c.body.starts_with("## Automated Review") {
                 continue;
             }
             match self.is_collaborator(repo, &c.user.login).await {
                 Ok(true) => {
-                    latest = Some(c);
-                    break;
+                    match newest {
+                        None => newest = Some(c),
+                        Some(prev) => {
+                            if c.created_at > prev.created_at {
+                                newest = Some(c);
+                            }
+                        }
+                    }
                 }
                 Ok(false) => {
                     tracing::warn!(
@@ -2405,7 +2427,7 @@ impl GhHttp {
             }
         }
 
-        match latest {
+        match newest {
             Some(c) => {
                 let first_line = c.body.lines().next().unwrap_or("");
                 if first_line.contains("Automated Review \u{2014} Approve") {
