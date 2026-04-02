@@ -224,10 +224,19 @@ pub(crate) async fn auto_merge_pr(
         );
     }
 
-    // 4. Wait for CI checks to pass (poll up to 5 minutes)
-    let max_wait = std::time::Duration::from_secs(300);
-    let poll_interval = std::time::Duration::from_secs(15);
+    // 4. Wait for CI checks to pass (poll with exponential backoff, up to max_wait)
+    // Configurable via workflow.ci_poll_max_wait_secs and workflow.ci_poll_interval_secs
+    let max_wait_secs: u64 = config::get("workflow.ci_poll_max_wait_secs")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    let base_interval_secs: u64 = config::get("workflow.ci_poll_interval_secs")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let max_wait = std::time::Duration::from_secs(max_wait_secs);
     let start = std::time::Instant::now();
+    let mut poll_count: u32 = 0;
 
     // Fetch PR and required contexts once (outside the polling loop).
     let pr = gh.get_pr(repo, pr_number).await?;
@@ -360,7 +369,11 @@ pub(crate) async fn auto_merge_pr(
             }
         }
 
-        tokio::time::sleep(poll_interval).await;
+        // Exponential backoff: double the interval each iteration, capped at 4x base
+        poll_count += 1;
+        let multiplier = (2_u64).pow(poll_count.saturating_sub(1)).min(4);
+        let sleep_secs = base_interval_secs.saturating_mul(multiplier);
+        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
     }
 
     // 5. Re-verify no reviewer has requested changes since the CI wait started.

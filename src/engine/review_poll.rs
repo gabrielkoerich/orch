@@ -516,25 +516,37 @@ pub(crate) async fn review_open_prs(
                     .model
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
-                if let Err(e) = crate::engine::auto_merge::auto_merge_pr(
-                    task,
-                    &task_info.branch,
-                    backend,
-                    repo,
-                    &task_agent,
-                    &task_model,
-                    task_manager,
-                    store,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        task_id,
-                        pr_number,
-                        err = %e,
-                        "auto-merge failed, keeping task in_review for next tick"
-                    );
-                }
+
+                // Spawn auto-merge in background to avoid blocking sync_tick.
+                // The CI polling loop can take up to 10 minutes with backoff.
+                let task_clone = task.clone();
+                let branch_clone = task_info.branch.clone();
+                let backend_clone = Arc::clone(backend);
+                let repo_string = repo.to_string();
+                let task_manager_clone = Arc::clone(task_manager);
+                let store_clone = Arc::clone(store);
+
+                tokio::spawn(async move {
+                    if let Err(e) = crate::engine::auto_merge::auto_merge_pr(
+                        &task_clone,
+                        &branch_clone,
+                        &backend_clone,
+                        &repo_string,
+                        &task_agent,
+                        &task_model,
+                        &task_manager_clone,
+                        &store_clone,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            task_id = task_clone.id.0,
+                            pr_number,
+                            err = %e,
+                            "auto-merge failed, keeping task in_review for next tick"
+                        );
+                    }
+                });
             }
             continue;
         }
