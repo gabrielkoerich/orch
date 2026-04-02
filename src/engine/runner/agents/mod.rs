@@ -474,6 +474,7 @@ pub trait AgentRunner: Send + Sync {
     ///
     /// Returns `Err(AgentError)` only for terminal errors (rate limit, auth, etc.)
     /// that should abort the review pipeline entirely.
+    #[allow(dead_code)] // used by per-agent unit tests; production uses find_agent_result
     fn extract_text(&self, raw: &str) -> Result<String, AgentError> {
         Ok(raw.to_string())
     }
