@@ -1109,6 +1109,21 @@ impl GhHttp {
         Ok(())
     }
 
+    /// Add a reaction to an issue.
+    ///
+    /// Supported content values: "+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"
+    pub async fn add_reaction(
+        &self,
+        repo: &str,
+        number: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let url = format!("{GITHUB_API}/repos/{repo}/issues/{number}/reactions");
+        let payload = serde_json::json!({ "content": content });
+        self.post_json_raw(&url, &payload).await?;
+        Ok(())
+    }
+
     /// List comments on an issue.
     pub async fn list_comments(
         &self,

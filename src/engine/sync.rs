@@ -1132,12 +1132,30 @@ pub(crate) async fn ingest_external_tasks(
     }
 
     // 3. Upsert into the store, collecting store IDs for batch status check.
+    //    Also acknowledge newly detected issues (eyes reaction).
     let mut id_status_pairs: Vec<(i64, crate::backends::Status)> = Vec::new();
     for (task, status) in &all_tasks {
+        // Check if this task already exists in the store before upserting.
+        let is_new = store
+            .get_by_external_id(repo, &task.id.0)
+            .await
+            .map(|t| t.is_none())
+            .unwrap_or(true);
+
         match store.ensure_external_task(repo, task).await {
             Ok(store_id) => {
                 if let Some(s) = status {
                     id_status_pairs.push((store_id, *s));
+                }
+                // Acknowledge newly detected issues with an eyes reaction.
+                if is_new {
+                    if let Err(e) = backend.acknowledge_issue(&task.id).await {
+                        tracing::debug!(
+                            task_id = task.id.0,
+                            err = %e,
+                            "ingest: acknowledgment failed"
+                        );
+                    }
                 }
             }
             Err(e) => {
