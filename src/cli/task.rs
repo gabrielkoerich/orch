@@ -1611,6 +1611,112 @@ pub async fn activity_log(id: &str, limit: Option<usize>, json: bool) -> anyhow:
     Ok(())
 }
 
+/// Show task routing history with attempt timeline.
+pub async fn history(id: &str) -> anyhow::Result<()> {
+    let store = crate::cli::init_store().await?;
+    let repo = config::get_current_repo().unwrap_or_default();
+    let Some(task_id) = store.resolve_task_id(&repo, id).await? else {
+        anyhow::bail!("task not found: {id}");
+    };
+
+    let task = store.get(task_id).await?;
+    let events = store.get_activity(task_id, None).await?;
+
+    // Header
+    println!("Routing History for Task {}", id);
+    println!("{}", "=".repeat(60));
+    println!("Title: {}", task.title);
+    println!("Status: {:?}", task.status);
+    println!();
+
+    // Find routing events (routed, rerouted)
+    let routing_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "routed" || e.event_type == "rerouted")
+        .collect();
+
+    if routing_events.is_empty() {
+        println!("No routing history found. Task has not been routed yet.");
+        return Ok(());
+    }
+
+    // Display routing timeline
+    println!("Attempt Timeline:");
+    println!("{}", "-".repeat(60));
+
+    for (i, event) in routing_events.iter().enumerate() {
+        let attempt_num = i + 1;
+        let agent = event.agent.as_deref().unwrap_or("-");
+        let model = event.model.as_deref().unwrap_or("-");
+        let timestamp = &event.timestamp;
+
+        if event.event_type == "routed" {
+            println!("\nAttempt #{}", attempt_num);
+            println!("  Time:     {}", timestamp);
+            println!("  Agent:    {}", agent);
+            println!("  Model:    {}", model);
+
+            // Extract routing details
+            if let Some(reason) = event.details.get("reason").and_then(|r| r.as_str()) {
+                println!("  Reason:   {}", reason);
+            }
+            if let Some(complexity) = event.details.get("complexity").and_then(|c| c.as_str()) {
+                println!("  Complexity: {}", complexity);
+            }
+        } else if event.event_type == "rerouted" {
+            println!("  → Rerouted at {}", timestamp);
+
+            // Check for failure reason
+            if let Some(failure) = event.details.get("failure_reason").and_then(|f| f.as_str()) {
+                println!("    Failure: {}", failure);
+            } else if let Some(failure) = event.details.get("silence_duration_secs") {
+                println!("    Failure: Agent silent for {}s", failure);
+            }
+
+            // Show from/to agent if available
+            if let Some(from) = event.details.get("from_agent").and_then(|a| a.as_str()) {
+                if let Some(to) = event.details.get("to_agent").and_then(|a| a.as_str()) {
+                    println!("    Change:   {} → {}", from, to);
+                }
+            }
+
+            // Show if agents were exhausted
+            if event.details.get("agents_exhausted").is_some() {
+                println!("    Note:     All agents exhausted");
+            }
+            if event.details.get("no_fallback_available").is_some() {
+                println!("    Note:     No fallback available");
+            }
+        }
+    }
+
+    // Summary
+    println!("\n{}", "-".repeat(60));
+    println!("Summary:");
+    println!("  Total routing attempts: {}", routing_events.len());
+
+    // Get cost summary from task
+    let total_tokens = task.input_tokens + task.output_tokens;
+    if total_tokens > 0 {
+        println!("  Input tokens:  {}", task.input_tokens);
+        println!("  Output tokens: {}", task.output_tokens);
+        println!(
+            "  Total cost:    ${:.6}",
+            task.input_cost_usd + task.output_cost_usd
+        );
+    }
+
+    // Show current assigned agent/model if available
+    if let Some(ref agent) = task.agent {
+        println!("  Current agent: {}", agent);
+    }
+    if let Some(ref model) = task.model {
+        println!("  Current model: {}", model);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

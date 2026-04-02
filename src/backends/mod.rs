@@ -67,6 +67,18 @@ impl Status {
             Self::NeedsReview => "status:needs_review",
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Routed => "routed",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+            Self::InReview => "in_review",
+            Self::NeedsReview => "needs_review",
+        }
+    }
 }
 
 /// The core trait for external task backends.

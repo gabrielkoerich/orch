@@ -534,6 +534,11 @@ enum TaskAction {
         #[arg(long)]
         json: bool,
     },
+    /// Show task routing history with attempt timeline
+    History {
+        /// Task ID (e.g. "internal:8" or issue number)
+        id: String,
+    },
     /// Show task run history and audit details
     Runs {
         /// Task ID (e.g. "internal:8" or issue number)
@@ -790,6 +795,9 @@ async fn main() -> anyhow::Result<()> {
             }
             TaskAction::Log { id, limit, json } => {
                 cli::task::activity_log(&id, limit, json).await?;
+            }
+            TaskAction::History { id } => {
+                cli::task::history(&id).await?;
             }
             TaskAction::Runs { id, verbose } => {
                 cli::task::runs(&id, verbose).await?;

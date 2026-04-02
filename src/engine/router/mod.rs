@@ -22,7 +22,9 @@ pub use config::{parse_pool_entry, RouterConfig};
 pub use weights::AgentWeights;
 
 use crate::backends::ExternalTask;
+use crate::store::store_log_activity;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use llm::LlmRouter;
 
@@ -496,15 +498,18 @@ impl Router {
                             complexity = %complexity,
                             "routed via label"
                         );
-                        return Ok(RouteResult {
+                        let result = RouteResult {
                             agent: agent.clone(),
-                            model,
+                            model: model.clone(),
                             complexity: complexity.clone(),
                             reason: format!("label agent:{agent}"),
                             profile,
                             selected_skills: self.config.default_skills.clone(),
                             warning: None,
-                        });
+                        };
+                        self.log_route_activity(store, repo, &task.id.0, &result, None)
+                            .await;
+                        return Ok(result);
                     } else {
                         // No concrete model found for the labeled agent — do
                         // not honor the label override. Fall through to the
@@ -533,25 +538,31 @@ impl Router {
 
             // 2. Weighted round-robin — capacity-based selection
             if self.config.weighted_round_robin {
-                return strategies::route_via_weighted_round_robin(
+                let result = strategies::route_via_weighted_round_robin(
                     &candidates,
                     &self.weights,
                     &self.config,
                     task,
                     &mut self.last_agent,
-                );
+                )?;
+                self.log_route_activity(store, repo, &task.id.0, &result, None)
+                    .await;
+                return Ok(result);
             }
 
             // 3. Round-robin mode — use stateful round-robin
             if self.config.mode == "round_robin" {
                 tracing::debug!(task_id = %task.id.0, "routing via round-robin mode");
-                return strategies::route_via_round_robin_stateful(
+                let result = strategies::route_via_round_robin_stateful(
                     &candidates,
                     &self.config,
                     task,
                     &mut self.rr_index,
                     &mut self.last_agent,
-                );
+                )?;
+                self.log_route_activity(store, repo, &task.id.0, &result, None)
+                    .await;
+                return Ok(result);
             }
 
             // 3. LLM-based routing with retry tracking
@@ -569,13 +580,16 @@ impl Router {
                     self.wait_for_cooldown(Some(&complexity)).await?;
                     continue;
                 }
-                return strategies::route_via_round_robin_stateful(
+                let result = strategies::route_via_round_robin_stateful(
                     &candidates,
                     &self.config,
                     task,
                     &mut self.rr_index,
                     &mut self.last_agent,
-                );
+                )?;
+                self.log_route_activity(store, repo, &task.id.0, &result, None)
+                    .await;
+                return Ok(result);
             }
 
             // Log routing start (before await)
@@ -620,18 +634,21 @@ impl Router {
                             fallback_agent
                         );
 
-                        return Ok(RouteResult {
-                            agent: fallback_agent,
+                        let result = RouteResult {
+                            agent: fallback_agent.clone(),
                             model: fallback_model,
                             complexity: result.complexity.clone(),
-                            reason,
-                            profile: result.profile,
-                            selected_skills: result.selected_skills,
+                            reason: reason.clone(),
+                            profile: result.profile.clone(),
+                            selected_skills: result.selected_skills.clone(),
                             warning: Some(
                                 "LLM-selected agent/model was cooled; rerouted to available agent"
                                     .to_string(),
                             ),
-                        });
+                        };
+                        self.log_route_activity(store, repo, &task.id.0, &result, None)
+                            .await;
+                        return Ok(result);
                     }
 
                     // Reset attempts on success
@@ -642,6 +659,8 @@ impl Router {
                         complexity = %result.complexity,
                         "routed via LLM"
                     );
+                    self.log_route_activity(store, repo, &task.id.0, &result, None)
+                        .await;
                     return Ok(result);
                 }
                 Err(e) => {
@@ -680,13 +699,16 @@ impl Router {
                             self.wait_for_cooldown(Some(&complexity)).await?;
                             continue;
                         }
-                        return strategies::route_via_round_robin_stateful(
+                        let result = strategies::route_via_round_robin_stateful(
                             &candidates,
                             &self.config,
                             task,
                             &mut self.rr_index,
                             &mut self.last_agent,
-                        );
+                        )?;
+                        self.log_route_activity(store, repo, &task.id.0, &result, None)
+                            .await;
+                        return Ok(result);
                     }
 
                     let candidates = self.available_agents_for_complexity(&complexity);
@@ -694,12 +716,15 @@ impl Router {
                         self.wait_for_cooldown(Some(&complexity)).await?;
                         continue;
                     }
-                    return strategies::route_via_fallback(
+                    let result = strategies::route_via_fallback(
                         &candidates,
                         &self.config,
                         task,
                         Some(&self.weights),
-                    );
+                    )?;
+                    self.log_route_activity(store, repo, &task.id.0, &result, None)
+                        .await;
+                    return Ok(result);
                 }
             }
         }
@@ -738,6 +763,41 @@ impl Router {
                 tracing::warn!(task_id, error = %e, "failed to store route_attempts");
             }
         }
+    }
+
+    /// Log a route event to task activity timeline.
+    async fn log_route_activity(
+        &self,
+        store: &std::sync::Arc<crate::store::TaskStore>,
+        repo: &str,
+        task_id: &str,
+        result: &RouteResult,
+        from_agent: Option<&str>,
+    ) {
+        let details = serde_json::json!({
+            "reason": result.reason,
+            "complexity": result.complexity,
+            "skills": result.selected_skills,
+            "role": result.profile.role,
+            "warning": result.warning,
+        });
+        let event_type = if from_agent.is_some() {
+            "rerouted"
+        } else {
+            "routed"
+        };
+        store_log_activity(
+            &Some(Arc::clone(store)),
+            repo,
+            task_id,
+            event_type,
+            None,
+            Some("routed"),
+            Some(&result.agent),
+            result.model.as_deref(),
+            Some(&details),
+        )
+        .await;
     }
 
     /// Route using LLM classification with pool round-robin.
