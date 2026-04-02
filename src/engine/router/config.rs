@@ -426,7 +426,7 @@ impl RouterConfig {
         if model.chars().any(char::is_whitespace) {
             return false;
         }
-        // Optionally, ensure that if there is a slash, both parts are non-empty
+        // Ensure that if there is a slash, both parts are non-empty
         if let Some(slash_pos) = model.find('/') {
             let before = &model[..slash_pos];
             let after = &model[slash_pos + 1..];
@@ -435,6 +435,13 @@ impl RouterConfig {
             }
         }
         true
+    }
+
+    /// Normalize a model identifier by stripping trailing slashes.
+    /// This is a defense-in-depth measure to handle edge cases where
+    /// a model string might have been incorrectly formatted.
+    fn normalize_model_identifier(model: &str) -> String {
+        model.trim_end_matches('/').to_string()
     }
 
     fn expanded_model_pool(&self, agent: &str, complexity: &str) -> Option<Vec<String>> {
@@ -516,7 +523,8 @@ impl RouterConfig {
                 continue;
             }
             if !crate::engine::cooldown::is_model_in_cooldown(agent, model) {
-                return Some(model.clone());
+                // Normalize the model identifier to handle edge cases like trailing slashes
+                return Some(Self::normalize_model_identifier(model));
             }
         }
         // All models cooled — return None so the caller can fall back to a different agent
@@ -685,6 +693,59 @@ mod tests {
                 "kimi:k2p5",
                 "claude:haiku",
             ]
+        );
+    }
+
+    #[test]
+    fn normalize_model_identifier_strips_trailing_slash() {
+        // Bug #1507: model assignment was producing "opus/" instead of "opus"
+        assert_eq!(
+            RouterConfig::normalize_model_identifier("opus/"),
+            "opus",
+            "trailing slash should be stripped from model identifier"
+        );
+        assert_eq!(
+            RouterConfig::normalize_model_identifier("sonnet/"),
+            "sonnet",
+            "trailing slash should be stripped from model identifier"
+        );
+        assert_eq!(
+            RouterConfig::normalize_model_identifier("github-copilot/gpt-5-mini/"),
+            "github-copilot/gpt-5-mini",
+            "trailing slash should be stripped from model identifier with internal slash"
+        );
+        // Edge cases: multiple trailing slashes
+        assert_eq!(
+            RouterConfig::normalize_model_identifier("opus//"),
+            "opus",
+            "multiple trailing slashes should be stripped"
+        );
+        // Edge cases: no trailing slash
+        assert_eq!(
+            RouterConfig::normalize_model_identifier("opus"),
+            "opus",
+            "model without trailing slash should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn is_valid_model_identifier_rejects_trailing_slash() {
+        // Ensure validation correctly rejects models with trailing slashes
+        assert!(
+            !RouterConfig::is_valid_model_identifier("opus/"),
+            "model with trailing slash should be invalid"
+        );
+        assert!(
+            RouterConfig::is_valid_model_identifier("opus"),
+            "model without trailing slash should be valid"
+        );
+        assert!(
+            RouterConfig::is_valid_model_identifier("github-copilot/gpt-5-mini"),
+            "model with internal slash should be valid"
+        );
+        assert!(
+            !RouterConfig::is_valid_model_identifier("github-copilot/"),
+            "model ending with slash after prefix should be invalid"
         );
     }
 }
