@@ -143,6 +143,8 @@ pub fn parse_pool_entry(entry: &str) -> (String, String) {
     if let Some(colon_pos) = entry.find(':') {
         let agent = entry[..colon_pos].to_string();
         let model = entry[colon_pos + 1..].to_string();
+        // Normalize trailing slashes in model part (defense-in-depth for bug #1507)
+        let model = RouterConfig::normalize_model_identifier(&model);
         (agent, model)
     } else {
         (entry.to_string(), String::new())
@@ -209,6 +211,7 @@ impl RouterConfig {
                     .filter(|l| l.contains("free"))
                     .map(|l| l.trim().to_string())
                     .filter(|l| !l.is_empty())
+                    .map(|l| Self::normalize_model_identifier(&l))
                     .collect()
             }
             Ok(output) => {
@@ -241,7 +244,7 @@ impl RouterConfig {
 
         if let Ok(model) = crate::config::get("router.model") {
             if !model.is_empty() {
-                config.router_model = model;
+                config.router_model = RouterConfig::normalize_model_identifier(&model);
             }
         }
 
@@ -358,19 +361,24 @@ impl RouterConfig {
                 // Try as list first (YAML arrays), fall back to single string
                 if let Ok(list) = crate::config::get_list(&key) {
                     if !list.is_empty() {
+                        let normalized: Vec<String> = list
+                            .iter()
+                            .map(|m| RouterConfig::normalize_model_identifier(m))
+                            .collect();
                         config
                             .model_map
                             .entry(complexity.to_string())
                             .or_default()
-                            .insert(agent.to_string(), list);
+                            .insert(agent.to_string(), normalized);
                     }
                 } else if let Ok(val) = crate::config::get(&key) {
                     if !val.is_empty() {
+                        let normalized = RouterConfig::normalize_model_identifier(&val);
                         config
                             .model_map
                             .entry(complexity.to_string())
                             .or_default()
-                            .insert(agent.to_string(), vec![val]);
+                            .insert(agent.to_string(), vec![normalized]);
                     }
                 }
             }
@@ -440,7 +448,7 @@ impl RouterConfig {
     /// Normalize a model identifier by stripping trailing slashes.
     /// This is a defense-in-depth measure to handle edge cases where
     /// a model string might have been incorrectly formatted.
-    fn normalize_model_identifier(model: &str) -> String {
+    pub fn normalize_model_identifier(model: &str) -> String {
         model.trim_end_matches('/').to_string()
     }
 

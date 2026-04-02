@@ -243,6 +243,7 @@ impl Router {
                     .filter(|l| l.contains("free"))
                     .map(|l| l.trim().to_string())
                     .filter(|l| !l.is_empty())
+                    .map(|l| RouterConfig::normalize_model_identifier(&l))
                     .collect()
             }
             Ok(output) => {

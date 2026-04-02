@@ -99,12 +99,12 @@ pub fn parse_model_spec(spec: &str) -> ModelSpec {
     if let Some((agent, model)) = spec.split_once(':') {
         ModelSpec {
             agent: agent.to_string(),
-            model: model.to_string(),
+            model: crate::engine::router::RouterConfig::normalize_model_identifier(model),
         }
     } else {
         ModelSpec {
             agent: infer_agent(spec).to_string(),
-            model: spec.to_string(),
+            model: crate::engine::router::RouterConfig::normalize_model_identifier(spec),
         }
     }
 }
