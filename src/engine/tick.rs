@@ -21,8 +21,54 @@ use crate::repo_context::REPO_CONTEXT;
 use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::time::SystemTime;
 use tokio::sync::{mpsc, Semaphore};
+
+/// Unix timestamp when the engine process started.
+/// Used to identify tmux sessions from previous runs.
+static ENGINE_START_TIME: LazyLock<u64> = LazyLock::new(|| {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+});
+
+/// Flag to ensure startup cleanup only runs once.
+static STARTUP_CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Cleanup stale tmux sessions from previous engine runs.
+/// Called once at startup to kill sessions created before this process started.
+async fn startup_cleanup(tmux: &TmuxManager) {
+    // Use compare_exchange to ensure this only runs once across all threads
+    if STARTUP_CLEANUP_DONE
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let start_time = *ENGINE_START_TIME;
+    tracing::info!(
+        start_time,
+        "running startup cleanup for stale tmux sessions"
+    );
+
+    match tmux.kill_stale_sessions(start_time).await {
+        Ok(killed) => {
+            if killed > 0 {
+                tracing::info!(killed, "startup cleanup killed stale sessions");
+            } else {
+                tracing::debug!("no stale tmux sessions found on startup");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to run startup cleanup");
+        }
+    }
+}
 
 use super::EngineConfig;
 use crate::store::{review_session_expected, set_review_session_expected};
@@ -869,6 +915,11 @@ pub(crate) async fn tick_dispatch_tasks(
         // Check if already running (has active session)
         let session_name = tmux.session_name(repo, &task.id.0);
         if tmux.session_exists(&session_name).await {
+            tracing::warn!(
+                task_id = task.id.0,
+                session_name,
+                "task has existing tmux session, skipping dispatch"
+            );
             continue; // dispatch_guard drops here, removing the key
         }
 
@@ -1168,6 +1219,10 @@ pub(crate) async fn tick(
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
+
+    // Run startup cleanup once to kill stale sessions from previous runs.
+    startup_cleanup(tmux).await;
+
     tick_check_session_completions(tmux, repo, capture).await?;
     tick_detect_silent_agents(tmux, repo, capture, backend, task_manager, config, store).await?;
     tick_recover_stuck_tasks(backend, tmux, repo, task_manager, config, store).await?;
