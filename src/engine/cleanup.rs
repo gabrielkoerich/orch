@@ -456,13 +456,38 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             return Ok(false);
         }
 
+        // Validate git metadata before attempting any git operations.
+        // If the .git file points to a deleted gitdir the worktree is
+        // unrecoverable — force-remove the directory and skip git commands.
+        let gitdir_valid = crate::engine::runner::worktree::validate_worktree_gitdir(&wt);
+
         if opts.dry_run {
             tracing::info!(
                 task_id,
                 worktree = %wt.display(),
                 branch = ?branch,
+                gitdir_valid,
                 "[dry-run] would remove worktree and branch"
             );
+        } else if !gitdir_valid {
+            tracing::warn!(
+                task_id,
+                worktree = %wt.display(),
+                "worktree has broken git metadata — force-removing directory without git operations"
+            );
+            match std::fs::remove_dir_all(&wt) {
+                Ok(()) => {
+                    did_clean = true;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id,
+                        worktree = %wt.display(),
+                        err = %e,
+                        "failed to force-remove broken worktree directory"
+                    );
+                }
+            }
         } else {
             tracing::info!(task_id, worktree = %wt.display(), "removing worktree");
             // Derive repo root from the worktree itself (for cross-project support).
