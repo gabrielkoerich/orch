@@ -272,13 +272,12 @@ pub async fn handle_success(
                     // Save pr_number to the store so the review gate can find it
                     // immediately without racing GitHub's list-API cache (~300 ms lag).
                     // This is set for both newly-created and pre-existing PRs.
-                    if let Some(pr_num) = url.rsplit('/').next().and_then(|n| n.parse::<i64>().ok())
-                    {
+                    if let Some(pr_num) = crate::engine::review::parse_pr_number_from_url(url) {
                         store::store_set(
                             store,
                             repo,
                             task_id,
-                            &[("pr_number", serde_json::json!(pr_num))],
+                            &[("pr_number", serde_json::json!(pr_num as i64))],
                         )
                         .await;
                     }
