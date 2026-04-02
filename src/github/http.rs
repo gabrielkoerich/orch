@@ -404,7 +404,7 @@ impl GhHttp {
         is_graphql: bool,
     ) -> anyhow::Result<Response>
     where
-        F: FnMut() -> reqwest::RequestBuilder,
+        F: FnMut() -> anyhow::Result<reqwest::RequestBuilder>,
     {
         // Circuit-breaker: if set, fail fast to avoid wasting work.
         if engine_cooldown::is_agent_in_cooldown("github:5xx") {
@@ -440,7 +440,7 @@ impl GhHttp {
 
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..attempts {
-            let req = make_req();
+            let req = make_req()?;
             let resp_result = req.send().await;
 
             match resp_result {
@@ -537,11 +537,12 @@ impl GhHttp {
         let auth = self.auth_header().await?;
         // Use send_with_retries to handle transient 5xx/network failures
         let make_req = || {
-            self.client
+            Ok(self
+                .client
                 .get(url)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("X-GitHub-Api-Version", "2022-11-28"))
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
@@ -559,11 +560,12 @@ impl GhHttp {
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         let make_req = || {
-            self.client
+            Ok(self
+                .client
                 .get(url)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("X-GitHub-Api-Version", "2022-11-28"))
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
@@ -585,12 +587,13 @@ impl GhHttp {
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         let make_req = || {
-            self.client
+            Ok(self
+                .client
                 .get(url)
                 .query(query)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("X-GitHub-Api-Version", "2022-11-28"))
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
@@ -608,12 +611,13 @@ impl GhHttp {
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         let make_req = || {
-            self.client
+            Ok(self
+                .client
                 .post(url)
                 .json(body)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("X-GitHub-Api-Version", "2022-11-28"))
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
@@ -641,12 +645,13 @@ impl GhHttp {
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         let make_req = || {
-            self.client
+            Ok(self
+                .client
                 .patch(url)
                 .json(body)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("X-GitHub-Api-Version", "2022-11-28"))
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
@@ -664,11 +669,12 @@ impl GhHttp {
         Self::check_backoff()?;
         let auth = self.auth_header().await?;
         let make_req = || {
-            self.client
+            Ok(self
+                .client
                 .delete(url)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("X-GitHub-Api-Version", "2022-11-28"))
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
@@ -716,11 +722,9 @@ impl GhHttp {
                     req = req.query(q);
                 }
 
-                // try_clone returns None only for streaming bodies; REST API
-                // requests use JSON bodies which are always clonable.
                 let make_req = || {
                     req.try_clone()
-                        .expect("request body must be clonable (JSON body expected)")
+                        .ok_or_else(|| anyhow::anyhow!("request clone failed"))
                 };
                 let resp = self.send_with_retries(make_req, false).await?;
                 let status = resp.status();
@@ -801,12 +805,10 @@ impl GhHttp {
             req = req.header(*k, *v);
         }
 
-        // Use send_with_retries wrapper for GraphQL (is_graphql = true).
-        // try_clone returns None only for streaming bodies; GraphQL requests
-        // use JSON bodies which are always clonable.
+        // Use send_with_retries wrapper for GraphQL (is_graphql = true)
         let make_req = || {
             req.try_clone()
-                .expect("graphql request body must be clonable (JSON body expected)")
+                .ok_or_else(|| anyhow::anyhow!("graphql request clone failed"))
         };
         let resp = self.send_with_retries(make_req, true).await?;
         let status = resp.status();
@@ -1327,13 +1329,14 @@ impl GhHttp {
 
         let auth = self.auth_header().await?;
         let make_req = || {
-            self.client
+            Ok(self
+                .client
                 .post(&url)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
                 .header(header::USER_AGENT, "orch")
                 .header("X-GitHub-Api-Version", "2022-11-28")
-                .json(&payload)
+                .json(&payload))
         };
         let response = self.send_with_retries(make_req, false).await?;
         let status = response.status();
@@ -1641,11 +1644,12 @@ impl GhHttp {
         let url = format!("{GITHUB_API}/repos/{repo}/collaborators/{username}");
         let auth = self.auth_header().await?;
         let make_req = || {
-            self.client
+            Ok(self
+                .client
                 .get(&url)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("X-GitHub-Api-Version", "2022-11-28"))
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
@@ -1883,12 +1887,13 @@ impl GhHttp {
         let payload = serde_json::json!({ "merge_method": "squash" });
         let auth = self.auth_header().await?;
         let make_req = || {
-            self.client
+            Ok(self
+                .client
                 .put(&url)
                 .json(&payload)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("X-GitHub-Api-Version", "2022-11-28"))
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
@@ -1937,7 +1942,7 @@ impl GhHttp {
             .header(header::ACCEPT, "application/vnd.github+json");
         let make_req = || {
             req.try_clone()
-                .expect("graphql request body must be clonable (JSON body expected)")
+                .ok_or_else(|| anyhow::anyhow!("graphql request clone failed"))
         };
         let resp = self.send_with_retries(make_req, true).await?;
         let body: serde_json::Value = resp.json().await?;
@@ -1959,7 +1964,7 @@ impl GhHttp {
             .header(header::ACCEPT, "application/vnd.github+json");
         let make_req = || {
             req.try_clone()
-                .expect("graphql request body must be clonable (JSON body expected)")
+                .ok_or_else(|| anyhow::anyhow!("graphql request clone failed"))
         };
         let resp = self.send_with_retries(make_req, true).await?;
         let status = resp.status();
@@ -2153,11 +2158,12 @@ impl GhHttp {
         let rerun_url = format!("{GITHUB_API}/repos/{repo}/actions/runs/{run_id}/rerun");
         let auth = self.auth_header().await?;
         let make_req = || {
-            self.client
+            Ok(self
+                .client
                 .post(&rerun_url)
                 .header(header::AUTHORIZATION, auth.clone())
                 .header(header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("X-GitHub-Api-Version", "2022-11-28"))
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
@@ -2768,6 +2774,29 @@ mod tests {
         assert!(rl.backoff_delay.as_secs() <= 47);
     }
 
+    #[tokio::test]
+    async fn send_with_retries_propagates_make_req_error() {
+        let guard = std::env::var_os("GH_TOKEN");
+        std::env::set_var("GH_TOKEN", "test_token");
+        let gh = GhHttp {
+            client: reqwest::Client::new(),
+            token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
+        };
+        let result = gh
+            .send_with_retries(
+                || Err(anyhow::anyhow!("simulated request clone failure")),
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert_eq!(err, "simulated request clone failure");
+        match guard {
+            Some(v) => std::env::set_var("GH_TOKEN", v),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+    }
+
     // ── get_all_pages integration tests (wiremock) ────────────────────────
 
     #[cfg(test)]
@@ -2936,6 +2965,30 @@ mod tests {
 
             // Malformed Link header → pagination stops after first page, no panic.
             assert_eq!(result.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn get_all_pages_returns_error_on_malformed_json_body() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/items"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("not valid json"))
+                .expect(3)
+                .mount(&server)
+                .await;
+
+            let (gh, _guard) = make_client();
+            let url = format!("{}/items", server.uri());
+            let result = gh.get_all_pages::<serde_json::Value>(&url, &[]).await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("JSON decode failed") || err.contains("expected ident"),
+                "error should mention JSON decode or serde error: {}",
+                err
+            );
         }
     }
 }
