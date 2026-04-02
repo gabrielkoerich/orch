@@ -272,7 +272,7 @@ impl Router {
         let now = chrono::Utc::now().timestamp();
         // If cached and not expired (1 hour), return cached copy.
         {
-            let guard = cache.lock().unwrap();
+            let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
             let (ts, models) = &*guard;
             if *ts != 0 && now.saturating_sub(*ts) < 3600 {
                 return models.clone();
@@ -311,7 +311,7 @@ impl Router {
 
         // Update cache with current timestamp (even if empty) so we don't hammer I/O.
         {
-            let mut guard = cache.lock().unwrap();
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
             *guard = (now, discovered.clone());
         }
 
