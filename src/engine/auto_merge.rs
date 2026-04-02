@@ -925,6 +925,16 @@ pub(crate) async fn handle_review_changes(
                 );
                 // Fall through to escalation below.
             } else {
+                // Reset review_cycles so the fresh review against new code starts
+                // from a clean count. Without this reset, the next review would
+                // immediately see review_cycles >= max_cycles and escalate again.
+                store_set(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    &[("review_cycles", serde_json::json!(0))],
+                )
+                .await;
                 return Ok(());
             }
         }
