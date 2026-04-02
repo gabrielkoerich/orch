@@ -9,21 +9,21 @@ use sqlx::Row;
 /// `sqlite3_column_count()` returns the updated count but the cached column
 /// metadata vector was built at prepare time. Explicit columns prevent the
 /// mismatch.
-pub const TASK_COLS: &str = "id, external_id, repo, origin, title, body, status, \
+pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, status, \
     source, source_id, author, url, labels, agent, model, complexity, \
     route_reason, agent_profile, selected_skills, route_attempts, attempts, \
     branch, worktree, worktree_cleaned, summary, last_error, parent_id, \
     block_reason, pr_number, pr_review_context, last_review_ts, \
     last_comment_review_ts, merge_conflict_retries, ci_merge_failures, \
-    pr_create_failures, push_failures, review_agent_failures, review_cycles, \
-    review_invocations, review_session_expected, input_tokens, output_tokens, \
-    input_cost_usd, output_cost_usd, total_cost_usd, model_reroute_chain, \
-    limit_reroute_chain, budget_warning, budget_exceeded, memory, delegations, \
-    auto_unblock_count, auto_unblock_last_at, auto_unblock_last_reason, \
-    ci_recovery_count, no_code_reroutes, created_at, updated_at";
+    pr_create_failures, review_agent_failures, review_cycles, input_tokens, \
+    output_tokens, input_cost_usd, output_cost_usd, total_cost_usd, \
+    model_reroute_chain, limit_reroute_chain, budget_warning, budget_exceeded, \
+    memory, delegations, created_at, updated_at, review_session_expected, \
+    review_invocations, push_failures, auto_unblock_count, auto_unblock_last_at, \
+    ci_recovery_count, auto_unblock_last_reason, no_code_reroutes";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub const TASK_COLS_COUNT: usize = 57;
+pub(crate) const TASK_COLS_COUNT: usize = 57;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str =
@@ -1544,6 +1544,17 @@ impl TaskStore {
     // ---------------------------------------------------------------
 
     fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Task> {
+        // Diagnostic: verify column count matches expected to prevent OOB panics
+        // when schema changes without updating TASK_COLS
+        let col_count = row.len();
+        if col_count != TASK_COLS_COUNT {
+            tracing::warn!(
+                expected = TASK_COLS_COUNT,
+                actual = col_count,
+                "TASK_COLS column count mismatch - schema may have changed"
+            );
+        }
+
         let status_str: String = row.try_get("status").unwrap_or_default();
         let labels_str: String = row.try_get("labels").unwrap_or_default();
         let memory_str: String = row.try_get("memory").unwrap_or_default();
