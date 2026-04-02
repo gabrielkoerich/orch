@@ -26,6 +26,39 @@ pub struct TmuxManager {
     prefix: String,
 }
 
+/// Info about session health for dispatch decisions.
+#[derive(Debug, Clone)]
+pub struct SessionHealth {
+    pub exists: bool,
+    pub pane_alive: bool,
+    pub created_at: Option<u64>,
+    pub last_activity: Option<u64>,
+}
+
+impl SessionHealth {
+    /// Returns true if the session is healthy and should prevent dispatch.
+    pub fn is_healthy(&self) -> bool {
+        self.exists && self.pane_alive
+    }
+
+    /// Returns true if the session appears dead/orphaned and can be reclaimed.
+    #[allow(dead_code)]
+    pub fn is_orphaned(&self) -> bool {
+        self.exists && !self.pane_alive
+    }
+
+    /// Returns the session age in seconds, if creation time is available.
+    pub fn age_secs(&self, now: u64) -> Option<u64> {
+        self.created_at.map(|created| now.saturating_sub(created))
+    }
+
+    /// Returns the idle time in seconds since last activity, if available.
+    pub fn idle_secs(&self, now: u64) -> Option<u64> {
+        self.last_activity
+            .map(|activity| now.saturating_sub(activity))
+    }
+}
+
 impl TmuxManager {
     pub fn new() -> Self {
         Self {
@@ -171,6 +204,64 @@ impl TmuxManager {
                 flag.trim() == "0" // 0 = alive, 1 = dead
             }
             _ => false,
+        }
+    }
+
+    /// Check comprehensive session health for dispatch decisions.
+    ///
+    /// This checks:
+    /// - Session existence (via has-session)
+    /// - Pane liveness (pane_dead flag)
+    /// - Session creation time
+    /// - Last activity time
+    ///
+    /// Returns a SessionHealth struct with all info needed for dispatch decisions.
+    pub async fn check_session_health(&self, session: &str) -> SessionHealth {
+        // First check if session exists at all
+        let exists = self.session_exists(session).await;
+        if !exists {
+            return SessionHealth {
+                exists: false,
+                pane_alive: false,
+                created_at: None,
+                last_activity: None,
+            };
+        }
+
+        // Get pane status, creation time, and activity in one call
+        let output = Command::new("tmux")
+            .args([
+                "list-panes",
+                "-t",
+                session,
+                "-F",
+                "#{pane_dead} #{session_created} #{session_activity}",
+            ])
+            .output_with_context()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let parts: Vec<&str> = stdout.split_whitespace().collect();
+
+                let pane_alive = parts.first().map(|&s| s == "0").unwrap_or(false);
+                let created_at = parts.get(1).and_then(|s| s.parse::<u64>().ok());
+                let last_activity = parts.get(2).and_then(|s| s.parse::<u64>().ok());
+
+                SessionHealth {
+                    exists: true,
+                    pane_alive,
+                    created_at,
+                    last_activity,
+                }
+            }
+            _ => SessionHealth {
+                exists: true,
+                pane_alive: false,
+                created_at: None,
+                last_activity: None,
+            },
         }
     }
 
