@@ -465,10 +465,14 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             );
         } else {
             tracing::info!(task_id, worktree = %wt.display(), "removing worktree");
-            // We need the repo root to run git commands that remove the
-            // worktree and delete branches. Resolve it lazily here so
-            // that tasks with nothing to clean don't fail early.
-            let repo_root = resolve_repo_root(repo).await?;
+            // Derive repo root from the worktree itself (for cross-project support).
+            // If the worktree belongs to a different project than the current repo
+            // context (e.g., internal task with worktree in another project), we can
+            // still find the repo root by examining the worktree's .git file.
+            let repo_root = match resolve_repo_root_from_worktree(&wt) {
+                Ok(root) => root,
+                Err(_) => resolve_repo_root(repo).await?,
+            };
             let removed = remove_worktree_and_branch(
                 task_id,
                 &wt,
@@ -733,6 +737,47 @@ fn worktree_age_hours(worktree: &std::path::Path) -> Option<u64> {
     let modified = metadata.modified().ok()?;
     let age = std::time::SystemTime::now().duration_since(modified).ok()?;
     Some(age.as_secs() / 3600)
+}
+
+/// Resolve the main git repository root from a worktree's .git file.
+///
+/// For cross-project worktree cleanup, we cannot rely on `resolve_repo_root` because
+/// the worktree may belong to a different project than the current repo context.
+/// Instead, we extract the repo root from the worktree's `.git` file which contains
+/// a `gitdir:` pointer to the main repo's git directory.
+fn resolve_repo_root_from_worktree(wt: &std::path::Path) -> anyhow::Result<String> {
+    // For worktrees, .git is a file (not a directory) containing gitdir path
+    let git_file = wt.join(".git");
+    if !git_file.exists() {
+        anyhow::bail!(".git file not found in worktree at {}", wt.display());
+    }
+
+    let content = std::fs::read_to_string(&git_file)
+        .map_err(|e| anyhow::anyhow!("failed to read .git file: {e}"))?;
+
+    // Parse gitdir line: "gitdir: /path/to/repo/.git/worktrees/<name>"
+    for line in content.lines() {
+        if let Some(gitdir) = line.strip_prefix("gitdir:") {
+            let gitdir = gitdir.trim();
+            // The main repo is the parent of the .git directory
+            // gitdir points to: <repo>/.git/worktrees/<name>
+            // We need to go up 3 levels: worktrees/<name> -> .git -> repo
+            let gitdir_path = std::path::Path::new(gitdir);
+            if let Some(repo_root) = gitdir_path
+                .parent() // worktrees/<name>
+                .and_then(|p| p.parent()) // .git
+                .and_then(|p| p.parent())
+            // repo root
+            {
+                return Ok(repo_root.display().to_string());
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "cannot resolve repo root from worktree .git file at {}",
+        wt.display()
+    )
 }
 
 /// Resolve the main git repository root path for a project.
