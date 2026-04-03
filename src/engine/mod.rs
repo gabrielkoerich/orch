@@ -1048,8 +1048,18 @@ pub async fn serve() -> anyhow::Result<()> {
         );
     }
 
-    // Agent router (selects agent + model per task) - shared across projects
-    let router = Arc::new(RwLock::new(Router::from_config()));
+    // Agent router (selects agent + model per task) - shared across projects.
+    // Router::from_config() may run `opencode models` (a blocking subprocess) to
+    // discover free models. Wrapping in spawn_blocking keeps the Tokio runtime
+    // thread free during that I/O.
+    let router = Arc::new(RwLock::new(
+        tokio::task::spawn_blocking(Router::from_config)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(?e, "router init panicked in spawn_blocking, using default");
+                Router::from_config()
+            }),
+    ));
     {
         let r = router.read().await;
         tracing::info!(

@@ -9,7 +9,7 @@
 //! Where API parity exists, prefer using [`GhHttp`](super::http::GhHttp) instead.
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Command;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -92,7 +92,7 @@ impl Gh {
 
     /// Execute the command and return the output (sync version without timeout).
     /// For timeout support, use the async version.
-    pub fn output(&self) -> GhResult<Output> {
+    pub fn output(&self) -> GhResult<std::process::Output> {
         let gh_path = find_gh()?;
         tracing::debug!(path = %gh_path.display(), args = ?self.args, "executing gh command");
 
@@ -144,10 +144,10 @@ impl Gh {
 
     /// Execute the command asynchronously and return the output.
     #[allow(dead_code)]
-    pub async fn output_async(&self) -> GhResult<Output> {
+    pub async fn output_async(&self) -> GhResult<std::process::Output> {
         use tokio::process::Command as TokioCommand;
 
-        let gh_path = find_gh()?;
+        let gh_path = find_gh_async().await?;
         tracing::debug!(path = %gh_path.display(), args = ?self.args, "executing gh command (async)");
 
         let mut cmd = TokioCommand::new(&gh_path);
@@ -222,6 +222,26 @@ fn find_gh() -> GhResult<PathBuf> {
     Err(GhError::NotFound)
 }
 
+/// Find the gh binary path asynchronously (non-blocking, safe to call from async contexts).
+async fn find_gh_async() -> GhResult<PathBuf> {
+    // First try PATH lookup (async)
+    if let Ok(path) = which_gh_async().await {
+        return Ok(path);
+    }
+
+    // Then try known fallback paths (filesystem check — non-blocking)
+    for path in GH_PATHS {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            tracing::debug!(path = %p.display(), "found gh at fallback path");
+            return Ok(p);
+        }
+    }
+
+    tracing::error!("gh CLI not found in PATH or known locations");
+    Err(GhError::NotFound)
+}
+
 /// Try to find gh in PATH using `which` or `where`.
 fn which_gh() -> GhResult<PathBuf> {
     // Try using std::process::Command to find gh
@@ -261,6 +281,55 @@ fn which_gh() -> GhResult<PathBuf> {
 
     if output.status.success() {
         // gh is in PATH but we couldn't get the path - return generic
+        return Ok(PathBuf::from("gh"));
+    }
+
+    Err(GhError::NotFound)
+}
+
+/// Async version of `which_gh` — uses `tokio::process::Command` to avoid
+/// blocking the Tokio runtime thread.
+async fn which_gh_async() -> GhResult<PathBuf> {
+    use tokio::process::Command as TokioCommand;
+
+    let output = TokioCommand::new("which")
+        .arg("gh")
+        .output()
+        .await
+        .map_err(GhError::Execution)?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+
+    // On Windows, try `where`
+    #[cfg(windows)]
+    {
+        let output = TokioCommand::new("where")
+            .arg("gh")
+            .output()
+            .await
+            .map_err(GhError::Execution)?;
+
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(PathBuf::from(path.split('\n').next().unwrap_or(&path)));
+            }
+        }
+    }
+
+    // Last resort: try running `gh --version` to see if it's in PATH
+    let output = TokioCommand::new("gh")
+        .args(["--version"])
+        .output()
+        .await
+        .map_err(GhError::Execution)?;
+
+    if output.status.success() {
         return Ok(PathBuf::from("gh"));
     }
 

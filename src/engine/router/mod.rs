@@ -117,6 +117,10 @@ impl Router {
             fallback = %config.effective_fallback(),
             "router LLM pool initialized"
         );
+        // Prime the RouterConfig free-model cache at startup (sync context) so
+        // that async callers hitting expanded_model_pool() later return
+        // instantly from cache instead of blocking a Tokio worker thread.
+        RouterConfig::prime_free_model_cache();
         Self {
             config,
             available_agents,

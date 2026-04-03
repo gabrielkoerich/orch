@@ -260,12 +260,12 @@ async fn run_checks(
 
             // 2. Done tasks with dirty worktrees (recent only — filesystem check, fast)
             for task in &recent_done_tasks {
-                check_dirty_worktree(task, &mut findings);
+                check_dirty_worktree(task, &mut findings).await;
             }
 
             // 3. Done tasks with unpushed commits (recent only — filesystem check, fast)
             for task in &recent_done_tasks {
-                check_unpushed_commits(task, &mut findings);
+                check_unpushed_commits(task, &mut findings).await;
             }
 
             // 4+5. Issue status and label checks (active external tasks only).
@@ -592,7 +592,7 @@ async fn check_done_no_merged_pr(
                     }
                     Ok(None) => {
                         // No PR at all — classify based on worktree state
-                        let fix = classify_no_pr_fix(task, store_id);
+                        let fix = classify_no_pr_fix(task, store_id).await;
                         findings.push(Finding {
                             severity: Severity::Error,
                             task_id: task_label,
@@ -623,7 +623,7 @@ async fn check_done_no_merged_pr(
 }
 
 /// Classify the appropriate fix when a done task has no PR.
-fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
+async fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
     if task.worktree.is_empty() || task.worktree_cleaned {
         // Work was lost — worktree already cleaned
         return FixAction::None;
@@ -634,10 +634,11 @@ fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
     }
 
     // Check for dirty files
-    let has_dirty = std::process::Command::new("git")
+    let has_dirty = tokio::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(wt)
         .output()
+        .await
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
 
@@ -646,10 +647,11 @@ fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
     }
 
     // Check for unpushed commits
-    let has_unpushed = std::process::Command::new("git")
+    let has_unpushed = tokio::process::Command::new("git")
         .args(["log", &format!("origin/{}..HEAD", task.branch), "--oneline"])
         .current_dir(wt)
         .output()
+        .await
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
 
@@ -658,10 +660,11 @@ fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
     }
 
     // Branch pushed, no PR
-    let branch_on_remote = std::process::Command::new("git")
+    let branch_on_remote = tokio::process::Command::new("git")
         .args(["ls-remote", "--heads", "origin", &task.branch])
         .current_dir(wt)
         .output()
+        .await
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
 
@@ -673,7 +676,7 @@ fn classify_no_pr_fix(task: &Task, store_id: i64) -> FixAction {
 }
 
 /// Check 2: Done task with dirty worktree (uncommitted changes).
-fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
+async fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
     if task.worktree.is_empty() || task.worktree_cleaned {
         return;
     }
@@ -681,10 +684,11 @@ fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
     if !wt.exists() || !wt.join(".git").exists() {
         return;
     }
-    let output = std::process::Command::new("git")
+    let output = tokio::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(wt)
-        .output();
+        .output()
+        .await;
     if let Ok(out) = output {
         if !out.stdout.is_empty() {
             findings.push(Finding {
@@ -701,7 +705,7 @@ fn check_dirty_worktree(task: &Task, findings: &mut Vec<Finding>) {
 }
 
 /// Check 3: Done task with unpushed commits.
-fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
+async fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
     if task.worktree.is_empty() || task.worktree_cleaned || task.branch.is_empty() {
         return;
     }
@@ -709,10 +713,11 @@ fn check_unpushed_commits(task: &Task, findings: &mut Vec<Finding>) {
     if !wt.exists() || !wt.join(".git").exists() {
         return;
     }
-    let output = std::process::Command::new("git")
+    let output = tokio::process::Command::new("git")
         .args(["log", &format!("origin/{}..HEAD", task.branch), "--oneline"])
         .current_dir(wt)
-        .output();
+        .output()
+        .await;
     if let Ok(out) = output {
         if !out.stdout.is_empty() {
             let count = out.stdout.iter().filter(|&&b| b == b'\n').count();
@@ -884,7 +889,7 @@ async fn check_orphaned_worktrees(all_tasks: &[Task], findings: &mut Vec<Finding
                 Some(task) => {
                     if task.status == TaskStatus::Done && !task.worktree_cleaned {
                         // Check if worktree has uncommitted/unpushed work
-                        let has_work = worktree_has_work(Path::new(&wt_path), &task.branch);
+                        let has_work = worktree_has_work(Path::new(&wt_path), &task.branch).await;
                         if has_work {
                             // Don't auto-clean — there's work to save
                             findings.push(Finding {
@@ -975,24 +980,26 @@ async fn check_dead_review_session(
 }
 
 /// Check if a worktree has uncommitted changes or unpushed commits.
-fn worktree_has_work(wt: &Path, branch: &str) -> bool {
+async fn worktree_has_work(wt: &Path, branch: &str) -> bool {
     if !wt.join(".git").exists() {
         return false;
     }
-    let has_dirty = std::process::Command::new("git")
+    let has_dirty = tokio::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(wt)
         .output()
+        .await
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
     if has_dirty {
         return true;
     }
     if !branch.is_empty() {
-        let has_unpushed = std::process::Command::new("git")
+        let has_unpushed = tokio::process::Command::new("git")
             .args(["log", &format!("origin/{}..HEAD", branch), "--oneline"])
             .current_dir(wt)
             .output()
+            .await
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(false);
         if has_unpushed {
@@ -1040,7 +1047,7 @@ async fn apply_fixes(
                 }
 
                 // Commit all changes
-                let commit_ok = git_cmd(wt, &["add", "-A"])
+                let commit_ok = git_cmd(wt, &["add", "-A"]).await
                     && git_cmd(
                         wt,
                         &[
@@ -1048,7 +1055,8 @@ async fn apply_fixes(
                             "-m",
                             &format!("fix: recover orphaned work for #{}", f.task_id),
                         ],
-                    );
+                    )
+                    .await;
                 if !commit_ok {
                     eprintln!("  fix failed for #{}: git commit failed", f.task_id);
                     skipped += 1;
@@ -1056,7 +1064,7 @@ async fn apply_fixes(
                 }
 
                 // Push
-                if !git_cmd(wt, &["push", "-u", "origin", &task.branch]) {
+                if !git_cmd(wt, &["push", "-u", "origin", &task.branch]).await {
                     eprintln!("  fix failed for #{}: git push failed", f.task_id);
                     skipped += 1;
                     continue;
@@ -1135,7 +1143,7 @@ async fn apply_fixes(
                     continue;
                 }
 
-                if !git_cmd(wt, &["push", "-u", "origin", &task.branch]) {
+                if !git_cmd(wt, &["push", "-u", "origin", &task.branch]).await {
                     eprintln!("  fix failed for #{}: git push failed", f.task_id);
                     skipped += 1;
                     continue;
@@ -1668,11 +1676,12 @@ async fn create_pr_for_task(gh: &GhHttp, repo: &str, task: &Task) -> anyhow::Res
 }
 
 /// Run a git command in a worktree directory, returning success/failure.
-fn git_cmd(wt: &Path, args: &[&str]) -> bool {
-    std::process::Command::new("git")
+async fn git_cmd(wt: &Path, args: &[&str]) -> bool {
+    tokio::process::Command::new("git")
         .args(args)
         .current_dir(wt)
         .output()
+        .await
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
