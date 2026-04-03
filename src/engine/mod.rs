@@ -1658,7 +1658,14 @@ mod tests {
             .register_session("owner/repo", &task_id, &session_name)
             .await;
         transport
-            .bind(&task_id, &session_name, "telegram", "12345", None)
+            .bind(
+                "owner/repo",
+                &task_id,
+                &session_name,
+                "telegram",
+                "12345",
+                None,
+            )
             .await;
 
         // Spawn capture.run() which exits when session is unregistered
@@ -1667,7 +1674,7 @@ mod tests {
 
         // Subscribe to transport output for this task
         let mut rx = transport
-            .subscribe(&task_id)
+            .subscribe("owner/repo", &task_id)
             .await
             .expect("no subscription");
 
@@ -1699,7 +1706,7 @@ mod tests {
         }
 
         // Clean up: unregister and kill tmux session
-        capture.unregister_session(&task_id).await;
+        capture.unregister_session("owner/repo", &task_id).await;
         let _ = tokio::process::Command::new("tmux")
             .args(["kill-session", "-t", &session_name])
             .output()

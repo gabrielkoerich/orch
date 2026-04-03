@@ -19,6 +19,14 @@ mod channels {
     pub mod transport {
         use crate::channels::OutputChunk;
 
+        pub fn session_key(repo: &str, task_id: &str) -> String {
+            if task_id.starts_with("internal:") {
+                task_id.to_string()
+            } else {
+                format!("{repo}:{task_id}")
+            }
+        }
+
         #[derive(Debug)]
         pub struct Transport;
 
@@ -31,7 +39,7 @@ mod channels {
                 None
             }
 
-            pub async fn push_output(&self, _task_id: &str, _chunk: OutputChunk) {}
+            pub async fn push_output(&self, _repo: &str, _task_id: &str, _chunk: OutputChunk) {}
         }
     }
 }

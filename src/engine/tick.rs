@@ -98,7 +98,7 @@ pub(crate) async fn tick_check_session_completions(
             );
             // Unregister from capture service using the task id the capture service
             // was registered under (task id without project prefix).
-            capture.unregister_session(&session.task_id).await;
+            capture.unregister_session(repo, &session.task_id).await;
             // Kill the actual tmux session name we discovered (do not reconstruct)
             if let Err(e) = tmux.kill_session(&session.name).await {
                 tracing::debug!(
@@ -218,7 +218,7 @@ pub(crate) async fn tick_detect_silent_agents(
         }
 
         // 2. Unregister from capture
-        capture.unregister_session(&task_id).await;
+        capture.unregister_session(repo, &task_id).await;
 
         let mut extended_note = String::new();
 
@@ -1197,7 +1197,7 @@ pub(crate) async fn tick_dispatch_tasks(
             }
 
             // Unregister session from capture
-            capture.unregister_session(&task_id_for_cleanup).await;
+            capture.unregister_session(&repo_owned, &task_id_for_cleanup).await;
 
             // Release the semaphore permit
             drop(permit);

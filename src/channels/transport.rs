@@ -34,6 +34,36 @@ use tokio::sync::{broadcast, RwLock};
 
 const MAX_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Build a globally unique session key from `(repo, task_id)`.
+///
+/// External task IDs (e.g. `"42"` for GitHub issue #42) are only unique
+/// within a repo. Internal tasks (`"internal:<id>"`) are globally unique.
+/// This function prefixes external task IDs with the repo slug to avoid
+/// collisions across repos while keeping internal task keys unchanged.
+pub fn session_key(repo: &str, task_id: &str) -> String {
+    if task_id.starts_with("internal:") {
+        task_id.to_string()
+    } else {
+        format!("{repo}:{task_id}")
+    }
+}
+
+/// Parse a session key created by [`session_key`] back into `(repo, task_id)`.
+///
+/// Returns `None` if the key is malformed.
+pub fn parse_session_key(key: &str) -> Option<(&str, &str)> {
+    if key.starts_with("internal:") {
+        // Internal tasks don't have a repo component in the key.
+        // Callers that need repo must track it separately.
+        None
+    } else {
+        // Format is "repo:task_id" — repo itself may contain "/" but not ":"
+        // The first ":" separates repo from task_id.
+        let (repo, task_id) = key.split_once(':')?;
+        Some((repo, task_id))
+    }
+}
+
 /// A live connection between a channel thread and a tmux session.
 #[derive(Debug, Clone)]
 pub struct SessionBinding {
@@ -84,13 +114,13 @@ pub fn parse_conversation_key(key: &str) -> Option<(&str, &str, Option<&str>)> {
 
 /// The transport layer manages all session bindings and routes messages.
 pub struct Transport {
-    /// Active session bindings, keyed by task_id
+    /// Active session bindings, keyed by session_key(repo, task_id)
     bindings: Arc<RwLock<HashMap<String, SessionBinding>>>,
-    /// Reverse lookup: conversation_key → task_id
+    /// Reverse lookup: conversation_key → session_key(repo, task_id)
     thread_to_task: Arc<RwLock<HashMap<String, String>>>,
     /// Broadcast sender for task completion notifications
     notification_tx: broadcast::Sender<TaskNotification>,
-    /// Last seen output per task (for PTY-backed sessions)
+    /// Last seen output per session (for PTY-backed sessions)
     last_output: Arc<RwLock<HashMap<String, String>>>,
 }
 
@@ -107,11 +137,15 @@ impl Transport {
 
     /// Bind a channel thread to a task's tmux session.
     ///
+    /// `repo` is required to build a globally unique session key, preventing
+    /// collisions when multiple repos share the same external task ID.
+    ///
     /// `topic_id` should be set for topic-aware channels (Telegram forum topics,
     /// Discord threads) so that bindings for different topics inside the same
     /// parent chat / channel do not collide.
     pub async fn bind(
         &self,
+        repo: &str,
         task_id: &str,
         tmux_session: &str,
         channel: &str,
@@ -119,13 +153,14 @@ impl Transport {
         topic_id: Option<&str>,
     ) {
         let key = conversation_key(channel, thread_id, topic_id);
+        let skey = session_key(repo, task_id);
         // Clear stale output before updating bindings to avoid holding
         // write lock across await points (deadlock risk).
-        self.clear_output(task_id).await;
+        self.clear_output(&skey).await;
         // Update bindings synchronously (no await while lock held)
         {
             let mut bindings = self.bindings.write().await;
-            let binding = bindings.entry(task_id.to_string()).or_insert_with(|| {
+            let binding = bindings.entry(skey.clone()).or_insert_with(|| {
                 let (tx, _) = broadcast::channel(256);
                 SessionBinding {
                     tmux_session: tmux_session.to_string(),
@@ -140,23 +175,26 @@ impl Transport {
             }
         } // bindings lock released here
           // Update thread_to_task after releasing bindings lock
-        self.thread_to_task
-            .write()
-            .await
-            .insert(key, task_id.to_string());
+        self.thread_to_task.write().await.insert(key, skey);
     }
 
     /// Get the broadcast receiver for a task's output stream.
-    pub async fn subscribe(&self, task_id: &str) -> Option<broadcast::Receiver<OutputChunk>> {
+    pub async fn subscribe(
+        &self,
+        repo: &str,
+        task_id: &str,
+    ) -> Option<broadcast::Receiver<OutputChunk>> {
+        let skey = session_key(repo, task_id);
         let bindings = self.bindings.read().await;
-        bindings.get(task_id).map(|b| b.output_tx.subscribe())
+        bindings.get(&skey).map(|b| b.output_tx.subscribe())
     }
 
     /// Push an output chunk to all subscribers of a task.
-    pub async fn push_output(&self, task_id: &str, chunk: OutputChunk) {
+    pub async fn push_output(&self, repo: &str, task_id: &str, chunk: OutputChunk) {
+        let skey = session_key(repo, task_id);
         if chunk.content.is_empty() {
             let bindings = self.bindings.read().await;
-            if let Some(binding) = bindings.get(task_id) {
+            if let Some(binding) = bindings.get(&skey) {
                 let _ = binding.output_tx.send(chunk.clone());
             }
             return;
@@ -171,12 +209,12 @@ impl Transport {
                 is_final: chunk.is_final && idx == last_index,
             };
             let bindings = self.bindings.read().await;
-            if let Some(binding) = bindings.get(task_id) {
+            if let Some(binding) = bindings.get(&skey) {
                 let _ = binding.output_tx.send(part_chunk.clone());
             }
             if !part_chunk.content.is_empty() {
                 let mut last = self.last_output.write().await;
-                let entry = last.entry(task_id.to_string()).or_insert_with(String::new);
+                let entry = last.entry(skey.clone()).or_insert_with(String::new);
                 entry.push_str(&part_chunk.content);
             }
         }
@@ -187,25 +225,26 @@ impl Transport {
     /// When a task is rebound to a new tmux session (retry) the previous
     /// run's output must not be replayed. Call this when registering or
     /// rebinding sessions so stale output is discarded.
-    pub async fn clear_output(&self, task_id: &str) {
+    pub async fn clear_output(&self, session_key: &str) {
         let mut last = self.last_output.write().await;
-        last.remove(task_id);
+        last.remove(session_key);
     }
 
     /// Get the session binding for a specific task, if any.
-    pub async fn get_binding(&self, task_id: &str) -> Option<SessionBinding> {
-        self.bindings.read().await.get(task_id).cloned()
+    pub async fn get_binding(&self, repo: &str, task_id: &str) -> Option<SessionBinding> {
+        let skey = session_key(repo, task_id);
+        self.bindings.read().await.get(&skey).cloned()
     }
 
     /// Route an incoming message to the appropriate handler.
-    /// Returns the task_id if this message maps to an existing session.
+    /// Returns the session_key if this message maps to an existing session.
     pub async fn route(&self, msg: &IncomingMessage) -> MessageRoute {
         let key = conversation_key(&msg.channel, &msg.thread_id, msg.topic_id.as_deref());
 
         // Check if this thread is bound to a task
-        if let Some(task_id) = self.thread_to_task.read().await.get(&key) {
+        if let Some(session_key) = self.thread_to_task.read().await.get(&key) {
             return MessageRoute::TaskSession {
-                task_id: task_id.clone(),
+                session_key: session_key.clone(),
             };
         }
 
@@ -266,8 +305,9 @@ fn split_chunks(content: &str, max_bytes: usize) -> Vec<String> {
 /// How an incoming message should be handled.
 #[derive(Debug)]
 pub enum MessageRoute {
-    /// Message belongs to an existing task session — forward to tmux
-    TaskSession { task_id: String },
+    /// Message belongs to an existing task session — forward to tmux.
+    /// `session_key` is the globally unique key (repo:task_id or internal:id).
+    TaskSession { session_key: String },
     /// Message is a command (e.g. "/status", "orch task list")
     Command { raw: String },
     /// Message is in the configured control session channel — route to control agent
@@ -345,7 +385,14 @@ mod tests {
     async fn bind_and_route_to_session() {
         let transport = Transport::new();
         transport
-            .bind("42", "orch-myproject-42", "telegram", "12345", None)
+            .bind(
+                "owner/repo",
+                "42",
+                "orch-myproject-42",
+                "telegram",
+                "12345",
+                None,
+            )
             .await;
 
         let msg = IncomingMessage {
@@ -360,7 +407,9 @@ mod tests {
         };
 
         match transport.route(&msg).await {
-            MessageRoute::TaskSession { task_id } => assert_eq!(task_id, "42"),
+            MessageRoute::TaskSession { session_key } => {
+                assert_eq!(session_key, "owner/repo:42");
+            }
             _ => panic!("expected TaskSession"),
         }
     }
@@ -384,6 +433,111 @@ mod tests {
             MessageRoute::Command { raw } => assert_eq!(raw, "/status"),
             _ => panic!("expected Command"),
         }
+    }
+
+    // ── session_key ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn session_key_external_is_prefixed_with_repo() {
+        assert_eq!(session_key("owner/repo", "42"), "owner/repo:42");
+    }
+
+    #[test]
+    fn session_key_internal_is_unchanged() {
+        assert_eq!(session_key("owner/repo", "internal:99"), "internal:99");
+    }
+
+    #[test]
+    fn session_key_same_id_different_repos_are_unique() {
+        let k1 = session_key("owner/repo-a", "42");
+        let k2 = session_key("owner/repo-b", "42");
+        assert_ne!(k1, k2);
+        assert_eq!(k1, "owner/repo-a:42");
+        assert_eq!(k2, "owner/repo-b:42");
+    }
+
+    // ── cross-repo collision regression ──────────────────────────────────────
+
+    /// Two repos with the same external task ID must not collide in bindings.
+    #[tokio::test]
+    async fn same_external_id_different_repos_do_not_collide() {
+        let transport = Transport::new();
+
+        // Repo A binds task "42"
+        transport
+            .bind(
+                "owner/repo-a",
+                "42",
+                "orch-repo-a-42",
+                "telegram",
+                "111",
+                None,
+            )
+            .await;
+        // Repo B binds task "42" (same external ID, different repo)
+        transport
+            .bind(
+                "owner/repo-b",
+                "42",
+                "orch-repo-b-42",
+                "telegram",
+                "222",
+                None,
+            )
+            .await;
+
+        // Each binding has its own session
+        let binding_a = transport.get_binding("owner/repo-a", "42").await.unwrap();
+        let binding_b = transport.get_binding("owner/repo-b", "42").await.unwrap();
+        assert_eq!(binding_a.tmux_session, "orch-repo-a-42");
+        assert_eq!(binding_b.tmux_session, "orch-repo-b-42");
+        assert_ne!(binding_a.tmux_session, binding_b.tmux_session);
+    }
+
+    /// Same external task ID in two repos: pushing output to one must not
+    /// reach the other's subscribers.
+    #[tokio::test]
+    async fn push_output_isolated_across_repos_with_same_task_id() {
+        let transport = Transport::new();
+
+        // Subscribe to repo-a's task 42
+        transport
+            .bind("owner/repo-a", "42", "orch-a-42", "cli", "stream-a", None)
+            .await;
+        let mut rx_a = transport.subscribe("owner/repo-a", "42").await.unwrap();
+
+        // Subscribe to repo-b's task 42
+        transport
+            .bind("owner/repo-b", "42", "orch-b-42", "cli", "stream-b", None)
+            .await;
+        let mut rx_b = transport.subscribe("owner/repo-b", "42").await.unwrap();
+
+        // Push output to repo-a's task 42
+        transport
+            .push_output(
+                "owner/repo-a",
+                "42",
+                OutputChunk {
+                    content: "hello from repo-a".to_string(),
+                    is_final: false,
+                },
+            )
+            .await;
+
+        // repo-a receives it
+        let chunk_a = tokio::time::timeout(std::time::Duration::from_millis(100), rx_a.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk_a.content, "hello from repo-a");
+
+        // repo-b should NOT receive anything (timeout)
+        let result_b =
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx_b.recv()).await;
+        assert!(
+            result_b.is_err(),
+            "repo-b should not receive repo-a's output"
+        );
     }
 
     // ── conversation_key ──────────────────────────────────────────────────────
@@ -459,11 +613,25 @@ mod tests {
 
         // Task 10 is in topic 100 of chat 999
         transport
-            .bind("10", "orch-proj-10", "telegram", "999", Some("100"))
+            .bind(
+                "owner/repo",
+                "10",
+                "orch-proj-10",
+                "telegram",
+                "999",
+                Some("100"),
+            )
             .await;
         // Task 20 is in topic 200 of the same chat 999
         transport
-            .bind("20", "orch-proj-20", "telegram", "999", Some("200"))
+            .bind(
+                "owner/repo",
+                "20",
+                "orch-proj-20",
+                "telegram",
+                "999",
+                Some("200"),
+            )
             .await;
 
         let msg_topic_100 = IncomingMessage {
@@ -489,12 +657,16 @@ mod tests {
         };
 
         match transport.route(&msg_topic_100).await {
-            MessageRoute::TaskSession { task_id } => assert_eq!(task_id, "10"),
+            MessageRoute::TaskSession { session_key } => {
+                assert_eq!(session_key, "owner/repo:10");
+            }
             other => panic!("expected TaskSession for task 10, got {other:?}"),
         }
 
         match transport.route(&msg_topic_200).await {
-            MessageRoute::TaskSession { task_id } => assert_eq!(task_id, "20"),
+            MessageRoute::TaskSession { session_key } => {
+                assert_eq!(session_key, "owner/repo:20");
+            }
             other => panic!("expected TaskSession for task 20, got {other:?}"),
         }
     }
@@ -507,7 +679,14 @@ mod tests {
 
         // Task 5 bound to topic 10 of chat 42
         transport
-            .bind("5", "orch-proj-5", "telegram", "42", Some("10"))
+            .bind(
+                "owner/repo",
+                "5",
+                "orch-proj-5",
+                "telegram",
+                "42",
+                Some("10"),
+            )
             .await;
 
         // Message arrives in topic 99 of the same chat — should NOT route to task 5
@@ -524,8 +703,8 @@ mod tests {
 
         match transport.route(&msg).await {
             MessageRoute::NewTask => {} // correct — not routed to task 5
-            MessageRoute::TaskSession { task_id } => {
-                panic!("should not have routed to task {task_id}")
+            MessageRoute::TaskSession { session_key } => {
+                panic!("should not have routed to session {session_key}")
             }
             other => panic!("unexpected route result: {other:?}"),
         }

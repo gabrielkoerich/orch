@@ -10,7 +10,7 @@
 //! when they complete.
 
 use crate::channels::tmux;
-use crate::channels::transport::Transport;
+use crate::channels::transport::{session_key, Transport};
 use crate::channels::OutputChunk;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -52,7 +52,7 @@ pub struct OutputBuffer {
 
 /// Service that captures tmux pane output and broadcasts to transport.
 pub struct CaptureService {
-    /// Session buffers keyed by task_id
+    /// Session buffers keyed by session_key(repo, task_id)
     buffers: Arc<RwLock<HashMap<String, OutputBuffer>>>,
     /// Transport layer for broadcasting output
     transport: Arc<Transport>,
@@ -73,6 +73,7 @@ impl CaptureService {
     /// Register a session to be tracked.
     pub async fn register_session(&self, repo: &str, task_id: &str, session: &str) {
         let now = Utc::now();
+        let skey = session_key(repo, task_id);
         let buffer = OutputBuffer {
             repo: repo.to_string(),
             session: session.to_string(),
@@ -85,16 +86,14 @@ impl CaptureService {
             registered_at: now,
             has_output: false,
         };
-        self.buffers
-            .write()
-            .await
-            .insert(task_id.to_string(), buffer);
+        self.buffers.write().await.insert(skey, buffer);
         tracing::debug!(repo, task_id, session, "session registered for capture");
     }
 
     /// Unregister a session (stop tracking).
-    pub async fn unregister_session(&self, task_id: &str) {
-        if let Some(buffer) = self.buffers.write().await.remove(task_id) {
+    pub async fn unregister_session(&self, repo: &str, task_id: &str) {
+        let skey = session_key(repo, task_id);
+        if let Some(buffer) = self.buffers.write().await.remove(&skey) {
             tracing::debug!(
                 repo = buffer.repo,
                 task_id = buffer.task_id,
@@ -175,14 +174,14 @@ impl CaptureService {
     /// Run one tick of the capture loop.
     async fn tick(&self) {
         let buffers = self.buffers.read().await;
-        let task_ids: Vec<String> = buffers.keys().cloned().collect();
+        let session_keys: Vec<String> = buffers.keys().cloned().collect();
         drop(buffers);
 
-        for task_id in task_ids {
+        for skey in session_keys {
             // Get buffer (reborrow for each iteration)
             let buffer = {
                 let buffers = self.buffers.read().await;
-                buffers.get(&task_id).cloned()
+                buffers.get(&skey).cloned()
             };
 
             if let Some(buffer) = buffer {
@@ -196,7 +195,7 @@ impl CaptureService {
                         // and session creation).
                         if buffer.seen_alive && tmux::is_session_dead(&buffer.session).await {
                             tracing::info!(
-                                task_id,
+                                task_id = buffer.task_id,
                                 session = buffer.session,
                                 "session ended, sending final chunk"
                             );
@@ -204,11 +203,13 @@ impl CaptureService {
                                 content: String::new(),
                                 is_final: true,
                             };
-                            self.transport.push_output(&task_id, chunk).await;
-                            self.unregister_session(&task_id).await;
+                            self.transport
+                                .push_output(&buffer.repo, &buffer.task_id, chunk)
+                                .await;
+                            self.unregister_session(&buffer.repo, &buffer.task_id).await;
                         } else {
                             tracing::trace!(
-                                task_id,
+                                task_id = buffer.task_id,
                                 session = buffer.session,
                                 ?e,
                                 "capture failed (transient)"
@@ -220,7 +221,7 @@ impl CaptureService {
 
                 let new_content = {
                     let mut buffers = self.buffers.write().await;
-                    if let Some(buf) = buffers.get_mut(&task_id) {
+                    if let Some(buf) = buffers.get_mut(&skey) {
                         buf.seen_alive = true;
                         buf.diff_and_update(&current_content)
                     } else {
@@ -233,7 +234,9 @@ impl CaptureService {
                         content: new_content,
                         is_final: false,
                     };
-                    self.transport.push_output(&task_id, chunk).await;
+                    self.transport
+                        .push_output(&buffer.repo, &buffer.task_id, chunk)
+                        .await;
                 }
             }
         }
@@ -413,8 +416,9 @@ mod tests {
         svc.register_session(repo, "silent-task", "orch-test-silent")
             .await;
         {
+            let skey = session_key(repo, "silent-task");
             let mut buffers = svc.buffers.write().await;
-            let buf = buffers.get_mut("silent-task").unwrap();
+            let buf = buffers.get_mut(&skey).unwrap();
             buf.registered_at = Utc::now() - chrono::Duration::seconds(200);
         }
 
@@ -422,8 +426,9 @@ mod tests {
         svc.register_session(repo, "active-task", "orch-test-active")
             .await;
         {
+            let skey = session_key(repo, "active-task");
             let mut buffers = svc.buffers.write().await;
-            let buf = buffers.get_mut("active-task").unwrap();
+            let buf = buffers.get_mut(&skey).unwrap();
             buf.registered_at = Utc::now() - chrono::Duration::seconds(200);
             buf.has_output = true;
         }
@@ -448,10 +453,12 @@ mod tests {
         svc.register_session("owner/repo-b", "task-b", "orch-b")
             .await;
         {
+            let skey_a = session_key("owner/repo-a", "task-a");
+            let skey_b = session_key("owner/repo-b", "task-b");
             let mut buffers = svc.buffers.write().await;
-            let buf_a = buffers.get_mut("task-a").unwrap();
+            let buf_a = buffers.get_mut(&skey_a).unwrap();
             buf_a.registered_at = Utc::now() - chrono::Duration::seconds(200);
-            let buf_b = buffers.get_mut("task-b").unwrap();
+            let buf_b = buffers.get_mut(&skey_b).unwrap();
             buf_b.registered_at = Utc::now() - chrono::Duration::seconds(200);
         }
 
@@ -467,6 +474,31 @@ mod tests {
             .await;
         assert_eq!(silent_b.len(), 1);
         assert_eq!(silent_b[0].0, "task-b");
+    }
+
+    /// Same external task ID in two repos must not collide in capture buffers.
+    #[tokio::test]
+    async fn same_task_id_different_repos_capture_buffers_isolated() {
+        let transport = Arc::new(Transport::new());
+        let svc = CaptureService::new(transport);
+
+        svc.register_session("owner/repo-a", "42", "orch-a-42")
+            .await;
+        svc.register_session("owner/repo-b", "42", "orch-b-42")
+            .await;
+
+        let skey_a = session_key("owner/repo-a", "42");
+        let skey_b = session_key("owner/repo-b", "42");
+
+        let buffers = svc.buffers.read().await;
+        let buf_a = buffers.get(&skey_a).unwrap();
+        let buf_b = buffers.get(&skey_b).unwrap();
+
+        assert_eq!(buf_a.session, "orch-a-42");
+        assert_eq!(buf_b.session, "orch-b-42");
+        assert_ne!(buf_a.session, buf_b.session);
+        assert_eq!(buf_a.repo, "owner/repo-a");
+        assert_eq!(buf_b.repo, "owner/repo-b");
     }
 
     #[test]

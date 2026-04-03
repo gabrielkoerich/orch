@@ -104,11 +104,12 @@ async fn send_to_thread(
 /// This function should be spawned as a background task when a channel
 /// thread is bound to an agent session.
 pub async fn fanout_output(
+    repo: String,
     task_id: String,
     transport: Arc<Transport>,
     channels: Arc<ChannelRegistry>,
 ) {
-    let mut rx = match transport.subscribe(&task_id).await {
+    let mut rx = match transport.subscribe(&repo, &task_id).await {
         Some(r) => r,
         None => {
             tracing::debug!(task_id, "fanout: no binding for task, cannot subscribe");
@@ -131,7 +132,7 @@ pub async fn fanout_output(
 
                 if !chunk.content.is_empty() {
                     // Look up current binding to find connected threads
-                    if let Some(binding) = transport.get_binding(&task_id).await {
+                    if let Some(binding) = transport.get_binding(&repo, &task_id).await {
                         let now = Instant::now();
 
                         for thread_key in &binding.connected_threads {
@@ -172,7 +173,7 @@ pub async fn fanout_output(
 
                 if is_final {
                     // Flush all remaining buffers immediately regardless of rate limits
-                    if let Some(_binding) = transport.get_binding(&task_id).await {
+                    if let Some(_binding) = transport.get_binding(&repo, &task_id).await {
                         // Drain buffers map and send everything
                         for (thread_key, buffered) in buffers.drain() {
                             if buffered.is_empty() {
@@ -241,7 +242,7 @@ pub async fn fanout_output(
                 tokio::time::sleep(sleep_dur).await;
 
                 // After waiting, attempt to flush any buffers whose rate limit expired
-                if let Some(_binding) = transport.get_binding(&task_id).await {
+                if let Some(_binding) = transport.get_binding(&repo, &task_id).await {
                     let now = Instant::now();
                     // Collect keys to flush to avoid borrowing issues
                     let keys: Vec<String> = buffers.keys().cloned().collect();
@@ -369,17 +370,26 @@ mod tests {
 
         // Bind a task to the channel:thread so fanout knows where to send
         let task_id = "fanout-test-task";
+        let repo = "owner/test-repo";
         transport
-            .bind(task_id, "orch-fanout-test", "telegram", "thread-1", None)
+            .bind(
+                repo,
+                task_id,
+                "orch-fanout-test",
+                "telegram",
+                "thread-1",
+                None,
+            )
             .await;
 
         // Spawn the fanout_output task
         let transport_clone = transport.clone();
         let registry_clone = registry.clone();
         let task_id_str = task_id.to_string();
-        tokio::spawn(
-            async move { fanout_output(task_id_str, transport_clone, registry_clone).await },
-        );
+        let repo_str = repo.to_string();
+        tokio::spawn(async move {
+            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await
+        });
 
         // Give fanout time to subscribe to the broadcast
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -387,6 +397,7 @@ mod tests {
         // Push some output into the transport; the fanout should forward it
         transport
             .push_output(
+                repo,
                 task_id,
                 crate::channels::OutputChunk {
                     content: "hello from agent".to_string(),
@@ -398,6 +409,7 @@ mod tests {
         // Push a final chunk to force flush
         transport
             .push_output(
+                repo,
                 task_id,
                 crate::channels::OutputChunk {
                     content: "".to_string(),
@@ -446,9 +458,11 @@ mod tests {
         let registry = std::sync::Arc::new(registry);
 
         let task_id = "topic-forward-task";
+        let repo = "owner/test-repo";
         // Bind with a specific topic_id
         transport
             .bind(
+                repo,
                 task_id,
                 "orch-topic-test",
                 "telegram",
@@ -460,14 +474,16 @@ mod tests {
         let transport_clone = transport.clone();
         let registry_clone = registry.clone();
         let task_id_str = task_id.to_string();
-        tokio::spawn(
-            async move { fanout_output(task_id_str, transport_clone, registry_clone).await },
-        );
+        let repo_str = repo.to_string();
+        tokio::spawn(async move {
+            fanout_output(repo_str, task_id_str, transport_clone, registry_clone).await
+        });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         transport
             .push_output(
+                repo,
                 task_id,
                 crate::channels::OutputChunk {
                     content: "topic reply".to_string(),

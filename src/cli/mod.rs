@@ -388,7 +388,7 @@ pub async fn stream_task(task_id: &str, raw: bool) -> anyhow::Result<()> {
     let repo = crate::config::get_current_repo().unwrap_or_default();
     let session_name = tmux.session_name(&repo, task_id);
     transport
-        .bind(task_id, &session_name, "cli", "stream", None)
+        .bind(&repo, task_id, &session_name, "cli", "stream", None)
         .await;
 
     // Start a CaptureService to poll the tmux session and push chunks to transport.
@@ -402,7 +402,7 @@ pub async fn stream_task(task_id: &str, raw: bool) -> anyhow::Result<()> {
         async move { capture.run().await }
     });
 
-    let mut rx = match transport.subscribe(task_id).await {
+    let mut rx = match transport.subscribe(&repo, task_id).await {
         Some(rx) => rx,
         None => {
             capture_handle.abort();
@@ -443,7 +443,7 @@ pub async fn stream_task(task_id: &str, raw: bool) -> anyhow::Result<()> {
     }
 
     // Clean up: unregister and stop capture
-    capture.unregister_session(task_id).await;
+    capture.unregister_session(&repo, task_id).await;
     capture_handle.abort();
 
     Ok(())
@@ -491,7 +491,7 @@ pub async fn stream_all(raw: bool) -> anyhow::Result<()> {
                     }
                     // Use session name as the task key (unique, descriptive)
                     transport
-                        .bind(&session, &session, "cli", "stream-all", None)
+                        .bind("cli", &session, &session, "cli", "stream-all", None)
                         .await;
                     capture.register_session("cli", &session, &session).await;
                     known.insert(session.clone());

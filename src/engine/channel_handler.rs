@@ -154,8 +154,13 @@ pub(super) async fn send_channel_reply(
 }
 
 /// Forward a text message to an agent's tmux session via send-keys.
-pub(super) async fn forward_to_tmux(transport: &Arc<Transport>, task_id: &str, text: &str) {
-    if let Some(binding) = transport.get_binding(task_id).await {
+pub(super) async fn forward_to_tmux(
+    transport: &Arc<Transport>,
+    repo: &str,
+    task_id: &str,
+    text: &str,
+) {
+    if let Some(binding) = transport.get_binding(repo, task_id).await {
         if let Err(e) = crate::channels::tmux::send_keys(&binding.tmux_session, text).await {
             tracing::warn!(
                 task_id,
@@ -280,7 +285,7 @@ async fn create_and_announce_task(
             };
             let session_name = tmux.session_name(repo, &task_id);
             transport
-                .bind(&task_id, &session_name, channel, thread_id, topic_id)
+                .bind(repo, &task_id, &session_name, channel, thread_id, topic_id)
                 .await;
             capture
                 .register_session(repo, &task_id, &session_name)
@@ -288,8 +293,9 @@ async fn create_and_announce_task(
             let transport_clone = transport.clone();
             let channels_clone = channels.clone();
             let task_id_clone = task_id.clone();
+            let repo_clone = repo.to_string();
             tokio::spawn(async move {
-                fanout_output(task_id_clone, transport_clone, channels_clone).await;
+                fanout_output(repo_clone, task_id_clone, transport_clone, channels_clone).await;
             });
             // Always show project label (caller sets forced_repo when project isn't obvious)
             let project_label = format!(" in [{repo}]");
@@ -345,10 +351,21 @@ pub(super) async fn handle_channel_message(
     let route = normalize_channel_route(&msg, transport.route(&msg).await, is_control);
 
     match route {
-        MessageRoute::TaskSession { task_id } => {
+        MessageRoute::TaskSession { session_key } => {
             let body = msg.body.trim().to_string();
             let channel = msg.channel.clone();
             let thread_id = msg.thread_id.clone();
+
+            // Derive repo and task_id from the session key.
+            // For external tasks the key is "repo:task_id"; for internal tasks
+            // it is "internal:<id>" and we fall back to resolved_repo.
+            let (repo, task_id): (&str, &str) =
+                if let Some((r, t)) = crate::channels::transport::parse_session_key(&session_key) {
+                    (r, t)
+                } else {
+                    // Internal task or unparseable key — use resolved_repo
+                    (resolved_repo.unwrap_or(""), &session_key)
+                };
 
             if body.starts_with('/') {
                 // Parse slash command and execute it on the bound task
@@ -360,11 +377,9 @@ pub(super) async fn handle_channel_message(
                     let repos: Vec<&str> =
                         engine_refs.iter().map(|(r, _, _, _)| r.as_str()).collect();
                     let idx = transport
-                        .get_binding(&task_id)
+                        .get_binding(repo, task_id)
                         .await
-                        .map(|b| {
-                            engine_ref_idx_for_session(&repos, tmux, &task_id, &b.tmux_session)
-                        })
+                        .map(|b| engine_ref_idx_for_session(&repos, tmux, task_id, &b.tmux_session))
                         .unwrap_or(0);
                     if let Some((repo, backend, task_manager, store)) = engine_refs.get(idx) {
                         let gh = match GhHttp::new() {
@@ -382,7 +397,7 @@ pub(super) async fn handle_channel_message(
                                 return;
                             }
                         };
-                        let ext_id = ExternalId(task_id.clone());
+                        let ext_id = ExternalId(task_id.to_string());
                         let result =
                             execute_command(backend, &gh, repo, &ext_id, &cmd, store, task_manager)
                                 .await;
@@ -401,11 +416,11 @@ pub(super) async fn handle_channel_message(
                     }
                 } else {
                     // Unknown command — forward to agent as-is
-                    forward_to_tmux(transport, &task_id, &body).await;
+                    forward_to_tmux(transport, repo, task_id, &body).await;
                 }
             } else {
                 // Regular message — forward to the agent's tmux session
-                forward_to_tmux(transport, &task_id, &body).await;
+                forward_to_tmux(transport, repo, task_id, &body).await;
             }
         }
 
@@ -476,6 +491,7 @@ pub(super) async fn handle_channel_message(
                     &thread_id,
                     msg_topic_id.as_deref(),
                     transport,
+                    engine_refs,
                 )
                 .await;
                 send_channel_reply(
@@ -875,6 +891,7 @@ pub(super) async fn handle_stream_command(
     thread_id: &str,
     topic_id: Option<&str>,
     transport: &Arc<Transport>,
+    engine_refs: &[EngineRef],
 ) -> String {
     let parts: Vec<&str> = cmd_str.splitn(2, ' ').collect();
     if parts.len() < 2 || parts[1].trim().is_empty() {
@@ -883,11 +900,28 @@ pub(super) async fn handle_stream_command(
     let task_id = parts[1].trim();
 
     // Check if the task has an active binding (i.e. is running)
-    if let Some(binding) = transport.get_binding(task_id).await {
+    // Try all known repos to find the binding
+    let repos: Vec<&str> = engine_refs.iter().map(|(r, _, _, _)| r.as_str()).collect();
+    let mut found = None;
+    for repo in &repos {
+        if let Some(binding) = transport.get_binding(repo, task_id).await {
+            found = Some((repo.to_string(), binding));
+            break;
+        }
+    }
+
+    if let Some((repo, binding)) = found {
         // Bind this channel/thread as an additional output target
         // The session name is retrieved from the existing binding
         transport
-            .bind(task_id, &binding.tmux_session, channel, thread_id, topic_id)
+            .bind(
+                &repo,
+                task_id,
+                &binding.tmux_session,
+                channel,
+                thread_id,
+                topic_id,
+            )
             .await;
         format!("Streaming output from task `{task_id}` to this channel.")
     } else {
