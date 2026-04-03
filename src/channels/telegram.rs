@@ -26,6 +26,13 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn is_preformatted_html(msg: &OutgoingMessage) -> bool {
+    msg.metadata
+        .get("preformatted_html")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 pub struct TelegramChannel {
     pub token: String,
     pub client: Client,
@@ -427,11 +434,7 @@ impl Channel for TelegramChannel {
 
         // Check if body is already pre-formatted HTML (e.g. TaskNotification::format_telegram)
         // or raw text that needs escaping (e.g. streamed agent output).
-        let preformatted = msg
-            .metadata
-            .get("preformatted_html")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let preformatted = is_preformatted_html(msg);
 
         if preformatted {
             self.send_formatted_message(chat_id, &msg.body, topic_id)
@@ -457,5 +460,45 @@ impl Channel for TelegramChannel {
 
         tracing::info!("telegram bot health check passed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn html_escape_escapes_telegram_html_entities() {
+        assert_eq!(
+            html_escape("a < b && c > d"),
+            "a &lt; b &amp;&amp; c &gt; d"
+        );
+    }
+
+    #[test]
+    fn preformatted_html_defaults_to_false() {
+        let msg = OutgoingMessage {
+            thread_id: "thread".to_string(),
+            body: "raw <text>".to_string(),
+            reply_to: None,
+            metadata: serde_json::Value::Null,
+            topic_id: None,
+        };
+
+        assert!(!is_preformatted_html(&msg));
+    }
+
+    #[test]
+    fn preformatted_html_honors_metadata_flag() {
+        let msg = OutgoingMessage {
+            thread_id: "thread".to_string(),
+            body: "<b>formatted</b>".to_string(),
+            reply_to: None,
+            metadata: json!({ "preformatted_html": true }),
+            topic_id: None,
+        };
+
+        assert!(is_preformatted_html(&msg));
     }
 }
