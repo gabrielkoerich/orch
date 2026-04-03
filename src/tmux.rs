@@ -139,7 +139,11 @@ impl TmuxManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!(session, %stderr, "kill-session failed (may already be dead)");
+            if stderr.contains("can't find session") || stderr.contains("no server running") {
+                tracing::debug!(session, %stderr, "kill-session: session already gone");
+            } else {
+                tracing::warn!(session, %stderr, "kill-session failed unexpectedly");
+            }
         }
         Ok(())
     }
