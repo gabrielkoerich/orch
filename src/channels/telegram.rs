@@ -10,7 +10,8 @@ use serde::Deserialize;
 use std::time::Duration;
 
 const TELEGRAM_LONG_POLL_TIMEOUT_SECS: u64 = 30;
-const TELEGRAM_HTTP_TIMEOUT_SECS: u64 = TELEGRAM_LONG_POLL_TIMEOUT_SECS + 5;
+const TELEGRAM_HTTP_TIMEOUT_SECS: u64 = TELEGRAM_LONG_POLL_TIMEOUT_SECS + 15;
+const TELEGRAM_MAX_RETRIES: u32 = 3;
 const _: () = assert!(TELEGRAM_HTTP_TIMEOUT_SECS > TELEGRAM_LONG_POLL_TIMEOUT_SECS);
 
 pub struct TelegramChannel {
@@ -92,20 +93,43 @@ impl TelegramChannel {
             "allowed_updates": ["message", "callback_query"]
         });
 
-        let response = self.client.post(&url).json(&params).send().await?;
+        let mut last_err = None;
+        for attempt in 0..TELEGRAM_MAX_RETRIES {
+            let response = match self.client.post(&url).json(&params).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < TELEGRAM_MAX_RETRIES {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "telegram getUpdates failed after {} attempts: {:?}",
+                        TELEGRAM_MAX_RETRIES,
+                        last_err.unwrap()
+                    );
+                }
+            };
 
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("telegram API error: {}", body);
+            if !response.status().is_success() {
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("telegram API error: {}", body);
+            }
+
+            let updates: GetUpdatesResponse = response.json().await?;
+
+            if !updates.ok {
+                anyhow::bail!("telegram API returned ok=false");
+            }
+
+            return Ok(updates.result);
         }
 
-        let updates: GetUpdatesResponse = response.json().await?;
-
-        if !updates.ok {
-            anyhow::bail!("telegram API returned ok=false");
-        }
-
-        Ok(updates.result)
+        anyhow::bail!(
+            "telegram getUpdates failed after {} attempts: {:?}",
+            TELEGRAM_MAX_RETRIES,
+            last_err.unwrap()
+        );
     }
 
     async fn send_message(
