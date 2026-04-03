@@ -723,6 +723,30 @@ pub(crate) fn is_transient_github_error(err_str: &str) -> bool {
     false
 }
 
+/// Returns true when an error looks like a transient *GitHub API/CLI* failure.
+///
+/// This is stricter than [`is_transient_github_error`]: in addition to matching
+/// a transient transport pattern, it requires GitHub-specific context in the
+/// message. This prevents generic agent/runtime transport failures (for
+/// example "broken pipe" from a model stream disconnect) from being treated as
+/// GitHub retry signals in review reroute logic.
+pub(crate) fn is_transient_github_api_error(err_str: &str) -> bool {
+    if !is_transient_github_error(err_str) {
+        return false;
+    }
+
+    if extract_github_http_status(err_str).is_some() {
+        return true;
+    }
+
+    let lower = err_str.to_lowercase();
+    lower.contains("github")
+        || lower.contains("api.github.com")
+        || lower.contains("gh api")
+        || lower.contains("gh pr")
+        || lower.contains("gh error")
+}
+
 /// Extract the HTTP status code from a GhHttp error string.
 ///
 /// GhHttp formats errors as: `"GitHub API POST https://... failed (NNN): body"`
@@ -1063,6 +1087,19 @@ mod tests {
         assert!(!is_transient_github_error("invalid argument"));
         assert!(!is_transient_github_error("authentication failed"));
         assert!(!is_transient_github_error("bad credentials"));
+    }
+
+    #[test]
+    fn is_transient_github_api_error_requires_github_context() {
+        assert!(is_transient_github_api_error(
+            "GitHub API POST https://api.github.com/repos/foo/bar/pulls failed (502): Bad Gateway"
+        ));
+        assert!(is_transient_github_api_error(
+            "gh error: transport error: connection reset by peer"
+        ));
+        assert!(!is_transient_github_api_error(
+            "codex failed: Reconnecting... (stream disconnected before completion: Broken pipe)"
+        ));
     }
 
     #[tokio::test]
