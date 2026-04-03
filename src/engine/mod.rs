@@ -51,7 +51,7 @@ use crate::channels::{Channel, ChannelRegistry, IncomingMessage, OutgoingMessage
 use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine::cleanup::remove_worktree_and_branch;
-use crate::engine::router::Router;
+use crate::engine::router::{Router, RouterConfig};
 use crate::engine::runner::worktree::{
     abort_worktree_rebase, list_project_worktrees, rebase_worktree_on_origin_main,
     task_id_from_worktree_name, validate_worktree_gitdir,
@@ -1085,13 +1085,21 @@ pub async fn serve() -> anyhow::Result<()> {
     // Router::from_config() may run `opencode models` (a blocking subprocess) to
     // discover free models. Wrapping in spawn_blocking keeps the Tokio runtime
     // thread free during that I/O.
+    // NOTE: Router::new() also calls prime_free_model_cache() (another blocking
+    // subprocess), so the fallback must also run inside spawn_blocking.
     let router = Arc::new(RwLock::new(
-        tokio::task::spawn_blocking(Router::from_config)
-            .await
-            .unwrap_or_else(|e| {
+        match tokio::task::spawn_blocking(Router::from_config).await {
+            Ok(r) => r,
+            Err(e) => {
                 tracing::error!(?e, "router init panicked in spawn_blocking, using default");
-                Router::from_config()
-            }),
+                tokio::task::spawn_blocking(|| Router::new(RouterConfig::default()))
+                    .await
+                    .unwrap_or_else(|e2| {
+                        tracing::error!(?e2, "router default init also panicked in spawn_blocking");
+                        Router::new(RouterConfig::default())
+                    })
+            }
+        },
     ));
     {
         let r = router.read().await;
