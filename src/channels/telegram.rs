@@ -112,20 +112,17 @@ impl TelegramChannel {
             "allowed_updates": ["message", "callback_query"]
         });
 
-        let mut last_err = None;
         for attempt in 0..TELEGRAM_MAX_RETRIES {
             let response = match self.client.post(&url).json(&params).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    last_err = Some(e);
                     if attempt + 1 < TELEGRAM_MAX_RETRIES {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
                     anyhow::bail!(
-                        "telegram getUpdates failed after {} attempts: {:?}",
+                        "telegram getUpdates failed after {} attempts: {e}",
                         TELEGRAM_MAX_RETRIES,
-                        last_err.unwrap()
                     );
                 }
             };
@@ -145,9 +142,8 @@ impl TelegramChannel {
         }
 
         anyhow::bail!(
-            "telegram getUpdates failed after {} attempts: {:?}",
+            "telegram getUpdates failed after {} attempts",
             TELEGRAM_MAX_RETRIES,
-            last_err.unwrap()
         );
     }
 
