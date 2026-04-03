@@ -376,6 +376,14 @@ pub async fn handle_success(
 
     let push_failed = !has_pushed && has_commits && stored_last_error.contains("push failed");
 
+    // Detect workflow scope errors — these are non-retryable token permission issues.
+    // Rerouting to a different agent won't help since the same token is used.
+    let is_workflow_scope_failure = push_failed
+        && (stored_last_error.contains("workflow` scope")
+            || stored_last_error.contains("workflow' scope")
+            || (stored_last_error.contains("refusing to allow")
+                && stored_last_error.contains("workflow")));
+
     // Determine whether this external task can be marked done without a PR.
     // External tasks with code-related labels must have a merged PR before
     // reaching `done`. Tasks with non-code labels (from the allowlist) may
@@ -386,7 +394,33 @@ pub async fn handle_success(
         && !resp.status.starts_with("needs_review")
         && !is_non_code_task(&resp);
 
-    let final_status = if push_failed {
+    let final_status = if is_workflow_scope_failure {
+        // Workflow scope errors are non-retryable — the token lacks the `workflow`
+        // OAuth scope. Rerouting won't help since all agents use the same token.
+        // Block immediately with actionable guidance.
+        tracing::error!(
+            task_id,
+            "push failed: token lacks `workflow` OAuth scope — blocking immediately \
+             (rerouting would not help)"
+        );
+        store::store_set(
+            store,
+            repo,
+            task_id,
+            &[(
+                "last_error",
+                serde_json::json!(format!(
+                    "push failed: GitHub token lacks `workflow` OAuth scope. \
+                     The agent modified .github/workflows/ files but the token cannot push them. \
+                     Fix: add `workflow` scope to your GitHub token, or use a GitHub App for auth. \
+                     Original error: {}",
+                    stored_last_error
+                )),
+            )],
+        )
+        .await;
+        "blocked"
+    } else if push_failed {
         // Use atomic increment helper to avoid a read-increment-write race.
         let push_failures = store::store_increment(store, repo, task_id, "push_failures").await;
 
