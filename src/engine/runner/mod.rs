@@ -228,8 +228,10 @@ pub struct TaskRunner {
 
 impl TaskRunner {
     pub fn new(repo: String) -> Self {
-        let orch_home =
-            crate::home::orch_home().unwrap_or_else(|_| PathBuf::from("/tmp").join(".orch"));
+        let orch_home = crate::home::orch_home().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "orch_home() failed — falling back to /tmp/.orch");
+            PathBuf::from("/tmp").join(".orch")
+        });
 
         Self {
             repo,
