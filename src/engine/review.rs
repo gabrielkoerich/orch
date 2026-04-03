@@ -478,8 +478,9 @@ async fn ensure_pr_exists(
                                     "failed to run gh pr create"
                                 );
                                 let e_str = format!("{e}");
-                                if crate::engine::runner::git_ops::is_transient_github_api_error(&e_str)
-                                {
+                                if crate::engine::runner::git_ops::is_transient_github_api_error(
+                                    &e_str,
+                                ) {
                                     tracing::warn!(
                                         task_id = task.id.0,
                                         branch = %branch_name,
