@@ -800,11 +800,16 @@ pub async fn serve() -> anyhow::Result<()> {
                                         "slack" => notification.format_slack(),
                                         _ => continue,
                                     };
+                                    let metadata = if ch_name == "telegram" {
+                                        serde_json::json!({"preformatted_html": true})
+                                    } else {
+                                        serde_json::json!({})
+                                    };
                                     let msg = OutgoingMessage {
                                         thread_id: notification.task_id.clone(),
                                         body,
                                         reply_to: None,
-                                        metadata: serde_json::json!({}),
+                                        metadata,
                                         topic_id: Some(topic_id.to_string()),
                                     };
                                     if let Err(e) = channel.send(&msg).await {
@@ -831,11 +836,16 @@ pub async fn serve() -> anyhow::Result<()> {
                                                 continue;
                                             };
                                             let body = notification.format_with_project(&ch_name);
+                                            let metadata = if ch_name == "telegram" {
+                                                serde_json::json!({"preformatted_html": true})
+                                            } else {
+                                                serde_json::json!({})
+                                            };
                                             let msg = OutgoingMessage {
                                                 thread_id: thread_id.clone(),
                                                 body,
                                                 reply_to: None,
-                                                metadata: serde_json::json!({}),
+                                                metadata,
                                                 topic_id: None,
                                             };
                                             if let Err(e) = channel.send(&msg).await {
@@ -864,24 +874,29 @@ pub async fn serve() -> anyhow::Result<()> {
                         // 3. Fallback: broadcast to all channels when no routing happened.
                         if !routed {
                             for channel in channels.iter() {
-                                let (body, should_send) = match channel.name() {
-                                    "telegram" => (notification.format_telegram(), true),
-                                    "discord" => (notification.format_discord(), true),
-                                    "slack" => (notification.format_slack(), true),
+                                let (body, should_send, is_telegram) = match channel.name() {
+                                    "telegram" => (notification.format_telegram(), true, true),
+                                    "discord" => (notification.format_discord(), true, false),
+                                    "slack" => (notification.format_slack(), true, false),
                                     // GitHub is already handled by backend.post_comment()
                                     // tmux doesn't need task completion notifications
-                                    _ => (String::new(), false),
+                                    _ => (String::new(), false, false),
                                 };
 
                                 if !should_send {
                                     continue;
                                 }
 
+                                let metadata = if is_telegram {
+                                    serde_json::json!({"preformatted_html": true})
+                                } else {
+                                    serde_json::json!({})
+                                };
                                 let msg = OutgoingMessage {
                                     thread_id: notification.task_id.clone(),
                                     body,
                                     reply_to: None,
-                                    metadata: serde_json::json!({}),
+                                    metadata,
                                     topic_id: None,
                                 };
 
