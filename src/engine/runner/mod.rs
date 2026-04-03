@@ -14,6 +14,13 @@
 //! - [`session`] — tmux session lifecycle and output collection
 //! - [`response_handler`] — success path: commit, push, PR, token storage, budget
 //! - [`fallback`] — error classification and recovery strategies
+//!
+//! # Panic safety
+//!
+//! Production code in this module contains no `unwrap()` or `expect()` calls
+//! that could panic at runtime. All fallible operations propagate errors via
+//! `anyhow::Result` using `?`, and optional values are handled with
+//! `unwrap_or_default()` / `unwrap_or_else(…)` safe fallbacks.
 
 pub mod agent;
 pub mod agents;

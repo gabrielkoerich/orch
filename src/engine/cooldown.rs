@@ -12,6 +12,14 @@
 //!
 //! When a rate limit includes a "try again at {date}" message, the cooldown
 //! is set to that specific timestamp instead of the default duration.
+//!
+//! # Panic safety
+//!
+//! Production code in this module contains no `unwrap()` or `expect()` calls
+//! that could panic at runtime. All `Mutex` locks use
+//! `.lock().unwrap_or_else(|e| e.into_inner())` (recovers from mutex poison
+//! instead of panicking), and all async KV operations propagate or log errors
+//! rather than unwrapping.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

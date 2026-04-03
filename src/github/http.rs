@@ -8,6 +8,14 @@
 //! - `gh.auth.token` config value
 //! - `gh auth token` CLI fallback (default — just run `gh auth login`)
 //! - GitHub App JWT generation (with app_id + private_key configuration)
+//!
+//! # Panic safety
+//!
+//! Production code in this module contains no `unwrap()` or `expect()` calls
+//! that could panic at runtime. All `Mutex` locks use `.lock().ok()` (ignoring
+//! poison — the relevant state is rate-limit timing, not correctness-critical
+//! data) and all fallible operations propagate errors via `anyhow::Result` or
+//! are handled with `unwrap_or_default()` / `unwrap_or(…)` safe fallbacks.
 
 use super::token;
 use super::types::{
