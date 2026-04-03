@@ -241,7 +241,7 @@ async fn auto_unblock_blocked_tasks(
     repo: &str,
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
-    dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    dispatching: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
     let blocked = store
         .list_by_status(repo, TaskStatus::Blocked)
@@ -271,11 +271,8 @@ async fn auto_unblock_blocked_tasks(
         }
 
         let dispatch_key = format!("{}/{}", repo, task.external_id.clone().unwrap_or_default());
-        {
-            let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.contains(&dispatch_key) {
-                continue;
-            }
+        if dispatching.contains(&dispatch_key) {
+            continue;
         }
 
         let runs = runs_by_task.remove(&task.id).unwrap_or_default();
@@ -434,7 +431,7 @@ pub(crate) async fn sync_tick(
     router: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
     store: &Arc<crate::store::TaskStore>,
-    dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    dispatching: &Arc<DashSet<String>>,
     auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
     tracing::debug!("sync tick");
@@ -556,8 +553,7 @@ pub(crate) async fn sync_tick(
             // Skip tasks currently being processed by the main tick (dispatch + review flow).
             let dispatch_key = format!("{}/{}", repo, task.id.0);
             {
-                let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-                if guard.contains(&dispatch_key) {
+                if dispatching.contains(&dispatch_key) {
                     tracing::debug!(
                         task_id = task.id.0,
                         "task locked by dispatch flow, skipping stale check"
@@ -703,11 +699,8 @@ pub(crate) async fn sync_tick(
 
             // Skip tasks actively being dispatched (subscriber is working on them).
             let dispatch_key = format!("{}/{}", repo, task.id.0);
-            {
-                let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-                if guard.contains(&dispatch_key) {
-                    continue;
-                }
+            if dispatching.contains(&dispatch_key) {
+                continue;
             }
 
             tracing::info!(
@@ -745,7 +738,7 @@ pub(crate) async fn sync_tick(
         Ok(()) => {
             // Invalidate the LLM router's skills catalog cache so new/updated
             // skill files are picked up on the next routing call.
-            router.read().await.invalidate_skills_catalog();
+            router.read().await.invalidate_skills_catalog().await;
         }
         Err(e) => {
             tracing::warn!(err = %e, "skills sync failed");
@@ -1218,7 +1211,6 @@ mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
     use async_trait::async_trait;
-    use std::collections::HashSet;
     use std::sync::Arc;
 
     // ── ingest_external_tasks tests ─────────────────────────────────────────
@@ -1496,71 +1488,51 @@ mod tests {
 
     #[test]
     fn dispatching_set_blocks_duplicate_processing() {
-        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let repo = "owner/repo";
         let task_id = "42";
         let dispatch_key = format!("{}/{}", repo, task_id);
 
         // Initially not in the set
-        {
-            let guard = dispatching.lock().unwrap();
-            assert!(!guard.contains(&dispatch_key));
-        }
+        assert!(!dispatching.contains(&dispatch_key));
 
         // Insert — simulates dispatch starting
-        {
-            let mut guard = dispatching.lock().unwrap();
-            guard.insert(dispatch_key.clone());
-        }
+        dispatching.insert(dispatch_key.clone());
 
         // Now should be blocked
-        {
-            let guard = dispatching.lock().unwrap();
-            assert!(
-                guard.contains(&dispatch_key),
-                "task should be locked while dispatching"
-            );
-        }
+        assert!(
+            dispatching.contains(&dispatch_key),
+            "task should be locked while dispatching"
+        );
 
         // Remove — simulates review completion
-        {
-            let mut guard = dispatching.lock().unwrap();
-            guard.remove(&dispatch_key);
-        }
+        dispatching.remove(&dispatch_key);
 
         // Now should be free again
-        {
-            let guard = dispatching.lock().unwrap();
-            assert!(
-                !guard.contains(&dispatch_key),
-                "task should be unlocked after review completes"
-            );
-        }
+        assert!(
+            !dispatching.contains(&dispatch_key),
+            "task should be unlocked after review completes"
+        );
     }
 
     #[test]
     fn dispatching_set_does_not_block_other_tasks() {
-        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let repo = "owner/repo";
 
         // Lock task 42
         let key_42 = format!("{}/42", repo);
-        {
-            let mut guard = dispatching.lock().unwrap();
-            guard.insert(key_42.clone());
-        }
+        dispatching.insert(key_42.clone());
 
         // Task 43 should NOT be blocked
         let key_43 = format!("{}/43", repo);
-        {
-            let guard = dispatching.lock().unwrap();
-            assert!(guard.contains(&key_42), "task 42 should be locked");
-            assert!(!guard.contains(&key_43), "task 43 should not be locked");
-        }
+        assert!(dispatching.contains(&key_42), "task 42 should be locked");
+        assert!(
+            !dispatching.contains(&key_43),
+            "task 43 should not be locked"
+        );
     }
 
     /// Regression test for a6d8b9a.
@@ -1579,16 +1551,12 @@ mod tests {
     async fn dispatch_key_held_during_review_agent_execution() {
         use tokio::sync::oneshot;
 
-        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let dispatch_key = "owner/repo/42".to_string();
 
         // Step 1: insert before spawning — this is the invariant added by a6d8b9a.
-        {
-            let mut guard = dispatching.lock().unwrap();
-            guard.insert(dispatch_key.clone());
-        }
+        dispatching.insert(dispatch_key.clone());
 
         let (agent_started_tx, agent_started_rx) = oneshot::channel::<()>();
         let (check_done_tx, check_done_rx) = oneshot::channel::<()>();
@@ -1602,37 +1570,30 @@ mod tests {
             // Simulate review agent work — hold until the concurrent check is done.
             check_done_rx.await.unwrap();
             // Remove from dispatching set on completion (mirror of tick.rs/sync.rs).
-            let mut guard = dispatching_agent.lock().unwrap();
-            guard.remove(&key_agent);
+            dispatching_agent.remove(&key_agent);
         });
 
         // Step 3: concurrent review_open_prs check — simulates step 4 of another
         // sync_tick invocation running while the review agent is still active.
         agent_started_rx.await.unwrap();
-        {
-            let guard = dispatching.lock().unwrap();
-            assert!(
-                guard.contains(&dispatch_key),
-                "dispatch_key must be visible in the dispatching set while the review \
-                 agent is running — without the a6d8b9a fix, review_open_prs would see \
-                 the key absent and re-dispatch the task, silently dropping \
-                 CHANGES_REQUESTED feedback"
-            );
-        }
+        assert!(
+            dispatching.contains(&dispatch_key),
+            "dispatch_key must be visible in the dispatching set while the review \
+             agent is running — without the a6d8b9a fix, review_open_prs would see \
+             the key absent and re-dispatch the task, silently dropping \
+             CHANGES_REQUESTED feedback"
+        );
 
         // Step 4: review agent completes.
         check_done_tx.send(()).unwrap();
         review_task.await.unwrap();
 
         // Step 5: key released — review_open_prs can now act on the task if needed.
-        {
-            let guard = dispatching.lock().unwrap();
-            assert!(
-                !guard.contains(&dispatch_key),
-                "dispatch_key must be removed from the dispatching set after the \
-                 review agent completes so subsequent sync ticks can process the task"
-            );
-        }
+        assert!(
+            !dispatching.contains(&dispatch_key),
+            "dispatch_key must be removed from the dispatching set after the \
+             review agent completes so subsequent sync ticks can process the task"
+        );
     }
 
     /// Regression test for issue #833.
@@ -1650,19 +1611,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_guard_releases_key_on_panic() {
         use crate::engine::dispatch_guard::DispatchGuard;
-        use std::collections::HashSet;
 
-        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
         let key = "owner/repo/42".to_string();
 
         // Insert key before spawn — mirrors the production invariant established
         // by the a6d8b9a fix (key must be visible before the spawn so concurrent
         // review_open_prs callers see it and skip the task).
-        {
-            let mut g = dispatching.lock().unwrap();
-            g.insert(key.clone());
-        }
+        dispatching.insert(key.clone());
 
         // Create the guard (takes ownership of the removal obligation).
         let guard = DispatchGuard::new(Arc::clone(&dispatching), key.clone());
@@ -1677,9 +1633,8 @@ mod tests {
         let _ = handle.await;
 
         // Key MUST be gone even though the task panicked.
-        let g = dispatching.lock().unwrap();
         assert!(
-            !g.contains(&key),
+            !dispatching.contains(&key),
             "dispatch key must be removed from the dispatching set even when the \
              spawned review task panics — without DispatchGuard the key leaks and \
              the task gets stuck in a permanent review loop"
@@ -1699,8 +1654,7 @@ mod tests {
         ));
         let tmux = Arc::new(TmuxManager::new());
         let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
-        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
         let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
@@ -1763,8 +1717,7 @@ mod tests {
         ));
         let tmux = Arc::new(TmuxManager::new());
         let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
-        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
         let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
@@ -1818,8 +1771,7 @@ mod tests {
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -1897,8 +1849,7 @@ mod tests {
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -2063,8 +2014,7 @@ mod tests {
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -2138,8 +2088,7 @@ mod tests {
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -2229,8 +2178,7 @@ mod tests {
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let dispatching: Arc<std::sync::Mutex<HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         let id = store
             .upsert_external(&crate::store::UpsertExternal {
@@ -2318,26 +2266,19 @@ mod tests {
 
     #[test]
     fn dispatching_key_includes_repo_for_cross_project_isolation() {
-        let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         // Lock task 42 in repo A
         let key_a = "owner/repo-a/42".to_string();
-        {
-            let mut guard = dispatching.lock().unwrap();
-            guard.insert(key_a.clone());
-        }
+        dispatching.insert(key_a.clone());
 
         // Same task ID in repo B should NOT be blocked
         let key_b = "owner/repo-b/42".to_string();
-        {
-            let guard = dispatching.lock().unwrap();
-            assert!(guard.contains(&key_a));
-            assert!(
-                !guard.contains(&key_b),
-                "same task ID in different repo should not be blocked"
-            );
-        }
+        assert!(dispatching.contains(&key_a));
+        assert!(
+            !dispatching.contains(&key_b),
+            "same task ID in different repo should not be blocked"
+        );
     }
 
     #[tokio::test]

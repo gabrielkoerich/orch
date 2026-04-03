@@ -45,7 +45,7 @@ pub(crate) async fn review_open_prs(
     config: &EngineConfig,
     task_manager: &Arc<TaskManager>,
     store: &Arc<TaskStore>,
-    dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    dispatching: &Arc<DashSet<String>>,
     auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
     // Get tasks that are in review (have open PRs).
@@ -103,15 +103,12 @@ pub(crate) async fn review_open_prs(
 
         // Skip tasks currently being processed by the main tick.
         let dispatch_key = format!("{}/{}", repo, task_id);
-        {
-            let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.contains(&dispatch_key) {
-                tracing::debug!(
-                    task_id,
-                    "task locked by dispatch flow, skipping review_open_prs"
-                );
-                continue;
-            }
+        if dispatching.contains(&dispatch_key) {
+            tracing::debug!(
+                task_id,
+                "task locked by dispatch flow, skipping review_open_prs"
+            );
+            continue;
         }
 
         let stored = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id).await;

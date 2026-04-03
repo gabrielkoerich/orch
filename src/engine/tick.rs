@@ -21,6 +21,7 @@ use crate::repo_context::REPO_CONTEXT;
 use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
+use dashmap::DashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -895,7 +896,7 @@ pub(crate) async fn tick_dispatch_tasks(
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
     router: &Router,
-    dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    dispatching: &Arc<DashSet<String>>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     // Note: Routed tasks should never have no-agent (filtered during Phase 3a routing),
@@ -958,15 +959,12 @@ pub(crate) async fn tick_dispatch_tasks(
         // does not exist until the runner completes worktree setup (~10s later), so the
         // session_exists check alone is insufficient.
         let dispatch_key = format!("{}/{}", repo, task.id.0);
-        {
-            let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-            if !guard.insert(dispatch_key.clone()) {
-                tracing::debug!(
-                    task_id = task.id.0,
-                    "task already dispatching, skipping duplicate"
-                );
-                continue;
-            }
+        if !dispatching.insert(dispatch_key.clone()) {
+            tracing::debug!(
+                task_id = task.id.0,
+                "task already dispatching, skipping duplicate"
+            );
+            continue;
         }
         // RAII guard — removes dispatch_key on drop even if the spawned task panics.
         let dispatch_guard = DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
@@ -1290,7 +1288,7 @@ pub(crate) async fn tick(
     router: &mut Router,
     task_manager: &Arc<TaskManager>,
     weight_tx: &mpsc::Sender<WeightSignal>,
-    dispatching: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    dispatching: &Arc<DashSet<String>>,
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
@@ -1991,7 +1989,7 @@ mod tests {
         let tmux = Arc::new(crate::tmux::TmuxManager::new());
         let semaphore = Arc::new(Semaphore::new(4));
         let (weight_tx, _weight_rx) = mpsc::channel(16);
-        let dispatching = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let dispatching = Arc::new(DashSet::new());
         let transport = Arc::new(Transport::new());
         let capture = Arc::new(CaptureService::new(transport));
 

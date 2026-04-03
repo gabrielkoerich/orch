@@ -8,7 +8,7 @@ use crate::engine::runner::{TaskRunner, WeightSignal};
 use crate::engine::tasks::TaskManager;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
-use std::collections::HashSet;
+use dashmap::DashSet;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, RwLock, Semaphore};
@@ -29,7 +29,7 @@ pub fn spawn(
     task_manager: Arc<TaskManager>,
     weight_tx: mpsc::Sender<WeightSignal>,
     router_arc: Arc<RwLock<Router>>,
-    dispatching: Arc<std::sync::Mutex<HashSet<String>>>,
+    dispatching: Arc<DashSet<String>>,
     store: Arc<TaskStore>,
     repo: String,
 ) {

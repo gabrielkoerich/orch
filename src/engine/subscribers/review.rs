@@ -10,7 +10,7 @@ use crate::github::http::GhHttp;
 use crate::repo_context::REPO_CONTEXT;
 use crate::store::{opt_store_get_task, store_set, TaskStatus, TaskStore};
 use crate::tmux::TmuxManager;
-use std::collections::HashSet;
+use dashmap::DashSet;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::{RwLock, Semaphore};
@@ -28,7 +28,7 @@ pub fn spawn(
     semaphore: Arc<Semaphore>,
     task_manager: Arc<TaskManager>,
     router: Arc<RwLock<Router>>,
-    dispatching: Arc<std::sync::Mutex<HashSet<String>>>,
+    dispatching: Arc<DashSet<String>>,
     store: Arc<TaskStore>,
     repo: String,
 ) {
@@ -47,16 +47,14 @@ pub fn spawn(
                     let task_id = &event.task_id;
                     let dispatch_key = format!("{}/{}", repo, task_id);
 
-                    // Guard: skip if already being processed.
-                    {
-                        let guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-                        if guard.contains(&dispatch_key) {
-                            tracing::debug!(
-                                task_id,
-                                "task locked by dispatch flow, skipping event-driven review"
-                            );
-                            continue;
-                        }
+                    // Atomically claim the task before any async work so concurrent
+                    // review events cannot double-spawn the same review flow.
+                    if !dispatching.insert(dispatch_key.clone()) {
+                        tracing::debug!(
+                            task_id,
+                            "task locked by dispatch flow, skipping event-driven review"
+                        );
+                        continue;
                     }
 
                     tracing::info!(task_id, "event-driven review triggered");
@@ -187,11 +185,6 @@ pub fn spawn(
                     crate::store::set_review_session_expected(&store, &repo, &task.id.0, true)
                         .await;
 
-                    // Insert into dispatching set.
-                    {
-                        let mut guard = dispatching.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.insert(dispatch_key.clone());
-                    }
                     // RAII guard — removes dispatch_key on drop even if the spawned task panics.
                     let dispatch_guard =
                         DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
