@@ -214,6 +214,15 @@ pub async fn handle_error(
                 status: "routed".to_string(),
             });
         }
+        agents::AgentError::StaleSession { session_id } => {
+            // Stale session errors only occur in the orch chat control session, not
+            // in task runners (tasks don't use --session-id / --resume). Treat as a
+            // generic agent failure so the task is retried from scratch.
+            (
+                response::RetryableError::Failed,
+                format!("{agent_name} stale session: {session_id}"),
+            )
+        }
         agents::AgentError::Unknown { exit_code, message } => {
             // Exit 0 with empty output is a silent failure (common with GitHub
             // Copilot models in opencode).  Record a model-specific cooldown so

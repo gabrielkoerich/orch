@@ -683,7 +683,7 @@ pub async fn send_message(
     let (session_uuid, is_new) = get_or_create_session_uuid(store, session_id).await?;
 
     // Invoke agent one-shot with --session-id (new) or --resume (existing) for conversation continuity
-    let result = invoke_agent_with_session(
+    let result = match invoke_agent_with_session(
         &agent,
         &model,
         &ctx.system,
@@ -691,7 +691,38 @@ pub async fn send_message(
         Some(&session_uuid),
         !is_new,
     )
-    .await?;
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // If the session UUID has expired server-side, reset it and retry
+            // with a fresh session. This handles the "No conversation found with
+            // session ID: <uuid>" error that Claude returns when a session expires.
+            // The AgentError is converted to a string by anyhow::bail! in direct.rs,
+            // so we match on the Display representation of StaleSession.
+            let is_stale = e.to_string().contains("stale session");
+            if is_stale {
+                tracing::info!(
+                    session_id,
+                    "chat session UUID expired; resetting and retrying with fresh session"
+                );
+                reset_session_uuid(store, session_id).await?;
+                // Fresh invocation — no resume, generates a new UUID
+                let (fresh_uuid, _) = get_or_create_session_uuid(store, session_id).await?;
+                invoke_agent_with_session(
+                    &agent,
+                    &model,
+                    &ctx.system,
+                    &full_message,
+                    Some(&fresh_uuid),
+                    false, // not resuming — new session
+                )
+                .await?
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     // Parse response for summary and memory tags
     let parsed = parse_response(&result.text);
