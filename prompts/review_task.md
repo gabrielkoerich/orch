@@ -5,8 +5,9 @@ You are reviewing a PR created by an AI agent. Complete all steps in order (Step
 ### Step 1: Rebase onto default branch (optional)
 
 Keep the branch up to date — other PRs may have merged since this was created:
-1. Fetch remote refs and rebase onto the default branch:
-   - `git fetch origin && git rebase origin/{{DEFAULT_BRANCH}}`
+1. Rebase onto the default branch:
+   - `git rebase origin/{{DEFAULT_BRANCH}}`
+   - Orch has already run `git fetch origin` before launching you — do NOT run `git fetch` or `git pull` yourself (they will fail in sandboxed environments because they need to write outside the worktree directory). Remote refs are already available locally.
 2. If there are conflicts:
    - Resolve each conflict by understanding both sides of the change
    - `git add <resolved files>` then `git rebase --continue`
