@@ -62,6 +62,7 @@ fn buffer() -> OutputBuffer {
         seen_alive: false,
         registered_at: chrono::Utc::now(),
         has_output: false,
+        generation: 0,
     }
 }
 
