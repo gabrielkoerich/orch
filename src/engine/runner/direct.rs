@@ -3,7 +3,7 @@
 //! Used by the control session and the router LLM to run agents
 //! in a fire-and-forget mode without a persistent tmux session.
 
-use crate::engine::runner::agents::{get_runner, AgentError, PermissionRules};
+use crate::engine::runner::agents::{get_runner, shell_single_quote, AgentError, PermissionRules};
 use anyhow::Result;
 use std::time::Duration;
 
@@ -119,7 +119,15 @@ pub async fn run_direct_with_session(
             let flag = if s.resume { "--resume" } else { "--session-id" };
             // Insert flag before the stdin redirect (< "msg_file")
             if let Some(pos) = shell_cmd.rfind("< \"") {
-                shell_cmd.insert_str(pos, &format!("{flag} {} \\\n  ", s.session_id));
+                let quoted = shell_single_quote(s.session_id);
+                shell_cmd.insert_str(pos, &format!("{flag} {quoted} \\\n  "));
+            } else {
+                tracing::warn!(
+                    agent,
+                    flag,
+                    session_id = s.session_id,
+                    "could not insert session flag: '< \"' pattern not found in shell command"
+                );
             }
         }
     }
