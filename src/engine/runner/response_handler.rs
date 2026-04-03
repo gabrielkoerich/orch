@@ -597,10 +597,17 @@ pub async fn handle_success(
     .await;
 
     // Check token budget with warning thresholds
-    let max_tokens: u64 = config::get("max_tokens_per_task")
+    // Use the same config key as pre-run checks. If set to 0, disable budget
+    // enforcement so tasks may continue without token budget gating.
+    let max_tokens: u64 = config::get("workflow.max_tokens_per_task")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000);
+
+    if max_tokens == 0 {
+        // Budget checks disabled — nothing to do here.
+        return Ok((final_status.to_string(), false, push_failed));
+    }
 
     // Query total tokens and cost estimate together (single DB read)
     let (total_tokens, cost) = store::get_token_summary(store, repo, task_id).await;
