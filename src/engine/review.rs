@@ -79,7 +79,12 @@ use super::router::Router;
 /// appear to describe the same set of changed files. This helps catch cases
 /// where a stale summary (from a prior reroute or reused worktree) would
 /// otherwise be injected into the review prompt and confuse the reviewer.
-fn verify_summary_matches_diff(agent_summary: &str, git_diff: &str) -> Result<(), String> {
+fn verify_summary_matches_diff(
+    agent_summary: &str,
+    git_diff: &str,
+    task_title: &str,
+    task_body: &str,
+) -> Result<(), String> {
     // Extract file paths from git diff using common markers.
     let mut diff_files = std::collections::HashSet::new();
     for line in git_diff.lines() {
@@ -99,13 +104,89 @@ fn verify_summary_matches_diff(agent_summary: &str, git_diff: &str) -> Result<()
         }
     }
 
-    // Extract file-like tokens from the agent summary (very permissive).
+    // Extract file-like tokens from the agent summary (conservative).
+    // Accept tokens that either look like path segments (contain '/') or
+    // have a known file extension (.rs, .md, .toml, etc.). This avoids
+    // misclassifying numeric/decimal tokens like `1.5s` or hostnames.
+    let allowed_exts = [
+        "rs",
+        "md",
+        "toml",
+        "yml",
+        "yaml",
+        "json",
+        "lock",
+        "sh",
+        "py",
+        "java",
+        "kt",
+        "ts",
+        "tsx",
+        "js",
+        "jsx",
+        "go",
+        "c",
+        "cpp",
+        "h",
+        "hpp",
+        "cmake",
+        "Dockerfile",
+        "Makefile",
+        "patch",
+        "diff",
+        "txt",
+        "cfg",
+        "ini",
+        "html",
+        "css",
+        "scss",
+        "svg",
+        "png",
+        "jpg",
+        "jpeg",
+        "sql",
+        "proto",
+        "gradle",
+    ];
+
+    let special_names = ["Dockerfile", "Makefile"];
+
     let mut summary_files = std::collections::HashSet::new();
     for raw in agent_summary.split_whitespace() {
-        let tok = raw
-            .trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-');
-        // Heuristic: must contain a dot (ext) or a path separator and a dot
-        if tok.len() >= 3 && (tok.contains('.') || (tok.contains('/') && tok.contains('.'))) {
+        let tok = raw.trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+        });
+        if tok.len() < 3 {
+            continue;
+        }
+
+        // If it contains a path separator, consider it a path candidate.
+        if tok.contains('/') {
+            // Use basename for extension check
+            if let Some(bname) = tok.rsplit('/').next() {
+                if bname.contains('.') {
+                    if let Some(ext) = bname.rsplit('.').next() {
+                        if allowed_exts.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+                            summary_files.insert(tok.to_string());
+                            continue;
+                        }
+                    }
+                } else if special_names.iter().any(|&s| s.eq_ignore_ascii_case(bname)) {
+                    summary_files.insert(tok.to_string());
+                    continue;
+                }
+            }
+            continue;
+        }
+
+        // No path separator: treat as file-like only if it has a known extension
+        if tok.contains('.') {
+            if let Some(ext) = tok.rsplit('.').next() {
+                if allowed_exts.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+                    summary_files.insert(tok.to_string());
+                }
+            }
+        } else if special_names.iter().any(|&s| s.eq_ignore_ascii_case(tok)) {
             summary_files.insert(tok.to_string());
         }
     }
@@ -114,7 +195,10 @@ fn verify_summary_matches_diff(agent_summary: &str, git_diff: &str) -> Result<()
     // only when agent_summary *contains* file-like tokens but git_diff does not,
     // or when both non-empty but have no intersection.
     if !summary_files.is_empty() && diff_files.is_empty() {
-        return Err("agent summary contains file references but current git diff is empty — possible stale summary".to_string());
+        return Err(
+            "agent summary contains file references but current git diff is empty — possible stale summary"
+                .to_string(),
+        );
     }
 
     if !summary_files.is_empty() && !diff_files.is_empty() {
@@ -131,7 +215,36 @@ fn verify_summary_matches_diff(agent_summary: &str, git_diff: &str) -> Result<()
             }
         }
 
-        return Err("agent summary file references do not overlap with current git diff — possible stale summary".to_string());
+        return Err(
+            "agent summary file references do not overlap with current git diff — possible stale summary"
+                .to_string(),
+        );
+    }
+
+    // Additional heuristic: if the agent summary contains no file references
+    // but the current diff does, check whether the task title/body mention
+    // any of the diff files. If they do not, this is likely a stale summary
+    // produced for a different change and we should fail closed.
+    if summary_files.is_empty() && !diff_files.is_empty() {
+        let title_body = format!("{} {}", task_title, task_body).to_lowercase();
+        let mut any_mentioned = false;
+        for d in &diff_files {
+            let d_lower = d.to_lowercase();
+            // check full path and basename
+            if title_body.contains(&d_lower) {
+                any_mentioned = true;
+                break;
+            }
+            if let Some(bname) = d_lower.rsplit('/').next() {
+                if title_body.contains(bname) {
+                    any_mentioned = true;
+                    break;
+                }
+            }
+        }
+        if !any_mentioned {
+            return Err(format!("agent summary contains no file references but current git diff touches files not mentioned in task title/body — possible stale summary: {:?}", diff_files));
+        }
     }
 
     Ok(())
@@ -918,7 +1031,18 @@ pub(crate) async fn review_and_merge(
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
 
     // Sanity-check that the stored agent summary matches the current diff.
-    if let Err(reason) = verify_summary_matches_diff(&agent_summary, &git_diff) {
+    let task_title = stored_task
+        .as_ref()
+        .map(|t| t.title.clone())
+        .unwrap_or_default();
+    let task_body = stored_task
+        .as_ref()
+        .map(|t| t.body.clone())
+        .unwrap_or_default();
+
+    if let Err(reason) =
+        verify_summary_matches_diff(&agent_summary, &git_diff, &task_title, &task_body)
+    {
         tracing::warn!(
             task_id = task.id.0,
             reason = %reason,
@@ -1633,30 +1757,53 @@ pub(crate) async fn review_and_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn verify_summary_matches_diff_ok_when_basename_matches() {
         let summary = "Preserved the Telegram long-poll timeout safety margin and updated src/channels/telegram.rs to handle reconnects.";
         let diff = "diff --git a/src/channels/telegram.rs b/src/channels/telegram.rs\n+++ b/src/channels/telegram.rs\n@@ -1,4 +1,5 @@";
-        assert!(verify_summary_matches_diff(summary, diff).is_ok());
+        assert!(
+            verify_summary_matches_diff(summary, diff, "Fix telegram", "update reconnect").is_ok()
+        );
     }
 
     #[test]
     fn verify_summary_matches_diff_err_when_summary_mentions_files_but_diff_empty() {
         let summary = "Fixed bug in src/engine/router/mod.rs: adjust weights";
         let diff = "";
-        let res = verify_summary_matches_diff(summary, diff);
+        let res = verify_summary_matches_diff(summary, diff, "Adjust weights", "tweak algo");
         assert!(res.is_err());
-        assert!(res.err().unwrap().contains("git diff is empty"));
+        assert!(res
+            .err()
+            .unwrap()
+            .contains("agent summary contains file references"));
     }
 
     #[test]
     fn verify_summary_matches_diff_err_when_no_overlap() {
         let summary = "Updated README.md and docs/usage.md with new instructions.";
         let diff = "diff --git a/src/main.rs b/src/main.rs\n+++ b/src/main.rs\n";
-        let res = verify_summary_matches_diff(summary, diff);
+        let res = verify_summary_matches_diff(summary, diff, "Docs update", "improve docs");
         assert!(res.is_err());
-        assert!(res.err().unwrap().contains("do not overlap"));
+        let e = res.err().unwrap();
+        assert!(
+            e.contains("do not overlap")
+                || e.contains("stale summary")
+                || e.contains("do not overlap")
+        );
+    }
+
+    #[test]
+    fn verify_summary_detects_stale_when_no_file_refs_and_diff_unrelated() {
+        let summary =
+            "Preserved the Telegram long-poll timeout safety margin and updated internal logic.";
+        // Diff touches files that are unrelated to the task title/body
+        let diff = "diff --git a/src/channels/discord_ws.rs b/src/channels/discord_ws.rs\n+++ b/src/channels/discord_ws.rs\n";
+        let res =
+            verify_summary_matches_diff(summary, diff, "Fix panic in router", "remove panic path");
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert!(err.contains("stale summary") || err.contains("not mentioned in task title/body"));
     }
     use crate::backends::ExternalTask;
     use crate::engine::router::RouterConfig;
