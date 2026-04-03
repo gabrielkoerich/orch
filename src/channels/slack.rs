@@ -17,6 +17,7 @@
 //! - `channels:read` — health check
 
 use super::{Channel, IncomingMessage, OutgoingMessage};
+use anyhow::Context as _;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -63,16 +64,17 @@ struct AuthTestResponse {
 }
 
 impl SlackChannel {
-    pub fn new(bot_token: String, channel_id: Option<String>) -> Self {
-        Self {
+    pub fn new(bot_token: String, channel_id: Option<String>) -> anyhow::Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("failed to build Slack HTTP client (TLS init failed)")?;
+        Ok(Self {
             bot_token,
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("valid TLS config"),
+            client,
             channel_id,
             last_ts: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-        }
+        })
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -165,11 +167,11 @@ impl Channel for SlackChannel {
 
         let bot_token = self.bot_token.clone();
         let client = self.client.clone();
-        // SAFETY: checked is_none() above and returned early
-        let channel_id = self
-            .channel_id
-            .clone()
-            .expect("BUG: channel_id is Some; None case returned early above");
+        let Some(channel_id) = self.channel_id.clone() else {
+            // Already handled above, but be defensive
+            tracing::warn!("slack channel_id not configured, skipping message polling");
+            return Ok(rx);
+        };
         let last_ts = self.last_ts.clone();
 
         tracing::info!(
@@ -300,13 +302,13 @@ mod tests {
 
     #[test]
     fn slack_channel_name() {
-        let ch = SlackChannel::new("xoxb-test".to_string(), None);
+        let ch = SlackChannel::new("xoxb-test".to_string(), None).unwrap();
         assert_eq!(ch.name(), "slack");
     }
 
     #[test]
     fn slack_api_url() {
-        let ch = SlackChannel::new("xoxb-test".to_string(), None);
+        let ch = SlackChannel::new("xoxb-test".to_string(), None).unwrap();
         assert_eq!(ch.api_url("auth.test"), "https://slack.com/api/auth.test");
         assert_eq!(
             ch.api_url("chat.postMessage"),

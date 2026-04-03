@@ -631,12 +631,16 @@ pub async fn serve() -> anyhow::Result<()> {
     if let Ok(token) = crate::config::get("channels.telegram.bot_token") {
         if !token.is_empty() {
             let chat_id = crate::config::get("channels.telegram.chat_id").ok();
-            let telegram = TelegramChannel::new(token, chat_id);
-            if let Err(e) = telegram.health_check().await {
-                tracing::warn!(?e, "telegram channel health check failed, skipping");
-            } else {
-                channel_registry.register(Box::new(telegram));
-                tracing::info!("telegram channel registered");
+            match TelegramChannel::new(token, chat_id) {
+                Err(e) => tracing::warn!(?e, "failed to initialize telegram channel, skipping"),
+                Ok(telegram) => {
+                    if let Err(e) = telegram.health_check().await {
+                        tracing::warn!(?e, "telegram channel health check failed, skipping");
+                    } else {
+                        channel_registry.register(Box::new(telegram));
+                        tracing::info!("telegram channel registered");
+                    }
+                }
             }
         }
     }
@@ -653,12 +657,16 @@ pub async fn serve() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(1);
-            let discord = DiscordGateway::new(token, channel_id, shard_id, shard_count);
-            if let Err(e) = discord.health_check().await {
-                tracing::warn!(?e, "discord gateway health check failed, skipping");
-            } else {
-                channel_registry.register(Box::new(discord));
-                tracing::info!(shard_id, shard_count, "discord gateway registered");
+            match DiscordGateway::new(token, channel_id, shard_id, shard_count) {
+                Err(e) => tracing::warn!(?e, "failed to initialize discord gateway, skipping"),
+                Ok(discord) => {
+                    if let Err(e) = discord.health_check().await {
+                        tracing::warn!(?e, "discord gateway health check failed, skipping");
+                    } else {
+                        channel_registry.register(Box::new(discord));
+                        tracing::info!(shard_id, shard_count, "discord gateway registered");
+                    }
+                }
             }
         }
     }
@@ -667,12 +675,16 @@ pub async fn serve() -> anyhow::Result<()> {
     if let Ok(token) = crate::config::get("channels.slack.bot_token") {
         if !token.is_empty() {
             let channel_id = crate::config::get("channels.slack.channel_id").ok();
-            let slack = SlackChannel::new(token, channel_id);
-            if let Err(e) = slack.health_check().await {
-                tracing::warn!(?e, "slack channel health check failed, skipping");
-            } else {
-                channel_registry.register(Box::new(slack));
-                tracing::info!("slack channel registered");
+            match SlackChannel::new(token, channel_id) {
+                Err(e) => tracing::warn!(?e, "failed to initialize slack channel, skipping"),
+                Ok(slack) => {
+                    if let Err(e) = slack.health_check().await {
+                        tracing::warn!(?e, "slack channel health check failed, skipping");
+                    } else {
+                        channel_registry.register(Box::new(slack));
+                        tracing::info!("slack channel registered");
+                    }
+                }
             }
         }
     }
