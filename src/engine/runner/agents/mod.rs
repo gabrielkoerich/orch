@@ -281,7 +281,6 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
     // Strong explicit completion phrases. These are high-confidence indicators
     // that the agent performed an action (filed issues, created commits, etc.).
     let explicit_done = [
-        "no changes",
         "nothing to",
         "nothing to do",
         "nothing to execute",
@@ -290,6 +289,7 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
         "no trades",
         "no trade",
         "no action needed",
+        "no changes to commit",
         "completed",
         // Action/issue completion phrases
         "filed",
@@ -307,7 +307,6 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
         "comment posted",
         "changes committed",
         "commit created",
-        "the commit",
         // Agent completion phrases (regression: #1362/#1363)
         "the fix is complete",
         "fix is working",
@@ -1270,7 +1269,7 @@ mod tests {
     #[test]
     fn synthesize_response_marks_done_for_commit_created() {
         let response = synthesize_response_from_text(
-            "The commit is created locally. The push is being blocked by permissions.",
+            "Commit created locally. The push is being blocked by permissions.",
         )
         .unwrap();
         assert_eq!(response.status, "done");
