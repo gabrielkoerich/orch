@@ -146,30 +146,40 @@ impl EngineConfig {
         if let Ok(val) = crate::config::get("engine.tick_interval") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.tick_interval = std::time::Duration::from_secs(secs);
+            } else {
+                tracing::warn!(key = "engine.tick_interval", value = %val, default_secs = config.tick_interval.as_secs(), "invalid value for engine.tick_interval, using default");
             }
         }
 
         if let Ok(val) = crate::config::get("engine.sync_interval") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.sync_interval = std::time::Duration::from_secs(secs);
+            } else {
+                tracing::warn!(key = "engine.sync_interval", value = %val, default_secs = config.sync_interval.as_secs(), "invalid value for engine.sync_interval, using default");
             }
         }
 
         if let Ok(val) = crate::config::get("engine.max_parallel") {
             if let Ok(n) = val.parse::<usize>() {
                 config.max_parallel = n;
+            } else {
+                tracing::warn!(key = "engine.max_parallel", value = %val, default = config.max_parallel, "invalid value for engine.max_parallel, using default");
             }
         }
 
         if let Ok(val) = crate::config::get("engine.stuck_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.stuck_timeout = secs;
+            } else {
+                tracing::warn!(key = "engine.stuck_timeout", value = %val, default_secs = config.stuck_timeout, "invalid value for engine.stuck_timeout, using default");
             }
         }
 
         if let Ok(val) = crate::config::get("engine.no_session_stuck_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.no_session_stuck_timeout = secs;
+            } else {
+                tracing::warn!(key = "engine.no_session_stuck_timeout", value = %val, default_secs = config.no_session_stuck_timeout, "invalid value for engine.no_session_stuck_timeout, using default");
             }
         }
 
@@ -181,6 +191,8 @@ impl EngineConfig {
                 } else {
                     config.webhook_health_check_interval = None;
                 }
+            } else {
+                tracing::warn!(key = "engine.webhook_health_check_interval", value = %val, default = ?config.webhook_health_check_interval, "invalid value for engine.webhook_health_check_interval, using default");
             }
         }
 
@@ -199,18 +211,24 @@ impl EngineConfig {
         if let Ok(val) = crate::config::get("engine.graceful_shutdown_timeout") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.graceful_shutdown_timeout = std::time::Duration::from_secs(secs);
+            } else {
+                tracing::warn!(key = "engine.graceful_shutdown_timeout", value = %val, default_secs = config.graceful_shutdown_timeout.as_secs(), "invalid value for engine.graceful_shutdown_timeout, using default");
             }
         }
 
         if let Ok(val) = crate::config::get("engine.silence_grace_period") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.silence_grace_period = secs;
+            } else {
+                tracing::warn!(key = "engine.silence_grace_period", value = %val, default = config.silence_grace_period, "invalid value for engine.silence_grace_period, using default");
             }
         }
 
         if let Ok(val) = crate::config::get("engine.silence_cooldown") {
             if let Ok(secs) = val.parse::<u64>() {
                 config.silence_cooldown = secs;
+            } else {
+                tracing::warn!(key = "engine.silence_cooldown", value = %val, default = config.silence_cooldown, "invalid value for engine.silence_cooldown, using default");
             }
         }
 
