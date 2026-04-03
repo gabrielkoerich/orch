@@ -1,6 +1,7 @@
 //! Router configuration — loading, defaults, and model map.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// Minimum healthy agents threshold for graceful degradation.
 /// When healthy agents fall below this number, dispatch switches to sequential mode.
@@ -193,14 +194,34 @@ impl Default for RouterConfig {
 impl RouterConfig {
     /// Run `opencode models` and return lines containing "free".
     ///
-    /// This is a synchronous blocking call.
+    /// This is a synchronous blocking call. Results are cached for 1 hour so that
+    /// repeated invocations from async contexts (e.g. `refresh_health`) return
+    /// instantly from the in-memory cache rather than spawning a new subprocess.
+    /// The initial population should happen at startup (from `Router::new`) before
+    /// the Tokio runtime is fully loaded with work.
     fn discover_free_opencode_models() -> Vec<String> {
+        static FREE_MODELS_CACHE: OnceLock<Mutex<(i64, Vec<String>)>> = OnceLock::new();
+        let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+
+        let now = chrono::Utc::now().timestamp();
+        // If cached and not expired (1 hour), return cached copy.
+        {
+            let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let (ts, models) = &*guard;
+            if *ts != 0 && now.saturating_sub(*ts) < 3600 {
+                return models.clone();
+            }
+        }
+
+        // Not cached or expired — perform discovery and refresh the cache.
         if !crate::cmd_cache::command_exists("opencode") {
             tracing::debug!("opencode not in PATH — skipping free model discovery");
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = (now, Vec::new());
             return vec![];
         }
 
-        match std::process::Command::new("opencode")
+        let discovered = match std::process::Command::new("opencode")
             .args(["models"])
             .output()
         {
@@ -222,7 +243,26 @@ impl RouterConfig {
                 tracing::debug!(error = %e, "failed to run opencode models");
                 vec![]
             }
+        };
+
+        // Update cache with current timestamp (even if empty) so we don't hammer I/O.
+        {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = (now, discovered.clone());
         }
+
+        discovered
+    }
+
+    /// Prime the free-model cache at startup from a synchronous context.
+    ///
+    /// Called from `Router::new()` (sync, before the Tokio runtime is heavily loaded)
+    /// so that subsequent async callers of `expanded_model_pool()` hit the 1-hour
+    /// in-memory cache rather than blocking a Tokio worker thread.
+    pub(crate) fn prime_free_model_cache() {
+        // Call the sync function to populate the cache. The result is discarded
+        // here — callers pick it up via `discover_free_opencode_models()` later.
+        let _ = Self::discover_free_opencode_models();
     }
 
     /// Load configuration from config files.
