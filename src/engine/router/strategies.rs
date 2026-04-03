@@ -102,6 +102,7 @@ pub(super) fn route_via_round_robin_stateful(
 
     // Skip cooled agents (e.g. from silence detection short cooldown)
     let mut found = false;
+    let mut skipped_last_idx: Option<usize> = None;
     for offset in 0..agents.len() {
         let idx = (agent_idx + offset) % agents.len();
         let candidate = &agents[idx];
@@ -112,6 +113,7 @@ pub(super) fn route_via_round_robin_stateful(
         if agents.len() > 1 {
             if let Some(ref last) = last_agent {
                 if candidate == last && offset + 1 < agents.len() {
+                    skipped_last_idx = Some(idx);
                     continue;
                 }
             }
@@ -120,9 +122,9 @@ pub(super) fn route_via_round_robin_stateful(
         found = true;
         break;
     }
-    // If all agents are cooled, fall back to the original index
+    // Prefer the skipped last-used (uncooled) over rr_index fallback (may be cooled)
     if !found {
-        agent_idx = *rr_index % agents.len();
+        agent_idx = skipped_last_idx.unwrap_or(*rr_index % agents.len());
     }
 
     let agent = agents[agent_idx].clone();
