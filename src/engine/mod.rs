@@ -805,7 +805,39 @@ pub async fn serve() -> anyhow::Result<()> {
                         // Track whether we sent to at least one dedicated/subscribed target.
                         let mut routed = false;
 
-                        if let Some(repo) = notification.repo.as_deref() {
+                        // 0. Direct target: if notify_target is set, send straight to
+                        //    that Telegram chat_id and skip all other routing.
+                        if let Some(ref target) = notification.notify_target {
+                            let telegram = channels.iter().find(|c| c.name() == "telegram");
+                            if let Some(channel) = telegram {
+                                let body = notification.format_telegram();
+                                let metadata = serde_json::json!({
+                                    "preformatted_html": true,
+                                    "chat_id_override": target
+                                });
+                                let msg = OutgoingMessage {
+                                    thread_id: notification.task_id.clone(),
+                                    body,
+                                    reply_to: None,
+                                    metadata,
+                                    topic_id: None,
+                                };
+                                if let Err(e) = channel.send(&msg).await {
+                                    tracing::warn!(
+                                        task_id = %notification.task_id,
+                                        target,
+                                        ?e,
+                                        "failed to send to notify_target"
+                                    );
+                                } else {
+                                    routed = true;
+                                }
+                            }
+                        }
+
+                        if routed {
+                            // notify_target handled — skip further routing
+                        } else if let Some(repo) = notification.repo.as_deref() {
                             // 1. Dedicated channel targets for this repo.
                             for channel in channels.iter() {
                                 let ch_name = channel.name();
@@ -1350,6 +1382,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &weight_tx,
                                 &dispatching,
                                 &engine.store,
+                                Some(&transport),
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "tick failed for project");
                             }
@@ -1439,6 +1472,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 &weight_tx,
                                 &dispatching,
                                 &engine.store,
+                                Some(&transport),
                             ).await {
                                 tracing::error!(repo = %engine.repo, ?e, "webhook-triggered tick failed");
                             }

@@ -1272,8 +1272,9 @@ pub(crate) async fn tick_job_scheduler(
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<crate::store::TaskStore>>,
     repo: &str,
+    transport: Option<&Arc<crate::channels::transport::Transport>>,
 ) -> anyhow::Result<()> {
-    jobs::tick(jobs_path, backend, store, repo).await
+    jobs::tick(jobs_path, backend, store, repo, transport).await
 }
 
 /// Core tick — runs every 10s.
@@ -1300,6 +1301,7 @@ pub(crate) async fn tick(
     weight_tx: &mpsc::Sender<WeightSignal>,
     dispatching: &Arc<DashSet<String>>,
     store: &Arc<TaskStore>,
+    transport: Option<&Arc<crate::channels::transport::Transport>>,
 ) -> anyhow::Result<()> {
     let _tick_span = tracing::info_span!("engine.tick").entered();
 
@@ -1325,7 +1327,7 @@ pub(crate) async fn tick(
     )
     .await?;
     tick_unblock_parents(backend, task_manager).await?;
-    if let Err(e) = tick_job_scheduler(jobs_path, backend, Some(store), repo).await {
+    if let Err(e) = tick_job_scheduler(jobs_path, backend, Some(store), repo, transport).await {
         tracing::error!(?e, "job scheduler tick failed");
     }
     Ok(())

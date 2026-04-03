@@ -400,12 +400,20 @@ impl Channel for TelegramChannel {
     }
 
     async fn send(&self, msg: &OutgoingMessage) -> anyhow::Result<()> {
-        let chat_id = self
-            .chat_id
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("telegram chat_id not configured"))?
-            .parse::<i64>()
-            .map_err(|_| anyhow::anyhow!("invalid chat_id"))?;
+        // Resolve chat_id: metadata override → configured default.
+        let chat_id = if let Some(override_val) = msg.metadata.get("chat_id_override") {
+            override_val
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("chat_id_override is not a string"))?
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("invalid chat_id_override"))?
+        } else {
+            self.chat_id
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("telegram chat_id not configured"))?
+                .parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("invalid chat_id"))?
+        };
 
         let topic_id = msg.topic_id.as_ref().and_then(|t| t.parse::<i64>().ok());
 
