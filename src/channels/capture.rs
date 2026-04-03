@@ -48,6 +48,11 @@ pub struct OutputBuffer {
     /// considered silent. Agents that produced output then go quiet are NOT
     /// killed (they may be running long tool calls with sparse output).
     pub has_output: bool,
+    /// Generation counter incremented on each registration for this session_key.
+    /// Used to detect when a session has been re-registered (e.g., after retry)
+    /// so that stale snapshots from previous generations don't incorrectly
+    /// trigger final/unregister side effects.
+    pub generation: u64,
 }
 
 /// Service that captures tmux pane output and broadcasts to transport.
@@ -74,6 +79,13 @@ impl CaptureService {
     pub async fn register_session(&self, repo: &str, task_id: &str, session: &str) {
         let now = Utc::now();
         let skey = session_key(repo, task_id);
+
+        // Check if we need to increment generation (re-registration case)
+        let generation = {
+            let buffers = self.buffers.read().await;
+            buffers.get(&skey).map(|b| b.generation + 1).unwrap_or(0)
+        };
+
         let buffer = OutputBuffer {
             repo: repo.to_string(),
             session: session.to_string(),
@@ -85,9 +97,16 @@ impl CaptureService {
             seen_alive: false,
             registered_at: now,
             has_output: false,
+            generation,
         };
         self.buffers.write().await.insert(skey, buffer);
-        tracing::debug!(repo, task_id, session, "session registered for capture");
+        tracing::debug!(
+            repo,
+            task_id,
+            session,
+            generation,
+            "session registered for capture"
+        );
     }
 
     /// Unregister a session (stop tracking).
@@ -172,72 +191,99 @@ impl CaptureService {
     }
 
     /// Run one tick of the capture loop.
+    ///
+    /// Acquires the read lock once and iterates over all buffers to avoid
+    /// the race condition of collecting keys, dropping the lock, then
+    /// re-acquiring to look up each buffer (which could result in missing
+    /// or stale entries).
     async fn tick(&self) {
         let buffers = self.buffers.read().await;
-        let session_keys: Vec<String> = buffers.keys().cloned().collect();
+        let sessions: Vec<(String, OutputBuffer)> = buffers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         drop(buffers);
 
-        for skey in session_keys {
-            // Get buffer (reborrow for each iteration)
-            let buffer = {
-                let buffers = self.buffers.read().await;
-                buffers.get(&skey).cloned()
+        for (skey, buffer) in sessions {
+            // Capture pane content directly via tmux
+            let current_content = match tmux::capture_pane(&buffer.session).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // Validate current buffer still represents same session instance
+                    // before triggering final/unregister side effects. This prevents
+                    // stale snapshots from previous registration generations
+                    // (e.g., after retry/re-dispatch) from incorrectly terminating
+                    // a newly registered session.
+                    let current = {
+                        let buffers = self.buffers.read().await;
+                        buffers.get(&skey).cloned()
+                    };
+
+                    // Only fire "session ended" if:
+                    // 1. The session still exists in the map
+                    // 2. It has the same generation (not re-registered)
+                    // 3. It was seen alive before
+                    // 4. The tmux session is actually dead
+                    let should_finalize = current
+                        .as_ref()
+                        .map(|c| {
+                            c.generation == buffer.generation
+                                && c.seen_alive
+                                && c.session == buffer.session
+                        })
+                        .unwrap_or(false);
+
+                    if should_finalize && tmux::is_session_dead(&buffer.session).await {
+                        tracing::info!(
+                            task_id = buffer.task_id,
+                            session = buffer.session,
+                            generation = buffer.generation,
+                            "session ended, sending final chunk"
+                        );
+                        let chunk = OutputChunk {
+                            content: String::new(),
+                            is_final: true,
+                        };
+                        self.transport
+                            .push_output(&buffer.repo, &buffer.task_id, chunk)
+                            .await;
+                        self.unregister_session(&buffer.repo, &buffer.task_id).await;
+                    } else if current.is_none() {
+                        tracing::trace!(
+                            task_id = buffer.task_id,
+                            session = buffer.session,
+                            "session already unregistered"
+                        );
+                    } else {
+                        tracing::trace!(
+                            task_id = buffer.task_id,
+                            session = buffer.session,
+                            ?e,
+                            "capture failed (transient)"
+                        );
+                    }
+                    continue;
+                }
             };
 
-            if let Some(buffer) = buffer {
-                // Capture pane content directly via tmux
-                let current_content = match tmux::capture_pane(&buffer.session).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        // Only fire "session ended" if the session was seen alive before.
-                        // Prevents false positives when the session is registered before
-                        // the tmux session is actually created (race between registration
-                        // and session creation).
-                        if buffer.seen_alive && tmux::is_session_dead(&buffer.session).await {
-                            tracing::info!(
-                                task_id = buffer.task_id,
-                                session = buffer.session,
-                                "session ended, sending final chunk"
-                            );
-                            let chunk = OutputChunk {
-                                content: String::new(),
-                                is_final: true,
-                            };
-                            self.transport
-                                .push_output(&buffer.repo, &buffer.task_id, chunk)
-                                .await;
-                            self.unregister_session(&buffer.repo, &buffer.task_id).await;
-                        } else {
-                            tracing::trace!(
-                                task_id = buffer.task_id,
-                                session = buffer.session,
-                                ?e,
-                                "capture failed (transient)"
-                            );
-                        }
-                        continue;
-                    }
-                };
-
-                let new_content = {
-                    let mut buffers = self.buffers.write().await;
-                    if let Some(buf) = buffers.get_mut(&skey) {
-                        buf.seen_alive = true;
-                        buf.diff_and_update(&current_content)
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(new_content) = new_content {
-                    let chunk = OutputChunk {
-                        content: new_content,
-                        is_final: false,
-                    };
-                    self.transport
-                        .push_output(&buffer.repo, &buffer.task_id, chunk)
-                        .await;
+            let new_content = {
+                let mut buffers = self.buffers.write().await;
+                if let Some(buf) = buffers.get_mut(&skey) {
+                    buf.seen_alive = true;
+                    buf.diff_and_update(&current_content)
+                } else {
+                    None
                 }
+            };
+
+            if let Some(new_content) = new_content {
+                let chunk = OutputChunk {
+                    content: new_content,
+                    is_final: false,
+                };
+                self.transport
+                    .push_output(&buffer.repo, &buffer.task_id, chunk)
+                    .await;
             }
         }
     }
@@ -318,6 +364,7 @@ mod tests {
             seen_alive: false,
             registered_at: Utc::now(),
             has_output: false,
+            generation: 0,
         }
     }
 
