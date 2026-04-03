@@ -998,6 +998,10 @@ impl TaskStore {
     // ---------------------------------------------------------------
 
     /// Store token usage and cost for a task.
+    ///
+    /// Accumulates tokens across multiple calls (e.g. retries) rather than
+    /// overwriting. This ensures the budget check sees the true cumulative
+    /// token usage across all attempts, not just the latest run.
     pub async fn store_tokens(
         &self,
         id: i64,
@@ -1014,8 +1018,12 @@ impl TaskStore {
 
         sqlx::query(
             "UPDATE tasks SET
-            input_tokens = ?, output_tokens = ?, model = ?,
-            input_cost_usd = ?, output_cost_usd = ?, total_cost_usd = ?,
+            input_tokens = COALESCE(input_tokens, 0) + ?,
+            output_tokens = COALESCE(output_tokens, 0) + ?,
+            model = ?,
+            input_cost_usd = COALESCE(input_cost_usd, 0) + ?,
+            output_cost_usd = COALESCE(output_cost_usd, 0) + ?,
+            total_cost_usd = COALESCE(total_cost_usd, 0) + ?,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )

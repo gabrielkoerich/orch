@@ -2743,11 +2743,13 @@ async fn store_tokens_accumulates_across_calls() {
     let cost1 = task.total_cost_usd;
     assert!(cost1 > 0.0);
 
-    // Second call replaces (not accumulates)
+    // Second call accumulates (not replaces) — critical for budget enforcement
+    // across retries. Without accumulation, only the last run's tokens are
+    // recorded, silently discarding all previous usage.
     store.store_tokens(id, 2000, 1000, "sonnet").await.unwrap();
     let task = store.get(id).await.unwrap();
-    assert_eq!(task.input_tokens, 2000);
-    assert_eq!(task.output_tokens, 1000);
+    assert_eq!(task.input_tokens, 3000); // 1000 + 2000
+    assert_eq!(task.output_tokens, 1500); // 500 + 1000
     assert!(task.total_cost_usd > cost1);
 }
 
@@ -3171,7 +3173,7 @@ async fn set_fields_multiple_fields_at_once() {
 }
 
 #[tokio::test]
-async fn store_tokens_overwrites_previous_values() {
+async fn store_tokens_accumulates_with_different_models() {
     let store = TaskStore::open_memory().await.unwrap();
     let id = store
         .create(&NewTask {
@@ -3189,17 +3191,17 @@ async fn store_tokens_overwrites_previous_values() {
         .await
         .unwrap();
 
-    // First token store
+    // First token store with haiku
     store.store_tokens(id, 1000, 500, "haiku").await.unwrap();
     let task = store.get(id).await.unwrap();
     assert_eq!(task.input_tokens, 1000);
     assert_eq!(task.output_tokens, 500);
 
-    // Second store overwrites (not accumulates)
+    // Second store accumulates; model field updates to latest
     store.store_tokens(id, 2000, 1000, "sonnet").await.unwrap();
     let task = store.get(id).await.unwrap();
-    assert_eq!(task.input_tokens, 2000);
-    assert_eq!(task.output_tokens, 1000);
+    assert_eq!(task.input_tokens, 3000); // 1000 + 2000
+    assert_eq!(task.output_tokens, 1500); // 500 + 1000
     assert_eq!(task.model, Some("sonnet".to_string()));
 }
 

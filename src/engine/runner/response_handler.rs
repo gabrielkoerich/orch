@@ -103,6 +103,7 @@ pub async fn handle_success(
     new_attempts: u32,
     repo: &str,
     store: &Option<Arc<TaskStore>>,
+    raw_output_bytes: usize,
 ) -> anyhow::Result<(String, bool, bool)> {
     let resp = parsed.response;
     tracing::info!(
@@ -565,16 +566,39 @@ pub async fn handle_success(
     )
     .await;
 
-    // Store token usage — prefer agent-parsed tokens, fall back to response
+    // Store token usage — prefer agent-parsed tokens, fall back to response,
+    // then fall back to byte-count estimation as a last resort.
+    // This ensures budget enforcement always has non-zero token data,
+    // even for agents that don't report usage (e.g. Codex, some OpenCode builds).
     let input_tokens = parsed.input_tokens.or(resp.input_tokens);
     let output_tokens = parsed.output_tokens.or(resp.output_tokens);
-    if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
+    let (input_tokens, output_tokens) = match (input_tokens, output_tokens) {
+        (Some(i), Some(o)) if i > 0 || o > 0 => (i, o),
+        _ => {
+            // No tokens reported by agent — estimate from raw output byte length.
+            // Uses ~4 bytes per token (standard approximation for English text),
+            // split 60/40 input/output (typical for agent runs where input context
+            // is larger than response). Floor at 1 to ensure budget always tracks.
+            let total_estimated = (raw_output_bytes as u64) / 4;
+            let input_estimated = total_estimated * 60 / 100;
+            let output_estimated = total_estimated.saturating_sub(input_estimated);
+            tracing::info!(
+                task_id,
+                raw_output_bytes,
+                input_estimated,
+                output_estimated,
+                "no token usage reported by agent, using byte-count estimation"
+            );
+            (input_estimated.max(1), output_estimated.max(1))
+        }
+    };
+    {
         let model = model_name.unwrap_or("haiku");
         if let Some(ref st) = store {
             // Resolve store_id once and reuse
             if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
                 if let Err(e) = st
-                    .store_tokens(store_id, input as i64, output as i64, model)
+                    .store_tokens(store_id, input_tokens as i64, output_tokens as i64, model)
                     .await
                 {
                     tracing::warn!(task_id, ?e, "failed to store token usage");
@@ -608,10 +632,10 @@ pub async fn handle_success(
 
     if total_tokens > max_tokens {
         tracing::warn!(task_id, total_tokens, max_tokens, "exceeded token budget");
-        // Only override to needs_review if there's a PR to review;
-        // otherwise keep the already-computed final_status (e.g. "done" for
-        // read-only tasks with no code changes).
-        let budget_status = if has_pr { "needs_review" } else { final_status };
+        // Always override status when budget is exceeded. Tasks should never
+        // silently succeed beyond their token limit — this was the root cause
+        // of tasks being marked "done" despite burning 2-25x their budget.
+        let budget_status = "needs_review";
         let budget_msg = format!(
             "token budget exceeded: {}/{} tokens (${:.4})",
             total_tokens, max_tokens, cost.total_cost_usd

@@ -42,6 +42,57 @@ use crate::parser;
 pub struct CodexRunner;
 
 impl CodexRunner {
+    /// Extract usage info from Codex NDJSON events if present.
+    ///
+    /// Codex's `exec --json` NDJSON format doesn't consistently include `usage`
+    /// fields. If found, returns them directly. Otherwise, returns None so the
+    /// caller can fall back to byte-count estimation.
+    fn extract_usage(&self, events: &[serde_json::Value]) -> (Option<u64>, Option<u64>) {
+        let mut input_tokens: Option<u64> = None;
+        let mut output_tokens: Option<u64> = None;
+
+        for event in events {
+            // Check top-level `usage` field
+            if let Some(usage) = event.get("usage") {
+                if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                    *input_tokens.get_or_insert(0) += inp;
+                }
+                if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                    *output_tokens.get_or_insert(0) += out;
+                }
+            }
+            // Check nested `item.usage` (some Codex versions)
+            if let Some(item) = event.get("item") {
+                if let Some(usage) = item.get("usage") {
+                    if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                        *input_tokens.get_or_insert(0) += inp;
+                    }
+                    if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                        *output_tokens.get_or_insert(0) += out;
+                    }
+                }
+            }
+        }
+
+        (input_tokens, output_tokens)
+    }
+
+    /// Estimate token count from raw output byte length.
+    ///
+    /// When agents don't report token usage (Codex never does currently),
+    /// we estimate using ~4 bytes per token (a common approximation for
+    /// English text). This is conservative — real tokenizers typically
+    /// produce fewer tokens, so this slightly overestimates usage.
+    fn estimate_tokens_from_bytes(raw: &str) -> (u64, u64) {
+        let bytes = raw.len() as u64;
+        // Rough estimate: 4 bytes per token, split 60% input / 40% output
+        // (typical for agent runs where input context is larger than response)
+        let total_estimated = bytes / 4;
+        let input_estimated = total_estimated * 60 / 100;
+        let output_estimated = total_estimated - input_estimated;
+        (input_estimated.max(1), output_estimated.max(1))
+    }
+
     /// Extract the agent's response text from NDJSON events.
     ///
     /// Looks for `item.completed` events with `item.type == "agent_message"`.
@@ -295,10 +346,12 @@ impl AgentRunner for CodexRunner {
         if events.is_empty() {
             // Maybe it's direct JSON, not NDJSON
             if let Ok(resp) = parser::parse(trimmed) {
+                // Use byte-count estimation for direct JSON (no NDJSON events)
+                let (est_input, est_output) = Self::estimate_tokens_from_bytes(trimmed);
                 return Ok(ParsedResponse {
                     response: resp,
-                    input_tokens: None,
-                    output_tokens: None,
+                    input_tokens: Some(est_input),
+                    output_tokens: Some(est_output),
                     duration_ms: None,
                 });
             }
@@ -324,10 +377,21 @@ impl AgentRunner for CodexRunner {
             raw: agent_text.clone(),
         })?;
 
+        // Try to extract real usage from events; fall back to byte-count estimate
+        let (input_tokens, output_tokens) = self.extract_usage(&events);
+        let (input_tokens, output_tokens) = match (input_tokens, output_tokens) {
+            (Some(i), Some(o)) if i > 0 || o > 0 => (Some(i), Some(o)),
+            _ => {
+                // Codex doesn't report usage — estimate from raw output size
+                let (est_input, est_output) = Self::estimate_tokens_from_bytes(trimmed);
+                (Some(est_input), Some(est_output))
+            }
+        };
+
         Ok(ParsedResponse {
             response,
-            input_tokens: None,
-            output_tokens: None,
+            input_tokens,
+            output_tokens,
             duration_ms: None,
         })
     }
@@ -413,8 +477,20 @@ pub fn find_codex_result(ndjson: &str) -> Option<super::AgentResult> {
     Some(super::AgentResult {
         is_error,
         result_text,
-        input_tokens: None,
-        output_tokens: None,
+        input_tokens: {
+            let (inp, _) = runner.extract_usage(&events);
+            inp.or_else(|| {
+                let (est, _) = CodexRunner::estimate_tokens_from_bytes(ndjson);
+                Some(est)
+            })
+        },
+        output_tokens: {
+            let (_, out) = runner.extract_usage(&events);
+            out.or_else(|| {
+                let (_, est) = CodexRunner::estimate_tokens_from_bytes(ndjson);
+                Some(est)
+            })
+        },
         cost_usd: None,
         duration_ms: None,
     })

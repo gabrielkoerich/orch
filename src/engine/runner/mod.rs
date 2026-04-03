@@ -561,6 +561,7 @@ impl TaskRunner {
                     init.new_attempts,
                     &self.repo,
                     &self.store,
+                    session_output.raw_stdout.len(),
                 )
                 .await?;
                 if budget_exceeded {
@@ -588,6 +589,41 @@ impl TaskRunner {
                 (status, budget_exceeded, push_failed)
             }
             Err(ref agent_err) => {
+                // Store estimated token usage for failed runs so budget tracking
+                // accounts for tokens burned before the error. Without this,
+                // agents that burn 200K tokens and then crash have zero tokens
+                // recorded, bypassing the budget system entirely.
+                if !session_output.raw_stdout.is_empty() {
+                    let stdout_bytes = session_output.raw_stdout.len() as u64;
+                    // Estimate ~4 bytes per token (conservative for English text)
+                    let estimated_total = stdout_bytes / 4;
+                    let est_input = (estimated_total * 60 / 100).max(1) as i64;
+                    let est_output = (estimated_total - estimated_total * 60 / 100).max(1) as i64;
+                    let model = init.model_name.as_deref().unwrap_or("haiku");
+                    if let Some(ref st) = self.store {
+                        if let Ok(Some(store_id)) = st.resolve_task_id(&self.repo, task_id).await {
+                            if let Err(e) = st
+                                .store_tokens(store_id, est_input, est_output, model)
+                                .await
+                            {
+                                tracing::warn!(
+                                    task_id,
+                                    ?e,
+                                    "failed to store estimated tokens for failed run"
+                                );
+                            } else {
+                                tracing::info!(
+                                    task_id,
+                                    est_input,
+                                    est_output,
+                                    stdout_bytes,
+                                    "stored estimated tokens for failed run"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 match fallback::handle_error(
                     task_id,
                     agent_err,
