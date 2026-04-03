@@ -344,6 +344,205 @@ pub(crate) fn build_git_auth_args() -> Vec<String> {
     }
 }
 
+/// Returns `true` if the push error indicates that the GitHub token lacks the
+/// `workflow` OAuth scope, which is required to push changes to
+/// `.github/workflows/` files.
+///
+/// GitHub rejects pushes with: "refusing to allow an OAuth App to create or
+/// update workflow `…` without `workflow` scope"
+pub(crate) fn is_workflow_scope_error(stderr: &str) -> bool {
+    stderr.contains("without `workflow` scope")
+        || stderr.contains("without 'workflow' scope")
+        || (stderr.contains("refusing to allow")
+            && stderr.contains("workflow")
+            && stderr.contains("scope"))
+}
+
+/// Remove `.github/workflows/` files from committed changes and amend the
+/// commits so the branch can be pushed without the `workflow` OAuth scope.
+///
+/// Strategy: find all commits ahead of `origin/{default_branch}`, identify
+/// which ones touch `.github/workflows/`, and rewrite them to exclude those
+/// files. Uses `git filter-branch`-style approach via interactive rebase
+/// with `exec` steps.
+///
+/// Returns `Ok(true)` if workflow files were removed and commits rewritten,
+/// `Ok(false)` if no workflow files were found in the commits.
+async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Result<bool> {
+    // Find workflow files in commits ahead of the default branch
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--name-only",
+            &format!("origin/{default_branch}...HEAD"),
+            "--",
+            ".github/workflows/",
+        ])
+        .current_dir(dir)
+        .output_with_context()
+        .await?;
+
+    let workflow_files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    if workflow_files.is_empty() {
+        return Ok(false);
+    }
+
+    tracing::info!(
+        files = ?workflow_files,
+        "stripping workflow files from commits to bypass missing workflow scope"
+    );
+
+    // Remove workflow files from the index and amend each commit.
+    // We use a soft reset → remove files → re-commit approach for simplicity.
+    //
+    // Count commits ahead of default branch
+    let count_output = Command::new("git")
+        .args([
+            "rev-list",
+            "--count",
+            &format!("origin/{default_branch}..HEAD"),
+        ])
+        .current_dir(dir)
+        .output_with_context()
+        .await?;
+
+    let commit_count: usize = String::from_utf8_lossy(&count_output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
+
+    if commit_count == 0 {
+        return Ok(false);
+    }
+
+    // Save the commit messages before resetting
+    let log_output = Command::new("git")
+        .args([
+            "log",
+            "--format=%H%n%B%n---COMMIT_SEP---",
+            &format!("origin/{default_branch}..HEAD"),
+        ])
+        .current_dir(dir)
+        .output_with_context()
+        .await?;
+    let log_text = String::from_utf8_lossy(&log_output.stdout).to_string();
+
+    // Parse commits in reverse order (oldest first)
+    let commits: Vec<(String, String)> = log_text
+        .split("---COMMIT_SEP---")
+        .filter(|s| !s.trim().is_empty())
+        .map(|block| {
+            let block = block.trim();
+            let first_nl = block.find('\n').unwrap_or(block.len());
+            let hash = block[..first_nl].to_string();
+            let msg = block[first_nl..].trim().to_string();
+            (hash, msg)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    if commits.is_empty() {
+        return Ok(false);
+    }
+
+    // Soft reset to the base (origin/default_branch)
+    let reset = Command::new("git")
+        .args(["reset", "--soft", &format!("origin/{default_branch}")])
+        .current_dir(dir)
+        .output_with_context()
+        .await?;
+
+    if !reset.status.success() {
+        let stderr = String::from_utf8_lossy(&reset.stderr);
+        anyhow::bail!("git reset --soft failed during workflow file stripping: {stderr}");
+    }
+
+    // Remove workflow files from the index
+    let mut rm_args = vec!["rm", "--cached", "--ignore-unmatch", "--"];
+    let file_refs: Vec<&str> = workflow_files.iter().map(|s| s.as_str()).collect();
+    rm_args.extend(file_refs);
+
+    let rm = Command::new("git")
+        .args(&rm_args)
+        .current_dir(dir)
+        .output_with_context()
+        .await?;
+
+    if !rm.status.success() {
+        let stderr = String::from_utf8_lossy(&rm.stderr);
+        tracing::warn!("git rm --cached for workflow files failed (non-fatal): {stderr}");
+    }
+
+    // Re-commit all remaining changes as a single commit preserving the first message.
+    // This squashes multiple commits but preserves the work minus workflow files.
+    let has_staged = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(dir)
+        .status()
+        .await
+        .map(|s| !s.success())
+        .unwrap_or(false);
+
+    if !has_staged {
+        tracing::warn!(
+            "after removing workflow files, no staged changes remain — \
+             the only changes were workflow files"
+        );
+        // Reset back to where we were — nothing to push
+        // Use the original HEAD from the first (newest) commit
+        if let Some((hash, _)) = commits.last() {
+            let _ = Command::new("git")
+                .args(["reset", "--soft", hash])
+                .current_dir(dir)
+                .output_with_context()
+                .await;
+        }
+        return Ok(false);
+    }
+
+    // Use the first commit's message (oldest commit)
+    let commit_msg = if commits.len() == 1 {
+        commits[0].1.clone()
+    } else {
+        // Combine messages when squashing
+        let mut combined = String::new();
+        for (i, (_, msg)) in commits.iter().enumerate() {
+            if i > 0 {
+                combined.push_str("\n\n");
+            }
+            combined.push_str(msg);
+        }
+        combined.push_str("\n\n[workflow files stripped: token lacks `workflow` scope]");
+        combined
+    };
+
+    let commit = Command::new("git")
+        .args(["commit", "-m", &commit_msg])
+        .current_dir(dir)
+        .output_with_context()
+        .await?;
+
+    if !commit.status.success() {
+        let stderr = String::from_utf8_lossy(&commit.stderr);
+        anyhow::bail!("git commit failed during workflow file stripping: {stderr}");
+    }
+
+    tracing::info!(
+        stripped_files = ?workflow_files,
+        original_commits = commit_count,
+        "successfully stripped workflow files from commits"
+    );
+
+    Ok(true)
+}
+
 /// Push the branch to origin.
 pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyhow::Result<bool> {
     let current = get_current_branch(dir).await;
@@ -407,6 +606,67 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
+    // Handle workflow scope error: the token lacks the `workflow` OAuth scope
+    // required to push changes to `.github/workflows/`. Strip workflow files
+    // from commits and retry the push.
+    if is_workflow_scope_error(&stderr) {
+        tracing::warn!(
+            branch = branch_to_push,
+            "push rejected: token lacks `workflow` scope — stripping workflow files and retrying"
+        );
+
+        match strip_workflow_files(dir, default_branch).await {
+            Ok(true) => {
+                // Workflow files stripped, retry push
+                let retry_args = build_push_args(&auth_args, branch_to_push, false);
+                let retry_output = Command::new("git")
+                    .args(&retry_args)
+                    .current_dir(dir)
+                    .output_with_context()
+                    .await?;
+
+                if retry_output.status.success() {
+                    tracing::info!(
+                        branch = branch_to_push,
+                        "push succeeded after stripping workflow files"
+                    );
+                    return Ok(true);
+                }
+
+                let retry_stderr = String::from_utf8_lossy(&retry_output.stderr)
+                    .trim()
+                    .to_string();
+
+                // If still failing with workflow scope, bail with clear message
+                if is_workflow_scope_error(&retry_stderr) {
+                    anyhow::bail!(
+                        "push failed: token lacks `workflow` OAuth scope and workflow files \
+                         could not be fully stripped — add `workflow` scope to your GitHub \
+                         token or use a GitHub App for authentication"
+                    );
+                }
+
+                anyhow::bail!("push failed after stripping workflow files: {retry_stderr}");
+            }
+            Ok(false) => {
+                // No workflow files found to strip (shouldn't happen if error was detected)
+                anyhow::bail!(
+                    "push failed: token lacks `workflow` OAuth scope — add `workflow` scope \
+                     to your GitHub token or use a GitHub App for authentication. \
+                     Error: {stderr}"
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to strip workflow files from commits");
+                anyhow::bail!(
+                    "push failed: token lacks `workflow` OAuth scope and automatic \
+                     recovery failed ({e}) — add `workflow` scope to your GitHub token \
+                     or use a GitHub App for authentication"
+                );
+            }
+        }
+    }
+
     // If non-fast-forward, the branch was likely rebased on the default branch
     // by `rebase_on_default()` before the agent started — the local history is
     // correct but diverges from the remote. Force-push with lease to update it
@@ -429,6 +689,53 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+        // Check if force push also hit the workflow scope error
+        if is_workflow_scope_error(&stderr) {
+            tracing::warn!(
+                branch = branch_to_push,
+                "force push also rejected due to workflow scope — stripping and retrying"
+            );
+            match strip_workflow_files(dir, default_branch).await {
+                Ok(true) => {
+                    let retry_args = build_push_args(&auth_args, branch_to_push, true);
+                    let retry_output = Command::new("git")
+                        .args(&retry_args)
+                        .current_dir(dir)
+                        .output_with_context()
+                        .await?;
+
+                    if retry_output.status.success() {
+                        tracing::info!(
+                            branch = branch_to_push,
+                            "force push succeeded after stripping workflow files"
+                        );
+                        return Ok(true);
+                    }
+
+                    let retry_stderr = String::from_utf8_lossy(&retry_output.stderr)
+                        .trim()
+                        .to_string();
+                    anyhow::bail!(
+                        "force push failed after stripping workflow files: {retry_stderr}"
+                    );
+                }
+                Ok(false) => {
+                    anyhow::bail!(
+                        "force push failed: token lacks `workflow` OAuth scope — \
+                         add `workflow` scope to your GitHub token or use a GitHub App. \
+                         Error: {stderr}"
+                    );
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "force push failed: token lacks `workflow` scope and recovery \
+                         failed ({e})"
+                    );
+                }
+            }
+        }
+
         anyhow::bail!("force push failed: {stderr}");
     }
 
@@ -1234,6 +1541,218 @@ mod tests {
             cached.map(|s| s.success()).unwrap_or(false),
             "files should be unstaged after commit failure"
         );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_workflow_scope_error_detects_backtick_format() {
+        let err = "! [remote rejected] branch -> branch (refusing to allow an OAuth App to create or update workflow `.github/workflows/ci.yml` without `workflow` scope)";
+        assert!(is_workflow_scope_error(err));
+    }
+
+    #[test]
+    fn is_workflow_scope_error_detects_single_quote_format() {
+        let err = "refusing to allow an OAuth App to create or update workflow '.github/workflows/ci.yml' without 'workflow' scope";
+        assert!(is_workflow_scope_error(err));
+    }
+
+    #[test]
+    fn is_workflow_scope_error_detects_refusing_to_allow_variant() {
+        let err = "remote: refusing to allow a Personal Access Token to create or update workflow `.github/workflows/scan.yml` without `workflow` scope";
+        assert!(is_workflow_scope_error(err));
+    }
+
+    #[test]
+    fn is_workflow_scope_error_rejects_unrelated_errors() {
+        assert!(!is_workflow_scope_error("non-fast-forward"));
+        assert!(!is_workflow_scope_error("permission denied"));
+        assert!(!is_workflow_scope_error("authentication failed"));
+        assert!(!is_workflow_scope_error("rejected"));
+    }
+
+    #[tokio::test]
+    async fn strip_workflow_files_removes_workflow_from_commits() {
+        // Create a temp git repo simulating the scenario
+        let dir = std::env::temp_dir().join(format!("orch_test_strip_wf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Init repo with initial commit
+        let _ = Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        std::fs::write(dir.join("init.txt"), "init").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .await;
+
+        // Create a "remote" by adding the repo as its own origin (for rev-list)
+        let _ = Command::new("git")
+            .args(["remote", "add", "origin", dir.to_str().unwrap()])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["fetch", "origin"])
+            .current_dir(&dir)
+            .output()
+            .await;
+
+        // Create a branch off main
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&dir)
+            .output()
+            .await;
+
+        // Add both a normal file and a workflow file
+        std::fs::write(dir.join("feature.txt"), "feature work").unwrap();
+        let wf_dir = dir.join(".github/workflows");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(wf_dir.join("ci.yml"), "name: CI\non: push").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "add feature and workflow"])
+            .current_dir(&dir)
+            .output()
+            .await;
+
+        // Get the default branch name
+        let branch_out = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "origin/HEAD"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        // Fallback to "main" if origin/HEAD is not set
+        let default_branch = branch_out
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .strip_prefix("origin/")
+                    .unwrap_or("main")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "main".to_string());
+
+        // Strip workflow files
+        let stripped = strip_workflow_files(&dir, &default_branch).await.unwrap();
+        assert!(stripped, "should have stripped workflow files");
+
+        // Verify workflow file is no longer in the committed tree
+        let ls_output = Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", "HEAD"])
+            .current_dir(&dir)
+            .output()
+            .await
+            .unwrap();
+        let files = String::from_utf8_lossy(&ls_output.stdout);
+        assert!(
+            !files.contains(".github/workflows/ci.yml"),
+            "workflow file should be removed from commits"
+        );
+        assert!(
+            files.contains("feature.txt"),
+            "non-workflow files should be preserved"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn strip_workflow_files_returns_false_when_no_workflows() {
+        let dir =
+            std::env::temp_dir().join(format!("orch_test_strip_wf_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Init repo
+        let _ = Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .output()
+            .await;
+        std::fs::write(dir.join("init.txt"), "init").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .await;
+
+        let _ = Command::new("git")
+            .args(["remote", "add", "origin", dir.to_str().unwrap()])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["fetch", "origin"])
+            .current_dir(&dir)
+            .output()
+            .await;
+
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "feature2"])
+            .current_dir(&dir)
+            .output()
+            .await;
+
+        // Only non-workflow files
+        std::fs::write(dir.join("feature.txt"), "feature").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "add feature only"])
+            .current_dir(&dir)
+            .output()
+            .await;
+
+        let stripped = strip_workflow_files(&dir, "main").await.unwrap();
+        assert!(!stripped, "should not strip when no workflow files exist");
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
