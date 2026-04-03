@@ -18,6 +18,68 @@ pub enum ErrorHandleResult {
     Continue { status: String },
 }
 
+/// Try to reroute the task to an untried free model.
+///
+/// Returns `Some(EarlyReturn { status: "routed" })` if a free model was found and the
+/// task was rerouted, `None` otherwise (caller should fall through to normal failover).
+///
+/// - `exclude_models`: models to skip in addition to already-tried ones
+/// - `check_cooldowns`: whether to skip models currently in cooldown
+/// - `set_agent`: if `Some`, also overwrite the task's `agent` field
+/// - `apply_backoff`: whether to pace the reroute with `wait_for_fallback_backoff`
+/// - `reason_prefix`: prefix for the `last_error` message (free model name is appended)
+#[allow(clippy::too_many_arguments)]
+async fn try_free_model_reroute(
+    task_id: &str,
+    agent_name: &str,
+    agent_runner: &dyn agents::AgentRunner,
+    exclude_models: &[&str],
+    check_cooldowns: bool,
+    set_agent: Option<&str>,
+    apply_backoff: bool,
+    reason_prefix: &str,
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+) -> Option<ErrorHandleResult> {
+    let free = agent_runner.free_models();
+    if free.is_empty() {
+        return None;
+    }
+    let tried_models: String = store::opt_store_get_task(store, repo, task_id)
+        .await
+        .map(|t| t.model_reroute_chain)
+        .unwrap_or_default();
+    let tried_set: std::collections::HashSet<&str> =
+        tried_models.split(',').filter(|s| !s.is_empty()).collect();
+    let next_free = free.iter().find(|m| {
+        !exclude_models.contains(&m.as_str())
+            && !tried_set.contains(m.as_str())
+            && (!check_cooldowns || !response::is_model_in_cooldown(agent_name, m))
+    })?;
+    tracing::info!(task_id, model = %next_free, "{}", reason_prefix);
+    let new_tried = if tried_models.is_empty() {
+        next_free.clone()
+    } else {
+        format!("{tried_models},{next_free}")
+    };
+    let msg = format!("{reason_prefix} {next_free}");
+    let mut fields: Vec<(&str, serde_json::Value)> = vec![
+        ("model", serde_json::json!(next_free.to_string())),
+        ("model_reroute_chain", serde_json::json!(new_tried)),
+        ("last_error", serde_json::json!(msg)),
+    ];
+    if let Some(agent) = set_agent {
+        fields.push(("agent", serde_json::json!(agent)));
+    }
+    store::store_set(store, repo, task_id, &fields).await;
+    if apply_backoff {
+        response::wait_for_fallback_backoff(task_id, store, repo).await;
+    }
+    Some(ErrorHandleResult::EarlyReturn {
+        status: "routed".to_string(),
+    })
+}
+
 /// Handle an agent error: classify it, attempt recovery strategies, and update store.
 ///
 /// Returns `Ok(ErrorHandleResult::EarlyReturn)` when the task was rerouted and
@@ -118,44 +180,21 @@ pub async fn handle_error(
             // No other standard models available — try free models for simple tasks
             let is_simple = matches!(complexity, None | Some("simple"));
             if is_simple {
-                let free = agent_runner.free_models();
-                if !free.is_empty() {
-                    let tried_models: String = store::opt_store_get_task(store, repo, task_id)
-                        .await
-                        .map(|t| t.model_reroute_chain)
-                        .unwrap_or_default();
-                    let tried_set: std::collections::HashSet<&str> =
-                        tried_models.split(',').filter(|s| !s.is_empty()).collect();
-                    if let Some(next_free) = free.iter().find(|m| {
-                        m.as_str() != current_model
-                            && m.as_str() != model
-                            && !tried_set.contains(m.as_str())
-                            && !response::is_model_in_cooldown(agent_name, m)
-                    }) {
-                        tracing::info!(task_id, model = %next_free, "retrying with free model after model unavailable");
-                        let new_tried = if tried_models.is_empty() {
-                            next_free.clone()
-                        } else {
-                            format!("{tried_models},{next_free}")
-                        };
-                        let msg =
-                            format!("model {model} unavailable, trying free model {next_free}");
-                        store::store_set(
-                            store,
-                            repo,
-                            task_id,
-                            &[
-                                ("model", serde_json::json!(next_free.to_string())),
-                                ("model_reroute_chain", serde_json::json!(new_tried)),
-                                ("last_error", serde_json::json!(msg)),
-                            ],
-                        )
-                        .await;
-                        response::wait_for_fallback_backoff(task_id, store, repo).await;
-                        return Ok(ErrorHandleResult::EarlyReturn {
-                            status: "routed".to_string(),
-                        });
-                    }
+                if let Some(result) = try_free_model_reroute(
+                    task_id,
+                    agent_name,
+                    agent_runner,
+                    &[current_model, model.as_str()],
+                    true,
+                    None,
+                    true,
+                    &format!("model {model} unavailable, trying free model"),
+                    store,
+                    repo,
+                )
+                .await
+                {
+                    return Ok(result);
                 }
             }
 
@@ -242,49 +281,23 @@ pub async fn handle_error(
                 // handle_failover() so the next agent is chosen at the same complexity
                 // level (e.g. claude/sonnet or codex/gpt-5.2) instead of a weaker model.
                 let is_simple = matches!(complexity, None | Some("simple"));
-                let free = agent_runner.free_models();
-                if is_simple && !free.is_empty() {
-                    let tried_models: String = store::opt_store_get_task(store, repo, task_id)
-                        .await
-                        .map(|t| t.model_reroute_chain)
-                        .unwrap_or_default();
-                    let tried_set: std::collections::HashSet<&str> =
-                        tried_models.split(',').filter(|s| !s.is_empty()).collect();
-                    let current = model_name.unwrap_or("");
-                    if let Some(next_free) = free.iter().find(|m| {
-                        m.as_str() != current
-                            && !tried_set.contains(m.as_str())
-                            && !response::is_model_in_cooldown(agent_name, m)
-                    }) {
-                        let new_tried = if tried_models.is_empty() {
-                            next_free.clone()
-                        } else {
-                            format!("{tried_models},{next_free}")
-                        };
-                        let msg = format!("silent exit 0, retrying with free model {next_free}");
-                        tracing::info!(
-                            task_id,
-                            model = %next_free,
-                            "silent exit-0: retrying with free model"
-                        );
-                        store::store_set(
-                            store,
-                            repo,
-                            task_id,
-                            &[
-                                ("agent", serde_json::json!("opencode")),
-                                ("model", serde_json::json!(next_free.to_string())),
-                                ("model_reroute_chain", serde_json::json!(new_tried)),
-                                ("last_error", serde_json::json!(msg)),
-                            ],
-                        )
-                        .await;
-                        // Apply backoff to pace retries.
-                        // Use "routed" since agent/model are already stored.
-                        response::wait_for_fallback_backoff(task_id, store, repo).await;
-                        return Ok(ErrorHandleResult::EarlyReturn {
-                            status: "routed".to_string(),
-                        });
+                let current = model_name.unwrap_or("");
+                if is_simple {
+                    if let Some(result) = try_free_model_reroute(
+                        task_id,
+                        agent_name,
+                        agent_runner,
+                        &[current],
+                        true,
+                        Some("opencode"),
+                        true,
+                        "silent exit 0, retrying with free model",
+                        store,
+                        repo,
+                    )
+                    .await
+                    {
+                        return Ok(result);
                     }
                 }
             }
@@ -347,39 +360,21 @@ pub async fn handle_error(
     let is_simple = matches!(complexity, None | Some("simple"));
     if all_agents_tried && is_simple {
         // All agents exhausted — try free models via opencode (only for simple tasks)
-        let free = agent_runner.free_models();
-        if !free.is_empty() {
-            let tried_models: String = store::opt_store_get_task(store, repo, task_id)
-                .await
-                .map(|t| t.model_reroute_chain)
-                .unwrap_or_default();
-            let tried_set: std::collections::HashSet<&str> =
-                tried_models.split(',').filter(|s| !s.is_empty()).collect();
-
-            if let Some(free_model) = free.iter().find(|m| !tried_set.contains(m.as_str())) {
-                tracing::info!(task_id, model = %free_model, "last resort: trying free model via opencode");
-                let new_tried = if tried_models.is_empty() {
-                    free_model.clone()
-                } else {
-                    format!("{tried_models},{free_model}")
-                };
-                let msg = format!("all agents exhausted, trying free model {free_model}");
-                store::store_set(
-                    store,
-                    repo,
-                    task_id,
-                    &[
-                        ("agent", serde_json::json!("opencode")),
-                        ("model", serde_json::json!(free_model.to_string())),
-                        ("model_reroute_chain", serde_json::json!(new_tried)),
-                        ("last_error", serde_json::json!(msg)),
-                    ],
-                )
-                .await;
-                return Ok(ErrorHandleResult::EarlyReturn {
-                    status: "routed".to_string(),
-                });
-            }
+        if let Some(result) = try_free_model_reroute(
+            task_id,
+            agent_name,
+            agent_runner,
+            &[],
+            true, // fix: check cooldowns (was previously missing, inconsistent with other paths)
+            Some("opencode"),
+            false,
+            "all agents exhausted, trying free model",
+            store,
+            repo,
+        )
+        .await
+        {
+            return Ok(result);
         }
     }
 
