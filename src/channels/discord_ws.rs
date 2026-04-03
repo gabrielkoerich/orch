@@ -9,6 +9,7 @@
 //!   on disconnect: resume with session_id+seq, or re-identify from scratch
 
 use super::{Channel, IncomingMessage, OutgoingMessage};
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
@@ -55,17 +56,24 @@ impl DiscordGateway {
     ///
     /// `shard_id` and `shard_count` follow Discord sharding conventions.
     /// For a single-shard bot, use `shard_id = 0, shard_count = 1`.
-    pub fn new(token: String, channel_id: Option<String>, shard_id: u64, shard_count: u64) -> Self {
-        Self {
+    pub fn new(
+        token: String,
+        channel_id: Option<String>,
+        shard_id: u64,
+        shard_count: u64,
+    ) -> anyhow::Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("failed to build HTTP client")?;
+
+        Ok(Self {
             token,
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("valid TLS config"),
+            client,
             channel_id,
             shard_id,
             shard_count,
-        }
+        })
     }
 
     fn api_url(&self, endpoint: &str) -> String {

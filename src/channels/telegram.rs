@@ -3,6 +3,7 @@
 //! Uses the Telegram Bot API to receive commands and stream agent output.
 
 use super::{Channel, IncomingMessage, OutgoingMessage};
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -23,6 +24,13 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn is_preformatted_html(msg: &OutgoingMessage) -> bool {
+    msg.metadata
+        .get("preformatted_html")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 pub struct TelegramChannel {
@@ -77,18 +85,18 @@ struct GetUpdatesResponse {
 }
 
 impl TelegramChannel {
-    pub fn new(token: String, chat_id: Option<String>) -> Self {
-        Self {
+    pub fn new(token: String, chat_id: Option<String>) -> anyhow::Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(TELEGRAM_HTTP_TIMEOUT_SECS))
+            .build()
+            .context("failed to build HTTP client")?;
+
+        Ok(Self {
             token,
-            client: Client::builder()
-                // Keep the client timeout above Telegram's long-poll timeout so
-                // healthy polls do not expire locally before the server responds.
-                .timeout(Duration::from_secs(TELEGRAM_HTTP_TIMEOUT_SECS))
-                .build()
-                .expect("valid TLS config"),
+            client,
             chat_id,
             offset: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
-        }
+        })
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -426,11 +434,7 @@ impl Channel for TelegramChannel {
 
         // Check if body is already pre-formatted HTML (e.g. TaskNotification::format_telegram)
         // or raw text that needs escaping (e.g. streamed agent output).
-        let preformatted = msg
-            .metadata
-            .get("preformatted_html")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let preformatted = is_preformatted_html(msg);
 
         if preformatted {
             self.send_formatted_message(chat_id, &msg.body, topic_id)
@@ -456,5 +460,45 @@ impl Channel for TelegramChannel {
 
         tracing::info!("telegram bot health check passed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn html_escape_escapes_telegram_html_entities() {
+        assert_eq!(
+            html_escape("a < b && c > d"),
+            "a &lt; b &amp;&amp; c &gt; d"
+        );
+    }
+
+    #[test]
+    fn preformatted_html_defaults_to_false() {
+        let msg = OutgoingMessage {
+            thread_id: "thread".to_string(),
+            body: "raw <text>".to_string(),
+            reply_to: None,
+            metadata: serde_json::Value::Null,
+            topic_id: None,
+        };
+
+        assert!(!is_preformatted_html(&msg));
+    }
+
+    #[test]
+    fn preformatted_html_honors_metadata_flag() {
+        let msg = OutgoingMessage {
+            thread_id: "thread".to_string(),
+            body: "<b>formatted</b>".to_string(),
+            reply_to: None,
+            metadata: json!({ "preformatted_html": true }),
+            topic_id: None,
+        };
+
+        assert!(is_preformatted_html(&msg));
     }
 }
