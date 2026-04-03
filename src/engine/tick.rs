@@ -82,17 +82,27 @@ pub(crate) async fn tick_check_session_completions(
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase1.sessions").entered();
     let session_snapshot = tmux.snapshot().await;
-    for (task_id, active) in &session_snapshot {
+    // Derive the short project name from repo (owner/repo -> repo)
+    let repo_name = repo.rsplit('/').next().unwrap_or(repo);
+    for (session, active) in session_snapshot {
+        // Only handle sessions that belong to this repo/project.
+        if session.project != repo_name {
+            continue;
+        }
+
         if !active {
-            tracing::info!(task_id, "session completed, collecting results");
-            // Unregister from capture service
-            capture.unregister_session(task_id).await;
-            // The runner handles status updates and GitHub comment posting.
-            // We just clean up the session.
-            let session_name = tmux.session_name(repo, task_id);
-            if let Err(e) = tmux.kill_session(&session_name).await {
+            tracing::info!(
+                session = %session.name,
+                task_id = %session.task_id,
+                "session completed, collecting results"
+            );
+            // Unregister from capture service using the task id the capture service
+            // was registered under (task id without project prefix).
+            capture.unregister_session(&session.task_id).await;
+            // Kill the actual tmux session name we discovered (do not reconstruct)
+            if let Err(e) = tmux.kill_session(&session.name).await {
                 tracing::debug!(
-                    task_id,
+                    session = %session.name,
                     ?e,
                     "kill_session failed (session may already be gone)"
                 );
