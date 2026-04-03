@@ -168,3 +168,45 @@ fn review_flow_minimax() {
     let (exit, stdout, stderr) = run_claude_agent("minimax", "sonnet");
     verify_review_output("minimax", "minimax:sonnet", exit, &stdout, &stderr);
 }
+
+fn run_opencode_agent(model: &str) -> (i32, String, String) {
+    eprintln!("Running opencode run --model {model}...");
+
+    let mut cmd = Command::new("opencode");
+    cmd.env_remove("CLAUDECODE");
+    cmd.args(["run", "--format", "json"]);
+    if !model.is_empty() {
+        cmd.arg("--model").arg(model);
+    }
+
+    // Pipe prompt via stdin
+    let mut echo = Command::new("printf");
+    echo.arg(REVIEW_PROMPT).stdout(std::process::Stdio::piped());
+
+    let mut echo_child = echo.spawn().expect("printf");
+    cmd.stdin(echo_child.stdout.take().unwrap());
+    let _ = echo_child.wait(); // avoid zombie
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("opencode: failed to run: {e}"));
+
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+#[ignore]
+fn review_flow_opencode() {
+    if !is_available("opencode") {
+        eprintln!("opencode not installed, skipping");
+        return;
+    }
+    let (exit, stdout, stderr) = run_opencode_agent("openai/gpt-4.1");
+    verify_review_output("opencode", "opencode:gpt-4.1", exit, &stdout, &stderr);
+}
