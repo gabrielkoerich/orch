@@ -26,8 +26,12 @@ timeout 300 gh pr checks {{PR_NUMBER}} --watch --fail-fast --required || true
 
 - **Required checks pass AND branch is up to date** (Step 1 rebase was a no-op or already applied) → proceed to Step 3 (skip local test runs)
 - **Required checks pass BUT branch was rebased** (Step 1 changed commits) → CI results are stale. Note in your review that CI needs to re-run post-rebase and proceed with code review. Orch will push the rebased branch (before posting the review decision) and CI will re-run before merging.
-- **Required checks fail** → check if the failure is related to files in this PR. If not, it's pre-existing — note it and proceed. If it is, set decision = `request_changes`
+- **Required checks fail** → check if the failure is related to files in this PR. If not, it's pre-existing — note it and proceed. If it is, **first check if it is trivially fixable** (e.g., `cargo fmt`, `cargo clippy --fix`, `npm run lint -- --fix`). If fixable: apply the fix in the worktree, commit, re-run the check locally to confirm it passes, then **approve** — do NOT request changes for auto-fixable issues. If not trivially fixable, set decision = `request_changes`
 - **Required checks not run yet or pending** → run local checks as fallback: read `.github/workflows/` to identify what CI runs and execute those commands. Do NOT hardcode language-specific commands
+
+**Self-fix rule**: If CI fails on formatting, linting, or other auto-fixable issues, apply the fix yourself, commit, and approve. Do NOT consume a review cycle for trivially fixable issues. Example: `cargo fmt --check` fails → run `cargo fmt`, `git add -A`, `git commit -m "style: run cargo fmt"`, re-run the check, then approve.
+
+**Worktree state**: Before running CI checks or applying fixes, run `git status` to verify the worktree is clean and not in a rebase state. If the worktree is mid-rebase (`git rebase --continue` needed), resolve that first. If conflicts are too complex to resolve safely, set decision = `request_changes`.
 
 **Do NOT request changes for local-only test failures when required checks are green.**
 

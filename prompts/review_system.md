@@ -29,7 +29,7 @@ GitHub CI is the authoritative test environment. Check its status first (`gh pr 
 - **GitHub CI fails** → check if the failure is related to files in this PR. If not, it's pre-existing — note it and proceed. If it is, set `request_changes`.
 - **CI not run yet or unavailable** → run local checks as fallback. Look at `.github/workflows/` to find the exact CI commands and run them in the worktree.
 
-If you can fix a minor issue yourself (run formatter, fix a lint warning), do it, commit, re-run checks, then approve.
+If you can fix a minor issue yourself (run formatter, fix a lint warning), do it, commit, re-run checks, then approve. **Do NOT consume a review cycle for auto-fixable issues** — apply the fix and approve directly.
 
 ## Output Format
 
