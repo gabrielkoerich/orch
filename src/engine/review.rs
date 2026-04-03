@@ -435,8 +435,10 @@ async fn ensure_pr_exists(
                                 // If this was a transient GitHub 5xx or transport error,
                                 // do NOT increment the persistent pr_create_failures counter
                                 // (which would eventually block the task). Let the
-                                // engine retry later. Detect via git_ops::is_transient_github_error.
-                                if crate::engine::runner::git_ops::is_transient_github_error(
+                                // engine retry later. Detect via git_ops::is_transient_github_api_error
+                                // so generic agent/model transport errors (e.g. broken pipe)
+                                // are NOT mis-classified as GitHub API transients.
+                                if crate::engine::runner::git_ops::is_transient_github_api_error(
                                     &stderr,
                                 ) {
                                     tracing::warn!(
@@ -476,8 +478,9 @@ async fn ensure_pr_exists(
                                     "failed to run gh pr create"
                                 );
                                 let e_str = format!("{e}");
-                                if crate::engine::runner::git_ops::is_transient_github_error(&e_str)
-                                {
+                                if crate::engine::runner::git_ops::is_transient_github_api_error(
+                                    &e_str,
+                                ) {
                                     tracing::warn!(
                                         task_id = task.id.0,
                                         branch = %branch_name,

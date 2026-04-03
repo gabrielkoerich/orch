@@ -198,7 +198,7 @@ pub(crate) async fn review_open_prs(
                     let e_str = format!("{e}");
                     // If transient GitHub 5xx/transport error, skip incrementing counters
                     // and let the task be retried on the next tick.
-                    if crate::engine::runner::git_ops::is_transient_github_error(&e_str) {
+                    if crate::engine::runner::git_ops::is_transient_github_api_error(&e_str) {
                         tracing::warn!(task_id, branch = %branch, err = %e, "transient failure getting PR number; will retry later");
                     } else {
                         tracing::warn!(task_id, branch = %branch, err = %e, "failed to get PR number");
@@ -222,7 +222,7 @@ pub(crate) async fn review_open_prs(
                 Ok(v) => v,
                 Err(e) => {
                     let e_str = format!("{e}");
-                    if crate::engine::runner::git_ops::is_transient_github_error(&e_str) {
+                    if crate::engine::runner::git_ops::is_transient_github_api_error(&e_str) {
                         tracing::warn!(task_id, branch = %branch, err = %e, "transient GitHub error checking merge status; will retry later");
                         continue;
                     }
