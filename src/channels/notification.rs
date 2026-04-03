@@ -80,9 +80,9 @@ impl TaskNotification {
              {summary}",
             emoji = emoji,
             task_id = self.task_id,
-            status = self.status,
+            status = escape_markdown(&self.status),
             title = escape_markdown(&self.title),
-            agent = self.agent,
+            agent = escape_markdown(&self.agent),
             duration = duration,
             summary = escape_markdown(&self.summary),
         )
@@ -151,6 +151,11 @@ impl TaskNotification {
             _ => self.format_telegram(), // fallback
         };
 
+        let project_name = if channel == "telegram" {
+            escape_markdown(project_name)
+        } else {
+            project_name.to_string()
+        };
         format!("[{project_name}] {base}")
     }
 }
@@ -300,6 +305,38 @@ mod tests {
         };
         let msg = n.format_telegram();
         assert!(msg.contains("Fix \\_underscores\\_ and \\*bold\\*"));
+    }
+
+    #[test]
+    fn format_telegram_escapes_status_with_underscores() {
+        let n = TaskNotification {
+            task_id: "5".to_string(),
+            title: "Test task".to_string(),
+            status: "needs_review".to_string(),
+            agent: "claude".to_string(),
+            duration_seconds: 30.0,
+            summary: "Ready for review".to_string(),
+            repo: None,
+        };
+        let msg = n.format_telegram();
+        // status "needs_review" must have its underscore escaped
+        assert!(msg.contains("needs\\_review"));
+        assert!(!msg.contains("needs_review"));
+    }
+
+    #[test]
+    fn format_telegram_escapes_agent_with_underscores() {
+        let n = TaskNotification {
+            task_id: "6".to_string(),
+            title: "Test".to_string(),
+            status: "done".to_string(),
+            agent: "my_agent".to_string(),
+            duration_seconds: 15.0,
+            summary: "Done".to_string(),
+            repo: None,
+        };
+        let msg = n.format_telegram();
+        assert!(msg.contains("my\\_agent"));
     }
 
     #[test]
