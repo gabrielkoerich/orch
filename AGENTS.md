@@ -560,14 +560,14 @@ An interactive conversational control plane. Talk to orch in natural language �
 
 ### How It Works
 
-Uses **persistent agent sessions in tmux** for speed (~2s per message vs 15-20s cold start):
+Uses one-shot agent invocations with SQLite-backed continuity:
 
 ```
-1. First message → spawn agent in orch-chat-{session_id} tmux session
-2. Subsequent messages → send-keys + pane capture diffing (~2s)
-3. Response extracted via line-count diff (before/after comparison)
-4. Session idle timeout (10 min) auto-kills inactive sessions
-5. Agent/model switch restarts session with new config
+1. Each named session stores conversation history, summaries, memories, and a session UUID in SQLite
+2. Every message assembles fresh context from that stored state
+3. The agent runs one-shot via `bash -c` with a timeout, not inside tmux
+4. Claude-compatible agents receive the stored session UUID for conversation continuity
+5. Changing `/model` or `/agent` resets the stored session UUID so the next message starts fresh with the new selection
 
 Storage: context assembled from SQLite (live state + memories)
 ```
@@ -590,6 +590,8 @@ orch chat history --search "bean"   # search past conversations
 /model sonnet                       # infer agent (claude)
 /model minimax:sonnet               # explicit agent:model
 /model opencode:minimax-m2.5-free   # opencode with specific model
+/agent codex                        # switch agent and its default model
+/agent                              # show current agent:model
 /model                              # show current agent:model
 ```
 
@@ -632,7 +634,7 @@ All in `~/.orch/orch.db`:
 
 ```yaml
 # No config needed — works with defaults (claude:sonnet)
-# Model/agent stored in KV, changed via /model command
+# Model/agent stored in KV, changed via /model or /agent commands
 ```
 
 ## Landing the Plane (Session Completion)

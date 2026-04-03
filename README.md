@@ -235,11 +235,13 @@ orch chat history                   # Show recent messages
 orch chat history --search "bean"   # Search past conversations
 ```
 
-In the REPL, use `/model` to switch models:
+In the REPL, use `/model` and `/agent` to manage the sticky agent:model selection:
 ```
 orch> /model sonnet                 # Infer agent (claude)
 orch> /model minimax:sonnet         # Explicit agent:model
 orch> /model opencode:minimax-m2.5-free  # OpenCode with specific model
+orch> /agent codex                  # Switch agent and its default model
+orch> /agent                        # Show current agent:model
 orch> /model                        # Show current agent:model
 ```
 
