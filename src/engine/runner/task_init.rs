@@ -108,6 +108,11 @@ pub async fn check_token_budget(
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000);
 
+    // If set to 0, token budget checks are disabled.
+    if max_tokens == 0 {
+        return BudgetCheckOutcome::Proceed;
+    }
+
     let (total_tokens, cost) = store::get_token_summary(store, repo, task_id).await;
 
     if total_tokens > max_tokens {
