@@ -252,7 +252,7 @@ pub(crate) async fn review_open_prs(
                 // Avoid incrementing persistent reroute counters when the last
                 // store error indicates a transient GitHub 5xx/transport failure.
                 let last_error = task_info.stored.last_error.clone();
-                if crate::engine::runner::git_ops::is_transient_github_error(&last_error) {
+                if crate::engine::runner::git_ops::is_transient_github_api_error(&last_error) {
                     tracing::warn!(task_id, "transient GitHub error recorded in last_error; skipping persistent no_pr_reroutes increment and retrying later");
                     continue;
                 }

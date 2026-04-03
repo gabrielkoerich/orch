@@ -49,6 +49,10 @@ fn review_started_comment(review_agent: &str, review_model: &str) -> String {
     )
 }
 
+fn should_skip_no_code_reroute_increment(last_error: &str) -> bool {
+    crate::engine::runner::git_ops::is_transient_github_api_error(last_error)
+}
+
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
@@ -615,7 +619,7 @@ async fn ensure_pr_exists(
                 // If the last_error indicates a transient GitHub 5xx/transport error,
                 // do NOT increment the persistent reroute counter which would
                 // eventually block the task. Instead, retry later.
-                if crate::engine::runner::git_ops::is_transient_github_error(&last_error) {
+                if should_skip_no_code_reroute_increment(&last_error) {
                     tracing::warn!(
                         task_id = task.id.0,
                         last_error = %last_error,
@@ -1795,6 +1799,13 @@ mod tests {
             review_started_comment("kimi", "opus"),
             "🔍 Automated review started (agent: kimi, model: opus)"
         );
+    }
+
+    #[test]
+    fn no_code_reroute_skip_check_rejects_agent_stream_disconnects() {
+        let last_error =
+            "codex failed: Reconnecting... (stream disconnected before completion: Broken pipe)";
+        assert!(!should_skip_no_code_reroute_increment(last_error));
     }
 
     #[tokio::test]
