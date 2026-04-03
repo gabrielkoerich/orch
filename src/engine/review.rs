@@ -1361,7 +1361,7 @@ pub(crate) async fn review_and_merge(
             ReviewDecision::Approve => "success",
             ReviewDecision::RequestChanges { .. } => "success",
             ReviewDecision::Failed(_) => "failed",
-            ReviewDecision::Blocked(_) => "success",
+            ReviewDecision::Blocked(_) => "failed",
             ReviewDecision::Skipped => "success",
         };
         let error = match &decision {
