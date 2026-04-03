@@ -172,72 +172,72 @@ impl CaptureService {
     }
 
     /// Run one tick of the capture loop.
+    ///
+    /// Acquires the read lock once and iterates over all buffers to avoid
+    /// the race condition of collecting keys, dropping the lock, then
+    /// re-acquiring to look up each buffer (which could result in missing
+    /// or stale entries).
     async fn tick(&self) {
         let buffers = self.buffers.read().await;
-        let session_keys: Vec<String> = buffers.keys().cloned().collect();
+        let sessions: Vec<(String, OutputBuffer)> = buffers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         drop(buffers);
 
-        for skey in session_keys {
-            // Get buffer (reborrow for each iteration)
-            let buffer = {
-                let buffers = self.buffers.read().await;
-                buffers.get(&skey).cloned()
+        for (skey, buffer) in sessions {
+            // Capture pane content directly via tmux
+            let current_content = match tmux::capture_pane(&buffer.session).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // Only fire "session ended" if the session was seen alive before.
+                    // Prevents false positives when the session is registered before
+                    // the tmux session is actually created (race between registration
+                    // and session creation).
+                    if buffer.seen_alive && tmux::is_session_dead(&buffer.session).await {
+                        tracing::info!(
+                            task_id = buffer.task_id,
+                            session = buffer.session,
+                            "session ended, sending final chunk"
+                        );
+                        let chunk = OutputChunk {
+                            content: String::new(),
+                            is_final: true,
+                        };
+                        self.transport
+                            .push_output(&buffer.repo, &buffer.task_id, chunk)
+                            .await;
+                        self.unregister_session(&buffer.repo, &buffer.task_id).await;
+                    } else {
+                        tracing::trace!(
+                            task_id = buffer.task_id,
+                            session = buffer.session,
+                            ?e,
+                            "capture failed (transient)"
+                        );
+                    }
+                    continue;
+                }
             };
 
-            if let Some(buffer) = buffer {
-                // Capture pane content directly via tmux
-                let current_content = match tmux::capture_pane(&buffer.session).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        // Only fire "session ended" if the session was seen alive before.
-                        // Prevents false positives when the session is registered before
-                        // the tmux session is actually created (race between registration
-                        // and session creation).
-                        if buffer.seen_alive && tmux::is_session_dead(&buffer.session).await {
-                            tracing::info!(
-                                task_id = buffer.task_id,
-                                session = buffer.session,
-                                "session ended, sending final chunk"
-                            );
-                            let chunk = OutputChunk {
-                                content: String::new(),
-                                is_final: true,
-                            };
-                            self.transport
-                                .push_output(&buffer.repo, &buffer.task_id, chunk)
-                                .await;
-                            self.unregister_session(&buffer.repo, &buffer.task_id).await;
-                        } else {
-                            tracing::trace!(
-                                task_id = buffer.task_id,
-                                session = buffer.session,
-                                ?e,
-                                "capture failed (transient)"
-                            );
-                        }
-                        continue;
-                    }
-                };
-
-                let new_content = {
-                    let mut buffers = self.buffers.write().await;
-                    if let Some(buf) = buffers.get_mut(&skey) {
-                        buf.seen_alive = true;
-                        buf.diff_and_update(&current_content)
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(new_content) = new_content {
-                    let chunk = OutputChunk {
-                        content: new_content,
-                        is_final: false,
-                    };
-                    self.transport
-                        .push_output(&buffer.repo, &buffer.task_id, chunk)
-                        .await;
+            let new_content = {
+                let mut buffers = self.buffers.write().await;
+                if let Some(buf) = buffers.get_mut(&skey) {
+                    buf.seen_alive = true;
+                    buf.diff_and_update(&current_content)
+                } else {
+                    None
                 }
+            };
+
+            if let Some(new_content) = new_content {
+                let chunk = OutputChunk {
+                    content: new_content,
+                    is_final: false,
+                };
+                self.transport
+                    .push_output(&buffer.repo, &buffer.task_id, chunk)
+                    .await;
             }
         }
     }
