@@ -89,15 +89,18 @@ impl TaskStore {
         channel: &str,
         thread_id: &str,
         repo: &str,
+        topic_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        let topic = topic_id.unwrap_or("");
         sqlx::query(
-        "INSERT OR IGNORE INTO channel_subscriptions (channel, thread_id, repo) VALUES (?, ?, ?)",
+        "INSERT OR IGNORE INTO channel_subscriptions (channel, thread_id, repo, topic_id) VALUES (?, ?, ?, ?)",
     )
-    .bind(channel)
-    .bind(thread_id)
-    .bind(repo)
-    .execute(&self.pool)
-    .await?;
+        .bind(channel)
+        .bind(thread_id)
+        .bind(repo)
+        .bind(topic)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -137,17 +140,18 @@ impl TaskStore {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
-    /// List all channel/thread pairs subscribed to a repo's notifications.
+    /// List all subscriptions (channel, thread_id, topic_id) for a repo.
     #[allow(dead_code)]
     pub async fn list_subscribers_for_repo(
         &self,
         repo: &str,
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT channel, thread_id FROM channel_subscriptions WHERE repo = ?")
-                .bind(repo)
-                .fetch_all(&self.pool)
-                .await?;
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT channel, thread_id, topic_id FROM channel_subscriptions WHERE repo = ?",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 }

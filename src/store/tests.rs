@@ -4343,11 +4343,11 @@ async fn increment_returns_new_value_via_named_column() {
 async fn subscribe_and_list_channel_subscriptions() {
     let store = TaskStore::open_memory().await.unwrap();
     store
-        .subscribe_channel("telegram", "42", "owner/orch")
+        .subscribe_channel("telegram", "42", "owner/orch", None)
         .await
         .unwrap();
     store
-        .subscribe_channel("telegram", "42", "owner/bean")
+        .subscribe_channel("telegram", "42", "owner/bean", None)
         .await
         .unwrap();
     let subs = store
@@ -4363,7 +4363,7 @@ async fn subscribe_and_list_channel_subscriptions() {
 async fn unsubscribe_channel() {
     let store = TaskStore::open_memory().await.unwrap();
     store
-        .subscribe_channel("telegram", "42", "owner/orch")
+        .subscribe_channel("telegram", "42", "owner/orch", None)
         .await
         .unwrap();
     store
@@ -4381,11 +4381,11 @@ async fn unsubscribe_channel() {
 async fn subscribe_idempotent() {
     let store = TaskStore::open_memory().await.unwrap();
     store
-        .subscribe_channel("telegram", "42", "owner/orch")
+        .subscribe_channel("telegram", "42", "owner/orch", None)
         .await
         .unwrap();
     store
-        .subscribe_channel("telegram", "42", "owner/orch")
+        .subscribe_channel("telegram", "42", "owner/orch", None)
         .await
         .unwrap(); // duplicate
     let subs = store
@@ -4399,15 +4399,15 @@ async fn subscribe_idempotent() {
 async fn list_subscribers_for_repo() {
     let store = TaskStore::open_memory().await.unwrap();
     store
-        .subscribe_channel("telegram", "42", "owner/orch")
+        .subscribe_channel("telegram", "42", "owner/orch", None)
         .await
         .unwrap();
     store
-        .subscribe_channel("discord", "99", "owner/orch")
+        .subscribe_channel("discord", "99", "owner/orch", None)
         .await
         .unwrap();
     store
-        .subscribe_channel("telegram", "42", "owner/bean")
+        .subscribe_channel("telegram", "42", "owner/bean", None)
         .await
         .unwrap();
     let subs = store.list_subscribers_for_repo("owner/orch").await.unwrap();
@@ -4508,17 +4508,17 @@ async fn subscription_round_trip_with_multiple_channels() {
 
     // Subscribe telegram and discord to orch
     store
-        .subscribe_channel("telegram", "42", "owner/orch")
+        .subscribe_channel("telegram", "42", "owner/orch", None)
         .await
         .unwrap();
     store
-        .subscribe_channel("discord", "1111", "owner/orch")
+        .subscribe_channel("discord", "1111", "owner/orch", None)
         .await
         .unwrap();
 
     // Subscribe telegram to bean too
     store
-        .subscribe_channel("telegram", "42", "owner/bean")
+        .subscribe_channel("telegram", "42", "owner/bean", None)
         .await
         .unwrap();
 
@@ -4551,7 +4551,47 @@ async fn subscription_round_trip_with_multiple_channels() {
     // orch should now only have discord subscriber
     let orch_subs = store.list_subscribers_for_repo("owner/orch").await.unwrap();
     assert_eq!(orch_subs.len(), 1);
-    assert_eq!(orch_subs[0], ("discord".to_string(), "1111".to_string()));
+    assert_eq!(
+        orch_subs[0],
+        ("discord".to_string(), "1111".to_string(), "".to_string())
+    );
+}
+
+#[tokio::test]
+async fn subscribe_with_topic_id_preserved() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    // Subscribe to orch with a topic_id (e.g., Telegram forum topic)
+    store
+        .subscribe_channel("telegram", "42", "owner/orch", Some("topic-123"))
+        .await
+        .unwrap();
+
+    // Subscribe to bean without a topic (root thread)
+    store
+        .subscribe_channel("telegram", "42", "owner/bean", None)
+        .await
+        .unwrap();
+
+    // List subscribers for orch - should include topic_id
+    let orch_subs = store.list_subscribers_for_repo("owner/orch").await.unwrap();
+    assert_eq!(orch_subs.len(), 1);
+    assert_eq!(
+        orch_subs[0],
+        (
+            "telegram".to_string(),
+            "42".to_string(),
+            "topic-123".to_string()
+        )
+    );
+
+    // List subscribers for bean - should have empty topic_id
+    let bean_subs = store.list_subscribers_for_repo("owner/bean").await.unwrap();
+    assert_eq!(bean_subs.len(), 1);
+    assert_eq!(
+        bean_subs[0],
+        ("telegram".to_string(), "42".to_string(), "".to_string())
+    );
 }
 
 // ── get_cost_summary_24h_by_repo ────────────────────────────────

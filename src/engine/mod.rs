@@ -897,7 +897,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             if let Some(store) = &notif_store {
                                 match store.list_subscribers_for_repo(repo).await {
                                     Ok(subscribers) => {
-                                        for (ch_name, thread_id) in subscribers {
+                                        for (ch_name, thread_id, topic_id) in subscribers {
                                             let channel =
                                                 channels.iter().find(|c| c.name() == ch_name);
                                             let Some(channel) = channel else {
@@ -909,12 +909,17 @@ pub async fn serve() -> anyhow::Result<()> {
                                             } else {
                                                 serde_json::json!({})
                                             };
+                                            let resolved_topic = if topic_id.is_empty() {
+                                                None
+                                            } else {
+                                                Some(topic_id.clone())
+                                            };
                                             let msg = OutgoingMessage {
                                                 thread_id: thread_id.clone(),
                                                 body,
                                                 reply_to: None,
                                                 metadata,
-                                                topic_id: None,
+                                                topic_id: resolved_topic,
                                             };
                                             if let Err(e) = channel.send(&msg).await {
                                                 tracing::warn!(

@@ -455,6 +455,7 @@ pub(super) async fn handle_channel_message(
                     &cmd_str,
                     &channel,
                     &thread_id,
+                    msg_topic_id.as_deref(),
                     engine_refs,
                     channel_router,
                 )
@@ -814,6 +815,7 @@ pub(super) async fn handle_subscribe_command(
     cmd_str: &str,
     channel: &str,
     thread_id: &str,
+    topic_id: Option<&str>,
     engine_refs: &[EngineRef],
     channel_router: &Arc<ChannelRouter>,
 ) -> String {
@@ -846,7 +848,10 @@ pub(super) async fn handle_subscribe_command(
 
     // Find a store to use for subscription
     if let Some((_, _, _, Some(store))) = engine_refs.first() {
-        match store.subscribe_channel(channel, thread_id, project).await {
+        match store
+            .subscribe_channel(channel, thread_id, project, topic_id)
+            .await
+        {
             Ok(()) => format!("Subscribed to notifications from `{project}`."),
             Err(e) => format!("Failed to subscribe: {e}"),
         }
