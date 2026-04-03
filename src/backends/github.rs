@@ -545,7 +545,7 @@ mod tests {
 
     #[test]
     fn allowed_associations_are_owner_and_contributor() {
-        assert_eq!(ALLOWED_ASSOCIATIONS, &["OWNER", "CONTRIBUTOR"]);
+        assert_eq!(ALLOWED_ASSOCIATIONS, &["OWNER", "COLLABORATOR"]);
     }
 
     #[test]
@@ -570,7 +570,28 @@ mod tests {
     }
 
     #[test]
-    fn is_trusted_author_contributor() {
+    fn is_trusted_author_collaborator() {
+        let issue = GitHubIssue {
+            number: 1,
+            title: "t".to_string(),
+            body: None,
+            state: "open".to_string(),
+            labels: vec![],
+            user: GitHubUser {
+                login: "u".to_string(),
+            },
+            created_at: "".to_string(),
+            updated_at: "".to_string(),
+            html_url: "".to_string(),
+            node_id: None,
+            pull_request: None,
+            author_association: Some("COLLABORATOR".to_string()),
+        };
+        assert!(is_trusted_author(&issue));
+    }
+
+    #[test]
+    fn is_not_trusted_author_contributor() {
         let issue = GitHubIssue {
             number: 1,
             title: "t".to_string(),
@@ -587,7 +608,7 @@ mod tests {
             pull_request: None,
             author_association: Some("CONTRIBUTOR".to_string()),
         };
-        assert!(is_trusted_author(&issue));
+        assert!(!is_trusted_author(&issue));
     }
 
     #[test]
