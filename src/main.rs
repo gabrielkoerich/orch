@@ -373,6 +373,21 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Send a Telegram notification message
+    ///
+    /// Agents can use this to notify about job results:
+    ///
+    ///   orch notify "Backup completed successfully"
+    ///   orch notify --target 602365815 "Deploy failed"
+    ///
+    /// Falls back to channels.telegram.chat_id from config when --target is omitted.
+    Notify {
+        /// Message text to send
+        message: String,
+        /// Telegram chat_id override (falls back to channels.telegram.chat_id from config)
+        #[arg(long, short = 't')]
+        target: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -971,6 +986,9 @@ async fn main() -> anyhow::Result<()> {
                 cli::session::export(&task_id, attempt, fmt).await?;
             }
         },
+        Commands::Notify { message, target } => {
+            cli::notify::send(&message, target.as_deref()).await?;
+        }
     }
 
     Ok(())

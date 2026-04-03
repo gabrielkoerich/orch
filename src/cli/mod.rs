@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod events;
 pub mod job;
 pub mod ndjson;
+pub mod notify;
 pub mod service;
 pub mod session;
 pub mod stats;
