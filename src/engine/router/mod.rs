@@ -955,13 +955,19 @@ impl Router {
                     return Ok(result);
                 }
                 Err(e) => {
+                    let is_timeout = e.to_string().contains("router LLM timed out");
                     tracing::warn!(
                         agent,
                         model = model_str,
                         error = %e,
                         "pool entry failed, recording cooldown and trying next"
                     );
-                    crate::engine::runner::response::record_model_failure(agent, model_str).await;
+                    // Timeouts are transient performance issues, not model failures —
+                    // skip cooldown so the model is retried on the next routing attempt.
+                    if !is_timeout {
+                        crate::engine::runner::response::record_model_failure(agent, model_str)
+                            .await;
+                    }
                     last_err = Some(e);
                     self.advance_pool_index_after_attempt(idx, n);
                 }
@@ -1004,14 +1010,22 @@ impl Router {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
+                    let is_timeout = e.to_string().contains("router LLM timed out");
                     tracing::warn!(
                         agent = %fb_agent,
                         model = %fb_model_str,
                         error = %e,
                         "fallback router LLM also failed"
                     );
-                    crate::engine::runner::response::record_model_failure(&fb_agent, fb_model_str)
+                    // Timeouts are transient performance issues, not model failures —
+                    // skip cooldown so the model is retried on the next routing attempt.
+                    if !is_timeout {
+                        crate::engine::runner::response::record_model_failure(
+                            &fb_agent,
+                            fb_model_str,
+                        )
                         .await;
+                    }
                     last_err = Some(e);
                 }
             }
