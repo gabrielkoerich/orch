@@ -44,8 +44,21 @@ pub const ORG_BACKOFF_BASE_SECS: i64 = 2 * 60 * 60;
 /// Maximum backoff for credit exhaustion and org-level disabling: 8 hours.
 pub const CREDIT_BACKOFF_MAX_SECS: i64 = 8 * 60 * 60;
 
-/// Flat cooldown for billing cycle exhaustion: 24 hours (calendar event, no backoff).
+/// Base cooldown for billing cycle exhaustion: 24 hours.
+///
+/// Unlike per-request rate limits, billing cycle exhaustion is a calendar event
+/// that won't self-resolve for days or weeks. The first failure starts at 24h;
+/// subsequent failures escalate via `compute_backoff()` up to
+/// `BILLING_CYCLE_MAX_SECS` (7 days). This prevents daily retry-and-fail cycles
+/// when a monthly billing quota is exhausted.
 pub const BILLING_CYCLE_COOLDOWN_SECS: i64 = 24 * 60 * 60;
+
+/// Maximum cooldown for billing cycle exhaustion: 7 days.
+///
+/// Monthly billing cycles typically reset on a fixed date. 7 days is a
+/// reasonable cap — the cooldown will expire before the next monthly reset
+/// in most cases, allowing a single probe to re-check availability.
+pub const BILLING_CYCLE_MAX_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Credit exhaustion reason detected from error message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +67,7 @@ pub enum CreditExhaustionReason {
     OutOfCredits,
     /// Organization-level disabling (org_level_disabled).
     OrgLevelDisabled,
-    /// Monthly billing cycle exhaustion — 24h flat cooldown (no backoff).
+    /// Monthly billing cycle exhaustion — escalating cooldown (24h base, 7d cap).
     BillingCycleExhausted,
 }
 
@@ -303,28 +316,21 @@ pub fn detect_credit_exhaustion(error_message: &str) -> Option<CreditExhaustionR
 /// Record an agent-level cooldown for credit exhaustion.
 ///
 /// Applies exponential backoff based on the agent's failure count.
-/// `BillingCycleExhausted` is a calendar event — flat 24h cooldown, no escalation.
-/// For other reasons, the backoff starts at 1h (out_of_credits) or 2h (org_level_disabled)
-/// and caps at 8h to prevent multi-day lockouts when credits can be refilled at any time.
+/// All variants use escalating backoff:
+/// - `OutOfCredits`: starts at 1h, caps at 8h (credits can be refilled any time)
+/// - `OrgLevelDisabled`: starts at 2h, caps at 8h
+/// - `BillingCycleExhausted`: starts at 24h, caps at 7 days (monthly event)
+///
+/// Billing cycle exhaustion was previously a flat 24h, but this caused daily
+/// retry-and-fail cycles when a monthly quota was exhausted (the 24h cooldown
+/// would expire, kimi would be retried, fail immediately, and get another 24h).
+/// Now each recurrence escalates: 24h → 72h → 7d (capped).
 pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustionReason) {
     let reason_str = match reason {
         CreditExhaustionReason::OutOfCredits => "credit_exhaustion_out_of_credits",
         CreditExhaustionReason::OrgLevelDisabled => "credit_exhaustion_org_level_disabled",
         CreditExhaustionReason::BillingCycleExhausted => "billing_cycle_exhausted",
     };
-
-    // Billing cycle exhaustion is a calendar event — flat 24h, backoff is meaningless.
-    if reason == CreditExhaustionReason::BillingCycleExhausted {
-        let cooldown_until = chrono::Utc::now().timestamp() + BILLING_CYCLE_COOLDOWN_SECS;
-        set_cooldown(agent_name, cooldown_until, reason_str);
-        tracing::warn!(
-            agent = agent_name,
-            reason = reason_str,
-            cooldown_secs = BILLING_CYCLE_COOLDOWN_SECS,
-            "billing cycle exhausted: applying 24h flat cooldown"
-        );
-        return;
-    }
 
     let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
     let count = read_and_increment_failure_count(&store_opt, agent_name).await;
@@ -334,7 +340,9 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
         CreditExhaustionReason::OrgLevelDisabled => {
             (ORG_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS)
         }
-        CreditExhaustionReason::BillingCycleExhausted => unreachable!(),
+        CreditExhaustionReason::BillingCycleExhausted => {
+            (BILLING_CYCLE_COOLDOWN_SECS, BILLING_CYCLE_MAX_SECS)
+        }
     };
     let cooldown_secs = compute_backoff(count, base, max);
     let cooldown_until = chrono::Utc::now().timestamp() + cooldown_secs;
@@ -1223,6 +1231,12 @@ mod tests {
 
     #[tokio::test]
     async fn record_credit_exhaustion_billing_cycle_applies_24h() {
+        let store = test_store().await;
+        {
+            let mut slot = cooldown_store().lock().unwrap();
+            *slot = Some(store.clone());
+        }
+
         let agent = "test_billing_cycle_agent";
         assert!(!is_agent_in_cooldown(agent));
 
@@ -1234,9 +1248,79 @@ mod tests {
             let entry = map.get(agent).expect("cooldown entry should exist");
             entry.cooldown_until - chrono::Utc::now().timestamp()
         };
+        // First failure: base = 24h
         assert!(
             remaining >= BILLING_CYCLE_COOLDOWN_SECS - 5,
-            "billing cycle cooldown should be ~24 hours, got {remaining}s"
+            "first billing cycle cooldown should be ~24 hours, got {remaining}s"
+        );
+        assert!(
+            remaining <= BILLING_CYCLE_MAX_SECS,
+            "cooldown should not exceed cap of 7 days, got {remaining}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_credit_exhaustion_billing_cycle_escalates() {
+        let store = test_store().await;
+        {
+            let mut slot = cooldown_store().lock().unwrap();
+            *slot = Some(store.clone());
+        }
+
+        let agent = "test_billing_cycle_escalation";
+
+        // First failure: 24h
+        record_credit_exhaustion(agent, CreditExhaustionReason::BillingCycleExhausted).await;
+        let remaining_1 = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("cooldown entry should exist");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        assert!(
+            (BILLING_CYCLE_COOLDOWN_SECS - 5..=BILLING_CYCLE_COOLDOWN_SECS + 5)
+                .contains(&remaining_1),
+            "first billing cycle cooldown should be ~24h, got {remaining_1}s"
+        );
+
+        // Clear in-memory cooldown (but NOT failure count) to allow next set_cooldown
+        {
+            let mut map = cooldowns().lock().unwrap();
+            map.remove(agent);
+        }
+
+        // Second failure: 24h * 3 = 72h (3 days)
+        record_credit_exhaustion(agent, CreditExhaustionReason::BillingCycleExhausted).await;
+        let remaining_2 = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("cooldown entry should exist");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        let expected_2 = BILLING_CYCLE_COOLDOWN_SECS * 3; // 72h
+        assert!(
+            remaining_2 >= expected_2 - 5,
+            "second billing cycle cooldown should be ~72h, got {remaining_2}s"
+        );
+
+        // Clear in-memory cooldown again
+        {
+            let mut map = cooldowns().lock().unwrap();
+            map.remove(agent);
+        }
+
+        // Third failure: 24h * 9 = 216h → capped at 7 days (168h)
+        record_credit_exhaustion(agent, CreditExhaustionReason::BillingCycleExhausted).await;
+        let remaining_3 = {
+            let map = cooldowns().lock().unwrap();
+            let entry = map.get(agent).expect("cooldown entry should exist");
+            entry.cooldown_until - chrono::Utc::now().timestamp()
+        };
+        assert!(
+            remaining_3 >= BILLING_CYCLE_MAX_SECS - 5,
+            "third billing cycle cooldown should be capped at 7 days, got {remaining_3}s"
+        );
+        assert!(
+            remaining_3 <= BILLING_CYCLE_MAX_SECS + 5,
+            "third billing cycle cooldown should not exceed 7 days, got {remaining_3}s"
         );
     }
 
@@ -1252,8 +1336,9 @@ mod tests {
             compute_backoff(1, ORG_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS),
             ORG_BACKOFF_BASE_SECS
         );
-        // BillingCycleExhausted: flat 24h
+        // BillingCycleExhausted: 24h base, 7d cap
         assert_eq!(BILLING_CYCLE_COOLDOWN_SECS, 24 * 60 * 60);
+        assert_eq!(BILLING_CYCLE_MAX_SECS, 7 * 24 * 60 * 60);
     }
 
     // ---- Degraded-agent tracking tests ----
