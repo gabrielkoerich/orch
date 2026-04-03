@@ -1,7 +1,17 @@
 //! Router configuration — loading, defaults, and model map.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+/// Module-level shared cache for discovered free opencode models.
+///
+/// Both `discover_free_opencode_models()` and `prime_free_model_cache()` must
+/// reference the SAME static so that startup priming is visible to all later
+/// callers.  Function-level statics are unique per-function and cannot be shared
+/// across methods, so we hoist them to module scope here.
+static FREE_MODELS_CACHE: OnceLock<Mutex<(i64, Vec<String>)>> = OnceLock::new();
+static REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Minimum healthy agents threshold for graceful degradation.
 /// When healthy agents fall below this number, dispatch switches to sequential mode.
@@ -192,19 +202,23 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
-    /// Run `opencode models` and return lines containing "free".
+    /// Return the cached free-model list, refreshing in the background when stale.
     ///
-    /// This is a synchronous blocking call. Results are cached for 1 hour so that
-    /// repeated invocations from async contexts (e.g. `refresh_health`) return
-    /// instantly from the in-memory cache rather than spawning a new subprocess.
-    /// The initial population should happen at startup (from `Router::new`) before
-    /// the Tokio runtime is fully loaded with work.
+    /// This method is intentionally non-blocking: it never runs the `opencode models`
+    /// subprocess on the calling thread. When the cache is cold or expired it spawns a
+    /// `std::thread` to run the discovery in the background and returns the stale (or
+    /// empty) list immediately. This avoids stalling a Tokio worker thread with blocking
+    /// subprocess I/O when called from async contexts such as `refresh_health` or
+    /// `emit_degraded_agents_if_needed`.
+    ///
+    /// The first call at startup (from `Router::new()` via a `spawn_blocking` context)
+    /// is the only time that may wait for discovery; all subsequent async calls hit the
+    /// in-memory cache or get an immediate background refresh.
     fn discover_free_opencode_models() -> Vec<String> {
-        static FREE_MODELS_CACHE: OnceLock<Mutex<(i64, Vec<String>)>> = OnceLock::new();
         let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
 
         let now = chrono::Utc::now().timestamp();
-        // If cached and not expired (1 hour), return cached copy.
+        // Fast path: return cached data if still fresh (1-hour TTL).
         {
             let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
             let (ts, models) = &*guard;
@@ -213,15 +227,40 @@ impl RouterConfig {
             }
         }
 
-        // Not cached or expired — perform discovery and refresh the cache.
+        // Cache is cold or expired. Spawn a background thread to refresh without
+        // blocking the calling thread (which may be a Tokio worker). Only one
+        // refresh runs at a time to avoid duplicate subprocess spawns.
+        if !REFRESH_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+            std::thread::spawn(|| {
+                let now_bg = chrono::Utc::now().timestamp();
+                let discovered = Self::run_opencode_models_discovery();
+                // Access the module-level static directly — no Arc needed.
+                let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+                if let Ok(mut guard) = cache.lock() {
+                    *guard = (now_bg, discovered);
+                }
+                REFRESH_IN_PROGRESS.store(false, Ordering::Release);
+            });
+        }
+
+        // Return whatever is in cache (may be empty on first call before refresh
+        // completes). Callers in async contexts get a consistent, non-blocking result.
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        guard.1.clone()
+    }
+
+    /// Execute `opencode models` synchronously and return lines containing "free".
+    ///
+    /// This is the only place that may block. It is called only from a dedicated
+    /// background thread spawned by `discover_free_opencode_models()` or from the
+    /// startup `spawn_blocking` context (via `Router::new()`).
+    fn run_opencode_models_discovery() -> Vec<String> {
         if !crate::cmd_cache::command_exists("opencode") {
             tracing::debug!("opencode not in PATH — skipping free model discovery");
-            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = (now, Vec::new());
             return vec![];
         }
 
-        let discovered = match std::process::Command::new("opencode")
+        match std::process::Command::new("opencode")
             .args(["models"])
             .output()
         {
@@ -243,26 +282,27 @@ impl RouterConfig {
                 tracing::debug!(error = %e, "failed to run opencode models");
                 vec![]
             }
-        };
-
-        // Update cache with current timestamp (even if empty) so we don't hammer I/O.
-        {
-            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = (now, discovered.clone());
         }
-
-        discovered
     }
 
     /// Prime the free-model cache at startup from a synchronous context.
     ///
-    /// Called from `Router::new()` (sync, before the Tokio runtime is heavily loaded)
-    /// so that subsequent async callers of `expanded_model_pool()` hit the 1-hour
-    /// in-memory cache rather than blocking a Tokio worker thread.
+    /// Called from `Router::new()` — which is itself called via `spawn_blocking` from
+    /// `async fn serve()` — so the initial blocking subprocess call does not stall
+    /// the Tokio runtime. Subsequent async callers of `expanded_model_pool()` hit
+    /// the 1-hour in-memory cache (or trigger a background refresh) instead of
+    /// blocking.
     pub(crate) fn prime_free_model_cache() {
-        // Call the sync function to populate the cache. The result is discarded
-        // here — callers pick it up via `discover_free_opencode_models()` later.
-        let _ = Self::discover_free_opencode_models();
+        // Run discovery synchronously to populate the cache. Safe here because the
+        // caller is expected to be in a blocking (non-async) context.
+        let discovered = Self::run_opencode_models_discovery();
+        // Write directly into the module-level FREE_MODELS_CACHE so the result is
+        // immediately visible to every subsequent caller of discover_free_opencode_models().
+        let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+        let now = chrono::Utc::now().timestamp();
+        if let Ok(mut guard) = cache.lock() {
+            *guard = (now, discovered);
+        }
     }
 
     /// Load configuration from config files.
