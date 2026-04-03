@@ -10,12 +10,13 @@ use async_trait::async_trait;
 use chrono::{Duration, Utc};
 
 /// Author associations that are allowed to create tasks.
-/// Only repository OWNER or CONTRIBUTOR authors are considered trusted for
+/// Only repository OWNER or COLLABORATOR authors are considered trusted for
 /// ingestion. Other associations (members, collaborators, first-time
 /// contributors, etc.) are ignored per the new sync policy.
-const ALLOWED_ASSOCIATIONS: &[&str] = &["OWNER", "CONTRIBUTOR"];
+/// Available values: COLLABORATOR, CONTRIBUTOR, FIRST_TIMER, FIRST_TIME_CONTRIBUTOR, MANNEQUIN, MEMBER, NONE, OWNER
+const ALLOWED_ASSOCIATIONS: &[&str] = &["OWNER", "COLLABORATOR"];
 
-/// Check if an issue author is trusted (owner, member, collaborator, or contributor).
+/// Check if an issue author is trusted
 fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
     issue
         .author_association
@@ -24,7 +25,7 @@ fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
         .unwrap_or(false) // missing field = untrusted
 }
 
-// Check if a comment's author is trusted (OWNER or CONTRIBUTOR). The
+// Check if a comment's author is trusted. The
 // GitHub REST comment payload includes an `author_association` field, so
 // prefer that when present. Missing association is treated as untrusted.
 fn is_trusted_comment_author(c: &crate::github::types::GitHubComment) -> bool {
