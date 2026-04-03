@@ -14,6 +14,16 @@ const TELEGRAM_HTTP_TIMEOUT_SECS: u64 = TELEGRAM_LONG_POLL_TIMEOUT_SECS + 15;
 const TELEGRAM_MAX_RETRIES: u32 = 3;
 const _: () = assert!(TELEGRAM_HTTP_TIMEOUT_SECS > TELEGRAM_LONG_POLL_TIMEOUT_SECS);
 
+/// Escape text for Telegram HTML parse_mode.
+///
+/// Telegram's HTML parser is strict: bare `<`, `>`, or `&` cause
+/// "can't parse entities" errors. This function escapes those characters.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 pub struct TelegramChannel {
     pub token: String,
     pub client: Client,
@@ -138,11 +148,22 @@ impl TelegramChannel {
         text: &str,
         topic_id: Option<i64>,
     ) -> anyhow::Result<()> {
+        let escaped = html_escape(text);
+        self.send_formatted_message(chat_id, &escaped, topic_id)
+            .await
+    }
+
+    async fn send_formatted_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        topic_id: Option<i64>,
+    ) -> anyhow::Result<()> {
         let url = self.api_url("sendMessage");
 
-        // Use HTML parse mode to avoid Markdown parsing edge-cases from
-        // user-provided summaries/titles. Notifications are formatted as
-        // HTML by TaskNotification::format_telegram(), so send as HTML here.
+        // Use HTML parse mode. Callers must ensure text is properly escaped
+        // (send_message escapes automatically; send_formatted_message expects
+        // pre-escaped/pre-formatted input from TaskNotification::format_telegram).
         let mut params = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
@@ -394,7 +415,20 @@ impl Channel for TelegramChannel {
             }
         }
 
-        self.send_message(chat_id, &msg.body, topic_id).await
+        // Check if body is already pre-formatted HTML (e.g. TaskNotification::format_telegram)
+        // or raw text that needs escaping (e.g. streamed agent output).
+        let preformatted = msg
+            .metadata
+            .get("preformatted_html")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if preformatted {
+            self.send_formatted_message(chat_id, &msg.body, topic_id)
+                .await
+        } else {
+            self.send_message(chat_id, &msg.body, topic_id).await
+        }
     }
 
     async fn ack_interaction(&self, callback_query_id: &str) -> anyhow::Result<()> {
