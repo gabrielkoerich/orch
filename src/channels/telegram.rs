@@ -140,10 +140,13 @@ impl TelegramChannel {
     ) -> anyhow::Result<()> {
         let url = self.api_url("sendMessage");
 
+        // Use HTML parse mode to avoid Markdown parsing edge-cases from
+        // user-provided summaries/titles. Notifications are formatted as
+        // HTML by TaskNotification::format_telegram(), so send as HTML here.
         let mut params = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
-            "parse_mode": "Markdown"
+            "parse_mode": "HTML"
         });
         if let Some(tid) = topic_id {
             params["message_thread_id"] = serde_json::json!(tid);
