@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::backends::{ExternalId, Status};
 use crate::channels::capture::CaptureService;
 use crate::channels::routing::ChannelRouter;
+use crate::channels::transport::conversation_key;
 use crate::channels::transport::{MessageRoute, Transport};
 use crate::channels::{ChannelRegistry, IncomingMessage, OutgoingMessage};
 use crate::engine::commands::{execute_command, parse_command};
@@ -86,6 +87,32 @@ pub fn buttons_for_picker(repos: &[&str], original_msg_id: &str) -> Vec<(String,
             (label, callback_data)
         })
         .collect()
+}
+
+fn control_session_id(channel: &str, thread_id: &str, topic_id: Option<&str>) -> String {
+    format!("control:{}", conversation_key(channel, thread_id, topic_id))
+}
+
+fn normalize_channel_route(
+    msg: &IncomingMessage,
+    route: MessageRoute,
+    is_control: bool,
+) -> MessageRoute {
+    if is_control {
+        return MessageRoute::ControlSession;
+    }
+
+    match route {
+        // Telegram should behave like `orch chat` by default. Keep explicit
+        // commands, bound task threads, and existing picker callbacks on their
+        // normal paths.
+        MessageRoute::NewTask
+            if msg.channel == "telegram" && parse_pick_callback(msg.body.trim()).is_none() =>
+        {
+            MessageRoute::ControlSession
+        }
+        other => other,
+    }
 }
 
 /// Send a reply message to a specific channel thread.
@@ -313,13 +340,9 @@ pub(super) async fn handle_channel_message(
     let is_control = channel_router.is_control_channel(&msg.channel, topic_id);
     let msg_topic_id = msg.topic_id.clone();
 
-    // Check control channel BEFORE task bindings so a control channel message
-    // never accidentally falls through to task session routing.
-    let route = if is_control {
-        MessageRoute::ControlSession
-    } else {
-        transport.route(&msg).await
-    };
+    // Check control-channel overrides before dispatch so configured control
+    // topics and Telegram default chat sessions both land on the chat path.
+    let route = normalize_channel_route(&msg, transport.route(&msg).await, is_control);
 
     match route {
         MessageRoute::TaskSession { task_id } => {
@@ -498,7 +521,8 @@ pub(super) async fn handle_channel_message(
             let body = msg.body.clone();
 
             // Session ID is per channel+topic so Telegram and Discord are isolated.
-            let session_id = format!("{}:{}", channel, topic_id);
+            let session_id = control_session_id(&channel, &thread_id, msg_topic_id.as_deref());
+            let channel_thread = conversation_key(&channel, &thread_id, msg_topic_id.as_deref());
 
             // Find a store from the first available engine reference.
             let store = engine_refs
@@ -511,7 +535,7 @@ pub(super) async fn handle_channel_message(
                     &store,
                     &session_id,
                     &channel,
-                    Some(&thread_id),
+                    Some(&channel_thread),
                     &body,
                 )
                 .await
@@ -950,6 +974,75 @@ mod tests {
         let buttons = buttons_for_picker(&repos, "id1");
         assert_eq!(buttons[0].0, "myrepo");
         assert_eq!(buttons[0].1, "pick:id1:myrepo");
+    }
+
+    #[test]
+    fn control_session_id_uses_conversation_key() {
+        assert_eq!(
+            control_session_id("telegram", "123", Some("456")),
+            "control:telegram:123|456"
+        );
+        assert_eq!(
+            control_session_id("telegram", "123", None),
+            "control:telegram:123"
+        );
+    }
+
+    #[test]
+    fn normalize_channel_route_promotes_telegram_new_task_to_control_session() {
+        let msg = IncomingMessage {
+            channel: "telegram".to_string(),
+            id: "m1".to_string(),
+            thread_id: "42".to_string(),
+            author: "user".to_string(),
+            body: "what's running?".to_string(),
+            timestamp: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+            topic_id: None,
+        };
+
+        assert!(matches!(
+            normalize_channel_route(&msg, MessageRoute::NewTask, false),
+            MessageRoute::ControlSession
+        ));
+    }
+
+    #[test]
+    fn normalize_channel_route_preserves_picker_callbacks() {
+        let msg = IncomingMessage {
+            channel: "telegram".to_string(),
+            id: "m1".to_string(),
+            thread_id: "42".to_string(),
+            author: "user".to_string(),
+            body: "pick:m1:owner/repo".to_string(),
+            timestamp: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+            topic_id: None,
+        };
+
+        assert!(matches!(
+            normalize_channel_route(&msg, MessageRoute::NewTask, false),
+            MessageRoute::NewTask
+        ));
+    }
+
+    #[test]
+    fn normalize_channel_route_preserves_non_telegram_new_task() {
+        let msg = IncomingMessage {
+            channel: "discord".to_string(),
+            id: "m1".to_string(),
+            thread_id: "42".to_string(),
+            author: "user".to_string(),
+            body: "create a task".to_string(),
+            timestamp: chrono::Utc::now(),
+            metadata: serde_json::json!({}),
+            topic_id: None,
+        };
+
+        assert!(matches!(
+            normalize_channel_route(&msg, MessageRoute::NewTask, false),
+            MessageRoute::NewTask
+        ));
     }
 
     /// Regression test for issue #780: TaskSession slash commands must use the engine_ref
