@@ -2675,6 +2675,7 @@ fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment
             .map(String::from),
         html_url: node.get("url").and_then(|v| v.as_str()).map(String::from),
         issue_url: None,
+        author_association: None,
     })
 }
 

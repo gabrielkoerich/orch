@@ -10,8 +10,10 @@ use async_trait::async_trait;
 use chrono::{Duration, Utc};
 
 /// Author associations that are allowed to create tasks.
-/// Issues from other authors are silently ignored during ingestion.
-const ALLOWED_ASSOCIATIONS: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"];
+/// Only repository OWNER or CONTRIBUTOR authors are considered trusted for
+/// ingestion. Other associations (members, collaborators, first-time
+/// contributors, etc.) are ignored per the new sync policy.
+const ALLOWED_ASSOCIATIONS: &[&str] = &["OWNER", "CONTRIBUTOR"];
 
 /// Check if an issue author is trusted (owner, member, collaborator, or contributor).
 fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
@@ -20,6 +22,16 @@ fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
         .as_deref()
         .map(|a| ALLOWED_ASSOCIATIONS.contains(&a))
         .unwrap_or(false) // missing field = untrusted
+}
+
+// Check if a comment's author is trusted (OWNER or CONTRIBUTOR). The
+// GitHub REST comment payload includes an `author_association` field, so
+// prefer that when present. Missing association is treated as untrusted.
+fn is_trusted_comment_author(c: &crate::github::types::GitHubComment) -> bool {
+    c.author_association
+        .as_deref()
+        .map(|a| ALLOWED_ASSOCIATIONS.contains(&a))
+        .unwrap_or(false)
 }
 
 pub struct GitHubBackend {
@@ -425,16 +437,51 @@ impl ExternalBackend for GitHubBackend {
 
     async fn get_mentions(&self, since: &str) -> anyhow::Result<Vec<Mention>> {
         let comments = self.gh.get_mentions(&self.repo, since).await?;
-        Ok(comments
-            .into_iter()
-            .map(|c| Mention {
+        // Only include mentions authored by trusted associations. The GitHub
+        // REST issue comment payload does not include author_association, so
+        // we conservatively check the parent issue's author_association when
+        // an issue_url is available. If we cannot resolve association, skip
+        // the comment.
+        let mut out = Vec::new();
+        for c in comments.into_iter() {
+            // Prefer the comment's own author_association when present. If the
+            // comment payload doesn't include it (older endpoints), fall back to
+            // inspecting the parent issue's association when an issue_url is
+            // available. If neither yields a trusted association, skip the
+            // comment.
+            let trusted = if is_trusted_comment_author(&c) {
+                true
+            } else if let Some(ref issue_url) = c.issue_url {
+                // extract issue number and fetch issue to inspect author_association
+                if let Some(n) = issue_url.rsplit('/').next() {
+                    if let Ok(issue) = self.gh.get_issue(&self.repo, n).await {
+                        is_trusted_author(&issue)
+                    } else {
+                        // failed to fetch issue -> treat as untrusted
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !trusted {
+                tracing::debug!(comment_id = c.id, author = %c.user.login, "ignoring mention from untrusted author");
+                continue;
+            }
+
+            out.push(Mention {
                 id: c.id.to_string(),
                 body: c.body,
                 author: c.user.login,
                 created_at: c.created_at,
                 issue_url: c.issue_url,
-            })
-            .collect())
+            });
+        }
+
+        Ok(out)
     }
 
     async fn list_issue_comments(&self, id: &ExternalId) -> anyhow::Result<Vec<Mention>> {
@@ -442,19 +489,160 @@ impl ExternalBackend for GitHubBackend {
             id.0.parse()
                 .map_err(|_| anyhow::anyhow!("invalid issue number: {}", id.0))?;
         let comments = self.gh.get_issue_comments(&self.repo, issue_number).await?;
-        Ok(comments
-            .into_iter()
-            .map(|c| Mention {
-                id: c.id.to_string(),
-                body: c.body,
-                author: c.user.login,
-                created_at: c.created_at,
-                issue_url: c.issue_url,
-            })
-            .collect())
+        // Filter comments to only include those from trusted associations.
+        let mut out = Vec::new();
+        for c in comments.into_iter() {
+            // Prefer the comment's own association when present.
+            if is_trusted_comment_author(&c) {
+                out.push(Mention {
+                    id: c.id.to_string(),
+                    body: c.body,
+                    author: c.user.login,
+                    created_at: c.created_at,
+                    issue_url: c.issue_url,
+                });
+                continue;
+            }
+
+            // Fall back to parent issue association when necessary.
+            if let Ok(issue) = self.gh.get_issue(&self.repo, &id.0).await {
+                if is_trusted_author(&issue) {
+                    out.push(Mention {
+                        id: c.id.to_string(),
+                        body: c.body,
+                        author: c.user.login,
+                        created_at: c.created_at,
+                        issue_url: c.issue_url,
+                    });
+                    continue;
+                } else {
+                    tracing::debug!(comment_id = c.id, author = %c.user.login, "ignoring issue comment from untrusted author");
+                    continue;
+                }
+            } else {
+                // If we cannot fetch the issue, skip the comment conservatively
+                tracing::debug!(
+                    comment_id = c.id,
+                    "failed to fetch parent issue, skipping comment"
+                );
+                continue;
+            }
+        }
+
+        Ok(out)
     }
 
     async fn acknowledge_issue(&self, id: &ExternalId) -> anyhow::Result<()> {
         self.gh.add_reaction(&self.repo, &id.0, "eyes").await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::types::{GitHubIssue, GitHubUser};
+
+    #[test]
+    fn allowed_associations_are_owner_and_contributor() {
+        assert_eq!(ALLOWED_ASSOCIATIONS, &["OWNER", "CONTRIBUTOR"]);
+    }
+
+    #[test]
+    fn is_trusted_author_owner() {
+        let issue = GitHubIssue {
+            number: 1,
+            title: "t".to_string(),
+            body: None,
+            state: "open".to_string(),
+            labels: vec![],
+            user: GitHubUser {
+                login: "u".to_string(),
+            },
+            created_at: "".to_string(),
+            updated_at: "".to_string(),
+            html_url: "".to_string(),
+            node_id: None,
+            pull_request: None,
+            author_association: Some("OWNER".to_string()),
+        };
+        assert!(is_trusted_author(&issue));
+    }
+
+    #[test]
+    fn is_trusted_author_contributor() {
+        let issue = GitHubIssue {
+            number: 1,
+            title: "t".to_string(),
+            body: None,
+            state: "open".to_string(),
+            labels: vec![],
+            user: GitHubUser {
+                login: "u".to_string(),
+            },
+            created_at: "".to_string(),
+            updated_at: "".to_string(),
+            html_url: "".to_string(),
+            node_id: None,
+            pull_request: None,
+            author_association: Some("CONTRIBUTOR".to_string()),
+        };
+        assert!(is_trusted_author(&issue));
+    }
+
+    #[test]
+    fn is_not_trusted_author_member() {
+        let issue = GitHubIssue {
+            number: 1,
+            title: "t".to_string(),
+            body: None,
+            state: "open".to_string(),
+            labels: vec![],
+            user: GitHubUser {
+                login: "u".to_string(),
+            },
+            created_at: "".to_string(),
+            updated_at: "".to_string(),
+            html_url: "".to_string(),
+            node_id: None,
+            pull_request: None,
+            author_association: Some("MEMBER".to_string()),
+        };
+        assert!(!is_trusted_author(&issue));
+    }
+
+    #[test]
+    fn is_trusted_comment_author_direct() {
+        use crate::github::types::GitHubComment;
+        let c = GitHubComment {
+            id: 1,
+            body: "hi".to_string(),
+            user: crate::github::types::GitHubUser {
+                login: "u".to_string(),
+            },
+            created_at: "".to_string(),
+            updated_at: None,
+            html_url: None,
+            issue_url: None,
+            author_association: Some("OWNER".to_string()),
+        };
+        assert!(is_trusted_comment_author(&c));
+    }
+
+    #[test]
+    fn is_not_trusted_comment_author_direct() {
+        use crate::github::types::GitHubComment;
+        let c = GitHubComment {
+            id: 1,
+            body: "hi".to_string(),
+            user: crate::github::types::GitHubUser {
+                login: "u".to_string(),
+            },
+            created_at: "".to_string(),
+            updated_at: None,
+            html_url: None,
+            issue_url: None,
+            author_association: Some("MEMBER".to_string()),
+        };
+        assert!(!is_trusted_comment_author(&c));
     }
 }
