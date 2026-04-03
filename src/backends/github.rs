@@ -379,7 +379,11 @@ impl ExternalBackend for GitHubBackend {
 
     async fn has_open_issue_with_title(&self, title: &str, label: &str) -> anyhow::Result<bool> {
         // Check open issues first
-        let open_issues = self.gh.list_issues(&self.repo, label).await?;
+        let open_issues = if label.is_empty() {
+            self.gh.list_all_open_issues(&self.repo).await?
+        } else {
+            self.gh.list_issues(&self.repo, label).await?
+        };
         if open_issues.iter().any(|i| i.title == title) {
             return Ok(true);
         }
@@ -388,10 +392,13 @@ impl ExternalBackend for GitHubBackend {
         let since = (chrono::Utc::now() - chrono::Duration::hours(24))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
-        let closed = self
-            .gh
-            .list_issues_closed_since(&self.repo, label, &since)
-            .await?;
+        let closed = if label.is_empty() {
+            self.gh.list_closed_issues_since(&self.repo, &since).await?
+        } else {
+            self.gh
+                .list_issues_closed_since(&self.repo, label, &since)
+                .await?
+        };
         Ok(closed.iter().any(|i| i.title == title))
     }
 
