@@ -291,7 +291,7 @@ pub fn spawn(
                                         "review agent hit rate limit — deferring retry until cooldown expires"
                                     );
                                     ReviewOutcome::RateLimited
-                                } else if crate::engine::runner::git_ops::is_transient_github_error(&reason) {
+                                } else if crate::engine::runner::git_ops::is_transient_github_api_error(&reason) {
                                     tracing::warn!(
                                         task_id = tid,
                                         reason,
@@ -342,7 +342,7 @@ pub fn spawn(
                                         "review_and_merge hit rate limit — deferring retry until cooldown expires"
                                     );
                                     ReviewOutcome::RateLimited
-                                } else if crate::engine::runner::git_ops::is_transient_github_error(&reason) {
+                                } else if crate::engine::runner::git_ops::is_transient_github_api_error(&reason) {
                                     tracing::warn!(
                                         task_id = tid,
                                         reason,
