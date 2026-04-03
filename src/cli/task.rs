@@ -729,7 +729,10 @@ pub async fn run(id: Option<String>) -> anyhow::Result<()> {
 }
 
 /// Retry a task (reset to new).
-pub async fn retry(id: i64) -> anyhow::Result<()> {
+///
+/// When `agent` is provided, the task is force-routed to that agent/model and
+/// set directly to `Routed` status, bypassing the router entirely.
+pub async fn retry(id: i64, agent: Option<String>, model: Option<String>) -> anyhow::Result<()> {
     use crate::backends::github::GitHubBackend;
     use crate::backends::ExternalBackend;
     use crate::store::TaskStatus;
@@ -746,12 +749,39 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
                     .unwrap_or_else(|| format!("internal:{}", task.id));
                 // Reset store counters
                 store::store_reset_counters(&store, &repo, &internal_id).await;
-                // Reset status to New
-                s.update_status(id, TaskStatus::New).await?;
-                println!(
-                    "Task #{} reset to new (attempts reset, will be re-routed)",
-                    id
-                );
+
+                if let Some(ref forced_agent) = agent {
+                    // Force-route: set agent/model and go straight to Routed.
+                    let fields: Vec<(&str, serde_json::Value)> = {
+                        let mut f = vec![
+                            ("agent", serde_json::json!(forced_agent)),
+                            (
+                                "route_reason",
+                                serde_json::json!(format!(
+                                    "forced via retry --agent {forced_agent}"
+                                )),
+                            ),
+                        ];
+                        if let Some(ref m) = model {
+                            f.push(("model", serde_json::json!(m)));
+                        }
+                        f
+                    };
+                    s.set_fields(id, &fields).await?;
+                    s.update_status(id, TaskStatus::Routed).await?;
+                    let model_hint = model.as_deref().unwrap_or("(router default)");
+                    println!(
+                        "Task #{} force-routed to {}:{} (set to routed, dispatches on next tick)",
+                        id, forced_agent, model_hint
+                    );
+                } else {
+                    // Reset status to New (re-routes normally)
+                    s.update_status(id, TaskStatus::New).await?;
+                    println!(
+                        "Task #{} reset to new (attempts reset, will be re-routed)",
+                        id
+                    );
+                }
                 return Ok(());
             }
         }
@@ -761,7 +791,7 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
 
     let ext_id = ExternalId(id.to_string());
 
-    // Remove agent label
+    // Remove existing agent labels
     let task = backend.get_task(&ext_id).await?;
     for label in &task.labels {
         if label.starts_with("agent:") {
@@ -772,13 +802,47 @@ pub async fn retry(id: i64) -> anyhow::Result<()> {
     // Reset store state (attempts + all failure counters)
     store::store_reset_counters(&store, &repo, &ext_id.0).await;
 
-    // Reset to new
-    update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
+    if let Some(ref forced_agent) = agent {
+        // Force-route: add agent label, store agent/model, set to Routed.
+        backend
+            .set_labels(&ext_id, &[format!("agent:{forced_agent}")])
+            .await?;
 
-    println!(
-        "Task #{} reset to new (attempts reset, will be re-routed)",
-        id
-    );
+        if let Some(ref s) = store {
+            if let Ok(Some(store_id)) = s.resolve_task_id(&repo, &ext_id.0).await {
+                let fields: Vec<(&str, serde_json::Value)> = {
+                    let mut f = vec![
+                        ("agent", serde_json::json!(forced_agent)),
+                        (
+                            "route_reason",
+                            serde_json::json!(format!("forced via retry --agent {forced_agent}")),
+                        ),
+                    ];
+                    if let Some(ref m) = model {
+                        f.push(("model", serde_json::json!(m)));
+                    }
+                    f
+                };
+                s.set_fields(store_id, &fields).await?;
+            }
+        }
+
+        update_status_store_first(&store, &backend, &repo, &ext_id, Status::Routed).await?;
+
+        let model_hint = model.as_deref().unwrap_or("(router default)");
+        println!(
+            "Task #{} force-routed to {}:{} (set to routed, dispatches on next tick)",
+            id, forced_agent, model_hint
+        );
+    } else {
+        // Reset to new (re-routes normally)
+        update_status_store_first(&store, &backend, &repo, &ext_id, Status::New).await?;
+        println!(
+            "Task #{} reset to new (attempts reset, will be re-routed)",
+            id
+        );
+    }
+
     Ok(())
 }
 
@@ -1771,5 +1835,67 @@ mod tests {
     #[test]
     fn matches_project_filter_rejects_non_matching_repo() {
         assert!(!matches_project_filter("gabrielkoerich/orch", "bean"));
+    }
+
+    /// Verify the forced-routing field construction for agent-only case.
+    #[test]
+    fn retry_force_route_fields_agent_only() {
+        let forced_agent = "claude";
+        let model: Option<String> = None;
+        let fields: Vec<(&str, serde_json::Value)> = {
+            let mut f = vec![
+                ("agent", serde_json::json!(forced_agent)),
+                (
+                    "route_reason",
+                    serde_json::json!(format!("forced via retry --agent {forced_agent}")),
+                ),
+            ];
+            if let Some(ref m) = model {
+                f.push(("model", serde_json::json!(m)));
+            }
+            f
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].1, serde_json::json!("claude"));
+        assert_eq!(
+            fields[1].1,
+            serde_json::json!("forced via retry --agent claude")
+        );
+    }
+
+    /// Verify the forced-routing field construction for agent+model case.
+    #[test]
+    fn retry_force_route_fields_agent_and_model() {
+        let forced_agent = "claude";
+        let model: Option<String> = Some("opus".to_string());
+        let fields: Vec<(&str, serde_json::Value)> = {
+            let mut f = vec![
+                ("agent", serde_json::json!(forced_agent)),
+                (
+                    "route_reason",
+                    serde_json::json!(format!("forced via retry --agent {forced_agent}")),
+                ),
+            ];
+            if let Some(ref m) = model {
+                f.push(("model", serde_json::json!(m)));
+            }
+            f
+        };
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].1, serde_json::json!("claude"));
+        assert_eq!(fields[2].0, "model");
+        assert_eq!(fields[2].1, serde_json::json!("opus"));
+    }
+
+    /// Verify that the model hint display is correct in both cases.
+    #[test]
+    fn retry_model_hint_display() {
+        let model_some: Option<String> = Some("opus".to_string());
+        let model_none: Option<String> = None;
+        assert_eq!(model_some.as_deref().unwrap_or("(router default)"), "opus");
+        assert_eq!(
+            model_none.as_deref().unwrap_or("(router default)"),
+            "(router default)"
+        );
     }
 }

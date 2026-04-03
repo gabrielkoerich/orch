@@ -482,6 +482,23 @@ enum TaskAction {
     Retry {
         /// Task ID
         id: i64,
+        /// Force routing to a specific agent (e.g. claude, codex, opencode)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Force routing to a specific model (e.g. opus, sonnet). Requires --agent.
+        #[arg(long, requires = "agent")]
+        model: Option<String>,
+    },
+    /// Reroute a task to a different agent/model (alias for retry with forced routing)
+    Reroute {
+        /// Task ID
+        id: i64,
+        /// Force routing to a specific agent (e.g. claude, codex, opencode)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Force routing to a specific model (e.g. opus, sonnet). Requires --agent.
+        #[arg(long, requires = "agent")]
+        model: Option<String>,
     },
     /// Unblock a task or all blocked tasks
     Unblock {
@@ -766,8 +783,11 @@ async fn main() -> anyhow::Result<()> {
             TaskAction::Run { id } => {
                 cli::task::run(id).await?;
             }
-            TaskAction::Retry { id } => {
-                cli::task::retry(id).await?;
+            TaskAction::Retry { id, agent, model } => {
+                cli::task::retry(id, agent, model).await?;
+            }
+            TaskAction::Reroute { id, agent, model } => {
+                cli::task::retry(id, agent, model).await?;
             }
             TaskAction::Unblock { id } => {
                 cli::task::unblock(&id).await?;
