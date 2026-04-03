@@ -979,6 +979,22 @@ mod tests {
         assert_eq!(parse_control_command("/session"), None);
     }
 
+    #[test]
+    fn control_prompt_slash_commands_match_supported_surface() {
+        let documented = Regex::new(r"`/([a-z]+)(?:[^`]*)`")
+            .unwrap()
+            .captures_iter(SYSTEM_TEMPLATE)
+            .map(|caps| caps[1].to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let expected = ["agent", "model"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(documented, expected);
+    }
+
     #[tokio::test]
     async fn set_agent_spec_persists_default_model() {
         let store = TaskStore::open_memory().await.unwrap();
