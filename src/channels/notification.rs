@@ -67,24 +67,28 @@ pub struct TaskNotification {
 }
 
 impl TaskNotification {
-    /// Format for Telegram (Markdown).
+    /// Format for Telegram (HTML).
+    ///
+    /// Use HTML parse mode to avoid fragile Markdown escaping issues. Values are
+    /// escaped for HTML entities (e.g. <, >, &) and simple tags are used for
+    /// bold/monospace formatting.
     pub fn format_telegram(&self) -> String {
         let emoji = status_emoji(&self.status);
         let duration = format_duration(self.duration_seconds);
 
         format!(
-            "{emoji} *Task #{task_id}*: {status}\n\
-             *{title}*\n\
-             Agent: `{agent}` | Duration: {duration}\n\
+            "{emoji} <b>Task #{task_id}</b>: {status}\n\
+             <b>{title}</b>\n\
+             Agent: <code>{agent}</code> | Duration: {duration}\n\
              \n\
              {summary}",
             emoji = emoji,
-            task_id = self.task_id,
-            status = escape_markdown(&self.status),
-            title = escape_markdown(&self.title),
-            agent = escape_markdown(&self.agent),
+            task_id = html_escape(&self.task_id),
+            status = html_escape(&self.status),
+            title = html_escape(&self.title),
+            agent = html_escape(&self.agent),
             duration = duration,
-            summary = escape_markdown(&self.summary),
+            summary = html_escape(&self.summary),
         )
     }
 
@@ -152,7 +156,7 @@ impl TaskNotification {
         };
 
         let project_name = if channel == "telegram" {
-            escape_markdown(project_name)
+            html_escape(project_name)
         } else {
             project_name.to_string()
         };
@@ -172,12 +176,11 @@ fn status_emoji(status: &str) -> &'static str {
     }
 }
 
-/// Escape special Markdown characters for Telegram's MarkdownV1.
-fn escape_markdown(s: &str) -> String {
-    s.replace('_', "\\_")
-        .replace('*', "\\*")
-        .replace('[', "\\[")
-        .replace('`', "\\`")
+/// Escape text for HTML to be sent in Telegram HTML parse_mode.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Format seconds into human-readable duration.
@@ -304,7 +307,11 @@ mod tests {
             repo: None,
         };
         let msg = n.format_telegram();
-        assert!(msg.contains("Fix \\_underscores\\_ and \\*bold\\*"));
+        // HTML mode: underscores and asterisks are literal characters; ensure
+        // HTML escaping did not mangle them and that title is present.
+        assert!(msg.contains("Fix _underscores_ and *bold*"));
+        // Ensure HTML tags are present for bold title
+        assert!(msg.contains("<b>Fix _underscores_ and *bold*</b>"));
     }
 
     #[test]
@@ -319,9 +326,9 @@ mod tests {
             repo: None,
         };
         let msg = n.format_telegram();
-        // status "needs_review" must have its underscore escaped
-        assert!(msg.contains("needs\\_review"));
-        assert!(!msg.contains("needs_review"));
+        // In HTML mode underscores are literal; ensure status is present and
+        // included without backslashes.
+        assert!(msg.contains("needs_review"));
     }
 
     #[test]
@@ -336,7 +343,9 @@ mod tests {
             repo: None,
         };
         let msg = n.format_telegram();
-        assert!(msg.contains("my\\_agent"));
+        // HTML mode: underscores are literal in text and agent is enclosed in
+        // <code> tags.
+        assert!(msg.contains("<code>my_agent</code>"));
     }
 
     #[test]
@@ -474,8 +483,8 @@ mod tests {
         // Both start with project prefix
         assert!(tg.starts_with("[svc]"));
         assert!(dc.starts_with("[svc]"));
-        // Discord uses ** for bold, telegram uses *
+        // Discord uses ** for bold, telegram uses HTML <b> tags
         assert!(dc.contains("**Task #5**"));
-        assert!(tg.contains("*Task #5*"));
+        assert!(tg.contains("<b>Task #5</b>"));
     }
 }
