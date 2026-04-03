@@ -131,9 +131,12 @@ jobs:
 
       If you find operational problems (stuck tasks, recurring failures, error patterns), create issues with `gh issue create --title "..." --body "..." --label "bug"`.
 
+      Before creating any issue:
+      - `gh issue list --state open` — don't duplicate existing issues
+      - `gh issue list --state closed --limit 20` — don't re-file resolved problems
+
       - Maximum 2-3 issues. Only for operational problems found during this review.
       - Focus on ROOT CAUSES, not symptoms
-      - Do NOT duplicate issues that already exist (`gh issue list --state open`).
       - Do NOT create feature/improvement issues — that's the development job's responsibility.
 
       Commit and push the summary post.
@@ -178,9 +181,12 @@ jobs:
 
       If you find problems (recurring failures, broken workflows, prompt issues), create issues with `gh issue create --title "..." --body "..." --label "bug"`.
 
+      Before creating any issue:
+      - `gh issue list --state open` — don't duplicate existing issues
+      - `gh issue list --state closed --limit 20` — don't re-file resolved problems
+
       - Maximum 2-3 issues. Only for problems discovered during this review.
       - Focus on ROOT CAUSES, not symptoms
-      - Do NOT duplicate issues that already exist (`gh issue list --state open`).
       - Do NOT create feature/improvement issues — that's the development job's responsibility.
 
       Commit and push the summary post.
@@ -190,7 +196,7 @@ jobs:
   external: false
 - id: agent-debugger
   type: task
-  schedule: '0 11,21 * * *'
+  schedule: '0 21 * * *'
   task:
     title: 'Self-improvement: debug agent errors and fix root causes'
     body: |
