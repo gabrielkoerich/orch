@@ -33,6 +33,7 @@ pub fn spawn(mut rx: broadcast::Receiver<TaskEvent>, transport: Arc<Transport>) 
                         duration_seconds: event.duration_seconds.unwrap_or(0.0),
                         summary: event.summary.unwrap_or_default(),
                         repo: Some(event.repo.clone()),
+                        notify_target: None,
                     };
                     transport.push_notification(notification);
                 }

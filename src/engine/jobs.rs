@@ -14,6 +14,8 @@
 //! - `external: true`: Creates a GitHub Issue
 
 use crate::backends::{ExternalBackend, ExternalId};
+use crate::channels::notification::TaskNotification;
+use crate::channels::transport::Transport;
 use crate::cmd::CommandErrorContext;
 use crate::store::{JobState, TaskStatus};
 use anyhow::Context;
@@ -44,6 +46,14 @@ pub struct Job {
     pub enabled: bool,
     #[serde(default = "default_external")]
     pub external: bool, // true = GitHub Issue, false (default) = internal SQLite task
+    /// Send a Telegram notification when this job completes or fails.
+    /// Uses `channels.telegram.chat_id` from config unless `notify_target` overrides it.
+    #[serde(default)]
+    pub notify: bool,
+    /// Override the Telegram chat_id for this job's completion notification.
+    /// Only used when `notify: true`. Falls back to `channels.telegram.chat_id`.
+    #[serde(default)]
+    pub notify_target: Option<String>,
 }
 
 /// Template for creating a task from a job.
@@ -171,6 +181,7 @@ pub async fn tick(
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<crate::store::TaskStore>>,
     repo: &str,
+    transport: Option<&Arc<Transport>>,
 ) -> anyhow::Result<()> {
     let jobs = load_jobs(jobs_path)?;
     let now = chrono::Utc::now();
@@ -363,7 +374,7 @@ pub async fn tick(
         }
 
         // Execute the job (may mutate state.active_task_id / last_task_status).
-        execute_job(job, &mut state, backend, store, repo).await;
+        execute_job(job, &mut state, backend, store, repo, transport).await;
 
         // Persist updated state (active_task_id, last_task_status) after execution.
         if let Some(s) = store {
@@ -390,6 +401,7 @@ pub async fn execute_job(
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<crate::store::TaskStore>>,
     repo: &str,
+    transport: Option<&Arc<Transport>>,
 ) {
     match job.r#type.as_str() {
         "task" => {
@@ -488,6 +500,39 @@ pub async fn execute_job(
         // to the warning handler below.
         other => {
             tracing::warn!(job_id = job.id, r#type = other, "unknown job type");
+        }
+    }
+
+    // Send Telegram notification if requested for this job.
+    if job.notify {
+        if let Some(t) = transport {
+            let status = state
+                .last_task_status
+                .as_deref()
+                .unwrap_or("unknown")
+                .to_string();
+            let summary = match status.as_str() {
+                "done" => format!("Job `{}` completed successfully.", job.id),
+                "failed" => format!("Job `{}` failed.", job.id),
+                "new" => format!("Job `{}` created a new task.", job.id),
+                other => format!("Job `{}` finished with status: {other}.", job.id),
+            };
+            // Resolve target chat_id: job override → config default
+            let target = job
+                .notify_target
+                .clone()
+                .or_else(|| crate::config::get("channels.telegram.chat_id").ok());
+            let notification = TaskNotification {
+                task_id: job.id.clone(),
+                title: format!("Job: {}", job.id),
+                status,
+                agent: "scheduler".to_string(),
+                duration_seconds: 0.0,
+                summary,
+                repo: Some(repo.to_string()),
+                notify_target: target,
+            };
+            t.push_notification(notification);
         }
     }
 }

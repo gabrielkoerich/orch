@@ -64,6 +64,11 @@ pub struct TaskNotification {
     pub summary: String,
     /// Repository (owner/repo) this task belongs to, for multi-project routing.
     pub repo: Option<String>,
+    /// Optional override chat_id for Telegram (e.g. from job `notify_target`).
+    /// When set, the notification is sent directly to this chat_id instead of
+    /// the channel routing logic.
+    #[serde(default)]
+    pub notify_target: Option<String>,
 }
 
 impl TaskNotification {
@@ -284,6 +289,7 @@ mod tests {
             duration_seconds: 120.0,
             summary: "Fixed the OAuth flow".to_string(),
             repo: Some("owner/my-project".to_string()),
+            notify_target: None,
         };
         let msg = n.format_telegram();
         assert!(msg.contains("✅"));
@@ -305,6 +311,7 @@ mod tests {
             duration_seconds: 10.0,
             summary: "Done".to_string(),
             repo: None,
+            notify_target: None,
         };
         let msg = n.format_telegram();
         // HTML mode: underscores and asterisks are literal characters; ensure
@@ -324,6 +331,7 @@ mod tests {
             duration_seconds: 30.0,
             summary: "Ready for review".to_string(),
             repo: None,
+            notify_target: None,
         };
         let msg = n.format_telegram();
         // In HTML mode underscores are literal; ensure status is present and
@@ -341,6 +349,7 @@ mod tests {
             duration_seconds: 15.0,
             summary: "Done".to_string(),
             repo: None,
+            notify_target: None,
         };
         let msg = n.format_telegram();
         // HTML mode: underscores are literal in text and agent is enclosed in
@@ -358,6 +367,7 @@ mod tests {
             duration_seconds: 60.0,
             summary: "Decomposed mod.rs".to_string(),
             repo: Some("org/refactor-repo".to_string()),
+            notify_target: None,
         };
         let msg = n.format_slack();
         assert!(msg.contains("✅"));
@@ -379,6 +389,7 @@ mod tests {
             duration_seconds: 1800.0,
             summary: "Timed out waiting for tests".to_string(),
             repo: Some("acme/deploy-svc".to_string()),
+            notify_target: None,
         };
         let msg = n.format_discord();
         assert!(msg.contains("⚠️"));
@@ -398,6 +409,7 @@ mod tests {
             duration_seconds: 45.0,
             summary: "Feature added".to_string(),
             repo: Some("acme/widgets".to_string()),
+            notify_target: None,
         };
         let msg = n.format_with_project("telegram");
         assert!(msg.starts_with("[widgets] "));
@@ -414,6 +426,7 @@ mod tests {
             duration_seconds: 5.0,
             summary: "Done".to_string(),
             repo: None,
+            notify_target: None,
         };
         let msg = n.format_with_project("discord");
         assert!(msg.starts_with("[unknown] "));
@@ -440,6 +453,7 @@ mod tests {
             duration_seconds: 90.0,
             summary: "Fixed it".into(),
             repo: Some("owner/myproject".into()),
+            notify_target: None,
         };
         let formatted = n.format_with_project("telegram");
         assert!(
@@ -459,6 +473,7 @@ mod tests {
             duration_seconds: 90.0,
             summary: "Fixed it".into(),
             repo: None,
+            notify_target: None,
         };
         let formatted = n.format_with_project("telegram");
         assert!(
@@ -477,6 +492,7 @@ mod tests {
             duration_seconds: 60.0,
             summary: "Deployed".into(),
             repo: Some("acme/svc".into()),
+            notify_target: None,
         };
         let tg = n.format_with_project("telegram");
         let dc = n.format_with_project("discord");

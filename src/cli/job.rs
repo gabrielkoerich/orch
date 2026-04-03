@@ -107,6 +107,8 @@ pub fn add(
         dir: None,
         enabled: true,
         external: true,
+        notify: false,
+        notify_target: None,
     };
 
     jobs.push(job);
@@ -274,7 +276,7 @@ pub async fn run(job_id: &str, project: Option<&str>) -> anyhow::Result<()> {
     }
 
     // Execute the job (may mutate state.active_task_id / last_task_status).
-    jobs::execute_job(&job, &mut state, &backend, store.as_ref(), &repo).await;
+    jobs::execute_job(&job, &mut state, &backend, store.as_ref(), &repo, None).await;
 
     let status = state.last_task_status.as_deref().unwrap_or("unknown");
     if let Some(ref task_id) = state.active_task_id {
@@ -297,7 +299,7 @@ pub async fn tick() -> anyhow::Result<()> {
     let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
 
     let path = jobs::resolve_jobs_path();
-    jobs::tick(&path, &backend, store.as_ref(), &repo).await?;
+    jobs::tick(&path, &backend, store.as_ref(), &repo, None).await?;
 
     println!("Job tick completed");
     Ok(())
