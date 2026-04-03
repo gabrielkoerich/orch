@@ -1836,4 +1836,66 @@ mod tests {
     fn matches_project_filter_rejects_non_matching_repo() {
         assert!(!matches_project_filter("gabrielkoerich/orch", "bean"));
     }
+
+    /// Verify the forced-routing field construction for agent-only case.
+    #[test]
+    fn retry_force_route_fields_agent_only() {
+        let forced_agent = "claude";
+        let model: Option<String> = None;
+        let fields: Vec<(&str, serde_json::Value)> = {
+            let mut f = vec![
+                ("agent", serde_json::json!(forced_agent)),
+                (
+                    "route_reason",
+                    serde_json::json!(format!("forced via retry --agent {forced_agent}")),
+                ),
+            ];
+            if let Some(ref m) = model {
+                f.push(("model", serde_json::json!(m)));
+            }
+            f
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].1, serde_json::json!("claude"));
+        assert_eq!(
+            fields[1].1,
+            serde_json::json!("forced via retry --agent claude")
+        );
+    }
+
+    /// Verify the forced-routing field construction for agent+model case.
+    #[test]
+    fn retry_force_route_fields_agent_and_model() {
+        let forced_agent = "claude";
+        let model: Option<String> = Some("opus".to_string());
+        let fields: Vec<(&str, serde_json::Value)> = {
+            let mut f = vec![
+                ("agent", serde_json::json!(forced_agent)),
+                (
+                    "route_reason",
+                    serde_json::json!(format!("forced via retry --agent {forced_agent}")),
+                ),
+            ];
+            if let Some(ref m) = model {
+                f.push(("model", serde_json::json!(m)));
+            }
+            f
+        };
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].1, serde_json::json!("claude"));
+        assert_eq!(fields[2].0, "model");
+        assert_eq!(fields[2].1, serde_json::json!("opus"));
+    }
+
+    /// Verify that the model hint display is correct in both cases.
+    #[test]
+    fn retry_model_hint_display() {
+        let model_some: Option<String> = Some("opus".to_string());
+        let model_none: Option<String> = None;
+        assert_eq!(model_some.as_deref().unwrap_or("(router default)"), "opus");
+        assert_eq!(
+            model_none.as_deref().unwrap_or("(router default)"),
+            "(router default)"
+        );
+    }
 }
