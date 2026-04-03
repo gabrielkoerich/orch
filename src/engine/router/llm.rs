@@ -218,7 +218,7 @@ pub(super) fn apply_self_routing_penalty(
 /// `Router` holds a `LlmRouter` and delegates `route_with_llm` to it.
 pub(super) struct LlmRouter {
     /// Cached skills catalog loaded once to avoid repeated blocking I/O.
-    skills_catalog: std::sync::Mutex<Option<String>>,
+    skills_catalog: tokio::sync::Mutex<Option<String>>,
 }
 
 /// Scan a skills directory for skill subdirectories containing SKILL.md files.
@@ -270,7 +270,7 @@ fn scan_skills_directory(skills_dir: &std::path::Path) -> Option<String> {
 impl LlmRouter {
     pub fn new() -> Self {
         Self {
-            skills_catalog: std::sync::Mutex::new(None),
+            skills_catalog: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -470,17 +470,17 @@ impl LlmRouter {
     /// Invalidate the skills catalog cache so the next routing call reloads from disk.
     ///
     /// Called after `skills_sync()` updates skill files on disk.
-    pub fn invalidate_skills_catalog(&self) {
-        if let Ok(mut cache) = self.skills_catalog.lock() {
-            *cache = None;
-        }
+    pub async fn invalidate_skills_catalog(&self) {
+        let mut cache = self.skills_catalog.lock().await;
+        *cache = None;
     }
 
     /// Load skills catalog from skills.yml or skills directory.
     /// Cached after first load to avoid blocking I/O in async context.
     async fn load_skills_catalog(&self) -> anyhow::Result<String> {
         // Check cache first (quick lock, drop immediately)
-        if let Ok(cache) = self.skills_catalog.lock() {
+        {
+            let cache = self.skills_catalog.lock().await;
             if let Some(ref catalog) = *cache {
                 return Ok(catalog.clone());
             }
@@ -524,9 +524,8 @@ impl LlmRouter {
         .await
         .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
 
-        if let Ok(mut cache) = self.skills_catalog.lock() {
-            *cache = Some(catalog.clone());
-        }
+        let mut cache = self.skills_catalog.lock().await;
+        *cache = Some(catalog.clone());
 
         Ok(catalog)
     }

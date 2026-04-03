@@ -138,8 +138,8 @@ impl Router {
     /// Invalidate the skills catalog cache so the next routing call reloads from disk.
     ///
     /// Call this after `skills_sync()` writes new/updated skill files.
-    pub fn invalidate_skills_catalog(&self) {
-        self.llm_router.invalidate_skills_catalog();
+    pub async fn invalidate_skills_catalog(&self) {
+        self.llm_router.invalidate_skills_catalog().await;
     }
 
     fn advance_pool_index_after_attempt(&mut self, idx: usize, pool_len: usize) {

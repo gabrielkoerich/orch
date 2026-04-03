@@ -924,7 +924,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .unwrap_or(false);
 
     // Shared status updated by the server-spawn task and the health-check loop.
-    let webhook_status = std::sync::Arc::new(std::sync::Mutex::new(
+    let webhook_status = Arc::new(tokio::sync::Mutex::new(
         crate::webhook_status::WebhookStatus::default(),
     ));
 
@@ -944,7 +944,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
         // Initialise status: configured, not yet healthy.
         {
-            let mut s = webhook_status.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s = webhook_status.lock().await;
             s.configured = true;
             s.port = Some(port);
             s.healthy = false;
@@ -986,7 +986,7 @@ pub async fn serve() -> anyhow::Result<()> {
                                 orch_webhook_in_fallback = true,
                                 "webhook server giving up, switching to polling fallback"
                             );
-                            let mut s = status_for_spawn.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut s = status_for_spawn.lock().await;
                             s.fallback_mode = true;
                             s.healthy = false;
                             s.last_failure_reason = Some(reason);
@@ -1002,7 +1002,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             "webhook bind failed (transient), retrying with backoff"
                         );
                         {
-                            let mut s = status_for_spawn.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut s = status_for_spawn.lock().await;
                             s.startup_attempts = attempt;
                             s.last_failure_reason = Some(reason);
                             s.save();
@@ -1037,7 +1037,7 @@ pub async fn serve() -> anyhow::Result<()> {
         webhook_port = None;
         webhook_healthy = false;
         {
-            let mut s = webhook_status.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s = webhook_status.lock().await;
             s.configured = false;
             s.fallback_mode = true;
             s.save();
@@ -1069,8 +1069,7 @@ pub async fn serve() -> anyhow::Result<()> {
     // still returns the task (search index propagation delay). The tmux session does not
     // exist until the runner completes worktree setup (~10s later), so session_exists
     // alone is insufficient. Keyed by "{repo}/{task_id}".
-    let dispatching: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let dispatching: Arc<dashmap::DashSet<String>> = Arc::new(dashmap::DashSet::new());
 
     // In-memory guard to prevent double-spawn of auto-merge background tasks.
     // Since review_open_prs runs every sync_tick (~10s) but CI polling can take
@@ -1345,7 +1344,7 @@ pub async fn serve() -> anyhow::Result<()> {
                             }
                             // Persist updated status.
                             {
-                                let mut s = webhook_status.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut s = webhook_status.lock().await;
                                 s.healthy = health;
                                 s.last_check_utc = Some(chrono::Utc::now());
                                 if health {
