@@ -101,6 +101,11 @@ impl ClaudeRunner {
 
         if is_error {
             // Classify the error from the result text.
+            // Check stale session first — it requires a targeted recovery action
+            // (reset UUID + retry) that is distinct from generic agent failures.
+            if let Some(e) = super::patterns::detect_stale_session(result_text) {
+                return Err(e);
+            }
             // Check auth before rate_limit — billing errors (credit balance)
             // are auth issues, not transient rate limits.
             let combined = format!("{result_text} {}", raw);

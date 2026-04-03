@@ -171,6 +171,11 @@ pub enum AgentError {
     PermissionDenied { message: String },
     /// Agent is waiting for interactive input (e.g., 1Password, SSH).
     WaitingForInput { message: String },
+    /// The agent's session ID is no longer valid (session expired or was cleared).
+    ///
+    /// Returned when Claude reports "No conversation found with session ID: <uuid>".
+    /// The caller should reset the stored UUID and retry with a fresh `--session-id`.
+    StaleSession { session_id: String },
     /// Agent returned unparseable output.
     InvalidResponse { raw: String },
     /// Agent self-reported a failure in its response.
@@ -194,6 +199,9 @@ impl std::fmt::Display for AgentError {
             Self::MissingTool { tool } => write!(f, "missing tool: {tool}"),
             Self::PermissionDenied { message } => write!(f, "permission denied: {message}"),
             Self::WaitingForInput { message } => write!(f, "waiting for input: {message}"),
+            Self::StaleSession { session_id } => {
+                write!(f, "stale session (session expired): {session_id}")
+            }
             Self::InvalidResponse { raw } => {
                 let end = truncate_at_char_boundary(raw, 200);
                 write!(f, "invalid response: {}", &raw[..end])
@@ -221,6 +229,7 @@ pub fn error_class_name(err: &AgentError) -> &'static str {
         AgentError::MissingTool { .. } => "MissingTool",
         AgentError::PermissionDenied { .. } => "PermissionDenied",
         AgentError::WaitingForInput { .. } => "WaitingForInput",
+        AgentError::StaleSession { .. } => "StaleSession",
         AgentError::InvalidResponse { .. } => "InvalidResponse",
         AgentError::AgentFailed { .. } => "AgentFailed",
         AgentError::NetworkError { .. } => "NetworkError",
@@ -882,6 +891,28 @@ pub(crate) mod patterns {
         None
     }
 
+    /// Check for a stale/expired Claude session ID.
+    ///
+    /// Claude returns `"No conversation found with session ID: <uuid>"` when
+    /// the session UUID stored in orch's KV has expired server-side. The caller
+    /// should reset the stored UUID and retry with a fresh `--session-id`.
+    pub fn detect_stale_session(text: &str) -> Option<AgentError> {
+        // Case-insensitive match; extract the UUID if present.
+        let lower = text.to_lowercase();
+        if let Some(pos) = lower.find("no conversation found with session id") {
+            // Try to extract the UUID that follows the colon.
+            let after = &text[pos..];
+            let session_id = after
+                .split_once(':')
+                .map(|(_, rest)| rest.trim())
+                // Take only the UUID portion (up to whitespace or end)
+                .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
+                .unwrap_or_default();
+            return Some(AgentError::StaleSession { session_id });
+        }
+        None
+    }
+
     /// Exit code returned by `timeout(1)` when the child is killed.
     const TIMEOUT_EXIT_CODE: i32 = 124;
 
@@ -1097,6 +1128,35 @@ mod tests {
         assert!(patterns::detect_waiting_for_input("Enter passphrase for key").is_some());
         assert!(patterns::detect_waiting_for_input("1Password CLI required").is_some());
         assert!(patterns::detect_waiting_for_input("done").is_none());
+    }
+
+    #[test]
+    fn pattern_detect_stale_session() {
+        // Exact error message from Claude
+        let err = patterns::detect_stale_session(
+            "No conversation found with session ID: 2be572c4-57bb-4f86-bc03-b593c329177c",
+        );
+        assert!(err.is_some(), "should detect stale session");
+        if let Some(AgentError::StaleSession { session_id }) = err {
+            assert_eq!(session_id, "2be572c4-57bb-4f86-bc03-b593c329177c");
+        }
+
+        // Case-insensitive
+        let err = patterns::detect_stale_session("no conversation found with session id: abc-123");
+        assert!(err.is_some(), "should detect lowercase variant");
+
+        // Non-matching text
+        assert!(patterns::detect_stale_session("all good").is_none());
+        assert!(patterns::detect_stale_session("conversation started").is_none());
+    }
+
+    #[test]
+    fn stale_session_display() {
+        let e = AgentError::StaleSession {
+            session_id: "abc-123".to_string(),
+        };
+        assert!(e.to_string().contains("stale session"));
+        assert!(e.to_string().contains("abc-123"));
     }
 
     #[test]
