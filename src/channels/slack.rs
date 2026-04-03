@@ -17,6 +17,7 @@
 //! - `channels:read` — health check
 
 use super::{Channel, IncomingMessage, OutgoingMessage};
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -64,16 +65,18 @@ struct AuthTestResponse {
 }
 
 impl SlackChannel {
-    pub fn new(bot_token: String, channel_id: Option<String>) -> Self {
-        Self {
+    pub fn new(bot_token: String, channel_id: Option<String>) -> anyhow::Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("failed to build HTTP client")?;
+
+        Ok(Self {
             bot_token,
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("valid TLS config"),
+            client,
             channel_id,
             last_ts: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-        }
+        })
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -309,13 +312,13 @@ mod tests {
 
     #[test]
     fn slack_channel_name() {
-        let ch = SlackChannel::new("xoxb-test".to_string(), None);
+        let ch = SlackChannel::new("xoxb-test".to_string(), None).unwrap();
         assert_eq!(ch.name(), "slack");
     }
 
     #[test]
     fn slack_api_url() {
-        let ch = SlackChannel::new("xoxb-test".to_string(), None);
+        let ch = SlackChannel::new("xoxb-test".to_string(), None).unwrap();
         assert_eq!(ch.api_url("auth.test"), "https://slack.com/api/auth.test");
         assert_eq!(
             ch.api_url("chat.postMessage"),

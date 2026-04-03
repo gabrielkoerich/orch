@@ -3,6 +3,7 @@
 //! Uses the Telegram Bot API to receive commands and stream agent output.
 
 use super::{Channel, IncomingMessage, OutgoingMessage};
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -77,18 +78,18 @@ struct GetUpdatesResponse {
 }
 
 impl TelegramChannel {
-    pub fn new(token: String, chat_id: Option<String>) -> Self {
-        Self {
+    pub fn new(token: String, chat_id: Option<String>) -> anyhow::Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(TELEGRAM_HTTP_TIMEOUT_SECS))
+            .build()
+            .context("failed to build HTTP client")?;
+
+        Ok(Self {
             token,
-            client: Client::builder()
-                // Keep the client timeout above Telegram's long-poll timeout so
-                // healthy polls do not expire locally before the server responds.
-                .timeout(Duration::from_secs(TELEGRAM_HTTP_TIMEOUT_SECS))
-                .build()
-                .expect("valid TLS config"),
+            client,
             chat_id,
             offset: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
-        }
+        })
     }
 
     fn api_url(&self, method: &str) -> String {
