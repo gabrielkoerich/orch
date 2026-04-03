@@ -9,6 +9,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
+const TELEGRAM_LONG_POLL_TIMEOUT_SECS: u64 = 30;
+const TELEGRAM_HTTP_TIMEOUT_SECS: u64 = TELEGRAM_LONG_POLL_TIMEOUT_SECS + 5;
+const _: () = assert!(TELEGRAM_HTTP_TIMEOUT_SECS > TELEGRAM_LONG_POLL_TIMEOUT_SECS);
+
 pub struct TelegramChannel {
     pub token: String,
     pub client: Client,
@@ -65,7 +69,9 @@ impl TelegramChannel {
         Self {
             token,
             client: Client::builder()
-                .timeout(Duration::from_secs(30))
+                // Keep the client timeout above Telegram's long-poll timeout so
+                // healthy polls do not expire locally before the server responds.
+                .timeout(Duration::from_secs(TELEGRAM_HTTP_TIMEOUT_SECS))
                 .build()
                 .expect("valid TLS config"),
             chat_id,
@@ -82,7 +88,7 @@ impl TelegramChannel {
 
         let params = serde_json::json!({
             "offset": offset,
-            "timeout": 30,
+            "timeout": TELEGRAM_LONG_POLL_TIMEOUT_SECS,
             "allowed_updates": ["message", "callback_query"]
         });
 
