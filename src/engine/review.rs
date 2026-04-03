@@ -1860,17 +1860,44 @@ mod tests {
     fn count_ahead_commits_returns_zero_when_no_ahead_commits() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
+
+        // Create a bare repo to act as the 'origin' remote
+        let bare = temp.path().join("bare.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+
         git(dir, &["init", "-b", "main"]);
         git(dir, &["config", "user.name", "Test"]);
         git(dir, &["config", "user.email", "test@test.com"]);
         std::fs::write(dir.join("f"), "a").unwrap();
         git(dir, &["add", "f"]);
         git(dir, &["commit", "-m", "init"]);
-        // origin/main doesn't exist, but rev-list with origin/main..HEAD
-        // will fail because origin doesn't exist — so we test with a local ref
-        // instead. Use HEAD~0..HEAD which is always valid but not the real check.
-        // For this test we verify the success path with a bare repo where
-        // the ref simply doesn't exist — the function should return Err.
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", bare.to_str().unwrap()])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["push", "origin", "main"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+
+        // origin/main now exists and HEAD is at the same commit — zero ahead
+        let result = count_ahead_commits(dir, "main");
+        assert!(
+            result.is_ok(),
+            "expected Ok when origin/main exists, got {result:?}"
+        );
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "expected 0 commits ahead when branch matches origin/main"
+        );
     }
 
     #[test]
