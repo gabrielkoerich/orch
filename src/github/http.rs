@@ -477,8 +477,8 @@ impl GhHttp {
 
                         if attempt + 1 < attempts {
                             // Exponential backoff (2^attempt * base), capped
-                            // Cap exponent at 62 to prevent overflow when attempt >= 64
-                            let exp = 1u64.checked_shl(attempt.min(62)).unwrap_or(u64::MAX);
+                            // Cap exponent at 63 to prevent overflow when attempt >= 64
+                            let exp = 1u64.checked_shl(attempt.min(63)).unwrap_or(u64::MAX);
                             let mut backoff = base_secs.saturating_mul(exp);
                             if backoff > max_secs {
                                 backoff = max_secs;
@@ -508,8 +508,8 @@ impl GhHttp {
                     tracing::warn!(err = %e, attempt, "HTTP send failed, will retry if attempts remain");
                     last_err = Some(anyhow::anyhow!("HTTP send failed: {}", e));
                     if attempt + 1 < attempts {
-                        // Cap exponent at 62 to prevent overflow when attempt >= 64
-                        let exp = 1u64.checked_shl(attempt.min(62)).unwrap_or(u64::MAX);
+                        // Cap exponent at 63 to prevent overflow when attempt >= 64
+                        let exp = 1u64.checked_shl(attempt.min(63)).unwrap_or(u64::MAX);
                         let backoff = base_secs.saturating_mul(exp);
                         let sleep_dur = Duration::from_secs(backoff)
                             + Duration::from_millis((attempt as u64 * 100).min(1000));
