@@ -1094,6 +1094,56 @@ pub(crate) async fn ingest_external_tasks(
     repo: &str,
     store: &Arc<crate::store::TaskStore>,
 ) -> anyhow::Result<()> {
+    #[derive(Clone)]
+    struct DuplicateTarget {
+        id: String,
+        status_label: String,
+    }
+
+    let mut existing_by_title: std::collections::HashMap<String, DuplicateTarget> =
+        std::collections::HashMap::new();
+    let mut accepted_by_title: std::collections::HashMap<String, DuplicateTarget> =
+        std::collections::HashMap::new();
+
+    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    match store.list_for_doctor(repo, &cutoff).await {
+        Ok(recent) => {
+            let mut insert_target = |task: &crate::store::Task| {
+                if task.origin == "internal" {
+                    return;
+                }
+                let Some(ext_id) = task.external_id.as_ref() else {
+                    return;
+                };
+                let status_label = task
+                    .labels
+                    .iter()
+                    .find(|l| l.starts_with("status:"))
+                    .cloned()
+                    .unwrap_or_default();
+                existing_by_title
+                    .entry(task.title.clone())
+                    .or_insert(DuplicateTarget {
+                        id: ext_id.clone(),
+                        status_label,
+                    });
+            };
+
+            // Prefer active tasks over recently done ones when selecting a canonical issue.
+            for task in recent.iter().filter(|t| t.status != TaskStatus::Done) {
+                insert_target(task);
+            }
+            for task in recent.iter().filter(|t| t.status == TaskStatus::Done) {
+                insert_target(task);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(repo, err = %e, "ingest: failed to load recent tasks for dedup");
+        }
+    }
+
     // Fetch all open issues in one call (includes unlabeled issues).
     // Also fetch routable tasks which catches unlabeled issues on backends
     // where list_all_tasks only returns labeled ones.
@@ -1145,6 +1195,59 @@ pub(crate) async fn ingest_external_tasks(
             .map(|t| t.is_none())
             .unwrap_or(true);
 
+        if is_new {
+            let duplicate_target = existing_by_title
+                .get(&task.title)
+                .or_else(|| accepted_by_title.get(&task.title));
+            if let Some(target) = duplicate_target {
+                if target.id != task.id.0 {
+                    let label = target.status_label.as_str();
+                    let should_dedupe =
+                        match backend.has_open_issue_with_title(&task.title, label).await {
+                            Ok(true) => true,
+                            Ok(false) => false,
+                            Err(e) => {
+                                tracing::warn!(
+                                    task_id = task.id.0,
+                                    err = %e,
+                                    "ingest: dedup check failed — defaulting to keep issue"
+                                );
+                                false
+                            }
+                        };
+
+                    if should_dedupe {
+                        let comment = format!(
+                            "Duplicate of #{id} — closing to avoid duplicate work.\n\n---\n{footer}",
+                            id = target.id,
+                            footer = crate::engine::orch_footer()
+                        );
+                        if let Err(e) = backend.post_comment(&task.id, &comment).await {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                err = %e,
+                                "ingest: failed to comment on duplicate issue"
+                            );
+                        }
+                        if let Err(e) = backend.update_status(&task.id, Status::Done).await {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                err = %e,
+                                "ingest: failed to close duplicate issue"
+                            );
+                        } else {
+                            tracing::info!(
+                                task_id = task.id.0,
+                                duplicate_of = target.id,
+                                "ingest: closed duplicate issue"
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
         match store.ensure_external_task(repo, task).await {
             Ok(store_id) => {
                 if let Some(s) = status {
@@ -1152,6 +1255,18 @@ pub(crate) async fn ingest_external_tasks(
                 }
                 // Acknowledge newly detected issues with an eyes reaction.
                 if is_new {
+                    let status_label = task
+                        .labels
+                        .iter()
+                        .find(|l| l.starts_with("status:"))
+                        .cloned()
+                        .unwrap_or_default();
+                    accepted_by_title
+                        .entry(task.title.clone())
+                        .or_insert(DuplicateTarget {
+                            id: task.id.0.clone(),
+                            status_label,
+                        });
                     if let Err(e) = backend.acknowledge_issue(&task.id).await {
                         tracing::debug!(
                             task_id = task.id.0,
@@ -1219,10 +1334,20 @@ mod tests {
     struct IngestMockBackend {
         /// Stored as (status_label, tasks) pairs since Status doesn't impl Hash.
         tasks: Vec<(String, Vec<ExternalTask>)>,
+        dedup_result: bool,
+        comments: tokio::sync::Mutex<Vec<(String, String)>>,
+        status_updates: tokio::sync::Mutex<Vec<(String, Status)>>,
     }
 
     impl IngestMockBackend {
         fn with_tasks(tasks: Vec<(Status, ExternalTask)>) -> Arc<Self> {
+            Self::with_tasks_and_dedup(tasks, false)
+        }
+
+        fn with_tasks_and_dedup(
+            tasks: Vec<(Status, ExternalTask)>,
+            dedup_result: bool,
+        ) -> Arc<Self> {
             let mut grouped: Vec<(String, Vec<ExternalTask>)> = Vec::new();
             for (status, task) in tasks {
                 let label = status.as_label().to_string();
@@ -1232,7 +1357,12 @@ mod tests {
                     grouped.push((label, vec![task]));
                 }
             }
-            Arc::new(Self { tasks: grouped })
+            Arc::new(Self {
+                tasks: grouped,
+                dedup_result,
+                comments: tokio::sync::Mutex::new(Vec::new()),
+                status_updates: tokio::sync::Mutex::new(Vec::new()),
+            })
         }
     }
 
@@ -1259,7 +1389,11 @@ mod tests {
         async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
             Ok(vec![])
         }
-        async fn post_comment(&self, _: &ExternalId, _: &str) -> anyhow::Result<()> {
+        async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()> {
+            self.comments
+                .lock()
+                .await
+                .push((id.0.clone(), body.to_string()));
             Ok(())
         }
         async fn set_labels(&self, _: &ExternalId, _: &[String]) -> anyhow::Result<()> {
@@ -1277,8 +1411,16 @@ mod tests {
         async fn get_mentions(&self, _: &str) -> anyhow::Result<Vec<Mention>> {
             Ok(vec![])
         }
-        async fn update_status(&self, _: &ExternalId, _: Status) -> anyhow::Result<()> {
+        async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+            self.status_updates
+                .lock()
+                .await
+                .push((id.0.clone(), status));
             Ok(())
+        }
+
+        async fn has_open_issue_with_title(&self, _: &str, _: &str) -> anyhow::Result<bool> {
+            Ok(self.dedup_result)
         }
     }
 
@@ -1365,6 +1507,46 @@ mod tests {
             .unwrap();
         assert_eq!(task.title, "Updated title");
         assert_eq!(task.status, crate::store::TaskStatus::Routed);
+    }
+
+    #[tokio::test]
+    async fn ingest_closes_duplicate_titles() {
+        use crate::store::{NewTask, TaskStore};
+
+        let backend = IngestMockBackend::with_tasks_and_dedup(
+            vec![(Status::New, make_ext_task("2", "Duplicate issue"))],
+            true,
+        );
+        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        store
+            .create(&NewTask {
+                external_id: Some("1".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Duplicate issue".to_string(),
+                labels: vec!["status:new".to_string()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ingest_external_tasks(&backend_dyn, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let all = store.list_all("owner/repo").await.unwrap();
+        assert_eq!(all.len(), 1);
+
+        let comments = backend.comments.lock().await;
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].1.contains("Duplicate of #1"));
+
+        let status_updates = backend.status_updates.lock().await;
+        assert_eq!(status_updates.len(), 1);
+        assert_eq!(status_updates[0].0, "2");
+        assert_eq!(status_updates[0].1, Status::Done);
     }
 
     #[tokio::test]
