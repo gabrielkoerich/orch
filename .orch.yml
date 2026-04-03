@@ -13,6 +13,7 @@ jobs:
       - `gh issue list --state open` — don't duplicate existing issues
       - `gh issue list --state closed --limit 20` — don't re-file resolved problems
       - Read the `DO NOT TOUCH` sections in `AGENTS.md` — respect settled decisions
+      - If you find any errors on /opt/homebrew/var/log/orch.error.log, first CHECK THE LAST UPDATE DATE OF THIS LOG. DO NOT REFILE issues if this log is stale.
 
       ## What to review
 
@@ -74,6 +75,7 @@ jobs:
       - `gh issue list --state open` — don't duplicate existing issues
       - `gh issue list --state closed --limit 50` — don't re-file resolved problems
       - Read the `DO NOT TOUCH` sections in `AGENTS.md` — respect settled decisions
+      - If you find any errors on /opt/homebrew/var/log/orch.error.log, first CHECK THE LAST UPDATE DATE OF THIS LOG. DO NOT REFILE issues if this log is stale.
       - **Check existing code/schema before creating migration or feature tasks** - run `sqlite3 ~/.orch/orch.db ".tables"` and search with `rg` for existing implementations. Do NOT create tasks for things that already exist or are partially implemented unless the remaining gap is clear.
       - **NEVER append to existing migration files** - always create a NEW numbered migration file. Appending to already-applied migrations breaks existing databases.
       - Prefer a small number of high-signal tasks over a long list of weak ideas. If you cannot name the root cause and the concrete files likely involved, do not file it.
@@ -134,6 +136,7 @@ jobs:
       Before creating any issue:
       - `gh issue list --state open` — don't duplicate existing issues
       - `gh issue list --state closed --limit 20` — don't re-file resolved problems
+      - If you find any errors on /opt/homebrew/var/log/orch.error.log, first CHECK THE LAST UPDATE DATE OF THIS LOG. DO NOT REFILE issues if this log is stale.
 
       - Maximum 2-3 issues. Only for operational problems found during this review.
       - Focus on ROOT CAUSES, not symptoms
@@ -302,7 +305,7 @@ jobs:
       - `gh issue list --state closed --limit 50` — don't re-file resolved problems
       - `git log --since="24 hours ago" --oneline` — check what was already fixed
       - Read `AGENTS.md` DO NOT TOUCH defined sections
-      - If you find any errors on ~/.orch/state/orch.error.log, first CHECK THE LAST UPDATE DATE OF THIS LOG. DO NOT REFILE issues if this log is stale.
+      - If you find any errors on /opt/homebrew/var/log/orch.error.log, first CHECK THE LAST UPDATE DATE OF THIS LOG. DO NOT REFILE issues if this log is stale.
 
       ## Rules
 
