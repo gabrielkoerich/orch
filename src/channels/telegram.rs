@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 const TELEGRAM_LONG_POLL_TIMEOUT_SECS: u64 = 30;
@@ -254,7 +255,15 @@ impl Channel for TelegramChannel {
         let chat_id = self.chat_id.clone();
         let offset = self.offset.clone();
 
-        tracing::info!(token_prefix = %token.chars().take(8).collect::<String>(), "telegram channel started");
+        let token_fingerprint = {
+            let mut hasher = Sha256::new();
+            hasher.update(token.as_bytes());
+            let hash = hasher.finalize();
+            let hex: String = hash[..8].iter().map(|b| format!("{:02x}", b)).collect();
+            format!("sha256:{hex}")
+        };
+
+        tracing::info!(token_fingerprint = %token_fingerprint, "telegram channel started");
 
         // Create a single TelegramChannel instance to reuse for all API calls
         let channel = TelegramChannel {

@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 pub struct SlackChannel {
@@ -172,8 +173,16 @@ impl Channel for SlackChannel {
             .expect("BUG: channel_id is Some; None case returned early above");
         let last_ts = self.last_ts.clone();
 
+        let token_fingerprint = {
+            let mut hasher = Sha256::new();
+            hasher.update(bot_token.as_bytes());
+            let hash = hasher.finalize();
+            let hex: String = hash[..8].iter().map(|b| format!("{:02x}", b)).collect();
+            format!("sha256:{hex}")
+        };
+
         tracing::info!(
-            token_prefix = %bot_token.chars().take(12).collect::<String>(),
+            token_fingerprint = %token_fingerprint,
             channel_id = %channel_id,
             "slack channel started"
         );
