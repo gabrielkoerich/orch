@@ -103,7 +103,7 @@ pub async fn check_token_budget(
     repo: &str,
     store: &Option<Arc<TaskStore>>,
 ) -> BudgetCheckOutcome {
-    let max_tokens: u64 = config::get("max_tokens_per_task")
+    let max_tokens: u64 = config::get("workflow.max_tokens_per_task")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000);
