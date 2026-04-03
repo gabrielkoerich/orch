@@ -49,7 +49,6 @@ Everything outside your current working directory is **read-only**. Never `cd ..
 
 1. **Update and rebase** (optional): Orch has already rebased this worktree on `origin/{{DEFAULT_BRANCH}}` before dispatch. You can skip this step unless you suspect new remote commits have arrived since launch. If you do need to rebase:
    ```
-   git rebase origin/$(git branch --show-current) 2>/dev/null || true
    git rebase origin/{{DEFAULT_BRANCH}}
    ```
    Orch has already run `git fetch origin` (all branches) before launching you — do NOT run `git fetch` or `git pull` yourself (they will fail in sandboxed environments because they need to write outside the worktree directory). Use `git rebase origin/<branch>` instead — the remote refs are already local. If the rebase has conflicts, resolve them before proceeding. **Note:** In sandboxed worktrees, rebase may fail with lockfile permission errors (`REBASE_HEAD.lock`, `AUTO_MERGE.lock`). If you encounter such errors and the branch is already up to date (check with `git status`), treat the error as non-blocking and continue with the task.
