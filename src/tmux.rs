@@ -15,7 +15,10 @@ use tokio::process::Command;
 #[derive(Debug, Clone)]
 pub struct Session {
     pub name: String,
+    /// The task id (preserving internal/external marker), e.g. "internal-21116" or "1775189963034"
     pub task_id: String,
+    /// Project short name derived from repo slug (owner/repo -> repo)
+    pub project: String,
     pub created_at: Option<u64>, // Unix timestamp from tmux #{session_created}
 }
 
@@ -203,32 +206,27 @@ impl TmuxManager {
         false
     }
 
-    /// Extract the task_id from a full session name.
+    /// Parse a session name into (project, task_id).
     ///
     /// Session names follow the format `orch-{project}-{task_id}`, where
     /// `{task_id}` may itself contain `-` (e.g. internal tasks: `internal-21116`).
     ///
-    /// Splitting on the last `-` only works for numeric external IDs. For internal
-    /// tasks, we detect the `-internal-` marker and take everything from `internal-`
-    /// onward as the task_id.
-    ///
     /// Returns `None` if the name does not start with the orch prefix.
-    pub fn task_id_from_session_name(&self, name: &str) -> Option<String> {
+    fn parse_session_name(&self, name: &str) -> Option<(String, String)> {
         let after_prefix = name.strip_prefix(&self.prefix)?;
+        // Project is the first segment before the next '-'
+        let mut parts = after_prefix.splitn(2, '-');
+        let project = parts.next()?.to_string();
+        let rest = parts.next().unwrap_or_default();
+
         // Internal tasks produce names like "{project}-internal-{n}".
-        // Find the last occurrence of "-internal-" and take from "internal-" onward.
-        if let Some(pos) = after_prefix.find("-internal-") {
-            Some(after_prefix[pos + 1..].to_string())
-        } else {
-            // External task: numeric id is the last segment.
-            Some(
-                after_prefix
-                    .rsplit('-')
-                    .next()
-                    .unwrap_or(after_prefix)
-                    .to_string(),
-            )
+        if rest.starts_with("internal-") {
+            return Some((project, rest.to_string()));
         }
+
+        // External task: numeric id is the last segment.
+        let ext_id = rest.rsplit('-').next().unwrap_or(rest).to_string();
+        Some((project, ext_id))
     }
 
     /// Get pane_dead status for all sessions in a single tmux call.
@@ -275,10 +273,11 @@ impl TmuxManager {
             let name = parts[0].to_string();
             let created_at = parts.get(1).and_then(|s| s.parse::<u64>().ok());
 
-            if let Some(task_id) = self.task_id_from_session_name(&name) {
+            if let Some((project, task_id)) = self.parse_session_name(&name) {
                 sessions.push(Session {
                     name,
                     task_id,
+                    project,
                     created_at,
                 });
             }
@@ -387,8 +386,11 @@ impl TmuxManager {
         }
     }
 
-    /// Snapshot all active sessions — for engine tick monitoring.
-    pub async fn snapshot(&self) -> HashMap<String, bool> {
+    /// Snapshot all orch-prefixed sessions — for engine tick monitoring.
+    ///
+    /// Returns a vector of (Session, alive) so callers can operate on the
+    /// actual session name instead of reconstructing one from repo+task_id.
+    pub async fn snapshot(&self) -> Vec<(Session, bool)> {
         let sessions = match self.list_sessions().await {
             Ok(s) => s,
             Err(err) => {
@@ -396,12 +398,12 @@ impl TmuxManager {
                 Vec::new()
             }
         };
-        let mut map = HashMap::new();
+        let mut out = Vec::new();
         for s in sessions {
             let active = self.is_session_active(&s.name).await;
-            map.insert(s.task_id, active);
+            out.push((s, active));
         }
-        map
+        out
     }
 
     // ── Environment variable helpers ───────────────────────────────────
@@ -523,37 +525,37 @@ mod tests {
     #[test]
     fn task_id_from_session_name_parses_external_task() {
         let tmux = TmuxManager::new();
-        // "orch-repo-1234" → task_id "1234"
+        // "orch-repo-1234" → project "repo", task_id "1234"
         assert_eq!(
-            tmux.task_id_from_session_name("orch-repo-1234"),
-            Some("1234".to_string())
+            tmux.parse_session_name("orch-repo-1234"),
+            Some(("repo".to_string(), "1234".to_string()))
         );
     }
 
     #[test]
     fn task_id_from_session_name_parses_internal_task() {
         let tmux = TmuxManager::new();
-        // "orch-orch-internal-21116" → task_id "internal-21116", not "21116"
+        // "orch-orch-internal-21116" → project "orch", task_id "internal-21116"
         assert_eq!(
-            tmux.task_id_from_session_name("orch-orch-internal-21116"),
-            Some("internal-21116".to_string())
+            tmux.parse_session_name("orch-orch-internal-21116"),
+            Some(("orch".to_string(), "internal-21116".to_string()))
         );
     }
 
     #[test]
     fn task_id_from_session_name_parses_internal_task_small_id() {
         let tmux = TmuxManager::new();
-        // "orch-repo-internal-8" → task_id "internal-8"
+        // "orch-repo-internal-8" → project "repo", task_id "internal-8"
         assert_eq!(
-            tmux.task_id_from_session_name("orch-repo-internal-8"),
-            Some("internal-8".to_string())
+            tmux.parse_session_name("orch-repo-internal-8"),
+            Some(("repo".to_string(), "internal-8".to_string()))
         );
     }
 
     #[test]
     fn task_id_from_session_name_returns_none_for_non_orch_session() {
         let tmux = TmuxManager::new();
-        assert_eq!(tmux.task_id_from_session_name("some-other-session"), None);
+        assert_eq!(tmux.parse_session_name("some-other-session"), None);
     }
 
     /// Verify set_env runs the correct tmux set-environment command.
