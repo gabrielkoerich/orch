@@ -77,6 +77,12 @@ pub struct GitHubComment {
     /// Present when fetched from the repo-level /issues/comments endpoint.
     /// Format: https://api.github.com/repos/owner/repo/issues/123
     pub issue_url: Option<String>,
+    /// Author's relationship to the repo for comment payloads when present.
+    /// This field is present on repo-level comment endpoints and may be
+    /// missing for some GraphQL-derived nodes. See `author_association` on
+    /// issues for the corresponding field.
+    #[serde(default)]
+    pub author_association: Option<String>,
 }
 
 /// PR review state - "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"
