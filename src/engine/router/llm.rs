@@ -164,6 +164,150 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// Classify a router LLM non-zero exit failure by extracting meaningful error information
+/// from stdout and stderr.
+///
+/// This function runs the same tolerant parsing used by `parse_llm_response()` to detect:
+/// - Structured error envelopes in stdout (type=error, error.message, etc.)
+/// - NDJSON/system envelopes that contain no actual routing output
+/// - Raw text errors in stderr
+///
+/// Returns a descriptive error message suitable for logging and cooldown recording.
+fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> String {
+    let stdout_trimmed = stdout.trim();
+
+    // If stdout has content, try to detect structured errors or startup-only envelopes
+    if !stdout_trimmed.is_empty() {
+        // Try to parse stdout as JSON to detect error envelopes
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout_trimmed) {
+            if let Some(err_msg) = detect_error_envelope(&val) {
+                return err_msg;
+            }
+        }
+
+        // Check for startup/system-only NDJSON by running through extract_agent_text
+        // This mirrors the logic in parse_llm_response() to detect when stdout only
+        // contains system envelopes (hook_started, init, etc.) with no actual result.
+        match extract_agent_text_for_classification(agent, stdout_trimmed) {
+            Ok(text) => {
+                let trimmed_text = text.trim();
+
+                // Check if all lines are valid JSON system/event envelopes
+                let lines: Vec<&str> = trimmed_text
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+                if !lines.is_empty() {
+                    let mut all_system = true;
+                    for line in &lines {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                            let typ = val.get("type").and_then(|v| v.as_str());
+                            let subtype = val.get("subtype").and_then(|v| v.as_str());
+                            if typ != Some("system")
+                                && typ != Some("event")
+                                && subtype != Some("init")
+                            {
+                                all_system = false;
+                                break;
+                            }
+                        } else {
+                            all_system = false;
+                            break;
+                        }
+                    }
+                    if all_system {
+                        return "router LLM produced only system/startup envelope".to_string();
+                    }
+                }
+
+                // If extracted text is empty or very short, it likely means the agent produced
+                // only metadata envelopes without actual routing output
+                if trimmed_text.is_empty() || trimmed_text.len() < 10 {
+                    return "router LLM produced no text output (NDJSON envelopes only)"
+                        .to_string();
+                }
+            }
+            Err(e) => {
+                return e.to_string();
+            }
+        }
+
+        // Try tolerant reparse to find embedded error envelopes
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout_trimmed) {
+            if let Some(err_msg) = detect_error_envelope(&val) {
+                return err_msg;
+            }
+        }
+
+        // Last resort: check for common error indicators in stdout
+        let stdout_lower = stdout_trimmed.to_lowercase();
+        let error_indicators = [
+            "rate limit",
+            "overloaded",
+            "quota",
+            "permission",
+            "unauthorized",
+            "authentication",
+            "429",
+            "401",
+            "403",
+            "503",
+            "500",
+            "529",
+            "context_length",
+            "max_tokens",
+        ];
+        for indicator in &error_indicators {
+            if stdout_lower.contains(indicator) {
+                return format!("error indicator '{indicator}' found in stdout");
+            }
+        }
+    }
+
+    // No useful error from stdout — fall back to stderr
+    let stderr_trimmed = stderr.trim();
+    if !stderr_trimmed.is_empty() {
+        let stderr_preview = stderr_trimmed[..stderr_trimmed.len().min(200)].to_string();
+        return stderr_preview;
+    }
+
+    // Both stdout and stderr are empty or uninformative
+    "router LLM failed with no output (empty stdout and stderr)".to_string()
+}
+
+/// Extract agent text for classification purposes.
+///
+/// This is a simplified version of `extract_agent_text()` that doesn't bail on
+/// system-only envelopes — instead it returns the raw text so the caller can
+/// classify the failure.
+fn extract_agent_text_for_classification(agent: &str, raw: &str) -> anyhow::Result<String> {
+    match agent {
+        "opencode" => {
+            let events = agents::parse_ndjson(raw.trim());
+            if events.is_empty() {
+                Ok(raw.to_string())
+            } else {
+                Ok(opencode::extract_ndjson_text(&events).unwrap_or_else(|| raw.to_string()))
+            }
+        }
+        "claude" | "kimi" | "minimax" => match claude::extract_stream_json_result_text(raw) {
+            Ok(text) => Ok(text),
+            Err(AgentError::AgentFailed { message }) => {
+                Err(anyhow::anyhow!("router LLM returned error: {message}"))
+            }
+            Err(AgentError::InvalidResponse { raw }) => {
+                if let Some(text) = opencode::extract_router_text(&raw) {
+                    Ok(text)
+                } else {
+                    Ok(raw)
+                }
+            }
+            Err(err) => Err(anyhow::anyhow!("router LLM returned error: {err}")),
+        },
+        _ => Ok(raw.to_string()),
+    }
+}
+
 /// Apply self-routing penalty: if the LLM chose the same agent that's running the router,
 /// probabilistically redirect to another agent.
 ///
@@ -567,10 +711,20 @@ impl LlmRouter {
                     crate::engine::runner::response::record_model_failure(agent, model_str).await;
                     anyhow::bail!("router LLM rate limited: {agent}:{model_str}");
                 }
+
+                // Try to extract meaningful text from stdout and detect structured errors.
+                // This handles cases where the agent exits non-zero but stdout contains
+                // useful error payloads (not just rate limits).
+                let error_msg = classify_router_llm_failure(agent, &stdout, &stderr);
                 let stdout_preview = &stdout[..stdout.floor_char_boundary(500)];
                 let stderr_preview = &stderr[..stderr.floor_char_boundary(500)];
-                tracing::warn!(stderr = %stderr_preview, stdout = %stdout_preview, "router LLM command failed");
-                anyhow::bail!("router LLM failed: {stderr}");
+                tracing::warn!(
+                    stderr = %stderr_preview,
+                    stdout = %stdout_preview,
+                    reason = %error_msg,
+                    "router LLM command failed"
+                );
+                anyhow::bail!("router LLM failed: {error_msg}");
             }
             Err(DirectCommandError::Timeout { secs }) => {
                 anyhow::bail!("router LLM timed out after {secs}s");
@@ -1533,5 +1687,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── classify_router_llm_failure ───────────────────────────────────────────
+
+    #[test]
+    fn classify_nonzero_exit_with_structured_stdout_error() {
+        let stdout =
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let stderr = "";
+        let result = classify_router_llm_failure("claude", stdout, stderr);
+        assert!(result.contains("type=error") && result.contains("Overloaded"));
+    }
+
+    #[test]
+    fn classify_nonzero_exit_with_claude_ndjson_error() {
+        let stdout = r#"{"type":"result","is_error":true,"result":"Claude model haiku is not available","usage":null}"#;
+        let stderr = "";
+        let result = classify_router_llm_failure("claude", stdout, stderr);
+        assert!(result.contains("router LLM returned error: Claude model haiku is not available"));
+    }
+
+    #[test]
+    fn classify_nonzero_exit_with_system_only_ndjson() {
+        let stdout = r#"{"type":"system","subtype":"hook_started","hook_id":"123"}
+{"type":"system","subtype":"init","hook_id":"123"}"#;
+        let stderr = "some warning here";
+        let result = classify_router_llm_failure("claude", stdout, stderr);
+        assert_eq!(result, "router LLM produced only system/startup envelope");
+    }
+
+    #[test]
+    fn classify_nonzero_exit_with_no_text_ndjson_only() {
+        let stdout = r#"{"type":"event","data":{}}"#;
+        let stderr = "some warning here";
+        let result = classify_router_llm_failure("opencode", stdout, stderr);
+        assert_eq!(result, "router LLM produced only system/startup envelope");
     }
 }
