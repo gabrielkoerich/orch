@@ -335,17 +335,19 @@ async fn auto_unblock_blocked_tasks(
             continue;
         }
 
-        // Always increment after cooldown check. When reason changed, count was reset to 0
-        // above — incrementing after that gives count=1 (first time with this new reason).
-        // When reason is the same, increment advances from current count for exponential backoff.
+        // Compute the new counter value: when reason changed, count was reset to 0 above,
+        // so incrementing gives 1 (first attempt for the new reason). When the reason is the
+        // same, advance from current count for exponential backoff.
+        // The increment is included in the same set_fields call below so both the counter
+        // and the status update succeed or fail together — no phantom increments on transient
+        // DB errors.
+        let new_count = cooldown_count + 1;
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        if let Err(e) = store.increment(task.id, "auto_unblock_count").await {
-            tracing::warn!(task_id = task.id, err = %e, "failed to increment auto_unblock_count");
-            continue;
-        }
 
-        // Combine all remaining field updates into a single set_fields call.
+        // Combine all field updates — including the counter increment — into a single atomic
+        // set_fields call.
         let mut fields: Vec<(&str, serde_json::Value)> = vec![
+            ("auto_unblock_count", serde_json::json!(new_count)),
             ("auto_unblock_last_at", serde_json::json!(now)),
             ("auto_unblock_last_reason", serde_json::json!(reason_key)),
             ("agent", serde_json::Value::Null),
@@ -361,7 +363,7 @@ async fn auto_unblock_blocked_tasks(
             fields.push(("review_invocations", serde_json::json!(0)));
         }
         if let Err(e) = store.set_fields(task.id, &fields).await {
-            tracing::warn!(task_id = task.id, err = %e, "failed to set auto_unblock fields — skipping unblock");
+            tracing::warn!(task_id = task.id, err = %e, "failed to set auto_unblock fields (including counter) — skipping unblock, counter not incremented");
             continue;
         }
 
