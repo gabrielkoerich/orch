@@ -17,8 +17,21 @@ pub async fn opt_store_get_task(
     task_id: &str,
 ) -> Option<Task> {
     let s = store.as_ref()?;
-    let store_id = s.resolve_task_id(repo, task_id).await.ok()??;
-    s.get(store_id).await.ok()
+    let store_id = match s.resolve_task_id(repo, task_id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "failed to resolve task id in store");
+            return None;
+        }
+    };
+    match s.get(store_id).await {
+        Ok(task) => Some(task),
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "failed to fetch task from store");
+            None
+        }
+    }
 }
 
 /// Write fields to the task store.
