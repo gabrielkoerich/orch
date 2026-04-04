@@ -1043,35 +1043,6 @@ pub(crate) async fn review_and_merge(
     let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
 
-    // Sanity-check that the stored agent summary matches the current diff.
-    let task_title = stored_task
-        .as_ref()
-        .map(|t| t.title.clone())
-        .unwrap_or_default();
-    let task_body = stored_task
-        .as_ref()
-        .map(|t| t.body.clone())
-        .unwrap_or_default();
-
-    if let Err(reason) =
-        verify_summary_matches_diff(&agent_summary, &git_diff, &task_title, &task_body)
-    {
-        tracing::warn!(
-            task_id = task.id.0,
-            reason = %reason,
-            "review sanity check failed: summary/diff mismatch — failing closed to avoid wasted review cycles"
-        );
-        // Persist an explanatory last_error so humans can see why review was skipped.
-        store_set(
-            &Some(Arc::clone(store)),
-            repo,
-            &task.id.0,
-            &[("last_error", serde_json::json!(reason.clone()))],
-        )
-        .await;
-        return Ok(ReviewDecision::Failed(reason));
-    }
-
     // 4. Build review prompt
     let review_prompt = runner::agent::build_review_prompt(
         task,
@@ -1256,6 +1227,48 @@ pub(crate) async fn review_and_merge(
         None
     };
 
+    // Sanity-check that the stored agent summary matches the current diff.
+    let task_title = stored_task
+        .as_ref()
+        .map(|t| t.title.clone())
+        .unwrap_or_default();
+    let task_body = stored_task
+        .as_ref()
+        .map(|t| t.body.clone())
+        .unwrap_or_default();
+
+    if let Err(reason) =
+        verify_summary_matches_diff(&agent_summary, &git_diff, &task_title, &task_body)
+    {
+        tracing::warn!(
+            task_id = task.id.0,
+            reason = %reason,
+            "review sanity check failed: summary/diff mismatch — failing closed to avoid wasted review cycles"
+        );
+        // Persist an explanatory last_error so humans can see why review was skipped.
+        store_set(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            &[("last_error", serde_json::json!(reason.clone()))],
+        )
+        .await;
+        if let Some(rid) = run_id {
+            let _ = store
+                .complete_run(&CompleteRun {
+                    run_id: rid,
+                    exit_code: Some(-1),
+                    stdout: "",
+                    stderr: &reason,
+                    parsed: "",
+                    outcome: "failed",
+                    error: &reason,
+                    tokens: RunTokenUsage::default(),
+                })
+                .await;
+        }
+        return Ok(ReviewDecision::Failed(reason));
+    }
     // 8. Spawn review agent in tmux
     let session = match runner::agent::spawn_in_tmux(tmux, &invocation).await {
         Ok(s) => s,
