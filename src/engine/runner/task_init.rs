@@ -313,6 +313,16 @@ pub async fn prepare_task(
         }
     }
 
+    // Sandbox: block .orch.yml project config (settled architecture: agents must not modify it)
+    {
+        let orch_yml = wt.work_dir.join(".orch.yml");
+        let orch_yml_str = orch_yml.to_string_lossy();
+        disallowed_tools.extend([
+            format!("Write({orch_yml_str})"),
+            format!("Edit({orch_yml_str})"),
+        ]);
+    }
+
     // Timeout
     let timeout_seconds: u64 = config::get("workflow.timeout_seconds")
         .ok()

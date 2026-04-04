@@ -1179,6 +1179,37 @@ pub(crate) async fn review_and_merge(
 
     let system_prompt = runner::agent::review_system_prompt();
 
+    // Build sandbox rules for the review agent — mirrors task_init protections.
+    let review_disallowed_tools = {
+        let mut tools = vec![
+            "Bash(rm *)".to_string(),
+            "Bash(rm -*)".to_string(),
+            "Bash(git push*)".to_string(),
+        ];
+        // Block .orch.yml project config (settled architecture: agents must not modify it)
+        let orch_yml = worktree_path.join(".orch.yml");
+        let orch_yml_str = orch_yml.to_string_lossy();
+        tools.extend([
+            format!("Write({orch_yml_str})"),
+            format!("Edit({orch_yml_str})"),
+        ]);
+        // Block global config files
+        if let Ok(orch_home) = crate::home::orch_home() {
+            for path in [
+                orch_home.join("config.yml"),
+                orch_home.join("config.example.yml"),
+            ] {
+                let path_str = path.to_string_lossy();
+                tools.extend([
+                    format!("Read({path_str})"),
+                    format!("Write({path_str})"),
+                    format!("Edit({path_str})"),
+                ]);
+            }
+        }
+        tools
+    };
+
     let invocation = runner::agent::AgentInvocation {
         agent: review_agent.clone(),
         model: review_model.clone(),
@@ -1186,7 +1217,7 @@ pub(crate) async fn review_and_merge(
         system_prompt,
         agent_message: review_prompt,
         task_id: review_task_id.clone(),
-        disallowed_tools: vec![],
+        disallowed_tools: review_disallowed_tools,
         git_author_name: git_name,
         git_author_email: git_email,
         output_file: output_file.clone(),
@@ -1488,6 +1519,86 @@ pub(crate) async fn review_and_merge(
         })),
     )
     .await;
+
+    // 12a. Guard: restore .orch.yml if the review agent modified it despite the disallowed_tools
+    // fence. Defence-in-depth — the primary prevention is the disallowed_tools list above.
+    {
+        // Restore any uncommitted working-tree changes first.
+        let _ = Command::new("git")
+            .args(["checkout", "HEAD", "--", ".orch.yml"])
+            .current_dir(&worktree_path)
+            .status()
+            .await;
+
+        // Then check for committed changes since the branch diverged from the default branch.
+        let merge_base = Command::new("git")
+            .args(["merge-base", "HEAD", &default_branch])
+            .current_dir(&worktree_path)
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        if !merge_base.is_empty() {
+            let orch_yml_changed = Command::new("git")
+                .args([
+                    "diff",
+                    "--name-only",
+                    &merge_base,
+                    "HEAD",
+                    "--",
+                    ".orch.yml",
+                ])
+                .current_dir(&worktree_path)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false);
+
+            if orch_yml_changed {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    "review agent modified .orch.yml (forbidden); restoring to merge-base version"
+                );
+                let restore_ok = Command::new("git")
+                    .args(["checkout", &merge_base, "--", ".orch.yml"])
+                    .current_dir(&worktree_path)
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+
+                if restore_ok {
+                    let staged = Command::new("git")
+                        .args(["diff", "--cached", "--name-only", "--", ".orch.yml"])
+                        .current_dir(&worktree_path)
+                        .output()
+                        .await
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| !o.stdout.is_empty())
+                        .unwrap_or(false);
+
+                    if staged {
+                        let _ = Command::new("git")
+                            .args([
+                                "commit",
+                                "-m",
+                                "revert: restore .orch.yml (review agent must not modify project config)",
+                            ])
+                            .current_dir(&worktree_path)
+                            .status()
+                            .await;
+                    }
+                }
+            }
+        }
+    }
 
     // 12. Push the rebased branch before posting the review decision so the
     // comment references code that's already on the PR.
