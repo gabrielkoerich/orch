@@ -1686,16 +1686,8 @@ mod tests {
 
         let updated = store.get(task_id_num).await.unwrap();
 
-        // Agent must be preserved (not cleared).
-        assert_eq!(
-            updated.agent.as_deref(),
-            Some("claude"),
-            "agent must be preserved after review changes, got: {:?}",
-            updated.agent
-        );
-
-        // When model_for_complexity returns a valid model → Routed.
-        // When all models are cooled → falls back to New.
+        // When model_for_complexity returns a valid model → Routed, agent preserved.
+        // When all models are cooled → falls back to New, agent cleared for full re-route.
         // In test env with no model_map configured, model_for_complexity returns None → New.
         // This is the expected fallback behavior.
         let model_was_resolved = updated
@@ -1704,14 +1696,24 @@ mod tests {
             .map(|m| !m.is_empty())
             .unwrap_or(false);
         if model_was_resolved {
-            // Got a valid model → should be Routed
+            // Got a valid model → should be Routed, agent preserved
+            assert_eq!(
+                updated.agent.as_deref(),
+                Some("claude"),
+                "agent must be preserved when model_for_complexity returns a valid model"
+            );
             assert_eq!(
                 updated.status,
                 TaskStatus::Routed,
                 "status must be Routed when model_for_complexity returns a valid model"
             );
         } else {
-            // All models cooled or no pools configured → falls back to New
+            // All models cooled or no pools configured → falls back to New, agent cleared
+            assert_eq!(
+                updated.agent.as_deref(),
+                None,
+                "agent must be cleared when falling back to full re-route"
+            );
             assert_eq!(
                 updated.status,
                 TaskStatus::New,
