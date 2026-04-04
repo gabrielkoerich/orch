@@ -190,7 +190,16 @@ impl DedupStore {
         // write_all, sync_all, rename) do not occupy a Tokio async worker thread.
         if let (Some(path), Some(entries)) = (&self.file_path, flush_entries) {
             let path = path.clone();
-            let _ = tokio::task::spawn_blocking(move || flush_dedup_file(&path, &entries)).await;
+            let path_for_log = path.clone();
+            match tokio::task::spawn_blocking(move || flush_dedup_file(&path, &entries)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(?e, path = %path_for_log.display(), "failed to flush webhook dedup state");
+                }
+                Err(e) => {
+                    tracing::warn!(?e, "spawn_blocking failed for flush_dedup_file");
+                }
+            }
         }
 
         is_new
@@ -280,22 +289,15 @@ fn load_dedup_file(path: &Path, window_secs: u64) -> HashMap<String, u64> {
 }
 
 /// Persist the dedup entries to a JSON file.
-fn flush_dedup_file(path: &Path, entries: &HashMap<String, u64>) {
+fn flush_dedup_file(path: &Path, entries: &HashMap<String, u64>) -> std::io::Result<()> {
     #[derive(serde::Serialize)]
     struct FileFormat<'a> {
         entries: &'a HashMap<String, u64>,
     }
 
-    match serde_json::to_string(&FileFormat { entries }) {
-        Ok(content) => {
-            if let Err(e) = atomic_write(path, &content) {
-                tracing::warn!(?e, path = %path.display(), "failed to flush webhook dedup state");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(?e, "failed to serialize webhook dedup state");
-        }
-    }
+    let content = serde_json::to_string(&FileFormat { entries })
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    atomic_write(path, &content)
 }
 
 fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
@@ -310,7 +312,9 @@ fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp_path, path)?;
     if let Some(parent) = path.parent() {
         if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
+            if let Err(e) = dir.sync_all() {
+                tracing::warn!(?e, path = %parent.display(), "failed to sync parent directory after dedup file rename");
+            }
         }
     }
     Ok(())
