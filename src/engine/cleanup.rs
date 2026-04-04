@@ -494,7 +494,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             // If the worktree belongs to a different project than the current repo
             // context (e.g., internal task with worktree in another project), we can
             // still find the repo root by examining the worktree's .git file.
-            let repo_root = match resolve_repo_root_from_worktree(&wt) {
+            let repo_root = match resolve_repo_root_from_worktree(&wt).await {
                 Ok(root) => root,
                 Err(_) => resolve_repo_root(repo).await?,
             };

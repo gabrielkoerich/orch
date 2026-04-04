@@ -383,7 +383,7 @@ pub async fn build_full_context(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> TaskContext {
-    let task_context = load_task_context(&task.id.0);
+    let task_context = load_task_context(&task.id.0).await;
 
     let parent_context = if let Some(b) = backend {
         build_parent_context(task, b, store, repo).await
@@ -437,16 +437,16 @@ mod tests {
         assert!(memory.is_empty());
     }
 
-    #[test]
-    fn test_build_project_instructions_empty_dir() {
+    #[tokio::test]
+    async fn test_build_project_instructions_empty_dir() {
         let dir = std::env::temp_dir().join("orch_test_nonexistent");
-        let instructions = build_project_instructions(&dir);
+        let instructions = build_project_instructions(&dir).await;
         assert!(instructions.is_empty());
     }
 
-    #[test]
-    fn test_build_skills_docs_empty() {
-        let docs = build_skills_docs(&[]);
+    #[tokio::test]
+    async fn test_build_skills_docs_empty() {
+        let docs = build_skills_docs(&[]).await;
         assert!(docs.is_empty());
     }
 

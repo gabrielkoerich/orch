@@ -187,7 +187,7 @@ exit $CMD_STATUS
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+        tokio::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).await?;
     }
 
     let command = format!("bash {}", script_path.display());
