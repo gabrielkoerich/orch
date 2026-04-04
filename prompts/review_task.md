@@ -27,6 +27,7 @@ timeout 300 gh pr checks {{PR_NUMBER}} --watch --fail-fast --required || true
 - **Required checks pass AND branch is up to date** (Step 1 rebase was a no-op or already applied) → proceed to Step 3 (skip local test runs)
 - **Required checks pass BUT branch was rebased** (Step 1 changed commits) → CI results are stale. Note in your review that CI needs to re-run post-rebase and proceed with code review. Orch will push the rebased branch (before posting the review decision) and CI will re-run before merging.
 - **Required checks fail** → check if the failure is related to files in this PR. If not, it's pre-existing — note it and proceed. If it is, **first check if it is trivially fixable** (e.g., `cargo fmt`, `cargo clippy --fix`, `npm run lint -- --fix`). If fixable: apply the fix in the worktree, commit, re-run the check locally to confirm it passes, then **approve** — do NOT request changes for auto-fixable issues. If not trivially fixable, set decision = `request_changes`
+- **Pre-existing CI failure that also affects this PR** → if the failure was introduced on the default branch (not by this PR), self-fix it if trivially fixable (run formatter, fix lint), commit, and approve. If not trivially fixable, note it as pre-existing and approve — do not block the PR for bugs it did not introduce.
 - **Required checks not run yet or pending** → run local checks as fallback: read `.github/workflows/` to identify what CI runs and execute those commands. Do NOT hardcode language-specific commands
 
 **Self-fix rule**: If CI fails on formatting, linting, or other auto-fixable issues, apply the fix yourself, commit, and approve. Do NOT consume a review cycle for trivially fixable issues. Example: `cargo fmt --check` fails → run `cargo fmt`, `git add -A`, `git commit -m "style: run cargo fmt"`, re-run the check, then approve.
@@ -53,6 +54,7 @@ Flag `request_changes` if the PR:
 3. **Code quality** — no obvious bugs, security issues, or regressions
 4. **Completeness** — all files committed, no TODOs left behind
 5. **Simplicity** — is the solution as simple as it can be? Flag unnecessary complexity.
+6. **Proportional review** — match review rigor to PR scope. For trivial changes (comment edits, typo fixes, single-line changes), focus on correctness and CI only. Do not request changes for style preferences, alternative wordings, or title mismatches on trivial PRs.
 
 ### Task Description
 {{TASK_BODY}}
