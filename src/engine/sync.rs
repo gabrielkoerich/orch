@@ -818,6 +818,12 @@ async fn scan_mentions(
 
     let gh = crate::github::http::GhHttp::new()?;
 
+    // Track the latest timestamp of a successfully processed mention so the
+    // cursor only advances past mentions that were actually handled.  If a
+    // `create_internal` call fails we leave the cursor before that mention so
+    // the next tick retries it instead of permanently losing it.
+    let mut last_success_ts: Option<String> = None;
+
     for mention in mentions {
         // Skip if already processed
         if existing_mentions.contains(&mention.id) {
@@ -980,6 +986,10 @@ async fn scan_mentions(
                         .create_internal(repo, &title, &task_body, "mention", &mention.id)
                         .await;
                 }
+                // Command was executed (or error-replied) — mention is handled.
+                if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
+                    last_success_ts = Some(mention.created_at.clone());
+                }
                 continue;
             }
         }
@@ -994,7 +1004,10 @@ async fn scan_mentions(
                 .await
             {
                 Ok(task_id) => {
-                    tracing::info!(task_id, mention_id = %mention.id, "created mention task")
+                    tracing::info!(task_id, mention_id = %mention.id, "created mention task");
+                    if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
+                        last_success_ts = Some(mention.created_at.clone());
+                    }
                 }
                 Err(e) => tracing::warn!(
                     mention_id = %mention.id,
@@ -1005,9 +1018,15 @@ async fn scan_mentions(
         }
     }
 
-    // Persist cursor so the next sync tick only fetches newer comments
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    kv_set_prefer_store(&store, "mentions_last_checked", &now).await;
+    // Persist cursor so the next sync tick only fetches newer comments.
+    // Use the latest successfully-processed mention timestamp rather than
+    // `now`, so any mention whose `create_internal` failed is retried on the
+    // next tick instead of being permanently skipped.
+    if let Some(ts) = last_success_ts {
+        kv_set_prefer_store(&store, "mentions_last_checked", &ts).await;
+    }
+    // If no mention was successfully processed, leave the cursor unchanged so
+    // the entire batch is retried on the next sync tick.
 
     Ok(())
 }
