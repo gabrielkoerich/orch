@@ -993,10 +993,19 @@ async fn scan_mentions(
         let task_body = format!("Mention by @{}:\n\n{}", mention.author, mention.body);
 
         if let Some(s) = store {
-            let task_id = s
+            match s
                 .create_internal(repo, &title, &task_body, "mention", &mention.id)
-                .await?;
-            tracing::info!(task_id, mention_id = %mention.id, "created mention task");
+                .await
+            {
+                Ok(task_id) => {
+                    tracing::info!(task_id, mention_id = %mention.id, "created mention task")
+                }
+                Err(e) => tracing::warn!(
+                    mention_id = %mention.id,
+                    err = %e,
+                    "failed to create mention task — skipping"
+                ),
+            }
         }
     }
 
