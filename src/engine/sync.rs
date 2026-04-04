@@ -826,6 +826,12 @@ async fn scan_mentions(
             continue;
         }
 
+        // Acknowledge the mention with an eyes reaction (non-fatal)
+        if let Err(e) = backend.acknowledge_mention(&mention.id).await {
+            tracing::debug!(err = %e, mention_id = %mention.id, "failed to acknowledge mention");
+        }
+
+        // Create internal task for this mention
         // Try to parse a slash command from the mention
         if let Some(command) = parse_command(&mention.body) {
             // Extract issue number from the mention's issue URL

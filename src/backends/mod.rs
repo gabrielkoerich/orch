@@ -341,6 +341,14 @@ pub trait ExternalBackend: Send + Sync {
     async fn acknowledge_issue(&self, _id: &ExternalId) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Acknowledge a mention (comment) by reacting with the eyes emoji.
+    ///
+    /// Called when a new @mention is detected in an issue or PR comment.
+    /// Default is a no-op; GitHub backend adds an eyes emoji reaction to the comment.
+    async fn acknowledge_mention(&self, _comment_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
