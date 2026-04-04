@@ -61,7 +61,7 @@ rm -rf ~/.orch/worktrees/orch/gh-issue-NNNN-*
 - Service log: `~/.orch/state/orch.log`
 - Brew stdout: `/opt/homebrew/var/log/orch.log` (startup messages only)
 - Brew stderr: `/opt/homebrew/var/log/orch.error.log`
-- If you find any errors on ~/.orch/state/orch.error.log, first CHECK THE **LAST UPDATE DATE** of this log file. DO NOT REFILE issues if this log is stale.
+- If you find any errors on `/opt/homebrew/var/log/orch.error.log`, first run `ls -lh /opt/homebrew/var/log/orch.error.log` to check the file modification date. This file is **truncated on every service restart**, so any content in it is from the current run only. DO NOT refile issues based on this file if its mtime predates the current session or is more than a few minutes old.
 
 ## Live Session Streaming
 

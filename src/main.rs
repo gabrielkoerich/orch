@@ -142,7 +142,11 @@ fn rotate_log_if_needed(path: &std::path::Path) {
 
 fn rotate_service_logs_if_needed() {
     let brew_prefix = std::env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| "/opt/homebrew".into());
-    rotate_log_if_needed(&std::path::PathBuf::from(&brew_prefix).join("var/log/orch.log"));
+    let brew_log_dir = std::path::PathBuf::from(&brew_prefix).join("var/log");
+    rotate_log_if_needed(&brew_log_dir.join("orch.log"));
+    // Truncate error log on every startup so agents never see stale panics from previous runs
+    // and file duplicate issues based on old errors.
+    let _ = std::fs::File::create(brew_log_dir.join("orch.error.log"));
 
     if let Ok(state_dir) = home::state_dir() {
         rotate_log_if_needed(&state_dir.join("orch.log"));
