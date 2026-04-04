@@ -87,6 +87,75 @@ pub fn write_result_json(
     }
 }
 
+/// Input to the pure status-decision function [`classify_final_status`].
+///
+/// The caller is responsible for pre-computing counter values (via store
+/// increments) and populating them here.  No I/O is performed inside the
+/// decision function itself, making it trivially unit-testable.
+#[derive(Default)]
+struct DecisionInput<'a> {
+    /// Agent-reported status (e.g. `"done"`, `"in_progress"`).
+    agent_status: &'a str,
+    /// Push was attempted and commits existed, but the push error contained a
+    /// `workflow` scope complaint — non-retryable.
+    is_workflow_scope_failure: bool,
+    /// Push was attempted (commits existed) but failed.
+    push_failed: bool,
+    /// Persistent push-failure counter *after* this run's increment.
+    /// Only meaningful when `push_failed` is `true`.
+    push_failures: u64,
+    /// A PR already exists (or was just created) for this task.
+    has_pr: bool,
+    /// The agent created sub-task delegations.
+    has_delegations: bool,
+    /// Commits were pushed to the remote branch successfully.
+    has_pushed: bool,
+    /// The task is external and requires a PR (has code-related labels and is
+    /// not a non-code task).
+    requires_pr: bool,
+    /// Persistent no-code-reroute counter *after* this run's increment.
+    /// Only meaningful when `requires_pr` is `true` and we enter that branch.
+    no_code_reroutes: u64,
+    /// Maximum no-code reroutes before blocking (from config).
+    max_reroutes: u32,
+}
+
+/// Determine the final task status from pre-computed state.
+///
+/// This is a pure function — it performs no I/O.  All store increments must be
+/// done by the caller **before** calling this function (so counters reflect the
+/// current run), and all store side-effects (clearing agent/model, writing
+/// last_error) must be applied **after** based on the returned status.
+fn classify_final_status(input: &DecisionInput<'_>) -> String {
+    if input.is_workflow_scope_failure {
+        "blocked".to_string()
+    } else if input.push_failed {
+        if input.push_failures >= 3 {
+            "blocked".to_string()
+        } else {
+            "new".to_string()
+        }
+    } else if input.agent_status == "done" && input.has_pr {
+        "needs_review".to_string()
+    } else if input.agent_status == "done" && !input.has_pr && input.has_delegations {
+        "blocked".to_string()
+    } else if input.agent_status == "done" && !input.has_pr && input.has_pushed {
+        "routed".to_string()
+    } else if input.agent_status == "done" && input.requires_pr {
+        if input.no_code_reroutes >= input.max_reroutes as u64 {
+            "blocked".to_string()
+        } else {
+            "new".to_string()
+        }
+    } else if input.agent_status == "done" {
+        // Covers both external non-code tasks and internal tasks — both are
+        // allowed to finish without a PR.
+        "done".to_string()
+    } else {
+        input.agent_status.to_string()
+    }
+}
+
 /// Handle a successful agent response: commit, push, PR, delegations, tokens, budget.
 ///
 /// Returns `Ok((status, budget_exceeded, push_failed))` where `status` is the final task status
@@ -394,10 +463,71 @@ pub async fn handle_success(
         && !resp.status.starts_with("needs_review")
         && !is_non_code_task(&resp);
 
-    let final_status = if is_workflow_scope_failure {
-        // Workflow scope errors are non-retryable — the token lacks the `workflow`
-        // OAuth scope. Rerouting won't help since all agents use the same token.
-        // Block immediately with actionable guidance.
+    // ── Pre-compute counters needed by classify_final_status ─────────────────
+    //
+    // Store increments must happen *before* the pure decision so that the
+    // returned counter values are already post-increment.
+
+    // Push-failure counter — use atomic increment to avoid a read-modify-write race.
+    let push_failures: u64 = if push_failed {
+        store::store_increment(store, repo, task_id, "push_failures").await
+    } else {
+        0
+    };
+
+    // Preferred config key `workflow.max_reroute_attempts`; fall back to
+    // `workflow.max_attempts` for backwards compatibility.
+    let max_reroutes: u32 = config::get("workflow.max_reroute_attempts")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            config::get("workflow.max_attempts")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(3);
+
+    // Determine whether we are entering the no-code-reroute branch (all
+    // earlier chain conditions are false + done + requires_pr).
+    let is_no_code_reroute = !is_workflow_scope_failure
+        && !push_failed
+        && resp.status == "done"
+        && !has_delegations
+        && !has_pushed
+        && requires_pr;
+
+    let no_code_reroutes: u64 = if is_no_code_reroute {
+        tracing::warn!(
+            task_id,
+            attempts = new_attempts,
+            max_reroutes,
+            "agent reported done but produced no code changes on external task requiring PR"
+        );
+        store::store_increment(store, repo, task_id, "no_code_reroutes").await
+    } else {
+        0
+    };
+
+    // ── Pure status decision ─────────────────────────────────────────────────
+
+    let final_status_owned = classify_final_status(&DecisionInput {
+        agent_status: &resp.status,
+        is_workflow_scope_failure,
+        push_failed,
+        push_failures,
+        has_pr,
+        has_delegations,
+        has_pushed,
+        requires_pr,
+        no_code_reroutes,
+        max_reroutes,
+    });
+    let final_status = final_status_owned.as_str();
+
+    // ── Post-decision side effects (tracing + store updates) ─────────────────
+
+    if is_workflow_scope_failure {
+        // Non-retryable — block immediately with actionable guidance.
         tracing::error!(
             task_id,
             "push failed: token lacks `workflow` OAuth scope — blocking immediately \
@@ -419,11 +549,7 @@ pub async fn handle_success(
             )],
         )
         .await;
-        "blocked"
     } else if push_failed {
-        // Use atomic increment helper to avoid a read-increment-write race.
-        let push_failures = store::store_increment(store, repo, task_id, "push_failures").await;
-
         // Clear agent and model so router picks a different one on reroute (#1604)
         store::store_set(
             store,
@@ -435,111 +561,59 @@ pub async fn handle_success(
             ],
         )
         .await;
-
         if push_failures >= 3 {
             tracing::error!(
                 task_id,
                 push_failures,
                 "push failed {push_failures} times — blocking for human intervention"
             );
-            "blocked"
         } else {
             tracing::warn!(
                 task_id,
                 push_failures,
                 "agent done but push failed ({push_failures}/3) — rerouting to different agent"
             );
-            "new"
         }
-    } else if resp.status == "done" && has_pr {
-        "needs_review"
     } else if resp.status == "done" && !has_pr && has_delegations {
         tracing::info!(
             task_id,
             "agent reported done with delegations but no PR — setting blocked"
         );
-        "blocked"
     } else if resp.status == "done" && !has_pr && has_pushed {
-        // Push succeeded but PR creation failed after retries. Re-dispatch so another
-        // agent attempt will push and create the PR (the worktree branch already exists,
-        // so the next run will detect the existing branch and create the PR).
+        // Push succeeded but PR creation failed after retries.
         tracing::warn!(
             task_id,
             "agent done, commits pushed, but PR creation failed — re-dispatching as routed"
         );
-        "routed"
-    } else if resp.status == "done" && requires_pr {
-        // Agent claimed done but produced no code changes on an external task
-        // that requires a PR (has code-related labels). Use a dedicated
-        // circuit-breaker counter persisted in the store so repeated reroutes
-        // across separate runs are counted. Prefer a dedicated config key
-        // `workflow.max_reroute_attempts` (fallback to `workflow.max_attempts`
-        // for backwards compatibility).
-        let max_reroutes: u32 = config::get("workflow.max_reroute_attempts")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
-                config::get("workflow.max_attempts")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-            })
-            .unwrap_or(3);
-
-        tracing::warn!(
-            task_id,
-            attempts = new_attempts,
-            max_reroutes,
-            "agent reported done but produced no code changes on external task requiring PR"
-        );
-
-        // Atomically increment the persistent reroute counter and decide.
-        let reroutes = store::store_increment(store, repo, task_id, "no_code_reroutes").await;
-
-        if reroutes as u32 >= max_reroutes {
+    } else if is_no_code_reroute {
+        if final_status == "blocked" {
             tracing::error!(
                 task_id,
-                reroutes,
+                no_code_reroutes,
                 max_reroutes,
                 "reached max reroute attempts for no-code-result on external task — blocking for human review"
             );
-            // Clear agent/model and record an explanatory last_error
-            let msg = format!(
-                "agent completed without code changes after {}/{} reroute attempts on external task requiring PR",
-                reroutes, max_reroutes
-            );
-            store::store_set(
-                store,
-                repo,
-                task_id,
-                &[
-                    ("agent", serde_json::json!(null)),
-                    ("model", serde_json::json!(null)),
-                    ("last_error", serde_json::json!(msg)),
-                ],
-            )
-            .await;
-            "blocked"
-        } else {
-            // Clear agent/model so router picks a different one and note the
-            // fact that this attempt produced no code changes.
-            store::store_set(
-                store,
-                repo,
-                task_id,
-                &[
-                    ("agent", serde_json::json!(null)),
-                    ("model", serde_json::json!(null)),
-                    (
-                        "last_error",
-                        serde_json::json!(
-                            "agent completed without code changes on external task requiring PR"
-                        ),
-                    ),
-                ],
-            )
-            .await;
-            "new"
         }
+        // Clear agent/model and record an explanatory last_error.
+        let msg = if final_status == "blocked" {
+            format!(
+                "agent completed without code changes after {}/{} reroute attempts on external task requiring PR",
+                no_code_reroutes, max_reroutes
+            )
+        } else {
+            "agent completed without code changes on external task requiring PR".to_string()
+        };
+        store::store_set(
+            store,
+            repo,
+            task_id,
+            &[
+                ("agent", serde_json::json!(null)),
+                ("model", serde_json::json!(null)),
+                ("last_error", serde_json::json!(msg)),
+            ],
+        )
+        .await;
     } else if resp.status == "done" && !has_pr && is_external {
         // External task with non-code labels (e.g. documentation, research) —
         // allowed to be marked done without a PR.
@@ -547,16 +621,12 @@ pub async fn handle_success(
             task_id,
             "external task with non-code labels reported done — marking done without PR"
         );
-        "done"
     } else if resp.status == "done" && !has_pr {
         tracing::info!(
             task_id,
             "internal task reported done with no PR — marking done"
         );
-        "done"
-    } else {
-        &resp.status
-    };
+    }
     store::store_set(
         store,
         repo,
@@ -753,6 +823,173 @@ fn has_non_code_label(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::parser::Delegation;
+
+    // ── classify_final_status — one test per decision branch ─────────────────
+
+    /// Branch 1: workflow-scope push failure → block immediately (non-retryable).
+    #[test]
+    fn classify_workflow_scope_failure_blocks() {
+        let status = classify_final_status(&DecisionInput {
+            is_workflow_scope_failure: true,
+            push_failed: true,
+            push_failures: 1,
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// Branch 2a: push failed, < 3 times → reroute with "new".
+    #[test]
+    fn classify_push_failed_under_threshold_reroutes() {
+        let status = classify_final_status(&DecisionInput {
+            push_failed: true,
+            push_failures: 2, // < 3
+            ..Default::default()
+        });
+        assert_eq!(status, "new");
+    }
+
+    /// Branch 2b: push failed >= 3 times → block for human intervention.
+    #[test]
+    fn classify_push_failed_at_threshold_blocks() {
+        let status = classify_final_status(&DecisionInput {
+            push_failed: true,
+            push_failures: 3, // >= 3
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// Branch 3: done + PR exists → send to review.
+    #[test]
+    fn classify_done_with_pr_goes_to_needs_review() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            has_pr: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "needs_review");
+    }
+
+    /// Branch 4: done + delegations, no PR → block (waiting on child tasks).
+    #[test]
+    fn classify_done_with_delegations_no_pr_blocks() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            has_delegations: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// Branch 5: done + commits pushed but PR creation failed → re-dispatch.
+    #[test]
+    fn classify_done_pushed_no_pr_reroutes_for_pr_creation() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            has_pushed: true,
+            ..Default::default()
+        });
+        assert_eq!(status, "routed");
+    }
+
+    /// Branch 6a: done + requires_pr, under max reroutes → reroute.
+    #[test]
+    fn classify_done_requires_pr_under_max_reroutes() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            requires_pr: true,
+            no_code_reroutes: 1,
+            max_reroutes: 3,
+            ..Default::default()
+        });
+        assert_eq!(status, "new");
+    }
+
+    /// Branch 6b: done + requires_pr, at max reroutes → block.
+    #[test]
+    fn classify_done_requires_pr_at_max_reroutes_blocks() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            requires_pr: true,
+            no_code_reroutes: 3,
+            max_reroutes: 3,
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// Branch 6b edge: exceeding max also blocks.
+    #[test]
+    fn classify_done_requires_pr_exceeds_max_reroutes_blocks() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            requires_pr: true,
+            no_code_reroutes: 5,
+            max_reroutes: 3,
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// Branch 7 (collapsed with 8): done + no PR, external non-code → done.
+    #[test]
+    fn classify_done_external_non_code_no_pr_is_done() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            requires_pr: false, // non-code task, no PR required
+            ..Default::default()
+        });
+        assert_eq!(status, "done");
+    }
+
+    /// Branch 8: done + no PR, internal task → done.
+    #[test]
+    fn classify_done_internal_task_no_pr_is_done() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            ..Default::default()
+        });
+        assert_eq!(status, "done");
+    }
+
+    /// Pass-through: non-"done" status is returned unchanged.
+    #[test]
+    fn classify_non_done_status_passes_through() {
+        for status_str in &["in_progress", "needs_review", "blocked"] {
+            let result = classify_final_status(&DecisionInput {
+                agent_status: status_str,
+                ..Default::default()
+            });
+            assert_eq!(result, *status_str, "status '{status_str}' should pass through unchanged");
+        }
+    }
+
+    /// push_failed takes precedence over done+has_pr (push failure detected first).
+    #[test]
+    fn classify_push_failed_takes_precedence_over_has_pr() {
+        let status = classify_final_status(&DecisionInput {
+            agent_status: "done",
+            has_pr: true,
+            push_failed: true,
+            push_failures: 1,
+            ..Default::default()
+        });
+        // push_failed branch runs before done+has_pr check
+        assert_eq!(status, "new");
+    }
+
+    /// workflow_scope_failure takes precedence over push_failed < 3.
+    #[test]
+    fn classify_workflow_scope_failure_takes_precedence_over_push_reroute() {
+        let status = classify_final_status(&DecisionInput {
+            is_workflow_scope_failure: true,
+            push_failed: true,
+            push_failures: 1, // would normally reroute
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
 
     #[test]
     fn test_has_non_code_label_detects_labels() {
