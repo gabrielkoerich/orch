@@ -157,16 +157,21 @@ pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
     if spec.agent == "opencode" {
         if let Ok(models) = list_opencode_models().await {
             if !models.iter().any(|m| m == &spec.model) {
+                let suggestions: Vec<_> = models
+                    .iter()
+                    .filter(|m| m.contains(&spec.model) || spec.model.contains(m.as_str()))
+                    .take(10)
+                    .cloned()
+                    .collect();
+                let shown = if suggestions.is_empty() {
+                    models.iter().take(20).cloned().collect()
+                } else {
+                    suggestions
+                };
                 anyhow::bail!(
                     "model '{}' not found in opencode. Available models:\n{}",
                     spec.model,
-                    models
-                        .iter()
-                        .filter(|m| m.contains(&spec.model) || spec.model.contains(m.as_str()))
-                        .take(10)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    shown.join("\n")
                 );
             }
         }
