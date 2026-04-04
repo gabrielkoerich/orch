@@ -79,12 +79,7 @@ use super::router::Router;
 /// appear to describe the same set of changed files. This helps catch cases
 /// where a stale summary (from a prior reroute or reused worktree) would
 /// otherwise be injected into the review prompt and confuse the reviewer.
-fn verify_summary_matches_diff(
-    agent_summary: &str,
-    git_diff: &str,
-    task_title: &str,
-    task_body: &str,
-) -> Result<(), String> {
+fn verify_summary_matches_diff(agent_summary: &str, git_diff: &str) -> Result<(), String> {
     // Extract file paths from git diff using common markers.
     let mut diff_files = std::collections::HashSet::new();
     for line in git_diff.lines() {
@@ -219,44 +214,6 @@ fn verify_summary_matches_diff(
             "agent summary file references do not overlap with current git diff — possible stale summary"
                 .to_string(),
         );
-    }
-
-    // Additional heuristic: if the agent summary contains no file references
-    // but the current diff does, check whether the task title/body mention
-    // any of the diff files. If they do not, this is likely a stale summary
-    // produced for a different change and we should fail closed.
-    if summary_files.is_empty() && !diff_files.is_empty() {
-        let title_body = format!("{} {}", task_title, task_body).to_lowercase();
-        let mut any_mentioned = false;
-        'outer: for d in &diff_files {
-            let d_lower = d.to_lowercase();
-            // check full path
-            if title_body.contains(&d_lower) {
-                any_mentioned = true;
-                break;
-            }
-            // check basename
-            if let Some(bname) = d_lower.rsplit('/').next() {
-                if title_body.contains(bname) {
-                    any_mentioned = true;
-                    break;
-                }
-            }
-            // check each path segment (e.g. "trading" in "scripts/trading/trading-data.json")
-            for segment in d_lower.split('/') {
-                if segment.len() >= 3
-                    && title_body
-                        .split_whitespace()
-                        .any(|w| w.trim_matches(|c: char| !c.is_alphanumeric()) == segment)
-                {
-                    any_mentioned = true;
-                    break 'outer;
-                }
-            }
-        }
-        if !any_mentioned {
-            return Err(format!("agent summary contains no file references but current git diff touches files not mentioned in task title/body — possible stale summary: {:?}", diff_files));
-        }
     }
 
     Ok(())
@@ -1228,18 +1185,7 @@ pub(crate) async fn review_and_merge(
     };
 
     // Sanity-check that the stored agent summary matches the current diff.
-    let task_title = stored_task
-        .as_ref()
-        .map(|t| t.title.clone())
-        .unwrap_or_default();
-    let task_body = stored_task
-        .as_ref()
-        .map(|t| t.body.clone())
-        .unwrap_or_default();
-
-    if let Err(reason) =
-        verify_summary_matches_diff(&agent_summary, &git_diff, &task_title, &task_body)
-    {
+    if let Err(reason) = verify_summary_matches_diff(&agent_summary, &git_diff) {
         tracing::warn!(
             task_id = task.id.0,
             reason = %reason,
@@ -1899,16 +1845,14 @@ mod tests {
     fn verify_summary_matches_diff_ok_when_basename_matches() {
         let summary = "Preserved the Telegram long-poll timeout safety margin and updated src/channels/telegram.rs to handle reconnects.";
         let diff = "diff --git a/src/channels/telegram.rs b/src/channels/telegram.rs\n+++ b/src/channels/telegram.rs\n@@ -1,4 +1,5 @@";
-        assert!(
-            verify_summary_matches_diff(summary, diff, "Fix telegram", "update reconnect").is_ok()
-        );
+        assert!(verify_summary_matches_diff(summary, diff).is_ok());
     }
 
     #[test]
     fn verify_summary_matches_diff_err_when_summary_mentions_files_but_diff_empty() {
         let summary = "Fixed bug in src/engine/router/mod.rs: adjust weights";
         let diff = "";
-        let res = verify_summary_matches_diff(summary, diff, "Adjust weights", "tweak algo");
+        let res = verify_summary_matches_diff(summary, diff);
         assert!(res.is_err());
         assert!(res
             .err()
@@ -1920,61 +1864,43 @@ mod tests {
     fn verify_summary_matches_diff_err_when_no_overlap() {
         let summary = "Updated README.md and docs/usage.md with new instructions.";
         let diff = "diff --git a/src/main.rs b/src/main.rs\n+++ b/src/main.rs\n";
-        let res = verify_summary_matches_diff(summary, diff, "Docs update", "improve docs");
+        let res = verify_summary_matches_diff(summary, diff);
         assert!(res.is_err());
         let e = res.err().unwrap();
-        assert!(
-            e.contains("do not overlap")
-                || e.contains("stale summary")
-                || e.contains("do not overlap")
-        );
+        assert!(e.contains("do not overlap") || e.contains("stale summary"));
     }
 
     #[test]
-    fn verify_summary_ok_when_path_segment_matches_title() {
-        // Trading cron tasks: prose summary, diff touches scripts/trading/trading-data.json,
-        // title contains "trading" which matches the path segment.
+    fn verify_summary_ok_when_output_artifact_not_in_task_body() {
+        // Trading cron tasks: agent ran screener.py and saved results to trading-data.json.
+        // The task body mentions screener.py but not trading-data.json (output artifact).
+        // Pre-dispatch validation must not block this — review agent decides work quality.
         let summary = "No open positions, no trades executed. Portfolio flat at $9,821.77 cash. Staying defensive — BTC 1d bearish.";
         let diff = "diff --git a/scripts/trading/trading-data.json b/scripts/trading/trading-data.json\n+++ b/scripts/trading/trading-data.json\n";
-        let res = verify_summary_matches_diff(
-            summary,
-            diff,
-            "Trading update: manage positions and update prices",
-            "",
-        );
+        let res = verify_summary_matches_diff(summary, diff);
         assert!(res.is_ok(), "expected Ok but got: {:?}", res);
     }
 
     #[test]
-    fn verify_summary_ok_when_diff_file_unrelated_to_title_but_in_related_dir() {
-        // Bug fix tasks: prose summary, diff touches src/channels/github.rs as part of
-        // error propagation chain; title mentions "DedupStore" but diff file has no
-        // direct name match — however title contains no path segments that overlap.
-        // This should still fail (true positive) when nothing matches.
+    fn verify_summary_ok_when_agent_touches_related_file_not_in_title() {
+        // Bug fix tasks: agent fixes error propagation, touching github.rs as part of the
+        // fix chain. Task title mentions DedupStore but not github.rs — that's fine, agents
+        // often touch related files. Review agent should validate, not pre-dispatch check.
         let summary = "Fixed error propagation in flush operations.";
         let diff = "diff --git a/src/channels/github.rs b/src/channels/github.rs\n+++ b/src/channels/github.rs\n";
-        let res = verify_summary_matches_diff(
-            summary,
-            diff,
-            "Missing error propagation in DedupStore file flush operations",
-            "the flush method silently drops errors",
-        );
-        // "channels" and "github" and "src" don't appear in the title/body,
-        // so this remains a detection (err) — regression test.
-        assert!(res.is_err());
+        let res = verify_summary_matches_diff(summary, diff);
+        assert!(res.is_ok(), "expected Ok but got: {:?}", res);
     }
 
     #[test]
-    fn verify_summary_detects_stale_when_no_file_refs_and_diff_unrelated() {
+    fn verify_summary_ok_when_prose_summary_and_diff_unrelated_to_title() {
+        // When summary has no file refs and diff has files not in title, we no longer
+        // block at pre-dispatch — the review agent evaluates work quality instead.
         let summary =
             "Preserved the Telegram long-poll timeout safety margin and updated internal logic.";
-        // Diff touches files that are unrelated to the task title/body
         let diff = "diff --git a/src/channels/discord_ws.rs b/src/channels/discord_ws.rs\n+++ b/src/channels/discord_ws.rs\n";
-        let res =
-            verify_summary_matches_diff(summary, diff, "Fix panic in router", "remove panic path");
-        assert!(res.is_err());
-        let err = res.err().unwrap();
-        assert!(err.contains("stale summary") || err.contains("not mentioned in task title/body"));
+        let res = verify_summary_matches_diff(summary, diff);
+        assert!(res.is_ok(), "expected Ok but got: {:?}", res);
     }
     use crate::backends::ExternalTask;
     use crate::engine::router::RouterConfig;
