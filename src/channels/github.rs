@@ -207,8 +207,7 @@ impl DedupStore {
                 {
                     Ok(Ok(())) => break,
                     Ok(Err(e)) if attempt < MAX_FLUSH_ATTEMPTS => {
-                        let delay =
-                            std::time::Duration::from_millis(100u64 << (attempt - 1));
+                        let delay = std::time::Duration::from_millis(100u64 << (attempt - 1));
                         tracing::warn!(
                             ?e,
                             attempt,
