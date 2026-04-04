@@ -1479,7 +1479,7 @@ pub async fn logs(id: &str) -> anyhow::Result<()> {
                 if output_file.exists() {
                     if let Ok(content) = std::fs::read_to_string(&output_file) {
                         let tail =
-                            crate::engine::runner::response_handler::safe_utf8_tail(&content, 2000);
+                            crate::engine::runner::agents::patterns::safe_tail(&content, 2000);
                         let truncated = if content.len() > 2000 {
                             format!(
                                 "...({} chars truncated)...\n{}",

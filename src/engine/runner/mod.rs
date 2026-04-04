@@ -1265,7 +1265,7 @@ impl TaskRunner {
 mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
-    use crate::engine::runner::response_handler::safe_utf8_tail;
+    use crate::engine::runner::agents::patterns::safe_tail as safe_utf8_tail;
     use async_trait::async_trait;
     use once_cell::sync::Lazy;
     use std::sync::{Arc, Mutex};

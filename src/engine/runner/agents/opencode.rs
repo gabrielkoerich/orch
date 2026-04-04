@@ -318,53 +318,57 @@ impl OpenCodeRunner {
 
     /// Check for error events in the stream.
     fn detect_error(&self, events: &[serde_json::Value]) -> Option<AgentError> {
-        for event in events {
-            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-            if event_type == "error" {
-                // OpenCode error events have multiple shapes:
-                // 1. {"type":"error","message":"..."}
-                // 2. {"type":"error","error":"string message"}
-                // 3. {"type":"error","error":{"name":"...","data":{"message":"..."}}}
-                let message = event
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| event.get("error").and_then(|v| v.as_str()))
-                    .or_else(|| {
-                        event
-                            .get("error")
-                            .and_then(|e| e.get("data"))
-                            .and_then(|d| d.get("message"))
-                            .and_then(|m| m.as_str())
-                    })
-                    .or_else(|| {
-                        // Last resort: stringify the error object
-                        event
-                            .get("error")
-                            .and_then(|e| e.get("name"))
-                            .and_then(|n| n.as_str())
-                    })
-                    .unwrap_or("unknown error");
-
-                return Some(classify_opencode_message(message));
-            }
-
-            // Check step_finish for error reasons
-            if event_type == "step_finish" {
-                if let Some(part) = event.get("part") {
-                    let reason = part.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-                    if reason == "error" || reason == "failed" {
-                        let msg = part
-                            .get("error")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("step failed");
-                        return Some(classify_opencode_message(msg));
+        super::patterns::detect_ndjson_error(
+            events,
+            |event| {
+                let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match event_type {
+                    "error" => {
+                        // OpenCode error events have multiple shapes:
+                        // 1. {"type":"error","message":"..."}
+                        // 2. {"type":"error","error":"string message"}
+                        // 3. {"type":"error","error":{"name":"...","data":{"message":"..."}}}
+                        Some(
+                            event
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| event.get("error").and_then(|v| v.as_str()))
+                                .or_else(|| {
+                                    event
+                                        .get("error")
+                                        .and_then(|e| e.get("data"))
+                                        .and_then(|d| d.get("message"))
+                                        .and_then(|m| m.as_str())
+                                })
+                                .or_else(|| {
+                                    event
+                                        .get("error")
+                                        .and_then(|e| e.get("name"))
+                                        .and_then(|n| n.as_str())
+                                })
+                                .unwrap_or("unknown error")
+                                .to_string(),
+                        )
                     }
+                    "step_finish" => {
+                        let part = event.get("part")?;
+                        let reason = part.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                        if reason == "error" || reason == "failed" {
+                            Some(
+                                part.get("error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("step failed")
+                                    .to_string(),
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
                 }
-            }
-        }
-
-        None
+            },
+            classify_opencode_message,
+        )
     }
 
     /// Return the cached free-model list, refreshing in the background when stale.
@@ -665,40 +669,27 @@ pub(crate) fn translate_permissions_to_opencode(allowed_tools: &[String]) -> Str
 fn classify_opencode_message(message: &str) -> AgentError {
     let lower = message.to_lowercase();
 
-    if lower.contains("rate limit")
-        || lower.contains("429")
-        || lower.contains("usage limit")
-        || lower.contains("too many requests")
-    {
-        return AgentError::RateLimit {
-            message: message.to_string(),
-        };
+    // Rate limit — delegate to shared helper
+    if let Some(e) = super::patterns::detect_rate_limit(message) {
+        return e;
     }
 
-    if lower.contains("context") && (lower.contains("length") || lower.contains("overflow")) {
-        return AgentError::ContextOverflow {
-            message: message.to_string(),
-        };
+    // Context overflow — delegate to shared helper (covers "context overflow", "context length", etc.)
+    if let Some(e) = super::patterns::detect_context_overflow(message) {
+        return e;
     }
 
-    if lower.contains("unauthorized")
-        || lower.contains("invalid key")
-        || super::patterns::contains_http_status(&lower, "401")
-    {
-        return AgentError::Auth {
-            message: message.to_string(),
-        };
+    // Auth errors — delegate to shared helper (includes HTTP 401/403, billing, etc.)
+    if let Some(e) = super::patterns::detect_auth_error(message) {
+        return e;
     }
 
-    if lower.contains("rejected permission")
-        || lower.contains("permission denied")
-        || lower.contains("permissionerror")
-    {
-        return AgentError::PermissionDenied {
-            message: message.to_string(),
-        };
+    // Permission denied — delegate to shared helper
+    if let Some(e) = super::patterns::detect_permission_denied(message) {
+        return e;
     }
 
+    // Model not available (opencode-specific extraction pattern)
     if lower.contains("model") && (lower.contains("not found") || lower.contains("not supported")) {
         // Try to extract model name from patterns like "Model not found: anthropic/claude-sonnet-4-6."
         let model = message
