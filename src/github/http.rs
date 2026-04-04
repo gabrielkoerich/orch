@@ -1521,7 +1521,7 @@ impl GhHttp {
         let aliases: String = issue_numbers
             .iter()
             .map(|n| {
-                format!("issue{n}: issue(number: {n}) {{ state labels {{ nodes {{ name }} }} }}")
+                format!("issue{n}: issue(number: {n}) {{ state labels(first: 100) {{ nodes {{ name }} }} }}")
             })
             .collect::<Vec<_>>()
             .join(" ");
@@ -2695,6 +2695,23 @@ mod tests {
             "GhHttp::new() must not panic and must return Ok; got: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn batch_get_issue_states_query_includes_labels_pagination() {
+        let issue_numbers = [1, 2, 3];
+        let expected = r#"{ repository(owner: "owner", name: "repo") { issue1: issue(number: 1) { state labels(first: 100) { nodes { name } } } issue2: issue(number: 2) { state labels(first: 100) { nodes { name } } } issue3: issue(number: 3) { state labels(first: 100) { nodes { name } } } } }"#;
+
+        let aliases: String = issue_numbers
+            .iter()
+            .map(|n| {
+                format!("issue{n}: issue(number: {n}) {{ state labels(first: 100) {{ nodes {{ name }} }} }}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let query = format!(r#"{{ repository(owner: "owner", name: "repo") {{ {aliases} }} }}"#);
+        assert_eq!(query, expected);
     }
 
     #[test]
