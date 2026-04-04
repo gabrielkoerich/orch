@@ -187,8 +187,18 @@ pub(crate) async fn tick_detect_silent_agents(
         let use_backend = should_use_backend(&task_id);
         // Look up agent + model from the store so we can cooldown the right model.
         let store_task = match store.resolve_task_id(repo, &task_id).await {
-            Ok(Some(store_id)) => store.get(store_id).await.ok(),
-            _ => None,
+            Ok(Some(store_id)) => match store.get(store_id).await {
+                Ok(task) => Some(task),
+                Err(e) => {
+                    tracing::warn!(task_id, error = %e, "failed to fetch task from store during silence detection");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "failed to resolve task id during silence detection");
+                None
+            }
         };
         let agent_name = store_task
             .as_ref()
@@ -304,7 +314,9 @@ pub(crate) async fn tick_detect_silent_agents(
                         || label.starts_with("complexity:")
                         || label.starts_with("model:")
                     {
-                        backend.remove_label(&task_eid, label).await.ok();
+                        if let Err(e) = backend.remove_label(&task_eid, label).await {
+                            tracing::warn!(task_id, label, error = %e, "failed to remove label during silence detection re-route");
+                        }
                     }
                 }
             }

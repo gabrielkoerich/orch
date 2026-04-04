@@ -978,7 +978,9 @@ impl TaskRunner {
                 // set_labels (add_labels) fails with 422 if the label doesn't exist
                 // in the repo yet — ensure_label creates it first.
                 let old_label = format!("agent:{agent_name}");
-                backend.remove_label(&task.id, &old_label).await.ok();
+                if let Err(e) = backend.remove_label(&task.id, &old_label).await {
+                    tracing::warn!(task_id = ?task.id, label = old_label, error = %e, "failed to remove old agent label during re-route");
+                }
                 let new_label = format!("agent:{new_agent}");
                 match crate::github::http::GhHttp::new() {
                     Ok(gh) => {
