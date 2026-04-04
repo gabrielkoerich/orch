@@ -433,7 +433,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
 
     if let Some(wt) = worktree_to_remove {
         // TTL guard: skip if the worktree directory is too young.
-        if let Some(age_hours) = worktree_age_hours(&wt) {
+        if let Some(age_hours) = worktree_age_hours(&wt).await {
             if age_hours < opts.ttl_hours {
                 tracing::debug!(
                     task_id,
@@ -757,11 +757,9 @@ async fn is_worktree_in_active_session(worktree: &std::path::Path) -> bool {
 /// Returns how many hours old the worktree directory is, based on its mtime.
 ///
 /// Returns `None` if the directory does not exist or the mtime cannot be read.
-/// Returns how many hours old the worktree directory is, based on its mtime.
-///
-/// Returns `None` if the directory does not exist or the mtime cannot be read.
-fn worktree_age_hours(worktree: &std::path::Path) -> Option<u64> {
-    let metadata = std::fs::metadata(worktree).ok()?;
+async fn worktree_age_hours(worktree: &std::path::Path) -> Option<u64> {
+    // Use tokio::fs to avoid blocking the async runtime when reading metadata.
+    let metadata = tokio::fs::metadata(worktree).await.ok()?;
     let modified = metadata.modified().ok()?;
     let age = std::time::SystemTime::now().duration_since(modified).ok()?;
     Some(age.as_secs() / 3600)
@@ -1046,18 +1044,18 @@ mod tests {
 
     // worktree_age_hours
 
-    #[test]
-    fn worktree_age_hours_returns_none_for_missing_dir() {
+    #[tokio::test]
+    async fn worktree_age_hours_returns_none_for_missing_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
-        assert!(worktree_age_hours(&missing).is_none());
+        assert!(worktree_age_hours(&missing).await.is_none());
     }
 
-    #[test]
-    fn worktree_age_hours_returns_some_for_existing_dir() {
+    #[tokio::test]
+    async fn worktree_age_hours_returns_some_for_existing_dir() {
         let tmp = tempfile::tempdir().unwrap();
         // A freshly created directory should have age ~0 hours.
-        let age = worktree_age_hours(tmp.path());
+        let age = worktree_age_hours(tmp.path()).await;
         assert!(age.is_some());
         assert_eq!(age.unwrap(), 0, "freshly created dir should have age 0h");
     }
@@ -1154,8 +1152,8 @@ mod tests {
         Some((tmp, wt_dir))
     }
 
-    #[test]
-    fn janitor_skips_young_worktree() {
+    #[tokio::test]
+    async fn janitor_skips_young_worktree() {
         let Some((tmp, wt_dir)) = setup_test_repo() else {
             eprintln!("skipping test: git not available");
             return;
@@ -1165,7 +1163,7 @@ mod tests {
         assert!(wt_dir.exists(), "worktree should exist before janitor runs");
 
         // Run the TTL guard check directly (without a full engine).
-        let age = worktree_age_hours(&wt_dir).unwrap_or(u64::MAX);
+        let age = worktree_age_hours(&wt_dir).await.unwrap_or(u64::MAX);
         assert!(
             age < 24,
             "freshly created worktree should be younger than 24h (age={age}h)"
@@ -1182,8 +1180,8 @@ mod tests {
         drop(tmp); // cleanup tempdir
     }
 
-    #[test]
-    fn janitor_eligible_when_ttl_zero() {
+    #[tokio::test]
+    async fn janitor_eligible_when_ttl_zero() {
         let Some((tmp, wt_dir)) = setup_test_repo() else {
             eprintln!("skipping test: git not available");
             return;
@@ -1203,8 +1201,8 @@ mod tests {
         drop(tmp);
     }
 
-    #[test]
-    fn dry_run_does_not_remove_worktree() {
+    #[tokio::test]
+    async fn dry_run_does_not_remove_worktree() {
         // Verify that with dry_run=true the worktree directory is NOT removed.
         let Some((tmp, wt_dir)) = setup_test_repo() else {
             eprintln!("skipping test: git not available");
