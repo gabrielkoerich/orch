@@ -52,7 +52,7 @@ Everything outside your current working directory is **read-only**. Never `cd ..
    git rebase origin/{{DEFAULT_BRANCH}}
    ```
    Orch has already run `git fetch origin` (all branches) before launching you — do NOT run `git fetch` or `git pull` yourself (they will fail in sandboxed environments because they need to write outside the worktree directory). Use `git rebase origin/<branch>` instead — the remote refs are already local. If the rebase has conflicts, resolve them before proceeding. **Note:** In sandboxed worktrees, rebase may fail with lockfile permission errors (`REBASE_HEAD.lock`, `AUTO_MERGE.lock`). If you encounter such errors and the branch is already up to date (check with `git status`), treat the error as non-blocking and continue with the task.
-2. **On retry**: check `git diff {{DEFAULT_BRANCH}}` and `git log {{DEFAULT_BRANCH}}..HEAD` first to see what previous attempts already did. Build on existing work — do not start over. If a PR already exists, read its review comments (`gh pr view --comments`) — fix everything the reviewer asked for, rebase on the default branch, resolve any conflicts, and make sure CI passes before committing. **Note:** In sandboxed worktrees, rebase may fail with lockfile permission errors (`REBASE_HEAD.lock`, `AUTO_MERGE.lock`). If you encounter such errors and the branch is already up to date (check with `git status`), treat the error as non-blocking and continue with the task.
+2. **On retry**: check `git diff {{DEFAULT_BRANCH}}` and `git log {{DEFAULT_BRANCH}}..HEAD` first to see what previous attempts already did. Build on existing work — do not start over. If a PR already exists, read its review comments (`gh pr view --comments`) — fix everything the reviewer asked for. If needed, rebase on the default branch (check with `git status` first) and resolve any conflicts. Make sure CI passes before committing.
 3. **Commit step by step** as you work, not one big commit at the end. Use conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, etc.).
 4. **Lockfiles**: if you add, remove, or update dependencies, regenerate the lockfile before committing (`bun install`, `npm install`, `cargo update`, etc.). Always commit the updated lockfile with your changes.
 5. **Run CI checks locally before committing**: look at `.github/workflows/` to see what CI runs and run those exact commands locally. Fix any failures before committing. Do NOT commit code that will fail CI. If you cannot fix a failure, set status to `needs_review` and explain it.
@@ -65,13 +65,15 @@ Everything outside your current working directory is **read-only**. Never `cd ..
 
 ## Before Writing Your Output — MANDATORY CHECKLIST
 
-Before you write the output JSON, run these checks. If ANY fails, go back and fix it:
+Before you write the output JSON, verify these conditions for a `done` status:
 
-1. `git status` — no uncommitted changes (clean working tree)
+**If your task produced code changes:**
+1. `git status` — clean working tree (no uncommitted changes)
 2. `git log {{DEFAULT_BRANCH}}..HEAD` — your commits exist
-   **Skip this check if your task produced no code changes** (e.g., you only created GitHub issues, posted comments, or performed read-only analysis). A visible non-code result satisfies the done requirement.
+Both must pass. If you made code changes but did not commit them, your status is `needs_review`, not `done`.
 
-Do NOT report `"status": "done"` unless all checks pass. If you made changes but did not commit, your status is `needs_review`, not `done`.
+**If your task produced only non-code results:**
+Skip the git checks. Non-code results include: creating GitHub issues, posting comments, or performing read-only analysis. A visible non-code result satisfies the done requirement.
 
 **Reminder:** Do NOT push or create PRs — orch handles that automatically. Do not ask for push approval in your summary, and do not mention pushing. Focus your summary on what you accomplished, not on the push step.
 
@@ -97,7 +99,7 @@ Note: `delegations` is optional — only include it when delegating subtasks.
 Any malformed, partial, or non-JSON final output is treated as an invalid agent response and will not be recorded as a successful completion.
 
 Status rules:
-- **done**: all work is committed and tests pass. You must have produced a visible result (committed code, posted a comment, or completed the requested action). Orch pushes and creates the PR automatically — do NOT mention pushing in your summary. Pure research with no output is `in_progress`. **Never report done if you did not complete the task. Asking a clarifying question is NOT done — it is blocked.**
+- **done**: all work is committed (if code changes were made) and tests pass. You must have produced a visible result (committed code, posted a comment, created an issue, or completed the requested action). Orch pushes and creates the PR automatically — do NOT mention pushing in your summary. **Never report done if you did not complete the task. Asking a clarifying question is NOT done — it is blocked.**
 - **in_progress**: partial work was committed but more remains.
 - **blocked**: waiting on dependencies, missing information, delegated subtasks, **you have a clarifying question**, or **the task is unclear / you don't have enough context to proceed**. When blocked, post your question as a comment on the issue (`gh issue comment`) and explain what information is missing in `reason`.
 - **needs_review**: agent completed, work is committed. Orch will push the PR and dispatch a review agent automatically. Use this when your work is done but you want an automated review pass.
