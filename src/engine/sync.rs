@@ -1285,25 +1285,20 @@ pub(crate) async fn ingest_external_tasks(
                             "ingest: acknowledgment failed"
                         );
                     }
+                    // Sync to project board only for newly ingested tasks.
+                    let task_status = status.unwrap_or(Status::New);
+                    if let Err(e) = backend.sync_to_project(&task.id, task_status).await {
+                        tracing::debug!(
+                            task_id = task.id.0,
+                            err = %e,
+                            "ingest: project board sync failed"
+                        );
+                    }
                 }
             }
             Err(e) => {
                 tracing::debug!(task_id = task.id.0, ?e, "ingest: upsert failed");
             }
-        }
-    }
-
-    // Sync newly ingested tasks to project board (if backend supports it).
-    // This ensures new issues appear on the project board immediately,
-    // not just when their status changes later.
-    for (task, status) in &all_tasks {
-        let task_status = status.unwrap_or(Status::New);
-        if let Err(e) = backend.sync_to_project(&task.id, task_status).await {
-            tracing::debug!(
-                task_id = task.id.0,
-                err = %e,
-                "ingest: project board sync failed"
-            );
         }
     }
 
