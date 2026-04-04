@@ -465,9 +465,10 @@ impl AgentRunner for OpenCodeRunner {
         // and git operations on the main repo's .git directory).
         let config_setup = if permissions.autonomous {
             let permission_json = translate_permissions_to_opencode(&permissions.allowed_tools);
+            let sq_permission_json = super::shell_single_quote(&permission_json);
             format!(
                 r#"mkdir -p .orch-opencode/opencode || {{ printf '%s\n' 'failed to create opencode config directory: .orch-opencode/opencode' >&2; exit 1; }}
-printf '%s\n' '{permission_json}' > .orch-opencode/opencode/opencode.json || {{ printf '%s\n' 'failed to write opencode config: .orch-opencode/opencode/opencode.json' >&2; exit 1; }}
+printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{ printf '%s\n' 'failed to write opencode config: .orch-opencode/opencode/opencode.json' >&2; exit 1; }}
 "#
             )
         } else {

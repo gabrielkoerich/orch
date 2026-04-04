@@ -3,6 +3,7 @@
 //! Supports Claude, Codex, OpenCode (plus Kimi/MiniMax as Claude aliases).
 //! Runs the agent via a runner.sh script executed as the tmux session shell.
 
+use crate::engine::runner::agents::shell_single_quote;
 use crate::template::render_template_str;
 use crate::tmux::TmuxManager;
 use std::collections::HashMap;
@@ -104,45 +105,44 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
     ) -> anyhow::Result<String> {
         let status_file = attempt_dir.join("exit.txt");
         let stderr_file = attempt_dir.join("stderr.txt");
+        let sq_git_name = shell_single_quote(&inv.git_author_name);
+        let sq_git_email = shell_single_quote(&inv.git_author_email);
+        let sq_task_id = shell_single_quote(&inv.task_id);
+        let sq_output_file = shell_single_quote(&inv.output_file.display().to_string());
+        let sq_work_dir = shell_single_quote(&inv.work_dir.display().to_string());
+        let sq_status_file = shell_single_quote(&status_file.display().to_string());
+        let sq_stderr_file = shell_single_quote(&stderr_file.display().to_string());
         Ok(format!(
             r#"#!/usr/bin/env bash
 set -euo pipefail
 
-status_file="{status_file}"
-stderr_file="{stderr_file}"
+status_file={sq_status_file}
+stderr_file={sq_stderr_file}
 trap 'status=$?; printf "%s\n" "$status" > "$status_file"' EXIT
 
 # Environment — ~/.path and ~/.private are loaded by orch at startup into the process env
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-export GIT_AUTHOR_NAME="{git_name}"
-export GIT_COMMITTER_NAME="{git_name}"
-export GIT_AUTHOR_EMAIL="{git_email}"
-export GIT_COMMITTER_EMAIL="{git_email}"
-export TASK_ID="{task_id}"
-export OUTPUT_FILE="{output_file}"
+export GIT_AUTHOR_NAME={sq_git_name}
+export GIT_COMMITTER_NAME={sq_git_name}
+export GIT_AUTHOR_EMAIL={sq_git_email}
+export GIT_COMMITTER_EMAIL={sq_git_email}
+export TASK_ID={sq_task_id}
+export OUTPUT_FILE={sq_output_file}
 unset CLAUDECODE  # allow nested claude invocations from orch
 
-cd "{work_dir}" || {{
-    printf '%s\n' "worktree directory does not exist: {work_dir}" > "$stderr_file"
+cd {sq_work_dir} || {{
+    printf '%s\n' "worktree directory does not exist: {sq_work_dir}" > "$stderr_file"
     exit 1
 }}
 
 # Run agent — tee to both output file and terminal (tmux pane) for live streaming
 set +e
-{agent_cmd} 2>"$stderr_file" | tee "{output_file}"
+{agent_cmd} 2>"$stderr_file" | tee {sq_output_file}
 CMD_STATUS=${{PIPESTATUS[0]:-0}}
 set -e
 
 exit $CMD_STATUS
 "#,
-            git_name = inv.git_author_name,
-            git_email = inv.git_author_email,
-            task_id = inv.task_id,
-            output_file = inv.output_file.display(),
-            work_dir = inv.work_dir.display(),
-            agent_cmd = agent_cmd,
-            status_file = status_file.display(),
-            stderr_file = stderr_file.display(),
         ))
     }
 
@@ -465,13 +465,13 @@ fn build_runner_script_in_dir(
     let status_file = attempt_dir.join("exit.txt");
     let stderr_file = attempt_dir.join("stderr.txt");
 
+    let sq_status = shell_single_quote(&status_file.display().to_string());
+    let sq_stderr = shell_single_quote(&stderr_file.display().to_string());
+    let sq_out = shell_single_quote(&inv.output_file.display().to_string());
+    let sq_work_dir = shell_single_quote(&inv.work_dir.to_string_lossy());
     let script = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nstatus_file='{status}'\nstderr_file='{stderr}'\ntrap 'status=$?; printf \"%s\\n\" \"$status\" > \"$status_file\"' EXIT\nunset CLAUDECODE\ncd '{work_dir}' || {{\n  printf '%s\\n' 'worktree directory does not exist: {work_dir}' > \"$stderr_file\"\n  exit 1\n}}\nset +e\nRESPONSE=$({agent_cmd} 2> \"$stderr_file\")\nCMD_STATUS=$?\nset -e\nprintf '%s' \"$RESPONSE\" > '{out}'\nexit $CMD_STATUS\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\nstatus_file={sq_status}\nstderr_file={sq_stderr}\ntrap 'status=$?; printf \"%s\\n\" \"$status\" > \"$status_file\"' EXIT\nunset CLAUDECODE\ncd {sq_work_dir} || {{\n  printf '%s\\n' \"worktree directory does not exist: {sq_work_dir}\" > \"$stderr_file\"\n  exit 1\n}}\nset +e\nRESPONSE=$({agent_cmd} 2> \"$stderr_file\")\nCMD_STATUS=$?\nset -e\nprintf '%s' \"$RESPONSE\" > {sq_out}\nexit $CMD_STATUS\n",
         agent_cmd = agent_cmd,
-        stderr = stderr_file.display(),
-        out = inv.output_file.display(),
-        status = status_file.display(),
-        work_dir = inv.work_dir.to_string_lossy(),
     );
 
     Ok(script)
@@ -553,7 +553,39 @@ mod tests {
         let script =
             build_runner_script_in_dir(&inv, tmp.path()).expect("runner script should build");
 
-        assert!(script.contains("worktree directory does not exist: /tmp"));
+        assert!(script.contains("worktree directory does not exist: '/tmp'"));
         assert!(script.contains("stderr_file='"));
+    }
+
+    #[test]
+    fn build_runner_script_escapes_shell_injection_in_paths() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut inv = test_invocation("injection-test");
+        inv.work_dir = std::path::PathBuf::from("/tmp/$(whoami)/workspace");
+        inv.output_file = std::path::PathBuf::from("/tmp/evil`id`.json");
+        let script =
+            build_runner_script_in_dir(&inv, tmp.path()).expect("runner script should build");
+
+        // Values must be single-quoted, neutralizing $() and backticks
+        assert!(
+            script.contains("'/tmp/$(whoami)/workspace'"),
+            "work_dir with $() must be single-quoted: {script}"
+        );
+        assert!(
+            script.contains("'/tmp/evil`id`.json'"),
+            "output_file with backticks must be single-quoted: {script}"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        use crate::engine::runner::agents::shell_single_quote;
+
+        assert_eq!(shell_single_quote("hello"), "'hello'");
+        assert_eq!(shell_single_quote("O'Brien"), "'O'\\''Brien'");
+        assert_eq!(shell_single_quote("$(rm -rf /)"), "'$(rm -rf /)'");
+        assert_eq!(shell_single_quote("`whoami`"), "'`whoami`'");
+        assert_eq!(shell_single_quote("a\"b"), "'a\"b'");
+        assert_eq!(shell_single_quote("$HOME"), "'$HOME'");
     }
 }
