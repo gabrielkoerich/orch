@@ -961,7 +961,10 @@ mod tests {
                 agent_status: status_str,
                 ..Default::default()
             });
-            assert_eq!(result, *status_str, "status '{status_str}' should pass through unchanged");
+            assert_eq!(
+                result, *status_str,
+                "status '{status_str}' should pass through unchanged"
+            );
         }
     }
 
