@@ -380,6 +380,9 @@ fn verify_signature(secret: &str, payload: &[u8], signature: &str) -> bool {
     let result = mac.finalize().into_bytes();
 
     let expected = format!("sha256={:x}", result);
+    if expected.len() != signature.len() {
+        return false;
+    }
     // Use constant-time comparison to prevent timing side-channel attacks
     bool::from(expected.as_bytes().ct_eq(signature.as_bytes()))
 }
