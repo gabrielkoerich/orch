@@ -652,7 +652,7 @@ pub(crate) mod patterns {
             let message = if let Some(pos) = match_pos {
                 extract_context_around(text, pos, 300)
             } else {
-                safe_tail(text, 300)
+                safe_tail(text, 300).to_string()
             };
             return Some(AgentError::RateLimit { message });
         }
@@ -732,7 +732,7 @@ pub(crate) mod patterns {
         let http_403 = contains_http_status(&lower, "403");
         if patterns.iter().any(|p| lower.contains(p)) || http_401 || http_403 {
             return Some(AgentError::Auth {
-                message: safe_tail(text, 300),
+                message: safe_tail(text, 300).to_string(),
             });
         }
         None
@@ -750,7 +750,7 @@ pub(crate) mod patterns {
         ];
         if patterns.iter().any(|p| lower.contains(p)) {
             return Some(AgentError::NetworkError {
-                message: safe_tail(text, 300),
+                message: safe_tail(text, 300).to_string(),
             });
         }
         None
@@ -766,7 +766,7 @@ pub(crate) mod patterns {
         ];
         if patterns.iter().any(|p| lower.contains(p)) {
             return Some(AgentError::AgentFailed {
-                message: safe_tail(text, 300),
+                message: safe_tail(text, 300).to_string(),
             });
         }
         None
@@ -781,6 +781,7 @@ pub(crate) mod patterns {
             "maximum context length",
             "too many tokens",
             "token limit",
+            "context overflow",
         ];
         if patterns.iter().any(|p| lower.contains(p)) {
             return Some(AgentError::ContextOverflow {
@@ -855,6 +856,8 @@ pub(crate) mod patterns {
         let lower = text.to_lowercase();
         let patterns = [
             "permission denied",
+            "rejected permission",
+            "permissionerror",
             "operation not permitted",
             "sandbox violation",
             "access denied",
@@ -963,7 +966,7 @@ pub(crate) mod patterns {
         // `is_error=false` handled earlier in agent-specific parsing) as
         // errors — callers should only invoke classify_from_text when the
         // process indicates failure.
-        if let Some(e) = detect_rate_limit(safe_tail(text, RATE_LIMIT_SCAN_TAIL_BYTES).as_str()) {
+        if let Some(e) = detect_rate_limit(safe_tail(text, RATE_LIMIT_SCAN_TAIL_BYTES)) {
             return e;
         }
         if let Some(e) = detect_network_error(text) {
@@ -975,14 +978,14 @@ pub(crate) mod patterns {
 
         AgentError::Unknown {
             exit_code,
-            message: safe_tail(text, 300),
+            message: safe_tail(text, 300).to_string(),
         }
     }
 
     /// Safely extract the last `max_bytes` of a string, respecting UTF-8 boundaries.
-    fn safe_tail(text: &str, max_bytes: usize) -> String {
+    pub fn safe_tail(text: &str, max_bytes: usize) -> &str {
         if text.len() <= max_bytes {
-            return text.to_string();
+            return text;
         }
         let start = text.len() - max_bytes;
         // Walk forward to find a char boundary
@@ -990,7 +993,7 @@ pub(crate) mod patterns {
         while idx < text.len() && !text.is_char_boundary(idx) {
             idx += 1;
         }
-        text[idx..].to_string()
+        &text[idx..]
     }
 }
 

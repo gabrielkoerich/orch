@@ -665,40 +665,27 @@ pub(crate) fn translate_permissions_to_opencode(allowed_tools: &[String]) -> Str
 fn classify_opencode_message(message: &str) -> AgentError {
     let lower = message.to_lowercase();
 
-    if lower.contains("rate limit")
-        || lower.contains("429")
-        || lower.contains("usage limit")
-        || lower.contains("too many requests")
-    {
-        return AgentError::RateLimit {
-            message: message.to_string(),
-        };
+    // Rate limit — delegate to shared helper
+    if let Some(e) = super::patterns::detect_rate_limit(message) {
+        return e;
     }
 
-    if lower.contains("context") && (lower.contains("length") || lower.contains("overflow")) {
-        return AgentError::ContextOverflow {
-            message: message.to_string(),
-        };
+    // Context overflow — delegate to shared helper (covers "context overflow", "context length", etc.)
+    if let Some(e) = super::patterns::detect_context_overflow(message) {
+        return e;
     }
 
-    if lower.contains("unauthorized")
-        || lower.contains("invalid key")
-        || super::patterns::contains_http_status(&lower, "401")
-    {
-        return AgentError::Auth {
-            message: message.to_string(),
-        };
+    // Auth errors — delegate to shared helper (includes HTTP 401/403, billing, etc.)
+    if let Some(e) = super::patterns::detect_auth_error(message) {
+        return e;
     }
 
-    if lower.contains("rejected permission")
-        || lower.contains("permission denied")
-        || lower.contains("permissionerror")
-    {
-        return AgentError::PermissionDenied {
-            message: message.to_string(),
-        };
+    // Permission denied — delegate to shared helper
+    if let Some(e) = super::patterns::detect_permission_denied(message) {
+        return e;
     }
 
+    // Model not available (opencode-specific extraction pattern)
     if lower.contains("model") && (lower.contains("not found") || lower.contains("not supported")) {
         // Try to extract model name from patterns like "Model not found: anthropic/claude-sonnet-4-6."
         let model = message

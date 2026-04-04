@@ -146,25 +146,17 @@ impl CodexRunner {
     fn classify_message(&self, message: &str) -> AgentError {
         let lower = message.to_lowercase();
 
-        // Rate limit / usage limit
-        if lower.contains("usage limit")
-            || lower.contains("rate limit")
-            || lower.contains("429")
-            || lower.contains("too many requests")
-            || lower.contains("you've hit your")
-        {
-            return AgentError::RateLimit {
-                message: message.to_string(),
-            };
+        // Rate limit — delegate to shared helper (covers "you've hit your", 429, 529, etc.)
+        if let Some(e) = super::patterns::detect_rate_limit(message) {
+            return e;
         }
 
-        // Model not supported / not found
+        // Model not supported / not found (codex-specific patterns)
         if lower.contains("model metadata")
             || lower.contains("model is not supported")
-            || lower.contains("not found")
-                && (lower.contains("model") || lower.contains("metadata"))
+            || (lower.contains("not found")
+                && (lower.contains("model") || lower.contains("metadata")))
         {
-            // Try to extract model name
             let model = extract_model_name(message).unwrap_or_default();
             return AgentError::ModelUnavailable {
                 message: message.to_string(),
@@ -172,33 +164,28 @@ impl CodexRunner {
             };
         }
 
-        // Auth errors
-        if lower.contains("unauthorized")
-            || lower.contains("invalid key")
-            || lower.contains("invalid api")
-            || super::patterns::contains_http_status(&lower, "401")
-            || super::patterns::contains_http_status(&lower, "403")
-        {
-            return AgentError::Auth {
-                message: message.to_string(),
-            };
+        // Auth errors — delegate to shared helper (includes HTTP 401/403, billing, etc.)
+        if let Some(e) = super::patterns::detect_auth_error(message) {
+            return e;
         }
 
-        // Context overflow
-        if lower.contains("context_length") || lower.contains("too many tokens") {
-            return AgentError::ContextOverflow {
-                message: message.to_string(),
-            };
+        // Context overflow — delegate to shared helper
+        if let Some(e) = super::patterns::detect_context_overflow(message) {
+            return e;
         }
 
-        // Connection/network errors — treat as transient, worth retrying
+        // Connection/network errors — codex-specific transient patterns
         if lower.contains("reconnecting")
             || lower.contains("stream disconnected")
             || lower.contains("connection closed")
             || lower.contains("websocket")
             || lower.contains("econnreset")
-            || lower.contains("econnrefused")
         {
+            return AgentError::AgentFailed {
+                message: format!("codex failed: {message}"),
+            };
+        }
+        if super::patterns::detect_network_error(message).is_some() {
             return AgentError::AgentFailed {
                 message: format!("codex failed: {message}"),
             };

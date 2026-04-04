@@ -2,7 +2,7 @@
 //!
 //! Extracted from `runner/mod.rs`. Handles the `Ok(parsed)` arm of the parse
 //! result, including git operations, delegation storage, and budget enforcement.
-//! Also owns `write_result_json` and the `safe_utf8_tail` utility.
+//! Also owns `write_result_json`.
 
 use crate::config;
 use crate::parser::AgentResponse;
@@ -12,21 +12,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::{agents, git_ops, response, worktree};
-
-/// Return the last `max_bytes` of `s`, walking forward to the nearest UTF-8
-/// character boundary so the slice is always valid.
-pub fn safe_utf8_tail(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let start = s.len() - max_bytes;
-    // Walk forward from `start` until we land on a char boundary
-    let mut idx = start;
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    &s[idx..]
-}
 
 /// Write a structured `result.json` to the attempt directory for debugging.
 #[allow(clippy::too_many_arguments)]
@@ -73,8 +58,8 @@ pub fn write_result_json(
                 "attempt": new_attempts,
                 "error_class": agents::error_class_name(agent_err),
                 "error_message": agent_err.to_string(),
-                "stderr_tail": safe_utf8_tail(raw_stderr, 2000),
-                "stdout_tail": safe_utf8_tail(raw_stdout, 2000),
+                "stderr_tail": agents::patterns::safe_tail(raw_stderr, 2000),
+                "stdout_tail": agents::patterns::safe_tail(raw_stdout, 2000),
             })
         }
     };
