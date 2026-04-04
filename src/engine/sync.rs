@@ -728,10 +728,13 @@ pub(crate) async fn sync_tick(
     }
 
     // 6. Scan for owner /slash commands in issue comments
-    if let Err(e) =
-        super::commands::scan_commands(backend, repo, &Some(Arc::clone(store)), task_manager).await
-    {
-        tracing::warn!(err = %e, "owner command scan failed");
+    if !gh_circuit_open {
+        if let Err(e) =
+            super::commands::scan_commands(backend, repo, &Some(Arc::clone(store)), task_manager)
+                .await
+        {
+            tracing::warn!(err = %e, "owner command scan failed");
+        }
     }
 
     // 7. Sync skill repositories
