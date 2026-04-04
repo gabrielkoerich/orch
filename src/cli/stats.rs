@@ -1,28 +1,31 @@
 use crate::config;
 
 /// Show task metrics and statistics, per-project by default.
-pub async fn stats(all: bool) -> anyhow::Result<()> {
+///
+/// `since_hours` controls the time window (default 24; pass 168 for 7 days, etc.).
+pub async fn stats(all: bool, since_hours: u32) -> anyhow::Result<()> {
     let store = crate::cli::init_store().await?;
+    let window_label = crate::cli::hours_to_label(since_hours);
 
     if all {
-        let summary = store.get_metrics_summary_24h().await?;
+        let summary = store.get_metrics_summary(since_hours).await?;
         let cost = store.get_cost_summary().await.ok();
         println!();
-        print_summary_table("All Projects", &summary, cost.as_ref());
+        print_summary_table("All Projects", &window_label, &summary, cost.as_ref());
     } else {
         let repos = get_configured_repos();
         if repos.is_empty() {
             // Fallback to global stats if no projects configured
-            let summary = store.get_metrics_summary_24h().await?;
+            let summary = store.get_metrics_summary(since_hours).await?;
             let cost = store.get_cost_summary().await.ok();
             println!();
-            print_summary_table("All Projects", &summary, cost.as_ref());
+            print_summary_table("All Projects", &window_label, &summary, cost.as_ref());
         } else {
             println!();
             for repo in &repos {
-                let summary = store.get_metrics_summary_24h_by_repo(repo).await?;
-                let cost = store.get_cost_summary_24h_by_repo(repo).await.ok();
-                print_summary_table(repo, &summary, cost.as_ref());
+                let summary = store.get_metrics_summary_by_repo(repo, since_hours).await?;
+                let cost = store.get_cost_summary_by_repo(repo, since_hours).await.ok();
+                print_summary_table(repo, &window_label, &summary, cost.as_ref());
             }
         }
     }
@@ -32,6 +35,7 @@ pub async fn stats(all: bool) -> anyhow::Result<()> {
 
 fn print_summary_table(
     title: &str,
+    window_label: &str,
     summary: &crate::store::MetricsSummary,
     cost: Option<&crate::store::CostSummary>,
 ) {
@@ -45,8 +49,8 @@ fn print_summary_table(
     };
 
     println!(
-        "  Tasks (24h):  {} completed, {} failed",
-        summary.tasks_completed_24h, summary.tasks_failed_24h
+        "  Tasks ({}):  {} completed, {} failed",
+        window_label, summary.tasks_completed_24h, summary.tasks_failed_24h
     );
     println!("  Success rate: {:.1}%", success_rate);
 
@@ -75,11 +79,16 @@ fn print_summary_table(
         println!("  Agents:       {}", agents.join(" | "));
     }
 
-    // Cost: extract 24h period if available
+    // Cost: show total across all recorded periods
     if let Some(c) = cost {
-        if let Some(period_24h) = c.periods.iter().find(|p| p.label == "24h") {
-            if period_24h.total_cost_usd > 0.0 {
-                println!("  Cost (24h):   ${:.2}", period_24h.total_cost_usd);
+        let total_cost: f64 = c.periods.iter().map(|p| p.total_cost_usd).sum();
+        if total_cost > 0.0 {
+            if let Some(period) = c.periods.iter().find(|p| p.label == window_label) {
+                println!("  Cost ({}): ${:.2}", window_label, period.total_cost_usd);
+            } else if let Some(period_24h) = c.periods.iter().find(|p| p.label == "24h") {
+                if period_24h.total_cost_usd > 0.0 {
+                    println!("  Cost (24h):   ${:.2}", period_24h.total_cost_usd);
+                }
             }
         }
     }

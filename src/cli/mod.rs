@@ -267,15 +267,27 @@ pub fn agents() {
 }
 
 /// Show task metrics summary.
-pub async fn metrics(details: bool) -> anyhow::Result<()> {
+///
+/// `since_hours` controls the time window (default 24; pass 168 for 7 days, etc.).
+pub async fn metrics(details: bool, since_hours: u32) -> anyhow::Result<()> {
     let store = init_store().await?;
 
-    let summary = store.get_metrics_summary_24h().await?;
+    let summary = store.get_metrics_summary(since_hours).await?;
+    let window_label = hours_to_label(since_hours);
 
     println!();
-    println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║              Orch Metrics (Last 24 Hours)               ║");
-    println!("╚══════════════════════════════════════════════════════════╝");
+    let header = format!("Orch Metrics (Last {})", window_label);
+    let width = 58usize;
+    let pad = width.saturating_sub(header.len() + 2);
+    let left_pad = pad / 2;
+    let right_pad = pad - left_pad;
+    println!("╔{}╗", "═".repeat(width));
+    println!(
+        "║{}{header}{}║",
+        " ".repeat(left_pad),
+        " ".repeat(right_pad)
+    );
+    println!("╚{}╝", "═".repeat(width));
     println!();
 
     // Task counts
@@ -320,10 +332,10 @@ pub async fn metrics(details: bool) -> anyhow::Result<()> {
     println!();
 
     if details {
-        // Slow tasks (last 7 days)
-        let slow = store.get_slow_tasks_7d().await?;
+        // Slow tasks
+        let slow = store.get_slow_tasks(since_hours).await?;
         if !slow.is_empty() {
-            println!(" Slowest Tasks (Last 7 Days):");
+            println!(" Slowest Tasks (Last {}):", window_label);
             println!(
                 "   {:<20} {:<12} {:<10} DURATION",
                 "TASK ID", "AGENT", "COMPLEXITY"
@@ -341,10 +353,10 @@ pub async fn metrics(details: bool) -> anyhow::Result<()> {
             println!();
         }
 
-        // Error distribution (last 7 days)
-        let errors = store.get_error_distribution_7d().await?;
+        // Error distribution
+        let errors = store.get_error_distribution(since_hours).await?;
         if !errors.is_empty() {
-            println!(" Error Distribution (Last 7 Days):");
+            println!(" Error Distribution (Last {}):", window_label);
             println!("   {:<30} {:>6}", "ERROR TYPE", "COUNT");
             println!("   {}", "-".repeat(38));
             for e in &errors {
@@ -356,12 +368,51 @@ pub async fn metrics(details: bool) -> anyhow::Result<()> {
             }
             println!();
         } else {
-            println!(" Error Distribution (Last 7 Days): none");
+            println!(" Error Distribution (Last {}): none", window_label);
+            println!();
+        }
+
+        // Repeated review loops
+        let review_loops = store.get_high_review_cycle_tasks(since_hours).await?;
+        if !review_loops.is_empty() {
+            println!(" Tasks with Repeated Review Loops (Last {}):", window_label);
+            println!("   {:<10} {:<12} TITLE", "CYCLES", "AGENT");
+            println!("   {}", "-".repeat(60));
+            for t in &review_loops {
+                println!(
+                    "   {:<10} {:<12} {}",
+                    t.review_cycles,
+                    t.agent.as_deref().unwrap_or("-"),
+                    t.title,
+                );
+            }
             println!();
         }
     }
 
     Ok(())
+}
+
+/// Convert hours to a human-readable label (e.g. 24 → "24h", 168 → "7d").
+pub fn hours_to_label(hours: u32) -> String {
+    if hours.is_multiple_of(24) {
+        format!("{}d", hours / 24)
+    } else {
+        format!("{hours}h")
+    }
+}
+
+/// Parse a `--since` string like "24h", "7d", "30d" into hours.
+/// Returns `None` if the format is unrecognised.
+pub fn parse_since(s: &str) -> Option<u32> {
+    if let Some(d) = s.strip_suffix('d') {
+        d.parse::<u32>().ok().map(|n| n * 24)
+    } else if let Some(h) = s.strip_suffix('h') {
+        h.parse::<u32>().ok()
+    } else {
+        // bare number treated as hours
+        s.parse::<u32>().ok()
+    }
 }
 
 /// Print a content chunk in human-readable form, formatting each NDJSON line.
@@ -1024,6 +1075,21 @@ pub async fn init_store() -> anyhow::Result<crate::store::TaskStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hours_to_label_prefers_days_for_full_day_windows() {
+        assert_eq!(hours_to_label(24), "1d");
+        assert_eq!(hours_to_label(168), "7d");
+        assert_eq!(hours_to_label(30), "30h");
+    }
+
+    #[test]
+    fn parse_since_supports_days_hours_and_bare_numbers() {
+        assert_eq!(parse_since("7d"), Some(168));
+        assert_eq!(parse_since("24h"), Some(24));
+        assert_eq!(parse_since("36"), Some(36));
+        assert_eq!(parse_since("bad"), None);
+    }
 
     #[test]
     fn parse_slug_owner_repo() {

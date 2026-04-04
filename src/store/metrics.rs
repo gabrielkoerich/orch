@@ -189,7 +189,97 @@ impl TaskStore {
         Ok(row.try_get("id").unwrap_or(0))
     }
 
+    /// Get aggregated metrics for a configurable time window.
+    ///
+    /// `hours` controls how far back to look (e.g. 24 for 24 h, 168 for 7 days).
+    /// The interval string is built from a `u32` config value, not user input.
+    pub async fn get_metrics_summary(&self, hours: u32) -> anyhow::Result<MetricsSummary> {
+        let interval = format!("-{hours} hours");
+
+        let completed: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', ?) AND outcome = 'success'",
+        )
+        .bind(&interval)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let failed: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', ?) AND outcome != 'success'",
+        )
+        .bind(&interval)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let avg_simple: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', ?) AND complexity = 'simple'",
+        )
+        .bind(&interval)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let avg_medium: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', ?) AND complexity = 'medium'",
+        )
+        .bind(&interval)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let avg_complex: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(duration_seconds) FROM task_metrics WHERE completed_at >= datetime('now', ?) AND complexity = 'complex'",
+        )
+        .bind(&interval)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let agent_rows = sqlx::query(
+            "SELECT agent, COUNT(*) as total,
+                SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as success_count
+         FROM task_metrics
+         WHERE completed_at >= datetime('now', ?)
+         GROUP BY agent",
+        )
+        .bind(&interval)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let agent_stats: Vec<AgentStat> = agent_rows
+            .iter()
+            .map(|row| {
+                let total: i64 = row.try_get("total").unwrap_or(0);
+                let success: i64 = row.try_get("success_count").unwrap_or(0);
+                AgentStat {
+                    agent: row.try_get("agent").unwrap_or_default(),
+                    total_runs: total,
+                    success_count: success,
+                    success_rate: if total > 0 {
+                        (success as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                }
+            })
+            .collect();
+
+        let rate_limit_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM rate_limits WHERE occurred_at >= datetime('now', ?)",
+        )
+        .bind(&interval)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(MetricsSummary {
+            tasks_completed_24h: completed.0,
+            tasks_failed_24h: failed.0,
+            avg_duration_simple: avg_simple.map(|r| r.0),
+            avg_duration_medium: avg_medium.map(|r| r.0),
+            avg_duration_complex: avg_complex.map(|r| r.0),
+            agent_stats,
+            rate_limits_24h: rate_limit_count.0,
+        })
+    }
+
     /// Get aggregated metrics for the last 24 hours.
+    #[allow(dead_code)]
     pub async fn get_metrics_summary_24h(&self) -> anyhow::Result<MetricsSummary> {
         let completed: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND outcome = 'success'",
@@ -263,6 +353,124 @@ impl TaskStore {
             avg_duration_complex: avg_complex.map(|r| r.0),
             agent_stats,
             rate_limits_24h: rate_limit_count.0,
+        })
+    }
+
+    /// Get metrics summary for a configurable time window, filtered by repo.
+    ///
+    /// `hours` controls how far back to look. Uses `COALESCE(NULLIF(m.repo, ''), t.repo)`
+    /// join pattern so older metric rows without a repo column still match.
+    pub async fn get_metrics_summary_by_repo(
+        &self,
+        repo: &str,
+        hours: u32,
+    ) -> anyhow::Result<MetricsSummary> {
+        let interval = format!("-{hours} hours");
+
+        let completed: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM task_metrics m
+         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+         WHERE m.completed_at >= datetime('now', ?)
+         AND m.outcome = 'success'
+         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        )
+        .bind(&interval)
+        .bind(repo)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let failed: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM task_metrics m
+         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+         WHERE m.completed_at >= datetime('now', ?)
+         AND m.outcome != 'success'
+         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        )
+        .bind(&interval)
+        .bind(repo)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let avg_simple: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(m.duration_seconds) FROM task_metrics m
+         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+         WHERE m.completed_at >= datetime('now', ?) AND m.complexity = 'simple'
+         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        )
+        .bind(&interval)
+        .bind(repo)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let avg_medium: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(m.duration_seconds) FROM task_metrics m
+         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+         WHERE m.completed_at >= datetime('now', ?) AND m.complexity = 'medium'
+         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        )
+        .bind(&interval)
+        .bind(repo)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let avg_complex: Option<(f64,)> = sqlx::query_as(
+            "SELECT AVG(m.duration_seconds) FROM task_metrics m
+         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+         WHERE m.completed_at >= datetime('now', ?) AND m.complexity = 'complex'
+         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        )
+        .bind(&interval)
+        .bind(repo)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let agent_rows = sqlx::query(
+            "SELECT m.agent, COUNT(*) as total,
+                SUM(CASE WHEN m.outcome = 'success' THEN 1 ELSE 0 END) as success_count
+         FROM task_metrics m
+         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+         WHERE m.completed_at >= datetime('now', ?)
+         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?
+         GROUP BY m.agent",
+        )
+        .bind(&interval)
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let agent_stats: Vec<AgentStat> = agent_rows
+            .iter()
+            .map(|row| {
+                let total: i64 = row.try_get("total").unwrap_or(0);
+                let success: i64 = row.try_get("success_count").unwrap_or(0);
+                AgentStat {
+                    agent: row.try_get("agent").unwrap_or_default(),
+                    total_runs: total,
+                    success_count: success,
+                    success_rate: if total > 0 {
+                        (success as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                }
+            })
+            .collect();
+
+        let rate_limits: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM rate_limits WHERE occurred_at >= datetime('now', ?)",
+        )
+        .bind(&interval)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(MetricsSummary {
+            tasks_completed_24h: completed.0,
+            tasks_failed_24h: failed.0,
+            avg_duration_simple: avg_simple.map(|r| r.0),
+            avg_duration_medium: avg_medium.map(|r| r.0),
+            avg_duration_complex: avg_complex.map(|r| r.0),
+            agent_stats,
+            rate_limits_24h: rate_limits.0,
         })
     }
 
@@ -374,12 +582,17 @@ impl TaskStore {
         })
     }
 
-    /// Get 24-hour cost summary filtered to a specific repository.
+    /// Get cost summary filtered to a specific repository for a configurable window.
     ///
     /// Uses the same `COALESCE(NULLIF(m.repo, ''), t.repo)` join pattern as
-    /// `get_metrics_summary_24h_by_repo` so older metrics rows that lack a `repo`
+    /// `get_metrics_summary_by_repo` so older metrics rows that lack a `repo`
     /// column value are still matched via the tasks table.
-    pub async fn get_cost_summary_24h_by_repo(&self, repo: &str) -> anyhow::Result<CostSummary> {
+    pub async fn get_cost_summary_by_repo(
+        &self,
+        repo: &str,
+        hours: u32,
+    ) -> anyhow::Result<CostSummary> {
+        let interval = format!("-{hours} hours");
         let row = sqlx::query(
             "SELECT COALESCE(SUM(m.input_tokens), 0) as input_tokens,
                 COALESCE(SUM(m.output_tokens), 0) as output_tokens,
@@ -389,16 +602,23 @@ impl TaskStore {
                 COUNT(*) as task_count
          FROM task_metrics m
          LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', '-24 hours')
+         WHERE m.completed_at >= datetime('now', ?)
          AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
         )
+        .bind(&interval)
         .bind(repo)
         .fetch_one(&self.pool)
         .await?;
 
         Ok(CostSummary {
             periods: vec![CostPeriod {
-                label: "24h".to_string(),
+                label: if hours == 24 {
+                    "24h".to_string()
+                } else if hours.is_multiple_of(24) {
+                    format!("{}d", hours / 24)
+                } else {
+                    format!("{hours}h")
+                },
                 input_tokens: row.try_get("input_tokens").unwrap_or(0),
                 output_tokens: row.try_get("output_tokens").unwrap_or(0),
                 input_cost_usd: row.try_get("input_cost_usd").unwrap_or(0.0),
@@ -407,6 +627,12 @@ impl TaskStore {
                 task_count: row.try_get("task_count").unwrap_or(0),
             }],
         })
+    }
+
+    /// Get 24-hour cost summary filtered to a specific repository.
+    #[allow(dead_code)]
+    pub async fn get_cost_summary_24h_by_repo(&self, repo: &str) -> anyhow::Result<CostSummary> {
+        self.get_cost_summary_by_repo(repo, 24).await
     }
 
     /// Record a rate limit event. Prunes records older than 30 days.
@@ -465,7 +691,33 @@ impl TaskStore {
         Ok(map)
     }
 
+    /// Get slow tasks (top 10 longest running) for a configurable time window.
+    pub async fn get_slow_tasks(&self, hours: u32) -> anyhow::Result<Vec<SlowTaskInfo>> {
+        let interval = format!("-{hours} hours");
+        let rows = sqlx::query(
+            "SELECT task_id, agent, complexity, duration_seconds
+         FROM task_metrics
+         WHERE completed_at >= datetime('now', ?) AND outcome = 'success'
+         ORDER BY duration_seconds DESC
+         LIMIT 10",
+        )
+        .bind(&interval)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| SlowTaskInfo {
+                task_id: row.try_get("task_id").unwrap_or_default(),
+                agent: row.try_get("agent").unwrap_or_default(),
+                complexity: row.try_get("complexity").unwrap_or(None),
+                duration_seconds: row.try_get("duration_seconds").unwrap_or(0.0),
+            })
+            .collect())
+    }
+
     /// Get slow tasks (top 10 longest running) from the last 7 days.
+    #[allow(dead_code)]
     pub async fn get_slow_tasks_7d(&self) -> anyhow::Result<Vec<SlowTaskInfo>> {
         let rows = sqlx::query(
             "SELECT task_id, agent, complexity, duration_seconds
@@ -488,17 +740,19 @@ impl TaskStore {
             .collect())
     }
 
-    /// Get error type distribution from the last 7 days.
-    pub async fn get_error_distribution_7d(&self) -> anyhow::Result<Vec<ErrorStat>> {
+    /// Get error type distribution for a configurable time window.
+    pub async fn get_error_distribution(&self, hours: u32) -> anyhow::Result<Vec<ErrorStat>> {
+        let interval = format!("-{hours} hours");
         let rows = sqlx::query(
             "SELECT error_type, COUNT(*) as count
          FROM task_metrics
-         WHERE completed_at >= datetime('now', '-7 days')
+         WHERE completed_at >= datetime('now', ?)
            AND outcome != 'success'
            AND error_type IS NOT NULL
          GROUP BY error_type
          ORDER BY count DESC",
         )
+        .bind(&interval)
         .fetch_all(&self.pool)
         .await?;
 
@@ -509,6 +763,12 @@ impl TaskStore {
                 count: row.try_get("count").unwrap_or(0),
             })
             .collect())
+    }
+
+    /// Get error type distribution from the last 7 days.
+    #[allow(dead_code)]
+    pub async fn get_error_distribution_7d(&self) -> anyhow::Result<Vec<ErrorStat>> {
+        self.get_error_distribution(24 * 7).await
     }
 
     /// Get cost summary over multiple time windows (24h, 7d, 30d).
@@ -643,6 +903,35 @@ impl TaskStore {
         let key = self_improvement_key();
         let count = self.kv_get(&key).await?;
         Ok(count.and_then(|c| c.parse().ok()).unwrap_or(0))
+    }
+
+    /// Get tasks with high review cycle counts (persistent review loops) for a configurable window.
+    pub async fn get_high_review_cycle_tasks(
+        &self,
+        hours: u32,
+    ) -> anyhow::Result<Vec<HighReviewCycleTask>> {
+        let interval = format!("-{hours} hours");
+        let rows = sqlx::query(
+            "SELECT external_id, agent, review_cycles, title
+         FROM tasks
+         WHERE review_cycles >= 2
+           AND updated_at >= datetime('now', ?)
+         ORDER BY review_cycles DESC
+         LIMIT 10",
+        )
+        .bind(&interval)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| HighReviewCycleTask {
+                external_id: row.try_get("external_id").unwrap_or(None),
+                agent: row.try_get("agent").unwrap_or(None),
+                review_cycles: row.try_get("review_cycles").unwrap_or(0),
+                title: row.try_get("title").unwrap_or_default(),
+            })
+            .collect())
     }
 
     /// Get tasks with high review cycle counts (persistent review loops) from the last 7 days.

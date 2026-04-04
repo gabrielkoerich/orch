@@ -293,9 +293,12 @@ enum Commands {
     },
     /// Show task metrics summary
     Metrics {
-        /// Show slow tasks and error distribution (last 7 days)
+        /// Show slow tasks and error distribution
         #[arg(long)]
         details: bool,
+        /// Time window to report on (e.g. "24h", "7d", "30d"; default: "24h")
+        #[arg(long, default_value = "24h")]
+        since: String,
     },
     /// Combined dashboard: tasks, sessions, recent activity
     Dashboard {
@@ -340,6 +343,9 @@ enum Commands {
         /// Aggregate all projects into one table
         #[arg(long)]
         all: bool,
+        /// Time window to report on (e.g. "24h", "7d", "30d"; default: "24h")
+        #[arg(long, default_value = "24h")]
+        since: String,
     },
     /// Generate shell completions
     Completions {
@@ -900,8 +906,15 @@ async fn main() -> anyhow::Result<()> {
                 cli::service::status()?;
             }
         },
-        Commands::Metrics { details } => {
-            cli::metrics(details).await?;
+        Commands::Metrics { details, since } => {
+            let hours = cli::parse_since(&since).unwrap_or_else(|| {
+                eprintln!(
+                    "Warning: unrecognised --since value {:?}, defaulting to 24h",
+                    since
+                );
+                24
+            });
+            cli::metrics(details, hours).await?;
         }
         // Combined dashboard view: tasks, sessions, recent activity
         Commands::Dashboard { global, project } => {
@@ -959,8 +972,15 @@ async fn main() -> anyhow::Result<()> {
                 cli::cost::show_summary().await?;
             }
         }
-        Commands::Stats { all } => {
-            cli::stats::stats(all).await?;
+        Commands::Stats { all, since } => {
+            let hours = cli::parse_since(&since).unwrap_or_else(|| {
+                eprintln!(
+                    "Warning: unrecognised --since value {:?}, defaulting to 24h",
+                    since
+                );
+                24
+            });
+            cli::stats::stats(all, hours).await?;
         }
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
