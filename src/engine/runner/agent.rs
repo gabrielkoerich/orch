@@ -556,4 +556,36 @@ mod tests {
         assert!(script.contains("worktree directory does not exist: '/tmp'"));
         assert!(script.contains("stderr_file='"));
     }
+
+    #[test]
+    fn build_runner_script_escapes_shell_injection_in_paths() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut inv = test_invocation("injection-test");
+        inv.work_dir = std::path::PathBuf::from("/tmp/$(whoami)/workspace");
+        inv.output_file = std::path::PathBuf::from("/tmp/evil`id`.json");
+        let script =
+            build_runner_script_in_dir(&inv, tmp.path()).expect("runner script should build");
+
+        // Values must be single-quoted, neutralizing $() and backticks
+        assert!(
+            script.contains("'/tmp/$(whoami)/workspace'"),
+            "work_dir with $() must be single-quoted: {script}"
+        );
+        assert!(
+            script.contains("'/tmp/evil`id`.json'"),
+            "output_file with backticks must be single-quoted: {script}"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        use crate::engine::runner::agents::shell_single_quote;
+
+        assert_eq!(shell_single_quote("hello"), "'hello'");
+        assert_eq!(shell_single_quote("O'Brien"), "'O'\\''Brien'");
+        assert_eq!(shell_single_quote("$(rm -rf /)"), "'$(rm -rf /)'");
+        assert_eq!(shell_single_quote("`whoami`"), "'`whoami`'");
+        assert_eq!(shell_single_quote("a\"b"), "'a\"b'");
+        assert_eq!(shell_single_quote("$HOME"), "'$HOME'");
+    }
 }
