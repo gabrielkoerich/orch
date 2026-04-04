@@ -1544,7 +1544,14 @@ pub(crate) async fn review_and_merge(
 
         if !merge_base.is_empty() {
             let orch_yml_changed = Command::new("git")
-                .args(["diff", "--name-only", &merge_base, "HEAD", "--", ".orch.yml"])
+                .args([
+                    "diff",
+                    "--name-only",
+                    &merge_base,
+                    "HEAD",
+                    "--",
+                    ".orch.yml",
+                ])
                 .current_dir(&worktree_path)
                 .output()
                 .await
