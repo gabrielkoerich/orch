@@ -1305,10 +1305,25 @@ pub(crate) async fn review_and_merge(
     }
 
     // 9. Read and parse response
-    let file_exists = output_file.exists();
-    let file_size = std::fs::metadata(&output_file)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let (file_exists, file_size, exit_code, stderr) = {
+        let output_file_clone = output_file.clone();
+        let review_attempt_dir_clone = review_attempt_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let file_exists = output_file_clone.exists();
+            let file_size = std::fs::metadata(&output_file_clone)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let exit_code = std::fs::read_to_string(review_attempt_dir_clone.join("exit.txt"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+                .unwrap_or(-1);
+            let stderr = std::fs::read_to_string(review_attempt_dir_clone.join("stderr.txt"))
+                .unwrap_or_default();
+            (file_exists, file_size, exit_code, stderr)
+        })
+        .await
+        .expect("spawn_blocking panicked reading review output metadata")
+    };
     tracing::info!(
         task_id = task.id.0,
         path = %output_file.display(),
@@ -1318,13 +1333,6 @@ pub(crate) async fn review_and_merge(
     );
     let raw_output = runner::response::read_output_file(&review_task_id, &output_file, repo).await;
     let agent_runner = runner::agents::get_runner(&review_agent);
-
-    let exit_code = std::fs::read_to_string(review_attempt_dir.join("exit.txt"))
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .unwrap_or(-1);
-
-    let stderr = std::fs::read_to_string(review_attempt_dir.join("stderr.txt")).unwrap_or_default();
 
     // Extract token usage from the raw output so we can track review agent costs.
     let agent_token_usage = {
