@@ -901,8 +901,23 @@ pub(crate) mod patterns {
     /// should reset the stored UUID and retry with a fresh `--session-id`.
     pub fn detect_stale_session(text: &str) -> Option<AgentError> {
         // Case-insensitive match; extract the UUID if present.
+        // We search the lowercased copy for the pattern, then find the
+        // corresponding byte offset in the *original* text via char_indices so
+        // we never use a byte index from `lower` (whose byte length may differ
+        // from `text` after Unicode case-folding, e.g. ß→ss, İ→i̇).
+        let needle = "no conversation found with session id";
         let lower = text.to_lowercase();
-        if let Some(pos) = lower.find("no conversation found with session id") {
+        if let Some(lower_pos) = lower.find(needle) {
+            // Map the byte offset in `lower` back to a char index, then find
+            // the same char index in `text`.  Because to_lowercase() maps each
+            // char to one or more chars, the char count up to the match may
+            // differ between `lower` and `text`, so we count chars in `lower`.
+            let char_idx = lower[..lower_pos].chars().count();
+            let pos = text
+                .char_indices()
+                .nth(char_idx)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len());
             // Try to extract the UUID that follows the colon.
             let after = &text[pos..];
             let session_id = after
@@ -1179,6 +1194,19 @@ mod tests {
         // Non-matching text
         assert!(patterns::detect_stale_session("all good").is_none());
         assert!(patterns::detect_stale_session("conversation started").is_none());
+
+        // Multi-byte UTF-8 characters before the match must not panic.
+        // German ß lowercases to "ss" (1 byte → 2 bytes), so using a byte
+        // offset from `lower` directly into `text` would be wrong.
+        let multibyte = "Straße: No conversation found with session ID: dead-beef";
+        let err = patterns::detect_stale_session(multibyte);
+        assert!(
+            err.is_some(),
+            "should detect stale session after multi-byte chars"
+        );
+        if let Some(AgentError::StaleSession { session_id }) = err {
+            assert_eq!(session_id, "dead-beef");
+        }
     }
 
     #[test]
