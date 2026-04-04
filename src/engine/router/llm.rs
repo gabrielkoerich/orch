@@ -111,6 +111,11 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
         }
         if let Some(data) = error_obj.get("data").and_then(|d| d.as_object()) {
             if let Some(data_msg) = data.get("message").and_then(|m| m.as_str()) {
+                // PermissionError with data.message is an OpenCode tool-use rejection,
+                // not an API auth/quota error. Skip it to avoid false-positive cooldowns.
+                if name == "PermissionError" {
+                    return None;
+                }
                 return Some(format!("error.name={name}: {data_msg}"));
             }
         }
@@ -135,7 +140,7 @@ fn detect_error_envelope(value: &serde_json::Value) -> Option<String> {
         "rate limit",
         "overloaded",
         "quota",
-        "permission",
+        "permission_error",
         "unauthorized",
         "authentication",
         "429",
@@ -1223,6 +1228,22 @@ mod tests {
         assert!(detect_error_envelope(&json).is_none());
         let json: serde_json::Value = serde_json::from_str(r#"[1,2,3]"#).unwrap();
         assert!(detect_error_envelope(&json).is_none());
+    }
+
+    #[test]
+    fn detect_error_returns_none_for_tool_use_permission_rejection() {
+        // OpenCode tool-use rejection must NOT be treated as an API error.
+        // Before the fix, the broad "permission" substring matched this and caused
+        // false-positive cooldowns on the model.
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"error":{"name":"PermissionError","data":{"message":"user rejected permission to use this specific tool call"}}}"#,
+        )
+        .unwrap();
+        let result = detect_error_envelope(&json);
+        assert!(
+            result.is_none(),
+            "tool-use permission rejection must not be detected as API error, got: {result:?}"
+        );
     }
 
     // ── parse_llm_response ────────────────────────────────────────────────────
