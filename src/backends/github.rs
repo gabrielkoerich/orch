@@ -536,6 +536,12 @@ impl ExternalBackend for GitHubBackend {
     async fn acknowledge_issue(&self, id: &ExternalId) -> anyhow::Result<()> {
         self.gh.add_reaction(&self.repo, &id.0, "eyes").await
     }
+
+    async fn acknowledge_mention(&self, comment_id: &str) -> anyhow::Result<()> {
+        self.gh
+            .add_comment_reaction(&self.repo, comment_id, "eyes")
+            .await
+    }
 }
 
 #[cfg(test)]

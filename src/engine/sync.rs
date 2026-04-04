@@ -821,6 +821,11 @@ async fn scan_mentions(
             continue;
         }
 
+        // Acknowledge the mention with an eyes reaction (non-fatal)
+        if let Err(e) = backend.acknowledge_mention(&mention.id).await {
+            tracing::debug!(err = %e, mention_id = %mention.id, "failed to acknowledge mention");
+        }
+
         // Create internal task for this mention
         let title = format!("Respond to mention by @{}", mention.author);
         let task_body = format!("Mention by @{}:\n\n{}", mention.author, mention.body);
