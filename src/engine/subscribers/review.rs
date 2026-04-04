@@ -15,6 +15,13 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::{RwLock, Semaphore};
 
+enum ReviewOutcome {
+    Reset,
+    RateLimited,
+    Block(String),
+    Ok,
+}
+
 /// Spawn a task that listens for NeedsReview events and triggers the review agent.
 ///
 /// This is the sole trigger for NeedsReview → InReview transitions. The sync tick
@@ -211,12 +218,6 @@ pub fn spawn(
                     tokio::spawn(REPO_CONTEXT.scope(repo_s.clone(), async move {
                         let _dispatch_guard = dispatch_guard; // released on drop (normal or panic)
                         let tid = task.id.0.clone();
-                        enum ReviewOutcome {
-                            Reset,
-                            RateLimited,
-                            Block(String),
-                            Ok,
-                        }
 
                         // Re-check agent cooldowns inside the spawned task. A concurrent
                         // review that ran between the outer dispatch check and now may have
@@ -294,106 +295,17 @@ pub fn spawn(
                                 ))
                             }
                             Ok(ReviewDecision::Failed(reason)) => {
-                                // Rate-limit failures are not real review failures — don't count
-                                // them toward MAX_REVIEW_AGENT_FAILURES. The cooldown system will
-                                // steer the next attempt to an available agent.
-                                if reason.to_lowercase().contains("rate limit") {
-                                    tracing::warn!(
-                                        task_id = tid,
-                                        reason,
-                                        "review agent hit rate limit — deferring retry until cooldown expires"
-                                    );
-                                    ReviewOutcome::RateLimited
-                                } else if crate::engine::runner::git_ops::is_transient_github_api_error(&reason) {
-                                    tracing::warn!(
-                                        task_id = tid,
-                                        reason,
-                                        "review agent hit transient GitHub error — deferring retry without counting as failure"
-                                    );
-                                    ReviewOutcome::Reset
-                                } else {
-                                    let failures = crate::store::store_increment(
-                                        &Some(store_c.clone()),
-                                        &repo_s,
-                                        &tid,
-                                        "review_agent_failures",
-                                    )
-                                    .await;
-                                    let blocking = failures >= MAX_REVIEW_AGENT_FAILURES;
-                                    // Post failure comment to the PR so the history is visible.
-                                    post_review_failure_comment(
-                                        &store_c, &repo_s, &tid, &reason, failures, blocking,
-                                    ).await;
-                                    if blocking {
-                                        tracing::error!(
-                                            task_id = tid,
-                                            reason,
-                                            failures,
-                                            "review agent failed too many times — blocking task"
-                                        );
-                                        ReviewOutcome::Block(format!(
-                                            "review agent failed {failures} times: {reason}"
-                                        ))
-                                    } else {
-                                        tracing::error!(
-                                            task_id = tid,
-                                            reason,
-                                            failures,
-                                            "review agent failed — resetting to NeedsReview for retry"
-                                        );
-                                        ReviewOutcome::Reset
-                                    }
-                                }
+                                classify_review_failure(
+                                    &store_c, &repo_s, &tid, &reason, "review agent",
+                                )
+                                .await
                             }
                             Err(e) => {
                                 let reason = format!("{e:#}");
-                                // Rate-limit errors don't count against the failure threshold.
-                                if reason.to_lowercase().contains("rate limit") {
-                                    tracing::warn!(
-                                        task_id = tid,
-                                        reason,
-                                        "review_and_merge hit rate limit — deferring retry until cooldown expires"
-                                    );
-                                    ReviewOutcome::RateLimited
-                                } else if crate::engine::runner::git_ops::is_transient_github_api_error(&reason) {
-                                    tracing::warn!(
-                                        task_id = tid,
-                                        reason,
-                                        "review_and_merge hit transient GitHub error — deferring retry without counting as failure"
-                                    );
-                                    ReviewOutcome::Reset
-                                } else {
-                                    let failures = crate::store::store_increment(
-                                        &Some(store_c.clone()),
-                                        &repo_s,
-                                        &tid,
-                                        "review_agent_failures",
-                                    )
-                                    .await;
-                                    let blocking = failures >= MAX_REVIEW_AGENT_FAILURES;
-                                    post_review_failure_comment(
-                                        &store_c, &repo_s, &tid, &reason, failures, blocking,
-                                    ).await;
-                                    if blocking {
-                                        tracing::error!(
-                                            task_id = tid,
-                                            error = %e,
-                                            failures,
-                                            "review_and_merge failed too many times — blocking task"
-                                        );
-                                        ReviewOutcome::Block(format!(
-                                            "review_and_merge failed {failures} times: {reason}"
-                                        ))
-                                    } else {
-                                        tracing::error!(
-                                            task_id = tid,
-                                            error = %e,
-                                            failures,
-                                            "review_and_merge failed — resetting to NeedsReview for retry"
-                                        );
-                                        ReviewOutcome::Reset
-                                    }
-                                }
+                                classify_review_failure(
+                                    &store_c, &repo_s, &tid, &reason, "review_and_merge",
+                                )
+                                .await
                             }
                             Ok(ReviewDecision::Approve) => {
                                 // On approval we clear transient failure counters
@@ -593,6 +505,69 @@ pub fn spawn(
             }
         }
     });
+}
+
+/// Classify a review failure and return the appropriate outcome.
+///
+/// Both the `Ok(ReviewDecision::Failed)` and `Err(e)` arms share the same
+/// logic; callers convert the error to a string before calling this helper.
+/// `context` is used in log messages to distinguish the two call sites
+/// ("review agent" vs "review_and_merge").
+async fn classify_review_failure(
+    store: &Arc<TaskStore>,
+    repo: &str,
+    task_id: &str,
+    reason: &str,
+    context: &str,
+) -> ReviewOutcome {
+    // Rate-limit failures are not real review failures — don't count them
+    // toward MAX_REVIEW_AGENT_FAILURES. The cooldown system steers the next
+    // attempt to an available agent.
+    if reason.to_lowercase().contains("rate limit") {
+        tracing::warn!(
+            task_id,
+            reason,
+            "{context} hit rate limit — deferring retry until cooldown expires"
+        );
+        return ReviewOutcome::RateLimited;
+    }
+
+    if crate::engine::runner::git_ops::is_transient_github_api_error(reason) {
+        tracing::warn!(
+            task_id,
+            reason,
+            "{context} hit transient GitHub error — deferring retry without counting as failure"
+        );
+        return ReviewOutcome::Reset;
+    }
+
+    let failures = crate::store::store_increment(
+        &Some(store.clone()),
+        repo,
+        task_id,
+        "review_agent_failures",
+    )
+    .await;
+    let blocking = failures >= MAX_REVIEW_AGENT_FAILURES;
+    // Post failure comment to the PR so the history is visible.
+    post_review_failure_comment(store, repo, task_id, reason, failures, blocking).await;
+    if blocking {
+        tracing::error!(
+            task_id,
+            reason,
+            failures,
+            "{context} failed too many times — blocking task"
+        );
+        ReviewOutcome::Block(format!("{context} failed {failures} times: {reason}"))
+    } else {
+        tracing::error!(
+            task_id,
+            reason,
+            failures,
+            "{context} failed — resetting to NeedsReview for retry"
+        );
+        ReviewOutcome::Reset
+    }
 }
 
 /// Post a comment on the PR explaining why the review agent failed.
