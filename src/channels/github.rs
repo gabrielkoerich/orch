@@ -186,8 +186,11 @@ impl DedupStore {
         };
 
         // Flush outside the mutex to keep the critical section short.
+        // Use spawn_blocking so that the blocking std::fs calls (File::create,
+        // write_all, sync_all, rename) do not occupy a Tokio async worker thread.
         if let (Some(path), Some(entries)) = (&self.file_path, flush_entries) {
-            flush_dedup_file(path, &entries);
+            let path = path.clone();
+            let _ = tokio::task::spawn_blocking(move || flush_dedup_file(&path, &entries)).await;
         }
 
         is_new
