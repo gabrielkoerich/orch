@@ -213,24 +213,61 @@ impl TmuxManager {
     /// Parse a session name into (project, task_id).
     ///
     /// Session names follow the format `orch-{project}-{task_id}`, where
-    /// `{task_id}` may itself contain `-` (e.g. internal tasks: `internal-21116`).
+    /// `{project}` may contain hyphens (e.g. `my-repo`) and `{task_id}` is one of:
+    /// - numeric (external): `1234`
+    /// - internal: `internal-{n}`
+    /// - review variant: `{id}-review` or `internal-{n}-review`
     ///
-    /// Returns `None` if the name does not start with the orch prefix.
+    /// Parsing works right-to-left since task_id formats are well-defined,
+    /// avoiding ambiguity when the project name contains hyphens.
+    ///
+    /// Returns `None` if the name does not start with the orch prefix or
+    /// cannot be parsed into a valid (project, task_id) pair.
     fn parse_session_name(&self, name: &str) -> Option<(String, String)> {
         let after_prefix = name.strip_prefix(&self.prefix)?;
-        // Project is the first segment before the next '-'
-        let mut parts = after_prefix.splitn(2, '-');
-        let project = parts.next()?.to_string();
-        let rest = parts.next().unwrap_or_default();
 
-        // Internal tasks produce names like "{project}-internal-{n}".
-        if rest.starts_with("internal-") {
-            return Some((project, rest.to_string()));
+        // Strip optional "-review" suffix, reattach to the task_id later.
+        let (base, is_review) = match after_prefix.strip_suffix("-review") {
+            Some(stripped) => (stripped, true),
+            None => (after_prefix, false),
+        };
+
+        // Try internal task: {project}-internal-{digits}
+        if let Some(idx) = base.rfind("-internal-") {
+            let project = &base[..idx];
+            let task_base = &base[idx + 1..]; // "internal-{digits}"
+            let after_internal = &task_base["internal-".len()..];
+            if !project.is_empty()
+                && !after_internal.is_empty()
+                && after_internal.chars().all(|c| c.is_ascii_digit())
+            {
+                let task_id = if is_review {
+                    format!("{task_base}-review")
+                } else {
+                    task_base.to_string()
+                };
+                return Some((project.to_string(), task_id));
+            }
         }
 
-        // External task: numeric id is the last segment.
-        let ext_id = rest.rsplit('-').next().unwrap_or(rest).to_string();
-        Some((project, ext_id))
+        // External task: {project}-{digits}
+        if let Some(idx) = base.rfind('-') {
+            let project = &base[..idx];
+            let digits = &base[idx + 1..];
+            if !project.is_empty()
+                && !digits.is_empty()
+                && digits.chars().all(|c| c.is_ascii_digit())
+            {
+                let task_id = if is_review {
+                    format!("{digits}-review")
+                } else {
+                    digits.to_string()
+                };
+                return Some((project.to_string(), task_id));
+            }
+        }
+
+        None
     }
 
     /// Get pane_dead status for all sessions in a single tmux call.
@@ -560,6 +597,57 @@ mod tests {
     fn task_id_from_session_name_returns_none_for_non_orch_session() {
         let tmux = TmuxManager::new();
         assert_eq!(tmux.parse_session_name("some-other-session"), None);
+    }
+
+    #[test]
+    fn parse_session_name_hyphenated_project_external() {
+        let tmux = TmuxManager::new();
+        // "orch-my-repo-1234" → project "my-repo", task_id "1234"
+        assert_eq!(
+            tmux.parse_session_name("orch-my-repo-1234"),
+            Some(("my-repo".to_string(), "1234".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_session_name_hyphenated_project_internal() {
+        let tmux = TmuxManager::new();
+        // "orch-my-repo-internal-8" → project "my-repo", task_id "internal-8"
+        assert_eq!(
+            tmux.parse_session_name("orch-my-repo-internal-8"),
+            Some(("my-repo".to_string(), "internal-8".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_session_name_hyphenated_project_review() {
+        let tmux = TmuxManager::new();
+        // "orch-my-repo-1234-review" → project "my-repo", task_id "1234-review"
+        assert_eq!(
+            tmux.parse_session_name("orch-my-repo-1234-review"),
+            Some(("my-repo".to_string(), "1234-review".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_session_name_multi_hyphen_project() {
+        let tmux = TmuxManager::new();
+        // "orch-my-cool-repo-42" → project "my-cool-repo", task_id "42"
+        assert_eq!(
+            tmux.parse_session_name("orch-my-cool-repo-42"),
+            Some(("my-cool-repo".to_string(), "42".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_session_name_roundtrip_hyphenated_project() {
+        let tmux = TmuxManager::new();
+        let name = tmux.session_name("owner/my-repo", "1793");
+        assert_eq!(name, "orch-my-repo-1793");
+        assert_eq!(
+            tmux.parse_session_name(&name),
+            Some(("my-repo".to_string(), "1793".to_string()))
+        );
     }
 
     /// Verify set_env runs the correct tmux set-environment command.
