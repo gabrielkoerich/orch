@@ -1343,6 +1343,7 @@ mod tests {
         dedup_result: bool,
         comments: tokio::sync::Mutex<Vec<(String, String)>>,
         status_updates: tokio::sync::Mutex<Vec<(String, Status)>>,
+        project_syncs: tokio::sync::Mutex<Vec<(String, Status)>>,
     }
 
     impl IngestMockBackend {
@@ -1368,6 +1369,7 @@ mod tests {
                 dedup_result,
                 comments: tokio::sync::Mutex::new(Vec::new()),
                 status_updates: tokio::sync::Mutex::new(Vec::new()),
+                project_syncs: tokio::sync::Mutex::new(Vec::new()),
             })
         }
     }
@@ -1427,6 +1429,11 @@ mod tests {
 
         async fn has_open_issue_with_title(&self, _: &str, _: &str) -> anyhow::Result<bool> {
             Ok(self.dedup_result)
+        }
+
+        async fn sync_to_project(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+            self.project_syncs.lock().await.push((id.0.clone(), status));
+            Ok(())
         }
     }
 
@@ -1633,6 +1640,44 @@ mod tests {
             crate::store::TaskStatus::Routed,
             "ingest must not overwrite store-authoritative status"
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_sync_to_project_called_only_for_new_tasks() {
+        use crate::store::{NewTask, TaskStore};
+
+        // Two tasks: "10" is pre-existing, "11" is new.
+        let backend = IngestMockBackend::with_tasks(vec![
+            (Status::New, make_ext_task("10", "Existing task")),
+            (Status::New, make_ext_task("11", "New task")),
+        ]);
+        let backend_dyn: Arc<dyn ExternalBackend> = backend.clone();
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        // Pre-insert task "10" so it already exists in the store.
+        store
+            .create(&NewTask {
+                external_id: Some("10".to_string()),
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "Existing task".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        ingest_external_tasks(&backend_dyn, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let syncs = backend.project_syncs.lock().await;
+        // Only the new task "11" should trigger sync_to_project — not the pre-existing "10".
+        assert_eq!(
+            syncs.len(),
+            1,
+            "sync_to_project must be called exactly once (for new task only), got: {syncs:?}"
+        );
+        assert_eq!(syncs[0].0, "11", "sync_to_project must target the new task");
     }
 
     // ── kv_get_prefer_store / kv_set_prefer_store ────────────────────
