@@ -86,7 +86,11 @@ fn classify_run_outcome(
     status: &str,
     parse_result: &Result<agents::ParsedResponse, agents::AgentError>,
     push_failed: bool,
+    budget_exceeded: bool,
 ) -> &'static str {
+    if budget_exceeded {
+        return "budget_exceeded";
+    }
     if push_failed {
         return "push_failed";
     }
@@ -178,6 +182,7 @@ struct RunAuditInput<'a> {
     error_override: Option<String>,
     elapsed_secs: Option<u64>,
     push_failed: bool,
+    budget_exceeded: bool,
 }
 
 fn parse_success_output(
@@ -294,8 +299,13 @@ impl TaskRunner {
             stdout: input.raw_stdout.to_string(),
             stderr: input.raw_stderr.to_string(),
             parsed_response: serialize_parsed_response(input.parse_result, input.raw_stdout),
-            outcome: classify_run_outcome(input.status, input.parse_result, input.push_failed)
-                .to_string(),
+            outcome: classify_run_outcome(
+                input.status,
+                input.parse_result,
+                input.push_failed,
+                input.budget_exceeded,
+            )
+            .to_string(),
             error,
             input_tokens,
             output_tokens,
@@ -470,6 +480,7 @@ impl TaskRunner {
                         error_override: Some(format!("silence detection set task to {status_str}")),
                         elapsed_secs: session_output.elapsed_secs,
                         push_failed: false,
+                        budget_exceeded: false,
                     })
                     .await;
                 return Ok(Some(RunExecution {
@@ -579,6 +590,7 @@ impl TaskRunner {
                             error_override: None,
                             elapsed_secs: session_output.elapsed_secs,
                             push_failed,
+                            budget_exceeded,
                         })
                         .await;
                     return Ok(Some(RunExecution {
@@ -617,6 +629,7 @@ impl TaskRunner {
                                 error_override: Some(agent_err.to_string()),
                                 elapsed_secs: session_output.elapsed_secs,
                                 push_failed: false,
+                                budget_exceeded: false,
                             })
                             .await;
                         return Ok(Some(RunExecution {
@@ -658,6 +671,7 @@ impl TaskRunner {
                 error_override: None,
                 elapsed_secs: session_output.elapsed_secs,
                 push_failed,
+                budget_exceeded: _budget_exceeded,
             })
             .await;
 
