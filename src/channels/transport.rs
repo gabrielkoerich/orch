@@ -292,8 +292,12 @@ fn split_chunks(content: &str, max_bytes: usize) -> Vec<String> {
             end -= 1;
         }
         if end == start {
-            // Single char exceeds limit — advance one byte to avoid infinite loop
-            end = (start + 1).min(total);
+            // Single char exceeds limit — advance past the full character
+            if let Some(ch) = content[start..].chars().next() {
+                end = start + ch.len_utf8();
+            } else {
+                break;
+            }
         }
         chunks.push(content[start..end].to_string());
         start = end;
@@ -366,6 +370,29 @@ mod tests {
         let n2 = rx2.recv().await.unwrap();
         assert_eq!(n1.task_id, "1");
         assert_eq!(n2.task_id, "1");
+    }
+
+    #[test]
+    fn split_chunks_multibyte_at_boundary_does_not_panic() {
+        // 4-byte emoji at the chunk boundary: the old code set end = start + 1
+        // and then sliced content[start..end], which panics on multi-byte chars.
+        let content = "x".repeat(97) + "😀"; // 101 bytes; with max=100 the cut is at byte 100 (mid-emoji)
+        let chunks = split_chunks(&content, 100);
+        assert_eq!(chunks.join(""), content);
+        for c in &chunks {
+            assert!(std::str::from_utf8(c.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn split_chunks_only_emojis() {
+        // Every boundary falls inside a 4-byte character.
+        let content = "😀".repeat(50); // 200 bytes
+        let chunks = split_chunks(&content, 10); // 10 bytes per chunk, emoji is 4 bytes
+        assert_eq!(chunks.join(""), content);
+        for c in &chunks {
+            assert!(std::str::from_utf8(c.as_bytes()).is_ok());
+        }
     }
 
     #[test]
