@@ -766,7 +766,7 @@ pub(super) async fn handle_stats_command(
             None => continue,
         };
 
-        match store.get_metrics_summary_24h_by_repo(repo).await {
+        match store.get_metrics_summary_by_repo(repo, 24).await {
             Ok(summary) => {
                 let total = summary.tasks_completed_24h + summary.tasks_failed_24h;
                 let rate = if total > 0 {

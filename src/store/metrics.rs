@@ -360,6 +360,8 @@ impl TaskStore {
     ///
     /// `hours` controls how far back to look. Uses `COALESCE(NULLIF(m.repo, ''), t.repo)`
     /// join pattern so older metric rows without a repo column still match.
+    ///
+    /// Optimized to use a single CTE query with conditional aggregation instead of 7 sequential queries.
     pub async fn get_metrics_summary_by_repo(
         &self,
         repo: &str,
@@ -367,71 +369,42 @@ impl TaskStore {
     ) -> anyhow::Result<MetricsSummary> {
         let interval = format!("-{hours} hours");
 
-        let completed: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', ?)
-         AND m.outcome = 'success'
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
+        let rows = sqlx::query(
+            "WITH base AS (
+                SELECT m.outcome, m.complexity, m.duration_seconds, m.agent,
+                    COALESCE(NULLIF(m.repo, ''), t.repo) AS resolved_repo
+                FROM task_metrics m
+                LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+                WHERE m.completed_at >= datetime('now', ?)
+            )
+            SELECT
+                SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN outcome != 'success' THEN 1 ELSE 0 END) AS failed,
+                AVG(CASE WHEN complexity = 'simple' THEN duration_seconds END) AS avg_simple,
+                AVG(CASE WHEN complexity = 'medium' THEN duration_seconds END) AS avg_medium,
+                AVG(CASE WHEN complexity = 'complex' THEN duration_seconds END) AS avg_complex
+            FROM base
+            WHERE resolved_repo = ?",
         )
         .bind(&interval)
         .bind(repo)
         .fetch_one(&self.pool)
         .await?;
 
-        let failed: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', ?)
-         AND m.outcome != 'success'
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
-        )
-        .bind(&interval)
-        .bind(repo)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let avg_simple: Option<(f64,)> = sqlx::query_as(
-            "SELECT AVG(m.duration_seconds) FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', ?) AND m.complexity = 'simple'
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
-        )
-        .bind(&interval)
-        .bind(repo)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let avg_medium: Option<(f64,)> = sqlx::query_as(
-            "SELECT AVG(m.duration_seconds) FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', ?) AND m.complexity = 'medium'
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
-        )
-        .bind(&interval)
-        .bind(repo)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let avg_complex: Option<(f64,)> = sqlx::query_as(
-            "SELECT AVG(m.duration_seconds) FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', ?) AND m.complexity = 'complex'
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
-        )
-        .bind(&interval)
-        .bind(repo)
-        .fetch_optional(&self.pool)
-        .await?;
+        let completed: i64 = rows.try_get("completed").unwrap_or(0);
+        let failed: i64 = rows.try_get("failed").unwrap_or(0);
+        let avg_simple: Option<f64> = rows.try_get("avg_simple").ok();
+        let avg_medium: Option<f64> = rows.try_get("avg_medium").ok();
+        let avg_complex: Option<f64> = rows.try_get("avg_complex").ok();
 
         let agent_rows = sqlx::query(
             "SELECT m.agent, COUNT(*) as total,
                 SUM(CASE WHEN m.outcome = 'success' THEN 1 ELSE 0 END) as success_count
-         FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', ?)
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?
-         GROUP BY m.agent",
+             FROM task_metrics m
+             LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
+             WHERE m.completed_at >= datetime('now', ?)
+             AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?
+             GROUP BY m.agent",
         )
         .bind(&interval)
         .bind(repo)
@@ -464,119 +437,11 @@ impl TaskStore {
         .await?;
 
         Ok(MetricsSummary {
-            tasks_completed_24h: completed.0,
-            tasks_failed_24h: failed.0,
-            avg_duration_simple: avg_simple.map(|r| r.0),
-            avg_duration_medium: avg_medium.map(|r| r.0),
-            avg_duration_complex: avg_complex.map(|r| r.0),
-            agent_stats,
-            rate_limits_24h: rate_limits.0,
-        })
-    }
-
-    /// Get metrics summary for the last 24 hours, filtered by repo.
-    /// Joins task_metrics with tasks table to get repo context.
-    #[allow(dead_code)]
-    pub async fn get_metrics_summary_24h_by_repo(
-        &self,
-        repo: &str,
-    ) -> anyhow::Result<MetricsSummary> {
-        // Use COALESCE: prefer task_metrics.repo if populated, otherwise join tasks table
-        let completed: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', '-24 hours')
-         AND m.outcome = 'success'
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
-        )
-        .bind(repo)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let failed: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', '-24 hours')
-         AND m.outcome != 'success'
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
-        )
-        .bind(repo)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let avg_simple: Option<(f64,)> = sqlx::query_as(
-            "SELECT AVG(m.duration_seconds) FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', '-24 hours') AND m.complexity = 'simple'
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
-        )
-        .bind(repo)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let avg_medium: Option<(f64,)> = sqlx::query_as(
-            "SELECT AVG(m.duration_seconds) FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', '-24 hours') AND m.complexity = 'medium'
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
-        )
-        .bind(repo)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let avg_complex: Option<(f64,)> = sqlx::query_as(
-            "SELECT AVG(m.duration_seconds) FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', '-24 hours') AND m.complexity = 'complex'
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?",
-        )
-        .bind(repo)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let agent_rows = sqlx::query(
-            "SELECT m.agent, COUNT(*) as total,
-                SUM(CASE WHEN m.outcome = 'success' THEN 1 ELSE 0 END) as success_count
-         FROM task_metrics m
-         LEFT JOIN tasks t ON m.task_id = CAST(t.id AS TEXT) OR m.task_id = t.external_id
-         WHERE m.completed_at >= datetime('now', '-24 hours')
-         AND COALESCE(NULLIF(m.repo, ''), t.repo) = ?
-         GROUP BY m.agent",
-        )
-        .bind(repo)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let agent_stats: Vec<AgentStat> = agent_rows
-            .iter()
-            .map(|row| {
-                let total: i64 = row.try_get("total").unwrap_or(0);
-                let success: i64 = row.try_get("success_count").unwrap_or(0);
-                AgentStat {
-                    agent: row.try_get("agent").unwrap_or_default(),
-                    total_runs: total,
-                    success_count: success,
-                    success_rate: if total > 0 {
-                        (success as f64 / total as f64) * 100.0
-                    } else {
-                        0.0
-                    },
-                }
-            })
-            .collect();
-
-        let rate_limits: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM rate_limits WHERE occurred_at >= datetime('now', '-24 hours')",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(MetricsSummary {
-            tasks_completed_24h: completed.0,
-            tasks_failed_24h: failed.0,
-            avg_duration_simple: avg_simple.map(|r| r.0),
-            avg_duration_medium: avg_medium.map(|r| r.0),
-            avg_duration_complex: avg_complex.map(|r| r.0),
+            tasks_completed_24h: completed,
+            tasks_failed_24h: failed,
+            avg_duration_simple: avg_simple,
+            avg_duration_medium: avg_medium,
+            avg_duration_complex: avg_complex,
             agent_stats,
             rate_limits_24h: rate_limits.0,
         })
