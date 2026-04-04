@@ -188,26 +188,47 @@ fn classify_router_llm_failure(agent: &str, stdout: &str, stderr: &str) -> Strin
         // Check for startup/system-only NDJSON by running through extract_agent_text
         // This mirrors the logic in parse_llm_response() to detect when stdout only
         // contains system envelopes (hook_started, init, etc.) with no actual result.
-        if let Ok(text) = extract_agent_text_for_classification(agent, stdout_trimmed) {
-            let trimmed_text = text.trim();
-            // If extraction yielded only a system/init envelope, report that specifically
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed_text) {
-                if val.get("type").and_then(|v| v.as_str()) == Some("system") {
-                    return "router LLM produced only system/startup envelope".to_string();
+        match extract_agent_text_for_classification(agent, stdout_trimmed) {
+            Ok(text) => {
+                let trimmed_text = text.trim();
+
+                // Check if all lines are valid JSON system/event envelopes
+                let lines: Vec<&str> = trimmed_text
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+                if !lines.is_empty() {
+                    let mut all_system = true;
+                    for line in &lines {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                            let typ = val.get("type").and_then(|v| v.as_str());
+                            let subtype = val.get("subtype").and_then(|v| v.as_str());
+                            if typ != Some("system")
+                                && typ != Some("event")
+                                && subtype != Some("init")
+                            {
+                                all_system = false;
+                                break;
+                            }
+                        } else {
+                            all_system = false;
+                            break;
+                        }
+                    }
+                    if all_system {
+                        return "router LLM produced only system/startup envelope".to_string();
+                    }
                 }
-                if val
-                    .get("subtype")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s == "init")
-                    .unwrap_or(false)
-                {
-                    return "router LLM produced only init envelope".to_string();
+
+                // If extracted text is empty or very short, it likely means the agent produced
+                // only metadata envelopes without actual routing output
+                if trimmed_text.is_empty() || trimmed_text.len() < 10 {
+                    return "router LLM produced no text output (NDJSON envelopes only)"
+                        .to_string();
                 }
             }
-            // If extracted text is empty or very short, it likely means the agent produced
-            // only metadata envelopes without actual routing output
-            if trimmed_text.is_empty() || trimmed_text.len() < 10 {
-                return "router LLM produced no text output (NDJSON envelopes only)".to_string();
+            Err(e) => {
+                return e.to_string();
             }
         }
 
@@ -271,8 +292,17 @@ fn extract_agent_text_for_classification(agent: &str, raw: &str) -> anyhow::Resu
         }
         "claude" | "kimi" | "minimax" => match claude::extract_stream_json_result_text(raw) {
             Ok(text) => Ok(text),
-            // On extraction errors, return raw so caller can still inspect it
-            Err(_) => Ok(raw.to_string()),
+            Err(AgentError::AgentFailed { message }) => {
+                Err(anyhow::anyhow!("router LLM returned error: {message}"))
+            }
+            Err(AgentError::InvalidResponse { raw }) => {
+                if let Some(text) = opencode::extract_router_text(&raw) {
+                    Ok(text)
+                } else {
+                    Ok(raw)
+                }
+            }
+            Err(err) => Err(anyhow::anyhow!("router LLM returned error: {err}")),
         },
         _ => Ok(raw.to_string()),
     }
@@ -1657,5 +1687,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── classify_router_llm_failure ───────────────────────────────────────────
+
+    #[test]
+    fn classify_nonzero_exit_with_structured_stdout_error() {
+        let stdout =
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let stderr = "";
+        let result = classify_router_llm_failure("claude", stdout, stderr);
+        assert!(result.contains("type=error") && result.contains("Overloaded"));
+    }
+
+    #[test]
+    fn classify_nonzero_exit_with_claude_ndjson_error() {
+        let stdout = r#"{"type":"result","is_error":true,"result":"Claude model haiku is not available","usage":null}"#;
+        let stderr = "";
+        let result = classify_router_llm_failure("claude", stdout, stderr);
+        assert!(result.contains("router LLM returned error: Claude model haiku is not available"));
+    }
+
+    #[test]
+    fn classify_nonzero_exit_with_system_only_ndjson() {
+        let stdout = r#"{"type":"system","subtype":"hook_started","hook_id":"123"}
+{"type":"system","subtype":"init","hook_id":"123"}"#;
+        let stderr = "some warning here";
+        let result = classify_router_llm_failure("claude", stdout, stderr);
+        assert_eq!(result, "router LLM produced only system/startup envelope");
+    }
+
+    #[test]
+    fn classify_nonzero_exit_with_no_text_ndjson_only() {
+        let stdout = r#"{"type":"event","data":{}}"#;
+        let stderr = "some warning here";
+        let result = classify_router_llm_failure("opencode", stdout, stderr);
+        assert_eq!(result, "router LLM produced only system/startup envelope");
     }
 }
