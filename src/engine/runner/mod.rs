@@ -397,12 +397,10 @@ impl TaskRunner {
                 );
                 if let Some(b) = backend {
                     let id = crate::backends::ExternalId(task_id.to_string());
-                    let _ = b
-                        .update_status(&id, crate::backends::Status::NeedsReview)
-                        .await;
+                    let _ = b.update_status(&id, crate::backends::Status::Blocked).await;
                 }
                 return Ok(Some(RunExecution {
-                    status: "needs_review".to_string(),
+                    status: "blocked".to_string(),
                     exit_code: None,
                     audit: RunAudit {
                         stdout: String::new(),
@@ -1916,5 +1914,68 @@ mod tests {
         let parsed = result.expect("should synthesize response from text");
         assert_eq!(parsed.input_tokens, None);
         assert_eq!(parsed.output_tokens, None);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn run_with_context_blocks_when_budget_exceeded_pre_run() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp_home = TempDir::new().unwrap();
+        let orch_home = temp_home.path().join(".orch");
+        std::fs::create_dir_all(&orch_home).unwrap();
+        let old_orch_home = std::env::var("ORCH_HOME").ok();
+        std::env::set_var("ORCH_HOME", &orch_home);
+
+        let repo = "owner/repo";
+        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+
+        let task_id = "111";
+        let task = make_task(task_id);
+
+        let row_id = store.ensure_external_task(repo, &task).await.unwrap();
+
+        store
+            .set_fields(
+                row_id,
+                &[
+                    ("pr_number", serde_json::json!(42)),
+                    ("budget_exceeded", serde_json::json!(true)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        store
+            .store_tokens(row_id, 100000, 100000, "haiku")
+            .await
+            .unwrap();
+
+        let mut runner = TaskRunner::new(repo.to_string());
+        runner = runner.with_store(store.clone());
+
+        std::env::set_var("ORCH_MAX_TOKENS_PER_TASK", "10");
+
+        let backend = Arc::new(TrackingBackend::new());
+        let backend_dyn: Arc<dyn crate::backends::ExternalBackend> = backend.clone();
+        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+
+        let result = runner
+            .run_with_context(&task, &backend_dyn, &tmux, None)
+            .await
+            .unwrap();
+
+        assert!(matches!(result, WeightSignal::Blocked));
+
+        let updates = backend.status_updates.lock().unwrap();
+        assert!(updates
+            .iter()
+            .any(|(id, s)| id == task_id && *s == crate::backends::Status::Blocked));
+
+        std::env::remove_var("ORCH_MAX_TOKENS_PER_TASK");
+        if let Some(old) = old_orch_home {
+            std::env::set_var("ORCH_HOME", old);
+        } else {
+            std::env::remove_var("ORCH_HOME");
+        }
     }
 }
