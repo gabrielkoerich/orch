@@ -403,11 +403,13 @@ impl OpenCodeRunner {
             let cache_arc = Arc::clone(&self.free_models_cache);
             let flag_arc = Arc::clone(&self.free_models_refresh_in_progress);
             std::thread::spawn(move || {
+                let _guard = scopeguard::guard((), |_| {
+                    flag_arc.store(false, std::sync::atomic::Ordering::Release);
+                });
                 let models = discover_free_models();
                 if let Ok(mut cache) = cache_arc.lock() {
                     *cache = Some((models, std::time::Instant::now()));
                 }
-                flag_arc.store(false, std::sync::atomic::Ordering::Release);
             });
         }
 
