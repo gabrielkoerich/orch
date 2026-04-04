@@ -390,6 +390,9 @@ impl TaskManager {
                 .ok_or_else(|| anyhow::anyhow!("store required for internal task status update"))?;
             let store_id = snapshot_store_id
                 .ok_or_else(|| anyhow::anyhow!("internal task {} not found in store", id.0))?;
+            if task_status != TaskStatus::Blocked {
+                store.set_block_reason(store_id, None).await?;
+            }
             store.update_status(store_id, task_status).await?;
             self.publish_event(id, status, &pre_snapshot, duration_seconds);
             return Ok(());
@@ -397,6 +400,9 @@ impl TaskManager {
 
         if let Some(ref store) = self.store {
             if let Some(store_id) = snapshot_store_id {
+                if task_status != TaskStatus::Blocked {
+                    store.set_block_reason(store_id, None).await?;
+                }
                 store.update_status(store_id, task_status).await?;
             }
         }
