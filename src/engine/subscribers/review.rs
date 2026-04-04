@@ -446,6 +446,29 @@ pub fn spawn(
                             false,
                         )
                         .await;
+
+                        // Freshness guard: re-fetch the task's current status before applying
+                        // any outcome transitions. A concurrent path (e.g. PR merge, manual
+                        // close, or another review cycle) may have already moved the task out
+                        // of `in_review`. If so, discard the stale outcome rather than
+                        // overwriting the newer state.
+                        let current_status: Option<crate::store::TaskStatus> = async {
+                            let id = store_c.resolve_task_id(&repo_s, &tid).await.ok().flatten()?;
+                            let task = store_c.get(id).await.ok()?;
+                            Some(task.status)
+                        }
+                        .await;
+
+                        if !matches!(current_status, Some(crate::store::TaskStatus::InReview)) {
+                            tracing::warn!(
+                                task_id = tid,
+                                current_status = current_status.as_ref().map(|s| s.as_str()).unwrap_or("unknown"),
+                                "review outcome discarded — task is no longer in_review (stale review agent result)"
+                            );
+                            drop(permit);
+                            return;
+                        }
+
                         match outcome {
                             ReviewOutcome::Reset => {
                                 // Kill any stale tmux review session before resetting — the
