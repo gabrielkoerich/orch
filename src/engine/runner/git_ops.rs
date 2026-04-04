@@ -230,7 +230,7 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
                 // apply it back by its exact ref, regardless of any stashes
                 // that other worktrees may push between now and then.
                 let ref_out = Command::new("git")
-                    .args(["rev-parse", "refs/stash"])
+                    .args(["rev-parse", "refs/stash@{0}"])
                     .current_dir(dir)
                     .output_with_context()
                     .await;
