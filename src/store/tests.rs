@@ -4481,7 +4481,7 @@ async fn metrics_summary_by_repo_filters_correctly() {
 
     // Query per-repo: orch
     let orch_stats = store
-        .get_metrics_summary_24h_by_repo("owner/orch")
+        .get_metrics_summary_by_repo("owner/orch", 24)
         .await
         .unwrap();
     assert_eq!(orch_stats.tasks_completed_24h, 1);
@@ -4490,7 +4490,7 @@ async fn metrics_summary_by_repo_filters_correctly() {
 
     // Query per-repo: bean
     let bean_stats = store
-        .get_metrics_summary_24h_by_repo("owner/bean")
+        .get_metrics_summary_by_repo("owner/bean", 24)
         .await
         .unwrap();
     assert_eq!(bean_stats.tasks_completed_24h, 1);
