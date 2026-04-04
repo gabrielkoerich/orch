@@ -87,59 +87,45 @@ impl CodexRunner {
     /// Scans ALL error events and returns the most specific one.
     /// Priority: RateLimit > ModelUnavailable > Auth > ContextOverflow > AgentFailed
     fn detect_error(&self, events: &[serde_json::Value]) -> Option<AgentError> {
-        let mut best: Option<AgentError> = None;
-
-        for event in events {
-            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-            let classified = match event_type {
-                "turn.failed" => {
-                    let message = event
-                        .get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("turn failed");
-                    Some(self.classify_message(message))
-                }
-                "error" => {
-                    let message = event
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error");
-                    Some(self.classify_message(message))
-                }
-                "item.completed" => {
-                    if let Some(item) = event.get("item") {
+        super::patterns::detect_ndjson_error(
+            events,
+            |event| {
+                let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match event_type {
+                    "turn.failed" => Some(
+                        event
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("turn failed")
+                            .to_string(),
+                    ),
+                    "error" => Some(
+                        event
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown error")
+                            .to_string(),
+                    ),
+                    "item.completed" => {
+                        let item = event.get("item")?;
                         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         if item_type == "error" {
-                            let message = item
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("item error");
-                            Some(self.classify_message(message))
+                            Some(
+                                item.get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("item error")
+                                    .to_string(),
+                            )
                         } else {
                             None
                         }
-                    } else {
-                        None
                     }
+                    _ => None,
                 }
-                _ => None,
-            };
-
-            if let Some(err) = classified {
-                // Replace if no best yet, or if current best is only a generic AgentFailed.
-                // Keep existing specific errors as-is.
-                match &best {
-                    None | Some(AgentError::AgentFailed { .. }) => {
-                        best = Some(err);
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-
-        best
+            },
+            |msg| self.classify_message(msg),
+        )
     }
 
     /// Classify an error message into an AgentError variant.

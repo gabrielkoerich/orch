@@ -318,53 +318,57 @@ impl OpenCodeRunner {
 
     /// Check for error events in the stream.
     fn detect_error(&self, events: &[serde_json::Value]) -> Option<AgentError> {
-        for event in events {
-            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-            if event_type == "error" {
-                // OpenCode error events have multiple shapes:
-                // 1. {"type":"error","message":"..."}
-                // 2. {"type":"error","error":"string message"}
-                // 3. {"type":"error","error":{"name":"...","data":{"message":"..."}}}
-                let message = event
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| event.get("error").and_then(|v| v.as_str()))
-                    .or_else(|| {
-                        event
-                            .get("error")
-                            .and_then(|e| e.get("data"))
-                            .and_then(|d| d.get("message"))
-                            .and_then(|m| m.as_str())
-                    })
-                    .or_else(|| {
-                        // Last resort: stringify the error object
-                        event
-                            .get("error")
-                            .and_then(|e| e.get("name"))
-                            .and_then(|n| n.as_str())
-                    })
-                    .unwrap_or("unknown error");
-
-                return Some(classify_opencode_message(message));
-            }
-
-            // Check step_finish for error reasons
-            if event_type == "step_finish" {
-                if let Some(part) = event.get("part") {
-                    let reason = part.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-                    if reason == "error" || reason == "failed" {
-                        let msg = part
-                            .get("error")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("step failed");
-                        return Some(classify_opencode_message(msg));
+        super::patterns::detect_ndjson_error(
+            events,
+            |event| {
+                let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match event_type {
+                    "error" => {
+                        // OpenCode error events have multiple shapes:
+                        // 1. {"type":"error","message":"..."}
+                        // 2. {"type":"error","error":"string message"}
+                        // 3. {"type":"error","error":{"name":"...","data":{"message":"..."}}}
+                        Some(
+                            event
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| event.get("error").and_then(|v| v.as_str()))
+                                .or_else(|| {
+                                    event
+                                        .get("error")
+                                        .and_then(|e| e.get("data"))
+                                        .and_then(|d| d.get("message"))
+                                        .and_then(|m| m.as_str())
+                                })
+                                .or_else(|| {
+                                    event
+                                        .get("error")
+                                        .and_then(|e| e.get("name"))
+                                        .and_then(|n| n.as_str())
+                                })
+                                .unwrap_or("unknown error")
+                                .to_string(),
+                        )
                     }
+                    "step_finish" => {
+                        let part = event.get("part")?;
+                        let reason = part.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                        if reason == "error" || reason == "failed" {
+                            Some(
+                                part.get("error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("step failed")
+                                    .to_string(),
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
                 }
-            }
-        }
-
-        None
+            },
+            classify_opencode_message,
+        )
     }
 
     /// Return the cached free-model list, refreshing in the background when stale.

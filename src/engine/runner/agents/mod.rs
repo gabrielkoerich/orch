@@ -995,6 +995,34 @@ pub(crate) mod patterns {
         }
         &text[idx..]
     }
+
+    /// Scan NDJSON events for errors using agent-specific extraction and classification.
+    ///
+    /// `extract_message` is called for each event to extract an error message string.
+    /// If it returns `Some`, the message is classified via `classify`. The most
+    /// specific error is kept — any typed error (RateLimit, Auth, etc.) takes
+    /// precedence over a generic `AgentFailed`.
+    pub fn detect_ndjson_error(
+        events: &[serde_json::Value],
+        extract_message: impl Fn(&serde_json::Value) -> Option<String>,
+        classify: impl Fn(&str) -> AgentError,
+    ) -> Option<AgentError> {
+        let mut best: Option<AgentError> = None;
+
+        for event in events {
+            if let Some(message) = extract_message(event) {
+                let err = classify(&message);
+                match &best {
+                    None | Some(AgentError::AgentFailed { .. }) => {
+                        best = Some(err);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+
+        best
+    }
 }
 
 #[cfg(test)]
