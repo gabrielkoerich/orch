@@ -1317,6 +1317,7 @@ pub(crate) async fn ingest_external_tasks(
     }
 
     // 2. All labeled active statuses — for status sync on first ingest.
+    //    All 6 calls are independent — run them in parallel to reduce sync latency.
     let active_statuses = [
         Status::New,
         Status::Routed,
@@ -1325,17 +1326,23 @@ pub(crate) async fn ingest_external_tasks(
         Status::InReview,
         Status::Blocked,
     ];
-    for status in &active_statuses {
-        let tasks = match backend.list_by_status(*status).await {
-            Ok(t) => t,
+    let status_results = futures::future::join_all(
+        active_statuses
+            .iter()
+            .map(|status| async move { (*status, backend.list_by_status(*status).await) }),
+    )
+    .await;
+    for (status, result) in status_results {
+        match result {
+            Ok(tasks) => {
+                for task in tasks {
+                    if seen.insert(task.id.0.clone()) {
+                        all_tasks.push((task, Some(status)));
+                    }
+                }
+            }
             Err(e) => {
                 tracing::debug!(?status, ?e, "ingest: failed to list tasks");
-                continue;
-            }
-        };
-        for task in tasks {
-            if seen.insert(task.id.0.clone()) {
-                all_tasks.push((task, Some(*status)));
             }
         }
     }
