@@ -990,6 +990,9 @@ pub(crate) mod patterns {
         if let Some(e) = detect_auth_error(text) {
             return e;
         }
+        if let Some(e) = detect_stale_session(text) {
+            return e;
+        }
 
         AgentError::Unknown {
             exit_code,
@@ -1265,6 +1268,25 @@ mod tests {
         assert!(
             matches!(err, AgentError::RateLimit { .. }),
             "real rate limit at tail must be detected, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_detects_stale_session() {
+        // Regression test for issue #1800: classify_from_text must call
+        // detect_stale_session to catch "No conversation found with session ID"
+        // errors. Without this, the error would be misclassified as Unknown and
+        // the control.rs recovery code would not trigger.
+        let text = "No conversation found with session ID: 2be572c4-57bb-4f86-bc03-b593c329177c";
+        let err = patterns::classify_from_text(1, text);
+        assert!(
+            matches!(err, AgentError::StaleSession { .. }),
+            "stale session must be detected via classify_from_text, got: {err:?}"
+        );
+        // Verify the Display format matches what control.rs expects
+        assert!(
+            err.to_string().contains("stale session"),
+            "error display must contain 'stale session' for recovery code to trigger"
         );
     }
 
