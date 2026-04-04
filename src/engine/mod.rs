@@ -349,7 +349,7 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
         let repo_root_path = std::path::PathBuf::from(&repo_root);
         let default_branch =
             crate::engine::runner::worktree::detect_default_branch(&repo_root_path).await;
-        let worktrees = list_project_worktrees(&repo_root_path)?;
+        let worktrees = list_project_worktrees(&repo_root_path).await?;
 
         // Fetch refs once for all worktrees in this project, so rebase below
         // operates on up-to-date origin/* refs without N sequential fetches.
@@ -373,7 +373,7 @@ async fn reconcile_startup_worktrees(project_engines: &[ProjectEngine]) -> anyho
 
             // Validate gitdir link before doing anything else — a broken .git file
             // means git commands on this worktree will fail with "not a git repository".
-            if !validate_worktree_gitdir(&worktree_dir) {
+            if !validate_worktree_gitdir(&worktree_dir).await {
                 tracing::warn!(repo = %engine.repo, worktree = %worktree_dir.display(), "worktree has invalid or missing gitdir, removing");
                 remove_worktree_and_branch(name, &worktree_dir, Some(name), &repo_root_path, false)
                     .await;
