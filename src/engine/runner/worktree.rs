@@ -40,7 +40,7 @@ pub fn project_worktrees_dir(project_dir: &Path) -> PathBuf {
 }
 
 /// List all worktree directories for a project.
-pub fn list_project_worktrees(project_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+pub async fn list_project_worktrees(project_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let base = project_worktrees_dir(project_dir);
     let mut worktrees = Vec::new();
 
@@ -48,8 +48,8 @@ pub fn list_project_worktrees(project_dir: &Path) -> anyhow::Result<Vec<PathBuf>
         return Ok(worktrees);
     }
 
-    for entry in std::fs::read_dir(&base)? {
-        let entry = entry?;
+    let mut entries = tokio::fs::read_dir(&base).await?;
+    while let Some(entry) = entries.next_entry().await? {
         if entry.path().is_dir() {
             worktrees.push(entry.path());
         }
@@ -327,7 +327,7 @@ async fn resolve_branch_start_point(repo_root: &str, branch: &str, default_branc
 /// In a git worktree, `.git` is a file containing `gitdir: /path/to/.git/worktrees/<name>`.
 /// Returns `false` when the `.git` file is missing or points to a non-existent gitdir,
 /// indicating the worktree metadata is broken and the directory should be cleaned up.
-pub fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
+pub async fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
     let git_file = worktree_dir.join(".git");
     if !git_file.exists() {
         return false;
@@ -336,7 +336,7 @@ pub fn validate_worktree_gitdir(worktree_dir: &Path) -> bool {
     if git_file.is_dir() {
         return true;
     }
-    let content = match std::fs::read_to_string(&git_file) {
+    let content = match tokio::fs::read_to_string(&git_file).await {
         Ok(c) => c,
         Err(_) => return false,
     };

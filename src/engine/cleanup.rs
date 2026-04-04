@@ -459,7 +459,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
         // Validate git metadata before attempting any git operations.
         // If the .git file points to a deleted gitdir the worktree is
         // unrecoverable — force-remove the directory and skip git commands.
-        let gitdir_valid = crate::engine::runner::worktree::validate_worktree_gitdir(&wt);
+        let gitdir_valid = crate::engine::runner::worktree::validate_worktree_gitdir(&wt).await;
 
         if opts.dry_run {
             tracing::info!(
@@ -475,7 +475,7 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
                 worktree = %wt.display(),
                 "worktree has broken git metadata — force-removing directory without git operations"
             );
-            match std::fs::remove_dir_all(&wt) {
+            match tokio::fs::remove_dir_all(&wt).await {
                 Ok(()) => {
                     did_clean = true;
                 }
@@ -605,7 +605,7 @@ pub(crate) async fn remove_worktree_and_branch(
                     path = %wt.display(),
                     "path is not a registered worktree (stale metadata) — removing directory and pruning"
                 );
-                if let Err(e) = std::fs::remove_dir_all(wt) {
+                if let Err(e) = tokio::fs::remove_dir_all(wt).await {
                     // Only warn if the directory actually still exists after removal attempt.
                     if wt.exists() {
                         tracing::warn!(
@@ -757,6 +757,9 @@ async fn is_worktree_in_active_session(worktree: &std::path::Path) -> bool {
 /// Returns how many hours old the worktree directory is, based on its mtime.
 ///
 /// Returns `None` if the directory does not exist or the mtime cannot be read.
+/// Returns how many hours old the worktree directory is, based on its mtime.
+///
+/// Returns `None` if the directory does not exist or the mtime cannot be read.
 fn worktree_age_hours(worktree: &std::path::Path) -> Option<u64> {
     let metadata = std::fs::metadata(worktree).ok()?;
     let modified = metadata.modified().ok()?;
@@ -770,14 +773,15 @@ fn worktree_age_hours(worktree: &std::path::Path) -> Option<u64> {
 /// the worktree may belong to a different project than the current repo context.
 /// Instead, we extract the repo root from the worktree's `.git` file which contains
 /// a `gitdir:` pointer to the main repo's git directory.
-fn resolve_repo_root_from_worktree(wt: &std::path::Path) -> anyhow::Result<String> {
+pub async fn resolve_repo_root_from_worktree(wt: &std::path::Path) -> anyhow::Result<String> {
     // For worktrees, .git is a file (not a directory) containing gitdir path
     let git_file = wt.join(".git");
     if !git_file.exists() {
         anyhow::bail!(".git file not found in worktree at {}", wt.display());
     }
 
-    let content = std::fs::read_to_string(&git_file)
+    let content = tokio::fs::read_to_string(&git_file)
+        .await
         .map_err(|e| anyhow::anyhow!("failed to read .git file: {e}"))?;
 
     // Parse gitdir line: "gitdir: /path/to/repo/.git/worktrees/<name>"
@@ -823,7 +827,7 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
         } else {
             continue;
         };
-        if let Ok(content) = std::fs::read_to_string(&config_file) {
+        if let Ok(content) = tokio::fs::read_to_string(&config_file).await {
             if let Ok(doc) = serde_yml::from_str::<serde_yml::Value>(&content) {
                 if let Some(r) = doc
                     .get("gh")
@@ -1186,7 +1190,7 @@ mod tests {
         };
 
         // With ttl_hours=0 even a brand-new worktree is eligible.
-        let age = worktree_age_hours(&wt_dir).unwrap_or(u64::MAX);
+        let age = worktree_age_hours(&wt_dir).await.unwrap_or(u64::MAX);
         let opts = JanitorOptions {
             ttl_hours: 0,
             dry_run: true,
@@ -1220,7 +1224,7 @@ mod tests {
         // bare repo we created inside tmp (even though it's not registered in config).
         // Because resolve_repo_root will fail for our synthetic repo slug, we test the
         // inner helpers directly here.
-        let age = worktree_age_hours(&wt_dir).unwrap_or(u64::MAX);
+        let age = worktree_age_hours(&wt_dir).await.unwrap_or(u64::MAX);
         let in_use = false; // no tmux running in tests
         let skip = age < opts.ttl_hours || in_use;
 

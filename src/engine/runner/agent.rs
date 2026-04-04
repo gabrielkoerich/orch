@@ -62,7 +62,7 @@ pub struct AgentInvocation {
 pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow::Result<String> {
     // Prepare attempt directory and prompt files (system + message).
     let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
-    std::fs::create_dir_all(&attempt_dir)?;
+    tokio::fs::create_dir_all(&attempt_dir).await?;
 
     let sys_file = attempt_dir.join("prompt-sys.md");
     let msg_file = attempt_dir.join("prompt-msg.md");
@@ -92,8 +92,8 @@ pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow:
         inv.system_prompt.clone()
     };
 
-    std::fs::write(&sys_file, &sys_content)?;
-    std::fs::write(&msg_file, &inv.agent_message)?;
+    tokio::fs::write(&sys_file, &sys_content).await?;
+    tokio::fs::write(&msg_file, &inv.agent_message).await?;
 
     // Build agent command using per-agent runner (used in non-PTY path below)
     let runner = super::agents::get_runner(&inv.agent);
@@ -181,7 +181,7 @@ exit $CMD_STATUS
     // Write runner script to per-task attempt dir
     let script_path = attempt_dir.join("runner.sh");
     let script_content = build_runner_script(inv, &agent_cmd, &attempt_dir)?;
-    std::fs::write(&script_path, &script_content)?;
+    tokio::fs::write(&script_path, &script_content).await?;
 
     // Make executable
     #[cfg(unix)]

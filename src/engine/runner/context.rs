@@ -41,11 +41,11 @@ pub struct TaskContext {
 }
 
 /// Load task-specific context from context file.
-pub fn load_task_context(task_id: &str) -> String {
+pub async fn load_task_context(task_id: &str) -> String {
     let contexts_dir = crate::home::contexts_dir().unwrap_or_default();
 
     let path = contexts_dir.join(format!("task-{task_id}.md"));
-    std::fs::read_to_string(&path).unwrap_or_default()
+    tokio::fs::read_to_string(&path).await.unwrap_or_default()
 }
 
 /// Build parent task context for subtasks.
@@ -123,12 +123,12 @@ pub async fn build_parent_context(
 }
 
 /// Build project instructions from CLAUDE.md, AGENTS.md, README.md.
-pub fn build_project_instructions(project_dir: &Path) -> String {
+pub async fn build_project_instructions(project_dir: &Path) -> String {
     let mut instructions = String::new();
 
     for filename in &["CLAUDE.md", "AGENTS.md", "README.md"] {
         let path = project_dir.join(filename);
-        if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
             if !content.is_empty() {
                 instructions.push_str(&format!("## {filename}\n\n{content}\n\n"));
             }
@@ -139,7 +139,7 @@ pub fn build_project_instructions(project_dir: &Path) -> String {
 }
 
 /// Build skills documentation for selected skills.
-pub fn build_skills_docs(selected_skills: &[String]) -> String {
+pub async fn build_skills_docs(selected_skills: &[String]) -> String {
     if selected_skills.is_empty() {
         return String::new();
     }
@@ -156,7 +156,7 @@ pub fn build_skills_docs(selected_skills: &[String]) -> String {
     for skill in selected_skills {
         for dir in &skills_dirs {
             let skill_file = dir.join(skill).join("SKILL.md");
-            if let Ok(content) = std::fs::read_to_string(&skill_file) {
+            if let Ok(content) = tokio::fs::read_to_string(&skill_file).await {
                 docs.push_str(&format!("## Skill: {skill}\n\n{content}\n\n"));
                 break;
             }
@@ -391,8 +391,8 @@ pub async fn build_full_context(
         String::new()
     };
 
-    let project_instructions = build_project_instructions(project_dir);
-    let skills_docs = build_skills_docs(selected_skills);
+    let project_instructions = build_project_instructions(project_dir).await;
+    let skills_docs = build_skills_docs(selected_skills).await;
     let repo_tree = build_repo_tree(project_dir).await;
 
     let git_diff = if attempts > 0 {
