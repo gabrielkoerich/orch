@@ -469,7 +469,10 @@ pub async fn handle_success(
     // returned counter values are already post-increment.
 
     // Push-failure counter — use atomic increment to avoid a read-modify-write race.
-    let push_failures: u64 = if push_failed {
+    // Workflow-scope failures are non-retryable and blocked immediately; do not
+    // increment this retry counter for them so that later normal push failures
+    // are not prematurely blocked.
+    let push_failures: u64 = if push_failed && !is_workflow_scope_failure {
         store::store_increment(store, repo, task_id, "push_failures").await
     } else {
         0
