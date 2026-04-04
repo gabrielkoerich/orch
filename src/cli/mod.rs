@@ -696,7 +696,7 @@ pub async fn board_link(project_id: &str) -> anyhow::Result<()> {
     println!("Discovering board fields...");
     let sync = ProjectSync::discover_fields(project_id).await?;
 
-    write_project_config(&sync)?;
+    write_project_config(&sync).await?;
 
     println!("Linked board: {}", project_id);
     println!("Status field: {}", sync.status_field_id());
@@ -722,7 +722,7 @@ pub async fn board_sync() -> anyhow::Result<()> {
     println!("Syncing board fields for {}...", project_id);
     let sync = ProjectSync::discover_fields(&project_id).await?;
 
-    write_project_config(&sync)?;
+    write_project_config(&sync).await?;
 
     println!("Updated config:");
     println!("  Status field: {}", sync.status_field_id());
@@ -1063,13 +1063,13 @@ pub async fn init_task_manager() -> anyhow::Result<TaskManager> {
     let repo = config::get_current_repo()
         .context("'repo' not set — run `orch init` or set gh.repo in .orch.yml")?;
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
-    let store = Arc::new(TaskStore::open(&crate::store::default_db_path()?).await?);
+    let store = Arc::new(TaskStore::open(&crate::store::default_db_path().await?).await?);
     Ok(TaskManager::with_store(backend, store, repo))
 }
 
 /// Initialize the unified task store for CLI commands.
 pub async fn init_store() -> anyhow::Result<crate::store::TaskStore> {
-    crate::store::TaskStore::open(&crate::store::default_db_path()?).await
+    crate::store::TaskStore::open(&crate::store::default_db_path().await?).await
 }
 
 #[cfg(test)]
