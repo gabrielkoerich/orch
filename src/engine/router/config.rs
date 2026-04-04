@@ -232,6 +232,9 @@ impl RouterConfig {
         // refresh runs at a time to avoid duplicate subprocess spawns.
         if !REFRESH_IN_PROGRESS.swap(true, Ordering::AcqRel) {
             std::thread::spawn(|| {
+                let _guard = scopeguard::guard((), |_| {
+                    REFRESH_IN_PROGRESS.store(false, Ordering::Release);
+                });
                 let now_bg = chrono::Utc::now().timestamp();
                 let discovered = Self::run_opencode_models_discovery();
                 // Access the module-level static directly — no Arc needed.
@@ -239,7 +242,6 @@ impl RouterConfig {
                 if let Ok(mut guard) = cache.lock() {
                     *guard = (now_bg, discovered);
                 }
-                REFRESH_IN_PROGRESS.store(false, Ordering::Release);
             });
         }
 
