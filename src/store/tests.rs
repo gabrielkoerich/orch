@@ -3768,7 +3768,7 @@ async fn slow_tasks_empty() {
 #[tokio::test]
 async fn error_distribution_empty() {
     let store = TaskStore::open_memory().await.unwrap();
-    let errors = store.get_error_distribution_7d().await.unwrap();
+    let errors = store.get_error_distribution(24 * 7).await.unwrap();
     assert!(errors.is_empty());
 }
 
@@ -3880,7 +3880,7 @@ async fn error_distribution_groups_by_type() {
             .unwrap();
     }
 
-    let errors = store.get_error_distribution_7d().await.unwrap();
+    let errors = store.get_error_distribution(24 * 7).await.unwrap();
     assert_eq!(errors.len(), 2);
     // timeout should be first (count=2)
     assert_eq!(errors[0].error_type.as_deref(), Some("timeout"));
@@ -3919,7 +3919,7 @@ async fn slow_tasks_returns_sorted_by_duration() {
             .unwrap();
     }
 
-    let slow = store.get_slow_tasks_7d().await.unwrap();
+    let slow = store.get_slow_tasks(24 * 7).await.unwrap();
     assert_eq!(slow.len(), 3);
     // Should be sorted descending by duration
     assert_eq!(slow[0].task_id, "t2");
@@ -4594,10 +4594,10 @@ async fn subscribe_with_topic_id_preserved() {
     );
 }
 
-// ── get_cost_summary_24h_by_repo ────────────────────────────────
+// ── get_cost_summary_by_repo ───────────────────────────────────
 
 #[tokio::test]
-async fn cost_summary_24h_by_repo_isolates_per_repo() {
+async fn cost_summary_by_repo_isolates_per_repo() {
     use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
@@ -4652,7 +4652,7 @@ async fn cost_summary_24h_by_repo_isolates_per_repo() {
 
     // owner/orch should only see its own cost
     let orch_cost = store
-        .get_cost_summary_24h_by_repo("owner/orch")
+        .get_cost_summary_by_repo("owner/orch", 24)
         .await
         .unwrap();
     assert_eq!(orch_cost.periods.len(), 1);
@@ -4662,7 +4662,7 @@ async fn cost_summary_24h_by_repo_isolates_per_repo() {
 
     // owner/bean should only see its own cost
     let bean_cost = store
-        .get_cost_summary_24h_by_repo("owner/bean")
+        .get_cost_summary_by_repo("owner/bean", 24)
         .await
         .unwrap();
     assert_eq!(bean_cost.periods[0].task_count, 1);
@@ -4670,7 +4670,7 @@ async fn cost_summary_24h_by_repo_isolates_per_repo() {
 
     // Unknown repo returns zeros
     let unknown = store
-        .get_cost_summary_24h_by_repo("unknown/repo")
+        .get_cost_summary_by_repo("unknown/repo", 24)
         .await
         .unwrap();
     assert_eq!(unknown.periods[0].task_count, 0);
@@ -4678,7 +4678,7 @@ async fn cost_summary_24h_by_repo_isolates_per_repo() {
 }
 
 #[tokio::test]
-async fn cost_summary_24h_by_repo_falls_back_to_tasks_join() {
+async fn cost_summary_by_repo_falls_back_to_tasks_join() {
     use chrono::Utc;
     let store = TaskStore::open_memory().await.unwrap();
     let now = Utc::now();
@@ -4714,11 +4714,81 @@ async fn cost_summary_24h_by_repo_falls_back_to_tasks_join() {
         .unwrap();
 
     let cost = store
-        .get_cost_summary_24h_by_repo("owner/orch")
+        .get_cost_summary_by_repo("owner/orch", 24)
         .await
         .unwrap();
     assert_eq!(cost.periods[0].task_count, 1);
     assert!((cost.periods[0].total_cost_usd - 0.0045).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn cost_summary_by_repo_uses_requested_window_label() {
+    use chrono::{Duration, Utc};
+    let store = TaskStore::open_memory().await.unwrap();
+    let now = Utc::now();
+    let eight_days_ago = now - Duration::days(8);
+
+    store
+        .insert_task_metric(&InsertTaskMetric {
+            repo: "owner/orch",
+            task_id: "recent",
+            agent: "claude",
+            model: Some("sonnet"),
+            complexity: None,
+            outcome: "success",
+            duration_seconds: 10.0,
+            started_at: &now,
+            completed_at: &now,
+            attempts: 1,
+            files_changed: 1,
+            error_type: None,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            input_cost_usd: Some(0.001),
+            output_cost_usd: Some(0.002),
+            total_cost_usd: Some(0.003),
+        })
+        .await
+        .unwrap();
+
+    store
+        .insert_task_metric(&InsertTaskMetric {
+            repo: "owner/orch",
+            task_id: "older",
+            agent: "claude",
+            model: Some("sonnet"),
+            complexity: None,
+            outcome: "success",
+            duration_seconds: 12.0,
+            started_at: &eight_days_ago,
+            completed_at: &eight_days_ago,
+            attempts: 1,
+            files_changed: 1,
+            error_type: None,
+            input_tokens: Some(200),
+            output_tokens: Some(100),
+            input_cost_usd: Some(0.002),
+            output_cost_usd: Some(0.004),
+            total_cost_usd: Some(0.006),
+        })
+        .await
+        .unwrap();
+
+    let summary_7d = store
+        .get_cost_summary_by_repo("owner/orch", 24 * 7)
+        .await
+        .unwrap();
+    assert_eq!(summary_7d.periods[0].label, "7d");
+    assert_eq!(summary_7d.periods[0].task_count, 1);
+    assert!((summary_7d.periods[0].total_cost_usd - 0.003).abs() < 1e-6);
+
+    let summary_30d = store
+        .get_cost_summary_by_repo("owner/orch", 24 * 30)
+        .await
+        .unwrap();
+    assert_eq!(summary_30d.periods[0].label, "30d");
+    assert_eq!(summary_30d.periods[0].task_count, 2);
+    assert!((summary_30d.periods[0].total_cost_usd - 0.009).abs() < 1e-6);
 }
 
 #[tokio::test]
