@@ -300,7 +300,7 @@ fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = path.with_extension(format!("db.tmp.{}", std::process::id()));
+    let tmp_path = path.with_extension(format!("db.tmp.{}", uuid::Uuid::new_v4()));
     let mut file = std::fs::File::create(&tmp_path)?;
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
