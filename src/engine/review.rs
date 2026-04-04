@@ -1031,7 +1031,6 @@ pub(crate) async fn review_and_merge(
     let git_diff = runner::context::build_git_diff(&worktree_path, &default_branch).await;
     let git_log = runner::context::build_git_log(&worktree_path, &default_branch).await;
 
-
     // 4. Build review prompt
     let review_prompt = runner::agent::build_review_prompt(
         task,
