@@ -13,7 +13,7 @@
 //! while delegating command building and routing to `ClaudeRunner`.
 
 use super::claude::ClaudeRunner;
-use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
+use super::{truncate_at_char_boundary, AgentError, AgentRunner, ParsedResponse, PermissionRules};
 
 /// Count Edit and Write tool_use events in NDJSON stream output.
 fn count_edit_tools(raw: &str) -> usize {
@@ -180,10 +180,9 @@ impl AgentRunner for MiniMaxClaudeRunner {
 
         let response = crate::parser::AgentResponse {
             status,
-            summary: if summary.len() > 500 {
-                summary[..500].to_string()
-            } else {
-                summary
+            summary: {
+                let end = truncate_at_char_boundary(&summary, 500);
+                summary[..end].to_string()
             },
             accomplished: vec![],
             remaining: vec![],
