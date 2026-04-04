@@ -599,7 +599,10 @@ impl LlmRouter {
         // Load skills catalog if available — perform blocking FS work off the async reactor.
         let skills_catalog = match self.load_skills_catalog().await {
             Ok(s) => s,
-            Err(_) => "[]".to_string(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load skills catalog, routing without skills");
+                "[]".to_string()
+            }
         };
 
         // Simple template substitution
