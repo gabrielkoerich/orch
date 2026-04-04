@@ -679,13 +679,21 @@ pub(crate) async fn auto_merge_pr(
                 e
             );
             let footer = attribution_footer("Commented", review_agent, review_model);
-            let _ = gh
+            if let Err(e) = gh
                 .add_comment(
                     repo,
                     &pr_number.to_string(),
                     &format!("{}{}", comment, footer),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    pr_number,
+                    err = %e,
+                    "auto-merge: failed to post merge conflict failure comment on PR"
+                );
+            }
             return Ok(());
         }
 
@@ -696,13 +704,21 @@ pub(crate) async fn auto_merge_pr(
             .await?;
         let comment = format!("Auto-merge failed: {}", e);
         let footer = attribution_footer("Commented", review_agent, review_model);
-        let _ = gh
+        if let Err(e) = gh
             .add_comment(
                 repo,
                 &pr_number.to_string(),
                 &format!("{}{}", comment, footer),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id.0,
+                pr_number,
+                err = %e,
+                "auto-merge: failed to post merge failure comment on PR"
+            );
+        }
         return Ok(());
     }
 
@@ -726,13 +742,21 @@ pub(crate) async fn auto_merge_pr(
     // 8. Post final comment on the PR
     let comment = "✅ PR reviewed, approved, and merged.";
     let footer = attribution_footer("Reviewed", review_agent, review_model);
-    let _ = gh
+    if let Err(e) = gh
         .add_comment(
             repo,
             &pr_number.to_string(),
             &format!("{}{}", comment, footer),
         )
-        .await;
+        .await
+    {
+        tracing::warn!(
+            task_id = task.id.0,
+            pr_number,
+            err = %e,
+            "auto-merge: failed to post success comment on PR"
+        );
+    }
 
     tracing::info!(task_id = task.id.0, "auto-merge completed");
 
