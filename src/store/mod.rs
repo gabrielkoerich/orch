@@ -59,8 +59,8 @@ pub use tasks::{
 };
 
 /// Default database path: `~/.orch/orch.db`
-pub fn default_db_path() -> anyhow::Result<std::path::PathBuf> {
-    crate::home::db_path()
+pub async fn default_db_path() -> anyhow::Result<std::path::PathBuf> {
+    crate::home::db_path().await
 }
 
 /// The unified task store backed by SQLite (via sqlx).

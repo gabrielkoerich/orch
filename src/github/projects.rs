@@ -269,10 +269,10 @@ fn parse_project_node(node: &serde_json::Value) -> Option<ProjectInfo> {
 }
 
 /// Write project config fields to `~/.orch/config.yml`.
-pub fn write_project_config(sync: &ProjectSync) -> anyhow::Result<()> {
+pub async fn write_project_config(sync: &ProjectSync) -> anyhow::Result<()> {
     let config_path = crate::home::config_path()?;
     let content = if config_path.exists() {
-        std::fs::read_to_string(&config_path)?
+        tokio::fs::read_to_string(&config_path).await?
     } else {
         String::new()
     };
@@ -324,7 +324,7 @@ pub fn write_project_config(sync: &ProjectSync) -> anyhow::Result<()> {
         serde_yml::Value::Mapping(map),
     );
 
-    std::fs::write(&config_path, serde_yml::to_string(&doc)?)?;
+    tokio::fs::write(&config_path, serde_yml::to_string(&doc)?).await?;
     Ok(())
 }
 

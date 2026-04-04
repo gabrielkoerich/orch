@@ -84,18 +84,20 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
 ///
 /// Also migrates legacy `orchestrator.db` → `orch.db` transparently if the old file
 /// exists and the new one does not.
-pub fn db_path() -> anyhow::Result<PathBuf> {
+pub async fn db_path() -> anyhow::Result<PathBuf> {
     let home = orch_home()?;
     let new_path = home.join("orch.db");
     let old_path = home.join("orchestrator.db");
     if old_path.exists() && !new_path.exists() {
-        std::fs::rename(&old_path, &new_path).with_context(|| {
-            format!(
-                "migrating database from {} to {}",
-                old_path.display(),
-                new_path.display()
-            )
-        })?;
+        tokio::fs::rename(&old_path, &new_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "migrating database from {} to {}",
+                    old_path.display(),
+                    new_path.display()
+                )
+            })?;
         tracing::info!("migrated database: legacy orchestrator.db -> orch.db");
     }
     Ok(new_path)
