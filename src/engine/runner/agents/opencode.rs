@@ -574,14 +574,76 @@ printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{
         prompt: &str,
         model: Option<&str>,
     ) -> anyhow::Result<tokio::process::Command> {
+        // Isolate opencode from the user's global config so that interactive
+        // permission defaults (e.g. "edit":"ask") don't trigger PermissionError
+        // events that the router misclassifies as model failures and applies
+        // unnecessary cooldowns to.  We write a deny-all permission config to a
+        // stable temp directory (reused across routing calls) and point
+        // XDG_CONFIG_HOME at it.
+        let config_dir = ensure_router_opencode_config()?;
+
+        // When XDG_CONFIG_HOME is overridden, gh CLI would also look for its
+        // config under the new home and fail to authenticate.  GH_CONFIG_DIR pins
+        // gh to its actual config regardless of XDG_CONFIG_HOME.
+        let gh_config_dir = std::env::var("GH_CONFIG_DIR")
+            .ok()
+            .or_else(|| {
+                dirs::home_dir().map(|h| h.join(".config").join("gh").display().to_string())
+            })
+            .unwrap_or_else(|| String::from("~/.config/gh"));
+
         let mut cmd = tokio::process::Command::new("opencode");
         cmd.arg("run").arg("--format").arg("json");
         if let Some(m) = model {
             cmd.arg("--model").arg(m);
         }
         cmd.arg(prompt);
+        cmd.env("XDG_CONFIG_HOME", &config_dir);
+        cmd.env("GH_CONFIG_DIR", &gh_config_dir);
         Ok(cmd)
     }
+}
+
+/// A deny-all opencode permission config used for routing invocations.
+///
+/// The router only needs text output — it should never exercise any tools.
+/// Denying all tools prevents interactive permission prompts (e.g. "edit":"ask"
+/// from the user's global config) from producing PermissionError events that
+/// the router misidentifies as model failures.
+///
+/// `external_directory` is kept "allow" for consistency with task-agent configs;
+/// the router doesn't use it, but leaving it "deny" would be harmless too.
+const ROUTER_DENY_ALL_CONFIG: &str = r#"{"permission":{"read":"deny","edit":"deny","glob":"deny","grep":"deny","bash":"deny","task":"deny","skill":"deny","webfetch":"deny","websearch":"deny","list":"deny","todowrite":"deny","todoread":"deny","question":"deny","codesearch":"deny","external_directory":"allow"}}"#;
+
+/// Return the path to the router opencode config directory, creating it and
+/// writing the deny-all config if needed.
+///
+/// Uses a stable path under the system temp directory so it persists across
+/// routing calls without needing a `TempDir` lifetime.  The directory and file
+/// are created idempotently — concurrent calls are safe because `write` is
+/// atomic on every supported platform for small files.
+fn ensure_router_opencode_config() -> anyhow::Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir()
+        .join("orch-router-opencode")
+        .join("opencode");
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to create router opencode config dir {}: {e}",
+            dir.display()
+        )
+    })?;
+
+    let config_file = dir.join("opencode.json");
+    std::fs::write(&config_file, ROUTER_DENY_ALL_CONFIG).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to write router opencode config {}: {e}",
+            config_file.display()
+        )
+    })?;
+
+    // Return the parent of the "opencode" subdirectory — that is the value to
+    // set as XDG_CONFIG_HOME so opencode finds opencode/opencode.json inside it.
+    Ok(dir.parent().expect("dir always has a parent").to_path_buf())
 }
 
 /// Map from unified allowed_tools names to OpenCode permission keys.
