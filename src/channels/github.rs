@@ -188,16 +188,47 @@ impl DedupStore {
         // Flush outside the mutex to keep the critical section short.
         // Use spawn_blocking so that the blocking std::fs calls (File::create,
         // write_all, sync_all, rename) do not occupy a Tokio async worker thread.
+        // Retry up to 3 times with exponential backoff (100ms, 200ms) to handle
+        // transient I/O failures without permanently losing dedup state.
         if let (Some(path), Some(entries)) = (&self.file_path, flush_entries) {
             let path = path.clone();
             let path_for_log = path.clone();
-            match tokio::task::spawn_blocking(move || flush_dedup_file(&path, &entries)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!(?e, path = %path_for_log.display(), "failed to flush webhook dedup state");
-                }
-                Err(e) => {
-                    tracing::warn!(?e, "spawn_blocking failed for flush_dedup_file");
+            let entries = Arc::new(entries);
+            const MAX_FLUSH_ATTEMPTS: u32 = 3;
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                let path_clone = path.clone();
+                let entries_clone = Arc::clone(&entries);
+                match tokio::task::spawn_blocking(move || {
+                    flush_dedup_file(&path_clone, &entries_clone)
+                })
+                .await
+                {
+                    Ok(Ok(())) => break,
+                    Ok(Err(e)) if attempt < MAX_FLUSH_ATTEMPTS => {
+                        let delay =
+                            std::time::Duration::from_millis(100u64 << (attempt - 1));
+                        tracing::warn!(
+                            ?e,
+                            attempt,
+                            path = %path_for_log.display(),
+                            "failed to flush webhook dedup state, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            ?e,
+                            path = %path_for_log.display(),
+                            "failed to flush webhook dedup state after {MAX_FLUSH_ATTEMPTS} attempts"
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(?e, "spawn_blocking failed for flush_dedup_file");
+                        break;
+                    }
                 }
             }
         }
