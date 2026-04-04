@@ -1,0 +1,42 @@
+--- src/engine/runner/mod.rs
++++ src/engine/runner/mod.rs
+@@ -1654,28 +1654,8 @@
+         store.set_fields(row_id, &[
+             ("pr_number", serde_json::json!(42)),
+         ]).await.unwrap();
+         
+-        // Exceed the 10 token budget
+-        let run_id = store.start_run(&crate::store::StartRun {
+-            task_id: row_id,
+-            attempt: 1,
+-            run_type: "agent",
+-            agent: "claude",
+-            model: "haiku",
+-            command: "cmd",
+-            prompt: "prompt",
+-        }).await.unwrap();
+-        
+-        store.complete_run(&crate::store::CompleteRun {
+-            run_id,
+-            exit_code: Some(0),
+-            stdout: "",
+-            stderr: "",
+-            parsed: "",
+-            outcome: "success",
+-            error: "",
+-            tokens: crate::store::RunTokenUsage {
+-                input_tokens: 50,
+-                output_tokens: 50,
+-                total_cost_usd: 0.1,
+-                duration_secs: 1.0,
+-            },
+-        }).await.unwrap();
++        // Exceed the 10 token budget by setting the tokens on the task row directly
++        store.store_tokens(row_id, 50, 50, "haiku").await.unwrap();
+         
+         let mut runner = TaskRunner::new(repo.clone());
+@@ -1710,3 +1690,3 @@
+         let updates = backend.status_updates.lock().unwrap();
+-        assert!(updates.iter().any(|(id, s)| id == "111" && *s == crate::backends::Status::Blocked));
++        assert!(updates.iter().any(|(id, s)| id == &task_id && *s == crate::backends::Status::Blocked));
+ 
