@@ -873,13 +873,12 @@ async fn scan_mentions(
                             command = %command,
                             "ignoring slash command in mention on non-open issue"
                         );
-                        // Still mark as processed so we don't keep trying
-                        kv_set_prefer_store(
-                            &store,
-                            "mentions_last_checked",
-                            &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                        )
-                        .await;
+                        // Do NOT advance the global mentions cursor here. Leaving the
+                        // cursor update until after the full batch (end of function)
+                        // prevents permanently skipping other mentions in the same
+                        // fetched batch when timestamps are non-monotonic or clocks
+                        // are skewed. The mention will be re-fetched on the next tick
+                        // and re-evaluated (idempotent skip).
                         continue;
                     }
                     Ok(_) => {}
@@ -903,13 +902,10 @@ async fn scan_mentions(
                             issue = %issue_num,
                             "ignoring slash command in mention from non-collaborator"
                         );
-                        // Still mark as processed
-                        kv_set_prefer_store(
-                            &store,
-                            "mentions_last_checked",
-                            &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                        )
-                        .await;
+                        // Do NOT advance the global mentions cursor here for the same
+                        // reason described above. Let the final cursor update at the
+                        // end of the function handle batch progression so later
+                        // mentions in this fetch are not skipped.
                         continue;
                     }
                     Err(e) => {
