@@ -217,9 +217,11 @@ fn verify_summary_matches_diff(agent_summary: &str, git_diff: &str) -> Result<()
                 }
             }
             // Relaxed check: allow matches on any path component
-            let s_parts: std::collections::HashSet<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+            let s_parts: std::collections::HashSet<&str> =
+                s.split('/').filter(|p| !p.is_empty()).collect();
             for d in &diff_files {
-                let d_parts: std::collections::HashSet<&str> = d.split('/').filter(|p| !p.is_empty()).collect();
+                let d_parts: std::collections::HashSet<&str> =
+                    d.split('/').filter(|p| !p.is_empty()).collect();
                 if s_parts.intersection(&d_parts).next().is_some() {
                     return Ok(());
                 }
@@ -1886,7 +1888,7 @@ mod tests {
 
     #[test]
     fn verify_summary_matches_diff_ok_when_abstract_summary_shares_directory_component() {
-        // Issue #1846: Retrospectives mention abstract items (e.g. PR #1835 in src/) 
+        // Issue #1846: Retrospectives mention abstract items (e.g. PR #1835 in src/)
         // but diff is docs/content/posts/evening-retrospective-2026-04-04.md.
         // If all files in the diff are in docs/, we skip validation because the
         // summary is allowed to talk about other files (like what was worked on).
