@@ -9,7 +9,7 @@
 //! - Owner /slash command scanning
 //! - Skill repository syncing
 
-use crate::backends::{ExternalBackend, Status};
+use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine::router::Router;
@@ -44,6 +44,7 @@ async fn kv_set_prefer_store(store: &Option<&Arc<TaskStore>>, key: &str, value: 
 }
 
 use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
+use super::commands::{execute_command, parse_command};
 use super::review_poll::review_open_prs;
 use super::EngineConfig;
 
@@ -482,7 +483,7 @@ pub(crate) async fn sync_tick(
 
     // 3. Scan for @mentions
     if !gh_circuit_open {
-        if let Err(e) = scan_mentions(backend, Some(store), repo).await {
+        if let Err(e) = scan_mentions(backend, Some(store), repo, task_manager).await {
             tracing::warn!(err = %e, "mention scan failed");
         }
     }
@@ -758,14 +759,16 @@ pub(crate) async fn sync_tick(
     Ok(())
 }
 
-/// Scan for @mentions and create internal tasks.
+/// Scan for @mentions and handle them.
 ///
-/// Checks recent issue comments for @orch (and legacy @orchestrator) mentions,
-/// creates internal tasks, and acknowledges them.
+/// Checks recent issue comments for @orch (and legacy @orchestrator) mentions.
+/// If a mention contains a slash command and the author is authorized, executes it.
+/// Otherwise, creates an internal task for the mention.
 async fn scan_mentions(
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<crate::store::TaskStore>>,
     repo: &str,
+    task_manager: &Arc<crate::engine::tasks::TaskManager>,
 ) -> anyhow::Result<()> {
     // Get the current user (for mention detection)
     let current_user = match backend.get_authenticated_user().await {
@@ -808,6 +811,8 @@ async fn scan_mentions(
         std::collections::HashSet::new()
     };
 
+    let gh = crate::github::http::GhHttp::new()?;
+
     for mention in mentions {
         // Skip if already processed
         if existing_mentions.contains(&mention.id) {
@@ -821,7 +826,158 @@ async fn scan_mentions(
             continue;
         }
 
-        // Create internal task for this mention
+        // Try to parse a slash command from the mention
+        if let Some(command) = parse_command(&mention.body) {
+            // Extract issue number from the mention's issue URL
+            let issue_number: Option<String> = match mention.issue_url.as_deref() {
+                Some(url) => match url.rsplit('/').next() {
+                    Some(num) if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) => {
+                        Some(num.to_string())
+                    }
+                    _ => {
+                        tracing::warn!(
+                            comment_id = %mention.id,
+                            "slash command in mention without valid issue number, creating task instead"
+                        );
+                        None
+                    }
+                },
+                None => {
+                    tracing::warn!(
+                        comment_id = %mention.id,
+                        "slash command in mention without issue_url, creating task instead"
+                    );
+                    None
+                }
+            };
+
+            // If we have an issue number, try to execute the command
+            if let Some(issue_num) = issue_number {
+                // Check if issue is still open
+                match gh.get_issue(repo, &issue_num).await {
+                    Ok(issue) if issue.state != "open" => {
+                        tracing::debug!(
+                            issue = %issue_num,
+                            state = %issue.state,
+                            command = %command,
+                            "ignoring slash command in mention on non-open issue"
+                        );
+                        // Still mark as processed so we don't keep trying
+                        kv_set_prefer_store(
+                            &store,
+                            "mentions_last_checked",
+                            &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        )
+                        .await;
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            issue = %issue_num,
+                            err = %e,
+                            "failed to check issue state for slash command in mention"
+                        );
+                        continue;
+                    }
+                }
+
+                // Check if author is collaborator
+                match gh.is_collaborator(repo, &mention.author).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::info!(
+                            author = %mention.author,
+                            command = %command,
+                            issue = %issue_num,
+                            "ignoring slash command in mention from non-collaborator"
+                        );
+                        // Still mark as processed
+                        kv_set_prefer_store(
+                            &store,
+                            "mentions_last_checked",
+                            &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            author = %mention.author,
+                            err = %e,
+                            "failed to check collaborator status for slash command in mention"
+                        );
+                        continue;
+                    }
+                }
+
+                // Execute the command
+                let task_id = ExternalId(issue_num.clone());
+                let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                let store_opt = store.cloned();
+
+                match execute_command(
+                    backend,
+                    &gh,
+                    repo,
+                    &task_id,
+                    &command,
+                    &store_opt,
+                    task_manager,
+                )
+                .await
+                {
+                    Ok(msg) => {
+                        tracing::info!(
+                            issue = %issue_num,
+                            author = %mention.author,
+                            command = %command,
+                            "executed command from @mention"
+                        );
+                        let confirmation = format!(
+                            "[{now}] {msg} — executed by @{}{}",
+                            mention.author,
+                            crate::engine::orch_footer()
+                        );
+                        if let Err(e) = backend.post_comment(&task_id, &confirmation).await {
+                            tracing::warn!(issue = %issue_num, err = %e, "failed to post confirmation for mention command");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            issue = %issue_num,
+                            command = %command,
+                            err = %e,
+                            "failed to execute command from @mention"
+                        );
+                        let error_msg = format!(
+                            "[{now}] Failed to execute `{command}`: {e}{}",
+                            crate::engine::orch_footer()
+                        );
+                        if let Err(e2) = backend.post_comment(&task_id, &error_msg).await {
+                            tracing::warn!(issue = %issue_num, err = %e2, "failed to post error comment for mention command");
+                        }
+                    }
+                }
+                // Mark as processed by creating the task
+                if let Some(s) = store {
+                    let title = format!(
+                        "Respond to mention by @{} — command executed",
+                        mention.author
+                    );
+                    let task_body = format!(
+                        "Mention by @{}:\n\n{}\n\n**Status:** Command executed",
+                        mention.author, mention.body
+                    );
+                    let _ = s
+                        .create_internal(repo, &title, &task_body, "mention", &mention.id)
+                        .await;
+                }
+                continue;
+            }
+        }
+
+        // No command found or command execution failed — create internal task for the mention
         let title = format!("Respond to mention by @{}", mention.author);
         let task_body = format!("Mention by @{}:\n\n{}", mention.author, mention.body);
 
