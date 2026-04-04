@@ -74,8 +74,18 @@ pub fn spawn(
                                 store.get_by_external_id(&repo, task_id).await
                             };
                             match result {
-                                Ok(Some(t)) => {
+                                Ok(Some(t))
+                                    if t.status == crate::store::TaskStatus::NeedsReview =>
+                                {
                                     Some(crate::engine::tasks::store_task_to_external(&t))
+                                }
+                                Ok(Some(t)) => {
+                                    tracing::debug!(
+                                        task_id,
+                                        status = t.status.as_str(),
+                                        "task found but not in needs_review status, skipping"
+                                    );
+                                    None
                                 }
                                 Ok(None) => None,
                                 Err(e) => {
