@@ -315,7 +315,7 @@ async fn recover_missing_review_worktree(
 /// Returns `Err` when the git command cannot determine the count (e.g., missing
 /// remote ref, non-zero exit, unparseable output). Callers must NOT treat this
 /// as zero — a failure means the ancestry relationship is unknown.
-fn count_ahead_commits(
+async fn count_ahead_commits(
     worktree_path: &std::path::Path,
     default_branch: &str,
 ) -> Result<u64, String> {
@@ -326,7 +326,7 @@ fn count_ahead_commits(
         )
     })?;
 
-    let output = std::process::Command::new("git")
+    let output = tokio::process::Command::new("git")
         .args([
             "-C",
             worktree_str,
@@ -335,6 +335,7 @@ fn count_ahead_commits(
             &format!("origin/{default_branch}..HEAD"),
         ])
         .output()
+        .await
         .map_err(|e| format!("git rev-list command failed to start: {e}"))?;
 
     if !output.status.success() {
@@ -398,7 +399,7 @@ async fn ensure_pr_exists(
         Ok(None) => {
             // No open PR — check if branch has commits ahead of default branch.
             let default_branch = worktree::detect_default_branch(worktree_path).await;
-            let has_commits = match count_ahead_commits(worktree_path, &default_branch) {
+            let has_commits = match count_ahead_commits(worktree_path, &default_branch).await {
                 Ok(count) => count > 0,
                 Err(e) => {
                     tracing::error!(
@@ -2122,8 +2123,8 @@ mod tests {
 
     // ── count_ahead_commits ─────────────────────────────────────────────────
 
-    #[test]
-    fn count_ahead_commits_returns_zero_when_no_ahead_commits() {
+    #[tokio::test]
+    async fn count_ahead_commits_returns_zero_when_no_ahead_commits() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
 
@@ -2154,7 +2155,7 @@ mod tests {
             .unwrap();
 
         // origin/main now exists and HEAD is at the same commit — zero ahead
-        let result = count_ahead_commits(dir, "main");
+        let result = count_ahead_commits(dir, "main").await;
         assert!(
             result.is_ok(),
             "expected Ok when origin/main exists, got {result:?}"
@@ -2166,8 +2167,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn count_ahead_commits_returns_error_when_remote_ref_missing() {
+    #[tokio::test]
+    async fn count_ahead_commits_returns_error_when_remote_ref_missing() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
         git(dir, &["init", "-b", "main"]);
@@ -2177,7 +2178,7 @@ mod tests {
         git(dir, &["add", "f"]);
         git(dir, &["commit", "-m", "init"]);
         // No remote 'origin' configured — rev-list will fail
-        let result = count_ahead_commits(dir, "main");
+        let result = count_ahead_commits(dir, "main").await;
         assert!(
             result.is_err(),
             "expected Err when origin/main does not exist, got {result:?}"
@@ -2189,13 +2190,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn count_ahead_commits_returns_error_when_git_cannot_start() {
+    #[tokio::test]
+    async fn count_ahead_commits_returns_error_when_git_cannot_start() {
         // Use a path that is not a git repo — git will fail with non-zero exit
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
         // Not a git repo at all
-        let result = count_ahead_commits(dir, "main");
+        let result = count_ahead_commits(dir, "main").await;
         assert!(
             result.is_err(),
             "expected Err when directory is not a git repo, got {result:?}"
