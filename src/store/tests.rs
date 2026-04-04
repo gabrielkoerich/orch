@@ -5312,3 +5312,85 @@ async fn batch_mark_cleaned_empty_is_noop() {
     let store = TaskStore::open_memory().await.unwrap();
     store.batch_mark_cleaned(&[]).await.unwrap();
 }
+
+// -----------------------------------------------------------------------
+// Regression tests for #1736: SQLite OOB panics (sqlx-sqlite workers)
+// -----------------------------------------------------------------------
+
+/// Verifies that TASK_COLS_COUNT matches the number of comma-separated
+/// columns in the TASK_COLS constant.  If a developer adds a column to
+/// TASK_COLS but forgets to update TASK_COLS_COUNT (or vice-versa) this
+/// test will catch it at compile+test time, long before a deployment.
+#[test]
+fn task_cols_count_matches_task_cols_string() {
+    let count = super::tasks::TASK_COLS.split(',').count();
+    assert_eq!(
+        count,
+        super::tasks::TASK_COLS_COUNT,
+        "TASK_COLS has {count} comma-separated columns but TASK_COLS_COUNT = {}. \
+         Update TASK_COLS_COUNT to match.",
+        super::tasks::TASK_COLS_COUNT,
+    );
+}
+
+/// Verifies that TASK_COLS_COUNT matches the number of columns in the
+/// `tasks` table after all migrations have been applied.
+///
+/// This is the primary regression guard for #1736: if a new migration
+/// adds a column to `tasks` without a corresponding update to TASK_COLS
+/// and TASK_COLS_COUNT, this test will fail — preventing the OOB panic
+/// from reaching production.
+#[tokio::test]
+async fn task_cols_count_matches_schema() {
+    use sqlx::Row as _;
+
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let row = sqlx::query("SELECT COUNT(*) as cnt FROM pragma_table_info('tasks')")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let schema_count: i64 = row.try_get("cnt").unwrap();
+
+    assert_eq!(
+        schema_count as usize,
+        super::tasks::TASK_COLS_COUNT,
+        "tasks table has {schema_count} columns after migrations but \
+         TASK_COLS_COUNT = {}. Add the new column(s) to TASK_COLS and \
+         increment TASK_COLS_COUNT.",
+        super::tasks::TASK_COLS_COUNT,
+    );
+}
+
+/// End-to-end regression test for #1736: creates a task row and reads it
+/// back through the full `row_to_task` deserialization path.  If TASK_COLS
+/// references a column that doesn't exist in the schema, or if the column
+/// index mapping is wrong, this test will panic (or fail) rather than
+/// silently crashing a sqlx-sqlite worker thread in production.
+#[tokio::test]
+async fn task_row_deserialization_no_oob_panic() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id = store
+        .create(&NewTask {
+            external_id: None,
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "OOB regression".to_string(),
+            body: "Regression test for #1736".to_string(),
+            source: "test".to_string(),
+            source_id: "oob-test".to_string(),
+            author: "".to_string(),
+            url: "".to_string(),
+            labels: vec![],
+        })
+        .await
+        .unwrap();
+
+    // This exercises the full SELECT TASK_COLS + row_to_task path.
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.title, "OOB regression");
+    assert_eq!(task.no_code_reroutes, 0);
+    assert_eq!(task.auto_unblock_count, 0);
+    assert_eq!(task.ci_recovery_count, 0);
+}
