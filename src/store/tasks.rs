@@ -647,6 +647,26 @@ impl TaskStore {
         .is_some()
     }
 
+    /// Return a set of external IDs for all external tasks in a repo.
+    ///
+    /// Used to eliminate N+1 queries when ingesting lists of external tasks.
+    pub async fn existing_external_ids(
+        &self,
+        repo: &str,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT external_id FROM tasks WHERE repo = ? AND origin != 'internal' AND external_id IS NOT NULL",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id,)| if id.is_empty() { None } else { Some(id) })
+            .collect())
+    }
+
     /// List tasks for `orch doctor`: active tasks + done tasks updated since `cutoff_str`.
     /// Much cheaper than `list_all` on repos with many historical done tasks.
     pub async fn list_for_doctor(&self, repo: &str, cutoff_str: &str) -> anyhow::Result<Vec<Task>> {

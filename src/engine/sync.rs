@@ -1187,13 +1187,24 @@ pub(crate) async fn ingest_external_tasks(
     // 3. Upsert into the store, collecting store IDs for batch status check.
     //    Also acknowledge newly detected issues (eyes reaction).
     let mut id_status_pairs: Vec<(i64, crate::backends::Status)> = Vec::new();
+    // Pre-load existing external IDs for this repo to avoid N+1 queries
+    // (each get_by_external_id call is an individual SQL query). If the
+    // lookup fails, fall back to an empty set so we conservatively treat
+    // tasks as new (they will be upserted below).
+    let existing_ext_ids: std::collections::HashSet<String> = match store
+        .existing_external_ids(repo)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(repo = repo, err = %e, "ingest: failed to load existing external ids — proceeding");
+            std::collections::HashSet::new()
+        }
+    };
     for (task, status) in &all_tasks {
         // Check if this task already exists in the store before upserting.
-        let is_new = store
-            .get_by_external_id(repo, &task.id.0)
-            .await
-            .map(|t| t.is_none())
-            .unwrap_or(true);
+        // Use the pre-loaded HashSet to avoid issuing N individual queries.
+        let is_new = !existing_ext_ids.contains(&task.id.0);
 
         if is_new {
             let duplicate_target = existing_by_title
