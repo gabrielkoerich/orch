@@ -228,17 +228,29 @@ fn verify_summary_matches_diff(
     if summary_files.is_empty() && !diff_files.is_empty() {
         let title_body = format!("{} {}", task_title, task_body).to_lowercase();
         let mut any_mentioned = false;
-        for d in &diff_files {
+        'outer: for d in &diff_files {
             let d_lower = d.to_lowercase();
-            // check full path and basename
+            // check full path
             if title_body.contains(&d_lower) {
                 any_mentioned = true;
                 break;
             }
+            // check basename
             if let Some(bname) = d_lower.rsplit('/').next() {
                 if title_body.contains(bname) {
                     any_mentioned = true;
                     break;
+                }
+            }
+            // check each path segment (e.g. "trading" in "scripts/trading/trading-data.json")
+            for segment in d_lower.split('/') {
+                if segment.len() >= 3
+                    && title_body
+                        .split_whitespace()
+                        .any(|w| w.trim_matches(|c: char| !c.is_alphanumeric()) == segment)
+                {
+                    any_mentioned = true;
+                    break 'outer;
                 }
             }
         }
@@ -1903,6 +1915,40 @@ mod tests {
                 || e.contains("stale summary")
                 || e.contains("do not overlap")
         );
+    }
+
+    #[test]
+    fn verify_summary_ok_when_path_segment_matches_title() {
+        // Trading cron tasks: prose summary, diff touches scripts/trading/trading-data.json,
+        // title contains "trading" which matches the path segment.
+        let summary = "No open positions, no trades executed. Portfolio flat at $9,821.77 cash. Staying defensive — BTC 1d bearish.";
+        let diff = "diff --git a/scripts/trading/trading-data.json b/scripts/trading/trading-data.json\n+++ b/scripts/trading/trading-data.json\n";
+        let res = verify_summary_matches_diff(
+            summary,
+            diff,
+            "Trading update: manage positions and update prices",
+            "",
+        );
+        assert!(res.is_ok(), "expected Ok but got: {:?}", res);
+    }
+
+    #[test]
+    fn verify_summary_ok_when_diff_file_unrelated_to_title_but_in_related_dir() {
+        // Bug fix tasks: prose summary, diff touches src/channels/github.rs as part of
+        // error propagation chain; title mentions "DedupStore" but diff file has no
+        // direct name match — however title contains no path segments that overlap.
+        // This should still fail (true positive) when nothing matches.
+        let summary = "Fixed error propagation in flush operations.";
+        let diff = "diff --git a/src/channels/github.rs b/src/channels/github.rs\n+++ b/src/channels/github.rs\n";
+        let res = verify_summary_matches_diff(
+            summary,
+            diff,
+            "Missing error propagation in DedupStore file flush operations",
+            "the flush method silently drops errors",
+        );
+        // "channels" and "github" and "src" don't appear in the title/body,
+        // so this remains a detection (err) — regression test.
+        assert!(res.is_err());
     }
 
     #[test]
