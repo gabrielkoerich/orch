@@ -517,6 +517,14 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
             let fc_key = format!("{FAILURE_COUNT_PREFIX}{k}");
             let _ = store.kv_set(&fc_key, "0").await;
         }
+        // Also reset any persisted failure_count keys that are not in the
+        // in-memory map (e.g. survived a restart or were set without a
+        // corresponding in-memory cooldown entry).
+        if let Ok(fc_entries) = store.kv_list_prefix(FAILURE_COUNT_PREFIX).await {
+            for (fc_key, _) in fc_entries {
+                let _ = store.kv_set(&fc_key, "0").await;
+            }
+        }
         tracing::info!(
             count = keys.len(),
             "cleared all cooldowns and failure counts"

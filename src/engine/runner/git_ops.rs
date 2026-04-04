@@ -420,11 +420,14 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
         return Ok(false);
     }
 
-    // Save the commit messages before resetting
+    // Save the commit messages before resetting.
+    // Use a null byte as the record prefix — null bytes cannot appear in git commit
+    // messages, so this separator is unambiguous (unlike a string like ---COMMIT_SEP---
+    // which an agent could write into a commit body, corrupting the parse).
     let log_output = Command::new("git")
         .args([
             "log",
-            "--format=%H%n%B%n---COMMIT_SEP---",
+            "--format=%x00%H%n%B",
             &format!("origin/{default_branch}..HEAD"),
         ])
         .current_dir(dir)
@@ -432,9 +435,11 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
         .await?;
     let log_text = String::from_utf8_lossy(&log_output.stdout).to_string();
 
-    // Parse commits in reverse order (oldest first)
+    // Parse commits in reverse order (oldest first).
+    // Each record starts with \0 (from %x00 in the format), so split on \0 and
+    // discard any leading empty fragment before the first record.
     let commits: Vec<(String, String)> = log_text
-        .split("---COMMIT_SEP---")
+        .split('\0')
         .filter(|s| !s.trim().is_empty())
         .map(|block| {
             let block = block.trim();
