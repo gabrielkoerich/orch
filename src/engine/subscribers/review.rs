@@ -8,7 +8,7 @@ use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::repo_context::REPO_CONTEXT;
-use crate::store::{opt_store_get_task, store_set, TaskStatus, TaskStore};
+use crate::store::{opt_store_get_task, store_set, TaskStore};
 use crate::tmux::TmuxManager;
 use dashmap::DashSet;
 use std::sync::Arc;
@@ -64,17 +64,20 @@ pub fn spawn(
                         if crate::engine::tasks::is_internal_id(task_id)
                             || store.has_external_tasks(&repo).await
                         {
-                            match store.list_by_status(&repo, TaskStatus::NeedsReview).await {
-                                Ok(tasks) => tasks
-                                    .iter()
-                                    .find(|t| {
-                                        let ext_id = t
-                                            .external_id
-                                            .clone()
-                                            .unwrap_or_else(|| format!("internal:{}", t.id));
-                                        ext_id == *task_id
-                                    })
-                                    .map(crate::engine::tasks::store_task_to_external),
+                            // O(1) indexed lookup — resolve task_id to its SQLite row id,
+                            // then fetch directly instead of scanning the whole needs_review set.
+                            let result = if let Some(numeric_id) =
+                                crate::engine::tasks::parse_internal_id(task_id)
+                            {
+                                store.get(numeric_id).await.map(Some)
+                            } else {
+                                store.get_by_external_id(&repo, task_id).await
+                            };
+                            match result {
+                                Ok(Some(t)) => {
+                                    Some(crate::engine::tasks::store_task_to_external(&t))
+                                }
+                                Ok(None) => None,
                                 Err(e) => {
                                     tracing::warn!(task_id, err = %e, "store lookup failed for review");
                                     None
