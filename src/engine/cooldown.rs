@@ -773,6 +773,10 @@ pub async fn record_github_5xx() {
             if let Some(store) = store_opt {
                 let _ = store.kv_set("cooldown:github:5xx", &cd.to_string()).await;
             }
+            // Also set the generic cooldown so is_agent_in_cooldown("github:5xx")
+            // returns true immediately, avoiding a race window where concurrent
+            // request goroutines bypass the circuit breaker.
+            set_agent_cooldown("github:5xx", GITHUB_5XX_COOLDOWN_SECS as u64);
         }
         // Clear the sliding window after tripping so we don't re-trip immediately
         let mut ts = github_5xx_timestamps()
