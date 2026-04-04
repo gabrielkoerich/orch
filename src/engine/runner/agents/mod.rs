@@ -427,7 +427,7 @@ pub(crate) fn shell_single_quote(value: &str) -> String {
 
 /// Find the largest byte index <= `max_bytes` that lies on a UTF-8 char
 /// boundary.  Used for safe string truncation in error messages.
-fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
+pub fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
     if max_bytes >= s.len() {
         return s.len();
     }
