@@ -902,14 +902,11 @@ impl TaskRunner {
             .await
             .unwrap_or_default();
 
-        // Determine weight signal based on outcome
-        // Only treat explicit rate-limit messages (or usage limit) as rate-limited.
-        // Do NOT consider generic "rerouted" text as evidence of a rate limit —
-        // reroutes can happen for timeouts, auth errors, missing tools, etc.
-        let is_rate_limited =
-            last_error.contains("usage limit") || last_error.contains("rate limit");
+        // Determine weight signal based on outcome.
+        // Any reroute ("new"/"routed") should avoid review-gate and go back through
+        // normal dispatch, regardless of why it was rerouted.
         let is_rerouted = status == "new" || status == "routed";
-        let weight_signal = if is_rerouted && is_rate_limited {
+        let weight_signal = if is_rerouted {
             WeightSignal::RateLimited {
                 agent: agent_name.clone(),
             }
@@ -1778,8 +1775,8 @@ mod tests {
 
     // ── weight signal logic ───────────────────────────────────────────────────
 
-    fn weight_signal_for(status: &str, is_rate_limited: bool, agent: &str) -> WeightSignal {
-        if (status == "new" || status == "routed") && is_rate_limited {
+    fn weight_signal_for(status: &str, _is_rate_limited: bool, agent: &str) -> WeightSignal {
+        if status == "new" || status == "routed" {
             WeightSignal::RateLimited {
                 agent: agent.to_string(),
             }
@@ -1834,9 +1831,9 @@ mod tests {
     }
 
     #[test]
-    fn weight_signal_none_for_unknown_status() {
+    fn weight_signal_rate_limited_for_rerouted_status() {
         let signal = weight_signal_for("routed", false, "claude");
-        assert!(matches!(signal, WeightSignal::None));
+        assert!(matches!(signal, WeightSignal::RateLimited { .. }));
     }
 
     // ── parse_success_output token extraction ────────────────────────────────
