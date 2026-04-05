@@ -738,7 +738,7 @@ pub async fn retry(id: i64, agent: Option<String>, model: Option<String>) -> any
     use crate::store::TaskStatus;
 
     let store = crate::cli::init_store().await.ok().map(std::sync::Arc::new);
-    let repo = config::get_current_repo().unwrap_or_default();
+    let mut repo = config::get_current_repo().unwrap_or_default();
 
     // Check if this is an internal task in the store.
     if let Some(ref s) = store {
@@ -785,6 +785,30 @@ pub async fn retry(id: i64, agent: Option<String>, model: Option<String>) -> any
                 return Ok(());
             }
         }
+    }
+
+    // If we still don't have a repo context, try to get the task from the store
+    // as an external task to determine its repo
+    if repo.is_empty() {
+        if let Some(ref s) = store {
+            // Get all tasks from the store and find the one matching our external ID
+            if let Ok(all_tasks) = s.list_all_active_global().await {
+                for task in all_tasks {
+                    if let Some(ref external_id) = task.external_id {
+                        if external_id == &id.to_string() {
+                            // We found the task in the store, use its repo
+                            repo = task.repo.clone();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If we still don't have a repo, we cannot proceed
+    if repo.is_empty() {
+        anyhow::bail!("cannot determine repository for task #{} - ensure .orch.yml is present or task exists in store", id);
     }
 
     let backend: Arc<dyn ExternalBackend> = Arc::new(GitHubBackend::new(repo.clone())?);
