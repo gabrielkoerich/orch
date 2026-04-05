@@ -203,14 +203,22 @@ pub fn compute_backoff(count: u32, base: i64, max: i64) -> i64 {
 /// Always increments — the backoff formula's `max` parameter prevents the
 /// cooldown duration from growing beyond the cap, so unbounded counts are safe.
 ///
-/// Returns 1 when the store is unavailable (unit-test contexts without a store).
+/// Returns 1 when no store is configured (unit-test contexts without a store).
+/// Returns `u32::MAX` on store errors (e.g. lock contention) so backoff applies the cap duration
+/// instead of resetting to the base, preventing rapid re-dispatch during store outages.
 async fn read_and_increment_failure_count(
     store_opt: &Option<Arc<crate::store::TaskStore>>,
     key: &str,
 ) -> u32 {
     let kv_key = format!("{FAILURE_COUNT_PREFIX}{key}");
     if let Some(store) = store_opt {
-        store.kv_increment(&kv_key).await.unwrap_or(1)
+        match store.kv_increment(&kv_key).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(key = %kv_key, err = %e, "failed to increment failure count — treating as high count for safe backoff");
+                u32::MAX
+            }
+        }
     } else {
         1
     }
