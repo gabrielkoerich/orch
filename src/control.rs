@@ -705,16 +705,29 @@ pub async fn send_message(
             // session ID: <uuid>" error that Claude returns when a session expires.
             // The AgentError is converted to a string by anyhow::bail! in direct.rs,
             // so we match on the Display representation of StaleSession.
-            let is_stale = e.to_string().contains("stale session");
-            if is_stale {
-                tracing::info!(
-                    session_id,
-                    "chat session UUID expired; resetting and retrying with fresh session"
-                );
+            let err_str = e.to_string();
+            let is_stale = err_str.contains("stale session");
+            // A timeout (exit code 124 from the `timeout` CLI tool) also means
+            // the session can no longer be resumed — reset and start fresh rather
+            // than surfacing "Control session error: timeout after 1800s" to the user.
+            let is_timeout =
+                err_str.contains("timeout after") || err_str.contains("timed out after");
+            if is_stale || is_timeout {
+                if is_stale {
+                    tracing::info!(
+                        session_id,
+                        "chat session UUID expired; resetting and retrying with fresh session"
+                    );
+                } else {
+                    tracing::info!(
+                        session_id,
+                        "chat session timed out; resetting and retrying with fresh session"
+                    );
+                }
                 reset_session_uuid(store, session_id).await?;
                 // Fresh invocation — no resume, generates a new UUID
                 let (fresh_uuid, _) = get_or_create_session_uuid(store, session_id).await?;
-                invoke_agent_with_session(
+                let fresh_result = invoke_agent_with_session(
                     &agent,
                     &model,
                     &ctx.system,
@@ -722,7 +735,15 @@ pub async fn send_message(
                     Some(&fresh_uuid),
                     false, // not resuming — new session
                 )
-                .await?
+                .await?;
+                if is_timeout {
+                    InvokeResult {
+                        text: format!("_(New session started.)_\n\n{}", fresh_result.text),
+                        ..fresh_result
+                    }
+                } else {
+                    fresh_result
+                }
             } else {
                 return Err(e);
             }
@@ -1156,5 +1177,31 @@ mod tests {
         let (uuid2, is_new2) = get_or_create_session_uuid(&store, "default").await.unwrap();
         assert_ne!(uuid1, uuid2, "reset should produce a new UUID");
         assert!(is_new2, "after reset should be new");
+    }
+
+    /// Verify that the timeout error patterns used in send_message recovery match
+    /// the actual error strings produced by the agent runner (AgentError::Timeout
+    /// formats as "timeout after Xs"; run_shell_command formats as "agent timed out
+    /// after Xs"). Both must trigger session reset rather than bubbling up as errors.
+    #[test]
+    fn timeout_error_patterns_match_runner_output() {
+        let patterns = ["timeout after 1800s", "agent timed out after 120s"];
+        for &msg in &patterns {
+            let is_timeout = msg.contains("timeout after") || msg.contains("timed out after");
+            assert!(is_timeout, "pattern should be detected as timeout: {msg:?}");
+        }
+        // Unrelated errors must not be misidentified as timeouts.
+        let non_timeout = [
+            "rate limit: 429",
+            "stale session (session expired): abc",
+            "auth error: invalid key",
+        ];
+        for &msg in &non_timeout {
+            let is_timeout = msg.contains("timeout after") || msg.contains("timed out after");
+            assert!(
+                !is_timeout,
+                "pattern must not be detected as timeout: {msg:?}"
+            );
+        }
     }
 }
