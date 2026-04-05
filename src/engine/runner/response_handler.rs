@@ -5,7 +5,6 @@
 //! Also owns `write_result_json`.
 
 use crate::config;
-use crate::parser::AgentResponse;
 use crate::store;
 use crate::store::TaskStore;
 use std::path::Path;
@@ -95,11 +94,13 @@ struct DecisionInput<'a> {
     has_delegations: bool,
     /// Commits were pushed to the remote branch successfully.
     has_pushed: bool,
-    /// The task is external and requires a PR (has code-related labels and is
-    /// not a non-code task).
+    /// Whether this is an external task (has a GitHub issue).
+    is_external: bool,
+    /// The task is external and requires a PR to be marked done.
+    /// Always false for internal tasks.
     requires_pr: bool,
     /// Persistent no-code-reroute counter *after* this run's increment.
-    /// Only meaningful when `requires_pr` is `true` and we enter that branch.
+    /// Only meaningful when `is_external` is `true` and `has_pushed` is `false`.
     no_code_reroutes: u64,
     /// Maximum no-code reroutes before blocking (from config).
     max_reroutes: u32,
@@ -132,10 +133,25 @@ fn classify_final_status(input: &DecisionInput<'_>) -> String {
         } else {
             "new".to_string()
         }
-    } else if input.agent_status == "done" {
-        // Covers both external non-code tasks and internal tasks — both are
-        // allowed to finish without a PR.
-        "done".to_string()
+    } else if input.agent_status == "done" && !input.has_pushed {
+        // Internal tasks and external non-code tasks may finish without a PR,
+        // but only when commits were actually pushed. If no commits were pushed
+        // (has_pushed=false), the task has no verifiable work product and must
+        // be re-routed — an agent claiming "nothing to do" without producing
+        // commits cannot close an issue.
+        if input.is_external {
+            // External task with no pushed commits: re-route up to max_reroutes,
+            // then block for human review.
+            if input.no_code_reroutes >= input.max_reroutes as u64 {
+                "blocked".to_string()
+            } else {
+                "new".to_string()
+            }
+        } else {
+            // Internal task with no pushed commits: still mark done (internal
+            // tasks may legitimately produce no git-visible changes).
+            "done".to_string()
+        }
     } else {
         input.agent_status.to_string()
     }
@@ -441,14 +457,14 @@ pub async fn handle_success(
                 && stored_last_error.contains("workflow")));
 
     // Determine whether this external task can be marked done without a PR.
-    // External tasks with code-related labels must have a merged PR before
-    // reaching `done`. Tasks with non-code labels (from the allowlist) may
-    // be marked done directly.
+    // External tasks always require a PR before reaching `done` — unless
+    // commits were successfully pushed (in which case the `has_pushed` branch
+    // handles routing). The `is_non_code_task` heuristic was removed because
+    // it relied on agent output and could be fooled: an agent claiming
+    // "already implemented" or "config-only" would match non-code keywords
+    // and close the issue without verification.
     let is_external = !task_id.starts_with("internal:");
-    let requires_pr = is_external
-        && !has_pr
-        && !resp.status.starts_with("needs_review")
-        && !is_non_code_task(&resp);
+    let requires_pr = is_external && !has_pr && !resp.status.starts_with("needs_review");
 
     // ── Pre-compute counters needed by classify_final_status ─────────────────
     //
@@ -508,6 +524,7 @@ pub async fn handle_success(
         has_pr,
         has_delegations,
         has_pushed,
+        is_external,
         requires_pr,
         no_code_reroutes,
         max_reroutes,
@@ -722,97 +739,9 @@ pub async fn handle_success(
 }
 
 /// Labels that indicate a task is non-code and can be marked done without a PR.
-/// If a task has ANY of these labels (and NO code-related labels), it may be
-/// marked `done` directly without requiring a merged PR.
-const NON_CODE_LABELS: &[&str] = &[
-    "documentation",
-    "docs",
-    "research",
-    "analysis",
-    "investigation",
-    "question",
-    "discussion",
-    "planning",
-    "design",
-    "review",
-    "audit",
-    "config-change",
-];
-
-/// Check if the response indicates a non-code task based on labels in the
-/// accomplished/remaining/summary text and delegations.
-///
-/// This is a heuristic — we check if the agent's output mentions non-code
-/// labels or if delegations suggest non-code work. The definitive check
-/// should come from GitHub issue labels, but those are not available in
-/// the response handler. This function provides a best-effort classification.
-///
-/// Returns `true` if the task appears to be non-code (can be done without PR).
-fn is_non_code_task(resp: &AgentResponse) -> bool {
-    // Check delegations for non-code indicators
-    for delegation in &resp.delegations {
-        let combined = format!("{} {}", delegation.title, delegation.body).to_lowercase();
-        if has_non_code_label(&combined) {
-            return true;
-        }
-    }
-
-    // Check accomplished items for non-code indicators
-    for item in &resp.accomplished {
-        let lower = item.to_lowercase();
-        if has_non_code_label(&lower) {
-            return true;
-        }
-    }
-
-    // Check summary for non-code indicators
-    let summary_lower = resp.summary.to_lowercase();
-    if has_non_code_label(&summary_lower) {
-        return true;
-    }
-
-    false
-}
-
-/// Check if text contains any non-code label as a whole word (not a substring of another word).
-///
-/// Uses word-boundary matching: a label matches only when it is surrounded by
-/// non-alphanumeric characters (spaces, punctuation, start/end of string).
-/// This prevents false positives like "reviewed" matching "review", or
-/// "designing" matching "design".
-fn has_non_code_label(text: &str) -> bool {
-    NON_CODE_LABELS.iter().any(|label| {
-        let bytes = text.as_bytes();
-        let label_bytes = label.as_bytes();
-        let label_len = label_bytes.len();
-        let text_len = bytes.len();
-
-        if label_len > text_len {
-            return false;
-        }
-
-        // Slide a window of label_len across text looking for a whole-word match.
-        for start in 0..=(text_len - label_len) {
-            let end = start + label_len;
-            if &bytes[start..end] != label_bytes {
-                continue;
-            }
-            // Check that the character before the match is a word boundary.
-            let left_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
-            // Check that the character after the match is a word boundary.
-            let right_ok = end == text_len || !bytes[end].is_ascii_alphanumeric();
-            if left_ok && right_ok {
-                return true;
-            }
-        }
-        false
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::Delegation;
 
     // ── classify_final_status — one test per decision branch ─────────────────
 
@@ -888,6 +817,7 @@ mod tests {
     fn classify_done_requires_pr_under_max_reroutes() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
+            is_external: true,
             requires_pr: true,
             no_code_reroutes: 1,
             max_reroutes: 3,
@@ -901,6 +831,7 @@ mod tests {
     fn classify_done_requires_pr_at_max_reroutes_blocks() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
+            is_external: true,
             requires_pr: true,
             no_code_reroutes: 3,
             max_reroutes: 3,
@@ -914,6 +845,7 @@ mod tests {
     fn classify_done_requires_pr_exceeds_max_reroutes_blocks() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
+            is_external: true,
             requires_pr: true,
             no_code_reroutes: 5,
             max_reroutes: 3,
@@ -922,22 +854,33 @@ mod tests {
         assert_eq!(status, "blocked");
     }
 
-    /// Branch 7 (collapsed with 8): done + no PR, external non-code → done.
+    /// External task with no pushed commits: reroute (agent must produce commits
+    /// before the issue can be closed). This was the source of issue #1898 — an
+    /// agent claiming "already implemented" without any code changes would
+    /// previously match non-code keywords and close the issue falsely.
     #[test]
-    fn classify_done_external_non_code_no_pr_is_done() {
+    fn classify_done_external_no_pushed_commits_reroutes() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
-            requires_pr: false, // non-code task, no PR required
+            is_external: true,
+            has_pushed: false,
+            requires_pr: false, // even non-code tasks need pushed commits
+            no_code_reroutes: 0,
+            max_reroutes: 3,
             ..Default::default()
         });
-        assert_eq!(status, "done");
+        assert_eq!(status, "new");
     }
 
-    /// Branch 8: done + no PR, internal task → done.
+    /// Internal task with no pushed commits may still be marked done — internal
+    /// tasks may produce no git-visible changes.
     #[test]
     fn classify_done_internal_task_no_pr_is_done() {
         let status = classify_final_status(&DecisionInput {
             agent_status: "done",
+            is_external: false,
+            has_pushed: false,
+            requires_pr: false,
             ..Default::default()
         });
         assert_eq!(status, "done");
@@ -982,132 +925,5 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(status, "blocked");
-    }
-
-    #[test]
-    fn test_has_non_code_label_detects_labels() {
-        // Whole-word matches must be detected
-        assert!(has_non_code_label("updated documentation"));
-        assert!(has_non_code_label("research completed"));
-        assert!(has_non_code_label("analysis of the issue"));
-        assert!(has_non_code_label("design review done"));
-        assert!(has_non_code_label("planning session"));
-        assert!(!has_non_code_label("fixed the bug"));
-        assert!(!has_non_code_label("refactored the code"));
-    }
-
-    #[test]
-    fn test_has_non_code_label_no_false_positives_on_substrings() {
-        // Words that *contain* a label as a substring but are NOT the label itself.
-        // These must NOT match because the label is not a whole word.
-        assert!(!has_non_code_label("i reviewed the code and fixed the bug")); // "reviewed" ≠ "review"
-        assert!(!has_non_code_label("reviewed the implementation")); // "reviewed" ≠ "review"
-        assert!(!has_non_code_label("redesign of the module")); // "redesign" ≠ "design"
-        assert!(!has_non_code_label("designer wrote a component")); // "designer" ≠ "design"
-        assert!(!has_non_code_label("analyzing patterns in code")); // "analyzing" ≠ "analysis"
-        assert!(!has_non_code_label("investigations into root cause")); // "investigations" ≠ "investigation"
-
-        // Whole-word "docs" must still match
-        assert!(has_non_code_label("wrote docs for the feature"));
-        // Whole-word "review" must still match
-        assert!(has_non_code_label("code review complete"));
-        // Whole-word "design" must still match (it IS a standalone word here)
-        assert!(has_non_code_label("design phase finished"));
-        // Whole-word at start/end of string
-        assert!(has_non_code_label("research"));
-        assert!(has_non_code_label("audit"));
-    }
-
-    #[test]
-    fn test_is_non_code_task_no_false_positive_reviewed() {
-        // Agent says "I reviewed the code and fixed the bug" — this is code work, not a review task.
-        // "reviewed" contains "review" as a substring but is NOT a whole-word match.
-        let resp = AgentResponse {
-            status: "done".to_string(),
-            summary: "I reviewed the code and fixed the bug".to_string(),
-            accomplished: vec!["Patched the authentication module".to_string()],
-            remaining: vec![],
-            files: vec!["src/auth.rs".to_string()],
-            error: None,
-            learnings: vec![],
-            delegations: vec![],
-            input_tokens: None,
-            output_tokens: None,
-        };
-        assert!(!is_non_code_task(&resp));
-    }
-
-    #[test]
-    fn test_is_non_code_task_no_false_positive_analyzed() {
-        // "analyzed" contains "analysis" — wait, no: "analyzed" does NOT contain "analysis".
-        // But "analyzing" does not contain "analysis" either. This test covers "redesign"/"design".
-        let resp = AgentResponse {
-            status: "done".to_string(),
-            summary: "Redesigned the module's internal state machine".to_string(),
-            accomplished: vec!["Implemented state machine in state.rs".to_string()],
-            remaining: vec![],
-            files: vec!["src/state.rs".to_string()],
-            error: None,
-            learnings: vec![],
-            delegations: vec![],
-            input_tokens: None,
-            output_tokens: None,
-        };
-        assert!(!is_non_code_task(&resp));
-    }
-
-    #[test]
-    fn test_is_non_code_task_with_delegations() {
-        let resp = AgentResponse {
-            status: "done".to_string(),
-            summary: "Delegated research tasks".to_string(),
-            accomplished: vec!["Analyzed requirements".to_string()],
-            remaining: vec![],
-            files: vec![],
-            error: None,
-            learnings: vec![],
-            delegations: vec![Delegation {
-                title: "Research architecture".to_string(),
-                body: "Investigate and document the new architecture".to_string(),
-                labels: vec![],
-            }],
-            input_tokens: None,
-            output_tokens: None,
-        };
-        assert!(is_non_code_task(&resp));
-    }
-
-    #[test]
-    fn test_is_non_code_task_with_accomplished() {
-        let resp = AgentResponse {
-            status: "done".to_string(),
-            summary: "Analysis complete".to_string(),
-            accomplished: vec!["Completed documentation review".to_string()],
-            remaining: vec![],
-            files: vec![],
-            error: None,
-            learnings: vec![],
-            delegations: vec![],
-            input_tokens: None,
-            output_tokens: None,
-        };
-        assert!(is_non_code_task(&resp));
-    }
-
-    #[test]
-    fn test_is_non_code_task_code_task() {
-        let resp = AgentResponse {
-            status: "done".to_string(),
-            summary: "Fixed authentication bug".to_string(),
-            accomplished: vec!["Patched auth.rs".to_string()],
-            remaining: vec![],
-            files: vec!["src/auth.rs".to_string()],
-            error: None,
-            learnings: vec![],
-            delegations: vec![],
-            input_tokens: None,
-            output_tokens: None,
-        };
-        assert!(!is_non_code_task(&resp));
     }
 }
