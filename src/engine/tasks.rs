@@ -545,7 +545,11 @@ impl TaskManager {
         match self.backend.get_task(child_id).await {
             Ok(child) => child.labels.iter().any(|l| l == Status::Done.as_label()),
             Err(e) => {
-                tracing::debug!(child = child_id.0, ?e, "failed to fetch child task from backend");
+                tracing::debug!(
+                    child = child_id.0,
+                    ?e,
+                    "failed to fetch child task from backend"
+                );
                 false
             }
         }
