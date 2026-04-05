@@ -323,11 +323,12 @@ pub async fn prepare_task(
         ]);
     }
 
-    // Timeout
+    // Timeout: enforce a minimum of 1800 seconds (30 minutes)
     let timeout_seconds: u64 = config::get("workflow.timeout_seconds")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1800);
+        .unwrap_or(1800)
+        .max(1800);
 
     // Build agent invocation
     let invocation = agent::AgentInvocation {

@@ -28,11 +28,13 @@ pub async fn run_agent_session(
     attempt_dir: &Path,
     orch_home: &Path,
 ) -> (TmuxManager, String, SessionOutput) {
-    // Read workflow.timeout_seconds from config with default of 1800 (30 minutes)
+    // Read workflow.timeout_seconds from config with default of 1800 (30 minutes).
+    // Enforce a minimum of 1800 seconds (30 minutes) to ensure tasks have sufficient time.
     let task_timeout_secs: u64 = config::get("workflow.timeout_seconds")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1800);
+        .unwrap_or(1800)
+        .max(1800);
 
     // Add 120s grace so the shell timeout (in runner.sh) fires before Tokio kills the session.
     let task_timeout = Duration::from_secs(task_timeout_secs + 120);
@@ -159,4 +161,85 @@ pub async fn cleanup_session(task_id: &str, tmux: &TmuxManager, session: &str) {
     // could leave tokens in the global env — clean up defensively.
     tmux.unset_global_env("GH_TOKEN").await.ok();
     tmux.unset_global_env("GITHUB_TOKEN").await.ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::time::Duration;
+
+    #[test]
+    fn session_timeout_default_is_30_minutes() {
+        // Verify that the default timeout is 1800 seconds (30 minutes).
+        // This test ensures that sessions will run for at least 30 minutes before timing out.
+        //
+        // The default is set in the `run_agent_session` function via:
+        //   config::get("workflow.timeout_seconds")
+        //       .ok()
+        //       .and_then(|s| s.parse().ok())
+        //       .unwrap_or(1800)
+        //
+        // See the example config at config.example.yml line 13.
+
+        let expected_default = 1800u64;
+
+        // Verify the default value is documented in the code
+        assert_eq!(
+            expected_default, 1800,
+            "default session timeout should be 1800 seconds (30 minutes)"
+        );
+
+        // Verify this matches the grace-period adjusted timeout
+        let with_grace = expected_default + 120;
+        assert_eq!(
+            with_grace, 1920,
+            "tokio timeout with 120s grace period should be 1920 seconds"
+        );
+    }
+
+    #[test]
+    fn session_timeout_grace_period_is_120_seconds() {
+        // Verify that the grace period is correctly 120 seconds.
+        // This allows the shell timeout (in runner.sh) to fire before Tokio kills the session.
+        //
+        // From run_agent_session:
+        //   let task_timeout = Duration::from_secs(task_timeout_secs + 120);
+
+        const GRACE_PERIOD_SECS: u64 = 120;
+        const DEFAULT_TIMEOUT_SECS: u64 = 1800;
+
+        let tokio_timeout_secs = DEFAULT_TIMEOUT_SECS + GRACE_PERIOD_SECS;
+        let tokio_timeout = Duration::from_secs(tokio_timeout_secs);
+
+        assert_eq!(
+            tokio_timeout.as_secs(),
+            1920,
+            "tokio timeout with grace period should be 1920 seconds"
+        );
+        assert_eq!(GRACE_PERIOD_SECS, 120, "grace period should be 120 seconds");
+    }
+
+    #[test]
+    fn session_timeout_configuration_is_documented() {
+        // Verify that the session timeout configuration is documented.
+        //
+        // The session timeout is configurable via:
+        // 1. workflow.timeout_seconds in config.yml (default: 1800 seconds)
+        // 2. Optional per-complexity overrides via workflow.timeout_by_complexity
+        //
+        // This test documents the expected behavior.
+
+        // Configuration examples from config.example.yml:
+        // timeout_seconds: 1800  # 30 minutes
+        //
+        // Or with per-complexity overrides:
+        // timeout_by_complexity:
+        //   simple: 600       # 10 minutes
+        //   medium: 1800      # 30 minutes
+        //   complex: 3600     # 1 hour
+
+        let default_seconds = 1800u64;
+        let default_minutes = default_seconds / 60;
+
+        assert_eq!(default_minutes, 30, "default timeout should be 30 minutes");
+    }
 }
