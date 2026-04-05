@@ -423,6 +423,19 @@ pub(crate) async fn auto_merge_pr(
                     task_manager
                         .update_task_status(&task.id, Status::Blocked)
                         .await?;
+                    store_set(
+                        &Some(Arc::clone(store)),
+                        repo,
+                        &task.id.0,
+                        &[(
+                            "block_reason",
+                            serde_json::json!(format!(
+                                "CI failure limit ({}) reached during auto-merge",
+                                MAX_CI_MERGE_FAILURES
+                            )),
+                        )],
+                    )
+                    .await;
                 } else {
                     tracing::warn!(
                         task_id = task.id.0,
@@ -457,6 +470,19 @@ pub(crate) async fn auto_merge_pr(
                         task_manager
                             .update_task_status(&task.id, Status::Blocked)
                             .await?;
+                        store_set(
+                            &Some(Arc::clone(store)),
+                            repo,
+                            &task.id.0,
+                            &[(
+                                "block_reason",
+                                serde_json::json!(format!(
+                                    "CI checks timed out after {} auto-merge failures",
+                                    MAX_CI_MERGE_FAILURES
+                                )),
+                            )],
+                        )
+                        .await;
                     } else {
                         tracing::warn!(
                             task_id = task.id.0,
@@ -537,6 +563,19 @@ pub(crate) async fn auto_merge_pr(
                 task_manager
                     .update_task_status(&task.id, Status::Blocked)
                     .await?;
+                store_set(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    &[(
+                        "block_reason",
+                        serde_json::json!(format!(
+                            "merge conflict retry limit ({}) reached",
+                            MAX_MERGE_CONFLICT_RETRIES
+                        )),
+                    )],
+                )
+                .await;
                 let comment = format!("Auto-merge failed after {} rebase attempts: {}", retries, e);
                 let footer = attribution_footer("Commented", review_agent, review_model);
                 let _ = gh
@@ -746,6 +785,21 @@ pub(crate) async fn auto_merge_pr(
                     e
                 )
             };
+            let block_reason = if push_failed {
+                format!(
+                    "auto-merge force-push failed after rebase: {}",
+                    push_err_msg
+                )
+            } else {
+                format!("auto-merge rebase failed after merge conflict: {}", e)
+            };
+            store_set(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                &[("block_reason", serde_json::json!(block_reason))],
+            )
+            .await;
             let footer = attribution_footer("Commented", review_agent, review_model);
             if let Err(e) = gh
                 .add_comment(
@@ -770,6 +824,16 @@ pub(crate) async fn auto_merge_pr(
         task_manager
             .update_task_status(&task.id, Status::Blocked)
             .await?;
+        store_set(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            &[(
+                "block_reason",
+                serde_json::json!(format!("auto-merge failed: {}", e)),
+            )],
+        )
+        .await;
         let comment = format!("Auto-merge failed: {}", e);
         let footer = attribution_footer("Commented", review_agent, review_model);
         if let Err(e) = gh
