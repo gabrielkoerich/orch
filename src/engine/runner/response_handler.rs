@@ -298,8 +298,10 @@ pub async fn handle_success(
         };
 
         // Create PR (skip if push failed or repo is unknown)
-        if !push_ok {
+        if has_commits && !push_ok {
             tracing::warn!(task_id, "skipping PR creation due to push failure");
+        } else if !push_ok {
+            // no commits — already logged "no commits ahead, skipping push + PR" at INFO level above
         } else if repo.is_empty() {
             tracing::warn!(
                 task_id,
