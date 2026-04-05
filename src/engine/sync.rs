@@ -890,12 +890,19 @@ async fn scan_mentions(
                             command = %command,
                             "ignoring slash command in mention on non-open issue"
                         );
-                        // Do NOT advance the global mentions cursor here. Leaving the
-                        // cursor update until after the full batch (end of function)
-                        // prevents permanently skipping other mentions in the same
-                        // fetched batch when timestamps are non-monotonic or clocks
-                        // are skewed. The mention will be re-fetched on the next tick
-                        // and re-evaluated (idempotent skip).
+                        if let Some(s) = store {
+                            let title = format!(
+                                "Skipped @orch command on closed issue #{issue_num} from @{}",
+                                mention.author
+                            );
+                            let task_body = format!(
+                                "Mention by @{}:\n\n{}\n\n**Skipped:** target issue is closed",
+                                mention.author, mention.body
+                            );
+                            let _ = s
+                                .create_internal(repo, &title, &task_body, "mention", &mention.id)
+                                .await;
+                        }
                         continue;
                     }
                     Ok(_) => {}
@@ -919,10 +926,19 @@ async fn scan_mentions(
                             issue = %issue_num,
                             "ignoring slash command in mention from non-collaborator"
                         );
-                        // Do NOT advance the global mentions cursor here for the same
-                        // reason described above. Let the final cursor update at the
-                        // end of the function handle batch progression so later
-                        // mentions in this fetch are not skipped.
+                        if let Some(s) = store {
+                            let title = format!(
+                                "Skipped @orch command from non-collaborator @{}",
+                                mention.author
+                            );
+                            let task_body = format!(
+                                "Mention by @{}:\n\n{}\n\n**Skipped:** author is not a collaborator",
+                                mention.author, mention.body
+                            );
+                            let _ = s
+                                .create_internal(repo, &title, &task_body, "mention", &mention.id)
+                                .await;
+                        }
                         continue;
                     }
                     Err(e) => {
