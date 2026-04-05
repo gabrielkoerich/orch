@@ -64,6 +64,10 @@ pub fn spawn(
                         continue;
                     }
 
+                    // Create guard IMMEDIATELY after inserting the key — owns removal for all subsequent exit paths
+                    let dispatch_guard =
+                        DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
+
                     tracing::info!(task_id, "event-driven review triggered");
 
                     // Look up the task from the store to get an ExternalTask.
@@ -204,10 +208,6 @@ pub fn spawn(
 
                     crate::store::set_review_session_expected(&store, &repo, &task.id.0, true)
                         .await;
-
-                    // RAII guard — removes dispatch_key on drop even if the spawned task panics.
-                    let dispatch_guard =
-                        DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
 
                     let backend_c = backend.clone();
                     let task_manager_c = task_manager.clone();
