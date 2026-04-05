@@ -385,11 +385,25 @@ pub fn spawn(
                         .await;
 
                         if !matches!(current_status, Some(crate::store::TaskStatus::InReview)) {
-                            tracing::warn!(
-                                task_id = tid,
-                                current_status = current_status.as_ref().map(|s| s.as_str()).unwrap_or("unknown"),
-                                "review outcome discarded — task is no longer in_review (stale review agent result)"
+                            let expected = matches!(
+                                current_status,
+                                Some(crate::store::TaskStatus::Done)
+                                    | Some(crate::store::TaskStatus::Routed)
+                                    | Some(crate::store::TaskStatus::New)
                             );
+                            if expected {
+                                tracing::debug!(
+                                    task_id = tid,
+                                    current_status = current_status.as_ref().map(|s| s.as_str()).unwrap_or("unknown"),
+                                    "review outcome discarded — task transitioned away from in_review (expected)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    task_id = tid,
+                                    current_status = current_status.as_ref().map(|s| s.as_str()).unwrap_or("unknown"),
+                                    "review outcome discarded — task is no longer in_review (stale review agent result)"
+                                );
+                            }
                             drop(permit);
                             return;
                         }
