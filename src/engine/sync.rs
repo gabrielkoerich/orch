@@ -1369,11 +1369,19 @@ pub(crate) async fn ingest_external_tasks(
 
     // 1. Routable tasks (unlabeled + status:new) — these are the ones that
     //    were previously missed because the per-status loop skipped them.
-    if let Ok(routable) = backend.list_routable().await {
-        for task in routable {
-            if seen.insert(task.id.0.clone()) {
-                all_tasks.push((task, None));
+    match backend.list_routable().await {
+        Ok(routable) => {
+            for task in routable {
+                if seen.insert(task.id.0.clone()) {
+                    all_tasks.push((task, None));
+                }
             }
+        }
+        Err(e) => {
+            tracing::debug!(
+                ?e,
+                "ingest: failed to list routable tasks — unlabeled new issues may be delayed"
+            );
         }
     }
 
