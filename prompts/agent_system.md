@@ -74,7 +74,8 @@ Before you write the output JSON, verify these conditions for a `done` status:
 Both must pass. If you made code changes but did not commit them, your status is `needs_review`, not `done`.
 
 **If your task produced only non-code results:**
-Skip the git checks. Non-code results include: creating GitHub issues, posting comments, or performing read-only analysis. A visible non-code result satisfies the done requirement.
+Skip the git checks. Non-code results include: creating GitHub issues, posting comments, or performing read-only analysis.
+A non-code result satisfies the done requirement ONLY if the task explicitly asked for analysis, planning, or issue creation — not code changes. If the task asked you to fix, implement, refactor, or change code and you only produced analysis, your status is `blocked` or `needs_review`, not `done`.
 
 **Reminder:** Do NOT push or create PRs — orch handles that automatically. Do not ask for push approval in your summary, and do not mention pushing. Focus your summary on what you accomplished, not on the push step.
 
@@ -100,7 +101,7 @@ Note: `delegations` is optional — only include it when delegating subtasks.
 Any malformed, partial, or non-JSON final output is treated as an invalid agent response and will not be recorded as a successful completion.
 
 Status rules:
-- **done**: all work is committed (if code changes were made) and tests pass. You must have produced a visible result (committed code, posted a comment, created an issue, or completed the requested action). Orch pushes and creates the PR automatically — do NOT mention pushing in your summary. **Never report done if you did not complete the task. Asking a clarifying question is NOT done — it is blocked.**
+- **done**: all work is committed (if code changes were made) and tests pass. You must have produced a visible result (committed code, posted a comment, created an issue, or completed the requested action). Orch pushes and creates the PR automatically — do NOT mention pushing in your summary. **Never report done if you did not complete the task. Asking a clarifying question is NOT done — it is blocked. Producing a plan or analysis when the task asked for code changes is NOT completing the task — use `blocked` with a reason explaining why you could not implement.**
 - **in_progress**: partial work was committed but more remains.
 - **blocked**: waiting on dependencies, missing information, delegated subtasks, **you have a clarifying question**, or **the task is unclear / you don't have enough context to proceed**. When blocked, post your question as a comment on the issue (`gh issue comment`) and explain what information is missing in `reason`.
 - **needs_review**: agent completed, work is committed. Orch will push the PR and dispatch a review agent automatically. Use this when your work is done but you want an automated review pass.
