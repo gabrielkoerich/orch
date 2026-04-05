@@ -51,22 +51,22 @@ pub fn spawn(
                         continue;
                     }
 
-                     let task_id = &event.task_id;
-                     let dispatch_key = format!("{}/{}", repo, task_id);
+                    let task_id = &event.task_id;
+                    let dispatch_key = format!("{}/{}", repo, task_id);
 
-                     // Atomically claim the task before any async work so concurrent
-                     // review events cannot double-spawn the same review flow.
-                     if !dispatching.insert(dispatch_key.clone()) {
-                         tracing::debug!(
-                             task_id,
-                             "task locked by dispatch flow, skipping event-driven review"
-                         );
-                         continue;
-                     }
+                    // Atomically claim the task before any async work so concurrent
+                    // review events cannot double-spawn the same review flow.
+                    if !dispatching.insert(dispatch_key.clone()) {
+                        tracing::debug!(
+                            task_id,
+                            "task locked by dispatch flow, skipping event-driven review"
+                        );
+                        continue;
+                    }
 
-                     // Create guard IMMEDIATELY after inserting the key — owns removal for all subsequent exit paths
-                     let dispatch_guard =
-                         DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
+                    // Create guard IMMEDIATELY after inserting the key — owns removal for all subsequent exit paths
+                    let dispatch_guard =
+                        DispatchGuard::new(dispatching.clone(), dispatch_key.clone());
 
                     tracing::info!(task_id, "event-driven review triggered");
 
@@ -196,18 +196,18 @@ pub fn spawn(
                         }
                     };
 
-                     // Transition to InReview — this IS the atomic guard against duplicates.
-                     if let Err(e) = task_manager
-                         .update_task_status(&task.id, Status::InReview)
-                         .await
-                     {
-                         tracing::warn!(task_id, err = %e, "failed to transition to InReview");
-                         drop(permit);
-                         continue;
-                     }
+                    // Transition to InReview — this IS the atomic guard against duplicates.
+                    if let Err(e) = task_manager
+                        .update_task_status(&task.id, Status::InReview)
+                        .await
+                    {
+                        tracing::warn!(task_id, err = %e, "failed to transition to InReview");
+                        drop(permit);
+                        continue;
+                    }
 
-                     crate::store::set_review_session_expected(&store, &repo, &task.id.0, true)
-                         .await;
+                    crate::store::set_review_session_expected(&store, &repo, &task.id.0, true)
+                        .await;
 
                     let backend_c = backend.clone();
                     let task_manager_c = task_manager.clone();
