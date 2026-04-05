@@ -757,10 +757,18 @@ fn classify_opencode_message(message: &str) -> AgentError {
     // Model not available (opencode-specific extraction pattern)
     if lower.contains("model") && (lower.contains("not found") || lower.contains("not supported")) {
         // Try to extract model name from patterns like "Model not found: anthropic/claude-sonnet-4-6."
+        // or "Model not found: github-copilot/gemini-3.1-pro. Did you mean: gemini-3.1-pro-preview?"
         let model = message
             .split(": ")
             .nth(1)
-            .map(|s| s.trim_end_matches('.').to_string())
+            .map(|s| {
+                // Strip opencode's "Did you mean: X?" suggestion suffix if present
+                s.split(". Did you mean")
+                    .next()
+                    .unwrap_or(s)
+                    .trim_end_matches('.')
+                    .to_string()
+            })
             .unwrap_or_default();
         return AgentError::ModelUnavailable {
             message: message.to_string(),
@@ -1002,6 +1010,22 @@ mod tests {
     fn classify_opencode_model_not_found() {
         let err = classify_opencode_message("model not found: gpt-5");
         assert!(matches!(err, AgentError::ModelUnavailable { .. }));
+    }
+
+    #[test]
+    fn classify_opencode_model_not_found_with_suggestion() {
+        // Issue #1934: opencode returns "Model not found: X. Did you mean: Y?"
+        // The parser must extract "X", not "X. Did you mean"
+        let err = classify_opencode_message(
+            "Model not found: github-copilot/gemini-3.1-pro. Did you mean: gemini-3.1-pro-preview?",
+        );
+        match err {
+            AgentError::ModelUnavailable { model, message } => {
+                assert_eq!(model, "github-copilot/gemini-3.1-pro");
+                assert!(message.contains("Did you mean"));
+            }
+            other => panic!("expected ModelUnavailable, got: {other:?}"),
+        }
     }
 
     #[test]
