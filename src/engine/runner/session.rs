@@ -28,11 +28,13 @@ pub async fn run_agent_session(
     attempt_dir: &Path,
     orch_home: &Path,
 ) -> (TmuxManager, String, SessionOutput) {
-    // Read workflow.timeout_seconds from config with default of 1800 (30 minutes)
+    // Read workflow.timeout_seconds from config with default of 1800 (30 minutes).
+    // Enforce a minimum of 1800 seconds (30 minutes) to ensure tasks have sufficient time.
     let task_timeout_secs: u64 = config::get("workflow.timeout_seconds")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1800);
+        .unwrap_or(1800)
+        .max(1800);
 
     // Add 120s grace so the shell timeout (in runner.sh) fires before Tokio kills the session.
     let task_timeout = Duration::from_secs(task_timeout_secs + 120);

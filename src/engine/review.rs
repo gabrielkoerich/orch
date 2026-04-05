@@ -963,6 +963,7 @@ pub(crate) async fn review_and_merge(
     let git_email = crate::config::get("git.email")
         .unwrap_or_else(|_| format!("{review_agent}[bot]@users.noreply.github.com"));
 
+    // Review timeout: enforce a minimum of 1800 seconds (30 minutes)
     let review_timeout_secs: u64 = crate::config::get("workflow.review_timeout_seconds")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -971,7 +972,8 @@ pub(crate) async fn review_and_merge(
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1800)
-        });
+        })
+        .max(1800);
 
     let system_prompt = runner::agent::review_system_prompt();
 
