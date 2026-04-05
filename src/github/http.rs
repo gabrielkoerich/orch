@@ -19,7 +19,7 @@ use reqwest::{header, Client, Response, StatusCode};
 use serde::Serialize;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 use urlencoding;
@@ -277,6 +277,7 @@ fn record_response_for_limiter(cell: &'static RateLimitCell, resp: &Response) {
 pub struct GhHttp {
     client: Client,
     token_resolver: Arc<token::TokenResolver>,
+    cached_username: OnceLock<String>,
 }
 
 impl GhHttp {
@@ -298,6 +299,7 @@ impl GhHttp {
         Ok(Self {
             client,
             token_resolver: token::shared(),
+            cached_username: OnceLock::new(),
         })
     }
 
@@ -1323,13 +1325,21 @@ impl GhHttp {
         self.get_all_pages(&url, &[("per_page", "100")]).await
     }
 
-    /// Get the current authenticated username.
+    /// Get the current authenticated username (cached after first call).
     pub async fn get_whoami(&self) -> anyhow::Result<String> {
+        if let Some(cached) = self.cached_username.get() {
+            return Ok(cached.clone());
+        }
+
         let user: serde_json::Value = self.get_json(&format!("{GITHUB_API}/user")).await?;
-        user.get("login")
+        let username = user
+            .get("login")
             .and_then(|v| v.as_str())
             .map(String::from)
-            .ok_or_else(|| anyhow::anyhow!("failed to get current user"))
+            .ok_or_else(|| anyhow::anyhow!("failed to get current user"))?;
+
+        let _ = self.cached_username.set(username.clone());
+        Ok(username)
     }
 
     /// Get PR number by branch name.
@@ -2897,6 +2907,7 @@ mod tests {
         let gh = GhHttp {
             client: reqwest::Client::new(),
             token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
+            cached_username: OnceLock::new(),
         };
         let result = gh
             .send_with_retries(
@@ -2953,6 +2964,7 @@ mod tests {
             let client = GhHttp {
                 client: reqwest::Client::new(),
                 token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
+                cached_username: OnceLock::new(),
             };
             (client, guard)
         }
