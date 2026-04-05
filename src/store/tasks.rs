@@ -487,6 +487,23 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Touch `updated_at` to now without changing any other field.
+    ///
+    /// Called by the runner immediately after a tmux session exits so that the
+    /// stuck-task recovery timer is reset before response_handler post-processing
+    /// (git push, PR creation, status update) begins.  Without this, a session
+    /// that ran longer than `no_session_stuck_timeout` (default 10 min) would be
+    /// re-dispatched by the tick while the runner is still writing results.
+    pub async fn touch_updated_at(&self, id: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Reset a task back to `new`.
     pub async fn reset_to_new(&self, id: i64) -> anyhow::Result<()> {
         let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")

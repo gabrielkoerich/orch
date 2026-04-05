@@ -52,6 +52,19 @@ pub async fn store_set(
     }
 }
 
+/// Touch `updated_at` to now so the stuck-task timer is reset after a session exits.
+///
+/// No-op when the store is unavailable or the task cannot be resolved.
+pub async fn store_touch_updated_at(store: &Option<Arc<TaskStore>>, repo: &str, task_id: &str) {
+    if let Some(ref s) = store {
+        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
+            if let Err(e) = s.touch_updated_at(store_id).await {
+                tracing::warn!(task_id, error = %e, "store touch_updated_at failed");
+            }
+        }
+    }
+}
+
 /// Append a lifecycle activity event to a task timeline.
 #[allow(clippy::too_many_arguments)]
 pub async fn store_log_activity(
