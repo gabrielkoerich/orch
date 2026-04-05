@@ -181,13 +181,17 @@ mod tests {
         let expected_default = 1800u64;
 
         // Verify the default value is documented in the code
-        assert_eq!(expected_default, 1800,
-                   "default session timeout should be 1800 seconds (30 minutes)");
+        assert_eq!(
+            expected_default, 1800,
+            "default session timeout should be 1800 seconds (30 minutes)"
+        );
 
         // Verify this matches the grace-period adjusted timeout
         let with_grace = expected_default + 120;
-        assert_eq!(with_grace, 1920,
-                   "tokio timeout with 120s grace period should be 1920 seconds");
+        assert_eq!(
+            with_grace, 1920,
+            "tokio timeout with 120s grace period should be 1920 seconds"
+        );
     }
 
     #[test]
@@ -204,10 +208,12 @@ mod tests {
         let tokio_timeout_secs = DEFAULT_TIMEOUT_SECS + GRACE_PERIOD_SECS;
         let tokio_timeout = Duration::from_secs(tokio_timeout_secs);
 
-        assert_eq!(tokio_timeout.as_secs(), 1920,
-                   "tokio timeout with grace period should be 1920 seconds");
-        assert_eq!(GRACE_PERIOD_SECS, 120,
-                   "grace period should be 120 seconds");
+        assert_eq!(
+            tokio_timeout.as_secs(),
+            1920,
+            "tokio timeout with grace period should be 1920 seconds"
+        );
+        assert_eq!(GRACE_PERIOD_SECS, 120, "grace period should be 120 seconds");
     }
 
     #[test]
@@ -232,8 +238,6 @@ mod tests {
         let default_seconds = 1800u64;
         let default_minutes = default_seconds / 60;
 
-        assert_eq!(default_minutes, 30,
-                   "default timeout should be 30 minutes");
+        assert_eq!(default_minutes, 30, "default timeout should be 30 minutes");
     }
 }
-
