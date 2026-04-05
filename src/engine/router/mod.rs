@@ -1122,6 +1122,15 @@ pub async fn get_route_result(
         valid
     });
 
+    // If a stale model was discarded, update the database to clear it.
+    // This prevents repeated warnings on subsequent dispatches (#1907).
+    let original_model = task.model.clone().filter(|m| !m.is_empty());
+    if original_model.is_some() && model.is_none() {
+        let _ = store
+            .set_fields(store_id, &[("model", serde_json::json!(""))])
+            .await;
+    }
+
     Ok(RouteResult {
         agent,
         model,
