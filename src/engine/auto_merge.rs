@@ -582,7 +582,16 @@ pub(crate) async fn auto_merge_pr(
                                 .output()
                                 .await
                         }
-                        Ok(out) => Ok(out),
+                        Ok(out) => {
+                            // fetch failed — not a content conflict; leave task in InReview for retry
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                stderr = %stderr,
+                                "git fetch failed before rebase — skipping rebase"
+                            );
+                            return Ok(());
+                        }
                         Err(err) => Err(err),
                     };
 
