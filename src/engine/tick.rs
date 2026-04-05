@@ -1245,26 +1245,13 @@ pub(crate) async fn tick_unblock_parents(
             continue;
         }
 
-        // Check if every child is done
+        // Check if every child is done using the local store (falls back to GitHub API
+        // only when the child is not yet in the store).
         let mut all_done = true;
         for child_id in &children {
-            match backend.get_task(child_id).await {
-                Ok(child) => {
-                    if !child.labels.iter().any(|l| l == Status::Done.as_label()) {
-                        all_done = false;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        parent = task.id.0,
-                        child = child_id.0,
-                        ?e,
-                        "failed to fetch child task"
-                    );
-                    all_done = false;
-                    break;
-                }
+            if !task_manager.is_child_done(child_id).await {
+                all_done = false;
+                break;
             }
         }
 

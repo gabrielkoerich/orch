@@ -523,6 +523,38 @@ impl TaskManager {
         store.list_all_internal(&self.repo).await
     }
 
+    /// Check whether a child task (identified by its external ID) is done,
+    /// using the local store when available and falling back to the GitHub backend.
+    ///
+    /// Returns `true` if the task is done, `false` if it is not done or cannot be
+    /// determined (caller should treat unknown as not-done).
+    pub async fn is_child_done(&self, child_id: &ExternalId) -> bool {
+        if let Some(ref store) = self.store {
+            match store.get_by_external_id(&self.repo, &child_id.0).await {
+                Ok(Some(task)) => return task.status == TaskStatus::Done,
+                Ok(None) => {
+                    // Not in local store yet — fall through to backend
+                }
+                Err(e) => {
+                    tracing::debug!(child = child_id.0, ?e, "store lookup failed for child task");
+                    // Fall through to backend
+                }
+            }
+        }
+        // Fallback: ask the backend (also handles the no-store case)
+        match self.backend.get_task(child_id).await {
+            Ok(child) => child.labels.iter().any(|l| l == Status::Done.as_label()),
+            Err(e) => {
+                tracing::debug!(
+                    child = child_id.0,
+                    ?e,
+                    "failed to fetch child task from backend"
+                );
+                false
+            }
+        }
+    }
+
     pub async fn publish_task(&self, id: i64, labels: &[String]) -> anyhow::Result<ExternalId> {
         let store = self
             .store
