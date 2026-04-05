@@ -654,6 +654,8 @@ pub(super) async fn handle_channel_message(
                 {
                     let key = format!("{channel}:{}", msg.id);
                     let mut picks = pending_picks.lock().await;
+                    // Evict expired entries to prevent unbounded growth.
+                    picks.retain(|_, v| !v.is_expired());
                     picks.insert(key, PendingPick::new(msg.body.clone()));
                 }
 
