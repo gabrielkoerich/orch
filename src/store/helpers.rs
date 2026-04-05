@@ -44,9 +44,15 @@ pub async fn store_set(
     store_fields: &[(&str, serde_json::Value)],
 ) {
     if let Some(ref store) = store {
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-            if let Err(e) = store.set_fields(store_id, store_fields).await {
-                tracing::warn!(task_id, error = %e, "store set_fields failed");
+        match store.resolve_task_id(repo, task_id).await {
+            Ok(Some(store_id)) => {
+                if let Err(e) = store.set_fields(store_id, store_fields).await {
+                    tracing::warn!(task_id, error = %e, "store set_fields failed");
+                }
+            }
+            Ok(None) => {}  // task not in store — no-op is expected
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
         }
     }
@@ -57,9 +63,15 @@ pub async fn store_set(
 /// No-op when the store is unavailable or the task cannot be resolved.
 pub async fn store_touch_updated_at(store: &Option<Arc<TaskStore>>, repo: &str, task_id: &str) {
     if let Some(ref s) = store {
-        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
-            if let Err(e) = s.touch_updated_at(store_id).await {
-                tracing::warn!(task_id, error = %e, "store touch_updated_at failed");
+        match s.resolve_task_id(repo, task_id).await {
+            Ok(Some(store_id)) => {
+                if let Err(e) = s.touch_updated_at(store_id).await {
+                    tracing::warn!(task_id, error = %e, "store touch_updated_at failed");
+                }
+            }
+            Ok(None) => {}  // task not in store — no-op is expected
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
         }
     }
@@ -79,20 +91,26 @@ pub async fn store_log_activity(
     details: Option<&serde_json::Value>,
 ) {
     if let Some(ref s) = store {
-        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
-            if let Err(e) = s
-                .append_activity(
-                    store_id,
-                    event_type,
-                    from_status,
-                    to_status,
-                    agent,
-                    model,
-                    details,
-                )
-                .await
-            {
-                tracing::warn!(task_id, event_type, error = %e, "store append_activity failed");
+        match s.resolve_task_id(repo, task_id).await {
+            Ok(Some(store_id)) => {
+                if let Err(e) = s
+                    .append_activity(
+                        store_id,
+                        event_type,
+                        from_status,
+                        to_status,
+                        agent,
+                        model,
+                        details,
+                    )
+                    .await
+                {
+                    tracing::warn!(task_id, event_type, error = %e, "store append_activity failed");
+                }
+            }
+            Ok(None) => {}  // task not in store — no-op is expected
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
         }
     }
@@ -135,9 +153,15 @@ pub async fn store_increment(
     field: &str,
 ) -> u64 {
     if let Some(ref s) = store {
-        if let Ok(Some(store_id)) = s.resolve_task_id(repo, task_id).await {
-            if let Ok(new_val) = s.increment(store_id, field).await {
-                return new_val as u64;
+        match s.resolve_task_id(repo, task_id).await {
+            Ok(Some(store_id)) => {
+                if let Ok(new_val) = s.increment(store_id, field).await {
+                    return new_val as u64;
+                }
+            }
+            Ok(None) => {}  // task not in store — no-op is expected
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
         }
     }
@@ -147,9 +171,15 @@ pub async fn store_increment(
 /// Reset all task counters in the task store.
 pub async fn store_reset_counters(store: &Option<Arc<TaskStore>>, repo: &str, task_id: &str) {
     if let Some(ref store) = store {
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-            if let Err(e) = store.reset_counters(store_id).await {
-                tracing::warn!(task_id, err = %e, "store reset_counters failed");
+        match store.resolve_task_id(repo, task_id).await {
+            Ok(Some(store_id)) => {
+                if let Err(e) = store.reset_counters(store_id).await {
+                    tracing::warn!(task_id, err = %e, "store reset_counters failed");
+                }
+            }
+            Ok(None) => {}  // task not in store — no-op is expected
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
         }
     }
@@ -165,9 +195,15 @@ pub async fn store_reset_failure_counters(
     task_id: &str,
 ) {
     if let Some(ref store) = store {
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-            if let Err(e) = store.reset_failure_counters(store_id).await {
-                tracing::warn!(task_id, err = %e, "failed to reset failure counters after review dispatch");
+        match store.resolve_task_id(repo, task_id).await {
+            Ok(Some(store_id)) => {
+                if let Err(e) = store.reset_failure_counters(store_id).await {
+                    tracing::warn!(task_id, err = %e, "failed to reset failure counters after review dispatch");
+                }
+            }
+            Ok(None) => {}  // task not in store — no-op is expected
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
         }
     }
