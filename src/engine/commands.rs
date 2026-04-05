@@ -86,10 +86,23 @@ pub fn parse_command(body: &str) -> Option<OwnerCommand> {
         if fence_char.is_some() {
             continue;
         }
-        if !trimmed.starts_with('/') {
-            continue;
-        }
-        let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+        // Support both `/command` and `@mention /command` (e.g. `@orch /retry`).
+        // Strip any leading `@word` tokens to find the slash command.
+        let cmd_part = if trimmed.starts_with('/') {
+            trimmed
+        } else {
+            let mut rest = trimmed;
+            while let Some(stripped) = rest.strip_prefix('@') {
+                let after = stripped.trim_start_matches(|c: char| !c.is_whitespace());
+                rest = after.trim_start();
+            }
+            if rest.starts_with('/') {
+                rest
+            } else {
+                continue;
+            }
+        };
+        let parts: Vec<&str> = cmd_part.splitn(2, char::is_whitespace).collect();
         let cmd = parts[0];
         let args = parts
             .get(1)
@@ -630,6 +643,33 @@ mod tests {
             parse_command("/block waiting on upstream fix"),
             Some(OwnerCommand::Block(Some("waiting on upstream fix".into())))
         );
+    }
+
+    #[test]
+    fn parse_mention_prefix_retry() {
+        assert_eq!(parse_command("@orch /retry"), Some(OwnerCommand::Retry));
+    }
+
+    #[test]
+    fn parse_mention_prefix_with_args() {
+        assert_eq!(
+            parse_command("@orch /block waiting on upstream fix"),
+            Some(OwnerCommand::Block(Some("waiting on upstream fix".into())))
+        );
+    }
+
+    #[test]
+    fn parse_mention_prefix_reroute_agent() {
+        assert_eq!(
+            parse_command("@orch /reroute codex"),
+            Some(OwnerCommand::Reroute(Some("codex".into())))
+        );
+    }
+
+    #[test]
+    fn parse_mention_in_multiline_body() {
+        let body = "Hey @orch please retry this\n@orch /retry\nThanks";
+        assert_eq!(parse_command(body), Some(OwnerCommand::Retry));
     }
 
     #[test]
