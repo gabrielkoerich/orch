@@ -108,14 +108,16 @@ impl ClaudeRunner {
             }
             // Check auth before rate_limit — billing errors (credit balance)
             // are auth issues, not transient rate limits.
-            let combined = format!("{result_text} {}", raw);
-            if let Some(e) = super::patterns::detect_auth_error(&combined) {
+            // Use result_text only (not combined with raw JSON) so the error
+            // message stays clean — the raw NDJSON stats blob must not leak
+            // into the logged reason string.
+            if let Some(e) = super::patterns::detect_auth_error(result_text) {
                 return Err(e);
             }
-            if let Some(e) = super::patterns::detect_rate_limit(&combined) {
+            if let Some(e) = super::patterns::detect_rate_limit(result_text) {
                 return Err(e);
             }
-            if let Some(e) = super::patterns::detect_context_overflow(&combined) {
+            if let Some(e) = super::patterns::detect_context_overflow(result_text) {
                 return Err(e);
             }
             return Err(AgentError::AgentFailed {
@@ -174,7 +176,7 @@ impl ClaudeRunner {
 /// (auth, rate limit, context overflow) rather than always returning AgentFailed.
 fn extract_error_from_envelope(
     obj: &serde_json::Map<String, serde_json::Value>,
-    raw: &str,
+    _raw: &str,
 ) -> Option<AgentError> {
     if obj.get("type").and_then(|v| v.as_str()) == Some("result")
         && obj
@@ -183,14 +185,16 @@ fn extract_error_from_envelope(
             .unwrap_or(false)
     {
         let result_text = obj.get("result").and_then(|v| v.as_str()).unwrap_or("");
-        let combined = format!("{result_text} {raw}");
-        if let Some(e) = super::patterns::detect_auth_error(&combined) {
+        // Use result_text only (not combined with raw JSON) so the error
+        // message stays clean — the raw NDJSON stats blob must not leak
+        // into the logged reason string.
+        if let Some(e) = super::patterns::detect_auth_error(result_text) {
             return Some(e);
         }
-        if let Some(e) = super::patterns::detect_rate_limit(&combined) {
+        if let Some(e) = super::patterns::detect_rate_limit(result_text) {
             return Some(e);
         }
-        if let Some(e) = super::patterns::detect_context_overflow(&combined) {
+        if let Some(e) = super::patterns::detect_context_overflow(result_text) {
             return Some(e);
         }
         return Some(AgentError::AgentFailed {
