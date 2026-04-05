@@ -529,6 +529,16 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
     }
 
     if did_clean {
+        // Mark as cleaned in store so we don't retry next tick.
+        // If resolve_task_id returns None the task is not (or no longer) in
+        // the store; that is fine — we already did the on-disk work.
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
+            if let Err(e) = store.mark_cleaned(store_id).await {
+                tracing::warn!(task_id, err = %e, "failed to mark worktree cleaned — will retry");
+                // Don't log activity; retry next tick will do the actual cleanup
+                return Ok(did_clean);
+            }
+        }
         store_log_activity(
             &Some(Arc::clone(store)),
             repo,
@@ -545,14 +555,6 @@ pub(crate) async fn cleanup_task_worktree_with_opts(
             })),
         )
         .await;
-        // Mark as cleaned in store so we don't retry next tick.
-        // If resolve_task_id returns None the task is not (or no longer) in
-        // the store; that is fine — we already did the on-disk work.
-        if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
-            if let Err(e) = store.mark_cleaned(store_id).await {
-                tracing::warn!(task_id, err = %e, "failed to mark worktree cleaned in store — will retry");
-            }
-        }
     }
 
     Ok(did_clean)
