@@ -209,27 +209,42 @@ pub(crate) async fn review_open_prs(
     }
 
     // ─── Phase 3: Handle tasks with no open PR ────────────────────────────────
-    // Split ready_tasks into those with a PR number and those without.
+    // Split ready_tasks into those with a PR number and those without, then
+    // run is_pr_merged concurrently for all no-PR tasks (mirrors Phase 2).
 
     let mut tasks_with_pr: Vec<ReadyTask> = Vec::new();
+    let mut no_pr_tasks: Vec<ReadyTask> = Vec::new();
 
     for task_info in ready_tasks {
-        let Some(pr_number) = task_info.pr_number else {
-            // No open PR — check if merged, then reroute or block.
-            let task_id = &task_info.task.id.0;
-            let branch = &task_info.branch;
-            let merged = match gh.is_pr_merged(repo, branch).await {
+        if task_info.pr_number.is_none() {
+            no_pr_tasks.push(task_info);
+        } else {
+            tasks_with_pr.push(task_info);
+        }
+    }
+
+    if !no_pr_tasks.is_empty() {
+        let merged_results =
+            futures::future::join_all(no_pr_tasks.iter().map(|t| gh.is_pr_merged(repo, &t.branch)))
+                .await;
+
+        for (task_info, merged_result) in no_pr_tasks.into_iter().zip(merged_results) {
+            let task_id = task_info.task.id.0.as_str();
+            let branch = task_info.branch.as_str();
+
+            let merged = match merged_result {
                 Ok(v) => v,
                 Err(e) => {
                     let e_str = format!("{e}");
                     if crate::engine::runner::git_ops::is_transient_github_api_error(&e_str) {
                         tracing::warn!(task_id, branch = %branch, err = %e, "transient GitHub error checking merge status; will retry later");
-                        continue;
+                    } else {
+                        tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
                     }
-                    tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
                     continue;
                 }
             };
+
             if merged {
                 tracing::info!(task_id, branch = %branch, "PR already merged, marking done");
                 if let Err(e) = task_manager
@@ -305,13 +320,7 @@ pub(crate) async fn review_open_prs(
                     }
                 }
             }
-            continue;
-        };
-
-        tasks_with_pr.push(ReadyTask {
-            pr_number: Some(pr_number),
-            ..task_info
-        });
+        }
     }
 
     if tasks_with_pr.is_empty() {
