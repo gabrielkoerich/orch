@@ -909,7 +909,7 @@ impl TaskRunner {
         let is_rate_limited =
             last_error.contains("usage limit") || last_error.contains("rate limit");
         let is_rerouted = status == "new" || status == "routed";
-        let weight_signal = if is_rerouted && is_rate_limited {
+        let weight_signal = if is_rerouted {
             WeightSignal::RateLimited {
                 agent: agent_name.clone(),
             }
@@ -1778,11 +1778,11 @@ mod tests {
 
     // ── weight signal logic ───────────────────────────────────────────────────
 
-    fn weight_signal_for(status: &str, is_rate_limited: bool, agent: &str) -> WeightSignal {
-        if (status == "new" || status == "routed") && is_rate_limited {
-            WeightSignal::RateLimited {
-                agent: agent.to_string(),
-            }
+     fn weight_signal_for(status: &str, _is_rate_limited: bool, agent: &str) -> WeightSignal {
+         if status == "new" || status == "routed" {
+             WeightSignal::RateLimited {
+                 agent: agent.to_string(),
+             }
         } else if status == "done"
             || status == "needs_review"
             || status == "in_progress"
@@ -1833,11 +1833,11 @@ mod tests {
         assert!(matches!(signal, WeightSignal::Blocked));
     }
 
-    #[test]
-    fn weight_signal_none_for_unknown_status() {
-        let signal = weight_signal_for("routed", false, "claude");
-        assert!(matches!(signal, WeightSignal::None));
-    }
+     #[test]
+     fn weight_signal_rate_limited_for_rerouted_status() {
+         let signal = weight_signal_for("routed", false, "claude");
+         assert!(matches!(signal, WeightSignal::RateLimited { .. }));
+     }
 
     // ── parse_success_output token extraction ────────────────────────────────
 
