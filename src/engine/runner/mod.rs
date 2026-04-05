@@ -902,12 +902,9 @@ impl TaskRunner {
             .await
             .unwrap_or_default();
 
-        // Determine weight signal based on outcome
-        // Only treat explicit rate-limit messages (or usage limit) as rate-limited.
-        // Do NOT consider generic "rerouted" text as evidence of a rate limit —
-        // reroutes can happen for timeouts, auth errors, missing tools, etc.
-        let is_rate_limited =
-            last_error.contains("usage limit") || last_error.contains("rate limit");
+        // Determine weight signal based on outcome.
+        // Any reroute ("new"/"routed") should avoid review-gate and go back through
+        // normal dispatch, regardless of why it was rerouted.
         let is_rerouted = status == "new" || status == "routed";
         let weight_signal = if is_rerouted {
             WeightSignal::RateLimited {
@@ -1778,11 +1775,11 @@ mod tests {
 
     // ── weight signal logic ───────────────────────────────────────────────────
 
-     fn weight_signal_for(status: &str, _is_rate_limited: bool, agent: &str) -> WeightSignal {
-         if status == "new" || status == "routed" {
-             WeightSignal::RateLimited {
-                 agent: agent.to_string(),
-             }
+    fn weight_signal_for(status: &str, _is_rate_limited: bool, agent: &str) -> WeightSignal {
+        if status == "new" || status == "routed" {
+            WeightSignal::RateLimited {
+                agent: agent.to_string(),
+            }
         } else if status == "done"
             || status == "needs_review"
             || status == "in_progress"
@@ -1833,11 +1830,11 @@ mod tests {
         assert!(matches!(signal, WeightSignal::Blocked));
     }
 
-     #[test]
-     fn weight_signal_rate_limited_for_rerouted_status() {
-         let signal = weight_signal_for("routed", false, "claude");
-         assert!(matches!(signal, WeightSignal::RateLimited { .. }));
-     }
+    #[test]
+    fn weight_signal_rate_limited_for_rerouted_status() {
+        let signal = weight_signal_for("routed", false, "claude");
+        assert!(matches!(signal, WeightSignal::RateLimited { .. }));
+    }
 
     // ── parse_success_output token extraction ────────────────────────────────
 
