@@ -739,6 +739,13 @@ pub(crate) async fn auto_merge_pr(
         tracing::warn!(task_id = task.id.0, err = %e, "post-merge cleanup failed");
     }
 
+    // Kill any orphaned review session that might be racing us
+    let tmux = crate::tmux::TmuxManager::new();
+    let stale_session = tmux.session_name(repo, &format!("{}-review", task.id.0));
+    if let Err(e) = tmux.kill_session(&stale_session).await {
+        tracing::debug!(task_id = task.id.0, error = %e, "failed to kill stale review session after auto-merge");
+    }
+
     // 8. Post final comment on the PR
     let comment = "✅ PR reviewed, approved, and merged.";
     let footer = attribution_footer("Reviewed", review_agent, review_model);

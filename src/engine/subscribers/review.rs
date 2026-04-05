@@ -404,6 +404,13 @@ pub fn spawn(
                                     "review outcome discarded — task is no longer in_review (stale review agent result)"
                                 );
                             }
+
+                            // Kill the orphaned review session
+                            let stale_session = tmux_c.session_name(&repo_s, &format!("{}-review", tid));
+                            if let Err(e) = tmux_c.kill_session(&stale_session).await {
+                                tracing::debug!(task_id = tid, error = %e, "failed to kill stale review session");
+                            }
+
                             drop(permit);
                             return;
                         }
