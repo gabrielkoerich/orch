@@ -244,10 +244,13 @@ async fn auto_unblock_blocked_tasks(
     store: &Arc<TaskStore>,
     dispatching: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
-    let blocked = store
-        .list_by_status(repo, TaskStatus::Blocked)
-        .await
-        .unwrap_or_default();
+    let blocked = match store.list_by_status(repo, TaskStatus::Blocked).await {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to list blocked tasks — skipping auto-unblock this tick");
+            return Ok(());
+        }
+    };
 
     if blocked.is_empty() {
         return Ok(());
