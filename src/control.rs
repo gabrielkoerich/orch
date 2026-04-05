@@ -237,7 +237,10 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Cha
         .bind(&memory_prefix)
         .fetch_all(store.pool())
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!(session_id, error = %e, "failed to load control memories from store");
+            Vec::new()
+        });
     let memories = if memory_rows.is_empty() {
         "(none)".to_string()
     } else {
@@ -257,7 +260,10 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Cha
     let summaries = store
         .control_recent_summaries(session_id, 20)
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!(session_id, error = %e, "failed to load control summaries from store");
+            Vec::new()
+        });
     let recent_summaries = if summaries.is_empty() {
         "(no recent conversation)".to_string()
     } else {
