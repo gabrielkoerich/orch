@@ -191,6 +191,82 @@ static METRIC_WAIT_SECS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total 5xx server error responses received (REST + GraphQL).
 static METRIC_5XX_HITS: AtomicU64 = AtomicU64::new(0);
 
+// ── Rate-limit generic helpers ────────────────────────────────────────
+
+type RateLimitCell = std::sync::LazyLock<Mutex<RateLimit>>;
+
+/// Fail fast if the given rate limiter is in hard backoff (post-403/429).
+fn check_rate_limit_backoff(cell: &'static RateLimitCell, api: &str) -> anyhow::Result<()> {
+    if let Some(remaining) = cell.lock().ok().and_then(|rl| rl.backoff_remaining()) {
+        anyhow::bail!(
+            "GitHub {} API rate-limited, backoff active for {}s",
+            api,
+            remaining.as_secs()
+        );
+    }
+    Ok(())
+}
+
+/// Proactively sleep if the given rate limiter's quota is running low.
+/// Clears stale header state after sleeping so the next request gets fresh values.
+async fn proactive_throttle_limiter(cell: &'static RateLimitCell, api: &str) {
+    let wait = cell.lock().ok().and_then(|rl| rl.proactive_wait_duration());
+    if let Some(d) = wait {
+        let secs = d.as_secs().max(1);
+        METRIC_PROACTIVE_THROTTLES.fetch_add(1, Ordering::Relaxed);
+        METRIC_WAIT_SECS_TOTAL.fetch_add(secs, Ordering::Relaxed);
+        tracing::warn!(
+            wait_secs = secs,
+            "approaching GitHub {} rate limit, throttling until reset",
+            api
+        );
+        tokio::time::sleep(d).await;
+        if let Ok(mut rl) = cell.lock() {
+            rl.clear_proactive_state();
+        }
+    }
+}
+
+/// Check response body for rate-limit signals on 403 responses.
+/// Not all 403s are rate limits — some are permission errors.
+fn maybe_record_body_rate_limit(cell: &'static RateLimitCell, status: StatusCode, body: &str) {
+    if status == StatusCode::FORBIDDEN {
+        let lower = body.to_lowercase();
+        if lower.contains("rate limit")
+            || lower.contains("abuse detection")
+            || lower.contains("secondary rate")
+        {
+            if let Ok(mut rl) = cell.lock() {
+                rl.record_rate_limit();
+            }
+        }
+    }
+}
+
+/// Update rate-limit state from response headers/status and detect 5xx errors.
+fn record_response_for_limiter(cell: &'static RateLimitCell, resp: &Response) {
+    if let Ok(mut rl) = cell.lock() {
+        rl.update_from_headers(resp.headers());
+        // Only backoff on 429 (always rate limit) — 403 requires body inspection
+        // which is handled in maybe_record_body_rate_limit().
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            rl.record_rate_limit();
+        } else if resp.status().is_success() {
+            rl.record_success();
+        }
+    }
+    // Detect 5xx server errors for the global circuit breaker.
+    let status = resp.status();
+    if status.is_server_error() {
+        METRIC_5XX_HITS.fetch_add(1, Ordering::Relaxed);
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                crate::engine::cooldown::record_github_5xx().await;
+            });
+        }
+    }
+}
+
 // ── Shared token resolver ────────────────────────────────────────────
 
 // ── GhHttp client ────────────────────────────────────────────────────
@@ -235,150 +311,40 @@ impl GhHttp {
 
     /// Fail fast if the REST API is in hard backoff (post-403/429).
     fn check_backoff() -> anyhow::Result<()> {
-        if let Some(remaining) = REST_RATE_LIMIT
-            .lock()
-            .ok()
-            .and_then(|rl| rl.backoff_remaining())
-        {
-            anyhow::bail!(
-                "GitHub API rate-limited, backoff active for {}s",
-                remaining.as_secs()
-            );
-        }
-        Ok(())
+        check_rate_limit_backoff(&REST_RATE_LIMIT, "REST")
     }
 
     /// Fail fast if the GraphQL API is in hard backoff (post-403/429).
     fn check_graphql_backoff() -> anyhow::Result<()> {
-        if let Some(remaining) = GRAPHQL_RATE_LIMIT
-            .lock()
-            .ok()
-            .and_then(|rl| rl.backoff_remaining())
-        {
-            anyhow::bail!(
-                "GitHub GraphQL API rate-limited, backoff active for {}s",
-                remaining.as_secs()
-            );
-        }
-        Ok(())
+        check_rate_limit_backoff(&GRAPHQL_RATE_LIMIT, "GraphQL")
     }
 
     /// Proactively sleep if the REST API quota is running low (remaining < threshold).
-    /// Clears stale header state after sleeping so the next request gets fresh values.
     async fn proactive_throttle_rest() {
-        let wait = REST_RATE_LIMIT
-            .lock()
-            .ok()
-            .and_then(|rl| rl.proactive_wait_duration());
-        if let Some(d) = wait {
-            let secs = d.as_secs().max(1);
-            METRIC_PROACTIVE_THROTTLES.fetch_add(1, Ordering::Relaxed);
-            METRIC_WAIT_SECS_TOTAL.fetch_add(secs, Ordering::Relaxed);
-            tracing::warn!(
-                wait_secs = secs,
-                "approaching GitHub REST rate limit, throttling until reset"
-            );
-            tokio::time::sleep(d).await;
-            if let Ok(mut rl) = REST_RATE_LIMIT.lock() {
-                rl.clear_proactive_state();
-            }
-        }
+        proactive_throttle_limiter(&REST_RATE_LIMIT, "REST").await;
     }
 
     /// Proactively sleep if the GraphQL API quota is running low (remaining < threshold).
     async fn proactive_throttle_graphql() {
-        let wait = GRAPHQL_RATE_LIMIT
-            .lock()
-            .ok()
-            .and_then(|rl| rl.proactive_wait_duration());
-        if let Some(d) = wait {
-            let secs = d.as_secs().max(1);
-            METRIC_PROACTIVE_THROTTLES.fetch_add(1, Ordering::Relaxed);
-            METRIC_WAIT_SECS_TOTAL.fetch_add(secs, Ordering::Relaxed);
-            tracing::warn!(
-                wait_secs = secs,
-                "approaching GitHub GraphQL rate limit, throttling until reset"
-            );
-            tokio::time::sleep(d).await;
-            if let Ok(mut rl) = GRAPHQL_RATE_LIMIT.lock() {
-                rl.clear_proactive_state();
-            }
-        }
+        proactive_throttle_limiter(&GRAPHQL_RATE_LIMIT, "GraphQL").await;
     }
 
     fn record_response(resp: &Response) {
-        if let Ok(mut rl) = REST_RATE_LIMIT.lock() {
-            rl.update_from_headers(resp.headers());
-            // Only backoff on 429 (always rate limit) — 403 requires body inspection
-            // which is handled in maybe_record_rate_limit_from_body().
-            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-                rl.record_rate_limit();
-            } else if resp.status().is_success() {
-                rl.record_success();
-            }
-        }
-        // Detect 5xx server errors for the global circuit breaker.
-        let status = resp.status();
-        if status.is_server_error() {
-            METRIC_5XX_HITS.fetch_add(1, Ordering::Relaxed);
-            if tokio::runtime::Handle::try_current().is_ok() {
-                tokio::spawn(async move {
-                    crate::engine::cooldown::record_github_5xx().await;
-                });
-            }
-        }
+        record_response_for_limiter(&REST_RATE_LIMIT, resp);
     }
 
     fn record_graphql_response(resp: &Response) {
-        if let Ok(mut rl) = GRAPHQL_RATE_LIMIT.lock() {
-            rl.update_from_headers(resp.headers());
-            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-                rl.record_rate_limit();
-            } else if resp.status().is_success() {
-                rl.record_success();
-            }
-        }
-        // Detect 5xx server errors for the global circuit breaker.
-        let status = resp.status();
-        if status.is_server_error() {
-            METRIC_5XX_HITS.fetch_add(1, Ordering::Relaxed);
-            if tokio::runtime::Handle::try_current().is_ok() {
-                tokio::spawn(async move {
-                    crate::engine::cooldown::record_github_5xx().await;
-                });
-            }
-        }
+        record_response_for_limiter(&GRAPHQL_RATE_LIMIT, resp);
     }
 
     /// Check response body for rate-limit signals on 403 responses (REST).
-    /// Not all 403s are rate limits — some are permission errors.
     fn maybe_record_rate_limit_from_body(status: StatusCode, body: &str) {
-        if status == StatusCode::FORBIDDEN {
-            let lower = body.to_lowercase();
-            if lower.contains("rate limit")
-                || lower.contains("abuse detection")
-                || lower.contains("secondary rate")
-            {
-                if let Ok(mut rl) = REST_RATE_LIMIT.lock() {
-                    rl.record_rate_limit();
-                }
-            }
-        }
+        maybe_record_body_rate_limit(&REST_RATE_LIMIT, status, body);
     }
 
     /// Check response body for rate-limit signals on 403 responses (GraphQL).
     fn maybe_record_graphql_rate_limit_from_body(status: StatusCode, body: &str) {
-        if status == StatusCode::FORBIDDEN {
-            let lower = body.to_lowercase();
-            if lower.contains("rate limit")
-                || lower.contains("abuse detection")
-                || lower.contains("secondary rate")
-            {
-                if let Ok(mut rl) = GRAPHQL_RATE_LIMIT.lock() {
-                    rl.record_rate_limit();
-                }
-            }
-        }
+        maybe_record_body_rate_limit(&GRAPHQL_RATE_LIMIT, status, body);
     }
 
     fn record_success() {
