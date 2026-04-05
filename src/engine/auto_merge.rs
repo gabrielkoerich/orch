@@ -554,6 +554,12 @@ pub(crate) async fn auto_merge_pr(
                 .await
                 .map(|t| t.worktree)
                 .filter(|wt| !wt.is_empty());
+            // Track whether a subsequent force-push failed after a successful rebase
+            // so we can report the correct reason to the PR instead of blaming
+            // the rebase/merge step. Declared here so it's visible after the worktree block.
+            let mut push_failed = false;
+            let mut push_err_msg = String::new();
+
             if let Some(wt) = worktree_path {
                 let wt_path = std::path::PathBuf::from(&wt);
                 if wt_path.exists() {
@@ -646,19 +652,26 @@ pub(crate) async fn auto_merge_pr(
                                     return Ok(());
                                 }
                                 Ok(push_out) => {
-                                    let stderr = String::from_utf8_lossy(&push_out.stderr);
+                                    // Push returned non-zero. Capture stderr for PR-facing message.
+                                    let stderr =
+                                        String::from_utf8_lossy(&push_out.stderr).to_string();
                                     tracing::error!(
                                         task_id = task.id.0,
                                         stderr = %stderr,
                                         "force-push after rebase failed — blocking for human review"
                                     );
+                                    push_failed = true;
+                                    push_err_msg = stderr;
                                 }
                                 Err(push_err) => {
+                                    let err_str = push_err.to_string();
                                     tracing::error!(
                                         task_id = task.id.0,
                                         error = %push_err,
                                         "force-push command error — blocking for human review"
                                     );
+                                    push_failed = true;
+                                    push_err_msg = err_str;
                                 }
                             }
                         }
@@ -718,14 +731,21 @@ pub(crate) async fn auto_merge_pr(
                 }
             }
 
-            // Rebase failed or no worktree — block
+            // Rebase failed or no worktree or push failure — block
             task_manager
                 .update_task_status(&task.id, Status::Blocked)
                 .await?;
-            let comment = format!(
-                "Auto-merge failed (merge conflict, rebase unsuccessful): {}",
-                e
-            );
+            let comment = if push_failed {
+                format!(
+                    "Auto-merge failed (rebase succeeded but force-push failed): {}",
+                    push_err_msg
+                )
+            } else {
+                format!(
+                    "Auto-merge failed (merge conflict, rebase unsuccessful): {}",
+                    e
+                )
+            };
             let footer = attribution_footer("Commented", review_agent, review_model);
             if let Err(e) = gh
                 .add_comment(
