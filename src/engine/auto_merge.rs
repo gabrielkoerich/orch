@@ -586,6 +586,8 @@ pub(crate) async fn auto_merge_pr(
                         Err(err) => Err(err),
                     };
 
+                    let mut rebase_conflict = false;
+
                     match rebase_result {
                         Ok(out) if out.status.success() => {
                             let push_result = tokio::process::Command::new("git")
@@ -653,11 +655,12 @@ pub(crate) async fn auto_merge_pr(
                         }
                         Ok(out) => {
                             let stderr = String::from_utf8_lossy(&out.stderr);
-                            tracing::error!(
+                            tracing::warn!(
                                 task_id = task.id.0,
                                 stderr = %stderr,
-                                "rebase failed — blocking for human review"
+                                "rebase failed with content conflict — re-routing to agent"
                             );
+                            rebase_conflict = true;
                         }
                         Err(io_err) => {
                             tracing::error!(
@@ -666,6 +669,42 @@ pub(crate) async fn auto_merge_pr(
                                 "fetch/rebase command error — blocking for human review"
                             );
                         }
+                    }
+
+                    if rebase_conflict {
+                        // Increment counter so retry limit fires if agent cannot resolve.
+                        // This matches the CI failure pattern: increment before re-routing.
+                        store_increment(
+                            &Some(Arc::clone(store)),
+                            repo,
+                            &task.id.0,
+                            "merge_conflict_retries",
+                        )
+                        .await;
+                        store_set(
+                            &Some(Arc::clone(store)),
+                            repo,
+                            &task.id.0,
+                            &[
+                                (
+                                    "last_error",
+                                    serde_json::json!(
+                                        "auto-merge rebase hit a content conflict; agent must resolve the in-progress rebase in the worktree"
+                                    ),
+                                ),
+                                (
+                                    "route_reason",
+                                    serde_json::json!(
+                                        "re-dispatch after auto-merge rebase conflict"
+                                    ),
+                                ),
+                            ],
+                        )
+                        .await;
+                        task_manager
+                            .update_task_status(&task.id, Status::Routed)
+                            .await?;
+                        return Ok(());
                     }
                 }
             }
