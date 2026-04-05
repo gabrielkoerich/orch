@@ -58,7 +58,10 @@ pub fn normalize_dow(expression: &str) -> String {
 /// | `@monthly` | none          | `@monthly`     | `0 0 1 * *`     |
 /// | `@yearly`  | month-day     | `@yearly 3-15` | `0 0 15 3 *`    |
 /// | `@yearly`  | none          | `@yearly`      | `0 0 1 1 *`     |
-pub fn expand_alias(s: &str) -> String {
+///
+/// Returns an error if a parameter is present but not a valid number, or is
+/// out of the accepted range for that field.
+pub fn expand_alias(s: &str) -> anyhow::Result<String> {
     let s = s.trim();
     let (alias, param) = match s.split_once(char::is_whitespace) {
         Some((a, p)) => (a, p.trim()),
@@ -66,41 +69,108 @@ pub fn expand_alias(s: &str) -> String {
     };
     match alias {
         "@hourly" => {
-            let min: u8 = param.parse().unwrap_or(0);
-            format!("{min} * * * *")
+            if param.is_empty() {
+                return Ok("0 * * * *".to_string());
+            }
+            let min: u8 = param
+                .parse()
+                .with_context(|| format!("invalid minute in @hourly alias: '{param}'"))?;
+            anyhow::ensure!(
+                min <= 59,
+                "minute out of range in @hourly alias: {min} (must be 0-59)"
+            );
+            Ok(format!("{min} * * * *"))
         }
         "@daily" => {
+            if param.is_empty() {
+                return Ok("0 0 * * *".to_string());
+            }
             if param.contains(':') {
-                // split_once is guaranteed because contains(':') returned true
-                let (h, m) = param.split_once(':').unwrap_or(("", ""));
-                let hour: u8 = h.parse().unwrap_or(0);
-                let min: u8 = m.parse().unwrap_or(0);
-                format!("{min} {hour} * * *")
+                let (h, m) = param
+                    .split_once(':')
+                    .expect("contains(':') guarantees split");
+                let hour: u8 = h
+                    .parse()
+                    .with_context(|| format!("invalid hour in @daily alias: '{h}'"))?;
+                let min: u8 = m
+                    .parse()
+                    .with_context(|| format!("invalid minute in @daily alias: '{m}'"))?;
+                anyhow::ensure!(
+                    hour <= 23,
+                    "hour out of range in @daily alias: {hour} (must be 0-23)"
+                );
+                anyhow::ensure!(
+                    min <= 59,
+                    "minute out of range in @daily alias: {min} (must be 0-59)"
+                );
+                Ok(format!("{min} {hour} * * *"))
             } else {
-                let hour: u8 = param.parse().unwrap_or(0);
-                format!("0 {hour} * * *")
+                let hour: u8 = param
+                    .parse()
+                    .with_context(|| format!("invalid hour in @daily alias: '{param}'"))?;
+                anyhow::ensure!(
+                    hour <= 23,
+                    "hour out of range in @daily alias: {hour} (must be 0-23)"
+                );
+                Ok(format!("0 {hour} * * *"))
             }
         }
         "@weekly" => {
-            let day: u8 = param.parse().unwrap_or(0);
-            format!("0 0 * * {day}")
+            if param.is_empty() {
+                return Ok("0 0 * * 0".to_string());
+            }
+            let day: u8 = param
+                .parse()
+                .with_context(|| format!("invalid day-of-week in @weekly alias: '{param}'"))?;
+            anyhow::ensure!(
+                day <= 7,
+                "day-of-week out of range in @weekly alias: {day} (must be 0-7)"
+            );
+            Ok(format!("0 0 * * {day}"))
         }
         "@monthly" => {
-            let dom: u8 = param.parse().unwrap_or(1);
-            format!("0 0 {dom} * *")
+            if param.is_empty() {
+                return Ok("0 0 1 * *".to_string());
+            }
+            let dom: u8 = param
+                .parse()
+                .with_context(|| format!("invalid day-of-month in @monthly alias: '{param}'"))?;
+            anyhow::ensure!(
+                (1..=31).contains(&dom),
+                "day-of-month out of range in @monthly alias: {dom} (must be 1-31)"
+            );
+            Ok(format!("0 0 {dom} * *"))
         }
         "@yearly" => {
+            if param.is_empty() {
+                return Ok("0 0 1 1 *".to_string());
+            }
             if param.contains('-') {
-                // split_once is guaranteed because contains('-') returned true
-                let (m, d) = param.split_once('-').unwrap_or(("", ""));
-                let month: u8 = m.parse().unwrap_or(1);
-                let dom: u8 = d.parse().unwrap_or(1);
-                format!("0 0 {dom} {month} *")
+                let (m, d) = param
+                    .split_once('-')
+                    .expect("contains('-') guarantees split");
+                let month: u8 = m
+                    .parse()
+                    .with_context(|| format!("invalid month in @yearly alias: '{m}'"))?;
+                let dom: u8 = d
+                    .parse()
+                    .with_context(|| format!("invalid day-of-month in @yearly alias: '{d}'"))?;
+                anyhow::ensure!(
+                    (1..=12).contains(&month),
+                    "month out of range in @yearly alias: {month} (must be 1-12)"
+                );
+                anyhow::ensure!(
+                    (1..=31).contains(&dom),
+                    "day-of-month out of range in @yearly alias: {dom} (must be 1-31)"
+                );
+                Ok(format!("0 0 {dom} {month} *"))
             } else {
-                "0 0 1 1 *".to_string()
+                anyhow::bail!(
+                    "invalid @yearly alias parameter: '{param}' (expected month-day, e.g. '3-15')"
+                );
             }
         }
-        _ => s.to_string(),
+        _ => Ok(s.to_string()),
     }
 }
 
@@ -114,7 +184,8 @@ pub fn check(expression: &str, since: Option<&str>) -> anyhow::Result<bool> {
     //
     // The cron crate uses 1-7 for DOW (Sun=1..Sat=7), but standard cron uses
     // 0-7 where both 0 and 7 mean Sunday. Normalize DOW=0 → DOW=7.
-    let expanded = expand_alias(expression);
+    let expanded =
+        expand_alias(expression).with_context(|| format!("invalid cron alias: {expression}"))?;
     let normalized = normalize_dow(&expanded);
     let full_expr = format!("0 {normalized} *");
 
@@ -324,73 +395,73 @@ mod tests {
 
     #[test]
     fn expand_alias_hourly_no_param() {
-        assert_eq!(expand_alias("@hourly"), "0 * * * *");
+        assert_eq!(expand_alias("@hourly").unwrap(), "0 * * * *");
     }
 
     #[test]
     fn expand_alias_hourly_with_minute() {
-        assert_eq!(expand_alias("@hourly 30"), "30 * * * *");
+        assert_eq!(expand_alias("@hourly 30").unwrap(), "30 * * * *");
     }
 
     #[test]
     fn expand_alias_daily_no_param() {
-        assert_eq!(expand_alias("@daily"), "0 0 * * *");
+        assert_eq!(expand_alias("@daily").unwrap(), "0 0 * * *");
     }
 
     #[test]
     fn expand_alias_daily_with_hour() {
-        assert_eq!(expand_alias("@daily 9"), "0 9 * * *");
+        assert_eq!(expand_alias("@daily 9").unwrap(), "0 9 * * *");
     }
 
     #[test]
     fn expand_alias_daily_with_hour_and_minute() {
-        assert_eq!(expand_alias("@daily 9:30"), "30 9 * * *");
+        assert_eq!(expand_alias("@daily 9:30").unwrap(), "30 9 * * *");
     }
 
     #[test]
     fn expand_alias_weekly_no_param() {
-        assert_eq!(expand_alias("@weekly"), "0 0 * * 0");
+        assert_eq!(expand_alias("@weekly").unwrap(), "0 0 * * 0");
     }
 
     #[test]
     fn expand_alias_weekly_with_day() {
-        assert_eq!(expand_alias("@weekly 1"), "0 0 * * 1");
+        assert_eq!(expand_alias("@weekly 1").unwrap(), "0 0 * * 1");
     }
 
     #[test]
     fn expand_alias_monthly_no_param() {
-        assert_eq!(expand_alias("@monthly"), "0 0 1 * *");
+        assert_eq!(expand_alias("@monthly").unwrap(), "0 0 1 * *");
     }
 
     #[test]
     fn expand_alias_monthly_with_day() {
-        assert_eq!(expand_alias("@monthly 15"), "0 0 15 * *");
+        assert_eq!(expand_alias("@monthly 15").unwrap(), "0 0 15 * *");
     }
 
     #[test]
     fn expand_alias_yearly_no_param() {
-        assert_eq!(expand_alias("@yearly"), "0 0 1 1 *");
+        assert_eq!(expand_alias("@yearly").unwrap(), "0 0 1 1 *");
     }
 
     #[test]
     fn expand_alias_yearly_with_month_day() {
-        assert_eq!(expand_alias("@yearly 3-15"), "0 0 15 3 *");
+        assert_eq!(expand_alias("@yearly 3-15").unwrap(), "0 0 15 3 *");
     }
 
     #[test]
     fn expand_alias_passthrough_regular_cron() {
-        assert_eq!(expand_alias("30 9 * * 1"), "30 9 * * 1");
+        assert_eq!(expand_alias("30 9 * * 1").unwrap(), "30 9 * * 1");
     }
 
     #[test]
     fn expand_alias_unknown_at_prefix_passthrough() {
-        assert_eq!(expand_alias("@unknown"), "@unknown");
+        assert_eq!(expand_alias("@unknown").unwrap(), "@unknown");
     }
 
     #[test]
     fn expand_alias_check_integration_daily_9_30() {
         // @daily 9:30 should produce a valid parseable cron expression
-        let expanded = expand_alias("@daily 9:30");
+        let expanded = expand_alias("@daily 9:30").unwrap();
         let normalized = normalize_dow(&expanded);
         let full = format!("0 {normalized} *");
         assert!(
@@ -401,13 +472,102 @@ mod tests {
 
     #[test]
     fn expand_alias_check_integration_weekly_monday() {
-        let expanded = expand_alias("@weekly 1");
+        let expanded = expand_alias("@weekly 1").unwrap();
         let normalized = normalize_dow(&expanded);
         let full = format!("0 {normalized} *");
         assert!(
             Schedule::from_str(&full).is_ok(),
             "expanded '@weekly 1' → '{expanded}' should parse"
         );
+    }
+
+    // --- expand_alias error cases ---
+
+    #[test]
+    fn expand_alias_hourly_invalid_param_errors() {
+        assert!(expand_alias("@hourly abc").is_err());
+    }
+
+    #[test]
+    fn expand_alias_hourly_out_of_range_errors() {
+        assert!(expand_alias("@hourly 60").is_err());
+    }
+
+    #[test]
+    fn expand_alias_daily_invalid_param_errors() {
+        assert!(expand_alias("@daily abc").is_err());
+    }
+
+    #[test]
+    fn expand_alias_daily_invalid_hour_colon_errors() {
+        assert!(expand_alias("@daily abc:30").is_err());
+    }
+
+    #[test]
+    fn expand_alias_daily_invalid_minute_colon_errors() {
+        assert!(expand_alias("@daily 9:xyz").is_err());
+    }
+
+    #[test]
+    fn expand_alias_daily_hour_out_of_range_errors() {
+        assert!(expand_alias("@daily 24").is_err());
+    }
+
+    #[test]
+    fn expand_alias_daily_minute_out_of_range_errors() {
+        assert!(expand_alias("@daily 9:60").is_err());
+    }
+
+    #[test]
+    fn expand_alias_weekly_invalid_param_errors() {
+        assert!(expand_alias("@weekly foo").is_err());
+    }
+
+    #[test]
+    fn expand_alias_weekly_out_of_range_errors() {
+        assert!(expand_alias("@weekly 8").is_err());
+    }
+
+    #[test]
+    fn expand_alias_monthly_invalid_param_errors() {
+        assert!(expand_alias("@monthly bar").is_err());
+    }
+
+    #[test]
+    fn expand_alias_monthly_out_of_range_errors() {
+        assert!(expand_alias("@monthly 0").is_err());
+    }
+
+    #[test]
+    fn expand_alias_yearly_invalid_param_no_dash_errors() {
+        assert!(expand_alias("@yearly 3").is_err());
+    }
+
+    #[test]
+    fn expand_alias_yearly_invalid_month_errors() {
+        assert!(expand_alias("@yearly abc-15").is_err());
+    }
+
+    #[test]
+    fn expand_alias_yearly_invalid_dom_errors() {
+        assert!(expand_alias("@yearly 3-xyz").is_err());
+    }
+
+    #[test]
+    fn expand_alias_yearly_month_out_of_range_errors() {
+        assert!(expand_alias("@yearly 13-1").is_err());
+    }
+
+    #[test]
+    fn expand_alias_daily_abc_errors_via_check() {
+        // Regression: @daily abc used to silently expand to "0 0 * * *"
+        assert!(check("@daily abc", None).is_err());
+    }
+
+    #[test]
+    fn expand_alias_hourly_not_a_number_errors_via_check() {
+        // Regression: @hourly not-a-number used to silently expand to "0 * * * *"
+        assert!(check("@hourly not-a-number", None).is_err());
     }
 
     #[test]

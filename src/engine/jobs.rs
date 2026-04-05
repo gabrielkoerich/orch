@@ -130,7 +130,9 @@ pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
     let file: ConfigFile =
         serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
     for job in &file.jobs {
-        let expanded = crate::cron::expand_alias(&job.schedule);
+        let expanded = crate::cron::expand_alias(&job.schedule).with_context(|| {
+            format!("job '{}': invalid cron schedule '{}'", job.id, job.schedule)
+        })?;
         let normalized = crate::cron::normalize_dow(&expanded);
         let full_expr = format!("0 {normalized} *");
         Schedule::from_str(&full_expr).with_context(|| {
