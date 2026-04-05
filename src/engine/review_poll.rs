@@ -49,9 +49,7 @@ pub(crate) async fn review_open_prs(
     auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
     // Get tasks that are in review (have open PRs).
-    let mut in_review_tasks = task_manager
-        .list_all_by_status(Status::InReview)
-        .await?;
+    let mut in_review_tasks = task_manager.list_all_by_status(Status::InReview).await?;
 
     // Also include internal tasks in InReview — they create real PRs
     // and can receive human review comments just like external tasks.
