@@ -104,6 +104,17 @@ impl TaskManager {
         }
     }
 
+    /// Get reference to the task store (if available).
+    pub fn store(&self) -> Option<&Arc<TaskStore>> {
+        self.store.as_ref()
+    }
+
+    /// Get reference to the repo identifier.
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+}
+
     /// Create a TaskManager with the unified store for dual-write support.
     pub fn with_store(
         backend: Arc<dyn ExternalBackend>,
@@ -284,6 +295,41 @@ impl TaskManager {
             }
         }
         self.backend.list_by_status(status).await
+    }
+
+    /// Get all tasks (external + internal) by status.
+    /// Store-first for external tasks: reads from the store when available, 
+    /// falls back to backend if the store has no tasks.
+    /// Always includes internal tasks from the store when available.
+    pub async fn list_all_by_status(
+        &self,
+        status: Status,
+    ) -> anyhow::Result<Vec<ExternalTask>> {
+        let mut tasks = Vec::new();
+
+        // Get external tasks with store-first pattern
+        if let Some(ref store) = self.store {
+            let db_status = status_to_task_status(status);
+            let external = store.list_external_by_status(&self.repo, db_status).await?;
+            // Use the fetched results when non-empty; only check the sentinel when empty
+            // (empty could mean "no tasks with this status" OR "store not yet synced").
+            if !external.is_empty() || store.has_external_tasks(&self.repo).await {
+                tasks.extend(external.into_iter().map(|t| store_task_to_external(&t)));
+            }
+        } else {
+            // No store - get from backend
+            let external = self.backend.list_by_status(status).await?;
+            tasks.extend(external.into_iter().map(|t| store_task_to_external(&t)));
+        }
+
+        // Always include internal tasks from store when available
+        if let Some(ref store) = self.store {
+            if let Ok(internal) = self.list_internal_by_status(status_to_task_status(status)).await {
+                tasks.extend(internal.into_iter().map(|t| store_task_to_external(&t)));
+            }
+        }
+
+        Ok(tasks)
     }
 
     /// Get open tasks that are routable (status = new).

@@ -161,18 +161,9 @@ pub(crate) async fn cleanup_done_worktrees_with_opts(
     opts: &JanitorOptions,
 ) -> anyhow::Result<()> {
     // Read done tasks from the store first; fall back to backend before first sync.
-    let done_tasks = {
-        if store.has_external_tasks(repo).await {
-            store
-                .list_external_by_status(repo, crate::store::TaskStatus::Done)
-                .await?
-                .iter()
-                .map(crate::engine::tasks::store_task_to_external)
-                .collect()
-        } else {
-            backend.list_by_status(Status::Done).await?
-        }
-    };
+    let done_tasks = task_manager
+        .list_all_by_status(Status::Done)
+        .await?;
     tracing::debug!(count = done_tasks.len(), "checking done tasks for cleanup");
 
     // Collect task IDs from external done tasks.
@@ -878,47 +869,44 @@ pub(crate) async fn check_merged_prs(
     let mut branch_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
-    // Read from the store first; fall back to backend if the store has no data.
-    let has_store = store.has_external_tasks(repo).await;
-    let in_review_tasks: Vec<ExternalTask> = if has_store {
-        let store_tasks = store
-            .list_external_by_status(repo, crate::store::TaskStatus::InReview)
-            .await?;
-        for t in &store_tasks {
-            if !t.branch.is_empty() {
-                let ext_id = t
-                    .external_id
-                    .clone()
-                    .unwrap_or_else(|| format!("internal:{}", t.id));
-                branch_map.insert(ext_id, t.branch.clone());
+    // Get all review tasks (external + internal) using store-first pattern.
+    // Branch mapping optimization: we'll build branch_map from store tasks when available.
+    let mut branch_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let in_review_tasks: Vec<ExternalTask> = {
+        let mut tasks = task_manager.list_all_by_status(Status::InReview).await?;
+        // Build branch map from store tasks for optimization (avoids N+1 lookups later)
+        if let Some(ref store) = task_manager.store {
+            if let Ok(store_tasks) = store.list_external_by_status(&task_manager.repo, crate::store::TaskStatus::InReview).await {
+                for t in &store_tasks {
+                    if !t.branch.is_empty() {
+                        let ext_id = t
+                            .external_id
+                            .clone()
+                            .unwrap_or_else(|| format!("internal:{}", t.id));
+                        branch_map.insert(ext_id, t.branch.clone());
+                    }
+                }
             }
         }
-        store_tasks
-            .iter()
-            .map(crate::engine::tasks::store_task_to_external)
-            .collect()
-    } else {
-        backend.list_by_status(Status::InReview).await?
+        tasks
     };
-    let needs_review_tasks: Vec<ExternalTask> = if has_store {
-        let store_tasks = store
-            .list_external_by_status(repo, crate::store::TaskStatus::NeedsReview)
-            .await?;
-        for t in &store_tasks {
-            if !t.branch.is_empty() {
-                let ext_id = t
-                    .external_id
-                    .clone()
-                    .unwrap_or_else(|| format!("internal:{}", t.id));
-                branch_map.insert(ext_id, t.branch.clone());
+    let needs_review_tasks: Vec<ExternalTask> = {
+        let mut tasks = task_manager.list_all_by_status(Status::NeedsReview).await?;
+        // Build branch map from store tasks for optimization (avoids N+1 lookups later)
+        if let Some(ref store) = task_manager.store {
+            if let Ok(store_tasks) = store.list_external_by_status(&task_manager.repo, crate::store::TaskStatus::NeedsReview).await {
+                for t in &store_tasks {
+                    if !t.branch.is_empty() {
+                        let ext_id = t
+                            .external_id
+                            .clone()
+                            .unwrap_or_else(|| format!("internal:{}", t.id));
+                        branch_map.insert(ext_id, t.branch.clone());
+                    }
+                }
             }
         }
-        store_tasks
-            .iter()
-            .map(crate::engine::tasks::store_task_to_external)
-            .collect()
-    } else {
-        backend.list_by_status(Status::NeedsReview).await?
+        tasks
     };
     let mut all_review_tasks: Vec<_> = in_review_tasks
         .into_iter()
