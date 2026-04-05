@@ -255,7 +255,13 @@ async fn auto_unblock_blocked_tasks(
 
     // Batch-load all runs for blocked tasks in a single query instead of N individual queries.
     let task_ids: Vec<i64> = blocked.iter().map(|t| t.id).collect();
-    let mut runs_by_task = store.get_runs_batch(&task_ids).await.unwrap_or_default();
+    let mut runs_by_task = match store.get_runs_batch(&task_ids).await {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(err = %e, "get_runs_batch failed — skipping auto-unblock this tick");
+            return Ok(());
+        }
+    };
 
     for task in blocked {
         if task.block_reason.is_some() {
