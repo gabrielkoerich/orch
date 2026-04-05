@@ -238,9 +238,9 @@ pub(crate) async fn review_open_prs(
                     let e_str = format!("{e}");
                     if crate::engine::runner::git_ops::is_transient_github_api_error(&e_str) {
                         tracing::warn!(task_id, branch = %branch, err = %e, "transient GitHub error checking merge status; will retry later");
-                    } else {
-                        tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
+                        continue;
                     }
+                    tracing::warn!(task_id, branch = %branch, err = %e, "merge check failed, skipping task this tick");
                     continue;
                 }
             };
