@@ -395,7 +395,7 @@ async fn auto_unblock_blocked_tasks(
         } else {
             "new"
         };
-        let _ = store
+        if let Err(e) = store
             .append_activity(
                 task.id,
                 "auto_unblock",
@@ -409,7 +409,10 @@ async fn auto_unblock_blocked_tasks(
                     "failures": failures.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>(),
                 })),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(task_id = task.id, err = %e, "failed to log auto_unblock activity");
+        }
 
         if let Err(e) = task_manager
             .update_task_status(&crate::backends::ExternalId(ext_id), new_status)
