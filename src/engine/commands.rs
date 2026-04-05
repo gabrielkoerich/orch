@@ -61,12 +61,13 @@ impl std::fmt::Display for OwnerCommand {
 
 /// Parse a slash command from a comment body.
 ///
-/// Scans each line for a `/command` at the start. Returns the first valid
-/// command found. Unknown `/something` lines are skipped. Lines inside
-/// markdown fenced code blocks (``` or ~~~) are ignored to prevent
-/// accidental command execution from code examples. Per CommonMark, a
-/// backtick fence closes only a backtick fence and a tilde fence closes
-/// only a tilde fence — mismatched closers are ignored.
+/// Scans each line for a `/command` at the start, optionally prefixed by an
+/// `@orch` or `@orchestrator` mention on the same line. Returns the first
+/// valid command found. Unknown `/something` lines are skipped. Lines inside
+/// markdown fenced code blocks (``` or ~~~) are ignored to prevent accidental
+/// command execution from code examples. Per CommonMark, a backtick fence
+/// closes only a backtick fence and a tilde fence closes only a tilde fence —
+/// mismatched closers are ignored.
 pub fn parse_command(body: &str) -> Option<OwnerCommand> {
     // Track the opening fence character so mismatched closers are ignored.
     // Per CommonMark: a backtick fence closes only a backtick fence, and a
@@ -86,10 +87,16 @@ pub fn parse_command(body: &str) -> Option<OwnerCommand> {
         if fence_char.is_some() {
             continue;
         }
-        if !trimmed.starts_with('/') {
+        let command_text = trimmed
+            .strip_prefix("@orchestrator")
+            .or_else(|| trimmed.strip_prefix("@orch"))
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+
+        if !command_text.starts_with('/') {
             continue;
         }
-        let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+        let parts: Vec<&str> = command_text.splitn(2, char::is_whitespace).collect();
         let cmd = parts[0];
         let args = parts
             .get(1)
@@ -667,6 +674,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_mention_prefixed_command() {
+        assert_eq!(parse_command("@orch /retry"), Some(OwnerCommand::Retry));
+    }
+
+    #[test]
+    fn parse_legacy_mention_prefixed_command() {
+        assert_eq!(
+            parse_command("@orchestrator /close"),
+            Some(OwnerCommand::Close)
+        );
+    }
+
+    #[test]
+    fn parse_ignores_non_command_after_mention() {
+        assert_eq!(parse_command("@orch please retry this"), None);
+    }
+
+    #[test]
     fn extract_issue_number_works() {
         assert_eq!(
             extract_issue_number("https://api.github.com/repos/owner/repo/issues/123"),
@@ -682,6 +707,12 @@ mod tests {
     #[test]
     fn parse_ignores_command_in_code_fence() {
         let body = "Some context\n```\n/retry\n```\nMore text";
+        assert_eq!(parse_command(body), None);
+    }
+
+    #[test]
+    fn parse_ignores_mention_prefixed_command_in_code_fence() {
+        let body = "```\n@orch /retry\n```";
         assert_eq!(parse_command(body), None);
     }
 
