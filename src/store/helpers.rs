@@ -50,7 +50,7 @@ pub async fn store_set(
                     tracing::warn!(task_id, error = %e, "store set_fields failed");
                 }
             }
-            Ok(None) => {}  // task not in store — no-op is expected
+            Ok(None) => {} // task not in store — no-op is expected
             Err(e) => {
                 tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
@@ -69,7 +69,7 @@ pub async fn store_touch_updated_at(store: &Option<Arc<TaskStore>>, repo: &str, 
                     tracing::warn!(task_id, error = %e, "store touch_updated_at failed");
                 }
             }
-            Ok(None) => {}  // task not in store — no-op is expected
+            Ok(None) => {} // task not in store — no-op is expected
             Err(e) => {
                 tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
@@ -108,7 +108,7 @@ pub async fn store_log_activity(
                     tracing::warn!(task_id, event_type, error = %e, "store append_activity failed");
                 }
             }
-            Ok(None) => {}  // task not in store — no-op is expected
+            Ok(None) => {} // task not in store — no-op is expected
             Err(e) => {
                 tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
@@ -159,7 +159,7 @@ pub async fn store_increment(
                     return new_val as u64;
                 }
             }
-            Ok(None) => {}  // task not in store — no-op is expected
+            Ok(None) => {} // task not in store — no-op is expected
             Err(e) => {
                 tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
@@ -177,7 +177,7 @@ pub async fn store_reset_counters(store: &Option<Arc<TaskStore>>, repo: &str, ta
                     tracing::warn!(task_id, err = %e, "store reset_counters failed");
                 }
             }
-            Ok(None) => {}  // task not in store — no-op is expected
+            Ok(None) => {} // task not in store — no-op is expected
             Err(e) => {
                 tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
@@ -201,7 +201,7 @@ pub async fn store_reset_failure_counters(
                     tracing::warn!(task_id, err = %e, "failed to reset failure counters after review dispatch");
                 }
             }
-            Ok(None) => {}  // task not in store — no-op is expected
+            Ok(None) => {} // task not in store — no-op is expected
             Err(e) => {
                 tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
             }
