@@ -80,26 +80,28 @@ impl CaptureService {
         let now = Utc::now();
         let skey = session_key(repo, task_id);
 
-        // Check if we need to increment generation (re-registration case)
+        // Atomically read the current generation and insert the new buffer under
+        // a single write lock to prevent a TOCTOU race where two concurrent
+        // re-registrations both observe the same stale generation value.
         let generation = {
-            let buffers = self.buffers.read().await;
-            buffers.get(&skey).map(|b| b.generation + 1).unwrap_or(0)
+            let mut buffers = self.buffers.write().await;
+            let generation = buffers.get(&skey).map(|b| b.generation + 1).unwrap_or(0);
+            let buffer = OutputBuffer {
+                repo: repo.to_string(),
+                session: session.to_string(),
+                task_id: task_id.to_string(),
+                last_content: String::new(),
+                last_len: 0,
+                last_hash: None,
+                last_capture: now,
+                seen_alive: false,
+                registered_at: now,
+                has_output: false,
+                generation,
+            };
+            buffers.insert(skey, buffer);
+            generation
         };
-
-        let buffer = OutputBuffer {
-            repo: repo.to_string(),
-            session: session.to_string(),
-            task_id: task_id.to_string(),
-            last_content: String::new(),
-            last_len: 0,
-            last_hash: None,
-            last_capture: now,
-            seen_alive: false,
-            registered_at: now,
-            has_output: false,
-            generation,
-        };
-        self.buffers.write().await.insert(skey, buffer);
         tracing::debug!(
             repo,
             task_id,
