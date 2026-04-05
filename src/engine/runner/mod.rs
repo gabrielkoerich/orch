@@ -442,6 +442,13 @@ impl TaskRunner {
         )
         .await;
 
+        // Touch updated_at immediately after session exit so the stuck-task recovery
+        // timer resets before response_handler post-processing (git push, PR creation,
+        // status update) begins.  Without this, a session that ran longer than
+        // no_session_stuck_timeout (default 10 min) would be re-dispatched by the tick
+        // while the runner is still writing results.
+        store::store_touch_updated_at(&self.store, &self.repo, task_id).await;
+
         // If silence detection (tick phase1b) already rerouted this task while the
         // session was running, skip all fallback/review processing. Without this check the
         // runner would call `fallback::handle_error` on the empty output, exhaust fallback
