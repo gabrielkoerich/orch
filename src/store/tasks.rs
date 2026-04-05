@@ -627,6 +627,24 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
+    /// Return only the `source_id` values for internal tasks with a specific source.
+    /// Use this instead of `list_internal_by_source` when only deduplication is needed —
+    /// avoids fetching all 57 task columns.
+    pub async fn list_source_ids_by_source(
+        &self,
+        repo: &str,
+        source: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT source_id FROM tasks WHERE repo = ? AND origin = 'internal' AND source = ?",
+        )
+        .bind(repo)
+        .bind(source)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>(0)).collect())
+    }
+
     /// List all active (non-done) tasks for a repo.
     pub async fn list_active(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(

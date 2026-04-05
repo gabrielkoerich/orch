@@ -815,13 +815,12 @@ async fn scan_mentions(
     };
 
     // Get existing mention tasks across ALL statuses to avoid duplicates.
-    // Uses a SQL-filtered query instead of loading all internal tasks.
+    // Uses a targeted source_id-only query to avoid fetching all 57 task columns.
     let existing_mentions: std::collections::HashSet<String> = if let Some(s) = store {
-        s.list_internal_by_source(repo, "mention")
+        s.list_source_ids_by_source(repo, "mention")
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|t| t.source_id.clone())
             .collect()
     } else {
         std::collections::HashSet::new()
