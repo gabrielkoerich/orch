@@ -1126,9 +1126,13 @@ pub async fn get_route_result(
     // This prevents repeated warnings on subsequent dispatches (#1907).
     let original_model = task.model.clone().filter(|m| !m.is_empty());
     if original_model.is_some() && model.is_none() {
-        let _ = store
+        if let Err(e) = store
             .set_fields(store_id, &[("model", serde_json::json!(""))])
-            .await;
+            .await
+        {
+            // Log the error so transient DB failures are visible and diagnosable.
+            tracing::warn!(task_id = %task_id, error = %e, "failed to clear stale model from store — will retry on next dispatch");
+        }
     }
 
     Ok(RouteResult {
