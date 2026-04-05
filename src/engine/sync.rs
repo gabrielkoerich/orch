@@ -271,7 +271,12 @@ async fn auto_unblock_blocked_tasks(
             continue;
         }
 
-        let dispatch_key = format!("{}/{}", repo, task.external_id.clone().unwrap_or_default());
+        let id_fallback = task.id.to_string();
+        let dispatch_key = format!(
+            "{}/{}",
+            repo,
+            task.external_id.as_deref().unwrap_or(&id_fallback)
+        );
         if dispatching.contains(&dispatch_key) {
             continue;
         }
