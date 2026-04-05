@@ -672,6 +672,15 @@ pub(crate) async fn auto_merge_pr(
                     }
 
                     if rebase_conflict {
+                        // Increment counter so retry limit fires if agent cannot resolve.
+                        // This matches the CI failure pattern: increment before re-routing.
+                        store_increment(
+                            &Some(Arc::clone(store)),
+                            repo,
+                            &task.id.0,
+                            "merge_conflict_retries",
+                        )
+                        .await;
                         store_set(
                             &Some(Arc::clone(store)),
                             repo,
