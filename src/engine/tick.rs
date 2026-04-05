@@ -1096,7 +1096,11 @@ pub(crate) async fn tick_dispatch_tasks(
                                     .ok()
                                     .and_then(|t| t.pr_number)
                                     .is_some(),
-                                _ => false,
+                                Ok(None) => false,
+                                Err(e) => {
+                                    tracing::warn!(task_id, err = %e, "failed to check PR status — defaulting to needs_review");
+                                    true
+                                }
                             };
                             if has_pr {
                                 "needs_review"
