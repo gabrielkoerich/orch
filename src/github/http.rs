@@ -2016,7 +2016,15 @@ impl GhHttp {
             if let Some(ref_name) = pr.pointer("/head/ref").and_then(|v| v.as_str()) {
                 let del_url = format!("{GITHUB_API}/repos/{repo}/git/refs/heads/{ref_name}");
                 if let Err(e) = self.delete(&del_url).await {
-                    tracing::warn!(ref_name, err = %e, "failed to delete branch after merge");
+                    let err_str = e.to_string();
+                    if err_str.contains("Reference does not exist") {
+                        tracing::debug!(
+                            ref_name,
+                            "branch already gone (GitHub auto-deleted on merge)"
+                        );
+                    } else {
+                        tracing::warn!(ref_name, err = %e, "failed to delete branch after merge");
+                    }
                 }
             }
         }
