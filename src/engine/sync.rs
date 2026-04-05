@@ -1011,9 +1011,16 @@ async fn scan_mentions(
                         "Mention by @{}:\n\n{}\n\n**Status:** Command executed",
                         mention.author, mention.body
                     );
-                    let _ = s
+                    if let Err(e) = s
                         .create_internal(repo, &title, &task_body, "mention", &mention.id)
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            mention_id = %mention.id,
+                            err = %e,
+                            "failed to create sentinel for command-executed mention — mention untracked in DB"
+                        );
+                    }
                 }
                 // Command was executed (or error-replied) — mention is handled.
                 if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
