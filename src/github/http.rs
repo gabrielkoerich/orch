@@ -1696,9 +1696,8 @@ impl GhHttp {
         // { "state": "pending", "total_count": N, "statuses": [...] }
         // Use get_all_pages_from_wrapper to follow pagination and extract the
         // `statuses` array across pages so we don't silently truncate at 100.
-        let statuses: Vec<serde_json::Value> = self
-            .get_all_pages_from_wrapper(&url, "statuses")
-            .await?;
+        let statuses: Vec<serde_json::Value> =
+            self.get_all_pages_from_wrapper(&url, "statuses").await?;
 
         Ok(statuses
             .into_iter()
