@@ -23,12 +23,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// expiry timestamp is unknown). New code should use [`BACKOFF_BASE_SECS`] instead.
 pub const AGENT_COOLDOWN_SECS: i64 = 30 * 60;
 
-/// Default fallback cooldown for models when no store is available: 1 hour.
-///
-/// Used in contexts that need a concrete duration. New code should use
-/// [`BACKOFF_BASE_SECS`] instead.
-pub const MODEL_COOLDOWN_SECS: i64 = 60 * 60;
-
 /// Base backoff for generic agent/model failures: 5 minutes.
 pub const BACKOFF_BASE_SECS: i64 = 5 * 60;
 

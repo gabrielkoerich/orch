@@ -1,6 +1,7 @@
 //! Reacts to NeedsReview events — spawns review agent immediately.
 
 use crate::backends::{ExternalBackend, ExternalId, Status};
+use crate::engine::cooldown::AGENT_COOLDOWN_SECS;
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::events::TaskEvent;
 use crate::engine::review::{review_and_merge, ReviewDecision, MAX_REVIEW_AGENT_FAILURES};
@@ -124,64 +125,26 @@ pub fn spawn(
                         continue;
                     };
 
-                    // If every known agent is currently in cooldown, wait until the
-                    // earliest cooldown expires before attempting to dispatch the
-                    // review. This prevents burning review attempts against
-                    // rate-limited agents.
-                    {
-                        let agents = router.read().await.available_agents.clone();
-                        let all_cooled = agents
-                            .iter()
-                            .all(|a| crate::engine::cooldown::is_agent_in_cooldown(a));
-                        if all_cooled && !agents.is_empty() {
-                            let now = chrono::Utc::now().timestamp();
-                            let wait_secs = agents
-                                .iter()
-                                .filter_map(|a| crate::engine::cooldown::cooldown_until(a))
-                                .min()
-                                .map(|until| ((until - now).max(1)) as u64)
-                                .unwrap_or(crate::engine::cooldown::AGENT_COOLDOWN_SECS as u64);
-                            tracing::info!(
-                                task_id,
-                                wait_secs,
-                                "all agents cooled — delaying review until cooldown expires"
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
-                        }
-                    }
-
-                    // Check model-level cooldowns before selecting an agent.
-                    // This prevents dispatching multiple reviews to the same
-                    // rate-limited model when events arrive concurrently.
-                    // The review agent selection (review.rs) also checks this,
-                    // but we check here to fail fast and avoid acquiring the
-                    // semaphore if the model is already cooled.
+                    // If no agents are currently routable (all cooled, degraded, or without
+                    // an available review model), wait until the earliest cooldown expires.
+                    // Using router.healthy_agent_count covers agent cooldowns, degradation,
+                    // weight thresholds, and model availability in one call — keeping this
+                    // check in sync with the main router's agent_is_routable() logic.
                     {
                         let router_guard = router.read().await;
-                        let config = &router_guard.config;
-                        let mut all_models_cooled = true;
-                        for agent in &router_guard.available_agents {
-                            if config
-                                .model_for_complexity(agent, "review", task_id)
-                                .is_some()
-                            {
-                                all_models_cooled = false;
-                                break;
-                            }
-                        }
-                        if all_models_cooled && !router_guard.available_agents.is_empty() {
+                        let no_routable = !router_guard.available_agents.is_empty()
+                            && router_guard.healthy_agent_count("review") == 0;
+                        if no_routable {
                             let now = chrono::Utc::now().timestamp();
                             let wait_secs = router_guard
-                                .available_agents
-                                .iter()
-                                .filter_map(|a| crate::engine::cooldown::cooldown_until(a))
-                                .min()
+                                .earliest_cooldown_until(Some("review"))
                                 .map(|until| ((until - now).max(1)) as u64)
-                                .unwrap_or(crate::engine::cooldown::MODEL_COOLDOWN_SECS as u64);
+                                .unwrap_or(AGENT_COOLDOWN_SECS as u64);
+                            drop(router_guard);
                             tracing::info!(
                                 task_id,
                                 wait_secs,
-                                "all review models cooled — delaying review until cooldown expires"
+                                "no routable review agents — delaying review until cooldown expires"
                             );
                             tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                         }
@@ -219,16 +182,13 @@ pub fn spawn(
                         let _dispatch_guard = dispatch_guard; // released on drop (normal or panic)
                         let tid = task.id.0.clone();
 
-                        // Re-check agent cooldowns inside the spawned task. A concurrent
+                        // Re-check agent routability inside the spawned task. A concurrent
                         // review that ran between the outer dispatch check and now may have
                         // set a cooldown — bail early rather than burning a review run
                         // against a rate-limited agent.
                         let pre_check_all_cooled = {
-                            let agents = router_c.read().await.available_agents.clone();
-                            !agents.is_empty()
-                                && agents
-                                    .iter()
-                                    .all(|a| crate::engine::cooldown::is_agent_in_cooldown(a))
+                            let r = router_c.read().await;
+                            !r.available_agents.is_empty() && r.healthy_agent_count("review") == 0
                         };
                         if pre_check_all_cooled {
                             tracing::info!(
@@ -245,14 +205,11 @@ pub fn spawn(
                             )
                             .await;
                             let wait_secs = {
-                                let agents = router_c.read().await.available_agents.clone();
+                                let r = router_c.read().await;
                                 let now = chrono::Utc::now().timestamp();
-                                agents
-                                    .iter()
-                                    .filter_map(|a| crate::engine::cooldown::cooldown_until(a))
-                                    .min()
+                                r.earliest_cooldown_until(Some("review"))
                                     .map(|until| ((until - now).max(1)) as u64)
-                                    .unwrap_or(crate::engine::cooldown::AGENT_COOLDOWN_SECS as u64)
+                                    .unwrap_or(AGENT_COOLDOWN_SECS as u64)
                             };
                             tracing::info!(
                                 task_id = tid,
@@ -449,20 +406,14 @@ pub fn spawn(
                                 // use a short backoff (30 s). If every agent is cooled, sleep
                                 // until the earliest cooldown expires so we don't spin.
                                 let wait_secs = {
-                                    let agents = router_c.read().await.available_agents.clone();
-                                    let any_available = agents
-                                        .iter()
-                                        .any(|a| !crate::engine::cooldown::is_agent_in_cooldown(a));
-                                    if any_available {
+                                    let r = router_c.read().await;
+                                    if r.healthy_agent_count("review") > 0 {
                                         30u64
                                     } else {
                                         let now = chrono::Utc::now().timestamp();
-                                        agents
-                                            .iter()
-                                            .filter_map(|a| crate::engine::cooldown::cooldown_until(a))
-                                            .min()
+                                        r.earliest_cooldown_until(Some("review"))
                                             .map(|until| ((until - now).max(1)) as u64)
-                                            .unwrap_or(crate::engine::cooldown::AGENT_COOLDOWN_SECS as u64)
+                                            .unwrap_or(AGENT_COOLDOWN_SECS as u64)
                                     }
                                 };
                                 tracing::info!(
