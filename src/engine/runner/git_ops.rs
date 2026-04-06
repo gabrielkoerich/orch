@@ -317,7 +317,7 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
     }
 }
 
-/// Build git `-c` config args that inject GitHub token credentials.
+/// Build git config environment variables that inject GitHub token credentials.
 ///
 /// This handles two scenarios:
 /// - **SSH remotes** (`git@github.com:user/repo.git`): rewritten to
@@ -328,39 +328,39 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
 /// When no token is available, falls back to the legacy SSH→HTTPS conversion
 /// without credentials (works for repos that use credential helpers or SSH keys).
 ///
-/// Returns a `Vec<String>` of alternating `-c KEY=VALUE` pairs suitable for
-/// prepending to any `git` command's argument list.
-pub(crate) fn build_git_auth_args() -> Vec<String> {
-    // Use a fresh resolver here so tests that temporarily set env vars
-    // are not affected by a process-wide cached resolver. The global
-    // `shared()` resolver intentionally caches tokens for the running
-    // process, but tests frequently mutate `GH_TOKEN`/`GITHUB_TOKEN` and
-    // expecting immediate visibility. Creating a local resolver reads the
-    // current environment without relying on the cached singleton.
+/// Returns a `Vec<(String, String)>` of environment variable key-value pairs.
+/// These are NOT visible in the process list (`ps`), unlike `-c` args.
+///
+/// Git environment variables:
+/// - `GIT_CONFIG_COUNT` — number of config entries
+/// - `GIT_CONFIG_KEY_N` — config key for entry N
+/// - `GIT_CONFIG_VALUE_N` — config value for entry N
+pub(crate) fn build_git_auth_env() -> Vec<(String, String)> {
     let token = crate::github::token::TokenResolver::default_env()
+        .with_gh_fallback(false)
         .get_token_sync()
         .ok()
         .flatten();
 
     match token {
         Some(t) if !t.is_empty() => {
-            // Map both SSH and HTTPS origins → HTTPS with token auth.
-            // Having two insteadOf rules pointing at the same replacement is
-            // valid: git picks the longest matching prefix.
             let authed = format!("url.https://x-access-token:{t}@github.com/.insteadOf");
             vec![
-                "-c".to_string(),
-                format!("{authed}=https://github.com/"),
-                "-c".to_string(),
-                format!("{authed}=git@github.com:"),
+                ("GIT_CONFIG_COUNT".into(), "2".into()),
+                ("GIT_CONFIG_KEY_0".into(), authed.clone()),
+                ("GIT_CONFIG_VALUE_0".into(), "https://github.com/".into()),
+                ("GIT_CONFIG_KEY_1".into(), authed),
+                ("GIT_CONFIG_VALUE_1".into(), "git@github.com:".into()),
             ]
         }
         _ => {
-            // No token: keep the legacy SSH→HTTPS conversion so SSH-origin
-            // repos can still push via credential helpers or SSH keys.
             vec![
-                "-c".to_string(),
-                "url.https://github.com/.insteadOf=git@github.com:".to_string(),
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                (
+                    "GIT_CONFIG_KEY_0".into(),
+                    "url.https://github.com/.insteadOf".into(),
+                ),
+                ("GIT_CONFIG_VALUE_0".into(), "git@github.com:".into()),
             ]
         }
     }
@@ -616,12 +616,12 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
 
     tracing::info!(branch = branch_to_push, "pushing branch");
 
-    let auth_args = build_git_auth_args();
+    let auth_env = build_git_auth_env();
 
     // First attempt: normal push (no force).
-    let push_args = build_push_args(&auth_args, branch_to_push, false);
     let output = Command::new("git")
-        .args(&push_args)
+        .args(["push", "-u", "origin", branch_to_push])
+        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .current_dir(dir)
         .output_with_context()
         .await?;
@@ -645,9 +645,9 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
         match strip_workflow_files(dir, default_branch).await {
             Ok(true) => {
                 // Workflow files stripped, retry push
-                let retry_args = build_push_args(&auth_args, branch_to_push, false);
                 let retry_output = Command::new("git")
-                    .args(&retry_args)
+                    .args(["push", "-u", "origin", branch_to_push])
+                    .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                     .current_dir(dir)
                     .output_with_context()
                     .await?;
@@ -703,9 +703,9 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
             branch = branch_to_push,
             "push rejected (non-fast-forward), force-pushing with lease"
         );
-        let force_args = build_push_args(&auth_args, branch_to_push, true);
         let output = Command::new("git")
-            .args(&force_args)
+            .args(["push", "--force-with-lease", "-u", "origin", branch_to_push])
+            .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .current_dir(dir)
             .output_with_context()
             .await?;
@@ -725,9 +725,9 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
             );
             match strip_workflow_files(dir, default_branch).await {
                 Ok(true) => {
-                    let retry_args = build_push_args(&auth_args, branch_to_push, true);
                     let retry_output = Command::new("git")
-                        .args(&retry_args)
+                        .args(["push", "--force-with-lease", "-u", "origin", branch_to_push])
+                        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                         .current_dir(dir)
                         .output_with_context()
                         .await?;
@@ -767,18 +767,6 @@ pub async fn push_branch(dir: &Path, branch: &str, default_branch: &str) -> anyh
     }
 
     anyhow::bail!("push failed: {stderr}")
-}
-
-fn build_push_args(auth_args: &[String], branch: &str, force: bool) -> Vec<String> {
-    let mut args: Vec<String> = auth_args.to_vec();
-    args.push("push".to_string());
-    if force {
-        args.push("--force-with-lease".to_string());
-    }
-    args.push("-u".to_string());
-    args.push("origin".to_string());
-    args.push(branch.to_string());
-    args
 }
 
 fn push_needs_rebase(stderr: &str) -> bool {
@@ -1257,15 +1245,16 @@ mod tests {
     }
 
     #[test]
-    fn build_git_auth_args_without_token_falls_back_to_ssh_https_conversion() {
+    fn build_git_auth_env_without_token_falls_back_to_ssh_https_conversion() {
         // Without a token in env the function must still return the legacy
         // SSH→HTTPS insteadOf rule so SSH-origin repos can push.
+        // Note: we disable gh CLI fallback to ensure predictable test behavior.
         let saved_gh = std::env::var("GH_TOKEN").ok();
         let saved_gh2 = std::env::var("GITHUB_TOKEN").ok();
         std::env::remove_var("GH_TOKEN");
         std::env::remove_var("GITHUB_TOKEN");
 
-        let args = build_git_auth_args();
+        let env = build_git_auth_env();
 
         // Restore env
         if let Some(v) = saved_gh {
@@ -1276,20 +1265,22 @@ mod tests {
         }
 
         // When no token is available the fallback must include the SSH insteadOf rule.
-        let joined = args.join(" ");
+        let has_ssh_rule = env
+            .iter()
+            .any(|(k, v)| k == "GIT_CONFIG_KEY_0" && v.contains("insteadOf=git@github.com:"));
         assert!(
-            joined.contains("insteadOf=git@github.com:"),
-            "expected SSH insteadOf fallback, got: {joined}"
+            has_ssh_rule,
+            "expected SSH insteadOf fallback, got: {env:?}"
         );
     }
 
     #[test]
-    fn build_git_auth_args_with_token_covers_both_ssh_and_https() {
+    fn build_git_auth_env_with_token_covers_both_ssh_and_https() {
         // Temporarily inject a fake token so we can verify both insteadOf rules.
         let saved = std::env::var("GH_TOKEN").ok();
         std::env::set_var("GH_TOKEN", "ghp_testtoken1234");
 
-        let args = build_git_auth_args();
+        let env = build_git_auth_env();
 
         // Restore env
         match saved {
@@ -1297,22 +1288,24 @@ mod tests {
             None => std::env::remove_var("GH_TOKEN"),
         }
 
-        let joined = args.join(" ");
-        // Must contain the token in the replacement URL
-        assert!(
-            joined.contains("x-access-token:ghp_testtoken1234@github.com"),
-            "expected token in auth URL, got: {joined}"
-        );
+        // Must contain the token in the replacement URL (check GIT_CONFIG_KEY values)
+        let has_token = env
+            .iter()
+            .any(|(_, v)| v.contains("x-access-token:ghp_testtoken1234@github.com"));
+        assert!(has_token, "expected token in auth URL, got: {env:?}");
         // Must cover HTTPS origins
+        let has_https_rule = env
+            .iter()
+            .any(|(k, v)| k == "GIT_CONFIG_VALUE_0" && v == "https://github.com/");
         assert!(
-            joined.contains("insteadOf=https://github.com/"),
-            "expected HTTPS insteadOf rule, got: {joined}"
+            has_https_rule,
+            "expected HTTPS insteadOf rule, got: {env:?}"
         );
         // Must cover SSH origins
-        assert!(
-            joined.contains("insteadOf=git@github.com:"),
-            "expected SSH insteadOf rule, got: {joined}"
-        );
+        let has_ssh_rule = env
+            .iter()
+            .any(|(k, v)| k == "GIT_CONFIG_VALUE_1" && v == "git@github.com:");
+        assert!(has_ssh_rule, "expected SSH insteadOf rule, got: {env:?}");
     }
 
     #[test]
