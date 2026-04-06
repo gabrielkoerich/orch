@@ -2319,6 +2319,14 @@ impl GhHttp {
                 .map(|nodes| nodes.iter().filter_map(parse_graphql_review).collect())
                 .unwrap_or_default();
 
+            if connection_has_next_page(pr_data.pointer("/reviews/pageInfo")) {
+                tracing::warn!(
+                    pr_number = n,
+                    fetched = reviews.len(),
+                    "batch review fetch truncated reviews connection at first page"
+                );
+            }
+
             // Ensure deterministic ordering by submitted timestamp (oldest -> newest).
             // GraphQL connections do not guarantee a stable sort unless explicitly
             // requested. Sort here so consumers can rely on chronological order.
@@ -2346,6 +2354,31 @@ impl GhHttp {
                 })
                 .unwrap_or_default();
 
+            if connection_has_next_page(pr_data.pointer("/reviewThreads/pageInfo")) {
+                tracing::warn!(
+                    pr_number = n,
+                    fetched_threads = pr_data
+                        .pointer("/reviewThreads/nodes")
+                        .and_then(|v| v.as_array())
+                        .map_or(0, |threads| threads.len()),
+                    "batch review fetch truncated reviewThreads connection at first page"
+                );
+            }
+            if pr_data
+                .pointer("/reviewThreads/nodes")
+                .and_then(|v| v.as_array())
+                .is_some_and(|threads| {
+                    threads.iter().any(|thread| {
+                        connection_has_next_page(thread.pointer("/comments/pageInfo"))
+                    })
+                })
+            {
+                tracing::warn!(
+                    pr_number = n,
+                    "batch review fetch truncated one or more review thread comment connections"
+                );
+            }
+
             // Sort inline review comments by created_at (oldest -> newest) so
             // callers can process them deterministically.
             review_comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -2360,6 +2393,13 @@ impl GhHttp {
                         .collect()
                 })
                 .unwrap_or_default();
+
+            if let Some(cursor) = connection_end_cursor(pr_data.pointer("/comments/pageInfo")) {
+                issue_comments.extend(
+                    self.fetch_pr_issue_comments_after(owner, name, n, Some(cursor))
+                        .await?,
+                );
+            }
 
             // Sort issue-level comments by created_at (oldest -> newest). The
             // review poll logic expects chronological ordering and may iterate
@@ -2380,6 +2420,53 @@ impl GhHttp {
         }
 
         Ok(result)
+    }
+
+    async fn fetch_pr_issue_comments_after(
+        &self,
+        owner: &str,
+        name: &str,
+        pr_number: u64,
+        mut cursor: Option<String>,
+    ) -> anyhow::Result<Vec<GitHubComment>> {
+        let mut comments = Vec::new();
+        let mut page_count = 0;
+        let max_pages = 50;
+
+        while let Some(current_cursor) = cursor.take() {
+            page_count += 1;
+            if page_count > max_pages {
+                tracing::warn!(
+                    pr_number,
+                    fetched = comments.len(),
+                    "stopping PR issue comment pagination after max page limit"
+                );
+                break;
+            }
+
+            let query = build_pr_issue_comments_page_query(owner, name, pr_number, &current_cursor);
+            let resp = self.graphql(&query).await?;
+            let comments_data = resp
+                .pointer("/data/repository/pullRequest/comments")
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "missing /data/repository/pullRequest/comments in GraphQL response"
+                    )
+                })?;
+
+            comments.extend(
+                comments_data
+                    .get("nodes")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(parse_graphql_issue_comment),
+            );
+
+            cursor = connection_end_cursor(comments_data.get("pageInfo"));
+        }
+
+        Ok(comments)
     }
 
     /// Check the latest automated review comment on a PR.
@@ -2538,6 +2625,7 @@ fn build_pr_review_alias(n: u64) -> String {
       submittedAt
       commit {{ oid }}
     }}
+    pageInfo {{ hasNextPage }}
   }}
   reviewThreads(first: 50) {{
     nodes {{
@@ -2557,8 +2645,10 @@ fn build_pr_review_alias(n: u64) -> String {
           replyTo {{ databaseId }}
           diffHunk
         }}
+        pageInfo {{ hasNextPage }}
       }}
     }}
+    pageInfo {{ hasNextPage }}
   }}
   comments(first: 50) {{
     nodes {{
@@ -2566,11 +2656,56 @@ fn build_pr_review_alias(n: u64) -> String {
       author {{ login }}
       body
       createdAt
+      updatedAt
       url
     }}
+    pageInfo {{ hasNextPage endCursor }}
   }}
 }}"#
     )
+}
+
+fn build_pr_issue_comments_page_query(
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+    after_cursor: &str,
+) -> String {
+    format!(
+        r#"{{ repository(owner: "{owner}", name: "{name}") {{
+  pullRequest(number: {pr_number}) {{
+    comments(first: 100, after: "{after_cursor}") {{
+      nodes {{
+        databaseId
+        author {{ login }}
+        body
+        createdAt
+        updatedAt
+        url
+      }}
+      pageInfo {{ hasNextPage endCursor }}
+    }}
+  }}
+}} }}"#
+    )
+}
+
+fn connection_has_next_page(page_info: Option<&serde_json::Value>) -> bool {
+    page_info
+        .and_then(|v| v.get("hasNextPage"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn connection_end_cursor(page_info: Option<&serde_json::Value>) -> Option<String> {
+    if !connection_has_next_page(page_info) {
+        return None;
+    }
+
+    page_info
+        .and_then(|v| v.get("endCursor"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }
 
 fn parse_graphql_review(node: &serde_json::Value) -> Option<GitHubReview> {
@@ -2711,6 +2846,47 @@ mod tests {
 
         let query = format!(r#"{{ repository(owner: "owner", name: "repo") {{ {aliases} }} }}"#);
         assert_eq!(query, expected);
+    }
+
+    #[test]
+    fn pr_review_batch_query_includes_page_info_for_nested_connections() {
+        let query = build_pr_review_alias(42);
+
+        assert!(query.contains("reviews(first: 50)"));
+        assert!(query.contains("reviews(first: 50) {\n    nodes"));
+        assert!(query.contains("pageInfo { hasNextPage }"));
+        assert!(query.contains("reviewThreads(first: 50)"));
+        assert!(query.contains("comments(first: 20)"));
+        assert!(query.contains("pageInfo { hasNextPage endCursor }"));
+        assert!(query.contains("updatedAt"));
+    }
+
+    #[test]
+    fn pr_issue_comments_page_query_uses_cursor_pagination() {
+        let query = build_pr_issue_comments_page_query("owner", "repo", 42, "cursor123");
+
+        assert!(query.contains("pullRequest(number: 42)"));
+        assert!(query.contains("comments(first: 100, after: \"cursor123\")"));
+        assert!(query.contains("pageInfo { hasNextPage endCursor }"));
+        assert!(query.contains("updatedAt"));
+    }
+
+    #[test]
+    fn connection_end_cursor_only_returns_cursor_when_more_pages_exist() {
+        let page_info = serde_json::json!({
+            "hasNextPage": true,
+            "endCursor": "cursor123"
+        });
+        assert_eq!(
+            connection_end_cursor(Some(&page_info)),
+            Some("cursor123".to_string())
+        );
+
+        let final_page = serde_json::json!({
+            "hasNextPage": false,
+            "endCursor": "cursor456"
+        });
+        assert_eq!(connection_end_cursor(Some(&final_page)), None);
     }
 
     #[test]
