@@ -348,10 +348,16 @@ pub(crate) async fn review_open_prs(
     let collab_logins: Vec<String> = unique_users.into_iter().collect();
     let collab_results =
         futures::future::join_all(collab_logins.iter().map(|u| gh.is_collaborator(repo, u))).await;
-    let collab_cache: HashMap<String, bool> = collab_logins
+    let collab_cache: HashMap<String, Option<bool>> = collab_logins
         .into_iter()
         .zip(collab_results.into_iter())
-        .map(|(u, r)| (u, r.unwrap_or(false)))
+        .map(|(u, r)| match r {
+            Ok(v) => (u, Some(v)),
+            Err(e) => {
+                tracing::warn!(user = %u, error = %e, "is_collaborator check failed; skipping review comment");
+                (u, None)
+            }
+        })
         .collect();
 
     // ─── Phase 6: Process each task using batch data ──────────────────────────
@@ -829,7 +835,7 @@ pub(crate) async fn review_open_prs(
 /// additional REST calls.
 fn automated_review_from_comments(
     issue_comments: &[GitHubComment],
-    collab_cache: &HashMap<String, bool>,
+    collab_cache: &HashMap<String, Option<bool>>,
     pr_number: u64,
 ) -> Option<String> {
     // Find the newest automated review comment authored by a collaborator.
@@ -838,13 +844,24 @@ fn automated_review_from_comments(
         if !c.body.starts_with("## Automated Review") {
             continue;
         }
-        if !collab_cache.get(&c.user.login).copied().unwrap_or(false) {
-            tracing::warn!(
-                user = %c.user.login,
-                pr_number,
-                "ignoring automated review comment from non-collaborator"
-            );
-            continue;
+        match collab_cache.get(&c.user.login).copied().flatten() {
+            None if collab_cache.contains_key(&c.user.login) => {
+                tracing::warn!(
+                    user = %c.user.login,
+                    pr_number,
+                    "skipping automated review comment: collaborator check unavailable"
+                );
+                continue;
+            }
+            None | Some(false) => {
+                tracing::warn!(
+                    user = %c.user.login,
+                    pr_number,
+                    "ignoring automated review comment from non-collaborator"
+                );
+                continue;
+            }
+            Some(true) => {}
         }
         match newest {
             None => newest = Some(c),
