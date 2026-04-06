@@ -74,14 +74,19 @@ pub(crate) fn calculate_backoff_delay(retry_count: usize) -> u64 {
     let exponential = base_delay * (2_u64.saturating_pow(retry_count as u32));
     let capped = exponential.min(max_delay);
 
-    // Add jitter: ±30% using a simple hash-based approach
+    // Add jitter: ±30% using a hash-based pseudo-random value.
+    // Mix system time (nanoseconds) with thread ID so concurrent retries on
+    // different threads get different delays even when called in the same
+    // microsecond, avoiding the thundering-herd problem.
     let jitter_range = (capped as f64 * JITTER_FACTOR) as u64;
-    // Use current time micros for simple randomization
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64;
-    let jitter = now % (jitter_range * 2 + 1);
+    let jitter = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        std::time::SystemTime::now().hash(&mut h);
+        std::thread::current().id().hash(&mut h);
+        h.finish() % (jitter_range * 2 + 1)
+    };
 
     capped.saturating_sub(jitter_range) + jitter
 }
