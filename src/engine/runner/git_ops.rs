@@ -98,6 +98,16 @@ pub async fn has_changes(dir: &Path) -> bool {
     has_diff || has_cached || has_untracked
 }
 
+fn find_stash_ref_by_hash(stash_list: &str, stash_hash: &str) -> Option<String> {
+    stash_list.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some(hash), Some(reference)) if hash == stash_hash => Some(reference.to_string()),
+            _ => None,
+        }
+    })
+}
+
 /// Auto-commit any uncommitted changes.
 pub async fn auto_commit(
     dir: &Path,
@@ -284,11 +294,23 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
             .output_with_context()
             .await;
         if apply.map(|o| o.status.success()).unwrap_or(false) {
-            let _ = Command::new("git")
-                .args(["stash", "drop", stash_hash])
+            let list = Command::new("git")
+                .args(["stash", "list", "--format=%H %gd"])
                 .current_dir(dir)
                 .output_with_context()
                 .await;
+            if let Ok(output) = list {
+                if output.status.success() {
+                    let list_str = String::from_utf8_lossy(&output.stdout);
+                    if let Some(stash_ref) = find_stash_ref_by_hash(&list_str, stash_hash) {
+                        let _ = Command::new("git")
+                            .args(["stash", "drop", &stash_ref])
+                            .current_dir(dir)
+                            .output_with_context()
+                            .await;
+                    }
+                }
+            }
         } else {
             tracing::warn!(stash = %stash_hash, "stash apply failed after rebase — stash preserved for manual recovery");
         }
@@ -1291,6 +1313,31 @@ mod tests {
             joined.contains("insteadOf=git@github.com:"),
             "expected SSH insteadOf rule, got: {joined}"
         );
+    }
+
+    #[test]
+    fn find_stash_ref_by_hash_returns_matching_reference() {
+        let stash_list = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa stash@{1}\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb stash@{0}";
+
+        assert_eq!(
+            find_stash_ref_by_hash(stash_list, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("stash@{1}".to_string())
+        );
+        assert_eq!(
+            find_stash_ref_by_hash(stash_list, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            Some("stash@{0}".to_string())
+        );
+    }
+
+    #[test]
+    fn find_stash_ref_by_hash_returns_none_when_missing_or_malformed() {
+        let stash_list = "malformed-line\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa stash@{2}";
+
+        assert_eq!(
+            find_stash_ref_by_hash(stash_list, "cccccccccccccccccccccccccccccccccccccccc"),
+            None
+        );
+        assert_eq!(find_stash_ref_by_hash("", "anything"), None);
     }
 
     #[test]
