@@ -79,12 +79,12 @@ use super::EngineConfig;
 use crate::store::{review_session_expected, set_review_session_expected, store_set_by_id};
 
 /// Phase 1 of tick: poll tmux for finished sessions and clean them up.
- pub(crate) async fn tick_check_session_completions(
-     tmux: &Arc<TmuxManager>,
-     repo: &str,
-     capture: &Arc<CaptureService>,
-     store: &Arc<TaskStore>,
- ) -> anyhow::Result<()> {
+pub(crate) async fn tick_check_session_completions(
+    tmux: &Arc<TmuxManager>,
+    repo: &str,
+    capture: &Arc<CaptureService>,
+    store: &Arc<TaskStore>,
+) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase1.sessions").entered();
     let session_snapshot = tmux.snapshot().await;
     // Derive the short project name from repo (owner/repo -> repo)
@@ -95,7 +95,7 @@ use crate::store::{review_session_expected, set_review_session_expected, store_s
             continue;
         }
 
-         if !active {
+        if !active {
             tracing::info!(
                 session = %session.name,
                 task_id = %session.task_id,
@@ -106,7 +106,8 @@ use crate::store::{review_session_expected, set_review_session_expected, store_s
             // reclaim this task while the runner is still finishing
             // post-processing (race: session observed dead → tick reclaim).
             // Best-effort: no-ops if the task isn't present in the store.
-            crate::store::store_touch_updated_at(&Some(Arc::clone(store)), repo, &session.task_id).await;
+            crate::store::store_touch_updated_at(&Some(Arc::clone(store)), repo, &session.task_id)
+                .await;
             // Unregister from capture service using the task id the capture service
             // was registered under (task id without project prefix).
             capture.unregister_session(repo, &session.task_id).await;
@@ -2143,7 +2144,9 @@ mod tests {
 
         // Register the session in capture (engine does this during dispatch)
         let task_key = task_id.to_string();
-        capture.register_session("owner/repo", &task_key, &session_name).await;
+        capture
+            .register_session("owner/repo", &task_key, &session_name)
+            .await;
 
         // Call phase1 (now touches store.updated_at for completed session)
         let config = EngineConfig {
@@ -2157,13 +2160,24 @@ mod tests {
             .unwrap();
 
         // Now run phase2 — the updated_at should have been touched so no reclaim occurs
-        tick_recover_stuck_tasks(&backend, &tmux, "owner/repo", &task_manager, &config, &store)
-            .await
-            .unwrap();
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+        )
+        .await
+        .unwrap();
 
         // Verify the task is still InProgress in the store
         let task = store.get(id).await.unwrap();
-        assert_eq!(task.status, crate::store::TaskStatus::InProgress, "task should not be reclaimed to New");
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::InProgress,
+            "task should not be reclaimed to New"
+        );
 
         let _ = tmux.kill_session(&session_name).await;
     }
