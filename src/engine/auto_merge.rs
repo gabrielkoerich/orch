@@ -352,8 +352,7 @@ pub(crate) async fn auto_merge_pr(
     let base_branch = pr.base.ref_.clone();
     let required_contexts = gh
         .get_required_status_check_contexts(repo, &base_branch)
-        .await
-        .unwrap_or_default();
+        .await?;
     // Determine whether the repository has any GitHub Actions workflows so that
     // `get_combined_status` can distinguish "no CI configured" (legitimately
     // empty check-run list → success) from "CI not started yet" (empty list
@@ -379,11 +378,8 @@ pub(crate) async fn auto_merge_pr(
                 gh.get_combined_status(repo, &head_sha, repo_has_workflows)
                     .await?
             } else {
-                let check_runs = gh.get_check_runs(repo, &head_sha).await.unwrap_or_default();
-                let statuses = gh
-                    .get_commit_status_contexts(repo, &head_sha)
-                    .await
-                    .unwrap_or_default();
+                let check_runs = gh.get_check_runs(repo, &head_sha).await?;
+                let statuses = gh.get_commit_status_contexts(repo, &head_sha).await?;
                 let check_runs = check_runs
                     .into_iter()
                     .map(|run| (run.name, run.status, run.conclusion))
