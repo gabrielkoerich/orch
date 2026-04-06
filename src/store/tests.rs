@@ -1431,6 +1431,7 @@ async fn reset_counters_preserves_other_fields() {
     store.increment(id, "attempts").await.unwrap();
     store.increment(id, "attempts").await.unwrap();
     store.increment(id, "review_cycles").await.unwrap();
+    store.increment(id, "network_retries").await.unwrap();
 
     // Reset
     store.reset_counters(id).await.unwrap();
@@ -1438,6 +1439,7 @@ async fn reset_counters_preserves_other_fields() {
     let task = store.get(id).await.unwrap();
     assert_eq!(task.attempts, 0);
     assert_eq!(task.review_cycles, 0);
+    assert_eq!(task.network_retries, 0);
     // Non-counter fields preserved
     assert_eq!(task.agent, Some("claude".to_string()));
     assert_eq!(task.branch, "fix-123");
@@ -1471,6 +1473,7 @@ async fn reset_failure_counters_preserves_review_cycles() {
     store.increment(id, "attempts").await.unwrap();
     store.increment(id, "review_agent_failures").await.unwrap();
     store.increment(id, "merge_conflict_retries").await.unwrap();
+    store.increment(id, "network_retries").await.unwrap();
 
     // reset_failure_counters must zero transient counters but preserve review_cycles and ci_merge_failures
     store.reset_failure_counters(id).await.unwrap();
@@ -1484,6 +1487,7 @@ async fn reset_failure_counters_preserves_review_cycles() {
     assert_eq!(task.attempts, 0);
     assert_eq!(task.review_agent_failures, 0);
     assert_eq!(task.merge_conflict_retries, 0);
+    assert_eq!(task.network_retries, 0);
 }
 
 #[tokio::test]

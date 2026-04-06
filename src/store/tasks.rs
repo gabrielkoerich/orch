@@ -20,10 +20,10 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
     model_reroute_chain, limit_reroute_chain, budget_warning, budget_exceeded, \
     memory, delegations, created_at, updated_at, review_session_expected, \
     review_invocations, push_failures, auto_unblock_count, auto_unblock_last_at, \
-    ci_recovery_count, auto_unblock_last_reason, no_code_reroutes";
+    ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub(crate) const TASK_COLS_COUNT: usize = 57;
+pub(crate) const TASK_COLS_COUNT: usize = 58;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str =
@@ -119,6 +119,7 @@ pub struct Task {
     pub ci_merge_failures: i32,
     pub pr_create_failures: i32,
     pub push_failures: i32,
+    pub network_retries: i32,
     pub review_agent_failures: i32,
     pub review_cycles: i32,
     pub review_invocations: i32,
@@ -867,6 +868,7 @@ impl TaskStore {
             "auto_unblock_last_reason",
             "ci_recovery_count",
             "no_code_reroutes",
+            "network_retries",
         ];
 
         for (col, _) in updates {
@@ -921,6 +923,7 @@ impl TaskStore {
             "auto_unblock_count",
             "ci_recovery_count",
             "no_code_reroutes",
+            "network_retries",
         ];
 
         anyhow::ensure!(
@@ -947,6 +950,7 @@ impl TaskStore {
             merge_conflict_retries = 0,
             pr_create_failures = 0,
             push_failures = 0,
+            network_retries = 0,
             ci_merge_failures = 0,
             review_cycles = 0,
             review_invocations = 0,
@@ -981,6 +985,7 @@ impl TaskStore {
             merge_conflict_retries = 0,
             pr_create_failures = 0,
             push_failures = 0,
+            network_retries = 0,
             review_session_expected = 0,
             auto_unblock_count = 0,
             auto_unblock_last_at = '',
@@ -1217,6 +1222,7 @@ impl TaskStore {
             "auto_unblock_last_reason",
             "ci_recovery_count",
             "no_code_reroutes",
+            "network_retries",
         ];
 
         for (_, entry_updates) in updates {
@@ -1329,6 +1335,7 @@ impl TaskStore {
             merge_conflict_retries = 0,
             pr_create_failures = 0,
             push_failures = 0,
+            network_retries = 0,
             review_session_expected = 0,
             auto_unblock_count = 0,
             auto_unblock_last_at = '',
@@ -1739,6 +1746,7 @@ impl TaskStore {
             ci_merge_failures: row.try_get("ci_merge_failures").unwrap_or(0),
             pr_create_failures: row.try_get("pr_create_failures").unwrap_or(0),
             push_failures: row.try_get::<i32, _>("push_failures").unwrap_or(0),
+            network_retries: row.try_get::<i32, _>("network_retries").unwrap_or(0),
             review_agent_failures: row.try_get("review_agent_failures").unwrap_or(0),
             review_cycles: row.try_get("review_cycles").unwrap_or(0),
             review_invocations: row.try_get::<i32, _>("review_invocations").unwrap_or(0),

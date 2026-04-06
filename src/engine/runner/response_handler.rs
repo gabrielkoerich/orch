@@ -197,6 +197,23 @@ pub async fn handle_success(
         None
     };
 
+    if let Some(store_id) = store_id_opt {
+        store::store_set_by_id(
+            store,
+            store_id,
+            &[("network_retries", serde_json::json!(0))],
+        )
+        .await;
+    } else {
+        store::store_set(
+            store,
+            repo,
+            task_id,
+            &[("network_retries", serde_json::json!(0))],
+        )
+        .await;
+    }
+
     // Auto-commit, push, create PR
     let mut has_pr = false;
     let mut has_pushed = false;
