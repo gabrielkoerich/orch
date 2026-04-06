@@ -672,6 +672,7 @@ pub(crate) mod patterns {
             "rate limit",
             "rate_limit",
             "ratelimit",
+            "rate increased too quickly", // Alibaba / Qwen via OpenCode
             "too many requests",
             "usage limit",
             "quota exceeded",
@@ -1115,6 +1116,10 @@ mod tests {
         assert!(patterns::detect_rate_limit("Error: rate limit exceeded").is_some());
         assert!(patterns::detect_rate_limit("HTTP 429 Too Many Requests").is_some());
         assert!(patterns::detect_rate_limit("You've hit your usage limit").is_some());
+        assert!(patterns::detect_rate_limit(
+            "Upstream error from Alibaba: Request rate increased too quickly. \
+             To ensure system stability, please adjust your client logic to scale requests more smoothly over time."
+        ).is_some());
         assert!(patterns::detect_rate_limit("all good").is_none());
     }
 
