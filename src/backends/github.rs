@@ -40,6 +40,15 @@ pub struct GitHubBackend {
     gh: GhHttp,
 }
 
+/// Returns `true` if `id` is a valid GitHub issue number (positive integer).
+///
+/// Internal tasks use IDs like `"internal:63857"` which are not valid GitHub
+/// issue numbers. Backend methods that call the GitHub API must skip these IDs
+/// to avoid spurious 404 errors.
+fn is_github_issue_id(id: &ExternalId) -> bool {
+    id.0.parse::<u64>().is_ok()
+}
+
 impl GitHubBackend {
     pub fn new(repo: String) -> anyhow::Result<Self> {
         Ok(Self {
@@ -130,6 +139,11 @@ impl ExternalBackend for GitHubBackend {
 
     /// Override default update_status to add project board sync after label update.
     async fn update_status(&self, id: &ExternalId, status: Status) -> anyhow::Result<()> {
+        // Internal tasks (e.g. "internal:63857") are not GitHub issues — skip silently.
+        if !is_github_issue_id(id) {
+            return Ok(());
+        }
+
         // Run the standard label-based status update (default trait impl logic)
         let label = status.as_label();
 
@@ -387,15 +401,27 @@ impl ExternalBackend for GitHubBackend {
     }
 
     async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()> {
+        // Internal tasks (e.g. "internal:63857") are not GitHub issues — skip silently.
+        if !is_github_issue_id(id) {
+            return Ok(());
+        }
         self.gh.add_comment(&self.repo, &id.0, body).await
     }
 
     /// Additive: uses POST (gh.add_labels), so existing labels like bug, priority:high are preserved.
     async fn set_labels(&self, id: &ExternalId, labels: &[String]) -> anyhow::Result<()> {
+        // Internal tasks (e.g. "internal:63857") are not GitHub issues — skip silently.
+        if !is_github_issue_id(id) {
+            return Ok(());
+        }
         self.gh.add_labels(&self.repo, &id.0, labels).await
     }
 
     async fn remove_label(&self, id: &ExternalId, label: &str) -> anyhow::Result<()> {
+        // Internal tasks (e.g. "internal:63857") are not GitHub issues — skip silently.
+        if !is_github_issue_id(id) {
+            return Ok(());
+        }
         self.gh.remove_label(&self.repo, &id.0, label).await
     }
 
@@ -604,6 +630,32 @@ impl ExternalBackend for GitHubBackend {
 mod tests {
     use super::*;
     use crate::github::types::{GitHubIssue, GitHubUser};
+
+    // --- is_github_issue_id guard ---
+
+    #[test]
+    fn is_github_issue_id_numeric() {
+        assert!(is_github_issue_id(&ExternalId("42".to_string())));
+        assert!(is_github_issue_id(&ExternalId("1".to_string())));
+        assert!(is_github_issue_id(&ExternalId("99999".to_string())));
+    }
+
+    #[test]
+    fn is_github_issue_id_rejects_internal_prefix() {
+        assert!(!is_github_issue_id(&ExternalId(
+            "internal:63857".to_string()
+        )));
+        assert!(!is_github_issue_id(&ExternalId("internal:1".to_string())));
+    }
+
+    #[test]
+    fn is_github_issue_id_rejects_empty_and_non_numeric() {
+        assert!(!is_github_issue_id(&ExternalId("".to_string())));
+        assert!(!is_github_issue_id(&ExternalId("abc".to_string())));
+        assert!(!is_github_issue_id(&ExternalId("1.0".to_string())));
+    }
+
+    // ---
 
     #[test]
     fn allowed_associations_are_owner_and_contributor() {
