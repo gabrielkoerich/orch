@@ -85,7 +85,7 @@ impl TaskStore {
     .bind(cost_usd)
     .fetch_one(&self.pool)
     .await?;
-        Ok(row.try_get("id").unwrap_or(0))
+        Ok(row.try_get("id")?)
     }
 
     /// List the most recent control messages for a session (chronological order).
@@ -126,7 +126,10 @@ impl TaskStore {
             .fetch_all(&self.pool)
             .await?
         };
-        Ok(rows.iter().map(Self::row_to_control_message).collect())
+        rows.iter()
+            .map(Self::row_to_control_message)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)
     }
 
     /// Search control messages by content (LIKE match, most recent first).
@@ -171,7 +174,10 @@ impl TaskStore {
             .fetch_all(&self.pool)
             .await?
         };
-        Ok(rows.iter().map(Self::row_to_control_message).collect())
+        rows.iter()
+            .map(Self::row_to_control_message)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)
     }
 
     /// Get the N most recent assistant message summaries (chronological order).
@@ -198,10 +204,12 @@ impl TaskStore {
             .collect())
     }
 
-    fn row_to_control_message(row: &sqlx::sqlite::SqliteRow) -> ControlMessage {
+    fn row_to_control_message(
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> Result<ControlMessage, sqlx::Error> {
         use sqlx::Row;
-        ControlMessage {
-            id: row.try_get("id").unwrap_or(0),
+        Ok(ControlMessage {
+            id: row.try_get("id")?,
             session_id: row.try_get("session_id").unwrap_or_default(),
             role: row.try_get("role").unwrap_or_default(),
             channel: row.try_get("channel").unwrap_or_default(),
@@ -213,7 +221,7 @@ impl TaskStore {
             tokens_used: row.try_get("tokens_used").unwrap_or(None),
             cost_usd: row.try_get("cost_usd").unwrap_or(None),
             created_at: row.try_get("created_at").unwrap_or_default(),
-        }
+        })
     }
 }
 
