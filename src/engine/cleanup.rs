@@ -130,22 +130,21 @@ async fn reconcile_closed_tasks(
                 labels = ?labels,
                 "closed issue with stale status label — reconciling to done and cleaning up"
             );
-            if let Err(e) = task_manager.update_task_status(&id, Status::Done).await {
-                tracing::warn!(
-                    task_id = task_id_str,
-                    err = %e,
-                    "failed to reconcile closed issue status to done"
-                );
+            match task_manager.update_task_status(&id, Status::Done).await {
+                Ok(()) => Some(task_id_str),
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = task_id_str,
+                        err = %e,
+                        "failed to reconcile closed issue status to done"
+                    );
+                    None
+                }
             }
         });
     }
-    futures::future::join_all(futs).await;
-    task_ids.extend(
-        needs_reconcile
-            .iter()
-            .take(MAX_RECONCILE_PER_CYCLE)
-            .map(|t| t.id.0.clone()),
-    );
+    let results = futures::future::join_all(futs).await;
+    task_ids.extend(results.into_iter().flatten());
 }
 
 /// Cleanup worktrees for completed tasks with explicit options.
