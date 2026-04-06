@@ -22,7 +22,11 @@ pub use config::{parse_pool_entry, RouterConfig};
 pub use weights::AgentWeights;
 
 use crate::backends::ExternalTask;
-use crate::store::store_log_activity;
+use crate::engine::cooldown::{
+    cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
+    refresh_degraded_agents,
+};
+use crate::store::{store_log_activity, TaskStore};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -284,7 +288,7 @@ impl Router {
     ///
     /// Queries the `rate_limits` table for recent events and combines with
     /// cooldown state to mark agents as degraded before routing attempts them.
-    pub async fn refresh_health(&self, store: &std::sync::Arc<crate::store::TaskStore>) {
+    pub async fn refresh_health(&self, store: &std::sync::Arc<TaskStore>) {
         let config_ref = &self.config;
         let agents = self.available_agents.clone();
         let model_checker = |agent: &str| -> bool {
@@ -296,7 +300,7 @@ impl Router {
             }
             false
         };
-        crate::engine::cooldown::refresh_degraded_agents(
+        refresh_degraded_agents(
             store,
             &agents,
             &model_checker,
@@ -315,11 +319,11 @@ impl Router {
         if !self.is_agent_available(agent) {
             return false;
         }
-        if crate::engine::cooldown::is_agent_in_cooldown(agent) {
+        if is_agent_in_cooldown(agent) {
             tracing::debug!(agent, "agent skipped: in cooldown");
             return false;
         }
-        if crate::engine::cooldown::is_agent_degraded(agent) {
+        if is_agent_degraded(agent) {
             tracing::debug!(agent, "agent skipped: degraded (pre-emptive health check)");
             return false;
         }
@@ -372,7 +376,7 @@ impl Router {
         let mut earliest: Option<i64> = None;
 
         for agent in &self.available_agents {
-            if let Some(until) = crate::engine::cooldown::cooldown_until(agent) {
+            if let Some(until) = cooldown_until(agent) {
                 earliest = Some(earliest.map_or(until, |current| current.min(until)));
             }
 
@@ -380,7 +384,7 @@ impl Router {
                 if let Some(pool) = self.config.model_pool_for_complexity(agent, comp) {
                     for model in pool {
                         let key = format!("{agent}:{model}");
-                        if let Some(until) = crate::engine::cooldown::cooldown_until(&key) {
+                        if let Some(until) = cooldown_until(&key) {
                             earliest = Some(earliest.map_or(until, |current| current.min(until)));
                         }
                     }
@@ -469,7 +473,7 @@ impl Router {
     pub async fn route(
         &mut self,
         task: &ExternalTask,
-        store: &std::sync::Arc<crate::store::TaskStore>,
+        store: &std::sync::Arc<TaskStore>,
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
         // Pre-emptive health check: refresh degraded-agent flags before routing.
@@ -633,9 +637,10 @@ impl Router {
                         continue;
                     }
 
-                    let model_cooled = result.model.as_deref().is_some_and(|model| {
-                        crate::engine::cooldown::is_model_in_cooldown(&result.agent, model)
-                    });
+                    let model_cooled = result
+                        .model
+                        .as_deref()
+                        .is_some_and(|model| is_model_in_cooldown(&result.agent, model));
                     if !candidates.contains(&result.agent) || model_cooled {
                         let fallback_agent = candidates
                             .iter()
@@ -764,7 +769,7 @@ impl Router {
     async fn get_route_attempts(
         &self,
         task_id: &str,
-        store: &std::sync::Arc<crate::store::TaskStore>,
+        store: &std::sync::Arc<TaskStore>,
         repo: &str,
     ) -> u32 {
         match store.resolve_task_id(repo, task_id).await {
@@ -782,7 +787,7 @@ impl Router {
         &self,
         task_id: &str,
         attempts: u32,
-        store: &std::sync::Arc<crate::store::TaskStore>,
+        store: &std::sync::Arc<TaskStore>,
         repo: &str,
     ) {
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
@@ -798,7 +803,7 @@ impl Router {
     /// Log a route event to task activity timeline.
     async fn log_route_activity(
         &self,
-        store: &std::sync::Arc<crate::store::TaskStore>,
+        store: &std::sync::Arc<TaskStore>,
         repo: &str,
         task_id: &str,
         result: &RouteResult,
@@ -846,7 +851,7 @@ impl Router {
         let uncooled_agents: Vec<String> = self
             .available_agents
             .iter()
-            .filter(|a| !crate::engine::cooldown::is_agent_in_cooldown(a))
+            .filter(|a| !is_agent_in_cooldown(a))
             .cloned()
             .collect();
         if uncooled_agents.is_empty() {
@@ -994,7 +999,7 @@ impl Router {
         &self,
         task_id: &str,
         result: &RouteResult,
-        store: &std::sync::Arc<crate::store::TaskStore>,
+        store: &std::sync::Arc<TaskStore>,
         repo: &str,
     ) -> anyhow::Result<()> {
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, task_id).await {
@@ -1019,7 +1024,7 @@ impl Router {
 
 /// Retrieve routing result from the task store.
 pub async fn get_route_result(
-    store: &std::sync::Arc<crate::store::TaskStore>,
+    store: &std::sync::Arc<TaskStore>,
     repo: &str,
     task_id: &str,
 ) -> anyhow::Result<RouteResult> {
@@ -1105,6 +1110,11 @@ mod tests {
     };
     use super::*;
     use crate::backends::{ExternalId, ExternalTask};
+    use crate::engine::cooldown::{
+        clear_agent_degraded, is_agent_degraded, is_model_in_cooldown, mark_agent_degraded,
+        record_model_failure,
+    };
+    use crate::store::TaskStore;
     use std::time::{Duration, Instant};
 
     // Test-only delegates so tests can call router.parse_llm_response() and
@@ -1124,8 +1134,8 @@ mod tests {
         }
     }
 
-    async fn test_store() -> std::sync::Arc<crate::store::TaskStore> {
-        std::sync::Arc::new(crate::store::TaskStore::open_memory().await.unwrap())
+    async fn test_store() -> std::sync::Arc<TaskStore> {
+        std::sync::Arc::new(TaskStore::open_memory().await.unwrap())
     }
 
     fn create_test_task(id: &str, title: &str, labels: Vec<String>) -> ExternalTask {
@@ -1297,7 +1307,6 @@ mod tests {
 
     #[tokio::test]
     async fn model_pool_selection_skips_cooled() {
-        use crate::engine::cooldown::{is_model_in_cooldown, record_model_failure};
         use std::collections::HashMap;
 
         let mut config = RouterConfig::default();
@@ -2324,7 +2333,7 @@ Hope that helps!"#;
         assert!(router.agent_is_routable("test_degraded_routing", "medium"));
 
         // Mark as degraded
-        crate::engine::cooldown::mark_agent_degraded("test_degraded_routing");
+        mark_agent_degraded("test_degraded_routing");
 
         // Now excluded from routing
         assert!(!router.agent_is_routable("test_degraded_routing", "medium"));
@@ -2339,7 +2348,7 @@ Hope that helps!"#;
         assert_eq!(router.healthy_agent_count("medium"), 0);
 
         // Cleanup
-        crate::engine::cooldown::clear_agent_degraded("test_degraded_routing");
+        clear_agent_degraded("test_degraded_routing");
     }
 
     #[test]
@@ -2356,14 +2365,14 @@ Hope that helps!"#;
         let mut router = Router::new(config);
         router.available_agents = vec!["agent_healthy".to_string(), "agent_degraded".to_string()];
 
-        crate::engine::cooldown::mark_agent_degraded("agent_degraded");
+        mark_agent_degraded("agent_degraded");
 
         let candidates = router.available_agents_for_complexity("medium");
         assert_eq!(candidates, vec!["agent_healthy".to_string()]);
         assert_eq!(router.healthy_agent_count("medium"), 1);
 
         // Cleanup
-        crate::engine::cooldown::clear_agent_degraded("agent_degraded");
+        clear_agent_degraded("agent_degraded");
     }
 
     #[tokio::test]
@@ -2392,7 +2401,7 @@ Hope that helps!"#;
         router.refresh_health(&store).await;
 
         assert!(
-            crate::engine::cooldown::is_agent_degraded(agent),
+            is_agent_degraded(agent),
             "agent should be degraded after exceeding rate limit threshold"
         );
         assert!(
@@ -2401,6 +2410,6 @@ Hope that helps!"#;
         );
 
         // Cleanup
-        crate::engine::cooldown::clear_agent_degraded(agent);
+        clear_agent_degraded(agent);
     }
 }
