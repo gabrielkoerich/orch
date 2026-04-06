@@ -107,7 +107,7 @@ pub async fn run_direct_with_session(
     tokio::fs::write(&msg_file, message).await?;
 
     let runner = get_runner(agent);
-    let permissions = PermissionRules::default();
+    let permissions = PermissionRules::deny_read_only();
     let timeout_cmd = format!("timeout {}", timeout.as_secs());
 
     let mut shell_cmd =
