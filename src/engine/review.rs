@@ -1161,15 +1161,22 @@ pub(crate) async fn review_and_merge(
     let raw_output = runner::response::read_output_file(&review_task_id, &output_file, repo).await;
     let agent_runner = runner::agents::get_runner(&review_agent);
 
-    // Extract token usage from the raw output so we can track review agent costs.
-    let agent_token_usage = {
-        let ar = runner::agents::find_agent_result(&review_agent, &raw_output);
-        RunTokenUsage {
-            input_tokens: ar.as_ref().and_then(|r| r.input_tokens).unwrap_or(0) as i64,
-            output_tokens: ar.as_ref().and_then(|r| r.output_tokens).unwrap_or(0) as i64,
-            total_cost_usd: ar.as_ref().and_then(|r| r.cost_usd).unwrap_or(0.0),
-            duration_secs: 0.0,
-        }
+    // Extract token usage and agent result in one call — reused below for review parsing.
+    let agent_result_for_tokens = runner::agents::find_agent_result(&review_agent, &raw_output);
+    let agent_token_usage = RunTokenUsage {
+        input_tokens: agent_result_for_tokens
+            .as_ref()
+            .and_then(|r| r.input_tokens)
+            .unwrap_or(0) as i64,
+        output_tokens: agent_result_for_tokens
+            .as_ref()
+            .and_then(|r| r.output_tokens)
+            .unwrap_or(0) as i64,
+        total_cost_usd: agent_result_for_tokens
+            .as_ref()
+            .and_then(|r| r.cost_usd)
+            .unwrap_or(0.0),
+        duration_secs: 0.0,
     };
 
     // Check the NDJSON result event for is_error flag.
@@ -1181,7 +1188,13 @@ pub(crate) async fn review_and_merge(
         .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))
         .and_then(|v| v.get("is_error").and_then(|e| e.as_bool()))
         .unwrap_or(false);
-    let is_hard_failure = raw_output.is_empty() || result_is_error;
+    // Also treat per-agent extractor is_error as a hard failure — this catches codex/opencode
+    // auth errors that emit exit 0 with is_error:true but no claude-style result event.
+    let agent_result_is_error = agent_result_for_tokens
+        .as_ref()
+        .map(|r| r.is_error)
+        .unwrap_or(false);
+    let is_hard_failure = raw_output.is_empty() || result_is_error || agent_result_is_error;
     if is_hard_failure {
         tracing::warn!(
             task_id = task.id.0,
@@ -1225,14 +1238,12 @@ pub(crate) async fn review_and_merge(
         return Ok(ReviewDecision::Failed(format!("agent error: {err}")));
     }
 
-    // Step 1: extract the result event using per-agent extractors.
-    // This gives us the clean result text without any agent-specific NDJSON envelope.
-    // Note: is_error cases are already handled by the hard-failure block above.
-    let agent_result = runner::agents::find_agent_result(&review_agent, &raw_output);
+    // Step 1: reuse the agent result already extracted above for token usage.
+    // is_error cases are already handled by the hard-failure block above.
 
     // Step 2: get the text to parse — prefer the clean result_text from the
     // per-agent extractor; fall back to raw output if extraction yielded nothing.
-    let text_for_review = agent_result
+    let text_for_review = agent_result_for_tokens
         .map(|r| r.result_text)
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| {
@@ -1258,8 +1269,8 @@ pub(crate) async fn review_and_merge(
                 );
                 r
             } else {
-                // Check if the text contains a rate limit message before returning parse error.
-                // Rate limits should trigger a cooldown, not increment the failure counter.
+                // Check if the text contains a rate limit or auth error before returning parse
+                // error. These should trigger a cooldown, not increment the failure counter.
                 if let Some(runner::agents::AgentError::RateLimit { message }) =
                     runner::agents::patterns::detect_rate_limit(&text_for_review)
                 {
@@ -1286,6 +1297,33 @@ pub(crate) async fn review_and_merge(
                             .await;
                     }
                     return Ok(ReviewDecision::Failed(format!("rate limit: {message}")));
+                }
+                if let Some(runner::agents::AgentError::Auth { message }) =
+                    runner::agents::patterns::detect_auth_error(&text_for_review)
+                {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        agent = %review_agent,
+                        "review agent hit auth error — adding to cooldown"
+                    );
+                    runner::response::record_agent_failure_with_message(&review_agent, &message)
+                        .await;
+
+                    if let Some(rid) = run_id {
+                        let _ = store
+                            .complete_run(&CompleteRun {
+                                run_id: rid,
+                                exit_code: Some(exit_code),
+                                stdout: &raw_output,
+                                stderr: &stderr,
+                                parsed: &text_for_review,
+                                outcome: "failed",
+                                error: &format!("auth error: {message}"),
+                                tokens: agent_token_usage,
+                            })
+                            .await;
+                    }
+                    return Ok(ReviewDecision::Failed(format!("auth error: {message}")));
                 }
 
                 tracing::error!(

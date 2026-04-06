@@ -492,14 +492,15 @@ async fn classify_review_failure(
     reason: &str,
     context: &str,
 ) -> ReviewOutcome {
-    // Rate-limit failures are not real review failures — don't count them
+    // Rate-limit and auth failures are not real review failures — don't count them
     // toward MAX_REVIEW_AGENT_FAILURES. The cooldown system steers the next
     // attempt to an available agent.
-    if reason.to_lowercase().contains("rate limit") {
+    let lower_reason = reason.to_lowercase();
+    if lower_reason.contains("rate limit") || lower_reason.contains("auth error") {
         tracing::warn!(
             task_id,
             reason,
-            "{context} hit rate limit — deferring retry until cooldown expires"
+            "{context} hit rate limit or auth error — deferring retry until cooldown expires"
         );
         return ReviewOutcome::RateLimited;
     }
