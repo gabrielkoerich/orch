@@ -454,19 +454,25 @@ async fn ensure_pr_exists(
                                     ));
                                 }
 
-                                let failures = store_increment(
+                                match store_increment(
                                     &Some(Arc::clone(store)),
                                     repo,
                                     &task.id.0,
                                     "pr_create_failures",
                                 )
-                                .await;
-                                if failures >= MAX_PR_CREATE_FAILURES {
-                                    return Ok(EnsurePrResult::EarlyReturn(
-                                        ReviewDecision::Blocked(format!(
-                                            "no PR, create failed {failures} times: {stderr}"
-                                        )),
-                                    ));
+                                .await
+                                {
+                                    Ok(failures) if failures >= MAX_PR_CREATE_FAILURES => {
+                                        return Ok(EnsurePrResult::EarlyReturn(
+                                            ReviewDecision::Blocked(format!(
+                                                "no PR, create failed {failures} times: {stderr}"
+                                            )),
+                                        ));
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::warn!(task_id = task.id.0, err = %e, "failed to increment pr_create_failures — skipping blocking decision this tick");
+                                    }
                                 }
                                 Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
                                     format!("no PR, create failed: {stderr}"),
@@ -492,19 +498,25 @@ async fn ensure_pr_exists(
                                     ));
                                 }
 
-                                let failures = store_increment(
+                                match store_increment(
                                     &Some(Arc::clone(store)),
                                     repo,
                                     &task.id.0,
                                     "pr_create_failures",
                                 )
-                                .await;
-                                if failures >= MAX_PR_CREATE_FAILURES {
-                                    return Ok(EnsurePrResult::EarlyReturn(
-                                        ReviewDecision::Blocked(format!(
-                                            "no PR, gh error {failures} times: {e}"
-                                        )),
-                                    ));
+                                .await
+                                {
+                                    Ok(failures) if failures >= MAX_PR_CREATE_FAILURES => {
+                                        return Ok(EnsurePrResult::EarlyReturn(
+                                            ReviewDecision::Blocked(format!(
+                                                "no PR, gh error {failures} times: {e}"
+                                            )),
+                                        ));
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::warn!(task_id = task.id.0, err = %e, "failed to increment pr_create_failures — skipping blocking decision this tick");
+                                    }
                                 }
                                 Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
                                     format!("no PR, gh error: {e}"),
@@ -635,13 +647,23 @@ async fn ensure_pr_exists(
                 }
 
                 // Atomically increment the persistent reroute counter and decide.
-                let reroutes = store_increment(
+                let reroutes = match store_increment(
                     &Some(Arc::clone(store)),
                     repo,
                     &task.id.0,
                     "no_code_reroutes",
                 )
-                .await;
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(task_id = task.id.0, err = %e, "failed to increment no_code_reroutes — skipping reroute/block decision this tick");
+                        // Skip action this tick
+                        return Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
+                            format!("transient store error: {e}"),
+                        )));
+                    }
+                };
 
                 if reroutes as u32 >= max_reroutes {
                     tracing::error!(
@@ -744,17 +766,12 @@ pub(crate) async fn review_and_merge(
     // increments). Stale output.json files from crashed attempts can no longer be
     // silently reused.
     let review_attempt: u32 = {
-        let v = store_increment(
-            &Some(Arc::clone(store)),
-            repo,
-            &task.id.0,
-            "review_invocations",
-        )
-        .await;
-        if v == 0 {
-            1
-        } else {
-            v as u32
+        match store_increment(&Some(Arc::clone(store)), repo, &task.id.0, "review_invocations").await {
+            Ok(v) => v as u32,
+            Err(e) => {
+                tracing::warn!(task_id = task.id.0, err = %e, "failed to increment review_invocations — using fallback attempt=1");
+                1
+            }
         }
     };
 

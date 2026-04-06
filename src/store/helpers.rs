@@ -5,6 +5,7 @@
 //! initialized.
 
 use crate::store::{CostEstimate, MemoryEntry, Task, TaskStore, TokenUsage};
+use anyhow::anyhow;
 use std::sync::Arc;
 
 /// Load the full `Task` record from the store.
@@ -166,27 +167,28 @@ pub async fn set_review_session_expected(
 /// Increment a counter in the task store.
 ///
 /// Uses `store.increment()` for an atomic SQL `field + 1`.
-/// Returns the new value, or 0 if the store is unavailable.
+/// Returns `Ok(new_value)` on success or `Err(anyhow::Error)` when the
+/// store is unavailable, the task cannot be resolved, or the underlying
+/// SQL increment failed. Callers must handle errors explicitly — this
+/// helper no longer silently returns 0 on error.
 pub async fn store_increment(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
     task_id: &str,
     field: &str,
-) -> u64 {
-    if let Some(ref s) = store {
-        match s.resolve_task_id(repo, task_id).await {
-            Ok(Some(store_id)) => {
-                if let Ok(new_val) = s.increment(store_id, field).await {
-                    return new_val as u64;
-                }
-            }
-            Ok(None) => {} // task not in store — no-op is expected
-            Err(e) => {
-                tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
-            }
+) -> anyhow::Result<u64> {
+    let s = store.as_ref().ok_or_else(|| anyhow!("task store unavailable"))?;
+    match s.resolve_task_id(repo, task_id).await {
+        Ok(Some(store_id)) => match s.increment(store_id, field).await {
+            Ok(new_val) => Ok(new_val as u64),
+            Err(e) => Err(anyhow!("store.increment failed: {}", e)),
+        },
+        Ok(None) => Err(anyhow!("task not present in store: {}/{}", repo, task_id)),
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
+            Err(anyhow!("resolve_task_id failed: {}", e))
         }
     }
-    0
 }
 
 /// Reset all task counters in the task store.

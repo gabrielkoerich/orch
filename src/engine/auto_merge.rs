@@ -406,13 +406,14 @@ pub(crate) async fn auto_merge_pr(
         match state.as_str() {
             "success" => break,
             "failure" => {
-                let ci_failures = store_increment(
-                    &Some(Arc::clone(store)),
-                    repo,
-                    &task.id.0,
-                    "ci_merge_failures",
-                )
-                .await;
+                let ci_failures = match store_increment(&Some(Arc::clone(store)), repo, &task.id.0, "ci_merge_failures").await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(task_id = task.id.0, err = %e, "failed to increment ci_merge_failures — skipping CI-failure based block this tick");
+                        // Skip escalation this tick and let the sync retry later
+                        return Ok(());
+                    }
+                };
                 if ci_failures >= MAX_CI_MERGE_FAILURES {
                     tracing::error!(
                         task_id = task.id.0,
@@ -454,13 +455,13 @@ pub(crate) async fn auto_merge_pr(
             _ => {
                 // pending — wait up to max_wait
                 if start.elapsed() >= max_wait {
-                    let ci_failures = store_increment(
-                        &Some(Arc::clone(store)),
-                        repo,
-                        &task.id.0,
-                        "ci_merge_failures",
-                    )
-                    .await;
+                    let ci_failures = match store_increment(&Some(Arc::clone(store)), repo, &task.id.0, "ci_merge_failures").await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(task_id = task.id.0, err = %e, "failed to increment ci_merge_failures — skipping CI-timeout based block this tick");
+                            return Ok(());
+                        }
+                    };
                     if ci_failures >= MAX_CI_MERGE_FAILURES {
                         tracing::error!(
                             task_id = task.id.0,
@@ -656,13 +657,9 @@ pub(crate) async fn auto_merge_pr(
                                 task_id = task.id.0,
                                 "rebase succeeded — resetting to NeedsReview for CI + merge"
                             );
-                                    store_increment(
-                                        &Some(Arc::clone(store)),
-                                        repo,
-                                        &task.id.0,
-                                        "merge_conflict_retries",
-                                    )
-                                    .await;
+                                    if let Err(e) = store_increment(&Some(Arc::clone(store)), repo, &task.id.0, "merge_conflict_retries").await {
+                                        tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — retry count may be inaccurate");
+                                    }
                                     // Enable auto-merge — GitHub merges once CI passes.
                                     // If auto-merge isn't available, keep task in InReview
                                     // so the sync tick retries merge on the next cycle.
@@ -735,13 +732,9 @@ pub(crate) async fn auto_merge_pr(
                     if rebase_conflict {
                         // Increment counter so retry limit fires if agent cannot resolve.
                         // This matches the CI failure pattern: increment before re-routing.
-                        store_increment(
-                            &Some(Arc::clone(store)),
-                            repo,
-                            &task.id.0,
-                            "merge_conflict_retries",
-                        )
-                        .await;
+                        if let Err(e) = store_increment(&Some(Arc::clone(store)), repo, &task.id.0, "merge_conflict_retries").await {
+                            tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — retry count may be inaccurate");
+                        }
                         store_set(
                             &Some(Arc::clone(store)),
                             repo,
@@ -1138,13 +1131,9 @@ pub(crate) async fn handle_review_changes(
                         &[("review_cycles", serde_json::json!(0))],
                     )
                     .await;
-                    store_increment(
-                        &Some(Arc::clone(store)),
-                        repo,
-                        &task.id.0,
-                        "ci_recovery_count",
-                    )
-                    .await;
+                    if let Err(e) = store_increment(&Some(Arc::clone(store)), repo, &task.id.0, "ci_recovery_count").await {
+                        tracing::warn!(task_id = task.id.0, err = %e, "failed to increment ci_recovery_count — recovery count may be inaccurate");
+                    }
                     if let Err(e) = task_manager
                         .update_task_status(&task.id, Status::NeedsReview)
                         .await

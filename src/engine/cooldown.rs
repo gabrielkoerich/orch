@@ -1772,6 +1772,11 @@ mod tests {
             *open = None;
             let mut ts = github_5xx_timestamps().lock().unwrap();
             ts.clear();
+            // Also clear any generic cooldown map entry for the github 5xx
+            // circuit so tests are isolated from other tests that may have
+            // set the generic cooldown via set_agent_cooldown("github:5xx", ...).
+            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            map.remove("github:5xx");
         }
 
         // Record fewer errors than threshold
@@ -1794,6 +1799,8 @@ mod tests {
             *open = None;
             let mut ts = github_5xx_timestamps().lock().unwrap();
             ts.clear();
+            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            map.remove("github:5xx");
         }
 
         // Record exactly threshold errors
@@ -1826,6 +1833,8 @@ mod tests {
             *open = None;
             let mut ts = github_5xx_timestamps().lock().unwrap();
             ts.clear();
+            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            map.remove("github:5xx");
         }
 
         // Trip the circuit
@@ -1862,6 +1871,8 @@ mod tests {
             *open = None;
             let mut ts = github_5xx_timestamps().lock().unwrap();
             ts.clear();
+            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            map.remove("github:5xx");
         }
 
         // Set the circuit to an expired cooldown
@@ -1885,6 +1896,8 @@ mod tests {
             *open = None;
             let mut ts = github_5xx_timestamps().lock().unwrap();
             ts.clear();
+            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            map.remove("github:5xx");
         }
 
         // Record errors that are outside the window
