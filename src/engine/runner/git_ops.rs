@@ -337,11 +337,13 @@ pub async fn rebase_on_default(dir: &Path, default_branch: &str) {
 /// - `GIT_CONFIG_VALUE_N` — config value for entry N
 pub(crate) fn build_git_auth_env() -> Vec<(String, String)> {
     let token = crate::github::token::TokenResolver::default_env()
-        .with_gh_fallback(false)
         .get_token_sync()
         .ok()
         .flatten();
+    build_git_auth_env_for_token(token)
+}
 
+fn build_git_auth_env_for_token(token: Option<String>) -> Vec<(String, String)> {
     match token {
         Some(t) if !t.is_empty() => {
             let authed = format!("url.https://x-access-token:{t}@github.com/.insteadOf");
@@ -1246,23 +1248,9 @@ mod tests {
 
     #[test]
     fn build_git_auth_env_without_token_falls_back_to_ssh_https_conversion() {
-        // Without a token in env the function must still return the legacy
-        // SSH→HTTPS insteadOf rule so SSH-origin repos can push.
-        // Note: we disable gh CLI fallback to ensure predictable test behavior.
-        let saved_gh = std::env::var("GH_TOKEN").ok();
-        let saved_gh2 = std::env::var("GITHUB_TOKEN").ok();
-        std::env::remove_var("GH_TOKEN");
-        std::env::remove_var("GITHUB_TOKEN");
-
-        let env = build_git_auth_env();
-
-        // Restore env
-        if let Some(v) = saved_gh {
-            std::env::set_var("GH_TOKEN", v);
-        }
-        if let Some(v) = saved_gh2 {
-            std::env::set_var("GITHUB_TOKEN", v);
-        }
+        // Pass None directly to test the no-token path without relying on env vars
+        // or the gh CLI, keeping the test deterministic regardless of local auth state.
+        let env = build_git_auth_env_for_token(None);
 
         // When no token is available the fallback must include the SSH insteadOf rule.
         // The SSH→HTTPS conversion sets the target URL (the rewrite destination) to git@github.com:.
@@ -1277,17 +1265,8 @@ mod tests {
 
     #[test]
     fn build_git_auth_env_with_token_covers_both_ssh_and_https() {
-        // Temporarily inject a fake token so we can verify both insteadOf rules.
-        let saved = std::env::var("GH_TOKEN").ok();
-        std::env::set_var("GH_TOKEN", "ghp_testtoken1234");
-
-        let env = build_git_auth_env();
-
-        // Restore env
-        match saved {
-            Some(v) => std::env::set_var("GH_TOKEN", v),
-            None => std::env::remove_var("GH_TOKEN"),
-        }
+        // Pass a pre-built token directly to test the token path without touching env vars.
+        let env = build_git_auth_env_for_token(Some("ghp_testtoken1234".into()));
 
         // Must contain the token in the auth URL (the token is in the value of GIT_CONFIG_KEY_N).
         let has_token = env
