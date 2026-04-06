@@ -865,6 +865,7 @@ pub async fn create_pr_if_needed(
     const MAX_RETRIES: u32 = 3;
     let mut last_error: Option<anyhow::Error> = None;
     let mut created_url: Option<String> = None;
+    let mut had_transient_error = false;
 
     for attempt in 1..=MAX_RETRIES {
         match gh
@@ -877,16 +878,19 @@ pub async fn create_pr_if_needed(
             }
             Err(e) => {
                 let err_str = format!("{e}");
-                if is_transient_github_error(&err_str) && attempt < MAX_RETRIES {
-                    let delay = std::time::Duration::from_secs(2u64.pow(attempt));
-                    tracing::warn!(
-                        task_id,
-                        attempt,
-                        delay_secs = delay.as_secs(),
-                        error = %e,
-                        "transient GitHub API error during PR creation — retrying"
-                    );
-                    tokio::time::sleep(delay).await;
+                if is_transient_github_error(&err_str) {
+                    had_transient_error = true;
+                    if attempt < MAX_RETRIES {
+                        let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                        tracing::warn!(
+                            task_id,
+                            attempt,
+                            delay_secs = delay.as_secs(),
+                            error = %e,
+                            "transient GitHub API error during PR creation — retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
                 }
                 last_error = Some(e);
             }
@@ -903,7 +907,10 @@ pub async fn create_pr_if_needed(
             // For transient 5xx errors, GitHub may have created the PR despite returning
             // an error (e.g. 502 after the write succeeded). Re-check for an existing PR
             // before propagating the failure so we don't orphan the PR from the task.
-            if is_transient_github_error(&err_str) {
+            // Also check when the final error is non-transient but a prior attempt had a
+            // transient error — the PR may have been created on that earlier attempt (e.g.
+            // attempt 1 returns 502, attempt 2 returns 422 "already exists").
+            if is_transient_github_error(&err_str) || had_transient_error {
                 tracing::warn!(
                     task_id,
                     error = %e,
