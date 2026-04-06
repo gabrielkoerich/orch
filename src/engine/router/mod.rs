@@ -24,7 +24,7 @@ pub use weights::AgentWeights;
 use crate::backends::ExternalTask;
 use crate::store::store_log_activity;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use llm::LlmRouter;
 
@@ -261,65 +261,14 @@ impl Router {
         self.pool_index = 0;
     }
 
-    /// Run `opencode models` and return lines containing "free".
+    /// Discover free opencode models by delegating to RouterConfig.
     ///
-    /// This is a synchronous blocking call, intentionally used only at startup
-    /// (called once from `Router::new()` and `Router::reload()`). The result is
-    /// stored in `router_pool` and not re-queried until the next reload.
+    /// This delegates to RouterConfig::discover_free_opencode_models() to ensure
+    /// all callers use the same module-level cache that is primed at startup via
+    /// RouterConfig::prime_free_model_cache(). See module-level FREE_MODELS_CACHE
+    /// comment in config.rs for details on why the cache is shared.
     fn discover_free_opencode_models() -> Vec<String> {
-        // Cache discovered free opencode models for 1 hour to avoid repeatedly
-        // running the blocking `opencode models` command during router init
-        // or reloads. The cache stores (timestamp_seconds, models).
-        static FREE_MODELS_CACHE: OnceLock<Mutex<(i64, Vec<String>)>> = OnceLock::new();
-        let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
-
-        let now = chrono::Utc::now().timestamp();
-        // If cached and not expired (1 hour), return cached copy.
-        {
-            let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-            let (ts, models) = &*guard;
-            if *ts != 0 && now.saturating_sub(*ts) < 3600 {
-                return models.clone();
-            }
-        }
-
-        // Not cached or expired — perform discovery and refresh the cache.
-        let discovered = if !crate::cmd_cache::command_exists("opencode") {
-            tracing::debug!("opencode not in PATH — skipping free model discovery");
-            Vec::new()
-        } else {
-            match std::process::Command::new("opencode")
-                .args(["models"])
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    stdout
-                        .lines()
-                        .filter(|l| l.contains("free"))
-                        .map(|l| l.trim().to_string())
-                        .filter(|l| !l.is_empty())
-                        .map(|l| RouterConfig::normalize_model_identifier(&l))
-                        .collect()
-                }
-                Ok(output) => {
-                    tracing::debug!(status = ?output.status, "opencode models command failed");
-                    Vec::new()
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "failed to run opencode models");
-                    Vec::new()
-                }
-            }
-        };
-
-        // Update cache with current timestamp (even if empty) so we don't hammer I/O.
-        {
-            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = (now, discovered.clone());
-        }
-
-        discovered
+        RouterConfig::discover_free_opencode_models()
     }
 
     /// Async version of discover_free_opencode_models that delegates to the cached
