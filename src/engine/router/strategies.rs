@@ -15,7 +15,7 @@ use crate::backends::ExternalTask;
 
 use super::config::RouterConfig;
 use super::weights::AgentWeights;
-use super::{AgentProfile, RouteResult};
+use super::RouteResult;
 
 /// Extract an explicit `agent:*` label from the task, if present and valid.
 ///
@@ -67,22 +67,13 @@ pub(super) fn route_via_round_robin(
     let agent_idx = task_num % agents.len();
     let agent = agents[agent_idx].clone();
 
-    let profile = AgentProfile {
-        role: "general".to_string(),
-        skills: vec![],
-        tools: config.allowed_tools.clone(),
-        constraints: vec![],
-    };
-
-    Ok(RouteResult {
-        agent: agent.clone(),
-        model: config.model_for_complexity(&agent, "medium", &task.id.0),
-        complexity: "medium".to_string(),
-        reason: format!("round_robin (task {} % {} agents)", task.id.0, agents.len()),
-        profile,
-        selected_skills: config.default_skills.clone(),
-        warning: None,
-    })
+    Ok(RouteResult::from_config(
+        agent,
+        "medium".to_string(),
+        format!("round_robin (task {} % {} agents)", task.id.0, agents.len()),
+        config,
+        &task.id.0,
+    ))
 }
 
 /// Stateful round-robin: cycles through agents using a persistent index,
@@ -133,28 +124,18 @@ pub(super) fn route_via_round_robin_stateful(
     *last_agent = Some(agent.clone());
 
     let complexity = extract_complexity_from_labels(&task.labels);
-    let model = config.model_for_complexity(&agent, &complexity, &task.id.0);
 
-    let profile = AgentProfile {
-        role: "general".to_string(),
-        skills: vec![],
-        tools: config.allowed_tools.clone(),
-        constraints: vec![],
-    };
-
-    Ok(RouteResult {
-        agent: agent.clone(),
-        model,
+    Ok(RouteResult::from_config(
+        agent,
         complexity,
-        reason: format!(
+        format!(
             "round_robin (index {} of {} agents)",
             agent_idx,
             agents.len()
         ),
-        profile,
-        selected_skills: config.default_skills.clone(),
-        warning: None,
-    })
+        config,
+        &task.id.0,
+    ))
 }
 
 /// Weighted round-robin: selects an agent based on capacity weights.
@@ -190,7 +171,6 @@ pub(super) fn route_via_weighted_round_robin(
 
     let weight = weights.get_weight(&agent);
     let complexity = extract_complexity_from_labels(&task.labels);
-    let model = config.model_for_complexity(&agent, &complexity, &task.id.0);
 
     let weight_summary: Vec<String> = weights
         .snapshot()
@@ -198,13 +178,6 @@ pub(super) fn route_via_weighted_round_robin(
         .filter(|(a, _, _)| agents.contains(a))
         .map(|(a, w, _)| format!("{a}={w:.2}"))
         .collect();
-
-    let profile = AgentProfile {
-        role: "general".to_string(),
-        skills: vec![],
-        tools: config.allowed_tools.clone(),
-        constraints: vec![],
-    };
 
     *last_agent = Some(agent.clone());
 
@@ -220,15 +193,9 @@ pub(super) fn route_via_weighted_round_robin(
         "weighted round-robin selected agent"
     );
 
-    Ok(RouteResult {
-        agent,
-        model,
-        complexity,
-        reason,
-        profile,
-        selected_skills: config.default_skills.clone(),
-        warning: None,
-    })
+    Ok(RouteResult::from_config(
+        agent, complexity, reason, config, &task.id.0,
+    ))
 }
 
 /// Fallback routing when LLM fails.
@@ -276,22 +243,12 @@ pub(super) fn route_via_fallback(
     };
 
     let complexity = extract_complexity_from_labels(&task.labels);
-    let model = config.model_for_complexity(&agent, &complexity, &task.id.0);
 
-    let profile = AgentProfile {
-        role: "general".to_string(),
-        skills: vec![],
-        tools: config.allowed_tools.clone(),
-        constraints: vec![],
-    };
-
-    Ok(RouteResult {
-        agent: agent.clone(),
-        model,
+    Ok(RouteResult::from_config(
+        agent.clone(),
         complexity,
-        reason: format!("router failed; fallback to {agent}"),
-        profile,
-        selected_skills: config.default_skills.clone(),
-        warning: None,
-    })
+        format!("router failed; fallback to {agent}"),
+        config,
+        &task.id.0,
+    ))
 }
