@@ -1688,12 +1688,14 @@ impl GhHttp {
         sha: &str,
     ) -> anyhow::Result<Vec<(String, String)>> {
         let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}/status?per_page=100");
-        let resp = self.get_json::<serde_json::Value>(&url).await?;
-        Ok(resp
-            .get("statuses")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
+        // The /commits/{sha}/status endpoint returns a wrapper object:
+        // { "state": "pending", "total_count": N, "statuses": [...] }
+        // Use get_all_pages_from_wrapper to follow pagination and extract the
+        // `statuses` array across pages so we don't silently truncate at 100.
+        let statuses: Vec<serde_json::Value> =
+            self.get_all_pages_from_wrapper(&url, "statuses").await?;
+
+        Ok(statuses
             .into_iter()
             .filter_map(|status| {
                 let context = status.get("context").and_then(|v| v.as_str())?;
