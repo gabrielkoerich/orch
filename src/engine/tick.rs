@@ -12,6 +12,11 @@
 use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
 use crate::config;
+use crate::engine::cooldown::{
+    github_circuit_remaining_secs, is_github_circuit_open, record_silence_detection,
+    set_agent_cooldown, set_model_cooldown, SILENCE_AGENT_COOLDOWN_SECS,
+    SILENCE_EXTENDED_COOLDOWN_SECS,
+};
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::jobs;
 use crate::engine::router::{get_route_result, Router};
@@ -234,19 +239,12 @@ pub(crate) async fn tick_detect_silent_agents(
 
         // 3. Cooldown the specific model (not the whole agent)
         if !agent_name.is_empty() && !model_name.is_empty() {
-            crate::engine::cooldown::set_model_cooldown(
-                &agent_name,
-                &model_name,
-                config.silence_cooldown,
-            );
-            if let Some(result) =
-                crate::engine::cooldown::record_silence_detection(&agent_name, &model_name).await
-            {
+            set_model_cooldown(&agent_name, &model_name, config.silence_cooldown);
+            if let Some(result) = record_silence_detection(&agent_name, &model_name).await {
                 if result.extended_cooldown_applied {
                     extended_note = format!(
                         " ({} silences in 24h -> extended cooldown {}s)",
-                        result.count,
-                        crate::engine::cooldown::SILENCE_EXTENDED_COOLDOWN_SECS
+                        result.count, SILENCE_EXTENDED_COOLDOWN_SECS
                     );
                 }
             }
@@ -256,10 +254,7 @@ pub(crate) async fn tick_detect_silent_agents(
         // Without this, the router picks the same agent with a different model,
         // looping through all models (~2 min each) before the long agent cooldown kicks in.
         if !agent_name.is_empty() {
-            crate::engine::cooldown::set_agent_cooldown(
-                &agent_name,
-                crate::engine::cooldown::SILENCE_AGENT_COOLDOWN_SECS,
-            );
+            set_agent_cooldown(&agent_name, SILENCE_AGENT_COOLDOWN_SECS);
         }
 
         // 4. Pick a fallback agent and set to Routed (not New) to preserve progress.
@@ -403,7 +398,7 @@ pub(crate) async fn tick_detect_silent_agents(
             config.silence_cooldown,
             extended_note,
             agent_name,
-            crate::engine::cooldown::SILENCE_AGENT_COOLDOWN_SECS,
+            SILENCE_AGENT_COOLDOWN_SECS,
             action,
             crate::engine::orch_footer(),
         );
@@ -770,8 +765,8 @@ pub(crate) async fn tick_route_tasks(
     // Global GitHub 5xx circuit breaker — skip routing during sustained GitHub outages
     // to avoid routing-heavy retry storms. Tasks will remain in 'new' status and be
     // retried when the circuit closes.
-    if crate::engine::cooldown::is_github_circuit_open() {
-        let remaining = crate::engine::cooldown::github_circuit_remaining_secs();
+    if is_github_circuit_open() {
+        let remaining = github_circuit_remaining_secs();
         tracing::info!(
             remaining_secs = remaining,
             "GitHub 5xx circuit breaker open — skipping routing phase"
@@ -1273,7 +1268,7 @@ pub(crate) async fn tick_unblock_parents(
 pub(crate) async fn tick_job_scheduler(
     jobs_path: &std::path::PathBuf,
     backend: &Arc<dyn ExternalBackend>,
-    store: Option<&Arc<crate::store::TaskStore>>,
+    store: Option<&Arc<TaskStore>>,
     repo: &str,
     transport: Option<&Arc<crate::channels::transport::Transport>>,
 ) -> anyhow::Result<()> {
@@ -1341,6 +1336,9 @@ mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
     use crate::channels::transport::Transport;
+    use crate::engine::tasks::TaskManager;
+    use crate::store::TaskStore;
+    use crate::tmux::TmuxManager;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -1566,7 +1564,7 @@ mod tests {
 
     /// Set `updated_at` to a far-past date for a task in an in-memory store.
     #[cfg(test)]
-    async fn set_task_updated_at_past(store: &crate::store::TaskStore, task_id: i64) {
+    async fn set_task_updated_at_past(store: &TaskStore, task_id: i64) {
         sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
             .bind(task_id)
             .execute(store.pool())
@@ -1576,16 +1574,16 @@ mod tests {
 
     #[tokio::test]
     async fn recover_stuck_tasks_resets_external_in_review_to_needs_review() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = MockBackend::new();
         let status_updates = mock.status_updates.clone();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let task_manager = Arc::new(TaskManager::with_store(
             backend.clone(),
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let tmux = Arc::new(TmuxManager::new());
         let config = EngineConfig {
             no_session_stuck_timeout: 600,
             stuck_timeout: 1800,
@@ -1632,16 +1630,16 @@ mod tests {
 
     #[tokio::test]
     async fn recover_stuck_tasks_skips_recent_in_review() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = MockBackend::new();
         let status_updates = mock.status_updates.clone();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let task_manager = Arc::new(TaskManager::with_store(
             backend.clone(),
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let tmux = Arc::new(TmuxManager::new());
         let config = EngineConfig {
             no_session_stuck_timeout: 600, // 10 minutes — recent task won't trigger
             stuck_timeout: 1800,
@@ -1688,14 +1686,14 @@ mod tests {
 
     #[tokio::test]
     async fn recover_stuck_tasks_resets_internal_in_review_to_needs_review() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let task_manager = Arc::new(TaskManager::with_store(
             backend.clone(),
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let tmux = Arc::new(TmuxManager::new());
         let config = EngineConfig {
             no_session_stuck_timeout: 600,
             stuck_timeout: 1800,
@@ -1735,16 +1733,16 @@ mod tests {
 
     #[tokio::test]
     async fn recover_stuck_tasks_skips_external_in_review_waiting_for_human_review() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = MockBackend::new();
         let status_updates = mock.status_updates.clone();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let task_manager = Arc::new(TaskManager::with_store(
             backend.clone(),
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let tmux = Arc::new(TmuxManager::new());
         let config = EngineConfig {
             no_session_stuck_timeout: 600,
             stuck_timeout: 1800,
@@ -1838,13 +1836,13 @@ mod tests {
         let capture = Arc::new(CaptureService::new(transport));
         let mock = Arc::new(MockBackend::new());
         let backend: Arc<dyn ExternalBackend> = mock.clone();
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let task_manager = Arc::new(TaskManager::with_store(
             backend.clone(),
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let tmux = Arc::new(TmuxManager::new());
         let config = EngineConfig {
             silence_grace_period: 0,
             ..EngineConfig::default()
@@ -1902,7 +1900,7 @@ mod tests {
 
     #[tokio::test]
     async fn stuck_task_timing_treats_dead_session_as_missing() {
-        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let tmux = Arc::new(TmuxManager::new());
         let repo = "owner/repo";
         let task_id = "internal:33498";
         let session_name = tmux.session_name(repo, task_id);
@@ -1993,15 +1991,15 @@ mod tests {
         use crate::engine::router::Router;
         use tokio::sync::RwLock;
 
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let mock = MockBackend::new();
         let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
-        let task_manager = Arc::new(crate::engine::tasks::TaskManager::with_store(
+        let task_manager = Arc::new(TaskManager::with_store(
             backend.clone(),
             store.clone(),
             "owner/repo".to_string(),
         ));
-        let tmux = Arc::new(crate::tmux::TmuxManager::new());
+        let tmux = Arc::new(TmuxManager::new());
         let semaphore = Arc::new(Semaphore::new(4));
         let (weight_tx, _weight_rx) = mpsc::channel(16);
         let dispatching = Arc::new(DashSet::new());

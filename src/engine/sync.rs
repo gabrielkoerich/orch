@@ -12,9 +12,13 @@
 use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
+use crate::engine::cooldown::{
+    cooldown_reason, github_circuit_remaining_secs, is_agent_in_cooldown, is_github_circuit_open,
+    is_model_in_cooldown,
+};
 use crate::engine::router::Router;
 use crate::engine::runner::agents::patterns;
-use crate::engine::tasks::TaskManager;
+use crate::engine::tasks::{status_to_task_status, TaskManager};
 use crate::store;
 use crate::store::TaskStatus;
 use crate::store::TaskStore;
@@ -450,7 +454,7 @@ pub(crate) async fn sync_tick(
     config: &EngineConfig,
     router: &Arc<RwLock<Router>>,
     task_manager: &Arc<TaskManager>,
-    store: &Arc<crate::store::TaskStore>,
+    store: &Arc<TaskStore>,
     dispatching: &Arc<DashSet<String>>,
     auto_merge_in_flight: &Arc<DashSet<String>>,
 ) -> anyhow::Result<()> {
@@ -458,10 +462,10 @@ pub(crate) async fn sync_tick(
 
     // Global GitHub 5xx circuit breaker — skip non-critical background work
     // during sustained GitHub outages to reduce churn and wasted API calls.
-    let gh_circuit_open = crate::engine::cooldown::is_github_circuit_open();
+    let gh_circuit_open = is_github_circuit_open();
 
     if gh_circuit_open {
-        let remaining = crate::engine::cooldown::github_circuit_remaining_secs();
+        let remaining = github_circuit_remaining_secs();
         tracing::debug!(
             remaining_secs = remaining,
             "GitHub 5xx circuit breaker open — skipping non-critical sync work"
@@ -744,9 +748,9 @@ pub(crate) async fn sync_tick(
 /// Otherwise, creates an internal task for the mention.
 async fn scan_mentions(
     backend: &Arc<dyn ExternalBackend>,
-    store: Option<&Arc<crate::store::TaskStore>>,
+    store: Option<&Arc<TaskStore>>,
     repo: &str,
-    task_manager: &Arc<crate::engine::tasks::TaskManager>,
+    task_manager: &Arc<TaskManager>,
 ) -> anyhow::Result<()> {
     // Get the current user (for mention detection)
     let current_user = match backend.get_authenticated_user().await {
@@ -1032,7 +1036,7 @@ async fn scan_mentions(
 /// to `~/.orch/skills/{repo}/`. This keeps skill documentation up-to-date
 /// for agents.
 async fn skills_sync() -> anyhow::Result<()> {
-    let skills = match crate::config::get_skills() {
+    let skills = match config::get_skills() {
         Ok(s) => s,
         Err(e) => {
             tracing::debug!(err = %e, "no skills configured");
@@ -1064,7 +1068,7 @@ async fn skills_sync() -> anyhow::Result<()> {
 /// All errors are logged via `tracing::warn!` so that one failing skill does not
 /// prevent the others from being updated.
 async fn sync_one_skill(
-    skill: crate::config::SkillConfig,
+    skill: config::SkillConfig,
     skills_base: std::path::PathBuf,
     git_timeout: std::time::Duration,
 ) {
@@ -1188,7 +1192,7 @@ async fn emit_degraded_agents_if_needed(
     let mut details: Vec<DegradedAgentDetail> = Vec::new();
 
     for agent in &router.available_agents {
-        let agent_in_cd = crate::engine::cooldown::is_agent_in_cooldown(agent);
+        let agent_in_cd = is_agent_in_cooldown(agent);
 
         // Collect individually cooled models across all complexity tiers (deduped).
         let mut cooled_models: Vec<String> = Vec::new();
@@ -1196,9 +1200,7 @@ async fn emit_degraded_agents_if_needed(
         for comp in COMPLEXITIES {
             if let Some(pool) = router.config.model_pool_for_complexity(agent, comp) {
                 for model in pool {
-                    if seen_models.insert(model.clone())
-                        && crate::engine::cooldown::is_model_in_cooldown(agent, &model)
-                    {
+                    if seen_models.insert(model.clone()) && is_model_in_cooldown(agent, &model) {
                         cooled_models.push(model);
                     }
                 }
@@ -1215,8 +1217,7 @@ async fn emit_degraded_agents_if_needed(
 
         if agent_in_cd || !has_model {
             let reason = if agent_in_cd {
-                crate::engine::cooldown::cooldown_reason(agent)
-                    .unwrap_or_else(|| "agent_cooldown".to_string())
+                cooldown_reason(agent).unwrap_or_else(|| "agent_cooldown".to_string())
             } else {
                 "no_available_model".to_string()
             };
@@ -1278,7 +1279,7 @@ async fn emit_degraded_agents_if_needed(
 pub(crate) async fn ingest_external_tasks(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
-    store: &Arc<crate::store::TaskStore>,
+    store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     #[derive(Clone)]
     struct DuplicateTarget {
@@ -1513,9 +1514,9 @@ pub(crate) async fn ingest_external_tasks(
         let existing_map = store.get_batch(&all_ids).await.unwrap_or_default();
         for (store_id, status) in id_status_pairs {
             if let Some(existing) = existing_map.get(&store_id) {
-                if existing.status == crate::store::TaskStatus::New {
-                    let db_status = crate::engine::tasks::status_to_task_status(status);
-                    if db_status != crate::store::TaskStatus::New {
+                if existing.status == TaskStatus::New {
+                    let db_status = status_to_task_status(status);
+                    if db_status != TaskStatus::New {
                         if let Err(e) = store.update_status(store_id, db_status).await {
                             tracing::debug!(?e, "ingest: status sync failed");
                         }
@@ -1532,6 +1533,8 @@ pub(crate) async fn ingest_external_tasks(
 mod tests {
     use super::*;
     use crate::backends::{ExternalId, ExternalTask, Mention, Status};
+    use crate::engine::cooldown::set_agent_cooldown;
+    use crate::store::{RunTokenUsage, TaskStore};
     use async_trait::async_trait;
     use std::sync::Arc;
 
@@ -1654,8 +1657,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_upserts_tasks_into_store() {
-        use crate::store::TaskStore;
-
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![
             (Status::New, make_ext_task("1", "First issue")),
             (Status::InProgress, make_ext_task("2", "Second issue")),
@@ -1676,7 +1677,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(task1.title, "First issue");
-        assert_eq!(task1.status, crate::store::TaskStatus::New);
+        assert_eq!(task1.status, TaskStatus::New);
 
         let task2 = store
             .get_by_external_id("owner/repo", "2")
@@ -1689,8 +1690,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_updates_existing_tasks() {
-        use crate::store::TaskStore;
-
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![(
             Status::Routed,
             make_ext_task("42", "Updated title"),
@@ -1765,8 +1764,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_handles_empty_backend() {
-        use crate::store::TaskStore;
-
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
@@ -1780,8 +1777,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_syncs_status_correctly_across_statuses() {
-        use crate::store::TaskStore;
-
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![
             (Status::New, make_ext_task("1", "New")),
             (Status::Routed, make_ext_task("2", "Routed")),
@@ -1807,8 +1802,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_does_not_overwrite_store_authoritative_status() {
-        use crate::store::TaskStore;
-
         // Backend reports task as New (GitHub labels haven't caught up yet)
         let backend: Arc<dyn ExternalBackend> =
             IngestMockBackend::with_tasks(vec![(Status::New, make_ext_task("99", "My task"))]);
@@ -1885,7 +1878,7 @@ mod tests {
 
     #[tokio::test]
     async fn kv_get_prefer_store_reads_from_store() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         store.kv_set("k1", "store_val").await.unwrap();
 
@@ -1896,14 +1889,14 @@ mod tests {
 
     #[tokio::test]
     async fn kv_get_prefer_store_returns_none_without_store() {
-        let opt: Option<&Arc<crate::store::TaskStore>> = None;
+        let opt: Option<&Arc<TaskStore>> = None;
         let val = kv_get_prefer_store(&opt, "k2").await;
         assert_eq!(val, None);
     }
 
     #[tokio::test]
     async fn kv_set_prefer_store_writes_to_store() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         let opt = Some(&store);
         kv_set_prefer_store(&opt, "k3", "val3").await;
@@ -1913,7 +1906,7 @@ mod tests {
 
     #[tokio::test]
     async fn kv_set_prefer_store_noop_without_store() {
-        let opt: Option<&Arc<crate::store::TaskStore>> = None;
+        let opt: Option<&Arc<TaskStore>> = None;
         // Should not panic
         kv_set_prefer_store(&opt, "k4", "val4").await;
     }
@@ -2079,7 +2072,7 @@ mod tests {
     /// regardless of review_session_expected — the review agent is dead.
     #[tokio::test]
     async fn stale_in_review_recovery_resets_orphaned_task_without_session() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend.clone(),
@@ -2142,7 +2135,7 @@ mod tests {
     /// agent may still be starting up.
     #[tokio::test]
     async fn stale_in_review_recovery_skips_fresh_tasks() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend.clone(),
@@ -2198,7 +2191,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_unblock_routes_recoverable_failure() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
@@ -2256,7 +2249,7 @@ mod tests {
                 parsed: "",
                 outcome: "rate_limit",
                 error: "rate limit exceeded",
-                tokens: crate::store::RunTokenUsage::default(),
+                tokens: RunTokenUsage::default(),
             })
             .await
             .unwrap();
@@ -2266,7 +2259,7 @@ mod tests {
             .unwrap();
 
         let task = store.get(id).await.unwrap();
-        assert_eq!(task.status, crate::store::TaskStatus::New);
+        assert_eq!(task.status, TaskStatus::New);
         assert!(task.agent.is_none());
         assert!(task.model.is_none());
         assert_eq!(task.auto_unblock_count, 1);
@@ -2276,7 +2269,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_unblock_skips_manual_block() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
@@ -2328,7 +2321,7 @@ mod tests {
                 parsed: "",
                 outcome: "rate_limit",
                 error: "rate limit exceeded",
-                tokens: crate::store::RunTokenUsage::default(),
+                tokens: RunTokenUsage::default(),
             })
             .await
             .unwrap();
@@ -2441,7 +2434,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_unblock_routes_task_blocked_by_model_unavailable() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
@@ -2489,7 +2482,7 @@ mod tests {
                 parsed: "",
                 outcome: "error",
                 error: "model unavailable (anthropic/claude-sonnet-4-6): Model not found: anthropic/claude-sonnet-4-6",
-                tokens: crate::store::RunTokenUsage::default(),
+                tokens: RunTokenUsage::default(),
             })
             .await
             .unwrap();
@@ -2501,7 +2494,7 @@ mod tests {
         let task = store.get(id).await.unwrap();
         assert_eq!(
             task.status,
-            crate::store::TaskStatus::New,
+            TaskStatus::New,
             "task blocked by model unavailable must be auto-unblocked and re-routed"
         );
         assert_eq!(task.auto_unblock_count, 1);
@@ -2515,7 +2508,7 @@ mod tests {
         // Regression test for #1227: when a task is blocked for a different failure
         // reason than the last auto-unblock, the counter should reset to 0 (immediate
         // retry) instead of accumulating across unrelated failures.
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
@@ -2578,7 +2571,7 @@ mod tests {
                 parsed: "",
                 outcome: "error",
                 error: "exceeded max attempts",
-                tokens: crate::store::RunTokenUsage::default(),
+                tokens: RunTokenUsage::default(),
             })
             .await
             .unwrap();
@@ -2590,7 +2583,7 @@ mod tests {
         let task = store.get(id).await.unwrap();
         assert_eq!(
             task.status,
-            crate::store::TaskStatus::New,
+            TaskStatus::New,
             "task must be auto-unblocked even with count=1 from a different reason"
         );
         // Count is reset to 0, then incremented to 1 for the new reason
@@ -2605,7 +2598,7 @@ mod tests {
     async fn auto_unblock_stores_reason_on_first_unblock() {
         // When a task is auto-unblocked for the first time, the failure reason
         // should be stored so subsequent blocks can be compared.
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
         let task_manager = Arc::new(TaskManager::with_store(
             backend,
@@ -2653,7 +2646,7 @@ mod tests {
                 parsed: "",
                 outcome: "timeout",
                 error: "task timed out",
-                tokens: crate::store::RunTokenUsage::default(),
+                tokens: RunTokenUsage::default(),
             })
             .await
             .unwrap();
@@ -2663,7 +2656,7 @@ mod tests {
             .unwrap();
 
         let task = store.get(id).await.unwrap();
-        assert_eq!(task.status, crate::store::TaskStatus::New);
+        assert_eq!(task.status, TaskStatus::New);
         assert_eq!(task.auto_unblock_count, 1);
         assert_eq!(
             task.auto_unblock_last_reason, "Timeout",
@@ -2719,7 +2712,7 @@ mod tests {
     async fn emit_degraded_agents_writes_metric_when_three_or_more_agents_degraded() {
         use crate::engine::router::{Router, RouterConfig};
 
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         // Create a router and set deterministic available agents
         let mut router = Router::new(RouterConfig::default());
@@ -2731,9 +2724,9 @@ mod tests {
         ];
 
         // Place three agents into cooldown (in-memory only)
-        crate::engine::cooldown::set_agent_cooldown("test-agent-3a", 3600);
-        crate::engine::cooldown::set_agent_cooldown("test-agent-3b", 3600);
-        crate::engine::cooldown::set_agent_cooldown("test-agent-3c", 3600);
+        set_agent_cooldown("test-agent-3a", 3600);
+        set_agent_cooldown("test-agent-3b", 3600);
+        set_agent_cooldown("test-agent-3c", 3600);
 
         // Call the helper and assert KV metrics written
         emit_degraded_agents_if_needed(&router, Some(&store)).await;
@@ -2757,14 +2750,14 @@ mod tests {
     async fn emit_degraded_agents_clears_alert_when_below_threshold() {
         use crate::engine::router::{Router, RouterConfig};
 
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         let mut router = Router::new(RouterConfig::default());
         router.available_agents = vec!["test-agent-2a".to_string(), "test-agent-2b".to_string()];
 
         // Place only two agents into cooldown — below the threshold of 3
-        crate::engine::cooldown::set_agent_cooldown("test-agent-2a", 3600);
-        crate::engine::cooldown::set_agent_cooldown("test-agent-2b", 3600);
+        set_agent_cooldown("test-agent-2a", 3600);
+        set_agent_cooldown("test-agent-2b", 3600);
 
         emit_degraded_agents_if_needed(&router, Some(&store)).await;
 
