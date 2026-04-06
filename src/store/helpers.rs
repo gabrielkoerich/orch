@@ -177,7 +177,9 @@ pub async fn store_increment(
     task_id: &str,
     field: &str,
 ) -> anyhow::Result<u64> {
-    let s = store.as_ref().ok_or_else(|| anyhow!("task store unavailable"))?;
+    let s = store
+        .as_ref()
+        .ok_or_else(|| anyhow!("task store unavailable"))?;
     match s.resolve_task_id(repo, task_id).await {
         Ok(Some(store_id)) => match s.increment(store_id, field).await {
             Ok(new_val) => Ok(new_val as u64),

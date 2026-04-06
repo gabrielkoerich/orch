@@ -766,7 +766,14 @@ pub(crate) async fn review_and_merge(
     // increments). Stale output.json files from crashed attempts can no longer be
     // silently reused.
     let review_attempt: u32 = {
-        match store_increment(&Some(Arc::clone(store)), repo, &task.id.0, "review_invocations").await {
+        match store_increment(
+            &Some(Arc::clone(store)),
+            repo,
+            &task.id.0,
+            "review_invocations",
+        )
+        .await
+        {
             Ok(v) => v as u32,
             Err(e) => {
                 tracing::warn!(task_id = task.id.0, err = %e, "failed to increment review_invocations — using fallback attempt=1");

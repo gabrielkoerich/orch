@@ -346,13 +346,19 @@ async fn helper_store_increment_returns_new_value() {
         .unwrap();
 
     let opt_store = Some(store);
-    let v1 = store_increment(&opt_store, "owner/repo", "73", "attempts").await.unwrap();
+    let v1 = store_increment(&opt_store, "owner/repo", "73", "attempts")
+        .await
+        .unwrap();
     assert_eq!(v1, 1);
 
-    let v2 = store_increment(&opt_store, "owner/repo", "73", "attempts").await.unwrap();
+    let v2 = store_increment(&opt_store, "owner/repo", "73", "attempts")
+        .await
+        .unwrap();
     assert_eq!(v2, 2);
 
-    let v3 = store_increment(&opt_store, "owner/repo", "73", "attempts").await.unwrap();
+    let v3 = store_increment(&opt_store, "owner/repo", "73", "attempts")
+        .await
+        .unwrap();
     assert_eq!(v3, 3);
 
     let task = opt_store.as_ref().unwrap().get(id).await.unwrap();
@@ -437,9 +443,15 @@ async fn helper_store_reset_counters_zeroes_counters() {
         .unwrap();
 
     let opt_store = Some(store.clone());
-    store_increment(&opt_store, "owner/repo", "91", "attempts").await.unwrap();
-    store_increment(&opt_store, "owner/repo", "91", "attempts").await.unwrap();
-    store_increment(&opt_store, "owner/repo", "91", "merge_conflict_retries").await.unwrap();
+    store_increment(&opt_store, "owner/repo", "91", "attempts")
+        .await
+        .unwrap();
+    store_increment(&opt_store, "owner/repo", "91", "attempts")
+        .await
+        .unwrap();
+    store_increment(&opt_store, "owner/repo", "91", "merge_conflict_retries")
+        .await
+        .unwrap();
 
     let task = store.get(id).await.unwrap();
     assert_eq!(task.attempts, 2);
@@ -473,10 +485,18 @@ async fn helper_store_reset_failure_counters_preserves_review_cycles() {
         .unwrap();
 
     let opt_store = Some(store.clone());
-    store_increment(&opt_store, "owner/repo", "93", "review_cycles").await.unwrap();
-    store_increment(&opt_store, "owner/repo", "93", "review_invocations").await.unwrap();
-    store_increment(&opt_store, "owner/repo", "93", "attempts").await.unwrap();
-    store_increment(&opt_store, "owner/repo", "93", "merge_conflict_retries").await.unwrap();
+    store_increment(&opt_store, "owner/repo", "93", "review_cycles")
+        .await
+        .unwrap();
+    store_increment(&opt_store, "owner/repo", "93", "review_invocations")
+        .await
+        .unwrap();
+    store_increment(&opt_store, "owner/repo", "93", "attempts")
+        .await
+        .unwrap();
+    store_increment(&opt_store, "owner/repo", "93", "merge_conflict_retries")
+        .await
+        .unwrap();
 
     store_reset_failure_counters(&opt_store, "owner/repo", "93").await;
 

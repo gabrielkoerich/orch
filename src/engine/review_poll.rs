@@ -262,7 +262,14 @@ pub(crate) async fn review_open_prs(
                     continue;
                 }
 
-                let reroutes = match store_increment(&Some(Arc::clone(store)), repo, task_id, "no_code_reroutes").await {
+                let reroutes = match store_increment(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    task_id,
+                    "no_code_reroutes",
+                )
+                .await
+                {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(task_id, err = %e, "failed to increment no_code_reroutes — skipping reroute/block decision this tick");
@@ -490,7 +497,14 @@ pub(crate) async fn review_open_prs(
                         retries,
                         "PR approved but has merge conflicts — re-triggering review agent to rebase"
                     );
-                    if let Err(e) = store_increment(&Some(Arc::clone(store)), repo, task_id, "merge_conflict_retries").await {
+                    if let Err(e) = store_increment(
+                        &Some(Arc::clone(store)),
+                        repo,
+                        task_id,
+                        "merge_conflict_retries",
+                    )
+                    .await
+                    {
                         tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — retry count may be inaccurate");
                     }
                     if let Err(e) = task_manager
@@ -604,7 +618,14 @@ pub(crate) async fn review_open_prs(
                         continue;
                     }
                     tracing::info!(task_id, pr_number, retries, "PR approved but has merge conflicts — re-triggering review agent to rebase (auto_close disabled)");
-                    if let Err(e) = store_increment(&Some(Arc::clone(store)), repo, task_id, "merge_conflict_retries").await {
+                    if let Err(e) = store_increment(
+                        &Some(Arc::clone(store)),
+                        repo,
+                        task_id,
+                        "merge_conflict_retries",
+                    )
+                    .await
+                    {
                         tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — retry count may be inaccurate");
                     }
                     if let Err(e) = task_manager
