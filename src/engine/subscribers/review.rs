@@ -499,7 +499,10 @@ async fn classify_review_failure(
 
     // Merge conflicts are infrastructure failures, not review agent failures.
     // The merge_conflict_retries counter handles these separately.
-    if lower_reason.contains("merge conflict") || lower_reason.contains("not mergeable") || lower_reason.contains("merge failed") {
+    if lower_reason.contains("merge conflict")
+        || lower_reason.contains("not mergeable")
+        || lower_reason.contains("merge failed")
+    {
         tracing::warn!(
             task_id,
             reason,
