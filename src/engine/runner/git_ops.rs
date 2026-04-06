@@ -1265,12 +1265,13 @@ mod tests {
         }
 
         // When no token is available the fallback must include the SSH insteadOf rule.
+        // The SSH→HTTPS conversion sets the target URL (the rewrite destination) to git@github.com:.
         let has_ssh_rule = env
             .iter()
-            .any(|(k, v)| k == "GIT_CONFIG_KEY_0" && v.contains("insteadOf=git@github.com:"));
+            .any(|(k, v)| k == "GIT_CONFIG_VALUE_0" && v == "git@github.com:");
         assert!(
             has_ssh_rule,
-            "expected SSH insteadOf fallback, got: {env:?}"
+            "expected SSH insteadOf fallback (value is git@github.com:), got: {env:?}"
         );
     }
 
@@ -1288,12 +1289,12 @@ mod tests {
             None => std::env::remove_var("GH_TOKEN"),
         }
 
-        // Must contain the token in the replacement URL (check GIT_CONFIG_KEY values)
+        // Must contain the token in the auth URL (the token is in the value of GIT_CONFIG_KEY_N).
         let has_token = env
             .iter()
             .any(|(_, v)| v.contains("x-access-token:ghp_testtoken1234@github.com"));
         assert!(has_token, "expected token in auth URL, got: {env:?}");
-        // Must cover HTTPS origins
+        // Must cover HTTPS origins (GIT_CONFIG_VALUE_0 is the HTTPS source URL).
         let has_https_rule = env
             .iter()
             .any(|(k, v)| k == "GIT_CONFIG_VALUE_0" && v == "https://github.com/");
@@ -1301,7 +1302,7 @@ mod tests {
             has_https_rule,
             "expected HTTPS insteadOf rule, got: {env:?}"
         );
-        // Must cover SSH origins
+        // Must cover SSH origins (GIT_CONFIG_VALUE_1 is the SSH source URL).
         let has_ssh_rule = env
             .iter()
             .any(|(k, v)| k == "GIT_CONFIG_VALUE_1" && v == "git@github.com:");
