@@ -1106,7 +1106,12 @@ pub(crate) async fn tick_dispatch_tasks(
                         WeightSignal::Success { .. } => "done",
                         WeightSignal::RateLimited { .. } => "new",
                         WeightSignal::Blocked => "blocked",
-                        WeightSignal::None => "needs_review",
+                        // None means the runner guard skipped the task or the task
+                        // completed with an unrecognised status string. Only route to
+                        // needs_review when the review agent is actually enabled;
+                        // otherwise mark done so the task is not permanently stuck.
+                        WeightSignal::None if enable_review => "needs_review",
+                        WeightSignal::None => "done",
                     };
 
                     // Send weight signal back to the router
@@ -1116,12 +1121,8 @@ pub(crate) async fn tick_dispatch_tasks(
                     // Status updates go through task_manager so internal tasks
                     // hit SQLite while external tasks hit GitHub labels.
                     if display_status == "needs_review" {
-                        let enable_review = config::get("workflow.enable_review_agent")
-                            .map(|v| v != "false")
-                            .unwrap_or(true);
-                        tracing::info!(task_id, enable_review, "review gate check");
-                        // Transition to NeedsReview — emits event so notify subscriber fires
-                        // with the correct duration before the review agent starts.
+                        // Transition to NeedsReview — emits event so the review subscriber
+                        // fires with the correct duration before the review agent starts.
                         if let Err(e) = task_manager_for_spawn
                             .update_task_status_with_duration(
                                 &ExternalId(task_id.clone()),
@@ -1131,12 +1132,8 @@ pub(crate) async fn tick_dispatch_tasks(
                             .await
                         {
                             tracing::error!(task_id, err = %e, "update_task_status(NeedsReview) failed — task may be stuck");
-                        } else if enable_review {
-                            // The review agent is spawned by the event-driven subscriber.
-                            // This path only emits the NeedsReview event and leaves the
-                            // in_review transition to that single entry point.
-                            tracing::debug!(task_id, "review dispatch will be handled by subscriber");
                         }
+                        // Review agent dispatch is handled by the event-driven subscriber.
                     } else {
                         // done, blocked, or new (rate-limited): update status directly.
                         let final_status = match display_status {
