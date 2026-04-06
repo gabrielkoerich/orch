@@ -64,6 +64,43 @@ pub struct AgentProfile {
     pub constraints: Vec<String>,
 }
 
+impl AgentProfile {
+    /// Build the default "general" profile from router config.
+    pub fn default_from_config(config: &RouterConfig) -> Self {
+        Self {
+            role: "general".to_string(),
+            skills: vec![],
+            tools: config.allowed_tools.clone(),
+            constraints: vec![],
+        }
+    }
+}
+
+impl RouteResult {
+    /// Build a standard route result from the three task-specific values.
+    ///
+    /// Fills `profile`, `selected_skills`, and `warning` with router-config
+    /// defaults so call sites only need to supply what varies per task.
+    pub fn from_config(
+        agent: String,
+        complexity: String,
+        reason: String,
+        config: &RouterConfig,
+        task_id: &str,
+    ) -> Self {
+        let model = config.model_for_complexity(&agent, &complexity, task_id);
+        Self {
+            agent,
+            model,
+            complexity,
+            reason,
+            profile: AgentProfile::default_from_config(config),
+            selected_skills: config.default_skills.clone(),
+            warning: None,
+        }
+    }
+}
+
 /// The agent router.
 pub struct Router {
     /// Router configuration
@@ -519,28 +556,23 @@ impl Router {
                     // routing logic so the LLM or round-robin can pick an
                     // appropriate agent/model.
                     if model.is_some() {
-                        let profile = AgentProfile {
-                            role: format!("{} specialist", agent),
-                            skills: vec![],
-                            tools: self.config.allowed_tools.clone(),
-                            constraints: vec![],
-                        };
-
                         tracing::debug!(
                             task_id = %task.id.0,
                             agent = %agent,
                             complexity = %complexity,
                             "routed via label"
                         );
-                        let result = RouteResult {
-                            agent: agent.clone(),
-                            model: model.clone(),
-                            complexity: complexity.clone(),
-                            reason: format!("label agent:{agent}"),
-                            profile,
-                            selected_skills: self.config.default_skills.clone(),
-                            warning: None,
-                        };
+                        let mut result = RouteResult::from_config(
+                            agent.clone(),
+                            complexity.clone(),
+                            format!("label agent:{agent}"),
+                            &self.config,
+                            &task.id.0,
+                        );
+                        // Label routing uses agent-specific role and the
+                        // resolved model (may differ from from_config's default).
+                        result.profile.role = format!("{} specialist", agent);
+                        result.model = model.clone();
                         self.log_route_activity(store, repo, &task.id.0, &result, None)
                             .await;
                         return Ok(result);
