@@ -692,9 +692,9 @@ pub(crate) async fn delete_branches(task_id: &str, br: &str, repo_root: &std::pa
     }
 
     // Delete remote branch
-    let auth_args = crate::engine::runner::git_ops::build_git_auth_args();
+    let auth_env = crate::engine::runner::git_ops::build_git_auth_env();
     let remote_delete = Command::new("git")
-        .args(&auth_args)
+        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .args([
             "-C",
             repo_root_str.as_ref(),
