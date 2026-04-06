@@ -675,7 +675,8 @@ pub(crate) async fn auto_merge_pr(
                                     )
                                     .await
                                     {
-                                        tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — retry count may be inaccurate");
+                                        tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
+                                        return Ok(());
                                     }
                                     // Enable auto-merge — GitHub merges once CI passes.
                                     // If auto-merge isn't available, keep task in InReview
@@ -757,7 +758,8 @@ pub(crate) async fn auto_merge_pr(
                         )
                         .await
                         {
-                            tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — retry count may be inaccurate");
+                            tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
+                            return Ok(());
                         }
                         store_set(
                             &Some(Arc::clone(store)),

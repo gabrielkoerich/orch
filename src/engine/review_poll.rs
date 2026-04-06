@@ -505,7 +505,8 @@ pub(crate) async fn review_open_prs(
                     )
                     .await
                     {
-                        tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — retry count may be inaccurate");
+                        tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
+                        continue;
                     }
                     if let Err(e) = task_manager
                         .update_task_status(&task.id, Status::NeedsReview)
@@ -626,7 +627,8 @@ pub(crate) async fn review_open_prs(
                     )
                     .await
                     {
-                        tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — retry count may be inaccurate");
+                        tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
+                        continue;
                     }
                     if let Err(e) = task_manager
                         .update_task_status(&task.id, Status::NeedsReview)
