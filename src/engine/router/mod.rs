@@ -653,21 +653,53 @@ impl Router {
                             &task.id.0,
                         );
 
-                        tracing::warn!(
-                            task_id = %task.id.0,
-                            agent = %result.agent,
-                            fallback = %fallback_agent,
-                            complexity = %result.complexity,
-                            "LLM selected cooled agent/model; rerouting to available agent"
-                        );
+                        // If the fallback model is None and the fallback agent is the
+                        // same as the LLM-selected agent, it means all models for the
+                        // only available agent are cooled. In that case, wait for
+                        // cooldowns instead of returning a RouteResult with
+                        // model: None which would be dispatched incorrectly.
+                        if fallback_model.is_none() && fallback_agent == result.agent {
+                            tracing::warn!(
+                                task_id = %task.id.0,
+                                agent = %result.agent,
+                                complexity = %result.complexity,
+                                "LLM-selected model(s) are cooled for the only available agent; waiting for cooldown"
+                            );
+                            self.wait_for_cooldown(Some(&result.complexity)).await?;
+                            continue;
+                        }
+
+                        // Distinguish logging and reasons when we actually switch
+                        // agents vs when we keep the same agent but pick a
+                        // different (non-cooled) model.
+                        if fallback_agent == result.agent {
+                            tracing::warn!(
+                                task_id = %task.id.0,
+                                agent = %result.agent,
+                                complexity = %result.complexity,
+                                "LLM-selected model was cooled; selecting an alternative model for the same agent"
+                            );
+                        } else {
+                            tracing::warn!(
+                                task_id = %task.id.0,
+                                agent = %result.agent,
+                                fallback = %fallback_agent,
+                                complexity = %result.complexity,
+                                "LLM selected cooled agent/model; rerouting to available agent"
+                            );
+                        }
 
                         // Reset attempts on success
                         self.set_route_attempts(&task.id.0, 0, store, repo).await;
 
-                        let reason = format!(
-                            "LLM selected cooled agent/model; rerouted to {}",
-                            fallback_agent
-                        );
+                        let reason = if fallback_agent == result.agent {
+                            format!(
+                                "LLM selected cooled model; using same agent {} with different model",
+                                fallback_agent
+                            )
+                        } else {
+                            format!("LLM selected cooled agent/model; rerouted to {}", fallback_agent)
+                        };
 
                         let result = RouteResult {
                             agent: fallback_agent.clone(),
@@ -676,10 +708,13 @@ impl Router {
                             reason: reason.clone(),
                             profile: result.profile.clone(),
                             selected_skills: result.selected_skills.clone(),
-                            warning: Some(
+                            warning: Some(if fallback_agent == result.agent {
+                                "LLM-selected model was cooled; selected alternative model for same agent"
+                                    .to_string()
+                            } else {
                                 "LLM-selected agent/model was cooled; rerouted to available agent"
-                                    .to_string(),
-                            ),
+                                    .to_string()
+                            }),
                         };
                         self.log_route_activity(store, repo, &task.id.0, &result, None)
                             .await;
