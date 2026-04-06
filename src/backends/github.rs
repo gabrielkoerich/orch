@@ -25,9 +25,7 @@ fn is_trusted_author(issue: &crate::github::types::GitHubIssue) -> bool {
         .unwrap_or(false) // missing field = untrusted
 }
 
-// Check if a comment's author is trusted. The
-// GitHub REST comment payload includes an `author_association` field, so
-// prefer that when present. Missing association is treated as untrusted.
+/// Check if a mention/comment author is trusted (used for @mention detection).
 fn is_trusted_comment_author(c: &crate::github::types::GitHubComment) -> bool {
     c.author_association
         .as_deref()
@@ -490,45 +488,19 @@ impl ExternalBackend for GitHubBackend {
             id.0.parse()
                 .map_err(|_| anyhow::anyhow!("invalid issue number: {}", id.0))?;
         let comments = self.gh.get_issue_comments(&self.repo, issue_number).await?;
-        // Filter comments to only include those from trusted associations.
-        let mut out = Vec::new();
-        for c in comments.into_iter() {
-            // Prefer the comment's own association when present.
-            if is_trusted_comment_author(&c) {
-                out.push(Mention {
-                    id: c.id.to_string(),
-                    body: c.body,
-                    author: c.user.login,
-                    created_at: c.created_at,
-                    issue_url: c.issue_url,
-                });
-                continue;
-            }
-
-            // Fall back to parent issue association when necessary.
-            if let Ok(issue) = self.gh.get_issue(&self.repo, &id.0).await {
-                if is_trusted_author(&issue) {
-                    out.push(Mention {
-                        id: c.id.to_string(),
-                        body: c.body,
-                        author: c.user.login,
-                        created_at: c.created_at,
-                        issue_url: c.issue_url,
-                    });
-                    continue;
-                } else {
-                    tracing::debug!(comment_id = c.id, author = %c.user.login, "ignoring issue comment from untrusted author");
-                    continue;
-                }
-            } else {
-                // If we cannot fetch the issue, skip the comment conservatively
-                tracing::debug!(
-                    comment_id = c.id,
-                    "failed to fetch parent issue, skipping comment"
-                );
-                continue;
-            }
-        }
+        // Include all comments — bot filtering is applied by the caller.
+        // The issue itself is already trusted (passed the ingest filter), so its
+        // comments provide context regardless of who posted them.
+        let out = comments
+            .into_iter()
+            .map(|c| Mention {
+                id: c.id.to_string(),
+                body: c.body,
+                author: c.user.login,
+                created_at: c.created_at,
+                issue_url: c.issue_url,
+            })
+            .collect();
 
         Ok(out)
     }
@@ -636,41 +608,5 @@ mod tests {
             author_association: Some("MEMBER".to_string()),
         };
         assert!(!is_trusted_author(&issue));
-    }
-
-    #[test]
-    fn is_trusted_comment_author_direct() {
-        use crate::github::types::GitHubComment;
-        let c = GitHubComment {
-            id: 1,
-            body: "hi".to_string(),
-            user: crate::github::types::GitHubUser {
-                login: "u".to_string(),
-            },
-            created_at: "".to_string(),
-            updated_at: None,
-            html_url: None,
-            issue_url: None,
-            author_association: Some("OWNER".to_string()),
-        };
-        assert!(is_trusted_comment_author(&c));
-    }
-
-    #[test]
-    fn is_not_trusted_comment_author_direct() {
-        use crate::github::types::GitHubComment;
-        let c = GitHubComment {
-            id: 1,
-            body: "hi".to_string(),
-            user: crate::github::types::GitHubUser {
-                login: "u".to_string(),
-            },
-            created_at: "".to_string(),
-            updated_at: None,
-            html_url: None,
-            issue_url: None,
-            author_association: Some("MEMBER".to_string()),
-        };
-        assert!(!is_trusted_comment_author(&c));
     }
 }

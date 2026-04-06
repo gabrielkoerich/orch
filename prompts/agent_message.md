@@ -13,7 +13,7 @@
 {{/if}}
 
 {{#if ISSUE_COMMENTS}}
-## Recent Comments
+## Issue Comments
 
 {{ISSUE_COMMENTS}}
 {{/if}}
