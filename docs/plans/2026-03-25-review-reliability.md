@@ -90,6 +90,17 @@ let review_attempt_dir = task_attempt_dir(repo, &review_task_id, review_attempts
 
 In `src/engine/subscribers/review.rs`, move `set_review_session_expected(true)` to BEFORE `spawn_in_tmux`, not after.
 
+## Implementation Status
+
+| Task | Description | Status | Reference |
+|------|-------------|--------|-----------|
+| 1 | Read SQLite for startup InReview reset | ✅ Done | `src/engine/mod.rs:1200` |
+| 2 | Per-agent review response extraction | ❌ Blocked | Issue #2032 |
+| 3 | Fix attempt numbering for reviews | ✅ Done | `src/engine/review.rs:768` |
+| 4 | Set review_session_expected before spawn | ✅ Done | `src/engine/review.rs:172` |
+| 5 | Integration test for full review cycle | ❌ Not done | - |
+| 6 | Startup worktree reconciliation | ✅ Done | - |
+
 ### Task 5: Integration test for full review cycle
 
 Extend `tests/integration_review.rs`:
