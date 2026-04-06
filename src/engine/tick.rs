@@ -76,7 +76,9 @@ async fn startup_cleanup(tmux: &TmuxManager) {
 }
 
 use super::EngineConfig;
-use crate::store::{review_session_expected, set_review_session_expected, store_set_by_id};
+use crate::store::{
+    review_session_expected, set_review_session_expected, store_set_by_id, store_touch_updated_at,
+};
 
 /// Phase 1 of tick: poll tmux for finished sessions and clean them up.
 pub(crate) async fn tick_check_session_completions(
@@ -106,8 +108,23 @@ pub(crate) async fn tick_check_session_completions(
             // reclaim this task while the runner is still finishing
             // post-processing (race: session observed dead → tick reclaim).
             // Best-effort: no-ops if the task isn't present in the store.
-            crate::store::store_touch_updated_at(&Some(Arc::clone(store)), repo, &session.task_id)
-                .await;
+            //
+            // session.task_id uses hyphens (e.g. "internal-63714") because the
+            // tmux session name sanitizes colons to hyphens. resolve_task_id only
+            // handles "internal:" prefix, so we must convert back before touching.
+            // Review sessions carry a "-review" suffix tracked under the main task.
+            let store_task_id = {
+                let base = session
+                    .task_id
+                    .strip_suffix("-review")
+                    .unwrap_or(&session.task_id);
+                if let Some(n) = base.strip_prefix("internal-") {
+                    format!("internal:{n}")
+                } else {
+                    base.to_string()
+                }
+            };
+            store_touch_updated_at(&Some(Arc::clone(store)), repo, &store_task_id).await;
             // Unregister from capture service using the task id the capture service
             // was registered under (task id without project prefix).
             capture.unregister_session(repo, &session.task_id).await;
@@ -1911,6 +1928,71 @@ mod tests {
             ),
             "internal task should be routed to fallback or needs_review, got {:?}",
             task.status
+        );
+    }
+
+    /// Regression test for the race between Phase 1 (tick_check_session_completions)
+    /// and Phase 2 (tick_recover_stuck_tasks).
+    ///
+    /// Before the fix, Phase 1 killed the tmux session without touching updated_at.
+    /// Phase 2 could then see status=in_progress, has_session=false, and an old
+    /// updated_at, and would reset the task to New — even though the runner's
+    /// wait_for_completion() poll had not yet returned.
+    ///
+    /// The fix: Phase 1 touches updated_at as soon as it detects the session is done.
+    /// This test verifies that after the touch, Phase 2 does NOT reclaim the task.
+    #[tokio::test]
+    async fn phase1_session_completion_touch_prevents_phase2_reclaim() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let mock = MockBackend::new();
+        let backend: Arc<dyn ExternalBackend> = Arc::new(mock);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let config = EngineConfig {
+            no_session_stuck_timeout: 600,
+            stuck_timeout: 1800,
+            ..EngineConfig::default()
+        };
+
+        // Create an in-progress internal task with old updated_at.
+        // Without the fix this task would be reclaimed by Phase 2 (age >> threshold,
+        // no session running in the test environment).
+        let id = store
+            .create_internal("owner/repo", "Completed task", "", "cron", "1")
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::InProgress)
+            .await
+            .unwrap();
+        set_task_updated_at_past(&store, id).await;
+
+        // Simulate Phase 1: touch updated_at when the session is detected as done.
+        // In production this happens inside tick_check_session_completions.
+        let task_id = format!("internal:{id}");
+        store_touch_updated_at(&Some(Arc::clone(&store)), "owner/repo", &task_id).await;
+
+        // Phase 2 runs — updated_at is fresh so the task must NOT be reclaimed.
+        tick_recover_stuck_tasks(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &task_manager,
+            &config,
+            &store,
+        )
+        .await
+        .unwrap();
+
+        let task = store.get(id).await.unwrap();
+        assert_eq!(
+            task.status,
+            crate::store::TaskStatus::InProgress,
+            "Phase 2 must not reclaim a task whose updated_at was just touched by Phase 1"
         );
     }
 
