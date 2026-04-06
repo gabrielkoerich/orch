@@ -345,8 +345,10 @@ pub(crate) async fn auto_merge_pr(
 
     // Fetch PR and required contexts once (outside the polling loop).
     let pr = gh.get_pr(repo, pr_number).await?;
-    if pr.mergeable == Some(false) {
-        anyhow::bail!("PR is not mergeable (merge conflicts present)");
+    match pr.mergeable {
+        Some(false) => anyhow::bail!("PR is not mergeable (merge conflicts present)"),
+        None => anyhow::bail!("PR mergeability not yet computed — retry"),
+        Some(true) => {} // proceed
     }
     let head_sha = pr.head.sha.clone();
     let base_branch = pr.base.ref_.clone();
