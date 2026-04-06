@@ -1732,6 +1732,11 @@ mod tests {
             updated.review_cycles, 1,
             "review_cycles must be incremented on each review change request"
         );
+
+        assert_eq!(
+            updated.review_agent_failures, 0,
+            "review_agent_failures must be reset to 0 when re-routing after review changes"
+        );
     }
 
     /// Regression: handle_review_changes must resolve a valid model via
@@ -1938,6 +1943,11 @@ mod tests {
                 "status must be New when model_for_complexity returns None (all cooled)"
             );
         }
+
+        assert_eq!(
+            updated.review_agent_failures, 0,
+            "review_agent_failures must be reset to 0 when re-routing after review changes"
+        );
     }
 
     /// Regression: a transient `update_task_status` failure must NOT
