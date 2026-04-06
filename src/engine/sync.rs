@@ -320,22 +320,13 @@ async fn auto_unblock_blocked_tasks(
         // Determine the most recent failure category as the "reason key" for this unblock.
         let reason_key = failures.first().map(|f| f.as_str()).unwrap_or("");
 
-        // Reset counter when the failure reason changes — exponential backoff should
-        // only accumulate for repeated identical failures, not different ones.
-        // This check must run BEFORE the cooldown check so new reasons bypass old cooldown.
+        // Detect reason changes to reset exponential backoff.
+        // New reasons bypass old cooldown windows and start fresh attempt counters.
         let current_reason = task.auto_unblock_last_reason.clone();
         let reason_changed = reason_key != current_reason;
-        if reason_changed {
-            if let Err(e) = store
-                .set_fields(task.id, &[("auto_unblock_count", serde_json::json!(0))])
-                .await
-            {
-                tracing::warn!(task_id = task.id, err = %e, "failed to reset auto_unblock counter for new reason — skipping");
-                continue;
-            }
-        }
 
-        // Check cooldown after reason-change detection (so new reasons bypass old cooldown).
+        // Compute effective counter: when the reason changes, start from 0;
+        // otherwise use the accumulated count for exponential backoff.
         let cooldown_count = if reason_changed {
             0
         } else {
@@ -353,17 +344,15 @@ async fn auto_unblock_blocked_tasks(
             continue;
         }
 
-        // Compute the new counter value: when reason changed, count was reset to 0 above,
+        // Compute the new counter value: when reason changed, cooldown_count is 0,
         // so incrementing gives 1 (first attempt for the new reason). When the reason is the
         // same, advance from current count for exponential backoff.
-        // The increment is included in the same set_fields call below so both the counter
-        // and the status update succeed or fail together — no phantom increments on transient
-        // DB errors.
         let new_count = cooldown_count + 1;
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-        // Combine all field updates — including the counter increment — into a single atomic
-        // set_fields call.
+        // Write all field updates in a single atomic set_fields call, ensuring counter,
+        // timestamp, and reason are updated together. No intermediate states observable
+        // by concurrent ticks.
         let mut fields: Vec<(&str, serde_json::Value)> = vec![
             ("auto_unblock_count", serde_json::json!(new_count)),
             ("auto_unblock_last_at", serde_json::json!(now)),
