@@ -23,7 +23,6 @@ use crate::engine::router::{get_route_result, Router};
 use crate::engine::runner::{TaskRunner, WeightSignal};
 use crate::engine::tasks::{is_internal_id, TaskManager};
 use crate::repo_context::REPO_CONTEXT;
-use crate::store;
 use crate::store::TaskStore;
 use crate::tmux::TmuxManager;
 use dashmap::DashSet;
@@ -77,7 +76,7 @@ async fn startup_cleanup(tmux: &TmuxManager) {
 }
 
 use super::EngineConfig;
-use crate::store::{review_session_expected, set_review_session_expected};
+use crate::store::{review_session_expected, set_review_session_expected, store_set_by_id};
 
 /// Phase 1 of tick: poll tmux for finished sessions and clean them up.
 pub(crate) async fn tick_check_session_completions(
@@ -317,42 +316,42 @@ pub(crate) async fn tick_detect_silent_agents(
             }
         }
 
-        if next_agent.is_some() {
-            store::store_set(
-                &Some(Arc::clone(store)),
-                repo,
-                &task_id,
-                &[
-                    ("agent", serde_json::json!("")),
-                    ("model", serde_json::json!("")),
-                    (
-                        "last_error",
-                        serde_json::json!(format!(
-                            "silence detected after {}s, clearing agent/model for re-route",
-                            config.silence_grace_period
-                        )),
-                    ),
-                ],
-            )
-            .await;
-        } else {
-            store::store_set(
-                &Some(Arc::clone(store)),
-                repo,
-                &task_id,
-                &[
-                    ("agent", serde_json::Value::Null),
-                    ("model", serde_json::Value::Null),
-                    (
-                        "last_error",
-                        serde_json::json!(format!(
-                            "silence detected after {}s, no fallback agents available",
-                            config.silence_grace_period
-                        )),
-                    ),
-                ],
-            )
-            .await;
+        if let Some(store_id) = store_task.as_ref().map(|t| t.id) {
+            if next_agent.is_some() {
+                store_set_by_id(
+                    &Some(Arc::clone(store)),
+                    store_id,
+                    &[
+                        ("agent", serde_json::json!("")),
+                        ("model", serde_json::json!("")),
+                        (
+                            "last_error",
+                            serde_json::json!(format!(
+                                "silence detected after {}s, clearing agent/model for re-route",
+                                config.silence_grace_period
+                            )),
+                        ),
+                    ],
+                )
+                .await;
+            } else {
+                store_set_by_id(
+                    &Some(Arc::clone(store)),
+                    store_id,
+                    &[
+                        ("agent", serde_json::Value::Null),
+                        ("model", serde_json::Value::Null),
+                        (
+                            "last_error",
+                            serde_json::json!(format!(
+                                "silence detected after {}s, no fallback agents available",
+                                config.silence_grace_period
+                            )),
+                        ),
+                    ],
+                )
+                .await;
+            }
         }
 
         if let Err(e) = task_manager
@@ -474,17 +473,18 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 backend.remove_label(&task.id, label).await.ok();
             }
         }
-        store::store_set(
-            &Some(Arc::clone(store)),
-            repo,
-            &task.id.0,
-            &[
-                ("agent", serde_json::Value::Null),
-                ("model", serde_json::Value::Null),
-                ("route_attempts", serde_json::json!(0)),
-            ],
-        )
-        .await;
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task.id.0).await {
+            store_set_by_id(
+                &Some(Arc::clone(store)),
+                store_id,
+                &[
+                    ("agent", serde_json::Value::Null),
+                    ("model", serde_json::Value::Null),
+                    ("route_attempts", serde_json::json!(0)),
+                ],
+            )
+            .await;
+        }
         if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
             tracing::warn!(task_id = task.id.0, ?e, "failed to reset stuck task status");
             continue;
@@ -590,17 +590,18 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
         // Reset routing state so the LLM router is used on the next attempt
         // (same reset that external tasks perform).
-        store::store_set(
-            &Some(Arc::clone(store)),
-            repo,
-            &task_id,
-            &[
-                ("agent", serde_json::Value::Null),
-                ("model", serde_json::Value::Null),
-                ("route_attempts", serde_json::json!(0)),
-            ],
-        )
-        .await;
+        if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task_id).await {
+            store_set_by_id(
+                &Some(Arc::clone(store)),
+                store_id,
+                &[
+                    ("agent", serde_json::Value::Null),
+                    ("model", serde_json::Value::Null),
+                    ("route_attempts", serde_json::json!(0)),
+                ],
+            )
+            .await;
+        }
         if let Err(e) = task_manager
             .update_task_status(&ExternalId(task_id.clone()), Status::New)
             .await
@@ -1605,7 +1606,7 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
-        store::set_review_session_expected(&store, "owner/repo", "99", true).await;
+        set_review_session_expected(&store, "owner/repo", "99", true).await;
         set_task_updated_at_past(&store, id).await;
 
         tick_recover_stuck_tasks(
@@ -1706,7 +1707,7 @@ mod tests {
             .update_status(id, crate::store::TaskStatus::InReview)
             .await
             .unwrap();
-        store::set_review_session_expected(&store, "owner/repo", "internal:1", true).await;
+        set_review_session_expected(&store, "owner/repo", "internal:1", true).await;
         set_task_updated_at_past(&store, id).await;
 
         tick_recover_stuck_tasks(

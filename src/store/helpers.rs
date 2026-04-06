@@ -12,6 +12,24 @@ use std::sync::Arc;
 ///
 /// Returns `None` if the store is unavailable, the task cannot be resolved,
 /// or the task row cannot be loaded.
+pub async fn opt_store_get_task_by_id(
+    store: &Option<Arc<TaskStore>>,
+    store_id: i64,
+) -> Option<Task> {
+    let s = store.as_ref()?;
+    match s.get(store_id).await {
+        Ok(task) => Some(task),
+        Err(e) => {
+            tracing::warn!(store_id, error = %e, "failed to fetch task from store");
+            None
+        }
+    }
+}
+
+/// Load the full `Task` record from the store.
+///
+/// Returns `None` if the store is unavailable, the task cannot be resolved,
+/// or the task row cannot be loaded.
 pub async fn opt_store_get_task(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
@@ -26,11 +44,20 @@ pub async fn opt_store_get_task(
             return None;
         }
     };
-    match s.get(store_id).await {
-        Ok(task) => Some(task),
-        Err(e) => {
-            tracing::warn!(task_id, error = %e, "failed to fetch task from store");
-            None
+    opt_store_get_task_by_id(store, store_id).await
+}
+
+/// Write fields to the task store.
+///
+/// `store` may be None if the store isn't initialized yet.
+pub async fn store_set_by_id(
+    store: &Option<Arc<TaskStore>>,
+    store_id: i64,
+    store_fields: &[(&str, serde_json::Value)],
+) {
+    if let Some(ref store) = store {
+        if let Err(e) = store.set_fields(store_id, store_fields).await {
+            tracing::warn!(store_id, error = %e, "store set_fields failed");
         }
     }
 }
@@ -64,6 +91,23 @@ pub async fn store_set(
 /// Unlike `store_set`, this variant propagates failures so callers can
 /// abort further processing when a critical write (e.g. a watermark) fails.
 /// Returns `Ok(())` when `store` is `None` (store not yet initialized).
+pub async fn store_set_result_by_id(
+    store: &Option<Arc<TaskStore>>,
+    store_id: i64,
+    store_fields: &[(&str, serde_json::Value)],
+) -> anyhow::Result<()> {
+    if let Some(ref store) = store {
+        store.set_fields(store_id, store_fields).await?;
+    }
+    Ok(())
+}
+
+/// Write fields to the task store, returning an error if the write fails.
+///
+/// Unlike `store_set`, this variant propagates failures so callers can
+/// abort further processing when a critical write (e.g. a watermark) fails.
+/// Returns `Ok(())` when `store` is `None` (store not yet initialized).
+#[allow(dead_code)]
 pub async fn store_set_result(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
@@ -78,6 +122,18 @@ pub async fn store_set_result(
         store.set_fields(store_id, store_fields).await?;
     }
     Ok(())
+}
+
+/// Touch `updated_at` to now so the stuck-task timer is reset after a session exits.
+///
+/// No-op when the store is unavailable or the task cannot be resolved.
+#[allow(dead_code)]
+pub async fn store_touch_updated_at_by_id(store: &Option<Arc<TaskStore>>, store_id: i64) {
+    if let Some(ref s) = store {
+        if let Err(e) = s.touch_updated_at(store_id).await {
+            tracing::warn!(store_id, error = %e, "store touch_updated_at failed");
+        }
+    }
 }
 
 /// Touch `updated_at` to now so the stuck-task timer is reset after a session exits.
@@ -171,6 +227,27 @@ pub async fn set_review_session_expected(
 /// store is unavailable, the task cannot be resolved, or the underlying
 /// SQL increment failed. Callers must handle errors explicitly — this
 /// helper no longer silently returns 0 on error.
+pub async fn store_increment_by_id(
+    store: &Option<Arc<TaskStore>>,
+    store_id: i64,
+    field: &str,
+) -> anyhow::Result<u64> {
+    let s = store
+        .as_ref()
+        .ok_or_else(|| anyhow!("task store unavailable"))?;
+    match s.increment(store_id, field).await {
+        Ok(new_val) => Ok(new_val as u64),
+        Err(e) => Err(anyhow!("store.increment failed: {}", e)),
+    }
+}
+
+/// Increment a counter in the task store.
+///
+/// Uses `store.increment()` for an atomic SQL `field + 1`.
+/// Returns `Ok(new_value)` on success or `Err(anyhow::Error)` when the
+/// store is unavailable, the task cannot be resolved, or the underlying
+/// SQL increment failed. Callers must handle errors explicitly — this
+/// helper no longer silently returns 0 on error.
 pub async fn store_increment(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
@@ -181,10 +258,7 @@ pub async fn store_increment(
         .as_ref()
         .ok_or_else(|| anyhow!("task store unavailable"))?;
     match s.resolve_task_id(repo, task_id).await {
-        Ok(Some(store_id)) => match s.increment(store_id, field).await {
-            Ok(new_val) => Ok(new_val as u64),
-            Err(e) => Err(anyhow!("store.increment failed: {}", e)),
-        },
+        Ok(Some(store_id)) => store_increment_by_id(store, store_id, field).await,
         Ok(None) => Err(anyhow!("task not present in store: {}/{}", repo, task_id)),
         Err(e) => {
             tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
