@@ -214,7 +214,7 @@ impl RouterConfig {
     /// The first call at startup (from `Router::new()` via a `spawn_blocking` context)
     /// is the only time that may wait for discovery; all subsequent async calls hit the
     /// in-memory cache or get an immediate background refresh.
-    fn discover_free_opencode_models() -> Vec<String> {
+    pub(crate) fn discover_free_opencode_models() -> Vec<String> {
         let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
 
         let now = chrono::Utc::now().timestamp();
