@@ -254,21 +254,13 @@ async fn ensure_pr_exists(
                     )
                 })?;
                 // Push first in case agent forgot (use token auth like git_ops::push_branch)
-                let auth_args = runner::git_ops::build_git_auth_args();
-                let mut push_args: Vec<String> = auth_args;
-                push_args.extend([
-                    "-C".to_string(),
-                    worktree_str.to_string(),
-                    "push".to_string(),
-                    "-u".to_string(),
-                    "origin".to_string(),
-                    branch_name.to_string(),
-                ]);
+                let auth_env = runner::git_ops::build_git_auth_env();
 
                 // Run a credentialed push and log any errors so failures are
                 // visible in logs instead of being silently discarded.
                 match tokio::process::Command::new("git")
-                    .args(&push_args)
+                    .args(["-C", worktree_str, "push", "-u", "origin", branch_name])
+                    .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                     .output()
                     .await
                 {
