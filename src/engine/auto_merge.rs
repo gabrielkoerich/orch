@@ -1364,10 +1364,16 @@ pub(crate) async fn handle_review_changes(
                 &Some(Arc::clone(store)),
                 repo,
                 &task.id.0,
-                &[(
-                    "review_cycles",
-                    serde_json::json!((review_cycles + 1) as i64),
-                )],
+                &[
+                    (
+                        "review_cycles",
+                        serde_json::json!((review_cycles + 1) as i64),
+                    ),
+                    (
+                        "review_agent_failures",
+                        serde_json::json!(0), // reset failures for the new review round
+                    ),
+                ],
             )
             .await;
 
@@ -1411,10 +1417,16 @@ pub(crate) async fn handle_review_changes(
                 &Some(Arc::clone(store)),
                 repo,
                 &task.id.0,
-                &[(
-                    "review_cycles",
-                    serde_json::json!((review_cycles + 1) as i64),
-                )],
+                &[
+                    (
+                        "review_cycles",
+                        serde_json::json!((review_cycles + 1) as i64),
+                    ),
+                    (
+                        "review_agent_failures",
+                        serde_json::json!(0), // reset failures for the new review round
+                    ),
+                ],
             )
             .await;
 
