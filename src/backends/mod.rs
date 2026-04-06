@@ -217,6 +217,30 @@ pub trait ExternalBackend: Send + Sync {
         self.list_by_status(Status::New).await
     }
 
+    /// List all open tasks with active statuses (everything except Done).
+    ///
+    /// This fetches all open issues in a single API call and partitions them
+    /// by status label locally. More efficient than making 6 separate calls to
+    /// `list_by_status` for each active status.
+    async fn list_all_active_tasks(&self) -> anyhow::Result<Vec<(ExternalTask, Status)>> {
+        let statuses = [
+            Status::New,
+            Status::Routed,
+            Status::InProgress,
+            Status::NeedsReview,
+            Status::InReview,
+            Status::Blocked,
+        ];
+        let mut all_tasks = Vec::new();
+        for status in statuses {
+            let tasks = self.list_by_status(status).await?;
+            for task in tasks {
+                all_tasks.push((task, status));
+            }
+        }
+        Ok(all_tasks)
+    }
+
     /// Post a comment / activity note.
     async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()>;
 
