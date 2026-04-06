@@ -487,6 +487,50 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Conditionally update the status of a task only if it currently has `expected` status.
+    ///
+    /// Returns `true` if the row was updated, `false` if the current status did not match
+    /// `expected` (i.e. a concurrent transition already moved the task elsewhere).
+    pub async fn update_status_if(
+        &self,
+        id: i64,
+        status: TaskStatus,
+        expected: TaskStatus,
+    ) -> anyhow::Result<bool> {
+        let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        let from_status: String = previous.try_get("status").unwrap_or_default();
+        let agent: Option<String> = previous.try_get("agent").unwrap_or(None);
+        let model: Option<String> = previous.try_get("model").unwrap_or(None);
+        let sql = if status == TaskStatus::Blocked {
+            "UPDATE tasks SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? AND status = ?"
+        } else {
+            "UPDATE tasks SET status = ?, block_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? AND status = ?"
+        };
+        let result = sqlx::query(sql)
+            .bind(status.as_str())
+            .bind(id)
+            .bind(expected.as_str())
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        self.append_activity(
+            id,
+            "status_change",
+            Some(from_status.as_str()),
+            Some(status.as_str()),
+            agent.as_deref(),
+            model.as_deref(),
+            None,
+        )
+        .await?;
+        Ok(true)
+    }
+
     /// Touch `updated_at` to now without changing any other field.
     ///
     /// Called by the runner immediately after a tmux session exits so that the

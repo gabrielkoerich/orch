@@ -617,13 +617,22 @@ pub(crate) async fn sync_tick(
                     &[("review_agent_failures", serde_json::json!(0))],
                 )
                 .await;
-                if let Err(e) = task_manager
-                    .update_task_status(&task.id, Status::NeedsReview)
+                match task_manager
+                    .update_task_status_if(&task.id, Status::NeedsReview, Status::InReview)
                     .await
                 {
-                    tracing::error!(task_id = %task.id.0, err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
-                } else {
-                    store::set_review_session_expected(store, repo, &task.id.0, false).await;
+                    Err(e) => {
+                        tracing::error!(task_id = %task.id.0, err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            task_id = %task.id.0,
+                            "stale InReview reset skipped — task already transitioned (concurrent Done/Blocked/InProgress)"
+                        );
+                    }
+                    Ok(true) => {
+                        store::set_review_session_expected(store, repo, &task.id.0, false).await;
+                    }
                 }
             }
         }

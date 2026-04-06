@@ -414,6 +414,68 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Update the status of a task only if it is currently in `expected_status`.
+    ///
+    /// Returns `Ok(true)` if the update was applied, `Ok(false)` if the task had
+    /// already transitioned to a different status (TOCTOU-safe — no-op on race).
+    pub async fn update_task_status_if(
+        &self,
+        id: &ExternalId,
+        status: Status,
+        expected_status: Status,
+    ) -> anyhow::Result<bool> {
+        let task_status = status_to_task_status(status);
+        let expected_task_status = status_to_task_status(expected_status);
+
+        let (pre_snapshot, snapshot_store_id) = self.read_task_snapshot(&id.0).await;
+
+        if is_internal_id(&id.0) {
+            let store = self
+                .store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("store required for internal task status update"))?;
+            let store_id = snapshot_store_id
+                .ok_or_else(|| anyhow::anyhow!("internal task {} not found in store", id.0))?;
+            if task_status != crate::store::TaskStatus::Blocked {
+                store.set_block_reason(store_id, None).await?;
+            }
+            let updated = store
+                .update_status_if(store_id, task_status, expected_task_status)
+                .await?;
+            if updated {
+                self.publish_event(id, status, &pre_snapshot, None);
+            }
+            return Ok(updated);
+        }
+
+        // External tasks: conditional store update, then mirror to backend.
+        if let Some(ref store) = self.store {
+            if let Some(store_id) = snapshot_store_id {
+                if task_status != crate::store::TaskStatus::Blocked {
+                    store.set_block_reason(store_id, None).await?;
+                }
+                let updated = store
+                    .update_status_if(store_id, task_status, expected_task_status)
+                    .await?;
+                if !updated {
+                    return Ok(false);
+                }
+            }
+        }
+
+        if let Err(e) = self.backend.update_status(id, status).await {
+            tracing::warn!(
+                task_id = id.0,
+                ?status,
+                err = %e,
+                "failed to mirror status to backend — store is authoritative"
+            );
+        }
+
+        self.publish_event(id, status, &pre_snapshot, None);
+        Ok(true)
+    }
+
     /// Update the status of a task and include elapsed duration in the event.
     ///
     /// Use this at task completion points (success or failure) so the notify
@@ -1510,5 +1572,91 @@ mod tests {
         let event2 = rx.try_recv().unwrap();
         assert_eq!(event2.old_status, "routed");
         assert_eq!(event2.new_status, "in_progress");
+    }
+
+    // ── update_task_status_if ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_task_status_if_applies_when_status_matches() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
+
+        let store_id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "10",
+                title: "T",
+                body: "",
+                author: "u",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        // Task starts as New; move it to InReview first
+        store
+            .update_status(store_id, crate::store::TaskStatus::InReview)
+            .await
+            .unwrap();
+
+        let id = ExternalId("10".to_string());
+        let updated = tm
+            .update_task_status_if(&id, Status::NeedsReview, Status::InReview)
+            .await
+            .unwrap();
+        assert!(updated, "should update when expected status matches");
+
+        let task = store.get(store_id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
+    }
+
+    #[tokio::test]
+    async fn update_task_status_if_is_noop_when_status_mismatches() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MockBackend::new());
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<crate::engine::events::TaskEvent>(16);
+        let tm = TaskManager::with_events(backend, store.clone(), "owner/repo".to_string(), tx);
+
+        let store_id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "11",
+                title: "T",
+                body: "",
+                author: "u",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        // Simulate a concurrent transition: task already moved to Done
+        store
+            .update_status(store_id, crate::store::TaskStatus::Done)
+            .await
+            .unwrap();
+
+        let id = ExternalId("11".to_string());
+        // Attempt to reset to NeedsReview expecting InReview — should be a no-op
+        let updated = tm
+            .update_task_status_if(&id, Status::NeedsReview, Status::InReview)
+            .await
+            .unwrap();
+        assert!(
+            !updated,
+            "should not update when status has already changed"
+        );
+
+        // Status must remain Done
+        let task = store.get(store_id).await.unwrap();
+        assert_eq!(task.status, crate::store::TaskStatus::Done);
+
+        // No event must be published
+        assert!(
+            rx.try_recv().is_err(),
+            "no event should be published on a no-op update"
+        );
     }
 }
