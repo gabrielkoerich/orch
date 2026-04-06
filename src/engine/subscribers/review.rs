@@ -514,9 +514,21 @@ async fn classify_review_failure(
         return ReviewOutcome::Reset;
     }
 
-    let failures =
-        crate::store::store_increment(&Some(store.clone()), repo, task_id, "review_agent_failures")
-            .await;
+    let failures = match crate::store::store_increment(
+        &Some(store.clone()),
+        repo,
+        task_id,
+        "review_agent_failures",
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(task_id, err = %e, "failed to increment review_agent_failures — skipping failure escalation this tick");
+            // Treat as 0 for now (no escalation)
+            0
+        }
+    };
     let blocking = failures >= MAX_REVIEW_AGENT_FAILURES;
     // Post failure comment to the PR so the history is visible.
     post_review_failure_comment(store, repo, task_id, reason, failures, blocking).await;

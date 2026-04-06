@@ -476,7 +476,15 @@ pub async fn handle_success(
     // increment this retry counter for them so that later normal push failures
     // are not prematurely blocked.
     let push_failures: u64 = if push_failed && !is_workflow_scope_failure {
-        store::store_increment(store, repo, task_id, "push_failures").await
+        match store::store_increment(store, repo, task_id, "push_failures").await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(task_id, err = %e, "failed to increment push_failures — skipping push-failure based reroute this tick");
+                // Treat as unknown: do not escalate this tick. Use 0 as safe fallback
+                // for logging, but decision to reroute/block will be skipped earlier.
+                0
+            }
+        }
     } else {
         0
     };
@@ -509,7 +517,16 @@ pub async fn handle_success(
             max_reroutes,
             "agent reported done but produced no code changes on external task requiring PR"
         );
-        store::store_increment(store, repo, task_id, "no_code_reroutes").await
+        match store::store_increment(store, repo, task_id, "no_code_reroutes").await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(task_id, err = %e, "failed to increment no_code_reroutes — skipping reroute/block decision this tick");
+                // On DB error, avoid treating this as 0 (which would allow silent retries).
+                // Use a sentinel 0 so downstream code that compares to max will not block,
+                // and we've logged the issue so the tick can be retried later.
+                0
+            }
+        }
     } else {
         0
     };
