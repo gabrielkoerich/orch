@@ -246,7 +246,7 @@ pub async fn record_agent_success(agent_name: &str, model: &str) {
 pub async fn record_agent_failure_with_message(agent_name: &str, error_message: &str) {
     // Vendor-specified retry date takes priority over backoff.
     if let Some(cooldown_until) = parse_retry_at(error_message) {
-        set_cooldown(agent_name, cooldown_until, "agent_error");
+        set_cooldown_async(agent_name, cooldown_until, "agent_error").await;
         return;
     }
 
@@ -254,7 +254,7 @@ pub async fn record_agent_failure_with_message(agent_name: &str, error_message: 
     let count = read_and_increment_failure_count(&store_opt, agent_name).await;
     let cooldown_until = chrono::Utc::now().timestamp()
         + compute_backoff(count, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS);
-    set_cooldown(agent_name, cooldown_until, "agent_error");
+    set_cooldown_async(agent_name, cooldown_until, "agent_error").await;
 }
 
 /// Detect credit exhaustion reasons from error message.
@@ -354,7 +354,7 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
     };
     let cooldown_secs = compute_backoff(count, base, max);
     let cooldown_until = chrono::Utc::now().timestamp() + cooldown_secs;
-    set_cooldown(agent_name, cooldown_until, reason_str);
+    set_cooldown_async(agent_name, cooldown_until, reason_str).await;
     tracing::warn!(
         agent = agent_name,
         reason = reason_str,
@@ -373,7 +373,7 @@ pub async fn record_model_failure(agent_name: &str, model: &str) {
     let count = read_and_increment_failure_count(&store_opt, &key).await;
     let cooldown_until = chrono::Utc::now().timestamp()
         + compute_backoff(count, BACKOFF_BASE_SECS, BACKOFF_MAX_SECS);
-    set_cooldown(&key, cooldown_until, "model_error");
+    set_cooldown_async(&key, cooldown_until, "model_error").await;
 }
 
 /// Set a model cooldown with a custom duration (in seconds).
@@ -551,28 +551,69 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
     }
 }
 
+/// Set a cooldown with a specific expiry timestamp. Updates in-memory state only.
+///
+/// Returns `true` if the cooldown was applied, `false` if an existing longer
+/// cooldown prevented the update (never-shorten rule).
+///
+/// **Callers are responsible for persisting to KV.** Use [`set_cooldown_async`]
+/// for critical cooldowns that must survive a crash, or this function combined
+/// with a fire-and-forget `tokio::spawn` for non-critical short cooldowns.
+fn set_cooldown_in_memory(key: &str, cooldown_until: i64, reason: &str) -> bool {
+    let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = map.get(key) {
+        // Never shorten an existing cooldown. This prevents a short
+        // retry window (e.g., generic rate limit) from overriding a longer
+        // billing-cycle cooldown.
+        if existing.cooldown_until >= cooldown_until {
+            return false;
+        }
+    }
+    map.insert(
+        key.to_string(),
+        CooldownEntry {
+            cooldown_until,
+            reason: reason.to_string(),
+        },
+    );
+    true
+}
+
+/// Set a cooldown with a specific expiry timestamp and persist to KV inline.
+///
+/// This is the preferred function for critical cooldowns (credit exhaustion,
+/// billing cycle, agent/model failures) that must survive a service crash.
+/// The KV write is awaited before returning, so the caller can be confident
+/// the cooldown is durable once this function returns `true`.
+///
+/// Returns `true` if the cooldown was applied, `false` if an existing longer
+/// cooldown prevented the update (never-shorten rule).
+async fn set_cooldown_async(key: &str, cooldown_until: i64, reason: &str) -> bool {
+    if !set_cooldown_in_memory(key, cooldown_until, reason) {
+        return false;
+    }
+    let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
+    if let Some(store) = store_opt {
+        let kv_key = format!("{KV_PREFIX}{key}");
+        let value = cooldown_until.to_string();
+        if let Err(e) = store.kv_set(&kv_key, &value).await {
+            tracing::warn!(kv_key, err = %e, "failed to persist cooldown to KV store");
+        }
+    }
+    true
+}
+
 /// Set a cooldown with a specific expiry timestamp. Persists to KV.
 ///
 /// Returns `true` if the cooldown was applied, `false` if an existing longer
 /// cooldown prevented the update (never-shorten rule).
+///
+/// For non-async callers (silence detection short cooldowns). The KV write is
+/// fire-and-forget — loss on crash is acceptable for these short-lived cooldowns.
+/// For critical cooldowns, use [`set_cooldown_async`] instead.
 fn set_cooldown(key: &str, cooldown_until: i64, reason: &str) -> bool {
-    {
-        let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = map.get(key) {
-            // Never shorten an existing cooldown. This prevents a short
-            // retry window (e.g., generic rate limit) from overriding a longer
-            // billing-cycle cooldown.
-            if existing.cooldown_until >= cooldown_until {
-                return false;
-            }
-        }
-        map.insert(
-            key.to_string(),
-            CooldownEntry {
-                cooldown_until,
-                reason: reason.to_string(),
-            },
-        );
+    if !set_cooldown_in_memory(key, cooldown_until, reason) {
+        return false;
     }
 
     // Persist to KV via a background task when we have a runtime.
