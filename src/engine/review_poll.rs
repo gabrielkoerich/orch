@@ -821,31 +821,13 @@ pub(crate) async fn review_open_prs(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2);
 
-            // Commit the watermark timestamps BEFORE dispatching the reroute.
-            // This ensures that if handle_review_changes succeeds but a
-            // subsequent DB write fails, the watermark is already advanced and
-            // the same review will not be re-processed on the next poll tick.
-            // If the watermark write itself fails, we bail out without calling
-            // handle_review_changes so review_cycles is not incremented on a
-            // retry.
-            let mut fields: Vec<(&str, serde_json::Value)> = vec![(
-                "last_review_ts",
-                serde_json::json!(latest_review_ts.clone()),
-            )];
-            if let Some(ref ts) = new_comment_review_ts {
-                fields.push(("last_comment_review_ts", serde_json::json!(ts)));
-            }
-            if let Err(e) =
-                store_set_result_by_id(&Some(Arc::clone(store)), task_info.store_id, &fields).await
-            {
-                tracing::warn!(
-                    task_id,
-                    err = %e,
-                    "failed to persist review watermark — skipping reroute, will retry next tick"
-                );
-                continue;
-            }
-
+            // Call handle_review_changes FIRST. If it fails, we do not advance the
+            // watermark, allowing the review to be re-processed on the next poll tick.
+            // If it succeeds, we advance the watermark to prevent duplicate re-dispatches.
+            //
+            // This trade-off (retry transient failures vs. prevent idempotent duplicates)
+            // is correct: it is better to retry a review once more than to silently drop
+            // reviewer feedback forever.
             if let Err(e) = handle_review_changes(
                 task,
                 &review_context,
@@ -860,10 +842,30 @@ pub(crate) async fn review_open_prs(
             )
             .await
             {
-                tracing::warn!(task_id, err = %e, "failed to handle review feedback");
-                // Watermark was already advanced above; the failed review will
-                // not be retried. Log clearly so operators can investigate.
-            } else if review_cycles < max_cycles {
+                tracing::warn!(task_id, err = %e, "failed to handle review feedback — will retry next tick");
+                continue;
+            }
+
+            // Only after handle_review_changes succeeds, persist the watermark timestamps.
+            let mut fields: Vec<(&str, serde_json::Value)> = vec![(
+                "last_review_ts",
+                serde_json::json!(latest_review_ts.clone()),
+            )];
+            if let Some(ref ts) = new_comment_review_ts {
+                fields.push(("last_comment_review_ts", serde_json::json!(ts)));
+            }
+            if let Err(e) =
+                store_set_result_by_id(&Some(Arc::clone(store)), task_info.store_id, &fields).await
+            {
+                tracing::warn!(
+                    task_id,
+                    err = %e,
+                    "failed to persist review watermark — will retry next tick"
+                );
+                continue;
+            }
+
+            if review_cycles < max_cycles {
                 tracing::info!(task_id, "re-dispatching task to address review feedback");
                 store_reset_failure_counters(&Some(Arc::clone(store)), repo, task_id).await;
             }
