@@ -30,8 +30,7 @@ use crate::github::http::GhHttp;
 use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview};
 use crate::store::TaskStore;
 use crate::store::{
-    opt_store_get_task, store_increment, store_reset_failure_counters, store_set,
-    store_set_result,
+    opt_store_get_task, store_increment, store_reset_failure_counters, store_set, store_set_result,
 };
 use dashmap::DashSet;
 use std::collections::HashMap;
@@ -790,8 +789,7 @@ pub(crate) async fn review_open_prs(
             if let Some(ref ts) = new_comment_review_ts {
                 fields.push(("last_comment_review_ts", serde_json::json!(ts)));
             }
-            if let Err(e) =
-                store_set_result(&Some(Arc::clone(store)), repo, task_id, &fields).await
+            if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, task_id, &fields).await
             {
                 tracing::warn!(
                     task_id,
