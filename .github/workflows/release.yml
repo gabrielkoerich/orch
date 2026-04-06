@@ -453,7 +453,7 @@ jobs:
 
   # Build Zola docs and deploy to GitHub Pages on every push to main.
   deploy:
-    needs: [release]
+    needs: [test, secrets]
     if: github.ref == 'refs/heads/main'
     concurrency:
       group: pages
