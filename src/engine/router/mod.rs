@@ -419,7 +419,7 @@ impl Router {
         self.healthy_agent_count("simple") < threshold
     }
 
-    fn earliest_cooldown_until(&self, complexity: Option<&str>) -> Option<i64> {
+    pub fn earliest_cooldown_until(&self, complexity: Option<&str>) -> Option<i64> {
         let mut earliest: Option<i64> = None;
 
         for agent in &self.available_agents {
