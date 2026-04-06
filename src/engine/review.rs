@@ -1258,6 +1258,36 @@ pub(crate) async fn review_and_merge(
                 );
                 r
             } else {
+                // Check if the text contains a rate limit message before returning parse error.
+                // Rate limits should trigger a cooldown, not increment the failure counter.
+                if let Some(runner::agents::AgentError::RateLimit { message }) =
+                    runner::agents::patterns::detect_rate_limit(&text_for_review)
+                {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        agent = %review_agent,
+                        "review agent hit rate limit — adding to cooldown"
+                    );
+                    runner::response::record_agent_failure_with_message(&review_agent, &message)
+                        .await;
+
+                    if let Some(rid) = run_id {
+                        let _ = store
+                            .complete_run(&CompleteRun {
+                                run_id: rid,
+                                exit_code: Some(exit_code),
+                                stdout: &raw_output,
+                                stderr: &stderr,
+                                parsed: &text_for_review,
+                                outcome: "failed",
+                                error: &format!("rate limit: {message}"),
+                                tokens: agent_token_usage,
+                            })
+                            .await;
+                    }
+                    return Ok(ReviewDecision::Failed(format!("rate limit: {message}")));
+                }
+
                 tracing::error!(
                     task_id = task.id.0,
                     error = %e,
