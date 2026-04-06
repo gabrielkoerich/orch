@@ -237,9 +237,23 @@ pub async fn handle_error(
             format!("{agent_name} failed: {message}"),
         ),
         agents::AgentError::NetworkError { message } => {
-            // Transient connectivity failure — retry same agent, no reroute chain update.
+            // Transient connectivity failure — retry same agent without rerouting,
+            // but grow a dedicated streak counter so backoff keeps increasing.
             // Use "routed" so it re-dispatches without a full re-routing cycle.
             let msg = format!("{agent_name} network error: {message}");
+            match store::store_increment(store, repo, task_id, "network_retries").await {
+                Ok(retry_count) => {
+                    tracing::info!(
+                        task_id,
+                        retry_count,
+                        agent = agent_name,
+                        "network retry scheduled"
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(task_id, error = %e, "failed to increment network_retries");
+                }
+            }
             store::store_set(
                 store,
                 repo,

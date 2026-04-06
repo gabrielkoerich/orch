@@ -1,0 +1,1 @@
+ALTER TABLE tasks ADD COLUMN network_retries INTEGER NOT NULL DEFAULT 0;

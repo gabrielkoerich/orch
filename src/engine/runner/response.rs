@@ -91,6 +91,19 @@ pub(crate) fn calculate_backoff_delay(retry_count: usize) -> u64 {
     capped.saturating_sub(jitter_range) + jitter
 }
 
+fn fallback_retry_count(task: Option<&crate::store::Task>) -> usize {
+    task.map(|t| {
+        let chain_retry_count = t
+            .limit_reroute_chain
+            .split(',')
+            .filter(|entry| !entry.is_empty())
+            .count();
+        let network_retry_count = t.network_retries.max(0) as usize;
+        chain_retry_count.max(network_retry_count)
+    })
+    .unwrap_or(0)
+}
+
 /// Wait with exponential backoff before retrying with a fallback agent.
 /// Returns the delay applied in milliseconds.
 pub async fn wait_for_fallback_backoff(
@@ -98,13 +111,11 @@ pub async fn wait_for_fallback_backoff(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
 ) -> u64 {
-    // Get retry count from reroute chain
-    let chain = get_reroute_chain(task_id, store, repo).await;
-    let retry_count = if chain.is_empty() {
-        0
-    } else {
-        chain.split(',').count()
-    };
+    let task = store::opt_store_get_task(store, repo, task_id).await;
+
+    // Normal failover uses reroute chain length. NetworkError retries bypass
+    // failover, so track their own streak and use whichever retry source is larger.
+    let retry_count = fallback_retry_count(task.as_ref());
 
     let delay = calculate_backoff_delay(retry_count);
 
@@ -921,6 +932,72 @@ mod tests {
                 "delay {delay} out of expected range [{lo}, {hi}]"
             );
         }
+    }
+
+    #[test]
+    fn fallback_retry_count_uses_larger_network_retry_streak() {
+        let task = crate::store::Task {
+            id: 1,
+            external_id: None,
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "test".to_string(),
+            body: String::new(),
+            status: crate::store::TaskStatus::New,
+            source: String::new(),
+            source_id: String::new(),
+            author: String::new(),
+            url: String::new(),
+            labels: vec![],
+            agent: None,
+            model: None,
+            complexity: "simple".to_string(),
+            route_reason: String::new(),
+            agent_profile: String::new(),
+            selected_skills: String::new(),
+            route_attempts: 0,
+            attempts: 0,
+            branch: String::new(),
+            worktree: String::new(),
+            worktree_cleaned: false,
+            summary: String::new(),
+            last_error: String::new(),
+            parent_id: None,
+            block_reason: None,
+            pr_number: None,
+            pr_review_context: String::new(),
+            last_review_ts: String::new(),
+            last_comment_review_ts: String::new(),
+            merge_conflict_retries: 0,
+            ci_merge_failures: 0,
+            pr_create_failures: 0,
+            push_failures: 0,
+            network_retries: 3,
+            review_agent_failures: 0,
+            review_cycles: 0,
+            review_invocations: 0,
+            review_session_expected: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            input_cost_usd: 0.0,
+            output_cost_usd: 0.0,
+            total_cost_usd: 0.0,
+            model_reroute_chain: String::new(),
+            limit_reroute_chain: "claude".to_string(),
+            budget_warning: String::new(),
+            budget_exceeded: false,
+            memory: vec![],
+            delegations: vec![],
+            auto_unblock_count: 0,
+            auto_unblock_last_at: String::new(),
+            auto_unblock_last_reason: String::new(),
+            ci_recovery_count: 0,
+            no_code_reroutes: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        assert_eq!(fallback_retry_count(Some(&task)), 3);
     }
 
     #[test]
