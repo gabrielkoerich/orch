@@ -268,12 +268,8 @@ fn is_bot_comment(mention: &crate::backends::Mention) -> bool {
 /// Fetch issue comments for agent context.
 ///
 /// Fetches all comments for the specific issue using the per-issue API endpoint,
-/// then returns the last `limit` non-bot comments formatted for the prompt.
-pub async fn fetch_issue_comments(
-    backend: &dyn ExternalBackend,
-    task_id: &str,
-    limit: usize,
-) -> String {
+/// then returns all non-bot comments in chronological order formatted for the prompt.
+pub async fn fetch_issue_comments(backend: &dyn ExternalBackend, task_id: &str) -> String {
     let id = crate::backends::ExternalId(task_id.to_string());
     let all_comments = match backend.list_issue_comments(&id).await {
         Ok(c) => c,
@@ -283,15 +279,8 @@ pub async fn fetch_issue_comments(
         }
     };
 
-    // Filter bot comments, then take the last `limit` entries
-    let human_comments: Vec<_> = all_comments
-        .into_iter()
-        .filter(|c| !is_bot_comment(c))
-        .collect();
-
-    let start = human_comments.len().saturating_sub(limit);
     let mut formatted = String::new();
-    for comment in &human_comments[start..] {
+    for comment in all_comments.into_iter().filter(|c| !is_bot_comment(c)) {
         formatted.push_str(&format!(
             "**@{}** ({}):\n{}\n\n",
             comment.author, comment.created_at, comment.body
@@ -402,7 +391,7 @@ pub async fn build_full_context(
     };
 
     let issue_comments = if let Some(b) = backend {
-        fetch_issue_comments(b, &task.id.0, 10).await
+        fetch_issue_comments(b, &task.id.0).await
     } else {
         String::new()
     };
