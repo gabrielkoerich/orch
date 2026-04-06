@@ -751,6 +751,78 @@ impl GhHttp {
         Ok(all)
     }
 
+    /// Paginated GET for GitHub endpoints that return a wrapper object instead of a raw
+    /// array.  Each page is expected to look like `{ "<array_field>": [...], ... }`.
+    /// The function extracts `array_field` from every page and appends the elements
+    /// to the accumulated result, following `Link: <next>` headers until exhausted.
+    ///
+    /// This is necessary for endpoints such as `/commits/{sha}/check-runs` which
+    /// return `{ "total_count": N, "check_runs": [...] }` rather than a bare `[...]`
+    /// array.  Using `get_all_pages` on those endpoints would fail at the
+    /// `serde_json::from_str::<Vec<T>>` step because the body is an object, not an
+    /// array.
+    async fn get_all_pages_from_wrapper<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        array_field: &str,
+    ) -> anyhow::Result<Vec<T>> {
+        Self::proactive_throttle_rest().await;
+        Self::check_backoff()?;
+        let mut all: Vec<T> = Vec::new();
+        let mut current_url: String = url.to_string();
+
+        loop {
+            let auth = self.auth_header().await?;
+            let make_req = || {
+                self.client
+                    .get(&current_url)
+                    .header(header::AUTHORIZATION, auth.clone())
+                    .header(header::ACCEPT, "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .try_clone()
+                    .ok_or_else(|| anyhow::anyhow!("request clone failed"))
+            };
+            let resp = self.send_with_retries(make_req, false).await?;
+            let status = resp.status();
+            let next = parse_link_next(resp.headers());
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                Self::maybe_record_rate_limit_from_body(status, &body);
+                anyhow::bail!(
+                    "GitHub API GET (wrapped paginated) {current_url} failed ({status}): {body}"
+                );
+            }
+
+            let wrapper: serde_json::Value = serde_json::from_str(&resp.text().await?)?;
+            let items = wrapper
+                .get(array_field)
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            for item in items {
+                match serde_json::from_value::<T>(item) {
+                    Ok(v) => all.push(v),
+                    Err(e) => {
+                        tracing::warn!(
+                            field = array_field,
+                            err = %e,
+                            "skipping item that failed to deserialize in wrapped pagination"
+                        );
+                    }
+                }
+            }
+
+            match next {
+                Some(next_url) => current_url = next_url,
+                None => break,
+            }
+        }
+
+        Ok(all)
+    }
+
     /// POST to the GraphQL endpoint. Uses separate rate-limit tracking from REST.
     async fn graphql_request(
         &self,
@@ -1587,7 +1659,7 @@ impl GhHttp {
         repo: &str,
         sha: &str,
     ) -> anyhow::Result<Vec<(String, String)>> {
-        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}/status");
+        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}/status?per_page=100");
         let resp = self.get_json::<serde_json::Value>(&url).await?;
         Ok(resp
             .get("statuses")
@@ -1652,16 +1724,16 @@ impl GhHttp {
         // per check name. Without this, the API returns all runs (oldest
         // first) and callers that pick the first match may observe a stale
         // failed run when a newer run with the same name has succeeded.
-        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}/check-runs?filter=latest");
-        let resp: serde_json::Value = self.get_json(&url).await?;
-        Ok(resp
-            .get("check_runs")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|run| serde_json::from_value(run).ok())
-            .collect())
+        //
+        // Use `per_page=100` and manual pagination via `get_all_pages_from_wrapper`
+        // because this endpoint returns a *wrapper object* — `{ "total_count": N,
+        // "check_runs": [...] }` — rather than a raw JSON array.  `get_all_pages`
+        // cannot be used here because it calls `serde_json::from_str::<Vec<T>>`
+        // which would fail on an object body.
+        let url = format!(
+            "{GITHUB_API}/repos/{repo}/commits/{sha}/check-runs?filter=latest&per_page=100"
+        );
+        self.get_all_pages_from_wrapper(&url, "check_runs").await
     }
 
     /// Get reviews for a PR.
@@ -3292,6 +3364,132 @@ mod tests {
                 err.contains("JSON decode failed") || err.contains("expected ident"),
                 "error should mention JSON decode or serde error: {}",
                 err
+            );
+        }
+
+        // ── get_all_pages_from_wrapper tests ─────────────────────────────────
+
+        #[tokio::test]
+        async fn get_all_pages_from_wrapper_single_page() {
+            // Simulates GitHub's check-runs response: a wrapper object with the
+            // array nested under a named field.
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/check-runs"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "total_count": 2,
+                    "check_runs": [{"id": 1, "name": "build"}, {"id": 2, "name": "test"}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (gh, _guard) = make_client();
+            let url = format!("{}/check-runs", server.uri());
+            let result: Vec<serde_json::Value> = gh
+                .get_all_pages_from_wrapper(&url, "check_runs")
+                .await
+                .unwrap();
+
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0]["id"], 1);
+            assert_eq!(result[1]["id"], 2);
+        }
+
+        #[tokio::test]
+        async fn get_all_pages_from_wrapper_follows_link_next() {
+            // Two-page check-runs response (common for repos with >100 distinct check names).
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/check-runs"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "total_count": 3,
+                            "check_runs": [{"id": 1, "name": "build"}]
+                        }))
+                        .insert_header(
+                            "Link",
+                            format!("<{}/check-runs/page2>; rel=\"next\"", server.uri()),
+                        ),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/check-runs/page2"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "total_count": 3,
+                    "check_runs": [{"id": 2, "name": "lint"}, {"id": 3, "name": "test"}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (gh, _guard) = make_client();
+            let url = format!("{}/check-runs", server.uri());
+            let result: Vec<serde_json::Value> = gh
+                .get_all_pages_from_wrapper(&url, "check_runs")
+                .await
+                .unwrap();
+
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[0]["id"], 1);
+            assert_eq!(result[1]["id"], 2);
+            assert_eq!(result[2]["id"], 3);
+        }
+
+        #[tokio::test]
+        async fn get_all_pages_from_wrapper_empty_field_returns_empty_vec() {
+            // When the array field is missing or empty, the function should return
+            // an empty vec rather than erroring.
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/check-runs"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "total_count": 0,
+                    "check_runs": []
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (gh, _guard) = make_client();
+            let url = format!("{}/check-runs", server.uri());
+            let result: Vec<serde_json::Value> = gh
+                .get_all_pages_from_wrapper(&url, "check_runs")
+                .await
+                .unwrap();
+
+            assert_eq!(result.len(), 0);
+        }
+
+        #[tokio::test]
+        async fn get_all_pages_from_wrapper_error_on_non_success_status() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/check-runs"))
+                .respond_with(ResponseTemplate::new(422).set_body_string("Unprocessable Entity"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (gh, _guard) = make_client();
+            let url = format!("{}/check-runs", server.uri());
+            let result = gh
+                .get_all_pages_from_wrapper::<serde_json::Value>(&url, "check_runs")
+                .await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("422") || err.contains("failed"),
+                "error should indicate failure: {err}"
             );
         }
     }
