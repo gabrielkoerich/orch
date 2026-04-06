@@ -19,11 +19,11 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
     output_tokens, input_cost_usd, output_cost_usd, total_cost_usd, \
     model_reroute_chain, limit_reroute_chain, budget_warning, budget_exceeded, \
     memory, delegations, created_at, updated_at, review_session_expected, \
-    review_invocations, needs_review_refires, push_failures, auto_unblock_count, auto_unblock_last_at, \
-    ci_recovery_count, auto_unblock_last_reason, no_code_reroutes";
+     review_invocations, needs_review_refires, push_failures, auto_unblock_count, auto_unblock_last_at, \
+     ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub(crate) const TASK_COLS_COUNT: usize = 58;
+pub(crate) const TASK_COLS_COUNT: usize = 59;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str =
@@ -940,6 +940,28 @@ impl TaskStore {
         let sql = format!(
         "UPDATE tasks SET {field} = {field} + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ? RETURNING {field} AS val"
     );
+
+        let row = sqlx::query(&sql).bind(id).fetch_one(&self.pool).await?;
+
+        Ok(row.try_get("val").unwrap_or(0))
+    }
+
+    /// Increment a counter in the task store **without** updating `updated_at`.
+    ///
+    /// Use this when the counter tracks bookkeeping state that should not reset
+    /// the task's timestamp (e.g. `needs_review_refires`, where `updated_at` is
+    /// used to compute task age for backoff decisions).  For most counters, prefer
+    /// `increment()` which also refreshes `updated_at`.
+    pub async fn increment_no_ts(&self, id: i64, field: &str) -> anyhow::Result<i32> {
+        const INCREMENTABLE_NO_TS: &[&str] = &["needs_review_refires"];
+
+        anyhow::ensure!(
+            INCREMENTABLE_NO_TS.contains(&field),
+            "field {field} is not incrementable without timestamp"
+        );
+
+        let sql =
+            format!("UPDATE tasks SET {field} = {field} + 1 WHERE id = ? RETURNING {field} AS val");
 
         let row = sqlx::query(&sql).bind(id).fetch_one(&self.pool).await?;
 

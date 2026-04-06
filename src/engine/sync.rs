@@ -682,34 +682,47 @@ pub(crate) async fn sync_tick(
                 continue;
             }
             // Decide whether to re-fire now using exponential backoff based on a per-task counter.
-            // Increment the counter (atomic in DB) and compute the required wait window.
-            let increment_result = crate::store::store_increment(
-                &Some(Arc::clone(store)),
-                repo,
-                &task.id.0,
-                "needs_review_refires",
-            )
-            .await;
-
-            let refires = match increment_result {
-                Ok(v) => v, // post-increment value
-                Err(e) => {
-                    tracing::warn!(task_id = task.id.0, err = %e, "failed to increment needs_review_refires — falling back to immediate re-fire");
-                    1
-                }
-            };
+            // Fetch the store task to read the current needs_review_refires counter without
+            // touching updated_at before we know whether we will actually fire.
+            let store_task =
+                crate::store::opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await;
+            let current_refires = store_task
+                .as_ref()
+                .map(|t| t.needs_review_refires as u64)
+                .unwrap_or(0);
+            let new_refires = current_refires + 1;
 
             // If we've exceeded max attempts, escalate the task to Blocked with a clear reason.
-            if refires >= MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS {
-                tracing::warn!(task_id = task.id.0, refires, "escalating NeedsReview task to Blocked after repeated refires");
+            if new_refires >= MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS {
+                // Increment first so the escalation value is accurate.
+                let _ = crate::store::store_increment(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    "needs_review_refires",
+                )
+                .await;
+                tracing::warn!(
+                    task_id = task.id.0,
+                    new_refires,
+                    "escalating NeedsReview task to Blocked after repeated refires"
+                );
                 // Write block reason and last_error (best-effort)
                 crate::store::store_set(
                     &Some(Arc::clone(store)),
                     repo,
                     &task.id.0,
                     &[
-                        ("block_reason", serde_json::json!("review agent rebroadcast escalated after repeated retries")),
-                        ("last_error", serde_json::json!(format!("escalated after {} retries", refires))),
+                        (
+                            "block_reason",
+                            serde_json::json!(
+                                "review agent rebroadcast escalated after repeated retries"
+                            ),
+                        ),
+                        (
+                            "last_error",
+                            serde_json::json!(format!("escalated after {} retries", new_refires)),
+                        ),
                     ],
                 )
                 .await;
@@ -722,8 +735,12 @@ pub(crate) async fn sync_tick(
                 continue;
             }
 
-            // Compute required age using exponential backoff: MIN * 2^(refires-1)
-            let required_minutes = MIN_STALE_NEEDS_REVIEW_MINUTES * (1i64 << (refires.saturating_sub(1) as u32));
+            // Compute required age using exponential backoff: MIN * 2^(current_refires)
+            // current_refires == 0 → required == MIN (1 min)
+            // current_refires == 1 → required == 2 * MIN (2 min)
+            // current_refires == 2 → required == 4 * MIN (4 min) …
+            let required_minutes =
+                MIN_STALE_NEEDS_REVIEW_MINUTES * (1i64 << (current_refires as u32));
 
             let should_fire = match age_minutes {
                 Some(age) => age >= required_minutes,
@@ -731,14 +748,50 @@ pub(crate) async fn sync_tick(
             };
 
             if !should_fire {
-                tracing::debug!(task_id = task.id.0, age_minutes, refires, required_minutes, "sync catch-up: delaying NeedsReview re-fire due to backoff");
+                // Not firing yet — bump the counter without touching updated_at so the
+                // age calculation remains valid on the next tick.
+                let _ = crate::store::store_increment_no_ts(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    "needs_review_refires",
+                )
+                .await;
+                tracing::debug!(
+                    task_id = task.id.0,
+                    age_minutes,
+                    current_refires,
+                    required_minutes,
+                    "sync catch-up: delaying NeedsReview re-fire due to backoff"
+                );
                 continue;
             }
+
+            // Fire: increment counter (this also updates updated_at, giving the task a fresh
+            // timestamp so subsequent ticks don't immediately re-fire it again).
+            let fired_refires = match crate::store::store_increment(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                "needs_review_refires",
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        err = %e,
+                        "failed to increment needs_review_refires — proceeding with re-fire anyway"
+                    );
+                    new_refires
+                }
+            };
 
             tracing::info!(
                 task_id = task.id.0,
                 age_minutes,
-                refires,
+                refires = fired_refires,
                 required_minutes,
                 "sync catch-up: re-firing NeedsReview event for stale task"
             );
