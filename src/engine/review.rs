@@ -1159,7 +1159,7 @@ pub(crate) async fn review_and_merge(
     let (file_exists, file_size, exit_code, stderr) = {
         let output_file_clone = output_file.clone();
         let review_attempt_dir_clone = review_attempt_dir.clone();
-        tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             let file_exists = output_file_clone.exists();
             let file_size = std::fs::metadata(&output_file_clone)
                 .map(|m| m.len())
@@ -1173,7 +1173,17 @@ pub(crate) async fn review_and_merge(
             (file_exists, file_size, exit_code, stderr)
         })
         .await
-        .expect("spawn_blocking panicked reading review output metadata")
+        {
+            Ok(tuple) => tuple,
+            Err(e) => {
+                tracing::error!(
+                    task_id = task.id.0,
+                    error = %e,
+                    "spawn_blocking panicked reading review output metadata"
+                );
+                (false, 0, -1, format!("spawn_blocking failed: {e}"))
+            }
+        }
     };
     tracing::info!(
         task_id = task.id.0,
