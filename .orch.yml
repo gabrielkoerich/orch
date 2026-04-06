@@ -273,7 +273,7 @@ jobs:
   external: false
 - id: self-review
   type: task
-  schedule: '0 2 * * 0'
+  schedule: '0 3 * * 0'
   task:
     title: 'Self-review: analyze metrics and file improvement issues'
     body: |
