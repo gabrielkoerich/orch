@@ -698,7 +698,10 @@ impl Router {
                                 fallback_agent
                             )
                         } else {
-                            format!("LLM selected cooled agent/model; rerouted to {}", fallback_agent)
+                            format!(
+                                "LLM selected cooled agent/model; rerouted to {}",
+                                fallback_agent
+                            )
                         };
 
                         let result = RouteResult {
