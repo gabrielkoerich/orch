@@ -1289,18 +1289,13 @@ pub(crate) async fn handle_review_changes(
         }
     }
 
-    // 3. Store review context.
+    // 3. Store review context (but NOT review_cycles — increment only after
+    // successful status transition to avoid premature escalation on failure).
     store_set(
         &Some(Arc::clone(store)),
         repo,
         &task.id.0,
-        &[
-            (
-                "review_cycles",
-                serde_json::json!((review_cycles + 1) as i64),
-            ),
-            ("pr_review_context", serde_json::json!(comment.clone())),
-        ],
+        &[("pr_review_context", serde_json::json!(comment.clone()))],
     )
     .await;
 
@@ -1356,11 +1351,23 @@ pub(crate) async fn handle_review_changes(
                 tracing::warn!(
                     task_id = task.id.0,
                     err = %e,
-                    review_cycles = review_cycles + 1,
-                    "review context saved but Routed transition failed — will retry on next tick"
+                    "Routed transition failed — will retry on next tick"
                 );
                 return Ok(());
             }
+
+            // Increment review_cycles only AFTER successful status transition.
+            // This prevents premature escalation if the transition fails.
+            store_set(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                &[(
+                    "review_cycles",
+                    serde_json::json!((review_cycles + 1) as i64),
+                )],
+            )
+            .await;
 
             tracing::info!(
                 task_id = task.id.0,
@@ -1391,11 +1398,23 @@ pub(crate) async fn handle_review_changes(
                 tracing::warn!(
                     task_id = task.id.0,
                     err = %e,
-                    review_cycles = review_cycles + 1,
                     "all models cooled for agent {previous_agent} — New transition failed, will retry on next tick"
                 );
                 return Ok(());
             }
+
+            // Increment review_cycles only AFTER successful status transition.
+            // This prevents premature escalation if the transition fails.
+            store_set(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                &[(
+                    "review_cycles",
+                    serde_json::json!((review_cycles + 1) as i64),
+                )],
+            )
+            .await;
 
             tracing::info!(
                 task_id = task.id.0,
@@ -2075,9 +2094,12 @@ mod tests {
                 .contains("Fix the null pointer on line 10"),
             "pr_review_context must be persisted even when status transition fails"
         );
+        // Review_cycles should NOT be incremented if the status transition fails.
+        // This prevents premature escalation when the Routed transition fails.
+        // The increment happens AFTER successful status transition in the fixed code.
         assert_eq!(
-            stored.review_cycles, 1,
-            "review_cycles must be incremented even when status transition fails"
+            stored.review_cycles, 0,
+            "review_cycles must NOT be incremented when status transition fails"
         );
         // Status stays InReview (not Routed/New) because the transition failed.
         assert_eq!(
