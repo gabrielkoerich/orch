@@ -330,6 +330,62 @@ impl ExternalBackend for GitHubBackend {
             .collect())
     }
 
+    /// List all open tasks with active statuses in a single API call.
+    ///
+    /// Fetches all open issues once and partitions by status label locally.
+    /// More efficient than making 6 separate `list_by_status` calls.
+    async fn list_all_active_tasks(&self) -> anyhow::Result<Vec<(ExternalTask, Status)>> {
+        let issues = self.gh.list_all_open_issues(&self.repo).await?;
+        let mut results = Vec::new();
+
+        for issue in issues {
+            if issue.pull_request.is_some() {
+                continue;
+            }
+            if !is_trusted_author(&issue) {
+                continue;
+            }
+
+            let labels: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
+
+            // Find the status label, if any
+            let status = labels.iter().find_map(|l| {
+                if let Some(status) = l.strip_prefix("status:") {
+                    match status {
+                        "new" => Some(Status::New),
+                        "routed" => Some(Status::Routed),
+                        "in_progress" => Some(Status::InProgress),
+                        "needs_review" => Some(Status::NeedsReview),
+                        "in_review" => Some(Status::InReview),
+                        "blocked" => Some(Status::Blocked),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            });
+
+            if let Some(status) = status {
+                results.push((
+                    ExternalTask {
+                        id: ExternalId(issue.number.to_string()),
+                        title: issue.title,
+                        body: issue.body.unwrap_or_default(),
+                        state: issue.state,
+                        labels: issue.labels.into_iter().map(|l| l.name).collect(),
+                        author: issue.user.login,
+                        created_at: issue.created_at,
+                        updated_at: issue.updated_at,
+                        url: issue.html_url,
+                    },
+                    status,
+                ));
+            }
+        }
+
+        Ok(results)
+    }
+
     async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()> {
         self.gh.add_comment(&self.repo, &id.0, body).await
     }

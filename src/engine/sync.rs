@@ -1353,33 +1353,50 @@ pub(crate) async fn ingest_external_tasks(
         }
     }
 
-    // 2. All labeled active statuses — for status sync on first ingest.
-    //    All 6 calls are independent — run them in parallel to reduce sync latency.
-    let active_statuses = [
-        Status::New,
-        Status::Routed,
-        Status::InProgress,
-        Status::NeedsReview,
-        Status::InReview,
-        Status::Blocked,
-    ];
-    let status_results = futures::future::join_all(
-        active_statuses
-            .iter()
-            .map(|status| async move { (*status, backend.list_by_status(*status).await) }),
-    )
-    .await;
-    for (status, result) in status_results {
-        match result {
-            Ok(tasks) => {
-                for task in tasks {
-                    if seen.insert(task.id.0.clone()) {
-                        all_tasks.push((task, Some(status)));
-                    }
+    // 2. All labeled active statuses — fetch in a single API call when backend
+    //    supports it, otherwise fall back to per-status calls.
+    match backend.list_all_active_tasks().await {
+        Ok(active_tasks) => {
+            for (task, status) in active_tasks {
+                if seen.insert(task.id.0.clone()) {
+                    all_tasks.push((task, Some(status)));
                 }
             }
-            Err(e) => {
-                tracing::debug!(?status, ?e, "ingest: failed to list tasks");
+        }
+        Err(e) => {
+            tracing::debug!(
+                ?e,
+                "ingest: list_all_active_tasks failed, falling back to per-status calls"
+            );
+            // Fallback: parallel per-status calls for backends that don't
+            // implement list_all_active_tasks efficiently.
+            let active_statuses = [
+                Status::New,
+                Status::Routed,
+                Status::InProgress,
+                Status::NeedsReview,
+                Status::InReview,
+                Status::Blocked,
+            ];
+            let status_results = futures::future::join_all(
+                active_statuses
+                    .iter()
+                    .map(|status| async move { (*status, backend.list_by_status(*status).await) }),
+            )
+            .await;
+            for (status, result) in status_results {
+                match result {
+                    Ok(tasks) => {
+                        for task in tasks {
+                            if seen.insert(task.id.0.clone()) {
+                                all_tasks.push((task, Some(status)));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(?status, ?e, "ingest: failed to list tasks");
+                    }
+                }
             }
         }
     }
