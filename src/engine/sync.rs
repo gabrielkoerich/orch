@@ -647,6 +647,7 @@ pub(crate) async fn sync_tick(
             .unwrap_or_default();
 
         const MIN_STALE_NEEDS_REVIEW_MINUTES: i64 = 1;
+        const MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS: u64 = 5; // escalate to Blocked after this many refires
         let needs_review_count = needs_review_tasks.len();
         if needs_review_count > 0 {
             tracing::info!(
@@ -680,12 +681,121 @@ pub(crate) async fn sync_tick(
             if dispatching.contains(&dispatch_key) {
                 continue;
             }
+            // Decide whether to re-fire now using exponential backoff based on a per-task counter.
+            // Fetch the store task to read the current needs_review_refires counter without
+            // touching updated_at before we know whether we will actually fire.
+            let store_task =
+                crate::store::opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await;
+            let current_refires = store_task
+                .as_ref()
+                .map(|t| t.needs_review_refires as u64)
+                .unwrap_or(0);
+            let new_refires = current_refires + 1;
+
+            // If we've exceeded max attempts, escalate the task to Blocked with a clear reason.
+            if new_refires >= MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS {
+                // Increment first so the escalation value is accurate.
+                let _ = crate::store::store_increment(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    "needs_review_refires",
+                )
+                .await;
+                tracing::warn!(
+                    task_id = task.id.0,
+                    new_refires,
+                    "escalating NeedsReview task to Blocked after repeated refires"
+                );
+                // Write block reason and last_error (best-effort)
+                crate::store::store_set(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    &[
+                        (
+                            "block_reason",
+                            serde_json::json!(
+                                "review agent rebroadcast escalated after repeated retries"
+                            ),
+                        ),
+                        (
+                            "last_error",
+                            serde_json::json!(format!("escalated after {} retries", new_refires)),
+                        ),
+                    ],
+                )
+                .await;
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::Blocked)
+                    .await
+                {
+                    tracing::warn!(task_id = task.id.0, err = %e, "failed to set Blocked during escalation");
+                }
+                continue;
+            }
+
+            // Compute required age using exponential backoff: MIN * 2^(current_refires)
+            // current_refires == 0 → required == MIN (1 min)
+            // current_refires == 1 → required == 2 * MIN (2 min)
+            // current_refires == 2 → required == 4 * MIN (4 min) …
+            let required_minutes =
+                MIN_STALE_NEEDS_REVIEW_MINUTES * (1i64 << (current_refires as u32));
+
+            let should_fire = match age_minutes {
+                Some(age) => age >= required_minutes,
+                None => true,
+            };
+
+            if !should_fire {
+                // Not firing yet — bump the counter without touching updated_at so the
+                // age calculation remains valid on the next tick.
+                let _ = crate::store::store_increment_no_ts(
+                    &Some(Arc::clone(store)),
+                    repo,
+                    &task.id.0,
+                    "needs_review_refires",
+                )
+                .await;
+                tracing::debug!(
+                    task_id = task.id.0,
+                    age_minutes,
+                    current_refires,
+                    required_minutes,
+                    "sync catch-up: delaying NeedsReview re-fire due to backoff"
+                );
+                continue;
+            }
+
+            // Fire: increment counter (this also updates updated_at, giving the task a fresh
+            // timestamp so subsequent ticks don't immediately re-fire it again).
+            let fired_refires = match crate::store::store_increment(
+                &Some(Arc::clone(store)),
+                repo,
+                &task.id.0,
+                "needs_review_refires",
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        err = %e,
+                        "failed to increment needs_review_refires — proceeding with re-fire anyway"
+                    );
+                    new_refires
+                }
+            };
 
             tracing::info!(
                 task_id = task.id.0,
                 age_minutes,
+                refires = fired_refires,
+                required_minutes,
                 "sync catch-up: re-firing NeedsReview event for stale task"
             );
+
             if let Err(e) = task_manager
                 .update_task_status(&task.id, Status::NeedsReview)
                 .await
@@ -2144,6 +2254,205 @@ mod tests {
         // Should be reset to NeedsReview since no tmux session exists
         let task = store.get(id).await.unwrap();
         assert_eq!(task.status, crate::store::TaskStatus::NeedsReview);
+    }
+
+    #[tokio::test]
+    async fn needs_review_refire_increments_and_fires_when_old_enough() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
+
+        // Create external task and set to NeedsReview
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "201",
+                title: "Needs review old",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+        // Backdate updated_at so it's considered stale (>1 minute)
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        // Ensure initial counter is zero
+        let t = store.get(id).await.unwrap();
+        assert_eq!(t.needs_review_refires, 0);
+
+        // Run sync tick — should increment counter and re-fire (no status transition beyond NeedsReview)
+        sync_tick(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &EngineConfig::default(),
+            &router,
+            &task_manager,
+            &store,
+            &dispatching,
+            &auto_merge_in_flight,
+        )
+        .await
+        .unwrap();
+
+        let t2 = store.get(id).await.unwrap();
+        assert_eq!(t2.needs_review_refires, 1);
+        assert_eq!(t2.status, crate::store::TaskStatus::NeedsReview);
+    }
+
+    #[tokio::test]
+    async fn needs_review_backoff_delays_fire_but_increments_counter() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "202",
+                title: "Needs review backoff",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+
+        // Set existing refires to 1 to simulate a prior attempt
+        store
+            .set_fields(id, &[("needs_review_refires", serde_json::json!(1))])
+            .await
+            .unwrap();
+
+        // Set updated_at to now - 1 minute (>= MIN but less than required for refires=2 which is 2 minutes)
+        let now_minus_1 = (chrono::Utc::now() - chrono::Duration::minutes(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        sqlx::query("UPDATE tasks SET updated_at = ? WHERE id = ?")
+            .bind(now_minus_1.clone())
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let before = store.get(id).await.unwrap();
+        assert_eq!(before.needs_review_refires, 1);
+
+        sync_tick(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &EngineConfig::default(),
+            &router,
+            &task_manager,
+            &store,
+            &dispatching,
+            &auto_merge_in_flight,
+        )
+        .await
+        .unwrap();
+
+        let after = store.get(id).await.unwrap();
+        // Counter should have been incremented to 2, but not re-fired (updated_at unchanged)
+        assert_eq!(after.needs_review_refires, 2);
+        assert_eq!(after.updated_at, now_minus_1);
+        assert_eq!(after.status, crate::store::TaskStatus::NeedsReview);
+    }
+
+    #[tokio::test]
+    async fn needs_review_escalates_to_blocked_after_max_refires() {
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+        let backend: Arc<dyn ExternalBackend> = IngestMockBackend::with_tasks(vec![]);
+        let task_manager = Arc::new(TaskManager::with_store(
+            backend.clone(),
+            store.clone(),
+            "owner/repo".to_string(),
+        ));
+        let tmux = Arc::new(TmuxManager::new());
+        let router = Arc::new(RwLock::new(crate::engine::router::Router::from_config()));
+        let dispatching: Arc<DashSet<String>> = Arc::new(DashSet::new());
+        let auto_merge_in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
+
+        let id = store
+            .upsert_external(&crate::store::UpsertExternal {
+                repo: "owner/repo",
+                ext_id: "203",
+                title: "Needs review escalate",
+                body: "",
+                author: "",
+                url: "",
+                labels: &[],
+                origin: "github",
+            })
+            .await
+            .unwrap();
+        store
+            .update_status(id, crate::store::TaskStatus::NeedsReview)
+            .await
+            .unwrap();
+
+        // Set counter to MAX-1 (4) so incrementing hits MAX (5) and escalates
+        store
+            .set_fields(id, &[("needs_review_refires", serde_json::json!(4))])
+            .await
+            .unwrap();
+        // Backdate updated_at so age check passes
+        sqlx::query("UPDATE tasks SET updated_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        sync_tick(
+            &backend,
+            &tmux,
+            "owner/repo",
+            &EngineConfig::default(),
+            &router,
+            &task_manager,
+            &store,
+            &dispatching,
+            &auto_merge_in_flight,
+        )
+        .await
+        .unwrap();
+
+        let after = store.get(id).await.unwrap();
+        assert_eq!(after.status, crate::store::TaskStatus::Blocked);
+        assert!(after.block_reason.is_some());
     }
 
     /// A fresh InReview task (<1 min old) should NOT be reset — the review
