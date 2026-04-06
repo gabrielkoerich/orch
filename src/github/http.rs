@@ -883,10 +883,6 @@ impl GhHttp {
 
     // ── Public API (mirrors GhCli) ───────────────────────────────
 
-    pub async fn graphql(&self, query: &str) -> anyhow::Result<serde_json::Value> {
-        self.graphql_request(query, &[], None).await
-    }
-
     pub async fn graphql_with_vars(
         &self,
         query: &str,

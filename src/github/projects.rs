@@ -74,12 +74,11 @@ impl ProjectSync {
     /// "Status" field, returning a `ProjectSync` populated with field/option IDs.
     pub async fn discover_fields(project_id: &str) -> anyhow::Result<Self> {
         let gh = GhHttp::new()?;
-        let query = format!(
-            r#"{{ node(id: "{}") {{ ... on ProjectV2 {{ fields(first: 100) {{ nodes {{ ... on ProjectV2SingleSelectField {{ id name options {{ id name }} }} }} }} }} }} }}"#,
-            project_id
-        );
+        let query = r#"query($projectId: ID!) { node(id: $projectId) { ... on ProjectV2 { fields(first: 100) { nodes { ... on ProjectV2SingleSelectField { id name options { id name } } } } } } }"#;
 
-        let result = gh.graphql(&query).await?;
+        let result = gh
+            .graphql_with_vars(query, serde_json::json!({ "projectId": project_id }))
+            .await?;
 
         let fields = result
             .pointer("/data/node/fields/nodes")
@@ -147,11 +146,11 @@ impl ProjectSync {
         let user = gh.get_whoami().await?;
 
         // User projects
-        let query = format!(
-            r#"{{ user(login: "{}") {{ projectsV2(first: 100) {{ nodes {{ id number title }} }} }} }}"#,
-            user
-        );
-        if let Ok(result) = gh.graphql(&query).await {
+        let query = r#"query($login: String!) { user(login: $login) { projectsV2(first: 100) { nodes { id number title } } } }"#;
+        if let Ok(result) = gh
+            .graphql_with_vars(query, serde_json::json!({ "login": user }))
+            .await
+        {
             if let Some(nodes) = result
                 .pointer("/data/user/projectsV2/nodes")
                 .and_then(|n| n.as_array())
@@ -168,11 +167,11 @@ impl ProjectSync {
         if let Ok(repo) = config::get_current_repo() {
             if let Some(owner) = repo.split('/').next() {
                 if owner != user {
-                    let query = format!(
-                        r#"{{ organization(login: "{}") {{ projectsV2(first: 100) {{ nodes {{ id number title }} }} }} }}"#,
-                        owner
-                    );
-                    if let Ok(result) = gh.graphql(&query).await {
+                    let query = r#"query($login: String!) { organization(login: $login) { projectsV2(first: 100) { nodes { id number title } } } }"#;
+                    if let Ok(result) = gh
+                        .graphql_with_vars(query, serde_json::json!({ "login": owner }))
+                        .await
+                    {
                         if let Some(nodes) = result
                             .pointer("/data/organization/projectsV2/nodes")
                             .and_then(|n| n.as_array())
@@ -193,12 +192,18 @@ impl ProjectSync {
 
     /// Add an issue to the project board. Returns the project item ID.
     pub async fn add_item(&self, issue_node_id: &str) -> anyhow::Result<String> {
-        let query = format!(
-            r#"mutation {{ addProjectV2ItemById(input: {{projectId: "{}", contentId: "{}"}}) {{ item {{ id }} }} }}"#,
-            self.project_id, issue_node_id
-        );
+        let query = r#"mutation($projectId: ID!, $contentId: ID!) { addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) { item { id } } }"#;
 
-        let result = self.gh.graphql(&query).await?;
+        let result = self
+            .gh
+            .graphql_with_vars(
+                query,
+                serde_json::json!({
+                    "projectId": self.project_id,
+                    "contentId": issue_node_id,
+                }),
+            )
+            .await?;
         result
             .pointer("/data/addProjectV2ItemById/item/id")
             .and_then(|v| v.as_str())
@@ -214,12 +219,19 @@ impl ProjectSync {
             .get(column)
             .ok_or_else(|| anyhow::anyhow!("no option ID for column: {column}"))?;
 
-        let query = format!(
-            r#"mutation {{ updateProjectV2ItemFieldValue(input: {{projectId: "{}", itemId: "{}", fieldId: "{}", value: {{singleSelectOptionId: "{}"}}}}) {{ projectV2Item {{ id }} }} }}"#,
-            self.project_id, item_id, self.status_field_id, option_id
-        );
+        let query = r#"mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) { updateProjectV2ItemFieldValue(input: { projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: { singleSelectOptionId: $optionId } }) { projectV2Item { id } } }"#;
 
-        self.gh.graphql(&query).await?;
+        self.gh
+            .graphql_with_vars(
+                query,
+                serde_json::json!({
+                    "projectId": self.project_id,
+                    "itemId": item_id,
+                    "fieldId": self.status_field_id,
+                    "optionId": option_id,
+                }),
+            )
+            .await?;
         Ok(())
     }
 
