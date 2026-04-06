@@ -29,7 +29,9 @@ use crate::engine::EngineConfig;
 use crate::github::http::GhHttp;
 use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview};
 use crate::store::TaskStore;
-use crate::store::{opt_store_get_task, store_increment, store_reset_failure_counters, store_set};
+use crate::store::{
+    opt_store_get_task, store_increment, store_reset_failure_counters, store_set, store_set_result,
+};
 use dashmap::DashSet;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -737,7 +739,7 @@ pub(crate) async fn review_open_prs(
                 review_context.push_str(&body);
                 review_context.push('\n');
 
-                // Capture the timestamp; persist only on success below.
+                // Capture the timestamp; persisted atomically with last_review_ts below.
                 new_comment_review_ts = Some(c.created_at.clone());
             }
         }
@@ -758,9 +760,6 @@ pub(crate) async fn review_open_prs(
         }
 
         // If we have new review feedback, re-dispatch the task.
-        // Timestamps are only persisted after handle_review_changes() succeeds
-        // so that a transient failure does not permanently skip this review on
-        // the next poll tick.
         if !review_context.is_empty() {
             let task_agent = stored_task
                 .agent
@@ -775,6 +774,30 @@ pub(crate) async fn review_open_prs(
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2);
+
+            // Commit the watermark timestamps BEFORE dispatching the reroute.
+            // This ensures that if handle_review_changes succeeds but a
+            // subsequent DB write fails, the watermark is already advanced and
+            // the same review will not be re-processed on the next poll tick.
+            // If the watermark write itself fails, we bail out without calling
+            // handle_review_changes so review_cycles is not incremented on a
+            // retry.
+            let mut fields: Vec<(&str, serde_json::Value)> = vec![(
+                "last_review_ts",
+                serde_json::json!(latest_review_ts.clone()),
+            )];
+            if let Some(ref ts) = new_comment_review_ts {
+                fields.push(("last_comment_review_ts", serde_json::json!(ts)));
+            }
+            if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, task_id, &fields).await
+            {
+                tracing::warn!(
+                    task_id,
+                    err = %e,
+                    "failed to persist review watermark — skipping reroute, will retry next tick"
+                );
+                continue;
+            }
 
             if let Err(e) = handle_review_changes(
                 task,
@@ -791,36 +814,11 @@ pub(crate) async fn review_open_prs(
             .await
             {
                 tracing::warn!(task_id, err = %e, "failed to handle review feedback");
-                // Do NOT update timestamps — leave them unchanged so the same
-                // review is retried on the next poll tick.
-            } else {
-                // Success: advance the watermark timestamps so we don't
-                // re-process the same reviews on the next tick.
-                store_set(
-                    &Some(Arc::clone(store)),
-                    repo,
-                    task_id,
-                    &[(
-                        "last_review_ts",
-                        serde_json::json!(latest_review_ts.clone()),
-                    )],
-                )
-                .await;
-
-                if let Some(ts) = new_comment_review_ts {
-                    store_set(
-                        &Some(Arc::clone(store)),
-                        repo,
-                        task_id,
-                        &[("last_comment_review_ts", serde_json::json!(ts))],
-                    )
-                    .await;
-                }
-
-                if review_cycles < max_cycles {
-                    tracing::info!(task_id, "re-dispatching task to address review feedback");
-                    store_reset_failure_counters(&Some(Arc::clone(store)), repo, task_id).await;
-                }
+                // Watermark was already advanced above; the failed review will
+                // not be retried. Log clearly so operators can investigate.
+            } else if review_cycles < max_cycles {
+                tracing::info!(task_id, "re-dispatching task to address review feedback");
+                store_reset_failure_counters(&Some(Arc::clone(store)), repo, task_id).await;
             }
         }
     }

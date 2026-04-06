@@ -58,6 +58,27 @@ pub async fn store_set(
     }
 }
 
+/// Write fields to the task store, returning an error if the write fails.
+///
+/// Unlike `store_set`, this variant propagates failures so callers can
+/// abort further processing when a critical write (e.g. a watermark) fails.
+/// Returns `Ok(())` when `store` is `None` (store not yet initialized).
+pub async fn store_set_result(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+    store_fields: &[(&str, serde_json::Value)],
+) -> anyhow::Result<()> {
+    if let Some(ref store) = store {
+        let store_id = store
+            .resolve_task_id(repo, task_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task {} not found in store", task_id))?;
+        store.set_fields(store_id, store_fields).await?;
+    }
+    Ok(())
+}
+
 /// Touch `updated_at` to now so the stuck-task timer is reset after a session exits.
 ///
 /// No-op when the store is unavailable or the task cannot be resolved.
