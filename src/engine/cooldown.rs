@@ -943,7 +943,21 @@ fn parse_retry_at(error_message: &str) -> Option<i64> {
             "%Y-%m-%d %H:%M",     // 2026-03-26 05:55
         ] {
             if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&cleaned, fmt) {
-                let utc = dt.and_utc();
+                // Vendor messages (e.g. Codex) emit times in the machine's local
+                // timezone, not UTC.  Interpret the naive datetime as local time
+                // and convert to UTC so the cooldown expires at the right moment.
+                use chrono::TimeZone;
+                let utc = match chrono::Local.from_local_datetime(&dt) {
+                    chrono::LocalResult::Single(local_dt) => local_dt.with_timezone(&chrono::Utc),
+                    chrono::LocalResult::Ambiguous(earliest, _) => {
+                        // DST fold: pick the earlier (conservative) interpretation
+                        earliest.with_timezone(&chrono::Utc)
+                    }
+                    chrono::LocalResult::None => {
+                        // DST gap: fall back to treating as UTC to avoid panic
+                        dt.and_utc()
+                    }
+                };
                 tracing::info!(
                     retry_at = %utc,
                     raw = date_str,
@@ -1044,7 +1058,26 @@ mod tests {
         let msg = "You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Mar 26th, 2026 5:55 AM.";
         let ts = parse_retry_at(msg);
         assert!(ts.is_some(), "should parse codex retry-at date");
-        // Should be March 26 2026
+
+        // The parsed timestamp must equal "Mar 26 2026 05:55 local" in UTC.
+        // We reconstruct what the function should produce and compare directly.
+        use chrono::TimeZone;
+        let naive = chrono::NaiveDateTime::new(
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 26).unwrap(),
+            chrono::NaiveTime::from_hms_opt(5, 55, 0).unwrap(),
+        );
+        let expected_utc = match chrono::Local.from_local_datetime(&naive) {
+            chrono::LocalResult::Single(local_dt) => local_dt.with_timezone(&chrono::Utc),
+            chrono::LocalResult::Ambiguous(earliest, _) => earliest.with_timezone(&chrono::Utc),
+            chrono::LocalResult::None => naive.and_utc(),
+        };
+        assert_eq!(
+            ts.unwrap(),
+            expected_utc.timestamp(),
+            "timestamp should reflect local-timezone interpretation of the vendor date"
+        );
+
+        // Sanity: the UTC date must still be March 26 (true for all timezones within ±14h)
         let dt = chrono::DateTime::from_timestamp(ts.unwrap(), 0).unwrap();
         use chrono::Datelike;
         assert_eq!(dt.month(), 3);
