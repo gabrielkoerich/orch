@@ -347,14 +347,15 @@ pub async fn prepare_task(
         attempt: next_attempt,
     };
 
-    // Increment attempts counter
-    store::store_set(
+    // Increment attempts counter — must succeed so max_attempts guard cannot be bypassed
+    store::store_set_result(
         store,
         repo,
         task_id,
         &[("attempts", serde_json::json!(next_attempt))],
     )
-    .await;
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to persist attempts counter: {e}"))?;
 
     Ok(TaskInitResult {
         agent_name,

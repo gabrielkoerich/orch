@@ -107,7 +107,6 @@ pub async fn store_set_result_by_id(
 /// Unlike `store_set`, this variant propagates failures so callers can
 /// abort further processing when a critical write (e.g. a watermark) fails.
 /// Returns `Ok(())` when `store` is `None` (store not yet initialized).
-#[allow(dead_code)]
 pub async fn store_set_result(
     store: &Option<Arc<TaskStore>>,
     repo: &str,
