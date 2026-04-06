@@ -19,8 +19,8 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
     output_tokens, input_cost_usd, output_cost_usd, total_cost_usd, \
     model_reroute_chain, limit_reroute_chain, budget_warning, budget_exceeded, \
     memory, delegations, created_at, updated_at, review_session_expected, \
-    review_invocations, push_failures, auto_unblock_count, auto_unblock_last_at, \
-    ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries";
+    review_invocations, needs_review_refires, push_failures, auto_unblock_count, auto_unblock_last_at, \
+    ci_recovery_count, auto_unblock_last_reason, no_code_reroutes";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
 pub(crate) const TASK_COLS_COUNT: usize = 58;
@@ -124,6 +124,8 @@ pub struct Task {
     pub review_cycles: i32,
     pub review_invocations: i32,
     pub review_session_expected: bool,
+    // NeedsReview re-fire counter (incremented by sync catch-up and reset on successful review cycles)
+    pub needs_review_refires: i32,
 
     // Tokens & Cost
     pub input_tokens: i64,
@@ -848,6 +850,7 @@ impl TaskStore {
             "review_agent_failures",
             "review_cycles",
             "review_invocations",
+            "needs_review_refires",
             "review_session_expected",
             "input_tokens",
             "output_tokens",
@@ -866,6 +869,8 @@ impl TaskStore {
             "auto_unblock_count",
             "auto_unblock_last_at",
             "auto_unblock_last_reason",
+            // allow resetting the needs_review_refires counter when tasks transition
+            "needs_review_refires",
             "ci_recovery_count",
             "no_code_reroutes",
             "network_retries",
@@ -920,6 +925,7 @@ impl TaskStore {
             "review_agent_failures",
             "review_cycles",
             "review_invocations",
+            "needs_review_refires",
             "auto_unblock_count",
             "ci_recovery_count",
             "no_code_reroutes",
@@ -960,6 +966,7 @@ impl TaskStore {
             auto_unblock_last_reason = '',
             ci_recovery_count = 0,
             no_code_reroutes = 0,
+            needs_review_refires = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
@@ -992,6 +999,7 @@ impl TaskStore {
             auto_unblock_last_reason = '',
             ci_recovery_count = 0,
             no_code_reroutes = 0,
+            needs_review_refires = 0,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
@@ -1202,6 +1210,7 @@ impl TaskStore {
             "review_agent_failures",
             "review_cycles",
             "review_invocations",
+            "needs_review_refires",
             "review_session_expected",
             "input_tokens",
             "output_tokens",
@@ -1222,7 +1231,7 @@ impl TaskStore {
             "auto_unblock_last_reason",
             "ci_recovery_count",
             "no_code_reroutes",
-            "network_retries",
+            "needs_review_refires",
         ];
 
         for (_, entry_updates) in updates {
@@ -1285,6 +1294,7 @@ impl TaskStore {
             "review_agent_failures",
             "review_cycles",
             "review_invocations",
+            "needs_review_refires",
             "auto_unblock_count",
             "ci_recovery_count",
             "no_code_reroutes",
@@ -1754,6 +1764,7 @@ impl TaskStore {
                 .try_get::<i32, _>("review_session_expected")
                 .unwrap_or(0)
                 != 0,
+            needs_review_refires: row.try_get::<i32, _>("needs_review_refires").unwrap_or(0),
             input_tokens: row.try_get("input_tokens").unwrap_or(0),
             output_tokens: row.try_get("output_tokens").unwrap_or(0),
             input_cost_usd: row.try_get("input_cost_usd").unwrap_or(0.0),

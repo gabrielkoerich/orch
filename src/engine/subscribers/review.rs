@@ -275,6 +275,14 @@ pub fn spawn(
                                     &tid,
                                 )
                                 .await;
+                                // Also reset needs_review_refires so the sync backoff doesn't persist across a successful review
+                                crate::store::store_set(
+                                    &Some(store_c.clone()),
+                                    &repo_s,
+                                    &tid,
+                                    &[("needs_review_refires", serde_json::json!(0))],
+                                )
+                                .await;
 
                                 // Ensure approved PRs do not re-enter the review loop
                                 // when `auto_close_task_on_approval` is disabled.
@@ -307,6 +315,13 @@ pub fn spawn(
                                     &tid,
                                 )
                                 .await;
+                                crate::store::store_set(
+                                    &Some(store_c.clone()),
+                                    &repo_s,
+                                    &tid,
+                                    &[("needs_review_refires", serde_json::json!(0))],
+                                )
+                                .await;
                                 ReviewOutcome::Ok
                             }
                             Ok(ReviewDecision::RequestChanges { .. }) => {
@@ -316,6 +331,13 @@ pub fn spawn(
                                     &Some(store_c.clone()),
                                     &repo_s,
                                     &tid,
+                                )
+                                .await;
+                                crate::store::store_set(
+                                    &Some(store_c.clone()),
+                                    &repo_s,
+                                    &tid,
+                                    &[("needs_review_refires", serde_json::json!(0))],
                                 )
                                 .await;
                                 ReviewOutcome::Ok
