@@ -828,10 +828,15 @@ impl GhHttp {
         &self,
         query: &str,
         extra_headers: &[(&str, &str)],
+        variables: Option<serde_json::Value>,
     ) -> anyhow::Result<serde_json::Value> {
         Self::proactive_throttle_graphql().await;
         Self::check_graphql_backoff()?;
-        let body = serde_json::json!({ "query": query });
+        let body = if let Some(vars) = variables {
+            serde_json::json!({ "query": query, "variables": vars })
+        } else {
+            serde_json::json!({ "query": query })
+        };
         let auth = self.auth_header().await?;
         let mut req = self
             .client
@@ -879,7 +884,15 @@ impl GhHttp {
     // ── Public API (mirrors GhCli) ───────────────────────────────
 
     pub async fn graphql(&self, query: &str) -> anyhow::Result<serde_json::Value> {
-        self.graphql_request(query, &[]).await
+        self.graphql_request(query, &[], None).await
+    }
+
+    pub async fn graphql_with_vars(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.graphql_request(query, &[], Some(variables)).await
     }
 
     pub async fn graphql_with_headers(
@@ -889,7 +902,17 @@ impl GhHttp {
     ) -> anyhow::Result<serde_json::Value> {
         // Convert "Key:Value" strings to (&str, &str) tuples.
         let pairs: Vec<(&str, &str)> = headers.iter().filter_map(|h| h.split_once(':')).collect();
-        self.graphql_request(query, &pairs).await
+        self.graphql_request(query, &pairs, None).await
+    }
+
+    pub async fn graphql_with_headers_and_vars(
+        &self,
+        query: &str,
+        headers: &[&str],
+        variables: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let pairs: Vec<(&str, &str)> = headers.iter().filter_map(|h| h.split_once(':')).collect();
+        self.graphql_request(query, &pairs, Some(variables)).await
     }
 
     /// Verify authentication by fetching the current user.
@@ -1305,22 +1328,25 @@ impl GhHttp {
 
         // Build one alias per branch using positional index to avoid GraphQL
         // alias restrictions on branch names that contain non-identifier chars.
-        let aliases: String = branches
-            .iter()
-            .enumerate()
-            .map(|(i, branch)| {
-                let escaped = branch.replace('\\', "\\\\").replace('"', "\\\"");
-                format!(
-                    r#"b{i}: pullRequests(headRefName: "{escaped}", states: [MERGED], last: 1) {{ nodes {{ merged }} }}"#
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+        // Branch names are passed via variables ($b0, $b1, …) to avoid injection.
+        let mut var_defs = String::new();
+        let mut aliases = String::new();
+        let mut vars = serde_json::json!({ "owner": owner, "name": name });
+        for (i, branch) in branches.iter().enumerate() {
+            var_defs.push_str(&format!(", $b{i}: String!"));
+            aliases.push_str(&format!(
+                r#"b{i}: pullRequests(headRefName: $b{i}, states: [MERGED], last: 1) {{ nodes {{ merged }} }} "#
+            ));
+            vars[format!("b{i}")] = serde_json::Value::String(branch.clone());
+        }
 
-        let query =
-            format!(r#"{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}"#);
+        let query = format!(
+            r#"query($owner: String!, $name: String!{var_defs}) {{
+                repository(owner: $owner, name: $name) {{ {aliases} }}
+            }}"#
+        );
 
-        let resp = self.graphql(&query).await?;
+        let resp = self.graphql_with_vars(&query, vars).await?;
 
         // Surface GraphQL partial errors before checking data structure
         if let Some(errors) = resp.get("errors").and_then(|e| e.as_array()) {
@@ -1540,10 +1566,13 @@ impl GhHttp {
                 .collect::<Vec<_>>()
                 .join("\n  ");
 
-            let query =
-                format!(r#"{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}"#);
+            let query = format!(
+                r#"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"#
+            );
 
-            let resp = self.graphql(&query).await?;
+            let resp = self
+                .graphql_with_vars(&query, serde_json::json!({ "owner": owner, "name": name }))
+                .await?;
             let repo_data = resp
                 .pointer("/data/repository")
                 .ok_or_else(|| anyhow::anyhow!("missing /data/repository in GraphQL response"))?;
@@ -1589,10 +1618,13 @@ impl GhHttp {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let query =
-            format!(r#"{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}"#);
+        let query = format!(
+            r#"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"#
+        );
 
-        let resp = self.graphql(&query).await?;
+        let resp = self
+            .graphql_with_vars(&query, serde_json::json!({ "owner": owner, "name": name }))
+            .await?;
         let repo_data = resp
             .pointer("/data/repository")
             .ok_or_else(|| anyhow::anyhow!("missing /data/repository in GraphQL response"))?;
@@ -1859,19 +1891,21 @@ impl GhHttp {
         let (owner, repo_name) = (parts[0], parts[1]);
 
         // First, get the repository and issue node IDs
-        let query = format!(
-            r#"{{
-                repository(owner: "{}", name: "{}") {{
+        let query = r#"query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
                     id
-                    issue(number: {}) {{
+                    issue(number: $number) {
                         id
-                    }}
-                }}
-            }}"#,
-            owner, repo_name, issue_number
-        );
+                    }
+                }
+            }"#;
+        let vars = serde_json::json!({
+            "owner": owner,
+            "name": repo_name,
+            "number": issue_number,
+        });
 
-        let result = self.graphql(&query).await?;
+        let result = self.graphql_with_vars(query, vars).await?;
 
         let repo_id = result
             .pointer("/data/repository/id")
@@ -1884,20 +1918,22 @@ impl GhHttp {
             .ok_or_else(|| anyhow::anyhow!("failed to get issue node ID"))?;
 
         // Fetch branch ref to get the commit OID required by createLinkedBranch
-        let branch_query = format!(
-            r#"{{
-                repository(owner: "{}", name: "{}") {{
-                    ref(qualifiedName: "refs/heads/{}") {{
-                        target {{
+        let branch_query = r#"query($owner: String!, $name: String!, $ref: String!) {
+                repository(owner: $owner, name: $name) {
+                    ref(qualifiedName: $ref) {
+                        target {
                             oid
-                        }}
-                    }}
-                }}
-            }}"#,
-            owner, repo_name, branch
-        );
+                        }
+                    }
+                }
+            }"#;
+        let branch_vars = serde_json::json!({
+            "owner": owner,
+            "name": repo_name,
+            "ref": format!("refs/heads/{}", branch),
+        });
 
-        let branch_result = self.graphql(&branch_query).await?;
+        let branch_result = self.graphql_with_vars(branch_query, branch_vars).await?;
         let branch_oid = branch_result
             .pointer("/data/repository/ref/target/oid")
             .and_then(|v| v.as_str());
@@ -1908,19 +1944,20 @@ impl GhHttp {
             Some(oid) => oid.to_string(),
             None => {
                 // Get default branch OID as the base for the new branch
-                let default_query = format!(
-                    r#"{{
-                        repository(owner: "{}", name: "{}") {{
-                            defaultBranchRef {{
-                                target {{
+                let default_query = r#"query($owner: String!, $name: String!) {
+                        repository(owner: $owner, name: $name) {
+                            defaultBranchRef {
+                                target {
                                     oid
-                                }}
-                            }}
-                        }}
-                    }}"#,
-                    owner, repo_name
-                );
-                let default_result = self.graphql(&default_query).await?;
+                                }
+                            }
+                        }
+                    }"#;
+                let default_vars = serde_json::json!({
+                    "owner": owner,
+                    "name": repo_name,
+                });
+                let default_result = self.graphql_with_vars(default_query, default_vars).await?;
                 match default_result
                     .pointer("/data/repository/defaultBranchRef/target/oid")
                     .and_then(|v| v.as_str())
@@ -1943,29 +1980,29 @@ impl GhHttp {
 
         // Use createLinkedBranch mutation to link the issue to the existing branch.
         // Required fields: issueId, repositoryId, name (branch name), oid (commit SHA).
-        let mutation = format!(
-            r#"mutation {{
-                createLinkedBranch(input: {{
-                    issueId: "{issue_id}"
-                    repositoryId: "{repo_id}"
-                    name: "{branch}"
-                    oid: "{branch_oid}"
-                }}) {{
-                    linkedBranch {{
+        let mutation = r#"mutation($issueId: ID!, $repositoryId: ID!, $name: String!, $oid: GitObjectID!) {
+                createLinkedBranch(input: {
+                    issueId: $issueId
+                    repositoryId: $repositoryId
+                    name: $name
+                    oid: $oid
+                }) {
+                    linkedBranch {
                         id
-                        ref {{
+                        ref {
                             name
-                        }}
-                    }}
-                }}
-            }}"#,
-            issue_id = issue_id,
-            repo_id = repo_id,
-            branch = branch,
-            branch_oid = branch_oid,
-        );
+                        }
+                    }
+                }
+            }"#;
+        let mutation_vars = serde_json::json!({
+            "issueId": issue_id,
+            "repositoryId": repo_id,
+            "name": branch,
+            "oid": branch_oid,
+        });
 
-        let link_result = self.graphql(&mutation).await;
+        let link_result = self.graphql_with_vars(mutation, mutation_vars).await;
 
         match link_result {
             Ok(result) => {
@@ -2090,22 +2127,21 @@ impl GhHttp {
         let (owner, repo_name) = (parts[0], parts[1]);
 
         // First get the PR node ID
-        let query = format!(
-            r#"{{"query":"query {{ repository(owner:\"{owner}\", name:\"{repo_name}\") {{ pullRequest(number:{pr_number}) {{ id }} }} }}"}}"#
-        );
-        let auth = self.auth_header().await?;
-        let req = self
-            .client
-            .post(format!("{GITHUB_API}/graphql"))
-            .body(query)
-            .header(header::AUTHORIZATION, &auth)
-            .header(header::ACCEPT, "application/vnd.github+json");
-        let make_req = || {
-            req.try_clone()
-                .ok_or_else(|| anyhow::anyhow!("graphql request clone failed"))
-        };
-        let resp = self.send_with_retries(make_req, true).await?;
-        let body: serde_json::Value = resp.json().await?;
+        let pr_query = r#"query($owner: String!, $name: String!, $number: Int!) {
+            repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) { id }
+            }
+        }"#;
+        let body = self
+            .graphql_with_vars(
+                pr_query,
+                serde_json::json!({
+                    "owner": owner,
+                    "name": repo_name,
+                    "number": pr_number,
+                }),
+            )
+            .await?;
         let pr_id = body
             .pointer("/data/repository/pullRequest/id")
             .and_then(|v| v.as_str())
@@ -2113,26 +2149,14 @@ impl GhHttp {
             .to_string();
 
         // Enable auto-merge with squash
-        let mutation = format!(
-            r#"{{"query":"mutation {{ enablePullRequestAutoMerge(input: {{pullRequestId: \"{pr_id}\", mergeMethod: SQUASH}}) {{ pullRequest {{ autoMergeRequest {{ enabledAt }} }} }} }}"}}"#
-        );
-        let req = self
-            .client
-            .post(format!("{GITHUB_API}/graphql"))
-            .body(mutation)
-            .header(header::AUTHORIZATION, &auth)
-            .header(header::ACCEPT, "application/vnd.github+json");
-        let make_req = || {
-            req.try_clone()
-                .ok_or_else(|| anyhow::anyhow!("graphql request clone failed"))
-        };
-        let resp = self.send_with_retries(make_req, true).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("enable auto-merge failed ({status}): {body}");
-        }
-        let body: serde_json::Value = resp.json().await?;
+        let mutation = r#"mutation($prId: ID!) {
+            enablePullRequestAutoMerge(input: {pullRequestId: $prId, mergeMethod: SQUASH}) {
+                pullRequest { autoMergeRequest { enabledAt } }
+            }
+        }"#;
+        let body = self
+            .graphql_with_vars(mutation, serde_json::json!({ "prId": pr_id }))
+            .await?;
         if let Some(errors) = body.get("errors") {
             anyhow::bail!("enable auto-merge GraphQL error: {errors}");
         }
@@ -2166,26 +2190,49 @@ impl GhHttp {
                 break;
             }
 
-            let after_clause = cursor
-                .as_ref()
-                .map(|c| format!(r#", after: "{}""#, c))
-                .unwrap_or_default();
-            let query = format!(
-                r#"{{
-                    repository(owner: "{}", name: "{}") {{
-                        issue(number: {}) {{
-                            subIssues(first: {}{}) {{
-                                nodes {{ number }}
-                                pageInfo {{ hasNextPage endCursor }}
-                            }}
-                        }}
-                    }}
-                }}"#,
-                owner, repo_name, number, page_size, after_clause
-            );
+            let (query, vars) = if let Some(ref c) = cursor {
+                (
+                    r#"query($owner: String!, $name: String!, $number: Int!, $first: Int!, $after: String!) {
+                    repository(owner: $owner, name: $name) {
+                        issue(number: $number) {
+                            subIssues(first: $first, after: $after) {
+                                nodes { number }
+                                pageInfo { hasNextPage endCursor }
+                            }
+                        }
+                    }
+                }"#,
+                    serde_json::json!({
+                        "owner": owner,
+                        "name": repo_name,
+                        "number": number.parse::<i64>().unwrap_or(0),
+                        "first": page_size,
+                        "after": c,
+                    }),
+                )
+            } else {
+                (
+                    r#"query($owner: String!, $name: String!, $number: Int!, $first: Int!) {
+                    repository(owner: $owner, name: $name) {
+                        issue(number: $number) {
+                            subIssues(first: $first) {
+                                nodes { number }
+                                pageInfo { hasNextPage endCursor }
+                            }
+                        }
+                    }
+                }"#,
+                    serde_json::json!({
+                        "owner": owner,
+                        "name": repo_name,
+                        "number": number.parse::<i64>().unwrap_or(0),
+                        "first": page_size,
+                    }),
+                )
+            };
 
             let result = self
-                .graphql_with_headers(&query, &["GraphQL-Features:sub_issues"])
+                .graphql_with_headers_and_vars(query, &["GraphQL-Features:sub_issues"], vars)
                 .await?;
 
             let sub_issues_data = result
@@ -2361,10 +2408,13 @@ impl GhHttp {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let query =
-            format!(r#"{{ repository(owner: "{owner}", name: "{name}") {{ {aliases} }} }}"#);
+        let query = format!(
+            r#"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"#
+        );
 
-        let resp = self.graphql(&query).await?;
+        let resp = self
+            .graphql_with_vars(&query, serde_json::json!({ "owner": owner, "name": name }))
+            .await?;
         let repo_data = resp
             .pointer("/data/repository")
             .ok_or_else(|| anyhow::anyhow!("missing /data/repository in GraphQL response"))?;
@@ -2516,8 +2566,9 @@ impl GhHttp {
                 break;
             }
 
-            let query = build_pr_issue_comments_page_query(owner, name, pr_number, &current_cursor);
-            let resp = self.graphql(&query).await?;
+            let (query, vars) =
+                build_pr_issue_comments_page_query(owner, name, pr_number, &current_cursor);
+            let resp = self.graphql_with_vars(&query, vars).await?;
             let comments_data = resp
                 .pointer("/data/repository/pullRequest/comments")
                 .ok_or_else(|| {
@@ -2742,24 +2793,32 @@ fn build_pr_issue_comments_page_query(
     name: &str,
     pr_number: u64,
     after_cursor: &str,
-) -> String {
-    format!(
-        r#"{{ repository(owner: "{owner}", name: "{name}") {{
-  pullRequest(number: {pr_number}) {{
-    comments(first: 100, after: "{after_cursor}") {{
-      nodes {{
-        databaseId
-        author {{ login }}
-        body
-        createdAt
-        updatedAt
-        url
-      }}
-      pageInfo {{ hasNextPage endCursor }}
-    }}
-  }}
-}} }}"#
-    )
+) -> (String, serde_json::Value) {
+    let query = r#"query($owner: String!, $name: String!, $number: Int!, $after: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(first: 100, after: $after) {
+        nodes {
+          databaseId
+          author { login }
+          body
+          createdAt
+          updatedAt
+          url
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}"#
+    .to_string();
+    let vars = serde_json::json!({
+        "owner": owner,
+        "name": name,
+        "number": pr_number,
+        "after": after_cursor,
+    });
+    (query, vars)
 }
 
 fn connection_has_next_page(page_info: Option<&serde_json::Value>) -> bool {
@@ -2905,8 +2964,7 @@ mod tests {
 
     #[test]
     fn batch_get_issue_states_query_includes_labels_pagination() {
-        let issue_numbers = [1, 2, 3];
-        let expected = r#"{ repository(owner: "owner", name: "repo") { issue1: issue(number: 1) { state labels(first: 100) { nodes { name } } } issue2: issue(number: 2) { state labels(first: 100) { nodes { name } } } issue3: issue(number: 3) { state labels(first: 100) { nodes { name } } } } }"#;
+        let issue_numbers = [1u64, 2, 3];
 
         let aliases: String = issue_numbers
             .iter()
@@ -2916,8 +2974,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let query = format!(r#"{{ repository(owner: "owner", name: "repo") {{ {aliases} }} }}"#);
-        assert_eq!(query, expected);
+        let query = format!(
+            r#"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"#
+        );
+        assert!(query.contains("$owner"));
+        assert!(query.contains("$name"));
+        assert!(query.contains("issue1: issue(number: 1)"));
+        assert!(query.contains("issue3: issue(number: 3)"));
+        assert!(query.contains("labels(first: 100)"));
     }
 
     #[test]
@@ -2935,12 +2999,16 @@ mod tests {
 
     #[test]
     fn pr_issue_comments_page_query_uses_cursor_pagination() {
-        let query = build_pr_issue_comments_page_query("owner", "repo", 42, "cursor123");
+        let (query, vars) = build_pr_issue_comments_page_query("owner", "repo", 42, "cursor123");
 
-        assert!(query.contains("pullRequest(number: 42)"));
-        assert!(query.contains("comments(first: 100, after: \"cursor123\")"));
+        assert!(query.contains("pullRequest(number: $number)"));
+        assert!(query.contains("comments(first: 100, after: $after)"));
         assert!(query.contains("pageInfo { hasNextPage endCursor }"));
         assert!(query.contains("updatedAt"));
+        assert_eq!(vars["owner"], "owner");
+        assert_eq!(vars["name"], "repo");
+        assert_eq!(vars["number"], 42);
+        assert_eq!(vars["after"], "cursor123");
     }
 
     #[test]
