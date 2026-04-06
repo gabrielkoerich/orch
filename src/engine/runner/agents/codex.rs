@@ -503,6 +503,7 @@ mod tests {
             disallowed_tools: vec![],
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         };
         let cmd = runner().build_command(None, "", "/tmp/sys.txt", "/tmp/msg.txt", &perms);
         assert!(

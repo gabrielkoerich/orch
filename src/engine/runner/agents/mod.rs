@@ -38,6 +38,11 @@ pub struct PermissionRules {
     /// When set, Edit/Write tools are scoped to these paths only.
     /// Set dynamically per invocation (not from config).
     pub allowed_edit_paths: Vec<PathBuf>,
+    /// Restrict to orchestration-only operations — denies Read, Glob, Grep,
+    /// and Bash commands for browsing/reading files (ls, cat, find, etc.).
+    /// Agents translate this into their native permission model.
+    #[allow(dead_code)]
+    pub deny_read_only: bool,
 }
 
 /// Sandbox level — how much filesystem access the agent gets.
@@ -63,6 +68,7 @@ impl Default for PermissionRules {
             ],
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         }
     }
 }
@@ -100,6 +106,39 @@ impl PermissionRules {
         }
 
         rules
+    }
+
+    /// Restriction preset for control sessions: denies Read, Glob, Grep, and
+    /// Bash commands that read files or list directories (ls, cat, find, etc.).
+    ///
+    /// The agent remains autonomous but is prevented from browsing or reading
+    /// arbitrary files on the host machine. Translation into agent-native flags
+    /// is handled by each `AgentRunner::build_command()` implementation.
+    pub fn deny_read_only() -> Self {
+        Self {
+            autonomous: true,
+            sandbox: SandboxLevel::WorkspaceWrite,
+            disallowed_tools: vec![
+                "Bash(rm *)".to_string(),
+                "Bash(rm -*)".to_string(),
+                "Bash(git push*)".to_string(),
+                "Bash(ls *)".to_string(),
+                "Bash(ls)".to_string(),
+                "Bash(find *)".to_string(),
+                "Bash(cat *)".to_string(),
+                "Bash(head *)".to_string(),
+                "Bash(tail *)".to_string(),
+                "Bash(fzf *)".to_string(),
+                "Bash(less *)".to_string(),
+                "Bash(more *)".to_string(),
+                "Read".to_string(),
+                "Glob".to_string(),
+                "Grep".to_string(),
+            ],
+            allowed_tools: vec![],
+            allowed_edit_paths: vec![],
+            deny_read_only: true,
+        }
     }
 }
 
@@ -1541,6 +1580,7 @@ mod tests {
             disallowed_tools: vec![],
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         };
         let sys = "/tmp/sys.md";
         let msg = "/tmp/msg.md";
@@ -1571,6 +1611,7 @@ mod tests {
             disallowed_tools: vec![],
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         };
         let sys = "/tmp/sys.md";
         let msg = "/tmp/msg.md";
@@ -1601,6 +1642,7 @@ mod tests {
             disallowed_tools: vec![],
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         };
         let codex = get_runner("codex");
         let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -1624,6 +1666,7 @@ mod tests {
                 "Bash".to_string(),
             ],
             allowed_edit_paths: vec![PathBuf::from("/home/user/worktree")],
+            deny_read_only: false,
         };
         let claude = get_runner("claude");
         let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -1650,6 +1693,7 @@ mod tests {
             disallowed_tools: vec![],
             allowed_tools: vec![],
             allowed_edit_paths: vec![PathBuf::from("/home/user/project")],
+            deny_read_only: false,
         };
         let codex = get_runner("codex");
         let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -1668,6 +1712,7 @@ mod tests {
             disallowed_tools: vec![],
             allowed_tools: vec![],
             allowed_edit_paths: vec![PathBuf::from("/home/user/project")],
+            deny_read_only: false,
         };
         let opencode = get_runner("opencode");
         let cmd = opencode.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -1690,6 +1735,7 @@ mod tests {
             ],
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         };
         let claude = get_runner("claude");
         let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -1707,6 +1753,7 @@ mod tests {
             disallowed_tools: vec!["Bash(rm *)".to_string(), "WebFetch".to_string()],
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         };
         let codex = get_runner("codex");
         let cmd = codex.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -1725,6 +1772,7 @@ mod tests {
             disallowed_tools: vec![],
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         };
         let claude = get_runner("claude");
         let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
@@ -1743,6 +1791,7 @@ mod tests {
             disallowed_tools: vec!["Bash(rm *)".to_string()],
             allowed_tools: vec![],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         };
         let sys = "/tmp/sys.md";
         let msg = "/tmp/msg.md";
@@ -1770,6 +1819,7 @@ mod tests {
             disallowed_tools: vec![],
             allowed_tools: vec!["Edit".to_string(), "Bash".to_string(), "git".to_string()],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         };
 
         for agent in &["kimi", "minimax"] {
@@ -1803,6 +1853,7 @@ mod tests {
                 "git".to_string(),
             ],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         };
 
         let claude = get_runner("claude");
@@ -1826,6 +1877,7 @@ mod tests {
             disallowed_tools: vec![],
             allowed_tools: vec!["Edit".to_string(), "git".to_string()],
             allowed_edit_paths: vec![],
+            deny_read_only: false,
         };
 
         let codex = get_runner("codex");
@@ -1915,5 +1967,68 @@ mod tests {
                 "supervised config → --ask-for-approval suggest, got: {cmd}"
             );
         }
+    }
+
+    // ── deny_read_only preset ───────────────────────────────────
+
+    /// Test that deny_read_only() sets the right disallowed tools for control sessions.
+    #[test]
+    fn deny_read_only_blocks_reading_tools() {
+        let perms = PermissionRules::deny_read_only();
+
+        let read_tools = [
+            "Bash(ls *)",
+            "Bash(ls)",
+            "Bash(find *)",
+            "Bash(cat *)",
+            "Bash(head *)",
+            "Bash(tail *)",
+            "Bash(fzf *)",
+            "Bash(less *)",
+            "Bash(more *)",
+            "Read",
+            "Glob",
+            "Grep",
+        ];
+
+        for tool in read_tools {
+            assert!(
+                perms.disallowed_tools.contains(&tool.to_string()),
+                "deny_read_only should block {tool}, got: {:?}",
+                perms.disallowed_tools
+            );
+        }
+    }
+
+    /// Test that deny_read_only() produces correct Claude command for control session.
+    #[test]
+    fn deny_read_only_claude_command() {
+        let perms = PermissionRules::deny_read_only();
+        let claude = get_runner("claude");
+        let cmd = claude.build_command(None, "", "/tmp/sys.md", "/tmp/msg.md", &perms);
+
+        // Should contain Read, Glob, Grep disallow patterns
+        assert!(
+            cmd.contains("Read"),
+            "should block Read for control session"
+        );
+        assert!(
+            cmd.contains("Glob"),
+            "should block Glob for control session"
+        );
+        assert!(
+            cmd.contains("Grep"),
+            "should block Grep for control session"
+        );
+        // Should block ls
+        assert!(
+            cmd.contains("Bash(ls") || cmd.contains("Bash(ls *)"),
+            "should block ls"
+        );
+        // Should still have bypassPermissions (autonomous)
+        assert!(
+            cmd.contains("--permission-mode bypassPermissions"),
+            "should be autonomous (bypassPermissions)"
+        );
     }
 }
