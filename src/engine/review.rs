@@ -1365,6 +1365,7 @@ pub(crate) async fn review_and_merge(
                     error = %e,
                     agent = %review_agent,
                     output = %text_for_review.chars().take(300).collect::<String>(),
+                    raw_output = %raw_output.chars().take(1000).collect::<String>(),
                     "failed to parse review response"
                 );
                 if let Some(rid) = run_id {
