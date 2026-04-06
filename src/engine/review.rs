@@ -1270,7 +1270,8 @@ pub(crate) async fn review_and_merge(
     // Step 2: get the text to parse — prefer the clean result_text from the
     // per-agent extractor; fall back to raw output if extraction yielded nothing.
     let text_for_review = agent_result_for_tokens
-        .map(|r| r.result_text)
+        .as_ref()
+        .map(|r| r.result_text.clone())
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| {
             tracing::debug!(
@@ -1295,8 +1296,55 @@ pub(crate) async fn review_and_merge(
                 );
                 r
             } else {
-                // Check if the text contains a rate limit or auth error before returning parse
-                // error. These should trigger a cooldown, not increment the failure counter.
+                // Per-agent extractor already detected is_error — use the classifier
+                // to get the proper error type (rate limit, auth, etc.) instead of
+                // re-scanning with generic pattern matchers.
+                let already_errored = agent_result_for_tokens
+                    .as_ref()
+                    .map(|r| r.is_error)
+                    .unwrap_or(false);
+                if already_errored {
+                    let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
+                    match &err {
+                        runner::agents::AgentError::RateLimit { .. }
+                        | runner::agents::AgentError::Auth { .. } => {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                agent = %review_agent,
+                                "review agent hit error (from per-agent extractor) — adding to cooldown"
+                            );
+                            runner::response::record_agent_failure_with_message(
+                                &review_agent,
+                                &err.to_string(),
+                            )
+                            .await;
+                        }
+                        _ => {}
+                    }
+                    tracing::error!(
+                        task_id = task.id.0,
+                        error = %err,
+                        "review agent error from per-agent extractor"
+                    );
+                    if let Some(rid) = run_id {
+                        let _ = store
+                            .complete_run(&CompleteRun {
+                                run_id: rid,
+                                exit_code: Some(exit_code),
+                                stdout: &raw_output,
+                                stderr: &stderr,
+                                parsed: &text_for_review,
+                                outcome: "failed",
+                                error: &format!("per-agent error: {err}"),
+                                tokens: agent_token_usage,
+                            })
+                            .await;
+                    }
+                    return Ok(ReviewDecision::Failed(format!("per-agent error: {err}")));
+                }
+
+                // Fall back to generic pattern detection only when the per-agent
+                // extractor didn't flag an error.
                 if let Some(runner::agents::AgentError::RateLimit { message }) =
                     runner::agents::patterns::detect_rate_limit(&text_for_review)
                 {
