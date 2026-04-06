@@ -703,9 +703,19 @@ pub(crate) async fn tick_recover_stuck_tasks(
     }
 
     // Recover internal (SQLite) tasks stuck in in_review.
-    let internal_in_review = task_manager
+    let internal_in_review = match task_manager
         .list_internal_by_status(DbStatus::InReview)
-        .await?;
+        .await
+    {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                "failed to list internal in_review tasks for stuck recovery"
+            );
+            vec![]
+        }
+    };
     for task in &internal_in_review {
         let task_id = task.id.0.clone();
         if !review_session_expected(store, repo, &task_id).await {
