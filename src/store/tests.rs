@@ -416,6 +416,36 @@ async fn helper_store_set_writes_fields() {
 }
 
 #[tokio::test]
+async fn helper_store_set_by_id_writes_fields() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("90b".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Store set by id test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let opt_store = Some(store.clone());
+    store_set_by_id(
+        &opt_store,
+        id,
+        &[
+            ("branch", serde_json::json!("fix-bug-by-id")),
+            ("worktree", serde_json::json!("/tmp/wt-by-id")),
+        ],
+    )
+    .await;
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.branch, "fix-bug-by-id");
+    assert_eq!(task.worktree, "/tmp/wt-by-id");
+}
+
+#[tokio::test]
 async fn helper_store_set_ignores_unknown_task() {
     let store = Arc::new(TaskStore::open_memory().await.unwrap());
     let opt_store = Some(store);
@@ -505,6 +535,35 @@ async fn helper_store_reset_failure_counters_preserves_review_cycles() {
     assert_eq!(task.review_invocations, 0);
     assert_eq!(task.attempts, 0);
     assert_eq!(task.merge_conflict_retries, 0);
+}
+
+#[tokio::test]
+async fn helper_store_increment_by_id_returns_new_value() {
+    let store = Arc::new(TaskStore::open_memory().await.unwrap());
+    let id = store
+        .create(&NewTask {
+            external_id: Some("73b".to_string()),
+            repo: "owner/repo".to_string(),
+            origin: "github".to_string(),
+            title: "Increment by id test".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let opt_store = Some(store.clone());
+    let v1 = store_increment_by_id(&opt_store, id, "attempts")
+        .await
+        .unwrap();
+    let v2 = store_increment_by_id(&opt_store, id, "attempts")
+        .await
+        .unwrap();
+
+    assert_eq!(v1, 1);
+    assert_eq!(v2, 2);
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.attempts, 2);
 }
 
 #[tokio::test]

@@ -30,7 +30,8 @@ use crate::github::http::GhHttp;
 use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview};
 use crate::store::TaskStore;
 use crate::store::{
-    opt_store_get_task, store_increment, store_reset_failure_counters, store_set, store_set_result,
+    opt_store_get_task_by_id, store_increment_by_id, store_reset_failure_counters, store_set_by_id,
+    store_set_result_by_id,
 };
 use dashmap::DashSet;
 use std::collections::HashMap;
@@ -80,6 +81,7 @@ pub(crate) async fn review_open_prs(
 
     struct ReadyTask {
         task: crate::backends::ExternalTask,
+        store_id: i64,
         stored: crate::store::Task,
         branch: String,
         /// `Some` = already stored in DB, `None` = needs REST lookup.
@@ -101,7 +103,38 @@ pub(crate) async fn review_open_prs(
             continue;
         }
 
-        let stored = opt_store_get_task(&Some(Arc::clone(store)), repo, task_id).await;
+        let store_id = match store.resolve_task_id(repo, task_id).await {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                tracing::warn!(
+                    task_id,
+                    "in_review task missing from store — setting needs_review"
+                );
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::NeedsReview)
+                    .await
+                {
+                    tracing::warn!(task_id, err = %e, "failed to update status");
+                }
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    task_id,
+                    err = %e,
+                    "failed to resolve in_review task in store — setting needs_review"
+                );
+                if let Err(e) = task_manager
+                    .update_task_status(&task.id, Status::NeedsReview)
+                    .await
+                {
+                    tracing::warn!(task_id, err = %e, "failed to update status");
+                }
+                continue;
+            }
+        };
+
+        let stored = opt_store_get_task_by_id(&Some(Arc::clone(store)), store_id).await;
         let stored = match stored {
             Some(t) => t,
             None => {
@@ -138,6 +171,7 @@ pub(crate) async fn review_open_prs(
         let stored_pr_number = stored.pr_number.map(|n| n as u64);
         ready_tasks.push(ReadyTask {
             task,
+            store_id,
             stored,
             branch,
             pr_number: stored_pr_number,
@@ -173,10 +207,9 @@ pub(crate) async fn review_open_prs(
             match result {
                 Ok(Some(n)) => {
                     ready_tasks[task_idx].pr_number = Some(*n);
-                    store_set(
+                    store_set_by_id(
                         &Some(Arc::clone(store)),
-                        repo,
-                        &task_id,
+                        ready_tasks[task_idx].store_id,
                         &[("pr_number", serde_json::json!(*n as i64))],
                     )
                     .await;
@@ -262,10 +295,9 @@ pub(crate) async fn review_open_prs(
                     continue;
                 }
 
-                let reroutes = match store_increment(
+                let reroutes = match store_increment_by_id(
                     &Some(Arc::clone(store)),
-                    repo,
-                    task_id,
+                    task_info.store_id,
                     "no_code_reroutes",
                 )
                 .await
@@ -288,10 +320,9 @@ pub(crate) async fn review_open_prs(
                         "no PR or code changes after {}/{} reroute attempts",
                         reroutes, max_reroutes
                     );
-                    store_set(
+                    store_set_by_id(
                         &Some(Arc::clone(store)),
-                        repo,
-                        task_id,
+                        task_info.store_id,
                         &[
                             ("agent", serde_json::json!(null)),
                             ("model", serde_json::json!(null)),
@@ -387,10 +418,9 @@ pub(crate) async fn review_open_prs(
         };
 
         // Persist PR number (idempotent if already stored).
-        store_set(
+        store_set_by_id(
             &Some(Arc::clone(store)),
-            repo,
-            task_id,
+            task_info.store_id,
             &[("pr_number", serde_json::json!(pr_number as i64))],
         )
         .await;
@@ -461,10 +491,9 @@ pub(crate) async fn review_open_prs(
                             retries,
                             "PR approved but merge conflict retry limit reached — blocking for human review"
                         );
-                        store_set(
+                        store_set_by_id(
                             &Some(Arc::clone(store)),
-                            repo,
-                            task_id,
+                            task_info.store_id,
                             &[
                                 (
                                     "block_reason",
@@ -497,10 +526,9 @@ pub(crate) async fn review_open_prs(
                         retries,
                         "PR approved but has merge conflicts — re-triggering review agent to rebase"
                     );
-                    if let Err(e) = store_increment(
+                    if let Err(e) = store_increment_by_id(
                         &Some(Arc::clone(store)),
-                        repo,
-                        task_id,
+                        task_info.store_id,
                         "merge_conflict_retries",
                     )
                     .await
@@ -619,10 +647,9 @@ pub(crate) async fn review_open_prs(
                         continue;
                     }
                     tracing::info!(task_id, pr_number, retries, "PR approved but has merge conflicts — re-triggering review agent to rebase (auto_close disabled)");
-                    if let Err(e) = store_increment(
+                    if let Err(e) = store_increment_by_id(
                         &Some(Arc::clone(store)),
-                        repo,
-                        task_id,
+                        task_info.store_id,
                         "merge_conflict_retries",
                     )
                     .await
@@ -808,7 +835,8 @@ pub(crate) async fn review_open_prs(
             if let Some(ref ts) = new_comment_review_ts {
                 fields.push(("last_comment_review_ts", serde_json::json!(ts)));
             }
-            if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, task_id, &fields).await
+            if let Err(e) =
+                store_set_result_by_id(&Some(Arc::clone(store)), task_info.store_id, &fields).await
             {
                 tracing::warn!(
                     task_id,

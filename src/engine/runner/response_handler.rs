@@ -182,6 +182,21 @@ pub async fn handle_success(
         "agent completed successfully"
     );
 
+    // Resolve numeric store_id once so we can reuse it for multiple store ops
+    // in this hot path and avoid repeated external_id -> store_id SQL lookups.
+    let store_id_opt: Option<i64> = if let Some(ref st) = store {
+        match st.resolve_task_id(repo, task_id).await {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "failed to resolve task id for store operations");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Auto-commit, push, create PR
     let mut has_pr = false;
     let mut has_pushed = false;
@@ -192,13 +207,18 @@ pub async fn handle_success(
         {
             tracing::error!(task_id, error = ?e, "auto commit failed");
             let msg = format!("auto commit failed: {e}");
-            store::store_set(
-                store,
-                repo,
-                task_id,
-                &[("last_error", serde_json::json!(msg))],
-            )
-            .await;
+            if let Some(store_id) = store_id_opt {
+                store::store_set_by_id(store, store_id, &[("last_error", serde_json::json!(msg))])
+                    .await;
+            } else {
+                store::store_set(
+                    store,
+                    repo,
+                    task_id,
+                    &[("last_error", serde_json::json!(msg))],
+                )
+                .await;
+            }
         }
 
         // Skip push + PR if there are no commits ahead of the default branch.
@@ -212,18 +232,34 @@ pub async fn handle_success(
             );
             // Clear stale push failure from previous runs
             // Load stored task once to inspect last_error (avoid repeated DB reads)
-            let last_err = store::opt_store_get_task(store, repo, task_id)
-                .await
-                .map(|t| t.last_error)
-                .unwrap_or_default();
+            let last_err = if let Some(store_id) = store_id_opt {
+                store::opt_store_get_task_by_id(store, store_id)
+                    .await
+                    .map(|t| t.last_error)
+                    .unwrap_or_default()
+            } else {
+                store::opt_store_get_task(store, repo, task_id)
+                    .await
+                    .map(|t| t.last_error)
+                    .unwrap_or_default()
+            };
             if last_err.contains("push failed") {
-                store::store_set(
-                    store,
-                    repo,
-                    task_id,
-                    &[("last_error", serde_json::json!(""))],
-                )
-                .await;
+                if let Some(store_id) = store_id_opt {
+                    store::store_set_by_id(
+                        store,
+                        store_id,
+                        &[("last_error", serde_json::json!(""))],
+                    )
+                    .await;
+                } else {
+                    store::store_set(
+                        store,
+                        repo,
+                        task_id,
+                        &[("last_error", serde_json::json!(""))],
+                    )
+                    .await;
+                }
             }
         }
 
@@ -251,63 +287,131 @@ pub async fn handle_success(
             match git_ops::push_branch(&wt.work_dir, &wt.branch, &wt.default_branch).await {
                 Ok(_) => {
                     has_pushed = true;
-                    store::store_log_activity(
-                        store,
-                        repo,
-                        task_id,
-                        "push",
-                        None,
-                        None,
-                        Some(agent_name),
-                        model_name,
-                        Some(&serde_json::json!({
-                            "status": "ok",
-                            "branch": wt.branch,
-                            "default_branch": wt.default_branch,
-                        })),
-                    )
-                    .await;
+                    if let Some(ref s) = store {
+                        if let Some(store_id) = store_id_opt {
+                            if let Err(e) = s
+                                .append_activity(
+                                    store_id,
+                                    "push",
+                                    None,
+                                    None,
+                                    Some(agent_name),
+                                    model_name,
+                                    Some(&serde_json::json!({
+                                        "status": "ok",
+                                        "branch": wt.branch,
+                                        "default_branch": wt.default_branch,
+                                    })),
+                                )
+                                .await
+                            {
+                                tracing::warn!(task_id, event_type = "push", error = %e, "store append_activity failed");
+                            }
+                        } else {
+                            store::store_log_activity(
+                                store,
+                                repo,
+                                task_id,
+                                "push",
+                                None,
+                                None,
+                                Some(agent_name),
+                                model_name,
+                                Some(&serde_json::json!({
+                                    "status": "ok",
+                                    "branch": wt.branch,
+                                    "default_branch": wt.default_branch,
+                                })),
+                            )
+                            .await;
+                        }
+                    }
                     // Clear any stale push failure from a previous run so review_and_merge
                     // does not incorrectly block an approved task.
-                    store::store_set(
-                        store,
-                        repo,
-                        task_id,
-                        &[
-                            ("last_error", serde_json::json!("")),
-                            ("push_failures", serde_json::json!(0)),
-                        ],
-                    )
-                    .await;
+                    if let Some(store_id) = store_id_opt {
+                        store::store_set_by_id(
+                            store,
+                            store_id,
+                            &[
+                                ("last_error", serde_json::json!("")),
+                                ("push_failures", serde_json::json!(0)),
+                            ],
+                        )
+                        .await;
+                    } else {
+                        store::store_set(
+                            store,
+                            repo,
+                            task_id,
+                            &[
+                                ("last_error", serde_json::json!("")),
+                                ("push_failures", serde_json::json!(0)),
+                            ],
+                        )
+                        .await;
+                    }
                     true
                 }
                 Err(e) => {
                     tracing::error!(task_id, error = ?e, "push failed");
-                    store::store_log_activity(
-                        store,
-                        repo,
-                        task_id,
-                        "push",
-                        None,
-                        None,
-                        Some(agent_name),
-                        model_name,
-                        Some(&serde_json::json!({
-                            "status": "error",
-                            "branch": wt.branch,
-                            "default_branch": wt.default_branch,
-                            "error": e.to_string(),
-                        })),
-                    )
-                    .await;
+                    if let Some(ref s) = store {
+                        if let Some(store_id) = store_id_opt {
+                            if let Err(e) = s
+                                .append_activity(
+                                    store_id,
+                                    "push",
+                                    None,
+                                    None,
+                                    Some(agent_name),
+                                    model_name,
+                                    Some(&serde_json::json!({
+                                        "status": "error",
+                                        "branch": wt.branch,
+                                        "default_branch": wt.default_branch,
+                                        "error": e.to_string(),
+                                    })),
+                                )
+                                .await
+                            {
+                                tracing::warn!(task_id, event_type = "push", error = %e, "store append_activity failed");
+                            }
+                        } else {
+                            store::store_log_activity(
+                                store,
+                                repo,
+                                task_id,
+                                "push",
+                                None,
+                                None,
+                                Some(agent_name),
+                                model_name,
+                                Some(&serde_json::json!({
+                                    "status": "error",
+                                    "branch": wt.branch,
+                                    "default_branch": wt.default_branch,
+                                    "error": e.to_string(),
+                                })),
+                            )
+                            .await;
+                        }
+                    }
                     let msg = format!("push failed: {e}");
-                    store::store_set(
-                        store,
-                        repo,
-                        task_id,
-                        &[("last_error", serde_json::json!(msg))],
-                    )
-                    .await;
+                    if let Some(store_id) = store_id_opt {
+                        store::store_set_by_id(
+                            store,
+                            store_id,
+                            &[("last_error", serde_json::json!(msg))],
+                        )
+                        .await;
+                    } else {
+                        store::store_set(
+                            store,
+                            repo,
+                            task_id,
+                            &[("last_error", serde_json::json!(msg))],
+                        )
+                        .await;
+                    }
                     false
                 }
             }
@@ -418,13 +522,22 @@ pub async fn handle_success(
 
     // Store delegations in store if present (processed by run_with_context)
     if !resp.delegations.is_empty() {
-        store::store_set(
-            store,
-            repo,
-            task_id,
-            &[("delegations", serde_json::json!(resp.delegations))],
-        )
-        .await;
+        if let Some(store_id) = store_id_opt {
+            store::store_set_by_id(
+                store,
+                store_id,
+                &[("delegations", serde_json::json!(resp.delegations))],
+            )
+            .await;
+        } else {
+            store::store_set(
+                store,
+                repo,
+                task_id,
+                &[("delegations", serde_json::json!(resp.delegations))],
+            )
+            .await;
+        }
     }
 
     // Store result in task store
@@ -441,10 +554,17 @@ pub async fn handle_success(
     // Applies regardless of agent-reported status — push failures must be
     // surfaced so task_runs records them correctly and the task is rerouted.
     // Read last_error once (reuse the value read earlier if available)
-    let stored_last_error = store::opt_store_get_task(store, repo, task_id)
-        .await
-        .map(|t| t.last_error)
-        .unwrap_or_default();
+    let stored_last_error = if let Some(store_id) = store_id_opt {
+        store::opt_store_get_task_by_id(store, store_id)
+            .await
+            .map(|t| t.last_error)
+            .unwrap_or_default()
+    } else {
+        store::opt_store_get_task(store, repo, task_id)
+            .await
+            .map(|t| t.last_error)
+            .unwrap_or_default()
+    };
 
     let push_failed = !has_pushed && has_commits && stored_last_error.contains("push failed");
 
@@ -476,14 +596,23 @@ pub async fn handle_success(
     // increment this retry counter for them so that later normal push failures
     // are not prematurely blocked.
     let push_failures: u64 = if push_failed && !is_workflow_scope_failure {
-        match store::store_increment(store, repo, task_id, "push_failures").await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(task_id, err = %e, "failed to increment push_failures — skipping push-failure based reroute this tick");
-                // Treat as unknown: do not escalate this tick. Use 0 as safe fallback
-                // for logging, but decision to reroute/block will be skipped earlier.
-                0
+        match store_id_opt {
+            Some(store_id) => {
+                match store::store_increment_by_id(store, store_id, "push_failures").await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(task_id, err = %e, "failed to increment push_failures — skipping push-failure based reroute this tick");
+                        0
+                    }
+                }
             }
+            None => match store::store_increment(store, repo, task_id, "push_failures").await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(task_id, err = %e, "failed to increment push_failures — skipping push-failure based reroute this tick");
+                    0
+                }
+            },
         }
     } else {
         0
@@ -517,15 +646,23 @@ pub async fn handle_success(
             max_reroutes,
             "agent reported done but produced no code changes on external task requiring PR"
         );
-        match store::store_increment(store, repo, task_id, "no_code_reroutes").await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(task_id, err = %e, "failed to increment no_code_reroutes — skipping reroute/block decision this tick");
-                // On DB error, avoid treating this as 0 (which would allow silent retries).
-                // Use a sentinel 0 so downstream code that compares to max will not block,
-                // and we've logged the issue so the tick can be retried later.
-                0
+        match store_id_opt {
+            Some(store_id) => {
+                match store::store_increment_by_id(store, store_id, "no_code_reroutes").await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(task_id, err = %e, "failed to increment no_code_reroutes — skipping reroute/block decision this tick");
+                        0
+                    }
+                }
             }
+            None => match store::store_increment(store, repo, task_id, "no_code_reroutes").await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(task_id, err = %e, "failed to increment no_code_reroutes — skipping reroute/block decision this tick");
+                    0
+                }
+            },
         }
     } else {
         0
@@ -557,34 +694,64 @@ pub async fn handle_success(
             "push failed: token lacks `workflow` OAuth scope — blocking immediately \
              (rerouting would not help)"
         );
-        store::store_set(
-            store,
-            repo,
-            task_id,
-            &[(
-                "last_error",
-                serde_json::json!(format!(
-                    "push failed: GitHub token lacks `workflow` OAuth scope. \
-                     The agent modified .github/workflows/ files but the token cannot push them. \
-                     Fix: add `workflow` scope to your GitHub token, or use a GitHub App for auth. \
-                     Original error: {}",
-                    stored_last_error
-                )),
-            )],
-        )
-        .await;
+        if let Some(store_id) = store_id_opt {
+            store::store_set_by_id(
+                store,
+                store_id,
+                &[(
+                    "last_error",
+                    serde_json::json!(format!(
+                        "push failed: GitHub token lacks `workflow` OAuth scope. \
+                         The agent modified .github/workflows/ files but the token cannot push them. \
+                         Fix: add `workflow` scope to your GitHub token, or use a GitHub App for auth. \
+                         Original error: {}",
+                        stored_last_error
+                    )),
+                )],
+            )
+            .await;
+        } else {
+            store::store_set(
+                store,
+                repo,
+                task_id,
+                &[(
+                    "last_error",
+                    serde_json::json!(format!(
+                        "push failed: GitHub token lacks `workflow` OAuth scope. \
+                         The agent modified .github/workflows/ files but the token cannot push them. \
+                         Fix: add `workflow` scope to your GitHub token, or use a GitHub App for auth. \
+                         Original error: {}",
+                        stored_last_error
+                    )),
+                )],
+            )
+            .await;
+        }
     } else if push_failed {
         // Clear agent and model so router picks a different one on reroute (#1604)
-        store::store_set(
-            store,
-            repo,
-            task_id,
-            &[
-                ("agent", serde_json::json!(null)),
-                ("model", serde_json::json!(null)),
-            ],
-        )
-        .await;
+        if let Some(store_id) = store_id_opt {
+            store::store_set_by_id(
+                store,
+                store_id,
+                &[
+                    ("agent", serde_json::json!(null)),
+                    ("model", serde_json::json!(null)),
+                ],
+            )
+            .await;
+        } else {
+            store::store_set(
+                store,
+                repo,
+                task_id,
+                &[
+                    ("agent", serde_json::json!(null)),
+                    ("model", serde_json::json!(null)),
+                ],
+            )
+            .await;
+        }
         if push_failures >= 3 {
             tracing::error!(
                 task_id,
@@ -627,17 +794,30 @@ pub async fn handle_success(
         } else {
             "agent completed without code changes on external task requiring PR".to_string()
         };
-        store::store_set(
-            store,
-            repo,
-            task_id,
-            &[
-                ("agent", serde_json::json!(null)),
-                ("model", serde_json::json!(null)),
-                ("last_error", serde_json::json!(msg)),
-            ],
-        )
-        .await;
+        if let Some(store_id) = store_id_opt {
+            store::store_set_by_id(
+                store,
+                store_id,
+                &[
+                    ("agent", serde_json::json!(null)),
+                    ("model", serde_json::json!(null)),
+                    ("last_error", serde_json::json!(msg)),
+                ],
+            )
+            .await;
+        } else {
+            store::store_set(
+                store,
+                repo,
+                task_id,
+                &[
+                    ("agent", serde_json::json!(null)),
+                    ("model", serde_json::json!(null)),
+                    ("last_error", serde_json::json!(msg)),
+                ],
+            )
+            .await;
+        }
     } else if resp.status == "done" && !has_pr && is_external {
         // External task with non-code labels (e.g. documentation, research) —
         // allowed to be marked done without a PR.
@@ -651,13 +831,22 @@ pub async fn handle_success(
             "internal task reported done with no PR — marking done"
         );
     }
-    store::store_set(
-        store,
-        repo,
-        task_id,
-        &[("summary", serde_json::json!(resp.summary))],
-    )
-    .await;
+    if let Some(store_id) = store_id_opt {
+        store::store_set_by_id(
+            store,
+            store_id,
+            &[("summary", serde_json::json!(resp.summary))],
+        )
+        .await;
+    } else {
+        store::store_set(
+            store,
+            repo,
+            task_id,
+            &[("summary", serde_json::json!(resp.summary))],
+        )
+        .await;
+    }
 
     // Store token usage — prefer agent-parsed tokens, fall back to response
     let input_tokens = parsed.input_tokens.or(resp.input_tokens);
@@ -665,8 +854,14 @@ pub async fn handle_success(
     if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
         let model = model_name.unwrap_or("haiku");
         if let Some(ref st) = store {
-            // Resolve store_id once and reuse
-            if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
+            if let Some(store_id) = store_id_opt {
+                if let Err(e) = st
+                    .store_tokens(store_id, input as i64, output as i64, model)
+                    .await
+                {
+                    tracing::warn!(task_id, ?e, "failed to store token usage");
+                }
+            } else if let Ok(Some(store_id)) = st.resolve_task_id(repo, task_id).await {
                 if let Err(e) = st
                     .store_tokens(store_id, input as i64, output as i64, model)
                     .await
@@ -704,7 +899,29 @@ pub async fn handle_success(
     }
 
     // Query total tokens and cost estimate together (single DB read)
-    let (total_tokens, cost) = store::get_token_summary(store, repo, task_id).await;
+    let (total_tokens, cost) = if let Some(ref s) = store {
+        if let Some(store_id) = store_id_opt {
+            if let Ok(task) = s.get(store_id).await {
+                let usage = crate::store::TokenUsage {
+                    input_tokens: task.input_tokens as u64,
+                    output_tokens: task.output_tokens as u64,
+                };
+                let total = usage.total_tokens();
+                let cost = crate::store::CostEstimate {
+                    input_cost_usd: task.input_cost_usd,
+                    output_cost_usd: task.output_cost_usd,
+                    total_cost_usd: task.total_cost_usd,
+                };
+                (total, cost)
+            } else {
+                store::get_token_summary(store, repo, task_id).await
+            }
+        } else {
+            store::get_token_summary(store, repo, task_id).await
+        }
+    } else {
+        store::get_token_summary(store, repo, task_id).await
+    };
     let warning_threshold = (max_tokens as f64 * 0.8) as u64;
 
     if total_tokens > max_tokens {
