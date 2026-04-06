@@ -100,11 +100,21 @@ pub async fn wait_for_fallback_backoff(
 ) -> u64 {
     // Get retry count from reroute chain
     let chain = get_reroute_chain(task_id, store, repo).await;
-    let retry_count = if chain.is_empty() {
+    let mut retry_count = if chain.is_empty() {
         0
     } else {
         chain.split(',').count()
     };
+
+    // Include network error count in backoff calculation
+    if let Some(s) = store {
+        let key = format!("network_error_count:{}", task_id);
+        if let Ok(Some(val)) = s.kv_get(&key).await {
+            if let Ok(count) = val.parse::<usize>() {
+                retry_count += count;
+            }
+        }
+    }
 
     let delay = calculate_backoff_delay(retry_count);
 

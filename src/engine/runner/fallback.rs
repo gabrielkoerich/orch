@@ -247,6 +247,11 @@ pub async fn handle_error(
                 &[("last_error", serde_json::json!(msg))],
             )
             .await;
+            if let Some(s) = store {
+                let _ = s
+                    .kv_increment(&format!("network_error_count:{}", task_id))
+                    .await;
+            }
             // Apply backoff to pace retries
             response::wait_for_fallback_backoff(task_id, store, repo).await;
             return Ok(ErrorHandleResult::EarlyReturn {
