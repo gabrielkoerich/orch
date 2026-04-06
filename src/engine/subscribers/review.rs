@@ -496,6 +496,18 @@ async fn classify_review_failure(
     // toward MAX_REVIEW_AGENT_FAILURES. The cooldown system steers the next
     // attempt to an available agent.
     let lower_reason = reason.to_lowercase();
+
+    // Merge conflicts are infrastructure failures, not review agent failures.
+    // The merge_conflict_retries counter handles these separately.
+    if lower_reason.contains("merge conflict") || lower_reason.contains("not mergeable") || lower_reason.contains("merge failed") {
+        tracing::warn!(
+            task_id,
+            reason,
+            "{context} hit merge conflict — deferring to merge_conflict_retries handler"
+        );
+        return ReviewOutcome::Reset;
+    }
+
     if lower_reason.contains("rate limit") || lower_reason.contains("auth error") {
         tracing::warn!(
             task_id,
