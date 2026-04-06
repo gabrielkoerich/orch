@@ -1453,80 +1453,23 @@ pub(crate) async fn ingest_external_tasks(
         }
     }
 
-    // Fetch all open issues in one call (includes unlabeled issues).
-    // Also fetch routable tasks which catches unlabeled issues on backends
-    // where list_all_tasks only returns labeled ones.
-    let mut seen = std::collections::HashSet::new();
-    let mut all_tasks: Vec<(crate::backends::ExternalTask, Option<Status>)> = Vec::new();
-
-    // 1. Routable tasks (unlabeled + status:new) — these are the ones that
-    //    were previously missed because the per-status loop skipped them.
-    match backend.list_routable().await {
-        Ok(routable) => {
-            for task in routable {
-                if seen.insert(task.id.0.clone()) {
-                    all_tasks.push((task, None));
-                }
+    // Fetch all open issues in a single backend call and partition by status label locally.
+    // The GitHub backend overrides list_active_open_issues() to use one list_all_open_issues()
+    // request instead of a routable call + N per-status calls.
+    let all_tasks: Vec<(crate::backends::ExternalTask, Option<Status>)> =
+        match backend.list_active_open_issues().await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                tracing::debug!(
+                    ?e,
+                    "ingest: failed to list active open issues — skipping this cycle"
+                );
+                return Ok(());
             }
-        }
-        Err(e) => {
-            tracing::debug!(
-                ?e,
-                "ingest: failed to list routable tasks — unlabeled new issues may be delayed"
-            );
-        }
-    }
+        };
 
-    // 2. All labeled active statuses — fetch in a single API call when backend
-    //    supports it, otherwise fall back to per-status calls.
-    match backend.list_all_active_tasks().await {
-        Ok(active_tasks) => {
-            for (task, status) in active_tasks {
-                if seen.insert(task.id.0.clone()) {
-                    all_tasks.push((task, Some(status)));
-                }
-            }
-        }
-        Err(e) => {
-            tracing::debug!(
-                ?e,
-                "ingest: list_all_active_tasks failed, falling back to per-status calls"
-            );
-            // Fallback: parallel per-status calls for backends that don't
-            // implement list_all_active_tasks efficiently.
-            let active_statuses = [
-                Status::New,
-                Status::Routed,
-                Status::InProgress,
-                Status::NeedsReview,
-                Status::InReview,
-                Status::Blocked,
-            ];
-            let status_results = futures::future::join_all(
-                active_statuses
-                    .iter()
-                    .map(|status| async move { (*status, backend.list_by_status(*status).await) }),
-            )
-            .await;
-            for (status, result) in status_results {
-                match result {
-                    Ok(tasks) => {
-                        for task in tasks {
-                            if seen.insert(task.id.0.clone()) {
-                                all_tasks.push((task, Some(status)));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(?status, ?e, "ingest: failed to list tasks");
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Upsert into the store, collecting store IDs for batch status check.
-    //    Also acknowledge newly detected issues (eyes reaction).
+    // Upsert into the store, collecting store IDs for batch status check.
+    // Also acknowledge newly detected issues (eyes reaction).
     let mut id_status_pairs: Vec<(i64, crate::backends::Status)> = Vec::new();
     // Pre-load existing external IDs for this repo to avoid N+1 queries
     // (each get_by_external_id call is an individual SQL query). If the
@@ -1745,6 +1688,26 @@ mod tests {
         }
         async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
             Ok(vec![])
+        }
+        async fn list_active_open_issues(
+            &self,
+        ) -> anyhow::Result<Vec<(ExternalTask, Option<Status>)>> {
+            let mut result = Vec::new();
+            for (label, tasks) in &self.tasks {
+                let status = match label.as_str() {
+                    "status:new" => None,
+                    "status:routed" => Some(Status::Routed),
+                    "status:in_progress" => Some(Status::InProgress),
+                    "status:needs_review" => Some(Status::NeedsReview),
+                    "status:in_review" => Some(Status::InReview),
+                    "status:blocked" => Some(Status::Blocked),
+                    _ => None,
+                };
+                for task in tasks {
+                    result.push((task.clone(), status));
+                }
+            }
+            Ok(result)
         }
         async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()> {
             self.comments
@@ -2017,6 +1980,106 @@ mod tests {
             "sync_to_project must be called exactly once (for new task only), got: {syncs:?}"
         );
         assert_eq!(syncs[0].0, "11", "sync_to_project must target the new task");
+    }
+
+    #[tokio::test]
+    async fn ingest_handles_mixed_labeled_and_unlabeled_open_issues() {
+        // Simulate a backend where some issues have no status label (routable/unlabeled)
+        // and others carry active status labels.  Both kinds must be ingested and the
+        // store status must reflect the label where present.
+        struct MixedBackend;
+
+        #[async_trait]
+        impl ExternalBackend for MixedBackend {
+            fn name(&self) -> &str {
+                "mixed"
+            }
+            async fn create_task(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[String],
+            ) -> anyhow::Result<ExternalId> {
+                Ok(ExternalId("x".into()))
+            }
+            async fn get_task(&self, _: &ExternalId) -> anyhow::Result<ExternalTask> {
+                anyhow::bail!("not implemented")
+            }
+            async fn list_by_status(&self, _: Status) -> anyhow::Result<Vec<ExternalTask>> {
+                Ok(vec![])
+            }
+            /// Return a mix: one unlabeled (no status) + one labeled in_progress.
+            async fn list_active_open_issues(
+                &self,
+            ) -> anyhow::Result<Vec<(ExternalTask, Option<Status>)>> {
+                Ok(vec![
+                    (make_ext_task("100", "Unlabeled routable"), None),
+                    (
+                        make_ext_task("101", "In progress issue"),
+                        Some(Status::InProgress),
+                    ),
+                ])
+            }
+            async fn post_comment(&self, _: &ExternalId, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn set_labels(&self, _: &ExternalId, _: &[String]) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn remove_label(&self, _: &ExternalId, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn get_sub_issues(&self, _: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+                Ok(vec![])
+            }
+            async fn health_check(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn get_mentions(&self, _: &str) -> anyhow::Result<Vec<Mention>> {
+                Ok(vec![])
+            }
+            async fn update_status(&self, _: &ExternalId, _: Status) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn has_open_issue_with_title(&self, _: &str, _: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn sync_to_project(&self, _: &ExternalId, _: Status) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let backend: Arc<dyn ExternalBackend> = Arc::new(MixedBackend);
+        let store = Arc::new(TaskStore::open_memory().await.unwrap());
+
+        ingest_external_tasks(&backend, "owner/repo", &store)
+            .await
+            .unwrap();
+
+        let all = store.list_all("owner/repo").await.unwrap();
+        assert_eq!(all.len(), 2, "both issues must be ingested");
+
+        let unlabeled = store
+            .get_by_external_id("owner/repo", "100")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unlabeled.status,
+            crate::store::TaskStatus::New,
+            "unlabeled issue should start as New"
+        );
+
+        let in_progress = store
+            .get_by_external_id("owner/repo", "101")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            in_progress.status,
+            crate::store::TaskStatus::InProgress,
+            "labeled in_progress issue must be synced to InProgress"
+        );
     }
 
     // ── kv_get_prefer_store / kv_set_prefer_store ────────────────────
