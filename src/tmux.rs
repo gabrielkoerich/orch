@@ -162,9 +162,13 @@ impl TmuxManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // "can't find pane" / "can't find session" are expected teardown races —
-            // the session was cleaned up between the caller's activity check and this call.
-            if stderr.contains("can't find pane") || stderr.contains("can't find session") {
+            // "can't find pane" / "can't find session" / "no server running" are expected
+            // teardown races — the session was cleaned up between the caller's activity
+            // check and this call, or the tmux server exited entirely.
+            if stderr.contains("can't find pane")
+                || stderr.contains("can't find session")
+                || stderr.contains("no server running")
+            {
                 tracing::debug!(
                     session,
                     "capture_pane: session/pane already gone (teardown race)"
