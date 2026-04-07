@@ -923,13 +923,13 @@ async fn scan_mentions(
     let mut last_success_ts: Option<String> = None;
 
     for mention in mentions {
-         // Skip if already processed
-         if existing_mentions.contains(&mention.id) {
-             if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
-                 last_success_ts = Some(mention.created_at.clone());
-             }
-             continue;
-         }
+        // Skip if already processed
+        if existing_mentions.contains(&mention.id) {
+            if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
+                last_success_ts = Some(mention.created_at.clone());
+            }
+            continue;
+        }
 
         if !mention.body.contains(&current_user)
             && !mention.body.contains("@orch")
@@ -973,79 +973,79 @@ async fn scan_mentions(
             if let Some(issue_num) = issue_number {
                 // Check if issue is still open
                 match gh.get_issue(repo, &issue_num).await {
-                     Ok(issue) if issue.state != "open" => {
-                         tracing::debug!(
-                             issue = %issue_num,
-                             state = %issue.state,
-                             command = %command,
-                             "ignoring slash command in mention on non-open issue"
-                         );
-                         if let Some(s) = store {
-                             let title = format!(
-                                 "Skipped @orch command on closed issue #{issue_num} from @{}",
-                                 mention.author
-                             );
-                             let task_body = format!(
-                                 "Mention by @{}:\n\n{}\n\n**Skipped:** target issue is closed",
-                                 mention.author, mention.body
-                             );
-                             let _ = s
-                                 .create_internal(repo, &title, &task_body, "mention", &mention.id)
-                                 .await;
-                             if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
-                                 last_success_ts = Some(mention.created_at.clone());
-                             }
-                         }
-                         continue;
-                     }
-                         Ok(_) => {}
-                         Err(e) => {
-                             tracing::warn!(
-                                 issue = %issue_num,
-                                 err = %e,
-                                 "failed to check issue state for slash command in mention"
-                             );
-                             continue;
-                         }
-                     }
- 
-                     // Check if author is collaborator
-                     match gh.is_collaborator(repo, &mention.author).await {
-                         Ok(true) => {}
-                         Ok(false) => {
-                             tracing::info!(
-                                 author = %mention.author,
-                                 command = %command,
-                                 issue = %issue_num,
-                                 "ignoring slash command in mention from non-collaborator"
-                             );
-                             if let Some(s) = store {
-                                 let title = format!(
-                                     "Skipped @orch command from non-collaborator @{}",
-                                     mention.author
-                                 );
-                                 let task_body = format!(
+                    Ok(issue) if issue.state != "open" => {
+                        tracing::debug!(
+                            issue = %issue_num,
+                            state = %issue.state,
+                            command = %command,
+                            "ignoring slash command in mention on non-open issue"
+                        );
+                        if let Some(s) = store {
+                            let title = format!(
+                                "Skipped @orch command on closed issue #{issue_num} from @{}",
+                                mention.author
+                            );
+                            let task_body = format!(
+                                "Mention by @{}:\n\n{}\n\n**Skipped:** target issue is closed",
+                                mention.author, mention.body
+                            );
+                            let _ = s
+                                .create_internal(repo, &title, &task_body, "mention", &mention.id)
+                                .await;
+                            if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
+                                last_success_ts = Some(mention.created_at.clone());
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            issue = %issue_num,
+                            err = %e,
+                            "failed to check issue state for slash command in mention"
+                        );
+                        continue;
+                    }
+                }
+
+                // Check if author is collaborator
+                match gh.is_collaborator(repo, &mention.author).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::info!(
+                            author = %mention.author,
+                            command = %command,
+                            issue = %issue_num,
+                            "ignoring slash command in mention from non-collaborator"
+                        );
+                        if let Some(s) = store {
+                            let title = format!(
+                                "Skipped @orch command from non-collaborator @{}",
+                                mention.author
+                            );
+                            let task_body = format!(
                                      "Mention by @{}:\n\n{}\n\n**Skipped:** author is not a collaborator",
                                      mention.author, mention.body
                                  );
-                                 let _ = s
-                                     .create_internal(repo, &title, &task_body, "mention", &mention.id)
-                                     .await;
-                                 if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
-                                     last_success_ts = Some(mention.created_at.clone());
-                                 }
-                             }
-                             continue;
-                         }
-                         Err(e) => {
-                             tracing::warn!(
-                                 author = %mention.author,
-                                 err = %e,
-                                 "failed to check collaborator status for slash command in mention"
-                             );
-                             continue;
-                         }
-                     }
+                            let _ = s
+                                .create_internal(repo, &title, &task_body, "mention", &mention.id)
+                                .await;
+                            if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
+                                last_success_ts = Some(mention.created_at.clone());
+                            }
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            author = %mention.author,
+                            err = %e,
+                            "failed to check collaborator status for slash command in mention"
+                        );
+                        continue;
+                    }
+                }
 
                 // Execute the command
                 let task_id = ExternalId(issue_num.clone());
