@@ -1725,7 +1725,9 @@ impl TaskStore {
             );
         }
 
-        let status_str: String = row.try_get("status").unwrap_or_default();
+        let status_str: String = row
+            .try_get("status")
+            .map_err(|e| anyhow::anyhow!("task row missing status column: {e}"))?;
         let labels_str: String = row.try_get("labels").unwrap_or_default();
         let memory_str: String = row.try_get("memory").unwrap_or_default();
         let delegations_str: String = row.try_get("delegations").unwrap_or_default();
@@ -1739,13 +1741,8 @@ impl TaskStore {
             origin: row.try_get("origin").unwrap_or_default(),
             title: row.try_get("title").unwrap_or_default(),
             body: row.try_get("body").unwrap_or_default(),
-            status: TaskStatus::from_str(&status_str).unwrap_or_else(|| {
-                tracing::warn!(
-                    status = status_str,
-                    "unknown task status, defaulting to New"
-                );
-                TaskStatus::New
-            }),
+            status: TaskStatus::from_str(&status_str)
+                .ok_or_else(|| anyhow::anyhow!("unknown task status: '{status_str}'"))?,
             source: row.try_get("source").unwrap_or_default(),
             source_id: row.try_get("source_id").unwrap_or_default(),
             author: row.try_get("author").unwrap_or_default(),
