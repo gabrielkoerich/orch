@@ -43,10 +43,8 @@ pub(crate) fn parse_pr_number_from_url(url: &str) -> Option<u64> {
 }
 
 fn review_started_comment(review_agent: &str, review_model: &str) -> String {
-    format!(
-        "🔍 Automated review started (agent: {}, model: {})",
-        review_agent, review_model
-    )
+    let footer = attribution_footer("Review started", review_agent, Some(review_model));
+    format!("🔍 Automated review started{}", footer)
 }
 
 fn should_skip_no_code_reroute_increment(last_error: &str) -> bool {
@@ -56,7 +54,8 @@ fn should_skip_no_code_reroute_increment(last_error: &str) -> bool {
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
-use crate::engine::auto_merge::{attribution_footer, auto_merge_pr, handle_review_changes};
+use crate::engine::attribution_footer;
+use crate::engine::auto_merge::{auto_merge_pr, handle_review_changes};
 use crate::engine::runner;
 use crate::engine::runner::worktree;
 use crate::engine::tasks::TaskManager;
@@ -1682,7 +1681,7 @@ pub(crate) async fn review_and_merge(
     };
 
     if !pr_comment.is_empty() {
-        let footer = attribution_footer("Reviewed", &review_agent, review_model_str);
+        let footer = attribution_footer("Reviewed", &review_agent, Some(review_model_str));
         let pr_comment_with_footer = format!("{}{}", pr_comment, footer);
         if let Err(e) = gh
             .add_comment(repo, &pr_number_early.to_string(), &pr_comment_with_footer)
@@ -2073,10 +2072,9 @@ mod tests {
 
     #[test]
     fn review_started_comment_includes_agent_and_model() {
-        assert_eq!(
-            review_started_comment("kimi", "opus"),
-            "🔍 Automated review started (agent: kimi, model: opus)"
-        );
+        let expected_footer = attribution_footer("Review started", "kimi", Some("opus"));
+        let expected = format!("🔍 Automated review started{}", expected_footer);
+        assert_eq!(review_started_comment("kimi", "opus"), expected);
     }
 
     #[test]

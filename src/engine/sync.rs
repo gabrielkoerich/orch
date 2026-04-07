@@ -1630,7 +1630,7 @@ pub(crate) async fn ingest_external_tasks(
 
                     if should_dedupe {
                         let comment = format!(
-                            "Duplicate of #{id} — closing to avoid duplicate work.\n\n---\n{footer}",
+                            "Duplicate of #{id} — closing to avoid duplicate work.{footer}",
                             id = target.id,
                             footer = crate::engine::orch_footer()
                         );
