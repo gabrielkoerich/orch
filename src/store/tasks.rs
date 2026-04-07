@@ -870,8 +870,6 @@ impl TaskStore {
             "auto_unblock_count",
             "auto_unblock_last_at",
             "auto_unblock_last_reason",
-            // allow resetting the needs_review_refires counter when tasks transition
-            "needs_review_refires",
             "ci_recovery_count",
             "no_code_reroutes",
             "network_retries",
