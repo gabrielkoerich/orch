@@ -1879,8 +1879,12 @@ impl TaskStore {
 
     fn row_to_run(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskRun> {
         Ok(TaskRun {
-            id: row.try_get("id").unwrap_or(0),
-            task_id: row.try_get("task_id").unwrap_or(0),
+            id: row
+                .try_get("id")
+                .map_err(|e| anyhow::anyhow!("run row missing id: {e}"))?,
+            task_id: row
+                .try_get("task_id")
+                .map_err(|e| anyhow::anyhow!("run row missing task_id: {e}"))?,
             attempt: row.try_get("attempt").unwrap_or(0),
             run_type: row.try_get("run_type").unwrap_or_default(),
             agent: row.try_get("agent").unwrap_or_default(),
@@ -1906,15 +1910,23 @@ impl TaskStore {
     fn row_to_activity(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskActivity> {
         let details_str: String = row.try_get("details").unwrap_or_else(|_| "{}".to_string());
         Ok(TaskActivity {
-            id: row.try_get("id").unwrap_or(0),
-            task_id: row.try_get("task_id").unwrap_or(0),
+            id: row
+                .try_get("id")
+                .map_err(|e| anyhow::anyhow!("activity row missing id: {e}"))?,
+            task_id: row
+                .try_get("task_id")
+                .map_err(|e| anyhow::anyhow!("activity row missing task_id: {e}"))?,
             timestamp: row.try_get("timestamp").unwrap_or_default(),
             event_type: row.try_get("event_type").unwrap_or_default(),
             from_status: row.try_get("from_status").unwrap_or(None),
             to_status: row.try_get("to_status").unwrap_or(None),
             agent: row.try_get("agent").unwrap_or(None),
             model: row.try_get("model").unwrap_or(None),
-            details: serde_json::from_str(&details_str).unwrap_or_else(|_| serde_json::json!({})),
+            details: serde_json::from_str(&details_str)
+                .inspect_err(
+                    |e| tracing::warn!(error = %e, "corrupt activity details JSON, defaulting to empty"),
+                )
+                .unwrap_or_else(|_| serde_json::json!({})),
         })
     }
 }
