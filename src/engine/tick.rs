@@ -824,7 +824,12 @@ pub(crate) async fn tick_route_tasks(
                     .store_route_result(&task.id.0, &result, store, repo)
                     .await
                 {
-                    tracing::warn!(task_id = task.id.0, ?e, "failed to store route result");
+                    tracing::warn!(
+                        task_id = task.id.0,
+                        ?e,
+                        "failed to store route result; skipping Routed transition"
+                    );
+                    continue;
                 }
 
                 if is_internal_id(&task.id.0) {
