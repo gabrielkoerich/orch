@@ -856,21 +856,17 @@ pub(crate) async fn sync_tick(
             };
 
             if !should_fire {
-                // Not firing yet — bump the counter without touching updated_at so the
-                // age calculation remains valid on the next tick.
-                let _ = crate::store::store_increment_no_ts(
-                    &Some(Arc::clone(store)),
-                    repo,
-                    task.task_id(),
-                    "needs_review_refires",
-                )
-                .await;
+                // Not firing yet — do NOT increment the refire counter on mere
+                // delay/backoff checks. The counter must reflect *actual* re-fire
+                // attempts so it can be used as an escalation budget. Incrementing
+                // here inflated the counter when the subscriber was simply still
+                // within the backoff window and could wrongly cause escalation.
                 tracing::debug!(
                     task_id = task.task_id(),
                     age_minutes,
                     current_refires,
                     required_minutes,
-                    "sync catch-up: delaying NeedsReview re-fire due to backoff"
+                    "sync catch-up: delaying NeedsReview re-fire due to backoff (no counter increment)"
                 );
                 continue;
             }
@@ -2586,8 +2582,9 @@ mod tests {
         .unwrap();
 
         let after = store.get(id).await.unwrap();
-        // Counter should have been incremented to 2, but not re-fired (updated_at unchanged)
-        assert_eq!(after.needs_review_refires, 2);
+        // Counter should NOT have been incremented on a mere backoff delay —
+        // only actual re-fire attempts increment the counter.
+        assert_eq!(after.needs_review_refires, 1);
         assert_eq!(after.updated_at, now_minus_1);
         assert_eq!(after.status, crate::store::TaskStatus::NeedsReview);
     }

@@ -248,19 +248,6 @@ async fn increment_propagates_returned_value_decode_errors() {
         err.to_string().contains("out of range") || err.to_string().contains("decode"),
         "unexpected error: {err:#}"
     );
-
-    store
-        .set_fields(id, &[("needs_review_refires", serde_json::json!(i32::MAX))])
-        .await
-        .unwrap();
-    let err = store
-        .increment_no_ts(id, "needs_review_refires")
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("out of range") || err.to_string().contains("decode"),
-        "unexpected error: {err:#}"
-    );
 }
 
 #[tokio::test]

@@ -945,28 +945,6 @@ impl TaskStore {
         Ok(row.try_get("val")?)
     }
 
-    /// Increment a counter in the task store **without** updating `updated_at`.
-    ///
-    /// Use this when the counter tracks bookkeeping state that should not reset
-    /// the task's timestamp (e.g. `needs_review_refires`, where `updated_at` is
-    /// used to compute task age for backoff decisions).  For most counters, prefer
-    /// `increment()` which also refreshes `updated_at`.
-    pub async fn increment_no_ts(&self, id: i64, field: &str) -> anyhow::Result<i32> {
-        const INCREMENTABLE_NO_TS: &[&str] = &["needs_review_refires"];
-
-        anyhow::ensure!(
-            INCREMENTABLE_NO_TS.contains(&field),
-            "field {field} is not incrementable without timestamp"
-        );
-
-        let sql =
-            format!("UPDATE tasks SET {field} = {field} + 1 WHERE id = ? RETURNING {field} AS val");
-
-        let row = sqlx::query(&sql).bind(id).fetch_one(&self.pool).await?;
-
-        Ok(row.try_get("val")?)
-    }
-
     /// Reset all failure/retry counters to zero.
     pub async fn reset_counters(&self, id: i64) -> anyhow::Result<()> {
         sqlx::query(
