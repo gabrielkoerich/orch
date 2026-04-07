@@ -1462,11 +1462,12 @@ impl TaskStore {
     /// Start a new run, returning its ID.
     pub async fn start_run(&self, run: &StartRun<'_>) -> anyhow::Result<i64> {
         let row = sqlx::query(
-            "INSERT INTO task_runs (task_id, attempt, run_type, agent, model, command, prompt)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO task_runs (task_id, attempt, run_type, agent, model, command, prompt, outcome)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
          ON CONFLICT(task_id, attempt, run_type) DO UPDATE SET
             agent = excluded.agent, model = excluded.model,
             command = excluded.command, prompt = excluded.prompt,
+            outcome = NULL,
             started_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          RETURNING id",
         )
