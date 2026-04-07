@@ -388,10 +388,9 @@ pub async fn handle_error(
 
     // Try free models as last resort before giving up
     let chain = response::get_reroute_chain(task_id, store, repo).await;
-    let available: Vec<String> = crate::engine::router::config::DEFAULT_AGENTS
-        .iter()
+    let available: Vec<String> = crate::engine::router::config::configured_agents()
+        .into_iter()
         .filter(|a| crate::cmd_cache::command_exists(a))
-        .map(|s| s.to_string())
         .collect();
 
     let all_agents_tried = {

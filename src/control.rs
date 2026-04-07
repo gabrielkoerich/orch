@@ -33,7 +33,6 @@ use uuid::Uuid;
 
 const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 
-use crate::engine::router::config::DEFAULT_AGENTS;
 use crate::store::TaskStore;
 
 /// Per-session invocation locks — ensures only one agent invocation runs at a time per session.
@@ -132,11 +131,12 @@ fn infer_agent(model: &str) -> &'static str {
 /// Performs lightweight checks (known agent + binary in PATH) without
 /// a test invocation. Used by `/agent` before persisting.
 pub fn validate_agent(agent: &str) -> Result<()> {
-    if !DEFAULT_AGENTS.contains(&agent) {
+    let agents = crate::engine::router::config::configured_agents();
+    if !agents.iter().any(|a| a == agent) {
         anyhow::bail!(
             "unknown agent '{}'. Available: {}",
             agent,
-            DEFAULT_AGENTS.join(", ")
+            agents.join(", ")
         );
     }
     if !crate::cmd_cache::command_exists(agent) {

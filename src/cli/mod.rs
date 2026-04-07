@@ -223,12 +223,12 @@ pub fn log(lines: &str) -> anyhow::Result<()> {
 
 /// List installed agent CLIs.
 pub fn agents() {
-    let agents = crate::engine::router::config::DEFAULT_AGENTS;
+    let agents = crate::engine::router::config::configured_agents();
 
     println!("{:<12} {:<10} PATH", "AGENT", "STATUS");
     println!("{}", "-".repeat(60));
 
-    for agent in agents {
+    for agent in &agents {
         match which::which(agent) {
             Ok(path) => {
                 // Try to get version

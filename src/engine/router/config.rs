@@ -76,6 +76,22 @@ pub fn retry_max_delay_ms() -> u64 {
 /// in their `config.yml` under `routing.agents`.
 pub const DEFAULT_AGENTS: &[&str] = &["claude", "codex", "opencode", "kimi", "minimax"];
 
+/// Return the configured agent list from `router.agents` in config.yml,
+/// falling back to [`DEFAULT_AGENTS`] when no config is present.
+///
+/// This is the canonical source of truth for "which agents does orch know
+/// about" — use it instead of `DEFAULT_AGENTS` directly so that
+/// Claude-compatible agents added via config (e.g. `olm`) are recognized
+/// without code changes.
+pub fn configured_agents() -> Vec<String> {
+    let config = RouterConfig::from_config();
+    if config.agents.is_empty() {
+        DEFAULT_AGENTS.iter().map(|s| s.to_string()).collect()
+    } else {
+        config.agents
+    }
+}
+
 /// Router configuration.
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
