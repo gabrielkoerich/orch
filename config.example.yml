@@ -1,6 +1,17 @@
 projects:
   - /path/to/your/project
 
+# Agents to discover in PATH (checked at startup).
+# Any Claude-compatible CLI (e.g. olm for Ollama) can be added here
+# without code changes — unknown agents use the Claude runner automatically.
+agents:
+  - claude
+  - codex
+  - opencode
+  - kimi
+  - minimax
+  # - olm  # Ollama via Claude-compatible CLI
+
 workflow:
   auto_close: true
   review_owner: "@owner"
@@ -45,16 +56,6 @@ engine:
   # Silence detection: grace period before flagging (seconds)
   # silence_grace_period: 120
   # silence_cooldown: 3600
-  # Agents to discover in PATH (checked at startup).
-  # Any Claude-compatible CLI (e.g. olm for Ollama) can be added here
-  # without code changes — unknown agents use the Claude runner automatically.
-  agents:
-    - claude
-    - codex
-    - opencode
-    - kimi
-    - minimax
-    # - olm  # Ollama via Claude-compatible CLI
 
 router:
   mode: "llm"              # "llm" (default) or "round_robin"

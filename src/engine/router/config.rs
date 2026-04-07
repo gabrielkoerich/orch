@@ -342,7 +342,7 @@ impl RouterConfig {
             }
         }
 
-        // Parse agents list from engine.agents (engine-level, not router-specific)
+        // Parse agents list from top-level `agents:` config key
         config.agents = crate::engine::configured_agents();
 
         if let Ok(max_attempts) = crate::config::get("router.max_route_attempts") {

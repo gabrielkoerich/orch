@@ -107,26 +107,32 @@ pub struct ProjectEngine {
     pub store: Arc<TaskStore>,
 }
 
-/// Return the configured agent list from `engine.agents` in config.yml,
+/// Return the configured agent list from top-level `agents` in config.yml,
 /// falling back to [`router::config::DEFAULT_AGENTS`] when not set.
 ///
 /// This is the canonical source of truth for "which agents does orch know
 /// about" — use it instead of `DEFAULT_AGENTS` directly so that
 /// Claude-compatible agents added via config (e.g. `olm`) are recognized
 /// without code changes.
+///
+/// The key is top-level (`agents:`) rather than nested (`engine.agents:`)
+/// because `config::get` serializes nested YAML arrays via `serde_yml::to_string`
+/// which produces YAML block format, not JSON — breaking downstream parsing.
 pub fn configured_agents() -> Vec<String> {
-    if let Ok(agents_str) = crate::config::get("engine.agents") {
+    if let Ok(agents_str) = crate::config::get("agents") {
         if !agents_str.is_empty() && agents_str != "[]" {
-            if let Ok(agents_arr) = serde_json::from_str::<Vec<String>>(&agents_str) {
-                return agents_arr;
+            // config::get returns serde_yml::to_string for arrays, which is
+            // YAML block format ("- claude\n- codex\n..."). Parse as YAML first.
+            if let Ok(agents_arr) = serde_yml::from_str::<Vec<String>>(&agents_str) {
+                if !agents_arr.is_empty() {
+                    return agents_arr;
+                }
             }
-            let parsed: Vec<String> = agents_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !parsed.is_empty() {
-                return parsed;
+            // Fallback: try JSON (inline arrays) or comma-separated
+            if let Ok(agents_arr) = serde_json::from_str::<Vec<String>>(&agents_str) {
+                if !agents_arr.is_empty() {
+                    return agents_arr;
+                }
             }
         }
     }
