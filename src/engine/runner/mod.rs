@@ -605,7 +605,8 @@ impl TaskRunner {
             &parse_result,
             &session_output.raw_stdout,
             &session_output.raw_stderr,
-        );
+        )
+        .await;
 
         // Handle outcome: success or error recovery
         let (final_status, _budget_exceeded, push_failed) = match parse_result {

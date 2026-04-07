@@ -15,7 +15,7 @@ use super::{agents, git_ops, response, worktree};
 
 /// Write a structured `result.json` to the attempt directory for debugging.
 #[allow(clippy::too_many_arguments)]
-pub fn write_result_json(
+pub async fn write_result_json(
     attempt_dir: &Path,
     task_id: &str,
     agent_name: &str,
@@ -64,10 +64,12 @@ pub fn write_result_json(
         }
     };
 
-    if let Err(e) = std::fs::write(
+    if let Err(e) = tokio::fs::write(
         attempt_dir.join("result.json"),
         serde_json::to_string_pretty(&result_json).unwrap_or_default(),
-    ) {
+    )
+    .await
+    {
         tracing::debug!(task_id, ?e, "failed to write result.json");
     }
 }

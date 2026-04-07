@@ -381,7 +381,7 @@ pub async fn setup_worktree(
     let default_branch = detect_default_branch(&main_dir).await;
 
     let worktrees_base = project_worktrees_dir(&main_dir);
-    std::fs::create_dir_all(&worktrees_base)?;
+    tokio::fs::create_dir_all(&worktrees_base).await?;
 
     // Check if we have a saved branch/worktree in store
     let (saved_branch, saved_worktree) = store::opt_store_get_task(store, repo, task_id)
@@ -402,7 +402,7 @@ pub async fn setup_worktree(
         }
     } else {
         // Check for existing worktree by prefix pattern
-        let existing = find_existing_worktree(&worktrees_base, task_id);
+        let existing = find_existing_worktree(&worktrees_base, task_id).await;
         if let Some(existing_dir) = existing {
             let bn = existing_dir
                 .file_name()
@@ -482,7 +482,7 @@ pub async fn setup_worktree(
 
         // Create worktree
         if let Some(parent) = worktree_dir.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
 
         let output = Command::new("git")
@@ -638,7 +638,7 @@ pub async fn setup_worktree(
 }
 
 /// Find an existing worktree by task ID prefix.
-fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<PathBuf> {
+async fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<PathBuf> {
     let (prefix_new, legacy_prefixes) = if let Some(num) = task_id.strip_prefix("internal:") {
         (
             format!("internal-{num}-"),
@@ -655,14 +655,16 @@ fn find_existing_worktree(worktrees_base: &Path, task_id: &str) -> Option<PathBu
         )
     };
 
-    if let Ok(entries) = std::fs::read_dir(worktrees_base) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let matches = name.starts_with(&prefix_new)
-                || legacy_prefixes.iter().any(|p| name.starts_with(p));
-            if matches && entry.path().is_dir() {
-                return Some(entry.path());
-            }
+    let mut entries = match tokio::fs::read_dir(worktrees_base).await {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+    while let Some(entry) = entries.next_entry().await.ok().flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let matches =
+            name.starts_with(&prefix_new) || legacy_prefixes.iter().any(|p| name.starts_with(p));
+        if matches && entry.path().is_dir() {
+            return Some(entry.path());
         }
     }
 
@@ -903,59 +905,61 @@ mod tests {
         assert_eq!(name, "gh-issue-265");
     }
 
-    #[test]
-    fn find_existing_worktree_returns_none_for_missing() {
+    #[tokio::test]
+    async fn find_existing_worktree_returns_none_for_missing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(find_existing_worktree(dir.path(), "42").is_none());
+        assert!(find_existing_worktree(dir.path(), "42").await.is_none());
     }
 
-    #[test]
-    fn find_existing_worktree_matches_prefix() {
+    #[tokio::test]
+    async fn find_existing_worktree_matches_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let wt_dir = dir.path().join("gh-issue-42-fix-login-bug");
-        std::fs::create_dir(&wt_dir).unwrap();
+        tokio::fs::create_dir(&wt_dir).await.unwrap();
 
-        let result = find_existing_worktree(dir.path(), "42");
+        let result = find_existing_worktree(dir.path(), "42").await;
         assert_eq!(result, Some(wt_dir));
     }
 
-    #[test]
-    fn find_existing_worktree_matches_internal_prefix() {
+    #[tokio::test]
+    async fn find_existing_worktree_matches_internal_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let wt_dir = dir.path().join("internal-8-fix");
-        std::fs::create_dir(&wt_dir).unwrap();
+        tokio::fs::create_dir(&wt_dir).await.unwrap();
 
-        let result = find_existing_worktree(dir.path(), "internal:8");
+        let result = find_existing_worktree(dir.path(), "internal:8").await;
         assert_eq!(result, Some(wt_dir));
     }
 
-    #[test]
-    fn find_existing_worktree_matches_legacy_gh_task_prefix() {
+    #[tokio::test]
+    async fn find_existing_worktree_matches_legacy_gh_task_prefix() {
         // Old worktrees created before the rename should still be found
         let dir = tempfile::tempdir().unwrap();
         let wt_dir = dir.path().join("gh-task-internal-8-fix");
-        std::fs::create_dir(&wt_dir).unwrap();
+        tokio::fs::create_dir(&wt_dir).await.unwrap();
 
-        let result = find_existing_worktree(dir.path(), "internal:8");
+        let result = find_existing_worktree(dir.path(), "internal:8").await;
         assert_eq!(result, Some(wt_dir));
     }
 
-    #[test]
-    fn find_existing_worktree_matches_legacy_external_prefix() {
+    #[tokio::test]
+    async fn find_existing_worktree_matches_legacy_external_prefix() {
         // Old external worktrees with gh-task- prefix should still be found
         let dir = tempfile::tempdir().unwrap();
         let wt_dir = dir.path().join("gh-task-42-fix-login-bug");
-        std::fs::create_dir(&wt_dir).unwrap();
+        tokio::fs::create_dir(&wt_dir).await.unwrap();
 
-        let result = find_existing_worktree(dir.path(), "42");
+        let result = find_existing_worktree(dir.path(), "42").await;
         assert_eq!(result, Some(wt_dir));
     }
 
-    #[test]
-    fn find_existing_worktree_ignores_other_tasks() {
+    #[tokio::test]
+    async fn find_existing_worktree_ignores_other_tasks() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("gh-issue-43-other-task")).unwrap();
+        tokio::fs::create_dir(dir.path().join("gh-issue-43-other-task"))
+            .await
+            .unwrap();
 
-        assert!(find_existing_worktree(dir.path(), "42").is_none());
+        assert!(find_existing_worktree(dir.path(), "42").await.is_none());
     }
 }
