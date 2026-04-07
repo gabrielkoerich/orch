@@ -696,7 +696,7 @@ pub(crate) mod patterns {
                 && !lower[lower.find(": 529").unwrap() + 5..]
                     .chars()
                     .next()
-                    .map_or(false, |c| c.is_ascii_digit()));
+                    .is_some_and(|c| c.is_ascii_digit()));
         if match_pos.is_some() || has_429 || has_529 {
             let message = if let Some(pos) = match_pos {
                 extract_context_around(text, pos, 300)
