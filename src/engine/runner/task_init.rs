@@ -278,7 +278,15 @@ pub async fn prepare_task(
 
     // Output file in per-task attempt directory (attempt = attempts + 1, set below)
     let next_attempt = attempts + 1;
-    let attempt_dir = crate::home::task_attempt_dir(repo, task_id, next_attempt)?;
+    let attempt_dir = match crate::home::task_attempt_dir(repo, task_id, next_attempt) {
+        Ok(dir) => dir,
+        Err(e) => {
+            if let Some(s) = store {
+                let _ = crate::engine::cleanup::cleanup_task_worktree(task_id, repo, s).await;
+            }
+            return Err(e);
+        }
+    };
     let output_file = attempt_dir.join("output.json");
 
     // Build sandbox disallowed tools
@@ -348,14 +356,19 @@ pub async fn prepare_task(
     };
 
     // Increment attempts counter — must succeed so max_attempts guard cannot be bypassed
-    store::store_set_result(
+    if let Err(e) = store::store_set_result(
         store,
         repo,
         task_id,
         &[("attempts", serde_json::json!(next_attempt))],
     )
     .await
-    .map_err(|e| anyhow::anyhow!("failed to persist attempts counter: {e}"))?;
+    {
+        if let Some(s) = store {
+            let _ = crate::engine::cleanup::cleanup_task_worktree(task_id, repo, s).await;
+        }
+        return Err(anyhow::anyhow!("failed to persist attempts counter: {e}"));
+    }
 
     Ok(TaskInitResult {
         agent_name,
