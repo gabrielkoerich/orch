@@ -286,32 +286,6 @@ pub async fn store_increment(
     }
 }
 
-/// Increment a counter **without** updating `updated_at`.
-///
-/// Use for fields where the task timestamp must remain stable across increments
-/// (e.g. `needs_review_refires`, where `updated_at` drives backoff age checks).
-pub async fn store_increment_no_ts(
-    store: &Option<Arc<TaskStore>>,
-    repo: &str,
-    task_id: &str,
-    field: &str,
-) -> anyhow::Result<u64> {
-    let s = store
-        .as_ref()
-        .ok_or_else(|| anyhow!("task store unavailable"))?;
-    match s.resolve_task_id(repo, task_id).await {
-        Ok(Some(store_id)) => {
-            let new_val = s.increment_no_ts(store_id, field).await?;
-            Ok(new_val as u64)
-        }
-        Ok(None) => Err(anyhow!("task not present in store: {}/{}", repo, task_id)),
-        Err(e) => {
-            tracing::warn!(task_id, error = %e, "resolve_task_id failed in store write helper");
-            Err(anyhow!("resolve_task_id failed: {}", e))
-        }
-    }
-}
-
 /// Reset all task counters in the task store.
 pub async fn store_reset_counters(store: &Option<Arc<TaskStore>>, repo: &str, task_id: &str) {
     if let Some(ref store) = store {
