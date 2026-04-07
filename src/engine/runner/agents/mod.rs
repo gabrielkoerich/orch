@@ -682,13 +682,22 @@ pub(crate) mod patterns {
             "insufficient_quota",
             "tokens_exceeded",
             "you've hit your usage limit",
-            "529",
         ];
         // Find the earliest match position so we can extract context around the
         // actual error message rather than the tail (which may be unrelated JSON).
         let match_pos = patterns.iter().filter_map(|p| lower.find(p)).min();
         let has_429 = lower.contains("429");
-        if match_pos.is_some() || has_429 {
+        // HTTP 529 is used by Cloudflare for rate limiting. Only match in HTTP status
+        // contexts (e.g. "HTTP 529", "status: 529") to avoid false positives from bare
+        // numbers like line numbers, port numbers, or file sizes.
+        let has_529 = lower.contains("http 529")
+            || lower.contains("529 service")
+            || (lower.contains(": 529")
+                && !lower[lower.find(": 529").unwrap() + 5..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit()));
+        if match_pos.is_some() || has_429 || has_529 {
             let message = if let Some(pos) = match_pos {
                 extract_context_around(text, pos, 300)
             } else {
@@ -1163,6 +1172,45 @@ mod tests {
         assert!(
             !msg.contains("web_fetch_requests"),
             "message should not be the tail JSON, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pattern_detect_rate_limit_529_not_bare() {
+        // Bare "529" in various contexts should NOT trigger rate limit detection.
+        // These are false positive cases we want to avoid.
+        assert!(
+            patterns::detect_rate_limit("error on line 529").is_none(),
+            "bare line number 529 should not match"
+        );
+        assert!(
+            patterns::detect_rate_limit("file size 529 bytes").is_none(),
+            "bare file size 529 should not match"
+        );
+        assert!(
+            patterns::detect_rate_limit("port :5290 in config").is_none(),
+            "port number containing 529 should not match"
+        );
+        assert!(
+            patterns::detect_rate_limit("timeout after 5290ms").is_none(),
+            "duration containing 529 should not match"
+        );
+        // But HTTP 529 status codes SHOULD match.
+        assert!(
+            patterns::detect_rate_limit("HTTP 529 Service Unavailable").is_some(),
+            "HTTP 529 status should match"
+        );
+        assert!(
+            patterns::detect_rate_limit("http 529").is_some(),
+            "http 529 should match"
+        );
+        assert!(
+            patterns::detect_rate_limit("529 service unavailable").is_some(),
+            "529 service unavailable should match"
+        );
+        assert!(
+            patterns::detect_rate_limit("status: 529").is_some(),
+            "status: 529 should match"
         );
     }
 
