@@ -896,12 +896,17 @@ async fn scan_mentions(
 
     // Get existing mention tasks across ALL statuses to avoid duplicates.
     // Uses a targeted source_id-only query to avoid fetching all 57 task columns.
+    // If the DB query fails, log and skip the mention scan for this tick to
+    // avoid treating every historical mention as new (which would create
+    // duplicate internal tasks during transient DB failures).
     let existing_mentions: std::collections::HashSet<String> = if let Some(s) = store {
-        s.list_source_ids_by_source(repo, "mention")
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect()
+        match s.list_source_ids_by_source(repo, "mention").await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to load existing mention source IDs — skipping mention scan this tick to prevent duplicates");
+                return Ok(());
+            }
+        }
     } else {
         std::collections::HashSet::new()
     };
