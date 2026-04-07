@@ -1647,7 +1647,13 @@ pub(crate) async fn ingest_external_tasks(
     // (e.g., store has Routed but GitHub still shows New labels).
     if !id_status_pairs.is_empty() {
         let all_ids: Vec<i64> = id_status_pairs.iter().map(|(id, _)| *id).collect();
-        let existing_map = store.get_batch(&all_ids).await.unwrap_or_default();
+        let existing_map = match store.get_batch(&all_ids).await {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!(err = %e, task_count = all_ids.len(), "ingest: get_batch failed — skipping initial status sync for newly ingested tasks this tick");
+                return Ok(());
+            }
+        };
         for (store_id, status) in id_status_pairs {
             if let Some(existing) = existing_map.get(&store_id) {
                 if existing.status == TaskStatus::New {
