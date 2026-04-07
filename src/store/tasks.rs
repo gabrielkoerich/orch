@@ -944,7 +944,7 @@ impl TaskStore {
 
         let row = sqlx::query(&sql).bind(id).fetch_one(&self.pool).await?;
 
-        Ok(row.try_get("val").unwrap_or(0))
+        Ok(row.try_get("val")?)
     }
 
     /// Increment a counter in the task store **without** updating `updated_at`.
@@ -966,7 +966,7 @@ impl TaskStore {
 
         let row = sqlx::query(&sql).bind(id).fetch_one(&self.pool).await?;
 
-        Ok(row.try_get("val").unwrap_or(0))
+        Ok(row.try_get("val")?)
     }
 
     /// Reset all failure/retry counters to zero.
