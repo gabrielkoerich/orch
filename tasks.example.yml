@@ -1,9 +1,0 @@
-version: 1
-agents:
-  - id: codex
-    description: General-purpose coding agent.
-  - id: claude
-    description: General-purpose reasoning agent.
-  - id: opencode
-    description: Lightweight coding agent.
-tasks: []
