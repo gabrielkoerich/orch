@@ -610,10 +610,13 @@ pub(crate) async fn remove_worktree_and_branch(
                 }
                 // Prune stale worktree entries from git metadata so the warning
                 // stops recurring on future `git worktree list` / cleanup cycles.
-                let _ = Command::new("git")
+                if let Err(e) = Command::new("git")
                     .args(["-C", repo_root_str.as_ref(), "worktree", "prune"])
-                    .output()
-                    .await;
+                    .output_with_context()
+                    .await
+                {
+                    tracing::warn!(task_id, err = %e, "git worktree prune failed — stale metadata may persist");
+                }
             } else {
                 tracing::warn!(task_id, err = %stderr, "failed to remove worktree");
             }
@@ -624,10 +627,13 @@ pub(crate) async fn remove_worktree_and_branch(
     }
 
     // Prune stale .git/worktrees/ entries left behind after removal.
-    let _ = Command::new("git")
+    if let Err(e) = Command::new("git")
         .args(["-C", repo_root_str.as_ref(), "worktree", "prune"])
         .output_with_context()
-        .await;
+        .await
+    {
+        tracing::warn!(task_id, err = %e, "git worktree prune failed — stale metadata may persist");
+    }
 
     // Delete local and remote branch from the main repo root (worktree is already gone).
     // When keep_remote_branch is set, only delete the local branch — the remote stays
