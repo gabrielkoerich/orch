@@ -1123,10 +1123,8 @@ impl TaskRunner {
         }
 
         // Append visible attribution footer (matches PR body style)
-        let model_str = model.map(|m| format!(" using `{m}`")).unwrap_or_default();
-        raw_comment.push_str(&format!(
-            "\n\n---\n*Created by {agent_name}[bot] via [Orch](https://github.com/gabrielkoerich/orch){model_str}*"
-        ));
+        let footer = crate::engine::attribution_footer("Created", &agent_name, model);
+        raw_comment.push_str(&footer);
 
         // Scan for leaked secrets and redact if needed
         let comment = if security::has_leaks(&raw_comment) {

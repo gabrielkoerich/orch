@@ -5,7 +5,7 @@
 //! - [`handle_review_changes`]: re-dispatch agent to address review feedback
 //! - [`dedup_reviews`]: deduplicate GitHub reviews by reviewer (keep latest)
 //! - [`any_changes_requested_in_reviews`]: check if any reviewer's latest review blocks merge
-//! - [`attribution_footer`]: standard "Commented/Reviewed by bot" footer for GitHub comments
+//! - [`crate::engine::attribution_footer`]: standard "Commented/Reviewed by bot" footer for GitHub comments
 
 use crate::backends::{ExternalBackend, ExternalTask, Status};
 use crate::config;
@@ -102,16 +102,6 @@ fn required_checks_state(
     };
 
     (state, total, passing, failing, pending)
-}
-
-/// Build a standard attribution footer for GitHub comments posted by orch bots.
-///
-/// `verb` is "Reviewed" or "Commented" depending on context.
-pub(crate) fn attribution_footer(verb: &str, agent: &str, model: &str) -> String {
-    format!(
-        "\n\n---\n*{} {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
-        verb, agent, model
-    )
 }
 
 /// Deduplicate GitHub reviews by reviewer, keeping only the latest per reviewer.
@@ -592,7 +582,11 @@ pub(crate) async fn auto_merge_pr(
                 )
                 .await;
                 let comment = format!("Auto-merge failed after {} rebase attempts: {}", retries, e);
-                let footer = attribution_footer("Commented", review_agent, review_model);
+                let footer = crate::engine::attribution_footer(
+                    "Commented",
+                    review_agent,
+                    Some(review_model),
+                );
                 let _ = gh
                     .add_comment(
                         repo,
@@ -823,7 +817,8 @@ pub(crate) async fn auto_merge_pr(
                 &[("block_reason", serde_json::json!(block_reason))],
             )
             .await;
-            let footer = attribution_footer("Commented", review_agent, review_model);
+            let footer =
+                crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
             if let Err(e) = gh
                 .add_comment(
                     repo,
@@ -858,7 +853,8 @@ pub(crate) async fn auto_merge_pr(
         )
         .await;
         let comment = format!("Auto-merge failed: {}", e);
-        let footer = attribution_footer("Commented", review_agent, review_model);
+        let footer =
+            crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
         if let Err(e) = gh
             .add_comment(
                 repo,
@@ -903,7 +899,7 @@ pub(crate) async fn auto_merge_pr(
 
     // 8. Post final comment on the PR
     let comment = "✅ PR reviewed, approved, and merged.";
-    let footer = attribution_footer("Reviewed", review_agent, review_model);
+    let footer = crate::engine::attribution_footer("Reviewed", review_agent, Some(review_model));
     if let Err(e) = gh
         .add_comment(
             repo,
@@ -1186,7 +1182,7 @@ pub(crate) async fn handle_review_changes(
                             "🔄 Auto-recovery: required CI checks pass. \
                             The review agent may have been blocked by a non-required check failure. \
                             Resetting review cycles and re-triggering review.{}",
-                            attribution_footer("Commented", review_agent, review_model)
+                            crate::engine::attribution_footer("Commented", review_agent, Some(review_model))
                         );
                         if let Err(e) = gh.add_comment(repo, &pr_num_str, &recovery_comment).await {
                             tracing::warn!(
@@ -1259,7 +1255,8 @@ pub(crate) async fn handle_review_changes(
             "🔍 Review agent requested changes after {} cycles. Escalating to human.\n\n**Review Notes:**\n{}",
             review_cycles, notes
         );
-        let footer = attribution_footer("Commented", review_agent, review_model);
+        let footer =
+            crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
         if let Err(e) = gh
             .add_comment(repo, &pr_num_str, &format!("{}{}", escalation, footer))
             .await

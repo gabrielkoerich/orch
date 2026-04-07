@@ -37,6 +37,22 @@ pub fn orch_footer() -> &'static str {
     "\n\n---\n*Posted by [Orch](https://github.com/gabrielkoerich/orch)*"
 }
 
+/// Build a standard attribution footer for GitHub comments posted by orch bots.
+///
+/// `verb` is "Created", "Reviewed", or "Commented" depending on context.
+pub fn attribution_footer(verb: &str, agent: &str, model: Option<&str>) -> String {
+    match model {
+        Some(m) => format!(
+            "\n\n---\n*{} by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch) using `{}`*",
+            verb, agent, m
+        ),
+        None => format!(
+            "\n\n---\n*{} by {}[bot] via [Orch](https://github.com/gabrielkoerich/orch)*",
+            verb, agent
+        ),
+    }
+}
+
 use crate::backends::{ExternalBackend, ExternalId};
 use crate::channels::capture::CaptureService;
 use crate::channels::discord_ws::DiscordGateway;
