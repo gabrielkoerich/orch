@@ -1,9 +1,10 @@
-project_dir: ""  # Auto-detected from CWD, override if needed
+projects:
+  - /path/to/your/project
+
 workflow:
   auto_close: true
   review_owner: "@owner"
   enable_review_agent: false
-  review_agent: "claude"
   max_attempts: 10
   # Only accept issues from these GitHub users. Repo owner is always included.
   # allowed_authors:
@@ -21,27 +22,58 @@ workflow:
   # Auto-close task (mark Done) when all PR reviews are approved (default: false).
   # Note: this does NOT merge the PR -- only updates the task status.
   auto_close_task_on_approval: false
-runner:
-  pty:
-    enabled: true
-router:
-  mode: "llm"  # "llm" (default) or "round_robin"
-  agent: "claude"
-  model: "haiku"
-  timeout_seconds: 60
-  fallback_executor: "codex"
-  max_route_attempts: 3  # After N LLM routing failures, fall back to round-robin
-  # Enable weighted round-robin: deprioritize agents hitting rate limits.
-  # Agents that return 429/rate limit errors get reduced routing weight,
-  # which gradually recovers as rate limit windows expire.
-  weighted_round_robin: false
-  # Agents to discover in PATH (checked at startup)
+  # Allowed tools for agents (used in permission rules)
+  allowed_tools:
+    - Edit
+    - Write
+    - Read
+    - Bash
+    - Grep
+    - Glob
+    - WebFetch
+    - WebSearch
+    - Task
+    - Skill
+
+# Engine settings
+engine:
+  tick_interval: 10
+  sync_interval: 45
+  max_parallel: 4
+  stuck_timeout: 1800
+  graceful_shutdown_timeout: 600
+  # Silence detection: grace period before flagging (seconds)
+  # silence_grace_period: 120
+  # silence_cooldown: 3600
+  # Agents to discover in PATH (checked at startup).
+  # Any Claude-compatible CLI (e.g. olm for Ollama) can be added here
+  # without code changes — unknown agents use the Claude runner automatically.
   agents:
     - claude
     - codex
     - opencode
     - kimi
     - minimax
+    # - olm  # Ollama via Claude-compatible CLI
+
+router:
+  mode: "llm"              # "llm" (default) or "round_robin"
+  agent: "claude"           # Which agent performs routing
+  model: "haiku"            # Model for routing (fast/cheap)
+  timeout_seconds: 60
+  fallback_executor: "codex"
+  max_route_attempts: 3     # After N LLM routing failures, fall back to round-robin
+  # Enable weighted round-robin: deprioritize agents hitting rate limits.
+  # weighted_round_robin: false
+  # Routing weights (higher = more tasks routed to this agent)
+  # weights:
+  #   claude: 0.25
+  #   codex: 0.1
+  #   opencode: 0.25
+  # Routing pool for LLM router (agent:model pairs)
+  # pool:
+  #   - claude:haiku
+  #   - opencode:free
   allowed_tools:
     - yq
     - jq
@@ -58,133 +90,87 @@ router:
   default_skills:
     - gh
     - git-worktree
+
 model_map:
   simple:
     claude: haiku
-    codex: gpt-5.1-codex-mini
+    codex: gpt-5.2-codex
     opencode:
+      - opencode:free
       - github-copilot/gpt-5-mini
-      - github-copilot/gemini-3-flash-preview
-      - opencode/minimax-m2.5-free
-      - opencode/nemotron-3-super-free
-    kimi: haiku
-    minimax: haiku
+    kimi: sonnet
+    minimax: sonnet
+    # olm: qwen3.5
   medium:
     claude: sonnet
-    codex: gpt-5.2
-    opencode:
-      - github-copilot/gpt-5.4-mini
-      - github-copilot/claude-sonnet-4-6
-      - github-copilot/gemini-2.5-pro
-      - opencode/mimo-v2-pro-free
-    kimi: sonnet
-    minimax: sonnet
-  complex:
-    claude: opus
     codex: gpt-5.3-codex
     opencode:
+      - opencode:free
+      - github-copilot/claude-sonnet-4.6
       - github-copilot/gpt-5.4
-      - github-copilot/claude-opus-4-6
-      - github-copilot/gpt-5.2
     kimi: opus
     minimax: opus
+    # olm: gemma4
+  complex:
+    claude: opus
+    codex: gpt-5.4
+    opencode:
+      - github-copilot/claude-opus-4.6
+      - github-copilot/gpt-5.4
+    kimi: opus
+    minimax: opus
+    # olm: gemma4
   review:
     claude: sonnet
-    codex: gpt-5.2
+    codex: gpt-5.3-codex
     opencode:
-      - github-copilot/gpt-5.4
-      - github-copilot/claude-sonnet-4-6
-      - github-copilot/gemini-2.5-pro
-    kimi: sonnet
-    minimax: sonnet
-  # Free models used as fallback when hitting usage limits (round-robin)
-  free:
-    - opencode/glm-5-free
-    - opencode/minimax-m2.5-free
-    - opencode/trinity-large-preview-free
-llm:
-  input_format: ""
-  output_format: "json"
+      - opencode:free
+      - github-copilot/gpt-5-mini
+    kimi: opus
+    minimax: opus
+    # olm: qwen3.5
+
 gh:
-  enabled: true
   repo: "owner/repo"
-  sync_label: "sync"
-  project_id: ""
-  project_status_field_id: ""
-  project_status_names: {}
-  project_status_map:
-    backlog: ""
-    in_progress: ""
-    review: ""
-    done: ""
-  backoff:
-    mode: "wait"
-    base_seconds: 30
-    max_seconds: 900
-  # GitHub authentication configuration
-  #
-  # Default: uses `gh auth token` — just run `gh auth login` and it works.
-  #
-  # For explicit token: set GH_TOKEN or GITHUB_TOKEN environment variable.
-  # For GitHub App (org automation): configure app_id and private_key below.
+  # GitHub Projects v2 integration (optional)
+  # project_id: ""
+  # project_status_field_id: ""
+  # project_status_map:
+  #   backlog: ""
+  #   in_progress: ""
+  #   review: ""
+  #   done: ""
   auth:
     # Auth mode: "auto" | "token" | "github_app" | "gh_cli"
-    # - "auto" (default): Try GH_TOKEN/GITHUB_TOKEN env vars, then GitHub App, then gh CLI
-    # - "token": Require Personal Access Token from env vars or gh.auth.token
+    # - "auto" (default): GH_TOKEN/GITHUB_TOKEN env → GitHub App → gh CLI
+    # - "token": Require PAT from env vars or gh.auth.token
     # - "github_app": Use GitHub App authentication
     # - "gh_cli": Always use `gh auth token`
     mode: "auto"
-
-    # Personal Access Token (optional — set GH_TOKEN env var instead)
     # token: "ghp_xxxxxxxxxxxxxxxxxxxx"
-
-    # GitHub App credentials (for mode: "github_app" or "auto")
     # app_id: "123456"
     # private_key: "/path/to/app-private-key.pem"
-    # Optional: specific installation ID (auto-detected if not set)
     # installation_id: "78901234"
-
-    # gh CLI fallback (default: true)
-    # Falls back to `gh auth token` when no token is otherwise configured
-    # allow_gh_fallback: true
+    allow_gh_fallback: true
 
 # GitHub webhook server for instant event delivery (bypasses polling)
-webhook:
-  enabled: false
-  port: 8080
-  secret: "${WEBHOOK_SECRET}"
-  # Deduplication settings (optional)
-  # dedup_window_seconds: 7200
-  # max_seen_deliveries: 50000
-  # dedup_store: "memory" # or "file"
-  # dedup_path: "~/.orch/webhook_dedup.db"
-  # dedup_metrics: true
-
-# Engine settings
-engine:
-  tick_interval: 10
-  sync_interval: 45
-  fallback_sync_interval: 30
-  webhook_health_check_interval: 60
-  max_parallel: 4
-  stuck_timeout: 1800
-  graceful_shutdown_timeout: 600
+# webhook:
+#   enabled: false
+#   port: 8080
+#   secret: "${WEBHOOK_SECRET}"
 
 # Task completion notifications — broadcast to all configured channels.
-# Level controls which events are sent:
-#   all         — every task completion (default)
-#   errors_only — only failures (needs_review, blocked, failed)
-#   none        — disable notifications
+# Level: all (default) | errors_only | none
 notifications:
   level: "all"
 
 # External notification channels
 channels:
   telegram:
-    enabled: true
+    enabled: false
     bot_token: "${TELEGRAM_BOT_TOKEN}"
     chat_id: "${TELEGRAM_CHAT_ID}"
   discord:
-    enabled: true
+    enabled: false
     bot_token: "${DISCORD_BOT_TOKEN}"
     channel_id: "${DISCORD_CHANNEL_ID}"
