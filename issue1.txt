@@ -1,0 +1,11 @@
+Title: Bug: Blocking I/O `std::fs::read_to_string` executed in Tokio async context during webhook server startup
+Body:
+The function `DedupStore::new_filebacked_with_metrics` in `src/channels/github.rs` uses synchronous file I/O `std::fs::read_to_string` (via `load_dedup_file`). 
+
+This constructor is invoked by `start_webhook_server` which is an `async fn` and runs on a Tokio worker thread. Loading a potentially large deduplication JSON file synchronously will block the tokio executor thread.
+
+**Location:**
+- `src/channels/github.rs` (`load_dedup_file` called by `new_filebacked_with_metrics` around line 122 and 291).
+
+**Suggested Fix:**
+Move the file reading operation inside `tokio::task::spawn_blocking` or use `tokio::fs::read_to_string` if `new_filebacked_with_metrics` can be made `async`.

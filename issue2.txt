@@ -1,0 +1,12 @@
+Title: Bug: Synchronous file system operations stall tokio executor threads in `src/home.rs` and `src/config/mod.rs`
+Body:
+Multiple path-resolution and config helpers use blocking `std::fs` operations but are invoked deeply within Tokio async execution paths, stalling worker threads.
+
+1. **`src/home.rs`**: `state_dir()`, `orch_home()`, and `repo_state_dir()` use `std::fs::create_dir_all`. These are called during async operations (e.g., `src/engine/events.rs:255`, `src/engine/cleanup.rs`, and logs rotation).
+2. **`src/config/mod.rs`**: `resolve_key` uses `std::fs::read_to_string` upon a cache miss. This is called in hot async paths like `poll_pr_reviews_for_tasks` (in `src/engine/review_poll.rs`) via `config::get`.
+3. **`src/engine/events.rs`**: `start_ws_server` explicitly executes `std::fs::write` directly in the `async fn`.
+
+**Suggested Fix:**
+- In `src/engine/events.rs`, use `tokio::fs::write`.
+- For `src/home.rs`, consider initializing these directories once at startup, or use `tokio::fs::create_dir_all` and make the functions `async`.
+- For `src/config/mod.rs`, ensure that file reads are wrapped in `spawn_blocking` or make the cache population asynchronous.
