@@ -209,12 +209,23 @@ pub async fn handle_error(
                 format!("model {model} unavailable"),
             )
         }
-        agents::AgentError::ContextOverflow { .. } => {
-            // Could truncate and retry, but for now treat as failed
-            (
-                response::RetryableError::Failed,
-                format!("{agent_name} context overflow"),
+        agents::AgentError::ContextOverflow { message } => {
+            // Context overflow is deterministic — the task's prompt/context is too large
+            // for this model's context window. Cycling through other agents would hit the
+            // same limit and waste API budget. Skip failover entirely and escalate
+            // immediately to needs_review so a human can intervene (e.g., split the task,
+            // reduce context, or manually assign a model with a larger context window).
+            let msg = format!("{agent_name} context overflow: {message}");
+            store::store_set(
+                store,
+                repo,
+                task_id,
+                &[("last_error", serde_json::json!(msg))],
             )
+            .await;
+            return Ok(ErrorHandleResult::EarlyReturn {
+                status: "needs_review".to_string(),
+            });
         }
         agents::AgentError::WaitingForInput { message } => {
             // Requires human — skip failover, go straight to needs_review
@@ -665,6 +676,35 @@ mod tests {
         assert!(
             matches!(result, ErrorHandleResult::Continue { .. }),
             "expected Continue for complex complexity — should fall through to agent failover, not retry with free model"
+        );
+    }
+
+    /// Context overflow is deterministic — the same context will overflow every agent.
+    /// Verify that it escalates directly to needs_review without cycling through fallback agents.
+    #[tokio::test]
+    async fn context_overflow_escalates_to_needs_review_immediately() {
+        let runner = MockRunner { free: vec![] };
+        let err = AgentError::ContextOverflow {
+            message: "prompt is too long: 250000 tokens, max 200000".to_string(),
+        };
+
+        let result = handle_error(
+            "test-2129-a",
+            &err,
+            "claude",
+            &runner,
+            Some("sonnet"),
+            Some("medium"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "needs_review"),
+            "context overflow must escalate directly to needs_review without cycling through fallback agents"
         );
     }
 
