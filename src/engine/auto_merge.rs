@@ -16,11 +16,7 @@ use crate::github::http::GhHttp;
 use crate::github::types::GitHubReview;
 use crate::store::TaskStore;
 use crate::store::{
-    opt_store_get_task,
-    store_increment,
-    store_reset_failure_counters,
-    store_set,
-    store_set_result,
+    opt_store_get_task, store_increment, store_reset_failure_counters, store_set, store_set_result,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -1374,7 +1370,10 @@ pub(crate) async fn handle_review_changes(
                 repo,
                 &task.id.0,
                 &[
-                    ("review_cycles", serde_json::json!((review_cycles + 1) as i64)),
+                    (
+                        "review_cycles",
+                        serde_json::json!((review_cycles + 1) as i64),
+                    ),
                     (
                         "review_agent_failures",
                         serde_json::json!(0), // reset failures for the new review round
@@ -1427,7 +1426,10 @@ pub(crate) async fn handle_review_changes(
                 repo,
                 &task.id.0,
                 &[
-                    ("review_cycles", serde_json::json!((review_cycles + 1) as i64)),
+                    (
+                        "review_cycles",
+                        serde_json::json!((review_cycles + 1) as i64),
+                    ),
                     (
                         "review_agent_failures",
                         serde_json::json!(0), // reset failures for the new review round
