@@ -67,23 +67,11 @@ impl TaskStore {
         Ok(rows)
     }
 
-    /// Delete job state (for cleanup when a job is removed from config).
-    #[allow(dead_code)]
-    pub async fn delete_job_state(&self, repo: &str, job_id: &str) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM job_state WHERE repo = ? AND job_id = ?")
-            .bind(repo)
-            .bind(job_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     // ---------------------------------------------------------------
     // Channel Subscriptions
     // ---------------------------------------------------------------
 
     /// Subscribe a channel/thread to notifications for a project.
-    #[allow(dead_code)]
     pub async fn subscribe_channel(
         &self,
         channel: &str,
@@ -105,7 +93,6 @@ impl TaskStore {
     }
 
     /// Unsubscribe a channel/thread from a project's notifications.
-    #[allow(dead_code)]
     pub async fn unsubscribe_channel(
         &self,
         channel: &str,
@@ -124,7 +111,7 @@ impl TaskStore {
     }
 
     /// List repos that a channel/thread is subscribed to.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn list_channel_subscriptions(
         &self,
         channel: &str,
@@ -141,7 +128,6 @@ impl TaskStore {
     }
 
     /// List all subscriptions (channel, thread_id, topic_id) for a repo.
-    #[allow(dead_code)]
     pub async fn list_subscribers_for_repo(
         &self,
         repo: &str,

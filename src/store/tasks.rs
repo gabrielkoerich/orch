@@ -1196,7 +1196,8 @@ impl TaskStore {
     ///
     /// Each entry is `(id, updates)` where `updates` is a slice of `(column, value)` pairs.
     /// Skips entries with empty update slices.
-    #[allow(dead_code)] // provided for callers that update many tasks at once
+    /// Test-only helper / bulk operations used by admin paths and tests.
+    #[cfg(test)]
     pub async fn batch_set_fields(
         &self,
         updates: &[(i64, &[(&str, serde_json::Value)])],
@@ -1301,7 +1302,8 @@ impl TaskStore {
     /// Batch-increment a field for multiple tasks in a single transaction.
     ///
     /// Each entry is `(id, field)`. All fields must be in the incrementable allowlist.
-    #[allow(dead_code)] // provided for callers that increment counters for many tasks at once
+    /// Test-only helper for bulk increments used by tests.
+    #[cfg(test)]
     pub async fn batch_increment(&self, entries: &[(i64, &str)]) -> anyhow::Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -1345,7 +1347,8 @@ impl TaskStore {
     ///
     /// Preserves `review_cycles` and `ci_merge_failures` (same semantics as
     /// [`reset_failure_counters`]).
-    #[allow(dead_code)] // provided for callers that reset counters for many tasks at once
+    /// Test-only helper for bulk counter resets used by tests.
+    #[cfg(test)]
     pub async fn batch_reset_failure_counters(&self, ids: &[i64]) -> anyhow::Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -1392,7 +1395,8 @@ impl TaskStore {
     /// Mark multiple tasks' worktrees as cleaned in a single transaction.
     ///
     /// Appends a `branch_delete` activity event for each task.
-    #[allow(dead_code)] // provided for callers that clean many worktrees at once
+    /// Test-only helper for bulk cleaning used by tests.
+    #[cfg(test)]
     pub async fn batch_mark_cleaned(&self, ids: &[i64]) -> anyhow::Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -1440,7 +1444,8 @@ impl TaskStore {
     }
 
     /// List tasks that are done/blocked with worktrees that haven't been cleaned.
-    #[allow(dead_code)]
+    /// Test-only helper and used by cleanup tests.
+    #[cfg(test)]
     pub async fn list_cleanable(&self, repo: &str) -> anyhow::Result<Vec<Task>> {
         let rows = sqlx::query(&format!(
             "SELECT {TASK_COLS} FROM tasks
@@ -1658,7 +1663,8 @@ impl TaskStore {
     }
 
     /// Get the last run of a specific type for a task.
-    #[allow(dead_code)]
+    /// Used by tests to assert run ordering.
+    #[cfg(test)]
     pub async fn get_last_run(
         &self,
         task_id: i64,
@@ -1694,7 +1700,8 @@ impl TaskStore {
     }
 
     /// Prune old runs for done/blocked tasks older than `days` days.
-    #[allow(dead_code)]
+    /// Test-only maintenance helper.
+    #[cfg(test)]
     pub async fn prune_old_runs(&self, days: i32) -> anyhow::Result<u64> {
         let result = sqlx::query(
             "DELETE FROM task_runs WHERE task_id IN (

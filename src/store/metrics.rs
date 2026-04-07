@@ -1,5 +1,7 @@
 use super::*;
-use chrono::{Datelike, Utc};
+#[cfg(test)]
+use chrono::Datelike;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
@@ -64,7 +66,6 @@ pub struct ErrorStat {
 
 /// Task with high review cycle count (persistent review loop).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct HighReviewCycleTask {
     pub external_id: Option<String>,
     pub agent: Option<String>,
@@ -101,7 +102,8 @@ pub struct CostByGroup {
 }
 
 /// Build the week-scoped KV key for the self-improvement counter.
-#[allow(dead_code)]
+/// Test-only helper.
+#[cfg(test)]
 fn self_improvement_key() -> String {
     let now = Utc::now();
     format!(
@@ -134,7 +136,8 @@ impl TaskStore {
 
     /// Count tasks by status for a repo.
     /// Returns a map of status string → count.
-    #[allow(dead_code)]
+    /// Only needed by tests.
+    #[cfg(test)]
     pub async fn status_counts(
         &self,
         repo: &str,
@@ -279,7 +282,8 @@ impl TaskStore {
     }
 
     /// Get aggregated metrics for the last 24 hours.
-    #[allow(dead_code)]
+    /// Test-only convenience wrapper.
+    #[cfg(test)]
     pub async fn get_metrics_summary_24h(&self) -> anyhow::Result<MetricsSummary> {
         let completed: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM task_metrics WHERE completed_at >= datetime('now', '-24 hours') AND outcome = 'success'",
@@ -494,12 +498,6 @@ impl TaskStore {
         })
     }
 
-    /// Get 24-hour cost summary filtered to a specific repository.
-    #[allow(dead_code)]
-    pub async fn get_cost_summary_24h_by_repo(&self, repo: &str) -> anyhow::Result<CostSummary> {
-        self.get_cost_summary_by_repo(repo, 24).await
-    }
-
     /// Record a rate limit event. Prunes records older than 30 days.
     pub async fn record_rate_limit(
         &self,
@@ -582,7 +580,8 @@ impl TaskStore {
     }
 
     /// Get slow tasks (top 10 longest running) from the last 7 days.
-    #[allow(dead_code)]
+    /// Test-only wrapper.
+    #[cfg(test)]
     pub async fn get_slow_tasks_7d(&self) -> anyhow::Result<Vec<SlowTaskInfo>> {
         let rows = sqlx::query(
             "SELECT task_id, agent, complexity, duration_seconds
@@ -628,12 +627,6 @@ impl TaskStore {
                 count: row.try_get("count").unwrap_or(0),
             })
             .collect())
-    }
-
-    /// Get error type distribution from the last 7 days.
-    #[allow(dead_code)]
-    pub async fn get_error_distribution_7d(&self) -> anyhow::Result<Vec<ErrorStat>> {
-        self.get_error_distribution(24 * 7).await
     }
 
     /// Get cost summary over multiple time windows (24h, 7d, 30d).
@@ -763,7 +756,8 @@ impl TaskStore {
     }
 
     /// Get count of self-improvement issues created this week.
-    #[allow(dead_code)]
+    /// Test-only helper that reads the KV counter.
+    #[cfg(test)]
     pub async fn count_self_improvement_issues_7d(&self) -> anyhow::Result<i64> {
         let key = self_improvement_key();
         let count = self.kv_get(&key).await?;
@@ -800,7 +794,8 @@ impl TaskStore {
     }
 
     /// Get tasks with high review cycle counts (persistent review loops) from the last 7 days.
-    #[allow(dead_code)]
+    /// Test-only wrapper.
+    #[cfg(test)]
     pub async fn get_high_review_cycle_tasks_7d(&self) -> anyhow::Result<Vec<HighReviewCycleTask>> {
         let rows = sqlx::query(
             "SELECT external_id, agent, review_cycles, title
@@ -826,7 +821,8 @@ impl TaskStore {
 
     /// Increment the self-improvement issue counter for the current week.
     /// Uses a single atomic SQL statement to avoid TOCTOU race conditions.
-    #[allow(dead_code)]
+    /// Test-only helper.
+    #[cfg(test)]
     pub async fn increment_self_improvement_counter(&self) -> anyhow::Result<()> {
         let key = self_improvement_key();
         sqlx::query(
