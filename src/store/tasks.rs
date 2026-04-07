@@ -1725,8 +1725,9 @@ impl TaskStore {
             );
         }
 
-        let status_str: String = row.try_get("status")
-    .map_err(|e| anyhow::anyhow!("task row missing status column: {e}"))?;
+        let status_str: String = row
+            .try_get("status")
+            .map_err(|e| anyhow::anyhow!("task row missing status column: {e}"))?;
         let labels_str: String = row.try_get("labels").unwrap_or_default();
         let memory_str: String = row.try_get("memory").unwrap_or_default();
         let delegations_str: String = row.try_get("delegations").unwrap_or_default();
