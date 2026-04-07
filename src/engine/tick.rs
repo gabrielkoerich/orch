@@ -815,6 +815,13 @@ pub(crate) async fn tick_route_tasks(
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
         .collect();
 
+    // Pre-emptive health check: refresh degraded-agent flags once per tick,
+    // not per-task (previously this ran inside route() causing N redundant
+    // DB queries when routing N tasks in the same tick).
+    if !routable.is_empty() {
+        router.refresh_health(store).await;
+    }
+
     for task in routable {
         let _task_span = tracing::info_span!("engine.route", task_id = %task.id.0).entered();
         match router.route(task, store, repo).await {

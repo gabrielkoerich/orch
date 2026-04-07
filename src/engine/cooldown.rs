@@ -91,6 +91,10 @@ const SILENCE_COUNT_PREFIX: &str = "silence_count:";
 /// KV key prefix for per-agent and per-agent:model failure counts (drives exponential backoff).
 const FAILURE_COUNT_PREFIX: &str = "failure_count:";
 
+/// KV key prefix for credit-exhaustion failure counts (separate from generic failures to prevent
+/// cross-contamination of backoff escalation — credit exhaustion uses different base/max durations).
+const CREDIT_FAILURE_COUNT_PREFIX: &str = "credit_failure_count:";
+
 struct CooldownEntry {
     /// Unix timestamp when the cooldown expires.
     cooldown_until: i64,
@@ -204,7 +208,19 @@ async fn read_and_increment_failure_count(
     store_opt: &Option<Arc<crate::store::TaskStore>>,
     key: &str,
 ) -> u32 {
-    let kv_key = format!("{FAILURE_COUNT_PREFIX}{key}");
+    read_and_increment_failure_count_with_prefix(store_opt, FAILURE_COUNT_PREFIX, key).await
+}
+
+/// Like [`read_and_increment_failure_count`] but with an explicit KV prefix.
+///
+/// Credit exhaustion uses [`CREDIT_FAILURE_COUNT_PREFIX`] so its backoff escalation
+/// is independent of generic agent failures (which use [`FAILURE_COUNT_PREFIX`]).
+async fn read_and_increment_failure_count_with_prefix(
+    store_opt: &Option<Arc<crate::store::TaskStore>>,
+    prefix: &str,
+    key: &str,
+) -> u32 {
+    let kv_key = format!("{prefix}{key}");
     if let Some(store) = store_opt {
         match store.kv_increment(&kv_key).await {
             Ok(n) => n,
@@ -222,13 +238,16 @@ async fn read_and_increment_failure_count(
 ///
 /// Call this from the runner's success path so that the next failure starts
 /// backoff from the base duration again, not from wherever it left off.
+/// Resets both generic and credit-exhaustion failure counters.
 pub async fn record_agent_success(agent_name: &str, model: &str) {
     let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
     if let Some(store) = store_opt {
         let agent_key = format!("{FAILURE_COUNT_PREFIX}{agent_name}");
         let model_key = format!("{FAILURE_COUNT_PREFIX}{agent_name}:{model}");
+        let credit_key = format!("{CREDIT_FAILURE_COUNT_PREFIX}{agent_name}");
         let _ = store.kv_set(&agent_key, "0").await;
         let _ = store.kv_set(&model_key, "0").await;
+        let _ = store.kv_set(&credit_key, "0").await;
     }
 }
 
@@ -335,7 +354,16 @@ pub async fn record_credit_exhaustion(agent_name: &str, reason: CreditExhaustion
     };
 
     let store_opt = cooldown_store().lock().ok().and_then(|g| g.clone());
-    let count = read_and_increment_failure_count(&store_opt, agent_name).await;
+    // Use a distinct failure counter (CREDIT_FAILURE_COUNT_PREFIX) so credit-
+    // exhaustion backoff escalation is independent of generic agent failures.
+    // Previously both paths shared FAILURE_COUNT_PREFIX, causing generic failures
+    // to inflate credit-exhaustion backoff (and vice versa).
+    let count = read_and_increment_failure_count_with_prefix(
+        &store_opt,
+        CREDIT_FAILURE_COUNT_PREFIX,
+        agent_name,
+    )
+    .await;
 
     let (base, max) = match reason {
         CreditExhaustionReason::OutOfCredits => (CREDIT_BACKOFF_BASE_SECS, CREDIT_BACKOFF_MAX_SECS),
@@ -518,6 +546,9 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
             // Reset failure count so backoff restarts from base.
             let fc_key = format!("{FAILURE_COUNT_PREFIX}{k}");
             let _ = store.kv_set(&fc_key, "0").await;
+            // Also reset credit-specific failure count.
+            let credit_fc_key = format!("{CREDIT_FAILURE_COUNT_PREFIX}{k}");
+            let _ = store.kv_set(&credit_fc_key, "0").await;
         }
         // Also reset any persisted failure_count keys that are not in the
         // in-memory map (e.g. survived a restart or were set without a
@@ -525,6 +556,11 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
         if let Ok(fc_entries) = store.kv_list_prefix(FAILURE_COUNT_PREFIX).await {
             for (fc_key, _) in fc_entries {
                 let _ = store.kv_set(&fc_key, "0").await;
+            }
+        }
+        if let Ok(cfc_entries) = store.kv_list_prefix(CREDIT_FAILURE_COUNT_PREFIX).await {
+            for (cfc_key, _) in cfc_entries {
+                let _ = store.kv_set(&cfc_key, "0").await;
             }
         }
         tracing::info!(
@@ -541,6 +577,9 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
         // Reset failure count so backoff restarts from base.
         let fc_key = format!("{FAILURE_COUNT_PREFIX}{key}");
         let _ = store.kv_set(&fc_key, "0").await;
+        // Also reset credit-specific failure count.
+        let credit_fc_key = format!("{CREDIT_FAILURE_COUNT_PREFIX}{key}");
+        let _ = store.kv_set(&credit_fc_key, "0").await;
         tracing::info!(key, "cleared cooldown and failure count");
     }
 }

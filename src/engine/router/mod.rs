@@ -524,8 +524,8 @@ impl Router {
         store: &std::sync::Arc<TaskStore>,
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
-        // Pre-emptive health check: refresh degraded-agent flags before routing.
-        self.refresh_health(store).await;
+        // NOTE: refresh_health() is called once per tick in tick_route_tasks()
+        // before the routing loop, not per-task. Do not re-add it here.
 
         loop {
             // 1. Check store agent field first (set by failover, authoritative over labels)
