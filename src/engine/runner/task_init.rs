@@ -278,7 +278,7 @@ pub async fn prepare_task(
 
     // Output file in per-task attempt directory (attempt = attempts + 1, set below)
     let next_attempt = attempts + 1;
-    let attempt_dir = match crate::home::task_attempt_dir(repo, task_id, next_attempt) {
+    let attempt_dir = match crate::home::task_attempt_dir_async(repo, task_id, next_attempt).await {
         Ok(dir) => dir,
         Err(e) => {
             if let Some(s) = store {

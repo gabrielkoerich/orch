@@ -126,7 +126,7 @@ impl EventBus {
         let listener = TcpListener::from_std(listener)?;
 
         // Write port file without blocking the runtime thread.
-        let port_path = ws_port_path()?;
+        let port_path = ws_port_path().await?;
         if let Some(parent) = port_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -243,9 +243,9 @@ pub fn select_available_listener() -> anyhow::Result<(std::net::TcpListener, u16
 }
 
 /// Remove the ws.port file on shutdown.
-pub fn cleanup_port_file() {
-    if let Ok(path) = ws_port_path() {
-        let _ = std::fs::remove_file(path);
+pub async fn cleanup_port_file() {
+    if let Ok(path) = ws_port_path().await {
+        let _ = tokio::fs::remove_file(path).await;
     }
 }
 
@@ -256,7 +256,7 @@ pub fn cleanup_version_file() {
     }
 }
 
-fn ws_port_path() -> anyhow::Result<std::path::PathBuf> {
+async fn ws_port_path() -> anyhow::Result<std::path::PathBuf> {
     if cfg!(test) {
         Ok(std::env::temp_dir().join("orch-test-state").join("ws.port"))
     } else {
@@ -458,7 +458,7 @@ mod tests {
         }
 
         // Cleanup
-        cleanup_port_file();
+        cleanup_port_file().await;
     }
 
     #[tokio::test]
@@ -502,7 +502,7 @@ mod tests {
         .await;
         assert!(result.is_err(), "expected no more messages (filtered)");
 
-        cleanup_port_file();
+        cleanup_port_file().await;
     }
 
     #[tokio::test]
@@ -550,7 +550,7 @@ mod tests {
         .await;
         assert!(result.is_err(), "expected no more messages (filtered)");
 
-        cleanup_port_file();
+        cleanup_port_file().await;
     }
 
     #[tokio::test]
@@ -588,7 +588,7 @@ mod tests {
 
         assert_eq!(received_ids, vec!["1", "2", "3"]);
 
-        cleanup_port_file();
+        cleanup_port_file().await;
     }
 
     /// When the broadcast receiver lags (missed events), the server must send a
@@ -647,6 +647,6 @@ mod tests {
             "expected a lagged ControlMessage when bus capacity is exceeded"
         );
 
-        cleanup_port_file();
+        cleanup_port_file().await;
     }
 }

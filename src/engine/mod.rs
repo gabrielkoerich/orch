@@ -542,6 +542,19 @@ fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelC
 pub async fn serve() -> anyhow::Result<()> {
     tracing::info!("orch engine starting");
 
+    // Pre-create standard directories with async I/O so subsequent synchronous
+    // callers (state_dir, orch_home, etc.) find them already present and their
+    // create_dir_all calls become fast no-ops.
+    if let Err(e) = crate::home::init_dirs().await {
+        tracing::warn!("failed to initialize orch directories: {e}");
+    }
+
+    // Pre-warm the config cache with async I/O so get() / get_list() calls in
+    // hot async paths never block a Tokio thread on std::fs::read_to_string.
+    if let Err(e) = crate::config::warm_cache().await {
+        tracing::warn!("failed to warm config cache: {e}");
+    }
+
     let mut config = EngineConfig::from_config();
 
     tracing::info!("internal database ready");
@@ -1666,7 +1679,7 @@ pub async fn serve() -> anyhow::Result<()> {
     }
 
     // Clean up event bus port file and service version file
-    events::cleanup_port_file();
+    events::cleanup_port_file().await;
     events::cleanup_version_file();
 
     // transport and channels drop here at end of scope

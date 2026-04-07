@@ -998,7 +998,8 @@ pub(crate) async fn review_and_merge(
 
     // 6. Build agent invocation for review
     let review_task_id = format!("{}-review", task.id.0);
-    let review_attempt_dir = crate::home::task_attempt_dir(repo, &review_task_id, review_attempt)?;
+    let review_attempt_dir =
+        crate::home::task_attempt_dir_async(repo, &review_task_id, review_attempt).await?;
     let output_file = review_attempt_dir.join("output.json");
 
     let git_name =

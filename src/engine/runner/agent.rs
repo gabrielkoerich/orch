@@ -61,8 +61,8 @@ pub struct AgentInvocation {
 /// Returns the tmux session name.
 pub async fn spawn_in_tmux(tmux: &TmuxManager, inv: &AgentInvocation) -> anyhow::Result<String> {
     // Prepare attempt directory and prompt files (system + message).
-    let attempt_dir = crate::home::task_attempt_dir(&inv.repo, &inv.task_id, inv.attempt)?;
-    tokio::fs::create_dir_all(&attempt_dir).await?;
+    let attempt_dir =
+        crate::home::task_attempt_dir_async(&inv.repo, &inv.task_id, inv.attempt).await?;
 
     let sys_file = attempt_dir.join("prompt-sys.md");
     let msg_file = attempt_dir.join("prompt-msg.md");

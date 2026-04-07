@@ -168,7 +168,7 @@ pub async fn read_output_file(task_id: &str, primary_path: &Path, repo: &str) ->
     }
 
     // Fallback: check all attempt dirs for this task (newest first)
-    if let Ok(task_dir) = crate::home::task_dir(repo, task_id) {
+    if let Ok(task_dir) = crate::home::task_dir_async(repo, task_id).await {
         let attempts_dir = task_dir.join("attempts");
         if attempts_dir.is_dir() {
             let mut attempt_nums: Vec<u32> = tokio::task::spawn_blocking({

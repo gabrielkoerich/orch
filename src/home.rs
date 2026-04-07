@@ -169,6 +169,18 @@ pub fn task_dir(repo: &str, task_id: &str) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Async version of [`task_dir`] — uses `tokio::fs::create_dir_all` to avoid
+/// blocking the Tokio executor when creating a new directory.
+pub async fn task_dir_async(repo: &str, task_id: &str) -> anyhow::Result<PathBuf> {
+    let state = state_dir()?;
+    let dir = state
+        .join(repo.replace('/', std::path::MAIN_SEPARATOR_STR))
+        .join("tasks")
+        .join(task_id);
+    tokio::fs::create_dir_all(&dir).await?;
+    Ok(dir)
+}
+
 /// Get the per-task attempt directory: `~/.orch/state/{owner}/{repo}/tasks/{id}/attempts/{n}/`.
 ///
 /// Creates the directory on demand.
@@ -178,6 +190,41 @@ pub fn task_attempt_dir(repo: &str, task_id: &str, attempt: u32) -> anyhow::Resu
         .join(attempt.to_string());
     ensure_dir(&dir)?;
     Ok(dir)
+}
+
+/// Async version of [`task_attempt_dir`] — uses `tokio::fs::create_dir_all` to
+/// avoid blocking the Tokio executor when creating a new directory.
+pub async fn task_attempt_dir_async(
+    repo: &str,
+    task_id: &str,
+    attempt: u32,
+) -> anyhow::Result<PathBuf> {
+    let state = state_dir()?;
+    let dir = state
+        .join(repo.replace('/', std::path::MAIN_SEPARATOR_STR))
+        .join("tasks")
+        .join(task_id)
+        .join("attempts")
+        .join(attempt.to_string());
+    tokio::fs::create_dir_all(&dir).await?;
+    Ok(dir)
+}
+
+/// Pre-create all standard orch directories using async I/O.
+///
+/// Call once at engine startup before the Tokio thread pool is busy so that
+/// subsequent synchronous callers of [`orch_home`], [`state_dir`], etc. find
+/// the directories already present and their `create_dir_all` calls become
+/// fast no-ops (a single `stat` syscall on an existing path).
+pub async fn init_dirs() -> anyhow::Result<()> {
+    let home = orch_home()?;
+    tokio::fs::create_dir_all(&home).await?;
+    tokio::fs::create_dir_all(home.join("state")).await?;
+    tokio::fs::create_dir_all(home.join("worktrees")).await?;
+    tokio::fs::create_dir_all(home.join("contexts")).await?;
+    tokio::fs::create_dir_all(home.join("projects")).await?;
+    tokio::fs::create_dir_all(home.join("skills")).await?;
+    Ok(())
 }
 
 #[cfg(test)]
