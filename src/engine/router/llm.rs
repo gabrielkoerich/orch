@@ -464,22 +464,6 @@ impl LlmRouter {
             .call_router_llm(&prompt, router_agent, router_model, timeout)
             .await?;
 
-        tracing::info!(
-            task_id = task.id.0,
-            router_agent,
-            router_model = router_model.unwrap_or("default"),
-            response_len = response.len(),
-            response_preview = %{
-                let end = response.floor_char_boundary(500);
-                &response[..end]
-            },
-            "LLM router raw response"
-        );
-
-        // Save raw response for debugging
-        let response_path = routing_dir.join("response.txt");
-        let _ = tokio::fs::write(&response_path, &response).await;
-
         // Parse the response
         let llm_response: LlmRouteResponse = self.parse_llm_response(router_agent, &response)?;
 
@@ -550,8 +534,41 @@ impl LlmRouter {
             }
         }
 
-        // Run sanity checks
+        // Save raw response for debugging
+        let response_path = routing_dir.join("response.txt");
+        let _ = tokio::fs::write(&response_path, &response).await;
+
+        // Log a concise routing summary at info level (after sanity checks complete)
         let warning = self.check_routing_sanity(task, &agent, &profile);
+
+        tracing::info!(
+            task_id = task.id.0,
+            router_agent,
+            router_model = router_model.unwrap_or("default"),
+            selected_executor = %agent,
+            complexity = %complexity,
+            warning = warning.as_deref(),
+            "LLM router decision"
+        );
+
+        // Log clean text payload at debug level (not raw NDJSON startup noise)
+        let debug_preview = {
+            let inner = self
+                .extract_agent_text(router_agent, response.trim())
+                .unwrap_or_else(|_| response.to_string());
+            let trimmed = inner.trim();
+            if trimmed.len() <= 500 {
+                trimmed.to_string()
+            } else {
+                format!("{}...", &trimmed[..trimmed.floor_char_boundary(500)])
+            }
+        };
+        tracing::debug!(
+            task_id = task.id.0,
+            response_len = response.len(),
+            response_preview = %debug_preview,
+            "LLM router parsed response (debug)"
+        );
 
         // Track last routed agent for distribution
         *last_agent = Some(agent.clone());
@@ -1562,6 +1579,31 @@ mod tests {
 {"type":"result","subtype":"success","is_error":false,"result":"{\"executor\":\"kimi\",\"complexity\":\"medium\",\"reason\":\"wrapper\"}"}"#;
         let resp = router.parse_llm_response("kimi", raw).unwrap();
         assert_eq!(resp.executor, "kimi");
+    }
+
+    #[test]
+    fn extract_agent_text_for_debug_log_ndjson_success() {
+        // Regression test: extract_agent_text should return the clean text payload,
+        // not the raw NDJSON startup noise that would appear in debug logs.
+        let router = make_router();
+        let raw = r#"{"type":"system","subtype":"hook_started","hook_id":"abc"}
+{"type":"system","subtype":"init"}
+{"type":"text","timestamp":2,"text":"{\"executor\":\"claude\",\"complexity\":\"simple\",\"reason\":\"small fix\"}"}
+{"type":"step_finish","timestamp":3}"#;
+        let text = router.extract_agent_text("claude", raw.trim()).unwrap();
+        let trimmed = text.trim();
+        // Should contain the routing decision, not hook_started noise
+        assert!(
+            trimmed.contains("executor")
+                && trimmed.contains("claude")
+                && trimmed.contains("simple"),
+            "extracted text must contain routing fields: {trimmed}"
+        );
+        // Must not contain hook_started in the extracted text
+        assert!(
+            !trimmed.contains("hook_started"),
+            "extracted text must not contain hook_started NDJSON noise"
+        );
     }
 
     // ── check_routing_sanity ─────────────────────────────────────────────────
