@@ -769,20 +769,28 @@ async fn check_token_budget(
     // Query total tokens and cost estimate together (single DB read)
     let (total_tokens, cost) = if let Some(ref s) = ctx.store {
         if let Some(store_id) = ctx.store_id_opt {
-            if let Ok(task) = s.get(store_id).await {
-                let usage = crate::store::TokenUsage {
-                    input_tokens: task.input_tokens as u64,
-                    output_tokens: task.output_tokens as u64,
-                };
-                let total = usage.total_tokens();
-                let cost = crate::store::CostEstimate {
-                    input_cost_usd: task.input_cost_usd,
-                    output_cost_usd: task.output_cost_usd,
-                    total_cost_usd: task.total_cost_usd,
-                };
-                (total, cost)
-            } else {
-                store::get_token_summary(ctx.store, ctx.repo, ctx.task_id).await
+            match s.get(store_id).await {
+                Ok(task) => {
+                    let usage = crate::store::TokenUsage {
+                        input_tokens: task.input_tokens as u64,
+                        output_tokens: task.output_tokens as u64,
+                    };
+                    let total = usage.total_tokens();
+                    let cost = crate::store::CostEstimate {
+                        input_cost_usd: task.input_cost_usd,
+                        output_cost_usd: task.output_cost_usd,
+                        total_cost_usd: task.total_cost_usd,
+                    };
+                    (total, cost)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = ctx.task_id,
+                        err = %e,
+                        "store.get() failed in check_token_budget — falling back to get_token_summary"
+                    );
+                    store::get_token_summary(ctx.store, ctx.repo, ctx.task_id).await
+                }
             }
         } else {
             store::get_token_summary(ctx.store, ctx.repo, ctx.task_id).await
