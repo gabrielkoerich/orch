@@ -763,6 +763,7 @@ pub(crate) mod patterns {
         let lower = text.to_lowercase();
         let patterns = [
             "unauthorized",
+            "authentication required",
             "invalid api",
             "invalid key",
             "invalid token",
@@ -779,7 +780,14 @@ pub(crate) mod patterns {
         ];
         let http_401 = contains_http_status(&lower, "401");
         let http_403 = contains_http_status(&lower, "403");
-        if patterns.iter().any(|p| lower.contains(p)) || http_401 || http_403 {
+        let http_407 = contains_http_status(&lower, "407");
+        let proxy_auth_required = lower.contains("proxy authentication required");
+        if patterns.iter().any(|p| lower.contains(p))
+            || http_401
+            || http_403
+            || http_407
+            || proxy_auth_required
+        {
             return Some(AgentError::Auth {
                 message: safe_tail(text, 300).to_string(),
             });
@@ -933,9 +941,13 @@ pub(crate) mod patterns {
             "op signin",
             "ssh passphrase",
             "password:",
-            "authentication required",
         ];
-        if patterns.iter().any(|p| lower.contains(p)) {
+        let auth_required_with_interactive_context = lower.contains("authentication required")
+            && (lower.contains("ssh")
+                || lower.contains("passphrase")
+                || lower.contains("1password")
+                || lower.contains("op signin"));
+        if patterns.iter().any(|p| lower.contains(p)) || auth_required_with_interactive_context {
             return Some(AgentError::WaitingForInput {
                 message: text.to_string(),
             });
@@ -1010,12 +1022,6 @@ pub(crate) mod patterns {
         if let Some(e) = detect_missing_tool(text) {
             return e;
         }
-        if let Some(e) = detect_waiting_for_input(text) {
-            return e;
-        }
-        if let Some(e) = detect_permission_denied(text) {
-            return e;
-        }
         if let Some(e) = detect_worktree_missing(text) {
             return e;
         }
@@ -1039,6 +1045,12 @@ pub(crate) mod patterns {
             return e;
         }
         if let Some(e) = detect_auth_error(scan_tail) {
+            return e;
+        }
+        if let Some(e) = detect_waiting_for_input(text) {
+            return e;
+        }
+        if let Some(e) = detect_permission_denied(text) {
             return e;
         }
         if let Some(e) = detect_stale_session(text) {
@@ -1209,6 +1221,8 @@ mod tests {
         assert!(patterns::detect_auth_error("error: 401").is_some());
         assert!(patterns::detect_auth_error("403 Forbidden").is_some());
         assert!(patterns::detect_auth_error("HTTP 403").is_some());
+        assert!(patterns::detect_auth_error("HTTP 407 Authentication Required").is_some());
+        assert!(patterns::detect_auth_error("407 Proxy Authentication Required").is_some());
         assert!(patterns::detect_auth_error("invalid api key").is_some());
         assert!(patterns::detect_auth_error("billing expired").is_some());
         assert!(patterns::detect_auth_error("task done").is_none());
@@ -1278,6 +1292,13 @@ mod tests {
     fn pattern_detect_waiting_for_input() {
         assert!(patterns::detect_waiting_for_input("Enter passphrase for key").is_some());
         assert!(patterns::detect_waiting_for_input("1Password CLI required").is_some());
+        assert!(
+            patterns::detect_waiting_for_input("SSH authentication required for deploy key")
+                .is_some()
+        );
+        assert!(
+            patterns::detect_waiting_for_input("HTTP 407 Proxy Authentication Required").is_none()
+        );
         assert!(patterns::detect_waiting_for_input("done").is_none());
     }
 
@@ -1403,6 +1424,24 @@ mod tests {
         assert!(
             matches!(err, AgentError::Auth { .. }),
             "real auth error at tail must be detected, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_prefers_auth_over_permission_denied() {
+        let err = patterns::classify_from_text(1, "HTTP 403 access denied: invalid token");
+        assert!(
+            matches!(err, AgentError::Auth { .. }),
+            "auth errors must outrank permission denied, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_prefers_auth_over_waiting_for_input() {
+        let err = patterns::classify_from_text(1, "HTTP 407 Proxy Authentication Required");
+        assert!(
+            matches!(err, AgentError::Auth { .. }),
+            "HTTP auth failures must not be treated as waiting for input, got: {err:?}"
         );
     }
 
