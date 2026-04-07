@@ -212,7 +212,9 @@ fn parse_success_output(
             }
             Err(_) => {
                 // Only fall back to text synthesis when parsing fails
-                if let Some(response) = agents::synthesize_response_from_text(&agent_result.result_text) {
+                if let Some(response) =
+                    agents::synthesize_response_from_text(&agent_result.result_text)
+                {
                     tracing::warn!(
                         task_id,
                         agent = agent_name,
@@ -1966,11 +1968,11 @@ mod tests {
         // Here we test that if find_agent_result succeeds and returns valid JSON, we use it directly
         // WITHOUT calling agent_runner.parse_response at all.
         let ndjson = r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"status\":\"done\",\"summary\":\"my summary\",\"accomplished\":[],\"remaining\":[],\"files\":[]}"}"#;
-        
+
         // FailingMockRunner always returns InvalidResponse, so if we called it, we'd synthesize "done" instead of getting "my summary".
         let runner = FailingMockRunner;
         let result = parse_success_output("999", "claude", &runner, ndjson);
-        
+
         let parsed = result.expect("should parse successfully via find_agent_result");
         assert_eq!(parsed.response.status, "done");
         assert_eq!(parsed.response.summary, "my summary");
@@ -1981,10 +1983,10 @@ mod tests {
         // Here we test that if find_agent_result returns is_error=true, we return AgentFailed
         // instead of falling back to synthesis or agent_runner.parse_response.
         let ndjson = r#"{"type":"result","subtype":"success","is_error":true,"result":"I failed because of reasons"}"#;
-        
+
         let runner = FailingMockRunner;
         let result = parse_success_output("999", "claude", &runner, ndjson);
-        
+
         let err = result.expect_err("should return error");
         match err {
             agents::AgentError::AgentFailed { message } => {
