@@ -160,21 +160,21 @@ impl CodexRunner {
             return e;
         }
 
-        // Connection/network errors — codex-specific transient patterns
+        // Connection/network errors — codex-specific transient patterns.
+        // Return NetworkError (not AgentFailed) so fallback.rs can route these
+        // into the dedicated network-retry loop with backoff and escalation.
         if lower.contains("reconnecting")
             || lower.contains("stream disconnected")
             || lower.contains("connection closed")
             || lower.contains("websocket")
             || lower.contains("econnreset")
         {
-            return AgentError::AgentFailed {
-                message: format!("codex failed: {message}"),
+            return AgentError::NetworkError {
+                message: format!("codex network error: {message}"),
             };
         }
-        if super::patterns::detect_network_error(message).is_some() {
-            return AgentError::AgentFailed {
-                message: format!("codex failed: {message}"),
-            };
+        if let Some(e) = super::patterns::detect_network_error(message) {
+            return e;
         }
 
         AgentError::AgentFailed {
@@ -537,8 +537,8 @@ mod tests {
     fn classify_codex_stream_disconnected() {
         let err = runner().classify_message("Reconnecting 3/5... stream disconnected");
         assert!(
-            matches!(err, AgentError::AgentFailed { .. }),
-            "got: {err:?}"
+            matches!(err, AgentError::NetworkError { .. }),
+            "expected NetworkError so fallback retries, got: {err:?}"
         );
     }
 
@@ -546,8 +546,8 @@ mod tests {
     fn classify_codex_websocket_error() {
         let err = runner().classify_message("WebSocket connection closed unexpectedly");
         assert!(
-            matches!(err, AgentError::AgentFailed { .. }),
-            "got: {err:?}"
+            matches!(err, AgentError::NetworkError { .. }),
+            "expected NetworkError so fallback retries, got: {err:?}"
         );
     }
 
@@ -555,8 +555,8 @@ mod tests {
     fn classify_codex_econnreset() {
         let err = runner().classify_message("ECONNRESET: connection reset by peer");
         assert!(
-            matches!(err, AgentError::AgentFailed { .. }),
-            "got: {err:?}"
+            matches!(err, AgentError::NetworkError { .. }),
+            "expected NetworkError so fallback retries, got: {err:?}"
         );
     }
 

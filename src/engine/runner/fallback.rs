@@ -126,9 +126,15 @@ pub async fn handle_error(
             )
         }
         agents::AgentError::Auth { message } => {
-            // Check for credit exhaustion in auth errors (billing-related)
+            // Check for credit exhaustion first — those need longer agent-wide cooldowns.
+            // For plain auth failures (expired key, wrong token, etc.) record a standard
+            // agent-level failure so the router can observe it before concurrent tasks
+            // start another run against the same unavailable agent.
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
                 crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
+            } else {
+                crate::engine::cooldown::record_agent_failure_with_message(agent_name, message)
+                    .await;
             }
             (
                 response::RetryableError::AuthError,
@@ -240,20 +246,26 @@ pub async fn handle_error(
             // Transient connectivity failure — retry same agent without rerouting,
             // but grow a dedicated streak counter so backoff keeps increasing.
             // Use "routed" so it re-dispatches without a full re-routing cycle.
+            // After MAX_NETWORK_RETRIES consecutive network errors, escalate to
+            // needs_review so a human is notified rather than looping forever.
+            const MAX_NETWORK_RETRIES: u64 = 8;
             let msg = format!("{agent_name} network error: {message}");
-            match store::store_increment(store, repo, task_id, "network_retries").await {
-                Ok(retry_count) => {
-                    tracing::info!(
-                        task_id,
-                        retry_count,
-                        agent = agent_name,
-                        "network retry scheduled"
-                    )
-                }
-                Err(e) => {
-                    tracing::warn!(task_id, error = %e, "failed to increment network_retries");
-                }
-            }
+            let retry_count =
+                match store::store_increment(store, repo, task_id, "network_retries").await {
+                    Ok(count) => {
+                        tracing::info!(
+                            task_id,
+                            retry_count = count,
+                            agent = agent_name,
+                            "network retry scheduled"
+                        );
+                        count
+                    }
+                    Err(e) => {
+                        tracing::warn!(task_id, error = %e, "failed to increment network_retries");
+                        0
+                    }
+                };
             store::store_set(
                 store,
                 repo,
@@ -261,6 +273,17 @@ pub async fn handle_error(
                 &[("last_error", serde_json::json!(msg))],
             )
             .await;
+            if retry_count >= MAX_NETWORK_RETRIES {
+                tracing::warn!(
+                    task_id,
+                    retry_count,
+                    agent = agent_name,
+                    "network retries exhausted, escalating to needs_review"
+                );
+                return Ok(ErrorHandleResult::Continue {
+                    status: "needs_review".to_string(),
+                });
+            }
             // Apply backoff to pace retries
             response::wait_for_fallback_backoff(task_id, store, repo).await;
             return Ok(ErrorHandleResult::EarlyReturn {
@@ -354,7 +377,7 @@ pub async fn handle_error(
 
     // Try free models as last resort before giving up
     let chain = response::get_reroute_chain(task_id, store, repo).await;
-    let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
+    let available: Vec<String> = crate::engine::router::config::DEFAULT_AGENTS
         .iter()
         .filter(|a| crate::cmd_cache::command_exists(a))
         .map(|s| s.to_string())

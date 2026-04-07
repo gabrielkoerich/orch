@@ -140,7 +140,7 @@ fn classify_failure(error: &str, outcome: &str) -> FailureCategory {
 
     if lower.contains("model unavailable")
         || lower.contains("model not found")
-        || lower.contains("does not exist") && lower.contains("model")
+        || (lower.contains("does not exist") && lower.contains("model"))
     {
         return FailureCategory::ModelUnavailable;
     }
@@ -530,10 +530,13 @@ pub(crate) async fn sync_tick(
     if enable_review {
         // Detect stale InReview tasks (review agent crashed, no active tmux session).
         // Read from the store (includes both external and internal tasks).
-        let in_review_tasks = task_manager
-            .list_all_by_status(Status::InReview)
-            .await
-            .unwrap_or_default();
+        let in_review_tasks = match task_manager.list_all_by_status(Status::InReview).await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to list InReview tasks for stale-session check; skipping");
+                vec![]
+            }
+        };
         // Fetch all live tmux sessions once instead of one subprocess call per task.
         let live_sessions: std::collections::HashSet<String> = tmux
             .list_sessions()
@@ -641,10 +644,13 @@ pub(crate) async fn sync_tick(
     // re-introducing the double-trigger race fixed in issue #857 — the subscriber is still
     // the sole spawner and uses the InReview transition as its atomic guard.
     if enable_review {
-        let needs_review_tasks = task_manager
-            .list_all_by_status(Status::NeedsReview)
-            .await
-            .unwrap_or_default();
+        let needs_review_tasks = match task_manager.list_all_by_status(Status::NeedsReview).await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to list NeedsReview tasks for stale-refire check; skipping");
+                vec![]
+            }
+        };
 
         const MIN_STALE_NEEDS_REVIEW_MINUTES: i64 = 1;
         const MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS: u64 = 5; // escalate to Blocked after this many refires
