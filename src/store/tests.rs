@@ -220,6 +220,50 @@ async fn increment_and_reset_counters() {
 }
 
 #[tokio::test]
+async fn increment_propagates_returned_value_decode_errors() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id = store
+        .create(&NewTask {
+            external_id: None,
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "Test".to_string(),
+            body: "".to_string(),
+            source: "manual".to_string(),
+            source_id: "".to_string(),
+            author: "".to_string(),
+            url: "".to_string(),
+            labels: vec![],
+        })
+        .await
+        .unwrap();
+
+    store
+        .set_fields(id, &[("push_failures", serde_json::json!(i32::MAX))])
+        .await
+        .unwrap();
+    let err = store.increment(id, "push_failures").await.unwrap_err();
+    assert!(
+        err.to_string().contains("out of range") || err.to_string().contains("decode"),
+        "unexpected error: {err:#}"
+    );
+
+    store
+        .set_fields(id, &[("needs_review_refires", serde_json::json!(i32::MAX))])
+        .await
+        .unwrap();
+    let err = store
+        .increment_no_ts(id, "needs_review_refires")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("out of range") || err.to_string().contains("decode"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
 async fn helper_get_token_usage_from_store() {
     let store = Arc::new(TaskStore::open_memory().await.unwrap());
     let id = store
