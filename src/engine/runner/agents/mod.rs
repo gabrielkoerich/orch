@@ -987,14 +987,15 @@ pub(crate) mod patterns {
     const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
     /// How many bytes from the end of combined stdout+stderr we scan for
-    /// transient rate-limit / usage-limit patterns.
+    /// CLI-style error patterns that should come from the process tail.
     ///
-    /// Rationale: real CLI error messages (rate limits, HTTP 429s) almost
-    /// always appear at the end of the process output. Scanning only the tail
-    /// avoids false-positives from agent work product (code, diffs, commit
-    /// messages) which may mention "quota", "limit", etc. 3000 bytes is a
-    /// conservative window large enough to capture multi-line error dumps but
-    /// small enough to exclude most long-form agent outputs.
+    /// Rationale: real CLI error messages (rate limits, auth failures, network
+    /// failures) almost always appear at the end of the process output.
+    /// Scanning only the tail avoids false-positives from agent work product
+    /// (code, diffs, commit messages) which may mention "quota",
+    /// "unauthorized", HTTP status codes, etc. 3000 bytes is a conservative
+    /// window large enough to capture multi-line error dumps but small enough
+    /// to exclude most long-form agent outputs.
     const RATE_LIMIT_SCAN_TAIL_BYTES: usize = 3000;
 
     /// Run all pattern detectors against combined stdout+stderr.
@@ -1021,22 +1022,23 @@ pub(crate) mod patterns {
         if let Some(e) = detect_context_overflow(text) {
             return e;
         }
-        // Only scan the tail of the combined output for rate limit patterns.
-        // The full output may contain agent work product (code, diffs, commit
-        // messages) that incidentally mentions rate-limiting keywords. Real
-        // CLI rate-limit errors appear at the end of the output. Scan a
-        // bounded tail (`RATE_LIMIT_SCAN_TAIL_BYTES`) to reduce false
-        // positives. Also, do not consider plain success envelopes (e.g.
-        // `is_error=false` handled earlier in agent-specific parsing) as
-        // errors — callers should only invoke classify_from_text when the
-        // process indicates failure.
-        if let Some(e) = detect_rate_limit(safe_tail(text, RATE_LIMIT_SCAN_TAIL_BYTES)) {
+        // Only scan the tail of the combined output for CLI-style error
+        // patterns. The full output may contain agent work product (code,
+        // diffs, commit messages) that incidentally mentions rate limiting,
+        // authorization, or HTTP status codes. Real process errors appear at
+        // the end of the output. Scan a bounded tail
+        // (`RATE_LIMIT_SCAN_TAIL_BYTES`) to reduce false positives. Also, do
+        // not consider plain success envelopes (e.g. `is_error=false` handled
+        // earlier in agent-specific parsing) as errors — callers should only
+        // invoke classify_from_text when the process indicates failure.
+        let scan_tail = safe_tail(text, RATE_LIMIT_SCAN_TAIL_BYTES);
+        if let Some(e) = detect_rate_limit(scan_tail) {
             return e;
         }
-        if let Some(e) = detect_network_error(text) {
+        if let Some(e) = detect_network_error(scan_tail) {
             return e;
         }
-        if let Some(e) = detect_auth_error(text) {
+        if let Some(e) = detect_auth_error(scan_tail) {
             return e;
         }
         if let Some(e) = detect_stale_session(text) {
@@ -1368,6 +1370,39 @@ mod tests {
         assert!(
             matches!(err, AgentError::RateLimit { .. }),
             "real rate limit at tail must be detected, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_no_false_positive_auth_from_work_product() {
+        // Regression test for issue #2126: auth keywords in agent work product
+        // must not trigger auth classification when the real failure is
+        // unrelated and appears at the end of the output.
+        let work_product = "if response.status == 401 { return Err(\"unauthorized\") }\n\
+             // handle 403 forbidden errors\n\
+             // billing checks happen elsewhere\n"
+            .repeat(80);
+        let actual_error = "\nerror: command not found: cargo\n";
+        let text = format!("{work_product}{actual_error}");
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            !matches!(err, AgentError::Auth { .. }),
+            "work product auth keywords must not trigger auth classification, got: {err:?}"
+        );
+        assert!(
+            matches!(err, AgentError::MissingTool { .. }),
+            "the real tail error should still win, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_still_detects_real_auth_at_tail() {
+        let padding = "normal agent work output ".repeat(100);
+        let text = format!("{padding}\nHTTP 401 Unauthorized\n");
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            matches!(err, AgentError::Auth { .. }),
+            "real auth error at tail must be detected, got: {err:?}"
         );
     }
 
