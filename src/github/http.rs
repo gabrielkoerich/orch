@@ -15,6 +15,7 @@ use super::types::{
     GitHubReviewComment,
 };
 use crate::engine::cooldown as engine_cooldown;
+use anyhow::Context;
 use reqwest::{header, Client, Response, StatusCode};
 use serde::Serialize;
 use std::sync::{
@@ -519,7 +520,9 @@ impl GhHttp {
             Self::maybe_record_rate_limit_from_body(status, &body);
             anyhow::bail!("GitHub API GET {url} failed ({status}): {body}");
         }
-        Ok(serde_json::from_str(&resp.text().await?)?)
+        let body = resp.text().await?;
+        serde_json::from_str(&body)
+            .with_context(|| format!("failed to parse GitHub API response from GET {url}: {body}"))
     }
 
     /// GET raw bytes (for endpoints that return non-JSON or we parse manually).
@@ -570,7 +573,9 @@ impl GhHttp {
             Self::maybe_record_rate_limit_from_body(status, &body);
             anyhow::bail!("GitHub API GET {url} failed ({status}): {body}");
         }
-        Ok(serde_json::from_str(&resp.text().await?)?)
+        let body = resp.text().await?;
+        serde_json::from_str(&body)
+            .with_context(|| format!("failed to parse GitHub API response from GET {url}: {body}"))
     }
 
     /// POST with JSON body, returns raw response text.
@@ -798,7 +803,10 @@ impl GhHttp {
                 );
             }
 
-            let wrapper: serde_json::Value = serde_json::from_str(&resp.text().await?)?;
+            let body = resp.text().await?;
+            let wrapper: serde_json::Value = serde_json::from_str(&body).with_context(|| {
+                format!("failed to parse wrapper response from {current_url}: {body}")
+            })?;
             let items = wrapper
                 .get(array_field)
                 .and_then(|v| v.as_array())
