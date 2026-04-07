@@ -967,6 +967,7 @@ mod tests {
             pr_number: None,
             pr_review_context: String::new(),
             last_review_ts: String::new(),
+            review_ts_map: "{}".to_string(),
             last_comment_review_ts: String::new(),
             merge_conflict_retries: 0,
             ci_merge_failures: 0,
