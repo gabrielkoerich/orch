@@ -149,6 +149,10 @@ impl TmuxManager {
     }
 
     /// Capture the current pane content (last N lines).
+    ///
+    /// Returns `Ok(String::new())` if the session or pane is not found — this is
+    /// an expected teardown race when the session was cleaned up between the caller's
+    /// `is_session_active()` check and this capture.
     pub async fn capture_pane(&self, session: &str, lines: i32) -> anyhow::Result<String> {
         let start = format!("-{lines}");
         let output = Command::new("tmux")
@@ -158,6 +162,19 @@ impl TmuxManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // "can't find pane" / "can't find session" / "no server running" are expected
+            // teardown races — the session was cleaned up between the caller's activity
+            // check and this call, or the tmux server exited entirely.
+            if stderr.contains("can't find pane")
+                || stderr.contains("can't find session")
+                || stderr.contains("no server running")
+            {
+                tracing::debug!(
+                    session,
+                    "capture_pane: session/pane already gone (teardown race)"
+                );
+                return Ok(String::new());
+            }
             anyhow::bail!("capture-pane failed for {session}: {stderr}");
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -412,8 +429,9 @@ impl TmuxManager {
             }
 
             if !self.is_session_active(session).await {
-                // Process finished — capture final output. Do not panic on capture errors;
-                // log and return empty output so callers can proceed gracefully.
+                // Process finished — capture final output. `capture_pane` returns empty
+                // for "can't find pane/session" teardown races; only unexpected failures
+                // reach this error path and are logged at ERROR level.
                 match self.capture_pane(session, 500).await {
                     Ok(output) => return Ok(output),
                     Err(err) => {
@@ -833,4 +851,51 @@ mod tests {
 
     // NOTE: No static test for GH_TOKEN handling here; behavior is enforced
     // by the call sites (runner code) and covered by session env helper tests.
+
+    /// Regression test: capture_pane returns empty string (not an error) when the
+    /// session/pane is already gone — this is an expected teardown race, not an error.
+    /// https://github.com/gabrielkoerich/orch/issues/2083
+    #[tokio::test]
+    async fn capture_pane_returns_empty_for_gone_session() {
+        let tmux = TmuxManager::new();
+        // Call capture_pane on a session that never existed — should return Ok(""), not an error.
+        let result = tmux
+            .capture_pane("orch-nonexistent-session-99999", 100)
+            .await;
+        assert!(
+            result.is_ok(),
+            "capture_pane should return Ok for non-existent session, got: {:?}",
+            result
+        );
+        assert_eq!(
+            result.unwrap(),
+            "",
+            "capture_pane should return empty string for non-existent session"
+        );
+    }
+
+    /// Regression test: wait_for_completion returns empty string (not an error) when
+    /// the session is already gone.
+    /// https://github.com/gabrielkoerich/orch/issues/2083
+    #[tokio::test]
+    async fn wait_for_completion_returns_empty_for_gone_session() {
+        let tmux = TmuxManager::new();
+        // Call wait_for_completion on a session that never existed — should return Ok(""), not an error.
+        let result = tmux
+            .wait_for_completion(
+                "orch-nonexistent-session-99999",
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "wait_for_completion should return Ok for non-existent session, got: {:?}",
+            result
+        );
+        assert_eq!(
+            result.unwrap(),
+            "",
+            "wait_for_completion should return empty string for non-existent session"
+        );
+    }
 }
