@@ -1728,7 +1728,11 @@ pub(crate) async fn review_and_merge(
     // Store token usage on the task so `orch cost` reflects review agent spend.
     if let Some(sid) = store_id {
         if agent_token_usage.input_tokens > 0 || agent_token_usage.output_tokens > 0 {
-            let model = review_model.as_deref().unwrap_or("haiku");
+            let model = if review_model_str.is_empty() {
+                "unknown"
+            } else {
+                review_model_str
+            };
             if let Err(e) = store
                 .store_tokens(
                     sid,
