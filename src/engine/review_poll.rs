@@ -437,10 +437,11 @@ pub(crate) async fn review_open_prs(
             }
         };
 
-        let review_ts_map: serde_json::Value = match serde_json::from_str(&stored_task.review_ts_map) {
-            Ok(map) => map,
-            Err(_) => serde_json::json!({}),
-        };
+        let review_ts_map: serde_json::Value =
+            match serde_json::from_str(&stored_task.review_ts_map) {
+                Ok(map) => map,
+                Err(_) => serde_json::json!({}),
+            };
 
         let reviews = &batch_data.reviews;
         let all_comments = &batch_data.review_comments;
@@ -703,10 +704,10 @@ pub(crate) async fn review_open_prs(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
 
-             // Skip if we've already processed this review for this reviewer.
-             if !reviewer_last_ts.is_empty() && review.submitted_at.as_str() <= reviewer_last_ts {
-                 continue;
-             }
+            // Skip if we've already processed this review for this reviewer.
+            if !reviewer_last_ts.is_empty() && review.submitted_at.as_str() <= reviewer_last_ts {
+                continue;
+            }
 
             // Track the latest timestamp for this reviewer.
             updated_review_ts_map[reviewer_login] = serde_json::json!(review.submitted_at.clone());
@@ -855,9 +856,8 @@ pub(crate) async fn review_open_prs(
             }
 
             // Only after handle_review_changes succeeds, persist the watermark timestamps.
-            let mut fields: Vec<(&str, serde_json::Value)> = vec![
-                ("review_ts_map", serde_json::json!(updated_review_ts_map)),
-            ];
+            let mut fields: Vec<(&str, serde_json::Value)> =
+                vec![("review_ts_map", serde_json::json!(updated_review_ts_map))];
             if let Some(ref ts) = new_comment_review_ts {
                 fields.push(("last_comment_review_ts", serde_json::json!(ts)));
             }
