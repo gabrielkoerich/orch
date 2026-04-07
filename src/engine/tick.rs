@@ -148,17 +148,19 @@ struct StuckTaskTiming {
     threshold: u64,
 }
 
-async fn stuck_task_timing(
+#[allow(clippy::too_many_arguments)]
+fn stuck_task_timing_from_map(
     tmux: &Arc<TmuxManager>,
     repo: &str,
-    task_id: &str,
     session_task_id: &str,
     updated_at: &str,
     config: &EngineConfig,
     parse_error_message: &'static str,
+    session_map: &std::collections::HashMap<String, bool>,
 ) -> Option<StuckTaskTiming> {
     let session_name = tmux.session_name(repo, session_task_id);
-    let has_session = tmux.session_is_running(&session_name).await;
+    // A session is "running" if it appears in the map with alive=true.
+    let has_session = session_map.get(&session_name).copied().unwrap_or(false);
     let threshold = if has_session {
         config.stuck_timeout
     } else {
@@ -169,7 +171,7 @@ async fn stuck_task_timing(
         Ok(dt) => dt.with_timezone(&chrono::Utc),
         Err(e) => {
             tracing::warn!(
-                task_id,
+                task_id = session_task_id,
                 updated_at,
                 ?e,
                 error_message = parse_error_message,
@@ -452,6 +454,9 @@ pub(crate) async fn tick_recover_stuck_tasks(
     store: &Arc<TaskStore>,
 ) -> anyhow::Result<()> {
     let _span = tracing::info_span!("engine.tick.phase2.stuck_tasks").entered();
+    // Fetch all session statuses once (single `list-panes -a` call) and reuse
+    // throughout this function instead of spawning one subprocess per task.
+    let session_map = tmux.batch_session_active().await;
     let in_progress = match task_manager
         .list_external_by_status(Status::InProgress)
         .await
@@ -463,17 +468,15 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
     };
     for task in &in_progress {
-        let Some(timing) = stuck_task_timing(
+        let Some(timing) = stuck_task_timing_from_map(
             tmux,
             repo,
-            &task.id.0,
             &task.id.0,
             &task.updated_at,
             config,
             "cannot parse updated_at, skipping stuck-task check",
-        )
-        .await
-        else {
+            &session_map,
+        ) else {
             continue;
         };
 
@@ -584,17 +587,15 @@ pub(crate) async fn tick_recover_stuck_tasks(
     };
     for task in &internal_in_progress {
         let task_id = task.id.0.clone();
-        let Some(timing) = stuck_task_timing(
+        let Some(timing) = stuck_task_timing_from_map(
             tmux,
             repo,
-            &task_id,
             &task_id,
             &task.updated_at,
             config,
             "cannot parse updated_at, skipping stuck internal-task check",
-        )
-        .await
-        else {
+            &session_map,
+        ) else {
             continue;
         };
 
@@ -655,17 +656,15 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
 
         let review_task_id = format!("{}-review", task.id.0);
-        let Some(timing) = stuck_task_timing(
+        let Some(timing) = stuck_task_timing_from_map(
             tmux,
             repo,
-            &task.id.0,
             &review_task_id,
             &task.updated_at,
             config,
             "cannot parse updated_at, skipping stuck in_review check",
-        )
-        .await
-        else {
+            &session_map,
+        ) else {
             continue;
         };
 
@@ -752,17 +751,15 @@ pub(crate) async fn tick_recover_stuck_tasks(
         }
 
         let review_task_id = format!("{}-review", task_id);
-        let Some(timing) = stuck_task_timing(
+        let Some(timing) = stuck_task_timing_from_map(
             tmux,
             repo,
-            &task_id,
             &review_task_id,
             &task.updated_at,
             config,
             "cannot parse updated_at, skipping stuck internal in_review check",
-        )
-        .await
-        else {
+            &session_map,
+        ) else {
             continue;
         };
 
@@ -1006,6 +1003,10 @@ pub(crate) async fn tick_dispatch_tasks(
         0
     };
 
+    // Fetch all session pane-alive statuses once (single `list-panes -a` call) and
+    // reuse throughout the dispatch loop instead of spawning 2 subprocesses per task.
+    let dispatch_session_map = tmux.batch_session_active().await;
+
     for (idx, task) in dispatchable.into_iter().enumerate() {
         // In degraded mode, add delay between dispatches to pace the system
         if idx > 0 && is_degraded {
@@ -1036,7 +1037,10 @@ pub(crate) async fn tick_dispatch_tasks(
 
         // Check if already running (has active session)
         let session_name = tmux.session_name(repo, &task.id.0);
-        if tmux.session_blocks_dispatch(&session_name).await {
+        if tmux
+            .session_blocks_dispatch_from_map(&session_name, &dispatch_session_map)
+            .await
+        {
             tracing::warn!(
                 task_id = task.id.0,
                 session_name,
@@ -2068,16 +2072,16 @@ mod tests {
             - chrono::Duration::seconds(config.no_session_stuck_timeout as i64 + 5))
         .to_rfc3339();
 
-        let timing = stuck_task_timing(
+        let session_map = tmux.batch_session_active().await;
+        let timing = stuck_task_timing_from_map(
             &tmux,
             repo,
-            task_id,
             task_id,
             &updated_at,
             &config,
             "parse failure",
+            &session_map,
         )
-        .await
         .expect("dead session should be treated as missing");
 
         assert!(!timing.has_session);
