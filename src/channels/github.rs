@@ -723,7 +723,23 @@ pub async fn start_webhook_server(
                     .unwrap_or_else(|_| PathBuf::from("/tmp"))
                     .join("webhook_dedup.db")
             });
-        DedupStore::new_filebacked_with_metrics(path, window_secs, max_size, metrics_enabled)
+
+        // Initialization may perform blocking filesystem I/O (reading the
+        // dedup file). Run the constructor on a blocking thread so we don't
+        // block the Tokio async worker thread that is running
+        // start_webhook_server.
+        match tokio::task::spawn_blocking(move || {
+            DedupStore::new_filebacked_with_metrics(path, window_secs, max_size, metrics_enabled)
+        })
+        .await
+        {
+            Ok(store) => store,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to initialize file-backed dedup store: {e}"
+                ))
+            }
+        }
     } else {
         DedupStore::new_in_memory_with_metrics(window_secs, max_size, metrics_enabled)
     };
