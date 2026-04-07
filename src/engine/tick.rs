@@ -19,7 +19,7 @@ use crate::engine::cooldown::{
 };
 use crate::engine::dispatch_guard::DispatchGuard;
 use crate::engine::jobs;
-use crate::engine::router::{get_route_result, Router};
+use crate::engine::router::{get_route_result, RouteResultError, Router};
 use crate::engine::runner::{TaskRunner, WeightSignal};
 use crate::engine::tasks::{is_internal_id, TaskManager};
 use crate::repo_context::REPO_CONTEXT;
@@ -1075,7 +1075,7 @@ pub(crate) async fn tick_dispatch_tasks(
         // Load routing result from store (stored during Phase 3a)
         let route_result = match get_route_result(store, repo, &task_id).await {
             Ok(r) => Some(r),
-            Err(e) if e.to_string().contains("no agent field found") => {
+            Err(RouteResultError::NoAgent { .. }) => {
                 tracing::warn!(
                     task_id,
                     "routed task missing agent — resetting to new for re-routing (#1604)"
@@ -1088,7 +1088,10 @@ pub(crate) async fn tick_dispatch_tasks(
                 }
                 continue;
             }
-            Err(_) => None,
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "get_route_result failed — dispatching without route info");
+                None
+            }
         };
 
         let repo_ctx = repo_owned.clone();
