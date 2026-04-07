@@ -4,7 +4,7 @@
 //! `/close`, `/block reason`) posted by repo collaborators. Commands are
 //! executed against the issue's task and a confirmation comment is posted.
 
-use crate::backends::{ExternalBackend, ExternalId, Status};
+use crate::backends::{ExternalBackend, ExternalId, Mention, Status};
 use crate::github::http::GhHttp;
 use crate::store;
 use crate::store::TaskStore;
@@ -137,22 +137,27 @@ pub async fn scan_commands(
     repo: &str,
     store: &Option<Arc<crate::store::TaskStore>>,
     task_manager: &Arc<crate::engine::tasks::TaskManager>,
+    prefetched_comments: Option<&[Mention]>,
 ) -> anyhow::Result<()> {
     let gh = GhHttp::new()?;
 
-    // Use persisted cursor, fall back to 24h ago
-    let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-    let since_str = match kv_get(store, "owner_commands_last_checked").await {
-        Some(ts) => ts,
-        None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-    };
+    let comments = if let Some(comments) = prefetched_comments {
+        comments.to_vec()
+    } else {
+        // Use persisted cursor, fall back to 24h ago
+        let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
+        let since_str = match kv_get(store, "owner_commands_last_checked").await {
+            Some(ts) => ts,
+            None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        };
 
-    // Fetch recent comments (same endpoint as mentions)
-    let comments = match backend.get_mentions(&since_str).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(err = %e, "failed to fetch comments for command scanning");
-            return Ok(());
+        // Fetch recent comments (same endpoint as mentions)
+        match backend.get_mentions(&since_str).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to fetch comments for command scanning");
+                return Ok(());
+            }
         }
     };
 

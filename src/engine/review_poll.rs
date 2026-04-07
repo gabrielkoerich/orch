@@ -30,18 +30,20 @@ use crate::github::http::GhHttp;
 use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview};
 use crate::store::TaskStore;
 use crate::store::{
-    opt_store_get_task_by_id, store_increment_by_id, store_reset_failure_counters, store_set_by_id,
-    store_set_result_by_id,
+    store_increment_by_id, store_reset_failure_counters, store_set_by_id, store_set_result_by_id,
 };
 use dashmap::DashSet;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use super::sync::ReviewTaskSnapshot;
 
 /// Review open PRs - re-dispatch agent to address review feedback.
 ///
 /// Lists tasks in review, fetches PR reviews, and re-dispatches the agent
 /// when a reviewer requests changes. The review context is stored in the
 /// store and injected into the agent prompt.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn review_open_prs(
     backend: &Arc<dyn ExternalBackend>,
     repo: &str,
@@ -50,19 +52,8 @@ pub(crate) async fn review_open_prs(
     store: &Arc<TaskStore>,
     dispatching: &Arc<DashSet<String>>,
     auto_merge_in_flight: &Arc<DashSet<String>>,
+    in_review_tasks: &[ReviewTaskSnapshot],
 ) -> anyhow::Result<()> {
-    // Get tasks that are in review (have open PRs).
-    let mut in_review_tasks = task_manager.list_all_by_status(Status::InReview).await?;
-
-    // Also include internal tasks in InReview — they create real PRs
-    // and can receive human review comments just like external tasks.
-    if let Ok(internal_in_review) = task_manager
-        .list_internal_by_status(crate::store::TaskStatus::InReview)
-        .await
-    {
-        in_review_tasks.extend(internal_in_review);
-    }
-
     if in_review_tasks.is_empty() {
         tracing::debug!(count = 0, "checking in_review tasks for PR reviews");
         return Ok(());
@@ -90,7 +81,8 @@ pub(crate) async fn review_open_prs(
 
     let mut ready_tasks: Vec<ReadyTask> = Vec::new();
 
-    for task in in_review_tasks {
+    for snapshot in in_review_tasks {
+        let task = snapshot.external.clone();
         let task_id = &task.id.0;
 
         // Skip tasks currently being processed by the main tick.
@@ -103,54 +95,8 @@ pub(crate) async fn review_open_prs(
             continue;
         }
 
-        let store_id = match store.resolve_task_id(repo, task_id).await {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                tracing::warn!(
-                    task_id,
-                    "in_review task missing from store — setting needs_review"
-                );
-                if let Err(e) = task_manager
-                    .update_task_status(&task.id, Status::NeedsReview)
-                    .await
-                {
-                    tracing::warn!(task_id, err = %e, "failed to update status");
-                }
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    task_id,
-                    err = %e,
-                    "failed to resolve in_review task in store — setting needs_review"
-                );
-                if let Err(e) = task_manager
-                    .update_task_status(&task.id, Status::NeedsReview)
-                    .await
-                {
-                    tracing::warn!(task_id, err = %e, "failed to update status");
-                }
-                continue;
-            }
-        };
-
-        let stored = opt_store_get_task_by_id(&Some(Arc::clone(store)), store_id).await;
-        let stored = match stored {
-            Some(t) => t,
-            None => {
-                tracing::warn!(
-                    task_id,
-                    "in_review task missing from store — setting needs_review"
-                );
-                if let Err(e) = task_manager
-                    .update_task_status(&task.id, Status::NeedsReview)
-                    .await
-                {
-                    tracing::warn!(task_id, err = %e, "failed to update status");
-                }
-                continue;
-            }
-        };
+        let store_id = snapshot.stored.id;
+        let stored = snapshot.stored.clone();
 
         let branch = if stored.branch.is_empty() {
             tracing::warn!(

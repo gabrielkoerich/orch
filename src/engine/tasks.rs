@@ -105,11 +105,13 @@ impl TaskManager {
     }
 
     /// Get reference to the task store (if available).
+    #[allow(dead_code)]
     pub fn store(&self) -> Option<&Arc<TaskStore>> {
         self.store.as_ref()
     }
 
     /// Get reference to the repo identifier.
+    #[allow(dead_code)]
     pub fn repo(&self) -> &str {
         &self.repo
     }
