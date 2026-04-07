@@ -1116,10 +1116,7 @@ pub async fn get_route_result(
         .ok_or_else(|| {
             RouteResultError::Other(anyhow::anyhow!("task {task_id} not found in store"))
         })?;
-    let task = store
-        .get(store_id)
-        .await
-        .map_err(RouteResultError::Other)?;
+    let task = store.get(store_id).await.map_err(RouteResultError::Other)?;
 
     let agent = task
         .agent
