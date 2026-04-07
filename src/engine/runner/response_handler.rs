@@ -618,16 +618,24 @@ pub async fn handle_success(
                 match store::store_increment_by_id(store, store_id, "push_failures").await {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::warn!(task_id, err = %e, "failed to increment push_failures — skipping push-failure based reroute this tick");
-                        0
+                        tracing::warn!(task_id, err = %e, "failed to increment push_failures — reading current value from store");
+                        // On DB error, read current value to ensure blocking threshold is still reachable
+                        store::opt_store_get_task_by_id(store, store_id)
+                            .await
+                            .map(|t| (t.push_failures as u64) + 1)
+                            .unwrap_or(1) // assume at least 1 if we can't read either
                     }
                 }
             }
             None => match store::store_increment(store, repo, task_id, "push_failures").await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(task_id, err = %e, "failed to increment push_failures — skipping push-failure based reroute this tick");
-                    0
+                    tracing::warn!(task_id, err = %e, "failed to increment push_failures — reading current value from store");
+                    // On DB error, read current value to ensure blocking threshold is still reachable
+                    store::opt_store_get_task(store, repo, task_id)
+                        .await
+                        .map(|t| (t.push_failures as u64) + 1)
+                        .unwrap_or(1) // assume at least 1 if we can't read either
                 }
             },
         }
@@ -668,16 +676,24 @@ pub async fn handle_success(
                 match store::store_increment_by_id(store, store_id, "no_code_reroutes").await {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::warn!(task_id, err = %e, "failed to increment no_code_reroutes — skipping reroute/block decision this tick");
-                        0
+                        tracing::warn!(task_id, err = %e, "failed to increment no_code_reroutes — reading current value from store");
+                        // On DB error, read current value to ensure blocking threshold is still reachable
+                        store::opt_store_get_task_by_id(store, store_id)
+                            .await
+                            .map(|t| (t.no_code_reroutes as u64) + 1)
+                            .unwrap_or(1) // assume at least 1 if we can't read either
                     }
                 }
             }
             None => match store::store_increment(store, repo, task_id, "no_code_reroutes").await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(task_id, err = %e, "failed to increment no_code_reroutes — skipping reroute/block decision this tick");
-                    0
+                    tracing::warn!(task_id, err = %e, "failed to increment no_code_reroutes — reading current value from store");
+                    // On DB error, read current value to ensure blocking threshold is still reachable
+                    store::opt_store_get_task(store, repo, task_id)
+                        .await
+                        .map(|t| (t.no_code_reroutes as u64) + 1)
+                        .unwrap_or(1) // assume at least 1 if we can't read either
                 }
             },
         }
