@@ -625,8 +625,12 @@ async fn post_review_failure_comment(
     };
 
     let comment = format!(
-        "⚠️ Review agent failed (attempt {}/{})\n\n**Reason:** {}\n\n{}",
-        failures, MAX_REVIEW_AGENT_FAILURES, reason, status,
+        "⚠️ Review agent failed (attempt {}/{})\n\n**Reason:** {}\n\n{}{}",
+        failures,
+        MAX_REVIEW_AGENT_FAILURES,
+        reason,
+        status,
+        crate::engine::orch_footer()
     );
 
     let gh = match GhHttp::new() {
