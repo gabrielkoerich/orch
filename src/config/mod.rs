@@ -46,6 +46,47 @@ pub fn subscribe() -> broadcast::Receiver<PathBuf> {
     CHANGE_TX.subscribe()
 }
 
+/// Pre-populate the config cache using async I/O.
+///
+/// Call once at engine startup so subsequent synchronous [`get`] / [`get_list`]
+/// calls always hit the in-memory cache and never block a Tokio thread with
+/// `std::fs::read_to_string`.
+pub async fn warm_cache() -> anyhow::Result<()> {
+    let global_path = global_config_path()?;
+    if global_path.exists() {
+        match tokio::fs::read_to_string(&global_path).await {
+            Ok(content) => {
+                if let Ok(parsed) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                    if let Ok(mut cache) = CACHE.write() {
+                        cache.insert(global_path.clone(), parsed);
+                    }
+                    watch_file(&global_path);
+                }
+            }
+            Err(e) => tracing::warn!("failed to warm global config cache: {e}"),
+        }
+    }
+
+    let project_path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".orch.yml");
+    if project_path.exists() {
+        match tokio::fs::read_to_string(&project_path).await {
+            Ok(content) => {
+                if let Ok(parsed) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                    if let Ok(mut cache) = CACHE.write() {
+                        cache.insert(project_path.clone(), parsed);
+                    }
+                    watch_file(&project_path);
+                }
+            }
+            Err(e) => tracing::warn!("failed to warm project config cache: {e}"),
+        }
+    }
+
+    Ok(())
+}
+
 /// Clear the entire config cache. Exposed for use by integration tests that
 /// need to run in an isolated config environment (e.g. a temp dir with no
 /// project `.orch.yml`).

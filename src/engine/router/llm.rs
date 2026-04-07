@@ -449,7 +449,8 @@ impl LlmRouter {
             .await?;
 
         // Save prompt and response to per-task routing dir for debugging
-        let routing_dir = crate::home::task_dir(repo, &task.id.0)
+        let routing_dir = crate::home::task_dir_async(repo, &task.id.0)
+            .await
             .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/orch-routing"))
             .join("routing");
         let _ = tokio::fs::create_dir_all(&routing_dir).await;
