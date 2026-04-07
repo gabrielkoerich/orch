@@ -131,7 +131,7 @@ fn infer_agent(model: &str) -> &'static str {
 /// Performs lightweight checks (known agent + binary in PATH) without
 /// a test invocation. Used by `/agent` before persisting.
 pub fn validate_agent(agent: &str) -> Result<()> {
-    let agents = crate::engine::router::config::configured_agents();
+    let agents = crate::engine::configured_agents();
     if !agents.iter().any(|a| a == agent) {
         anyhow::bail!(
             "unknown agent '{}'. Available: {}",

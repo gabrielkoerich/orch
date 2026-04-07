@@ -223,7 +223,7 @@ pub fn log(lines: &str) -> anyhow::Result<()> {
 
 /// List installed agent CLIs.
 pub fn agents() {
-    let agents = crate::engine::router::config::configured_agents();
+    let agents = crate::engine::configured_agents();
 
     println!("{:<12} {:<10} PATH", "AGENT", "STATUS");
     println!("{}", "-".repeat(60));

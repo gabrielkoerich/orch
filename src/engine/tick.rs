@@ -290,7 +290,7 @@ pub(crate) async fn tick_detect_silent_agents(
         let task_eid = ExternalId(task_id.clone());
 
         // Build available agents list and reroute chain for failover
-        let available: Vec<String> = crate::engine::router::config::configured_agents()
+        let available: Vec<String> = crate::engine::configured_agents()
             .into_iter()
             .filter(|a| crate::cmd_cache::command_exists(a))
             .collect();

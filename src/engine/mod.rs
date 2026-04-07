@@ -107,6 +107,35 @@ pub struct ProjectEngine {
     pub store: Arc<TaskStore>,
 }
 
+/// Return the configured agent list from `engine.agents` in config.yml,
+/// falling back to [`router::config::DEFAULT_AGENTS`] when not set.
+///
+/// This is the canonical source of truth for "which agents does orch know
+/// about" — use it instead of `DEFAULT_AGENTS` directly so that
+/// Claude-compatible agents added via config (e.g. `olm`) are recognized
+/// without code changes.
+pub fn configured_agents() -> Vec<String> {
+    if let Ok(agents_str) = crate::config::get("engine.agents") {
+        if !agents_str.is_empty() && agents_str != "[]" {
+            if let Ok(agents_arr) = serde_json::from_str::<Vec<String>>(&agents_str) {
+                return agents_arr;
+            }
+            let parsed: Vec<String> = agents_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+    }
+    router::config::DEFAULT_AGENTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Engine configuration.
 pub struct EngineConfig {
     /// Main tick interval
