@@ -1,0 +1,22 @@
+Title: Bug: Swallowed network errors in `github/http.rs` cause cryptic JSON parse failures
+Body:
+In `src/github/http.rs`, several methods (`graphql_with_vars`, `post_json_raw`, `patch_json_raw`) use `unwrap_or_default()` when downloading the response body text:
+
+```rust
+let status = resp.status();
+let text = resp.text().await.unwrap_or_default();
+```
+
+If the network connection drops or the stream is interrupted while reading the response body, `reqwest::Error` is silently swallowed and `""` is returned. If `status.is_success()` was true (headers arrived successfully), this results in an `Ok("")` return value or a cryptic downstream JSON parsing error (`EOF while parsing a value at line 1 column 0`) rather than exposing the actual connection error.
+
+**Suggested Fix:**
+Properly propagate the error on successful HTTP status codes:
+```rust
+let status = resp.status();
+let text_res = resp.text().await;
+if !status.is_success() {
+    let text = text_res.unwrap_or_default();
+    // handle error
+}
+let text = text_res?; // Propagate reqwest error on stream failure
+```
