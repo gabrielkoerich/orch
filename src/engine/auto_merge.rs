@@ -15,7 +15,13 @@ use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubReview;
 use crate::store::TaskStore;
-use crate::store::{opt_store_get_task, store_increment, store_reset_failure_counters, store_set};
+use crate::store::{
+    opt_store_get_task,
+    store_increment,
+    store_reset_failure_counters,
+    store_set,
+    store_set_result,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
@@ -1360,22 +1366,22 @@ pub(crate) async fn handle_review_changes(
 
             // Increment review_cycles only AFTER successful status transition.
             // This prevents premature escalation if the transition fails.
-            store_set(
+            // Use the "_result" variant so failures are propagated to the caller
+            // and the outer caller (review_poll) can retry instead of silently
+            // allowing the task to bypass the max-review guard.
+            store_set_result(
                 &Some(Arc::clone(store)),
                 repo,
                 &task.id.0,
                 &[
-                    (
-                        "review_cycles",
-                        serde_json::json!((review_cycles + 1) as i64),
-                    ),
+                    ("review_cycles", serde_json::json!((review_cycles + 1) as i64)),
                     (
                         "review_agent_failures",
                         serde_json::json!(0), // reset failures for the new review round
                     ),
                 ],
             )
-            .await;
+            .await?;
 
             tracing::info!(
                 task_id = task.id.0,
@@ -1413,22 +1419,22 @@ pub(crate) async fn handle_review_changes(
 
             // Increment review_cycles only AFTER successful status transition.
             // This prevents premature escalation if the transition fails.
-            store_set(
+            // Use the "_result" variant so failures are propagated to the caller
+            // and the outer caller (review_poll) can retry instead of silently
+            // allowing the task to bypass the max-review guard.
+            store_set_result(
                 &Some(Arc::clone(store)),
                 repo,
                 &task.id.0,
                 &[
-                    (
-                        "review_cycles",
-                        serde_json::json!((review_cycles + 1) as i64),
-                    ),
+                    ("review_cycles", serde_json::json!((review_cycles + 1) as i64)),
                     (
                         "review_agent_failures",
                         serde_json::json!(0), // reset failures for the new review round
                     ),
                 ],
             )
-            .await;
+            .await?;
 
             tracing::info!(
                 task_id = task.id.0,
