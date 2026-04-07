@@ -589,11 +589,13 @@ impl GhHttp {
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text_res = resp.text().await;
         if !status.is_success() {
+            let text = text_res.unwrap_or_default();
             Self::maybe_record_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub API POST {url} failed ({status}): {text}");
         }
+        let text = text_res?;
         Ok(text)
     }
 
@@ -623,11 +625,13 @@ impl GhHttp {
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text_res = resp.text().await;
         if !status.is_success() {
+            let text = text_res.unwrap_or_default();
             Self::maybe_record_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub API PATCH {url} failed ({status}): {text}");
         }
+        let text = text_res?;
         Ok(text)
     }
 
@@ -857,11 +861,13 @@ impl GhHttp {
         };
         let resp = self.send_with_retries(make_req, true).await?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text_res = resp.text().await;
         if !status.is_success() {
+            let text = text_res.unwrap_or_default();
             Self::maybe_record_graphql_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub GraphQL failed ({status}): {text}");
         }
+        let text = text_res?;
         let json: serde_json::Value = serde_json::from_str(&text)?;
         // GraphQL always returns 200 even for errors; check the errors field explicitly.
         if let Some(errors) = json.get("errors").and_then(|e| e.as_array()) {
