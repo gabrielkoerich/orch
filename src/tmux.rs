@@ -191,6 +191,7 @@ impl TmuxManager {
     }
 
     /// Check whether a session exists and still has a live pane process.
+    #[cfg(test)]
     pub async fn session_is_running(&self, session: &str) -> bool {
         self.session_exists(session).await && self.is_session_active(session).await
     }
@@ -217,6 +218,37 @@ impl TmuxManager {
         }
 
         false
+    }
+
+    /// Batch variant of `session_blocks_dispatch` that uses a pre-fetched session map.
+    ///
+    /// `session_map` is the result of `batch_session_active()`. Sessions absent from the
+    /// map do not exist (→ no block). Sessions present with `alive=true` block dispatch.
+    /// Sessions present with `alive=false` have a dead pane and are cleaned up eagerly.
+    pub async fn session_blocks_dispatch_from_map(
+        &self,
+        session: &str,
+        session_map: &std::collections::HashMap<String, bool>,
+    ) -> bool {
+        match session_map.get(session).copied() {
+            None => false,      // session does not exist → no block
+            Some(true) => true, // session exists and pane is alive → block
+            Some(false) => {
+                // Session exists but pane is dead — clean up eagerly.
+                tracing::warn!(
+                    session,
+                    "found stale tmux session with dead pane; cleaning up"
+                );
+                if let Err(err) = self.kill_session(session).await {
+                    tracing::debug!(
+                        session,
+                        error = %err,
+                        "failed to clean up stale tmux session"
+                    );
+                }
+                false
+            }
+        }
     }
 
     /// Parse a session name into (project, task_id).
@@ -441,6 +473,9 @@ impl TmuxManager {
     ///
     /// Returns a vector of (Session, alive) so callers can operate on the
     /// actual session name instead of reconstructing one from repo+task_id.
+    ///
+    /// Uses `batch_session_active()` internally to fetch all pane-dead statuses
+    /// in a single subprocess call instead of one call per session (N+1 → 2).
     pub async fn snapshot(&self) -> Vec<(Session, bool)> {
         let sessions = match self.list_sessions().await {
             Ok(s) => s,
@@ -449,12 +484,16 @@ impl TmuxManager {
                 Vec::new()
             }
         };
-        let mut out = Vec::new();
-        for s in sessions {
-            let active = self.is_session_active(&s.name).await;
-            out.push((s, active));
-        }
-        out
+        // Fetch all pane-dead statuses in a single `list-panes -a` call.
+        let active_map = self.batch_session_active().await;
+        sessions
+            .into_iter()
+            .map(|s| {
+                // Sessions absent from the map are treated as dead (pane missing).
+                let active = active_map.get(&s.name).copied().unwrap_or(false);
+                (s, active)
+            })
+            .collect()
     }
 
     // ── Environment variable helpers ───────────────────────────────────
