@@ -5,10 +5,21 @@
 //! run side by side without conflicts.
 
 use anyhow::Context;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The home directory name.
 const HOME_DIR: &str = ".orch";
+
+fn ensure_dir(path: &Path) -> anyhow::Result<()> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(tokio::fs::create_dir_all(path)))?;
+        }
+        _ => std::fs::create_dir_all(path)?,
+    }
+
+    Ok(())
+}
 
 /// Get the orch home directory path (~/.orch/).
 ///
@@ -17,13 +28,13 @@ const HOME_DIR: &str = ".orch";
 pub fn orch_home() -> anyhow::Result<PathBuf> {
     if let Ok(dir) = std::env::var("ORCH_HOME") {
         let path = PathBuf::from(dir);
-        std::fs::create_dir_all(&path)?;
+        ensure_dir(&path)?;
         return Ok(path);
     }
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let path = home.join(HOME_DIR);
-    std::fs::create_dir_all(&path)?;
+    ensure_dir(&path)?;
     Ok(path)
 }
 
@@ -34,7 +45,7 @@ pub fn orch_home() -> anyhow::Result<PathBuf> {
 pub fn state_dir() -> anyhow::Result<PathBuf> {
     let home = orch_home()?;
     let state = home.join("state");
-    std::fs::create_dir_all(&state)?;
+    ensure_dir(&state)?;
     Ok(state)
 }
 
@@ -114,28 +125,28 @@ pub fn service_version_path() -> anyhow::Result<std::path::PathBuf> {
 /// Get the path to the worktrees directory (~/.orch/worktrees/).
 pub fn worktrees_dir() -> anyhow::Result<PathBuf> {
     let dir = orch_home()?.join("worktrees");
-    std::fs::create_dir_all(&dir)?;
+    ensure_dir(&dir)?;
     Ok(dir)
 }
 
 /// Get the path to the contexts directory (~/.orch/contexts/).
 pub fn contexts_dir() -> anyhow::Result<PathBuf> {
     let dir = orch_home()?.join("contexts");
-    std::fs::create_dir_all(&dir)?;
+    ensure_dir(&dir)?;
     Ok(dir)
 }
 
 /// Get the path to the projects directory (~/.orch/projects/).
 pub fn projects_dir() -> anyhow::Result<PathBuf> {
     let dir = orch_home()?.join("projects");
-    std::fs::create_dir_all(&dir)?;
+    ensure_dir(&dir)?;
     Ok(dir)
 }
 
 /// Get the path to the skills directory (~/.orch/skills/).
 pub fn skills_dir() -> anyhow::Result<PathBuf> {
     let dir = orch_home()?.join("skills");
-    std::fs::create_dir_all(&dir)?;
+    ensure_dir(&dir)?;
     Ok(dir)
 }
 
@@ -145,7 +156,7 @@ pub fn skills_dir() -> anyhow::Result<PathBuf> {
 pub fn repo_state_dir(repo: &str) -> anyhow::Result<PathBuf> {
     let state = state_dir()?;
     let dir = state.join(repo.replace('/', std::path::MAIN_SEPARATOR_STR));
-    std::fs::create_dir_all(&dir)?;
+    ensure_dir(&dir)?;
     Ok(dir)
 }
 
@@ -154,7 +165,7 @@ pub fn repo_state_dir(repo: &str) -> anyhow::Result<PathBuf> {
 /// Creates the directory on demand.
 pub fn task_dir(repo: &str, task_id: &str) -> anyhow::Result<PathBuf> {
     let dir = repo_state_dir(repo)?.join("tasks").join(task_id);
-    std::fs::create_dir_all(&dir)?;
+    ensure_dir(&dir)?;
     Ok(dir)
 }
 
@@ -165,7 +176,7 @@ pub fn task_attempt_dir(repo: &str, task_id: &str, attempt: u32) -> anyhow::Resu
     let dir = task_dir(repo, task_id)?
         .join("attempts")
         .join(attempt.to_string());
-    std::fs::create_dir_all(&dir)?;
+    ensure_dir(&dir)?;
     Ok(dir)
 }
 

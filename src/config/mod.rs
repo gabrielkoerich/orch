@@ -12,7 +12,7 @@
 use anyhow::Context;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -117,6 +117,36 @@ fn watch_file(path: &PathBuf) {
     }
 }
 
+fn read_file_to_string(path: &Path) -> anyhow::Result<String> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            Ok(tokio::task::block_in_place(|| {
+                handle.block_on(tokio::fs::read_to_string(path))
+            })?)
+        }
+        _ => Ok(std::fs::read_to_string(path)?),
+    }
+}
+
+fn load_cached_root(path: &PathBuf) -> anyhow::Result<serde_yml::Value> {
+    if let Ok(cache) = CACHE.read() {
+        if let Some(cached) = cache.get(path) {
+            return Ok(cached.clone());
+        }
+    }
+
+    let content =
+        read_file_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let parsed: serde_yml::Value =
+        serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+
+    if let Ok(mut cache) = CACHE.write() {
+        cache.insert(path.clone(), parsed.clone());
+    }
+
+    Ok(parsed)
+}
+
 /// Resolve the global config path: `~/.orch/config.yml`
 fn global_config_path() -> anyhow::Result<PathBuf> {
     crate::home::config_path()
@@ -167,24 +197,7 @@ pub fn get_list(key: &str) -> anyhow::Result<Vec<String>> {
 fn resolve_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String>> {
     watch_file(path);
 
-    let root = {
-        if let Ok(cache) = CACHE.read() {
-            if let Some(cached) = cache.get(path) {
-                return extract_list(cached, key);
-            }
-        }
-
-        let content =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let parsed: serde_yml::Value =
-            serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
-
-        if let Ok(mut cache) = CACHE.write() {
-            cache.insert(path.clone(), parsed.clone());
-        }
-
-        parsed
-    };
+    let root = load_cached_root(path)?;
 
     extract_list(&root, key)
 }
@@ -413,26 +426,7 @@ pub fn get_skills() -> anyhow::Result<Vec<SkillConfig>> {
         return Ok(vec![]);
     }
 
-    let root = {
-        // Try to get from cache first (read lock)
-        if let Ok(cache) = CACHE.read() {
-            if let Some(cached) = cache.get(&global_path) {
-                return extract_skills_list(cached);
-            }
-        }
-
-        // Not in cache, load and cache it (write lock)
-        let content = std::fs::read_to_string(&global_path)
-            .with_context(|| format!("reading {}", global_path.display()))?;
-        let parsed: serde_yml::Value = serde_yml::from_str(&content)
-            .with_context(|| format!("parsing {}", global_path.display()))?;
-
-        if let Ok(mut cache) = CACHE.write() {
-            cache.insert(global_path.clone(), parsed.clone());
-        }
-
-        parsed
-    };
+    let root = load_cached_root(&global_path)?;
 
     extract_skills_list(&root)
 }
@@ -466,26 +460,7 @@ fn resolve_projects_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String
     // First, ensure we're watching this file for changes
     watch_file(path);
 
-    let root = {
-        // Try to get from cache first (read lock)
-        if let Ok(cache) = CACHE.read() {
-            if let Some(cached) = cache.get(path) {
-                return extract_projects_list(cached, key);
-            }
-        }
-
-        // Not in cache, load and cache it (write lock)
-        let content =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let parsed: serde_yml::Value =
-            serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
-
-        if let Ok(mut cache) = CACHE.write() {
-            cache.insert(path.clone(), parsed.clone());
-        }
-
-        parsed
-    };
+    let root = load_cached_root(path)?;
 
     // Try to extract projects list - if key doesn't exist, return empty vector
     match extract_projects_list(&root, key) {
@@ -530,29 +505,10 @@ fn extract_projects_list(root: &serde_yml::Value, key: &str) -> anyhow::Result<V
 /// Caches the parsed YAML so repeated lookups don't re-read disk.
 /// Sets up file watching for hot reload when first loading.
 fn resolve_key(path: &PathBuf, key: &str) -> anyhow::Result<String> {
-    let root = {
-        // First, ensure we're watching this file for changes
-        watch_file(path);
+    // First, ensure we're watching this file for changes
+    watch_file(path);
 
-        // Try to get from cache first (read lock)
-        if let Ok(cache) = CACHE.read() {
-            if let Some(cached) = cache.get(path) {
-                return extract_value(cached, key);
-            }
-        }
-
-        // Not in cache, load and cache it (write lock)
-        let content =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let parsed: serde_yml::Value =
-            serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
-
-        if let Ok(mut cache) = CACHE.write() {
-            cache.insert(path.clone(), parsed.clone());
-        }
-
-        parsed
-    };
+    let root = load_cached_root(path)?;
 
     extract_value(&root, key)
 }
