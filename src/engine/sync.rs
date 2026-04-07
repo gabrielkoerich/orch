@@ -9,7 +9,7 @@
 //! - Owner /slash command scanning
 //! - Skill repository syncing
 
-use crate::backends::{ExternalBackend, ExternalId, Status};
+use crate::backends::{ExternalBackend, ExternalId, Mention, Status};
 use crate::cmd::CommandErrorContext;
 use crate::config;
 use crate::engine::cooldown::{
@@ -51,6 +51,58 @@ use super::cleanup::{check_merged_prs, cleanup_done_worktrees};
 use super::commands::{execute_command, parse_command};
 use super::review_poll::review_open_prs;
 use super::EngineConfig;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewTaskSnapshot {
+    pub external: crate::backends::ExternalTask,
+    pub stored: crate::store::Task,
+}
+
+impl ReviewTaskSnapshot {
+    fn task_id(&self) -> &str {
+        &self.external.id.0
+    }
+}
+
+async fn prefetch_review_tasks(
+    store: &Arc<TaskStore>,
+    repo: &str,
+) -> anyhow::Result<(Vec<ReviewTaskSnapshot>, Vec<ReviewTaskSnapshot>)> {
+    let in_review = store
+        .list_by_status(repo, TaskStatus::InReview)
+        .await?
+        .into_iter()
+        .map(|stored| ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        })
+        .collect();
+    let needs_review = store
+        .list_by_status(repo, TaskStatus::NeedsReview)
+        .await?
+        .into_iter()
+        .map(|stored| ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        })
+        .collect();
+    Ok((in_review, needs_review))
+}
+
+async fn fetch_comments_since(
+    backend: &Arc<dyn ExternalBackend>,
+    since: &str,
+) -> anyhow::Result<Vec<Mention>> {
+    backend.get_mentions(since).await
+}
+
+fn filter_mentions_by_since(comments: &[Mention], since: &str) -> Vec<Mention> {
+    comments
+        .iter()
+        .filter(|comment| comment.created_at.as_str() > since)
+        .cloned()
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureCategory {
@@ -486,34 +538,104 @@ pub(crate) async fn sync_tick(
         });
     }
 
-    // 2. Check for merged PRs (in_review → done)
+    let (mut in_review_tasks, mut needs_review_tasks) =
+        match prefetch_review_tasks(store, repo).await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to prefetch review tasks");
+                (vec![], vec![])
+            }
+        };
+
     if !gh_circuit_open {
-        if let Err(e) = check_merged_prs(backend, repo, store, task_manager).await {
+        let mention_fallback = chrono::Utc::now() - chrono::Duration::hours(24);
+        let mention_since = kv_get_prefer_store(&Some(store), "mentions_last_checked")
+            .await
+            .unwrap_or_else(|| mention_fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        let command_fallback = chrono::Utc::now() - chrono::Duration::hours(24);
+        let command_since = store
+            .kv_get("owner_commands_last_checked")
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| command_fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        let shared_since = mention_since
+            .as_str()
+            .min(command_since.as_str())
+            .to_string();
+
+        let (merge_result, comments_result, review_result) = tokio::join!(
+            check_merged_prs(
+                backend,
+                repo,
+                store,
+                task_manager,
+                &in_review_tasks,
+                &needs_review_tasks,
+            ),
+            fetch_comments_since(backend, &shared_since),
+            review_open_prs(
+                backend,
+                repo,
+                config,
+                task_manager,
+                store,
+                dispatching,
+                auto_merge_in_flight,
+                &in_review_tasks,
+            )
+        );
+
+        if let Err(e) = merge_result {
             tracing::warn!(err = %e, "PR merge check failed");
         }
-    }
 
-    // 3. Scan for @mentions
-    if !gh_circuit_open {
-        if let Err(e) = scan_mentions(backend, Some(store), repo, task_manager).await {
-            tracing::warn!(err = %e, "mention scan failed");
+        match comments_result {
+            Ok(comments) => {
+                let mention_comments = filter_mentions_by_since(&comments, &mention_since);
+                let command_comments = filter_mentions_by_since(&comments, &command_since);
+
+                if let Err(e) = scan_mentions(
+                    backend,
+                    Some(store),
+                    repo,
+                    task_manager,
+                    Some(&mention_comments),
+                )
+                .await
+                {
+                    tracing::warn!(err = %e, "mention scan failed");
+                }
+
+                if let Err(e) = super::commands::scan_commands(
+                    backend,
+                    repo,
+                    &Some(Arc::clone(store)),
+                    task_manager,
+                    Some(&command_comments),
+                )
+                .await
+                {
+                    tracing::warn!(err = %e, "owner command scan failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "comment fetch failed");
+            }
         }
-    }
 
-    // 4. Review open PRs (parse review comments, create follow-ups)
-    if !gh_circuit_open {
-        if let Err(e) = review_open_prs(
-            backend,
-            repo,
-            config,
-            task_manager,
-            store,
-            dispatching,
-            auto_merge_in_flight,
-        )
-        .await
-        {
+        if let Err(e) = review_result {
             tracing::warn!(err = %e, "PR review failed");
+        }
+
+        match prefetch_review_tasks(store, repo).await {
+            Ok((latest_in_review, latest_needs_review)) => {
+                in_review_tasks = latest_in_review;
+                needs_review_tasks = latest_needs_review;
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to refresh review task cache after sync work");
+            }
         }
     }
 
@@ -530,13 +652,6 @@ pub(crate) async fn sync_tick(
     if enable_review {
         // Detect stale InReview tasks (review agent crashed, no active tmux session).
         // Read from the store (includes both external and internal tasks).
-        let in_review_tasks = match task_manager.list_all_by_status(Status::InReview).await {
-            Ok(tasks) => tasks,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to list InReview tasks for stale-session check; skipping");
-                vec![]
-            }
-        };
         // Fetch all live tmux sessions once instead of one subprocess call per task.
         let live_sessions: std::collections::HashSet<String> = tmux
             .list_sessions()
@@ -545,13 +660,13 @@ pub(crate) async fn sync_tick(
             .into_iter()
             .map(|s| s.name)
             .collect();
-        for task in in_review_tasks {
+        for task in &in_review_tasks {
             // Skip tasks currently being processed by the main tick (dispatch + review flow).
-            let dispatch_key = format!("{}/{}", repo, task.id.0);
+            let dispatch_key = format!("{}/{}", repo, task.task_id());
             {
                 if dispatching.contains(&dispatch_key) {
                     tracing::debug!(
-                        task_id = task.id.0,
+                        task_id = task.task_id(),
                         "task locked by dispatch flow, skipping stale check"
                     );
                     continue;
@@ -561,12 +676,12 @@ pub(crate) async fn sync_tick(
             // review agent to start its tmux session before treating it as stale.
             // A task is only considered stale if it has been in InReview for > 1 minute.
             const MIN_STALE_MINUTES: i64 = 1;
-            match chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
+            match chrono::DateTime::parse_from_rfc3339(&task.external.updated_at) {
                 Ok(updated_at) => {
                     let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
                     if age.num_minutes() < MIN_STALE_MINUTES {
                         tracing::debug!(
-                            task_id = task.id.0,
+                            task_id = task.task_id(),
                             age_seconds = age.num_seconds(),
                             "InReview task is too young to be considered stale, skipping"
                         );
@@ -575,15 +690,15 @@ pub(crate) async fn sync_tick(
                 }
                 Err(e) => {
                     tracing::warn!(
-                        task_id = task.id.0,
-                        ts = %task.updated_at,
+                        task_id = task.task_id(),
+                        ts = %task.external.updated_at,
                         err = %e,
                         "invalid updated_at timestamp — treating task as potentially stale"
                     );
                 }
             }
 
-            let review_task_id = format!("{}-review", task.id.0);
+            let review_task_id = format!("{}-review", task.task_id());
             let review_session = tmux.session_name(repo, &review_task_id);
             if live_sessions.contains(&review_session) {
                 // Review agent is still alive — skip.
@@ -595,7 +710,7 @@ pub(crate) async fn sync_tick(
             // Reset to NeedsReview so the subscriber re-dispatches.
             {
                 tracing::warn!(
-                    task_id = task.id.0,
+                    task_id = task.task_id(),
                     session = %review_session,
                     "InReview task has no active review session — resetting to NeedsReview"
                 );
@@ -605,25 +720,26 @@ pub(crate) async fn sync_tick(
                 store::store_set(
                     &Some(Arc::clone(store)),
                     repo,
-                    &task.id.0,
+                    task.task_id(),
                     &[("review_agent_failures", serde_json::json!(0))],
                 )
                 .await;
                 match task_manager
-                    .update_task_status_if(&task.id, Status::NeedsReview, Status::InReview)
+                    .update_task_status_if(&task.external.id, Status::NeedsReview, Status::InReview)
                     .await
                 {
                     Err(e) => {
-                        tracing::error!(task_id = %task.id.0, err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
+                        tracing::error!(task_id = task.task_id(), err = %e, "failed to reset stale InReview task — task may be stuck in InReview indefinitely");
                     }
                     Ok(false) => {
                         tracing::debug!(
-                            task_id = %task.id.0,
+                            task_id = task.task_id(),
                             "stale InReview reset skipped — task already transitioned (concurrent Done/Blocked/InProgress)"
                         );
                     }
                     Ok(true) => {
-                        store::set_review_session_expected(store, repo, &task.id.0, false).await;
+                        store::set_review_session_expected(store, repo, task.task_id(), false)
+                            .await;
                     }
                 }
             }
@@ -644,14 +760,6 @@ pub(crate) async fn sync_tick(
     // re-introducing the double-trigger race fixed in issue #857 — the subscriber is still
     // the sole spawner and uses the InReview transition as its atomic guard.
     if enable_review {
-        let needs_review_tasks = match task_manager.list_all_by_status(Status::NeedsReview).await {
-            Ok(tasks) => tasks,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to list NeedsReview tasks for stale-refire check; skipping");
-                vec![]
-            }
-        };
-
         const MIN_STALE_NEEDS_REVIEW_MINUTES: i64 = 1;
         const MAX_NEEDS_REVIEW_REFIRE_ATTEMPTS: u64 = 5; // escalate to Blocked after this many refires
         let needs_review_count = needs_review_tasks.len();
@@ -666,39 +774,30 @@ pub(crate) async fn sync_tick(
                 "sync catch-up: checking stale NeedsReview tasks"
             );
         }
-        for task in needs_review_tasks {
+        for task in &needs_review_tasks {
             // Only retry tasks that have been in NeedsReview long enough that the
             // subscriber should have handled them by now. Fresh tasks (just transitioned)
             // are likely still in flight via the event bus. Unparseable timestamps are
             // treated as stale (fall through to retry).
-            let age_minutes =
-                if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&task.updated_at) {
-                    let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
-                    if age.num_minutes() < MIN_STALE_NEEDS_REVIEW_MINUTES {
-                        continue;
-                    }
-                    Some(age.num_minutes())
-                } else {
-                    None
-                };
+            let age_minutes = if let Ok(updated_at) =
+                chrono::DateTime::parse_from_rfc3339(&task.external.updated_at)
+            {
+                let age = chrono::Utc::now() - updated_at.with_timezone(&chrono::Utc);
+                if age.num_minutes() < MIN_STALE_NEEDS_REVIEW_MINUTES {
+                    continue;
+                }
+                Some(age.num_minutes())
+            } else {
+                None
+            };
 
             // Skip tasks actively being dispatched (subscriber is working on them).
-            let dispatch_key = format!("{}/{}", repo, task.id.0);
+            let dispatch_key = format!("{}/{}", repo, task.task_id());
             if dispatching.contains(&dispatch_key) {
                 continue;
             }
             // Decide whether to re-fire now using exponential backoff based on a per-task counter.
-            // Fetch the store task to read the current needs_review_refires counter without
-            // touching updated_at before we know whether we will actually fire.
-            let store_task =
-                crate::store::opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await;
-            let current_refires = match store_task.as_ref() {
-                Some(t) => t.needs_review_refires as u64,
-                None => {
-                    tracing::warn!(task_id = task.id.0, "failed to read task from store for refire backoff — skipping re-fire this tick");
-                    continue;
-                }
-            };
+            let current_refires = task.stored.needs_review_refires as u64;
             let new_refires = current_refires + 1;
 
             // If we've exceeded max attempts, escalate the task to Blocked with a clear reason.
@@ -707,12 +806,12 @@ pub(crate) async fn sync_tick(
                 let _ = crate::store::store_increment(
                     &Some(Arc::clone(store)),
                     repo,
-                    &task.id.0,
+                    task.task_id(),
                     "needs_review_refires",
                 )
                 .await;
                 tracing::warn!(
-                    task_id = task.id.0,
+                    task_id = task.task_id(),
                     new_refires,
                     "escalating NeedsReview task to Blocked after repeated refires"
                 );
@@ -720,7 +819,7 @@ pub(crate) async fn sync_tick(
                 crate::store::store_set(
                     &Some(Arc::clone(store)),
                     repo,
-                    &task.id.0,
+                    task.task_id(),
                     &[
                         (
                             "block_reason",
@@ -736,10 +835,10 @@ pub(crate) async fn sync_tick(
                 )
                 .await;
                 if let Err(e) = task_manager
-                    .update_task_status(&task.id, Status::Blocked)
+                    .update_task_status(&task.external.id, Status::Blocked)
                     .await
                 {
-                    tracing::warn!(task_id = task.id.0, err = %e, "failed to set Blocked during escalation");
+                    tracing::warn!(task_id = task.task_id(), err = %e, "failed to set Blocked during escalation");
                 }
                 continue;
             }
@@ -762,12 +861,12 @@ pub(crate) async fn sync_tick(
                 let _ = crate::store::store_increment_no_ts(
                     &Some(Arc::clone(store)),
                     repo,
-                    &task.id.0,
+                    task.task_id(),
                     "needs_review_refires",
                 )
                 .await;
                 tracing::debug!(
-                    task_id = task.id.0,
+                    task_id = task.task_id(),
                     age_minutes,
                     current_refires,
                     required_minutes,
@@ -781,7 +880,7 @@ pub(crate) async fn sync_tick(
             let fired_refires = match crate::store::store_increment(
                 &Some(Arc::clone(store)),
                 repo,
-                &task.id.0,
+                task.task_id(),
                 "needs_review_refires",
             )
             .await
@@ -789,7 +888,7 @@ pub(crate) async fn sync_tick(
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(
-                        task_id = task.id.0,
+                        task_id = task.task_id(),
                         err = %e,
                         "failed to increment needs_review_refires — proceeding with re-fire anyway"
                     );
@@ -798,7 +897,7 @@ pub(crate) async fn sync_tick(
             };
 
             tracing::info!(
-                task_id = task.id.0,
+                task_id = task.task_id(),
                 age_minutes,
                 refires = fired_refires,
                 required_minutes,
@@ -806,11 +905,11 @@ pub(crate) async fn sync_tick(
             );
 
             if let Err(e) = task_manager
-                .update_task_status(&task.id, Status::NeedsReview)
+                .update_task_status(&task.external.id, Status::NeedsReview)
                 .await
             {
                 tracing::warn!(
-                    task_id = task.id.0,
+                    task_id = task.task_id(),
                     err = %e,
                     "sync catch-up: failed to re-fire NeedsReview event"
                 );
@@ -823,17 +922,7 @@ pub(crate) async fn sync_tick(
         tracing::warn!(err = %e, "auto-unblock failed");
     }
 
-    // 6. Scan for owner /slash commands in issue comments
-    if !gh_circuit_open {
-        if let Err(e) =
-            super::commands::scan_commands(backend, repo, &Some(Arc::clone(store)), task_manager)
-                .await
-        {
-            tracing::warn!(err = %e, "owner command scan failed");
-        }
-    }
-
-    // 7. Sync skill repositories
+    // 6. Sync skill repositories
     match skills_sync().await {
         Ok(()) => {
             // Invalidate the LLM router's skills catalog cache so new/updated
@@ -868,6 +957,7 @@ async fn scan_mentions(
     store: Option<&Arc<TaskStore>>,
     repo: &str,
     task_manager: &Arc<TaskManager>,
+    prefetched_mentions: Option<&[Mention]>,
 ) -> anyhow::Result<()> {
     // Get the current user (for mention detection)
     let current_user = match backend.get_authenticated_user().await {
@@ -882,18 +972,22 @@ async fn scan_mentions(
         }
     };
 
-    // Use persisted cursor if available, otherwise fall back to 24h ago
-    let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-    let since_str = match kv_get_prefer_store(&store, "mentions_last_checked").await {
-        Some(ts) => ts,
-        None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-    };
+    let mentions = if let Some(mentions) = prefetched_mentions {
+        mentions.to_vec()
+    } else {
+        // Use persisted cursor if available, otherwise fall back to 24h ago
+        let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
+        let since_str = match kv_get_prefer_store(&store, "mentions_last_checked").await {
+            Some(ts) => ts,
+            None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        };
 
-    let mentions = match backend.get_mentions(&since_str).await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(err = %e, "failed to get mentions");
-            return Ok(());
+        match backend.get_mentions(&since_str).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to get mentions");
+                return Ok(());
+            }
         }
     };
 
