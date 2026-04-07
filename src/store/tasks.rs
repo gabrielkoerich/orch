@@ -13,8 +13,8 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
     source, source_id, author, url, labels, agent, model, complexity, \
     route_reason, agent_profile, selected_skills, route_attempts, attempts, \
     branch, worktree, worktree_cleaned, summary, last_error, parent_id, \
-    block_reason, pr_number, pr_review_context, last_review_ts, \
-    last_comment_review_ts, merge_conflict_retries, ci_merge_failures, \
+    block_reason, pr_number, pr_review_context, review_ts_map, \
+    merge_conflict_retries, ci_merge_failures, \
     pr_create_failures, review_agent_failures, review_cycles, input_tokens, \
     output_tokens, input_cost_usd, output_cost_usd, total_cost_usd, \
     model_reroute_chain, limit_reroute_chain, budget_warning, budget_exceeded, \
@@ -114,6 +114,7 @@ pub struct Task {
     pub pr_number: Option<i32>,
     pub pr_review_context: String,
     pub last_review_ts: String,
+    pub review_ts_map: String,
     pub last_comment_review_ts: String,
     pub merge_conflict_retries: i32,
     pub ci_merge_failures: i32,
@@ -1770,6 +1771,7 @@ impl TaskStore {
             pr_number: row.try_get("pr_number").unwrap_or(None),
             pr_review_context: row.try_get("pr_review_context").unwrap_or_default(),
             last_review_ts: row.try_get("last_review_ts").unwrap_or_default(),
+            review_ts_map: row.try_get("review_ts_map").unwrap_or_default(),
             last_comment_review_ts: row.try_get("last_comment_review_ts").unwrap_or_default(),
             merge_conflict_retries: row.try_get("merge_conflict_retries").unwrap_or(0),
             ci_merge_failures: row.try_get("ci_merge_failures").unwrap_or(0),
