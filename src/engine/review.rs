@@ -14,6 +14,20 @@ pub(crate) const MAX_REVIEW_AGENT_FAILURES: u64 = 3;
 /// Maximum consecutive PR-creation failures before blocking the task.
 const MAX_PR_CREATE_FAILURES: u64 = 3;
 
+/// Map an [`AgentError`] to the structured outcome string stored in `task_runs.outcome`.
+///
+/// Mirrors the logic in `runner::classify_run_outcome` so review runs carry the
+/// same outcome fidelity as agent runs.
+fn outcome_for_agent_error(err: &runner::agents::AgentError) -> &'static str {
+    match err {
+        runner::agents::AgentError::Timeout { .. } => "timeout",
+        runner::agents::AgentError::RateLimit { .. } => "rate_limit",
+        runner::agents::AgentError::Auth { .. } => "auth_error",
+        runner::agents::AgentError::InvalidResponse { .. } => "parse_error",
+        _ => "failed",
+    }
+}
+
 /// Parse a PR number from a GitHub PR URL.
 ///
 /// Validates that the URL matches the expected GitHub PR URL format
@@ -1165,7 +1179,7 @@ pub(crate) async fn review_and_merge(
                         stdout: "",
                         stderr: "timeout",
                         parsed: "",
-                        outcome: "failed",
+                        outcome: "timeout",
                         error: "timeout",
                         tokens: RunTokenUsage::default(),
                     })
@@ -1283,7 +1297,7 @@ pub(crate) async fn review_and_merge(
                     stdout: &raw_output,
                     stderr: &stderr,
                     parsed: "",
-                    outcome: "failed",
+                    outcome: outcome_for_agent_error(&err),
                     error: &err.to_string(),
                     tokens: agent_token_usage,
                 })
@@ -1362,7 +1376,7 @@ pub(crate) async fn review_and_merge(
                                 stdout: &raw_output,
                                 stderr: &stderr,
                                 parsed: &text_for_review,
-                                outcome: "failed",
+                                outcome: outcome_for_agent_error(&err),
                                 error: &format!("per-agent error: {err}"),
                                 tokens: agent_token_usage,
                             })
@@ -1392,7 +1406,7 @@ pub(crate) async fn review_and_merge(
                                 stdout: &raw_output,
                                 stderr: &stderr,
                                 parsed: &text_for_review,
-                                outcome: "failed",
+                                outcome: "rate_limit",
                                 error: &format!("rate limit: {message}"),
                                 tokens: agent_token_usage,
                             })
@@ -1419,7 +1433,7 @@ pub(crate) async fn review_and_merge(
                                 stdout: &raw_output,
                                 stderr: &stderr,
                                 parsed: &text_for_review,
-                                outcome: "failed",
+                                outcome: "auth_error",
                                 error: &format!("auth error: {message}"),
                                 tokens: agent_token_usage,
                             })
@@ -1444,7 +1458,7 @@ pub(crate) async fn review_and_merge(
                             stdout: &raw_output,
                             stderr: &stderr,
                             parsed: &text_for_review,
-                            outcome: "failed",
+                            outcome: "parse_error",
                             error: &format!("parse error: {e}"),
                             tokens: agent_token_usage,
                         })
