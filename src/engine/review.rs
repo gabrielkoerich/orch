@@ -258,13 +258,27 @@ async fn ensure_pr_exists(
 
                 // Run a credentialed push and log any errors so failures are
                 // visible in logs instead of being silently discarded.
-                match tokio::process::Command::new("git")
-                    .args(["-C", worktree_str, "push", "-u", "origin", branch_name])
-                    .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                    .output()
-                    .await
+                // Wrap with a timeout to prevent indefinitely blocking a Tokio worker on a
+                // hung network connection (corporate proxy, partial GitHub outage, TCP hang).
+                let push_timeout = std::time::Duration::from_secs(120);
+                match tokio::time::timeout(
+                    push_timeout,
+                    tokio::process::Command::new("git")
+                        .args(["-C", worktree_str, "push", "-u", "origin", branch_name])
+                        .envs(auth_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                        .output(),
+                )
+                .await
                 {
-                    Ok(o) => {
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            branch = %branch_name,
+                            timeout_secs = push_timeout.as_secs(),
+                            "review gate fallback push timed out"
+                        );
+                    }
+                    Ok(Ok(o)) => {
                         if !o.status.success() {
                             tracing::warn!(
                                 task_id = task.id.0,
@@ -278,7 +292,7 @@ async fn ensure_pr_exists(
                             tracing::info!(task_id = task.id.0, branch = %branch_name, "review gate fallback push succeeded");
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::error!(
                             task_id = task.id.0,
                             branch = %branch_name,
@@ -325,8 +339,21 @@ async fn ensure_pr_exists(
                     Err(e) => {
                         let e_str = format!("{e}");
                         if e_str.contains("already exists") {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                            if let Ok(Some(n)) = gh_check.get_pr_number(repo, branch_name).await {
+                            // GitHub list-API cache may be stale immediately after a 422.
+                            // Use two attempts with exponential backoff (2s → 4s) to avoid
+                            // racing into a duplicate `gh pr create` call.
+                            let backoff_delays = [2u64, 4u64];
+                            let mut found_pr: Option<u64> = None;
+                            for delay_secs in backoff_delays {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs))
+                                    .await;
+                                if let Ok(Some(n)) = gh_check.get_pr_number(repo, branch_name).await
+                                {
+                                    found_pr = Some(n);
+                                    break;
+                                }
+                            }
+                            if let Some(n) = found_pr {
                                 tracing::info!(
                                     task_id = task.id.0,
                                     pr_number = n,
