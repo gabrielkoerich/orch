@@ -112,14 +112,6 @@ impl TmuxManager {
         self.set_env(session, key, value).await
     }
 
-    /// Unset an environment variable in an existing tmux session.
-    ///
-    /// Uses: `tmux set-environment -u <key> -t <session>`
-    #[allow(dead_code)]
-    pub async fn unset_session_env(&self, session: &str, key: &str) -> anyhow::Result<()> {
-        self.unset_env(session, key).await
-    }
-
     /// Check if a session exists.
     pub async fn session_exists(&self, session: &str) -> bool {
         Command::new("tmux")
@@ -518,21 +510,6 @@ impl TmuxManager {
         }
 
         tracing::debug!(key, "unset tmux global environment variable");
-        Ok(())
-    }
-
-    /// Set multiple environment variables in a tmux session at once.
-    ///
-    /// This is a convenience method for setting multiple variables efficiently.
-    #[allow(dead_code)]
-    pub async fn set_env_batch(
-        &self,
-        session: &str,
-        vars: &[(String, String)],
-    ) -> anyhow::Result<()> {
-        for (key, value) in vars {
-            self.set_env(session, key, value).await?;
-        }
         Ok(())
     }
 
