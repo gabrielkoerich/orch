@@ -519,6 +519,18 @@ async fn classify_review_failure(
     // attempt to an available agent.
     let lower_reason = reason.to_lowercase();
 
+    // Parse errors are orch's fault, not review feedback. Re-route for retry
+    // without counting toward the failure threshold, so parse errors don't
+    // incorrectly block tasks that have no actual review feedback.
+    if lower_reason.contains("parse error") {
+        tracing::warn!(
+            task_id,
+            reason,
+            "{context} hit parse error — re-routing for retry without counting as failure"
+        );
+        return ReviewOutcome::Reset;
+    }
+
     // Merge conflicts are infrastructure failures, not review agent failures.
     // The merge_conflict_retries counter handles these separately.
     if lower_reason.contains("merge conflict")
