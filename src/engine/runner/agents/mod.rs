@@ -1070,11 +1070,19 @@ pub(crate) mod patterns {
         for event in events {
             if let Some(message) = extract_message(event) {
                 let err = classify(&message);
-                match &best {
-                    None | Some(AgentError::AgentFailed { .. }) => {
-                        best = Some(err);
-                    }
-                    Some(_) => {}
+                // Priority (highest wins): RateLimit / Auth / other > NetworkError > AgentFailed
+                // A transient reconnect mid-stream must not obscure a subsequent billing/rate error.
+                let upgrade = match &best {
+                    None => true,
+                    Some(AgentError::AgentFailed { .. }) => true,
+                    Some(AgentError::NetworkError { .. }) => !matches!(
+                        err,
+                        AgentError::NetworkError { .. } | AgentError::AgentFailed { .. }
+                    ),
+                    Some(_) => false,
+                };
+                if upgrade {
+                    best = Some(err);
                 }
             }
         }

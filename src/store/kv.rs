@@ -51,10 +51,19 @@ impl TaskStore {
     }
 
     /// List all (key, value) pairs where the key starts with `prefix`.
+    ///
+    /// The prefix is escaped so that literal `%` and `_` characters are treated as
+    /// plain text rather than SQLite LIKE wildcards.
     pub async fn kv_list_prefix(&self, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
-        let pattern = format!("{prefix}%");
+        // Escape LIKE metacharacters so a prefix containing '%' or '_' (or the chosen
+        // escape char '\') is matched literally.
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
         let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT key, value FROM kv WHERE key LIKE ?")
+            sqlx::query_as("SELECT key, value FROM kv WHERE key LIKE ? ESCAPE '\\'")
                 .bind(&pattern)
                 .fetch_all(&self.pool)
                 .await?;
