@@ -560,6 +560,14 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
 
     if !commit.status.success() {
         let stderr = String::from_utf8_lossy(&commit.stderr);
+        // Recovery: restore the original commits so the worktree isn't stuck
+        if let Some((original_head, _)) = commits.last() {
+            let _ = Command::new("git")
+                .args(["reset", "--hard", original_head])
+                .current_dir(dir)
+                .output_with_context()
+                .await;
+        }
         anyhow::bail!("git commit failed during workflow file stripping: {stderr}");
     }
 
