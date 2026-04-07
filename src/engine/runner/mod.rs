@@ -191,6 +191,45 @@ fn parse_success_output(
     agent_runner: &dyn agents::AgentRunner,
     raw_stdout: &str,
 ) -> Result<agents::ParsedResponse, agents::AgentError> {
+    // 1. Try to use the unified agent result extractor first
+    if let Some(agent_result) = agents::find_agent_result(agent_name, raw_stdout) {
+        // Treat is_error as authoritative for the success path
+        if agent_result.is_error {
+            return Err(agents::AgentError::AgentFailed {
+                message: agent_result.result_text,
+            });
+        }
+
+        // Try to parse the inner result text as standard JSON
+        match crate::parser::parse(&agent_result.result_text) {
+            Ok(response) => {
+                return Ok(agents::ParsedResponse {
+                    response,
+                    input_tokens: agent_result.input_tokens,
+                    output_tokens: agent_result.output_tokens,
+                    duration_ms: agent_result.duration_ms,
+                });
+            }
+            Err(_) => {
+                // Only fall back to text synthesis when parsing fails
+                if let Some(response) = agents::synthesize_response_from_text(&agent_result.result_text) {
+                    tracing::warn!(
+                        task_id,
+                        agent = agent_name,
+                        "parse failed on agent result, synthesizing response from plain text"
+                    );
+                    return Ok(agents::ParsedResponse {
+                        response,
+                        input_tokens: agent_result.input_tokens,
+                        output_tokens: agent_result.output_tokens,
+                        duration_ms: agent_result.duration_ms,
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. Fall back to generic agent-specific parser if extraction failed
     match agent_runner.parse_response(raw_stdout) {
         Ok(parsed) => Ok(parsed),
         Err(agents::AgentError::InvalidResponse { raw }) => {
@@ -1920,6 +1959,39 @@ mod tests {
         let parsed = result.expect("should synthesize response from text");
         assert_eq!(parsed.input_tokens, None);
         assert_eq!(parsed.output_tokens, None);
+    }
+
+    #[test]
+    fn parse_success_output_uses_agent_result_directly() {
+        // Here we test that if find_agent_result succeeds and returns valid JSON, we use it directly
+        // WITHOUT calling agent_runner.parse_response at all.
+        let ndjson = r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"status\":\"done\",\"summary\":\"my summary\",\"accomplished\":[],\"remaining\":[],\"files\":[]}"}"#;
+        
+        // FailingMockRunner always returns InvalidResponse, so if we called it, we'd synthesize "done" instead of getting "my summary".
+        let runner = FailingMockRunner;
+        let result = parse_success_output("999", "claude", &runner, ndjson);
+        
+        let parsed = result.expect("should parse successfully via find_agent_result");
+        assert_eq!(parsed.response.status, "done");
+        assert_eq!(parsed.response.summary, "my summary");
+    }
+
+    #[test]
+    fn parse_success_output_treats_agent_result_is_error_as_authoritative() {
+        // Here we test that if find_agent_result returns is_error=true, we return AgentFailed
+        // instead of falling back to synthesis or agent_runner.parse_response.
+        let ndjson = r#"{"type":"result","subtype":"success","is_error":true,"result":"I failed because of reasons"}"#;
+        
+        let runner = FailingMockRunner;
+        let result = parse_success_output("999", "claude", &runner, ndjson);
+        
+        let err = result.expect_err("should return error");
+        match err {
+            agents::AgentError::AgentFailed { message } => {
+                assert_eq!(message, "I failed because of reasons");
+            }
+            _ => panic!("expected AgentFailed, got {err:?}"),
+        }
     }
 
     #[allow(clippy::await_holding_lock)]
