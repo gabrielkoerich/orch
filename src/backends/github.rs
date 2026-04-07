@@ -344,60 +344,49 @@ impl ExternalBackend for GitHubBackend {
             .collect())
     }
 
-    /// List all open tasks with active statuses in a single API call.
-    ///
-    /// Fetches all open issues once and partitions by status label locally.
-    /// More efficient than making 6 separate `list_by_status` calls.
-    async fn list_all_active_tasks(&self) -> anyhow::Result<Vec<(ExternalTask, Status)>> {
+    /// Single-call override: fetches all open issues once and partitions by status label locally,
+    /// replacing the 1 (list_routable) + 5 (list_by_status per active status) fan-out with a
+    /// single `list_all_open_issues` request.
+    async fn list_active_open_issues(
+        &self,
+    ) -> anyhow::Result<Vec<(ExternalTask, Option<crate::backends::Status>)>> {
         let issues = self.gh.list_all_open_issues(&self.repo).await?;
-        let mut results = Vec::new();
 
-        for issue in issues {
-            if issue.pull_request.is_some() {
-                continue;
+        let active_status_from_label = |label: &str| -> Option<crate::backends::Status> {
+            match label {
+                "status:routed" => Some(crate::backends::Status::Routed),
+                "status:in_progress" => Some(crate::backends::Status::InProgress),
+                "status:needs_review" => Some(crate::backends::Status::NeedsReview),
+                "status:in_review" => Some(crate::backends::Status::InReview),
+                "status:blocked" => Some(crate::backends::Status::Blocked),
+                _ => None,
             }
-            if !is_trusted_author(&issue) {
-                continue;
-            }
+        };
 
-            let labels: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
-
-            // Find the status label, if any
-            let status = labels.iter().find_map(|l| {
-                if let Some(status) = l.strip_prefix("status:") {
-                    match status {
-                        "new" => Some(Status::New),
-                        "routed" => Some(Status::Routed),
-                        "in_progress" => Some(Status::InProgress),
-                        "needs_review" => Some(Status::NeedsReview),
-                        "in_review" => Some(Status::InReview),
-                        "blocked" => Some(Status::Blocked),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            });
-
-            if let Some(status) = status {
-                results.push((
-                    ExternalTask {
-                        id: ExternalId(issue.number.to_string()),
-                        title: issue.title,
-                        body: issue.body.unwrap_or_default(),
-                        state: issue.state,
-                        labels: issue.labels.into_iter().map(|l| l.name).collect(),
-                        author: issue.user.login,
-                        created_at: issue.created_at,
-                        updated_at: issue.updated_at,
-                        url: issue.html_url,
-                    },
-                    status,
-                ));
-            }
-        }
-
-        Ok(results)
+        Ok(issues
+            .into_iter()
+            .filter(|issue| issue.pull_request.is_none()) // Exclude PRs
+            .filter(is_trusted_author) // Only trusted authors
+            .map(|issue| {
+                // Detect active (non-new) status from labels; None = unlabeled or status:new.
+                let status = issue
+                    .labels
+                    .iter()
+                    .find_map(|l| active_status_from_label(&l.name));
+                let task = ExternalTask {
+                    id: ExternalId(issue.number.to_string()),
+                    title: issue.title,
+                    body: issue.body.unwrap_or_default(),
+                    state: issue.state,
+                    labels: issue.labels.into_iter().map(|l| l.name).collect(),
+                    author: issue.user.login,
+                    created_at: issue.created_at,
+                    updated_at: issue.updated_at,
+                    url: issue.html_url,
+                };
+                (task, status)
+            })
+            .collect())
     }
 
     async fn post_comment(&self, id: &ExternalId, body: &str) -> anyhow::Result<()> {

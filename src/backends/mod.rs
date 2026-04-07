@@ -217,28 +217,45 @@ pub trait ExternalBackend: Send + Sync {
         self.list_by_status(Status::New).await
     }
 
-    /// List all open tasks with active statuses (everything except Done).
+    /// Fetch all open issues for ingest in a single logical call, returning each issue paired
+    /// with its detected status (`None` = unlabeled/routable, `Some(s)` = has status label `s`).
     ///
-    /// This fetches all open issues in a single API call and partitions them
-    /// by status label locally. More efficient than making 6 separate calls to
-    /// `list_by_status` for each active status.
-    async fn list_all_active_tasks(&self) -> anyhow::Result<Vec<(ExternalTask, Status)>> {
-        let statuses = [
-            Status::New,
+    /// The default implementation calls `list_routable()` followed by `list_by_status()` for
+    /// each active non-new status, deduplicating by ID.  Backends that support bulk listing
+    /// (e.g. GitHub) should override this to fetch all open issues in one API call and
+    /// partition locally, eliminating the 1 + N fan-out.
+    async fn list_active_open_issues(&self) -> anyhow::Result<Vec<(ExternalTask, Option<Status>)>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+
+        // Routable tasks: unlabeled issues + status:new → no status sync needed.
+        if let Ok(routable) = self.list_routable().await {
+            for task in routable {
+                if seen.insert(task.id.0.clone()) {
+                    result.push((task, None));
+                }
+            }
+        }
+
+        // Remaining active statuses (non-new) that require status sync on first ingest.
+        let active_non_new = [
             Status::Routed,
             Status::InProgress,
             Status::NeedsReview,
             Status::InReview,
             Status::Blocked,
         ];
-        let mut all_tasks = Vec::new();
-        for status in statuses {
-            let tasks = self.list_by_status(status).await?;
-            for task in tasks {
-                all_tasks.push((task, status));
+        for status in active_non_new {
+            if let Ok(tasks) = self.list_by_status(status).await {
+                for task in tasks {
+                    if seen.insert(task.id.0.clone()) {
+                        result.push((task, Some(status)));
+                    }
+                }
             }
         }
-        Ok(all_tasks)
+
+        Ok(result)
     }
 
     /// Post a comment / activity note.
