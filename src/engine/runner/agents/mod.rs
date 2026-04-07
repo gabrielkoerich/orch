@@ -842,7 +842,7 @@ pub(crate) mod patterns {
         ];
         if patterns.iter().any(|p| lower.contains(p)) {
             return Some(AgentError::ContextOverflow {
-                message: text.to_string(),
+                message: safe_tail(text, 300).to_string(),
             });
         }
         None
@@ -926,7 +926,7 @@ pub(crate) mod patterns {
         ];
         if patterns.iter().any(|p| lower.contains(p)) {
             return Some(AgentError::PermissionDenied {
-                message: text.to_string(),
+                message: safe_tail(text, 300).to_string(),
             });
         }
         None
@@ -949,7 +949,7 @@ pub(crate) mod patterns {
                 || lower.contains("op signin"));
         if patterns.iter().any(|p| lower.contains(p)) || auth_required_with_interactive_context {
             return Some(AgentError::WaitingForInput {
-                message: text.to_string(),
+                message: safe_tail(text, 300).to_string(),
             });
         }
         None
