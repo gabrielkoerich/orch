@@ -1747,32 +1747,9 @@ pub(crate) async fn review_and_merge(
         }
     }
 
-    // 15. Check for push failures before acting on the decision.
-    // Push either succeeded (reaching here) or returned early with Failed; if it
-    // succeeded and cleared a previous failure, had_prev_push_failure captures that.
-    // Either way the current push did not fail, so has_push_failure is false.
-    let has_push_failure = false;
-
-    // 16. Handle the decision
+    // 15. Handle the decision
     match decision {
         ReviewDecision::Approve => {
-            if has_push_failure {
-                tracing::warn!(
-                    task_id = task.id.0,
-                    pr_number = pr_number_early,
-                    "review approved but last push failed — blocking for human check"
-                );
-                if let Err(e) = task_manager
-                    .update_task_status(&task.id, Status::Blocked)
-                    .await
-                {
-                    tracing::error!(task_id = task.id.0, err = %e, "failed to block task");
-                }
-                return Ok(ReviewDecision::Blocked(
-                    "review approved but last push failed — PR may have stale code".to_string(),
-                ));
-            }
-
             let auto_merge = crate::config::get("workflow.auto_close_task_on_approval")
                 .or_else(|_| crate::config::get("workflow.auto_close"))
                 .or_else(|_| crate::config::get("workflow.auto_merge"))
