@@ -589,11 +589,13 @@ impl GhHttp {
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text_res = resp.text().await;
         if !status.is_success() {
+            let text = text_res.unwrap_or_default();
             Self::maybe_record_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub API POST {url} failed ({status}): {text}");
         }
+        let text = text_res?;
         Ok(text)
     }
 
@@ -623,11 +625,13 @@ impl GhHttp {
         };
         let resp = self.send_with_retries(make_req, false).await?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text_res = resp.text().await;
         if !status.is_success() {
+            let text = text_res.unwrap_or_default();
             Self::maybe_record_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub API PATCH {url} failed ({status}): {text}");
         }
+        let text = text_res?;
         Ok(text)
     }
 
@@ -830,6 +834,22 @@ impl GhHttp {
         extra_headers: &[(&str, &str)],
         variables: Option<serde_json::Value>,
     ) -> anyhow::Result<serde_json::Value> {
+        self.graphql_request_to_url(
+            &format!("{GITHUB_API}/graphql"),
+            query,
+            extra_headers,
+            variables,
+        )
+        .await
+    }
+
+    async fn graphql_request_to_url(
+        &self,
+        url: &str,
+        query: &str,
+        extra_headers: &[(&str, &str)],
+        variables: Option<serde_json::Value>,
+    ) -> anyhow::Result<serde_json::Value> {
         Self::proactive_throttle_graphql().await;
         Self::check_graphql_backoff()?;
         let body = if let Some(vars) = variables {
@@ -840,7 +860,7 @@ impl GhHttp {
         let auth = self.auth_header().await?;
         let mut req = self
             .client
-            .post(format!("{GITHUB_API}/graphql"))
+            .post(url)
             .json(&body)
             .header(header::AUTHORIZATION, auth)
             .header(header::ACCEPT, "application/vnd.github+json")
@@ -857,11 +877,13 @@ impl GhHttp {
         };
         let resp = self.send_with_retries(make_req, true).await?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text_res = resp.text().await;
         if !status.is_success() {
+            let text = text_res.unwrap_or_default();
             Self::maybe_record_graphql_rate_limit_from_body(status, &text);
             anyhow::bail!("GitHub GraphQL failed ({status}): {text}");
         }
+        let text = text_res?;
         let json: serde_json::Value = serde_json::from_str(&text)?;
         // GraphQL always returns 200 even for errors; check the errors field explicitly.
         if let Some(errors) = json.get("errors").and_then(|e| e.as_array()) {
@@ -2945,6 +2967,36 @@ fn parse_graphql_issue_comment(node: &serde_json::Value) -> Option<GitHubComment
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_truncated_body_server(body_prefix: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+
+            let declared_len = body_prefix.len() + 32;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {declared_len}\r\nconnection: close\r\n\r\n{body_prefix}"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn test_client() -> GhHttp {
+        GhHttp {
+            client: reqwest::Client::new(),
+            token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
+            cached_username: OnceLock::new(),
+        }
+    }
 
     /// Verify `GhHttp::new()` returns `Ok` and does not panic on construction.
     ///
@@ -3218,11 +3270,7 @@ mod tests {
     async fn send_with_retries_propagates_make_req_error() {
         let guard = std::env::var_os("GH_TOKEN");
         std::env::set_var("GH_TOKEN", "test_token");
-        let gh = GhHttp {
-            client: reqwest::Client::new(),
-            token_resolver: Arc::new(crate::github::token::TokenResolver::default_env()),
-            cached_username: OnceLock::new(),
-        };
+        let gh = test_client();
         let result = gh
             .send_with_retries(
                 || Err(anyhow::anyhow!("simulated request clone failure")),
@@ -3232,6 +3280,105 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert_eq!(err, "simulated request clone failure");
+        match guard {
+            Some(v) => std::env::set_var("GH_TOKEN", v),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_json_raw_propagates_body_read_errors_on_success() {
+        let guard = std::env::var_os("GH_TOKEN");
+        std::env::set_var("GH_TOKEN", "test_token");
+        let server_url = spawn_truncated_body_server("{").await;
+        let gh = test_client();
+
+        let result = gh
+            .post_json_raw(
+                &format!("{server_url}/post"),
+                &serde_json::json!({"ok": true}),
+            )
+            .await;
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            !err.contains("EOF while parsing a value"),
+            "should surface the body read error, got: {err}"
+        );
+        assert!(
+            err.contains("error decoding response body")
+                || err.contains("request or response body error")
+                || err.contains("end of file before message length reached"),
+            "expected a transport/body read error, got: {err}"
+        );
+
+        match guard {
+            Some(v) => std::env::set_var("GH_TOKEN", v),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_json_raw_propagates_body_read_errors_on_success() {
+        let guard = std::env::var_os("GH_TOKEN");
+        std::env::set_var("GH_TOKEN", "test_token");
+        let server_url = spawn_truncated_body_server("{").await;
+        let gh = test_client();
+
+        let result = gh
+            .patch_json_raw(
+                &format!("{server_url}/patch"),
+                &serde_json::json!({"ok": true}),
+            )
+            .await;
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            !err.contains("EOF while parsing a value"),
+            "should surface the body read error, got: {err}"
+        );
+        assert!(
+            err.contains("error decoding response body")
+                || err.contains("request or response body error")
+                || err.contains("end of file before message length reached"),
+            "expected a transport/body read error, got: {err}"
+        );
+
+        match guard {
+            Some(v) => std::env::set_var("GH_TOKEN", v),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+    }
+
+    #[tokio::test]
+    async fn graphql_request_propagates_body_read_errors_on_success() {
+        let guard = std::env::var_os("GH_TOKEN");
+        std::env::set_var("GH_TOKEN", "test_token");
+        let server_url = spawn_truncated_body_server("{").await;
+        let gh = test_client();
+        let query = "query { viewer { login } }";
+
+        let result = gh
+            .graphql_request_to_url(
+                &format!("{server_url}/graphql"),
+                query,
+                &[],
+                Some(serde_json::json!({"k": "v"})),
+            )
+            .await;
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            !err.contains("EOF while parsing a value"),
+            "should surface the body read error, got: {err}"
+        );
+        assert!(
+            err.contains("error decoding response body")
+                || err.contains("request or response body error")
+                || err.contains("end of file before message length reached"),
+            "expected a transport/body read error, got: {err}"
+        );
+
         match guard {
             Some(v) => std::env::set_var("GH_TOKEN", v),
             None => std::env::remove_var("GH_TOKEN"),
