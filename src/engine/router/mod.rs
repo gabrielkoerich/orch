@@ -21,6 +21,17 @@ pub mod weights;
 pub use config::{parse_pool_entry, RouterConfig};
 pub use weights::AgentWeights;
 
+/// Typed error returned by [`get_route_result`].
+#[derive(Debug, thiserror::Error)]
+pub enum RouteResultError {
+    /// The task has no agent field — it needs to be re-routed.
+    #[error("no agent configured for task {task_id}")]
+    NoAgent { task_id: String },
+    /// Any other failure (store lookup, SQL, etc.).
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 use crate::backends::ExternalTask;
 use crate::engine::cooldown::{
     cooldown_until, is_agent_degraded, is_agent_in_cooldown, is_model_in_cooldown,
@@ -1097,18 +1108,23 @@ pub async fn get_route_result(
     store: &std::sync::Arc<TaskStore>,
     repo: &str,
     task_id: &str,
-) -> anyhow::Result<RouteResult> {
+) -> Result<RouteResult, RouteResultError> {
     let store_id = store
         .resolve_task_id(repo, task_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("task {task_id} not found in store"))?;
-    let task = store.get(store_id).await?;
+        .await
+        .map_err(RouteResultError::Other)?
+        .ok_or_else(|| {
+            RouteResultError::Other(anyhow::anyhow!("task {task_id} not found in store"))
+        })?;
+    let task = store.get(store_id).await.map_err(RouteResultError::Other)?;
 
     let agent = task
         .agent
         .clone()
         .filter(|a| !a.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("no agent field found for task {task_id}"))?;
+        .ok_or_else(|| RouteResultError::NoAgent {
+            task_id: task_id.to_string(),
+        })?;
 
     let complexity = if task.complexity.is_empty() {
         "medium".to_string()
