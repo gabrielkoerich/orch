@@ -925,6 +925,13 @@ async fn scan_mentions(
     for mention in mentions {
         // Skip if already processed
         if existing_mentions.contains(&mention.id) {
+            // Advance the cursor past already-processed mentions so the scan
+            // doesn't get stuck re-fetching the same window when the latest
+            // mention is a duplicate. Only advance when the mention's
+            // timestamp is newer than our current cursor.
+            if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
+                last_success_ts = Some(mention.created_at.clone());
+            }
             continue;
         }
 
@@ -932,6 +939,13 @@ async fn scan_mentions(
             && !mention.body.contains("@orch")
             && !mention.body.contains("@orchestrator")
         {
+            // This mention batch may include comments that the backend
+            // returned but that are not actually addressed to the bot
+            // (e.g., legacy fetch semantics). Treat these as handled for
+            // cursor advancement so we don't repeatedly re-fetch them.
+            if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
+                last_success_ts = Some(mention.created_at.clone());
+            }
             continue;
         }
 
@@ -990,6 +1004,11 @@ async fn scan_mentions(
                                 .create_internal(repo, &title, &task_body, "mention", &mention.id)
                                 .await;
                         }
+                        // Advance cursor: we created a sentinel task so this mention
+                        // is considered handled and the cursor should move past it.
+                        if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
+                            last_success_ts = Some(mention.created_at.clone());
+                        }
                         continue;
                     }
                     Ok(_) => {}
@@ -1025,6 +1044,10 @@ async fn scan_mentions(
                             let _ = s
                                 .create_internal(repo, &title, &task_body, "mention", &mention.id)
                                 .await;
+                        }
+                        // Advance cursor: sentinel created for skipped non-collaborator mention
+                        if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
+                            last_success_ts = Some(mention.created_at.clone());
                         }
                         continue;
                     }
