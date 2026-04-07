@@ -125,12 +125,19 @@ impl EventBus {
         listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(listener)?;
 
-        // Write port file
-        std::fs::write(ws_port_path()?, port.to_string())?;
+        // Write port file without blocking the runtime thread.
+        let port_path = ws_port_path()?;
+        if let Some(parent) = port_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&port_path, port.to_string()).await?;
 
         // Write service version file so `orch version` can detect CLI/service drift
         if let Ok(path) = crate::home::service_version_path() {
-            let _ = std::fs::write(path, env!("ORCH_VERSION"));
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::write(path, env!("ORCH_VERSION")).await;
         }
 
         let tx = self.tx.clone();
@@ -251,9 +258,7 @@ pub fn cleanup_version_file() {
 
 fn ws_port_path() -> anyhow::Result<std::path::PathBuf> {
     if cfg!(test) {
-        let dir = std::env::temp_dir().join("orch-test-state");
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir.join("ws.port"))
+        Ok(std::env::temp_dir().join("orch-test-state").join("ws.port"))
     } else {
         Ok(crate::home::state_dir()?.join("ws.port"))
     }
