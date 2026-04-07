@@ -692,10 +692,13 @@ pub(crate) async fn sync_tick(
             // touching updated_at before we know whether we will actually fire.
             let store_task =
                 crate::store::opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await;
-            let current_refires = store_task
-                .as_ref()
-                .map(|t| t.needs_review_refires as u64)
-                .unwrap_or(0);
+            let current_refires = match store_task.as_ref() {
+                Some(t) => t.needs_review_refires as u64,
+                None => {
+                    tracing::warn!(task_id = task.id.0, "failed to read task from store for refire backoff — skipping re-fire this tick");
+                    continue;
+                }
+            };
             let new_refires = current_refires + 1;
 
             // If we've exceeded max attempts, escalate the task to Blocked with a clear reason.
