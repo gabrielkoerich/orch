@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::process::Command;
 
+use super::sync::ReviewTaskSnapshot;
+
 /// Options controlling the worktree janitor.
 #[derive(Debug, Clone)]
 pub struct JanitorOptions {
@@ -868,74 +870,20 @@ pub(crate) async fn check_merged_prs(
     repo: &str,
     store: &Arc<TaskStore>,
     task_manager: &Arc<TaskManager>,
+    in_review_tasks: &[ReviewTaskSnapshot],
+    needs_review_tasks: &[ReviewTaskSnapshot],
 ) -> anyhow::Result<()> {
-    // Build a branch map from store tasks before converting to ExternalTask,
-    // so we don't need N+1 opt_store_get_task calls later to re-fetch branches.
     let mut branch_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-
-    // Get all review tasks (external + internal) using store-first pattern.
-    // Branch mapping optimization: we'll build branch_map from store tasks when available.
-    let in_review_tasks: Vec<ExternalTask> = {
-        let tasks = task_manager.list_all_by_status(Status::InReview).await?;
-        // Build branch map from store tasks for optimization (avoids N+1 lookups later)
-        if let Some(store) = task_manager.store() {
-            if let Ok(store_tasks) = store
-                .list_external_by_status(task_manager.repo(), crate::store::TaskStatus::InReview)
-                .await
-            {
-                for t in &store_tasks {
-                    if !t.branch.is_empty() {
-                        let ext_id = t
-                            .external_id
-                            .clone()
-                            .unwrap_or_else(|| format!("internal:{}", t.id));
-                        branch_map.insert(ext_id, t.branch.clone());
-                    }
-                }
-            }
-        }
-        tasks
-    };
-    let needs_review_tasks: Vec<ExternalTask> = {
-        let tasks = task_manager.list_all_by_status(Status::NeedsReview).await?;
-        // Build branch map from store tasks for optimization (avoids N+1 lookups later)
-        if let Some(store) = task_manager.store() {
-            if let Ok(store_tasks) = store
-                .list_external_by_status(task_manager.repo(), crate::store::TaskStatus::NeedsReview)
-                .await
-            {
-                for t in &store_tasks {
-                    if !t.branch.is_empty() {
-                        let ext_id = t
-                            .external_id
-                            .clone()
-                            .unwrap_or_else(|| format!("internal:{}", t.id));
-                        branch_map.insert(ext_id, t.branch.clone());
-                    }
-                }
-            }
-        }
-        tasks
-    };
-    let mut all_review_tasks: Vec<_> = in_review_tasks
-        .into_iter()
-        .chain(needs_review_tasks)
+    let all_review_tasks: Vec<&ReviewTaskSnapshot> = in_review_tasks
+        .iter()
+        .chain(needs_review_tasks.iter())
         .collect();
 
-    // Also include internal (SQLite) tasks — they create real GitHub PRs
-    // and their merged PRs must be detected the same way as external tasks.
-    if let Ok(internal_in_review) = task_manager
-        .list_internal_by_status(crate::store::TaskStatus::InReview)
-        .await
-    {
-        all_review_tasks.extend(internal_in_review);
-    }
-    if let Ok(internal_needs_review) = task_manager
-        .list_internal_by_status(crate::store::TaskStatus::NeedsReview)
-        .await
-    {
-        all_review_tasks.extend(internal_needs_review);
+    for task in &all_review_tasks {
+        if !task.stored.branch.is_empty() {
+            branch_map.insert(task.external.id.0.clone(), task.stored.branch.clone());
+        }
     }
 
     tracing::debug!(
@@ -948,7 +896,7 @@ pub(crate) async fn check_merged_prs(
     // not in the map (e.g. internal tasks, backend fallback path).
     let mut task_branches: Vec<(String, String)> = Vec::new();
     for task in all_review_tasks {
-        let task_id = &task.id.0;
+        let task_id = &task.external.id.0;
         let branch = if let Some(b) = branch_map.get(task_id) {
             b.clone()
         } else {
@@ -1586,9 +1534,37 @@ mod tests {
             "owner/repo".to_string(),
         ));
 
-        check_merged_prs(&backend_dyn, "owner/repo", &store, &task_manager)
+        let in_review_tasks = store
+            .list_by_status("owner/repo", crate::store::TaskStatus::InReview)
             .await
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(|stored| ReviewTaskSnapshot {
+                external: crate::engine::tasks::store_task_to_external(&stored),
+                stored,
+            })
+            .collect::<Vec<_>>();
+        let needs_review_tasks = store
+            .list_by_status("owner/repo", crate::store::TaskStatus::NeedsReview)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|stored| ReviewTaskSnapshot {
+                external: crate::engine::tasks::store_task_to_external(&stored),
+                stored,
+            })
+            .collect::<Vec<_>>();
+
+        check_merged_prs(
+            &backend_dyn,
+            "owner/repo",
+            &store,
+            &task_manager,
+            &in_review_tasks,
+            &needs_review_tasks,
+        )
+        .await
+        .unwrap();
 
         let checked = backend.single_checked_branches.lock().unwrap().clone();
         assert_eq!(
