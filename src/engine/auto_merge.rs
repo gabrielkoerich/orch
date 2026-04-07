@@ -1308,10 +1308,10 @@ pub(crate) async fn handle_review_changes(
     // model directly produced invalid combos after failover (e.g. opencode:opus
     // when "opus" was the review agent's model, not a valid opencode model).
     //
-    // We read the task's existing agent and complexity from the store, then
-    // resolve a fresh model from the agent's configured pool.  If all models
-    // for that agent are cooled, we fall back to Status::New for a full re-route.
-    let task_store_record = opt_store_get_task(&Some(Arc::clone(store)), repo, &task.id.0).await;
+    // We read the task's existing agent and complexity from the store record
+    // fetched at line 1087, then resolve a fresh model from the agent's
+    // configured pool.  If all models for that agent are cooled, we fall back
+    // to Status::New for a full re-route.
     let previous_agent = task_store_record
         .as_ref()
         .and_then(|t| t.agent.as_ref())
