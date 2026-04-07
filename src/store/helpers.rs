@@ -8,6 +8,26 @@ use crate::store::{CostEstimate, MemoryEntry, Task, TaskStore, TokenUsage};
 use anyhow::anyhow;
 use std::sync::Arc;
 
+/// Resolve a task's numeric store ID from its external identifier.
+///
+/// Returns `None` if the store is unavailable, the task is not found, or the
+/// lookup fails (with a warning logged in that case).
+pub async fn resolve_store_id(
+    store: &Option<Arc<TaskStore>>,
+    repo: &str,
+    task_id: &str,
+) -> Option<i64> {
+    let s = store.as_ref()?;
+    match s.resolve_task_id(repo, task_id).await {
+        Ok(Some(id)) => Some(id),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(task_id, error = %e, "failed to resolve task id for store operations");
+            None
+        }
+    }
+}
+
 /// Load the full `Task` record from the store.
 ///
 /// Returns `None` if the store is unavailable, the task cannot be resolved,
