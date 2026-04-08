@@ -1272,18 +1272,22 @@ pub(crate) async fn review_and_merge(
         );
         let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
         match &err {
-            runner::agents::AgentError::RateLimit { .. }
-            | runner::agents::AgentError::Auth { .. } => {
+            runner::agents::AgentError::RateLimit { message }
+            | runner::agents::AgentError::Auth { message } => {
                 tracing::warn!(
                     task_id = task.id.0,
                     agent = %review_agent,
                     "review agent hit rate limit — adding to cooldown"
                 );
-                runner::response::record_agent_failure_with_message(
-                    &review_agent,
-                    &err.to_string(),
-                )
-                .await;
+                if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
+                    crate::engine::cooldown::record_credit_exhaustion(&review_agent, reason).await;
+                } else {
+                    runner::response::record_agent_failure_with_message(
+                        &review_agent,
+                        &err.to_string(),
+                    )
+                    .await;
+                }
             }
             _ => {}
         }
@@ -1347,18 +1351,28 @@ pub(crate) async fn review_and_merge(
                 if already_errored {
                     let err = agent_runner.classify_error(exit_code, &raw_output, &stderr);
                     match &err {
-                        runner::agents::AgentError::RateLimit { .. }
-                        | runner::agents::AgentError::Auth { .. } => {
+                        runner::agents::AgentError::RateLimit { message }
+                        | runner::agents::AgentError::Auth { message } => {
                             tracing::warn!(
                                 task_id = task.id.0,
                                 agent = %review_agent,
                                 "review agent hit error (from per-agent extractor) — adding to cooldown"
                             );
-                            runner::response::record_agent_failure_with_message(
-                                &review_agent,
-                                &err.to_string(),
-                            )
-                            .await;
+                            if let Some(reason) =
+                                crate::engine::cooldown::detect_credit_exhaustion(message)
+                            {
+                                crate::engine::cooldown::record_credit_exhaustion(
+                                    &review_agent,
+                                    reason,
+                                )
+                                .await;
+                            } else {
+                                runner::response::record_agent_failure_with_message(
+                                    &review_agent,
+                                    &err.to_string(),
+                                )
+                                .await;
+                            }
                         }
                         _ => {}
                     }
