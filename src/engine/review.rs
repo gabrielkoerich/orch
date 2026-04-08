@@ -1176,7 +1176,17 @@ async fn post_review_comment(
     decision: &ReviewDecision,
     review_notes_for_comment: &str,
 ) -> anyhow::Result<()> {
-    let gh = GhHttp::new()?;
+    let gh = match GhHttp::new() {
+        Ok(gh) => gh,
+        Err(e) => {
+            tracing::warn!(
+                task_id = task.id.0,
+                error = %e,
+                "failed to create GH client for review comment"
+            );
+            return Ok(());
+        }
+    };
     let pr_comment = build_pr_review_comment(decision, review_notes_for_comment);
 
     if !pr_comment.is_empty() {
