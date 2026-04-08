@@ -443,6 +443,21 @@ impl Router {
         earliest
     }
 
+    /// Find the earliest cooldown expiration among the router LLM pool entries.
+    ///
+    /// Returns `Some(earliest_ts)` if at least one pool model is on cooldown,
+    /// or `None` if no pool model has a cooldown.
+    fn earliest_pool_cooldown(&self) -> Option<i64> {
+        let mut earliest: Option<i64> = None;
+        for (agent, model) in &self.router_pool {
+            let key = format!("{agent}:{model}");
+            if let Some(until) = cooldown_until(&key) {
+                earliest = Some(earliest.map_or(until, |current| current.min(until)));
+            }
+        }
+        earliest
+    }
+
     async fn wait_for_cooldown(&self, complexity: Option<&str>) -> anyhow::Result<()> {
         // If any cooldowns are present, return an error immediately so the
         // caller (the tick loop) can skip this task and retry on the next tick.
@@ -947,6 +962,7 @@ impl Router {
         let n = pool.len();
         let start = self.pool_index;
         let mut last_err: Option<anyhow::Error> = None;
+        let mut attempted_any = false;
 
         // Try pool entries in round-robin order, skipping cooled ones
         for i in 0..n {
@@ -958,6 +974,9 @@ impl Router {
                 tracing::debug!(agent, model = model_str, "pool entry on cooldown, skipping");
                 continue;
             }
+
+            // At least one pool entry was available to attempt
+            attempted_any = true;
 
             let model_opt = if model_str.is_empty() {
                 None
@@ -1001,6 +1020,30 @@ impl Router {
                     self.advance_pool_index_after_attempt(idx, n);
                 }
             }
+        }
+
+        // If every pool entry was pre-cooled (nothing was attempted), do not
+        // immediately exhaust the pool again — fail fast and let the tick loop
+        // retry on the next cycle instead of cascading failures.
+        if !attempted_any {
+            let now = chrono::Utc::now().timestamp();
+            let earliest = self.earliest_pool_cooldown();
+            if let Some(until) = earliest {
+                let remaining = until.saturating_sub(now);
+                tracing::warn!(
+                    remaining_secs = remaining,
+                    pool = ?pool,
+                    "all router LLM pool entries on cooldown — failing fast to let tick retry"
+                );
+                return Err(AllCooledError {
+                    scope: "router pool".to_string(),
+                }
+                .into());
+            }
+            // No pool cooldowns found either — this means the pool was empty
+            // or every entry was filtered out for some other reason.
+            return Err(last_err
+                .unwrap_or_else(|| anyhow::anyhow!("all router LLM pool entries exhausted")));
         }
 
         // All pool entries failed or were cooled — try the configured fallback
@@ -1198,7 +1241,7 @@ mod tests {
     use crate::backends::{ExternalId, ExternalTask};
     use crate::engine::cooldown::{
         clear_agent_degraded, is_agent_degraded, is_model_in_cooldown, mark_agent_degraded,
-        record_model_failure,
+        record_model_failure, set_model_cooldown,
     };
     use crate::store::TaskStore;
     use std::time::{Duration, Instant};
@@ -2396,6 +2439,58 @@ Hope that helps!"#;
         router.advance_pool_index_after_attempt(2, router.router_pool.len());
 
         assert_eq!(router.pool_index, 0);
+    }
+
+    #[test]
+    fn earliest_pool_cooldown_returns_none_when_no_cooldowns() {
+        let router = Router::new(RouterConfig::default());
+        assert!(router.earliest_pool_cooldown().is_none());
+    }
+
+    #[tokio::test]
+    async fn earliest_pool_cooldown_returns_earliest_when_set() {
+        // Use explicit pool with predictable model names to avoid opencode discovery.
+        let config = RouterConfig {
+            pool: vec![
+                "claude:haiku-4-5-20251001".to_string(),
+                "opencode:haiku-4-5-20251001".to_string(),
+            ],
+            ..Default::default()
+        };
+        let router = Router::new(config);
+        set_model_cooldown("claude", "haiku-4-5-20251001", 300); // 5 min
+        set_model_cooldown("opencode", "haiku-4-5-20251001", 600); // 10 min
+
+        let earliest = router.earliest_pool_cooldown();
+        assert!(earliest.is_some());
+        let now = chrono::Utc::now().timestamp();
+        let remaining = earliest.unwrap() - now;
+        // Should be close to 300 (5 min, the minimum) — allow 5s tolerance for test runtime
+        assert!((295..=300).contains(&remaining));
+    }
+
+    #[test]
+    fn earliest_pool_cooldown_skips_non_pool_entries() {
+        // Use explicit pool so we can predict what entries exist.
+        let config = RouterConfig {
+            pool: vec![
+                "claude:pool-model-a".to_string(),
+                "opencode:pool-model-b".to_string(),
+            ],
+            ..Default::default()
+        };
+        let router = Router::new(config);
+        // Set cooldown on a non-pool model — should not affect earliest_pool_cooldown
+        set_model_cooldown("claude", "opus", 999);
+        // Set cooldown on a pool entry (opencode:pool-model-b)
+        set_model_cooldown("opencode", "pool-model-b", 300);
+
+        let earliest = router.earliest_pool_cooldown();
+        assert!(earliest.is_some());
+        let now = chrono::Utc::now().timestamp();
+        let remaining = earliest.unwrap() - now;
+        // Should be ~300 (the pool-model-b cooldown), NOT 999 (claude:opus is not in pool)
+        assert!((295..=300).contains(&remaining));
     }
 
     // ---- Pre-emptive health check: degraded agent exclusion ----
