@@ -1035,15 +1035,16 @@ pub(crate) async fn tick_dispatch_tasks(
 
     if dispatchable.is_empty() {
         tracing::debug!(count = 0, "dispatchable tasks found");
-    } else {
-        tracing::info!(count = dispatchable.len(), "dispatchable tasks found");
-        if is_degraded {
-            tracing::warn!(
-                healthy_agents = healthy_count,
-                threshold = threshold,
-                "degraded mode: using sequential dispatch"
-            );
-        }
+        return Ok(());
+    }
+
+    tracing::info!(count = dispatchable.len(), "dispatchable tasks found");
+    if is_degraded {
+        tracing::warn!(
+            healthy_agents = healthy_count,
+            threshold = threshold,
+            "degraded mode: using sequential dispatch"
+        );
     }
 
     let sequential_delay = if is_degraded {
