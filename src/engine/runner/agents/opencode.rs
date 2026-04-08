@@ -27,7 +27,6 @@
 //! - `opencode/trinity-large-preview-free`
 
 use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
-use crate::cmd::SyncCommandErrorContext;
 use crate::parser;
 
 use std::sync::{Arc, Mutex};
@@ -799,17 +798,48 @@ fn discover_free_models() -> Vec<String> {
     // Known free models as fallback
     let known = known_free_models();
 
-    // Try to discover dynamically using blocking I/O.
-    // Note: this function is sync; callers in async contexts should wrap with
-    // tokio::task::spawn_blocking() at the call site.
-    let stdout = match std::process::Command::new("opencode")
+    // Spawn with a 30s timeout to prevent orphaned processes.
+    // `opencode models` can hang indefinitely on network requests.
+    let mut child = match std::process::Command::new("opencode")
         .args(["models"])
-        .output_with_context()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
     {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).to_string()
+        Ok(c) => c,
+        Err(_) => return known,
+    };
+
+    let timeout = std::time::Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    let stdout = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                break child
+                    .stdout
+                    .take()
+                    .map(|mut s| {
+                        let mut buf = String::new();
+                        std::io::Read::read_to_string(&mut s, &mut buf).ok();
+                        buf
+                    })
+                    .unwrap_or_default();
+            }
+            Ok(Some(_)) => return known,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    tracing::warn!("opencode models timed out after 30s, killing process");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return known;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                return known;
+            }
         }
-        _ => return known,
     };
     let discovered: Vec<String> = stdout
         .lines()

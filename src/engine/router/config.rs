@@ -262,27 +262,61 @@ impl RouterConfig {
             return vec![];
         }
 
-        match std::process::Command::new("opencode")
+        // Spawn with a 30s timeout to prevent orphaned processes.
+        // `opencode models` can hang on network requests indefinitely.
+        let mut child = match std::process::Command::new("opencode")
             .args(["models"])
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
         {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout
-                    .lines()
-                    .filter(|l| l.contains("free"))
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .map(|l| Self::normalize_model_identifier(&l))
-                    .collect()
-            }
-            Ok(output) => {
-                tracing::debug!(status = ?output.status, "opencode models command failed");
-                vec![]
-            }
+            Ok(c) => c,
             Err(e) => {
-                tracing::debug!(error = %e, "failed to run opencode models");
-                vec![]
+                tracing::debug!(error = %e, "failed to spawn opencode models");
+                return vec![];
+            }
+        };
+
+        let timeout = std::time::Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        let stdout = child
+                            .stdout
+                            .take()
+                            .map(|mut s| {
+                                let mut buf = String::new();
+                                std::io::Read::read_to_string(&mut s, &mut buf).ok();
+                                buf
+                            })
+                            .unwrap_or_default();
+                        return stdout
+                            .lines()
+                            .filter(|l| l.contains("free"))
+                            .map(|l| l.trim().to_string())
+                            .filter(|l| !l.is_empty())
+                            .map(|l| Self::normalize_model_identifier(&l))
+                            .collect();
+                    }
+                    tracing::debug!(?status, "opencode models command failed");
+                    return vec![];
+                }
+                Ok(None) => {
+                    if start.elapsed() > timeout {
+                        tracing::warn!("opencode models timed out after 30s, killing process");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return vec![];
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "failed to wait on opencode models");
+                    let _ = child.kill();
+                    return vec![];
+                }
             }
         }
     }
