@@ -328,10 +328,9 @@ pub async fn handle_failover(
     let chain = update_reroute_chain(task_id, agent_name, &chain, store, repo).await;
 
     // Get all available agents
-    let available: Vec<String> = ["claude", "codex", "opencode", "kimi", "minimax"]
-        .iter()
+    let available: Vec<String> = crate::engine::configured_agents()
+        .into_iter()
         .filter(|a| crate::cmd_cache::command_exists(a))
-        .map(|s| s.to_string())
         .collect();
 
     // Check if we've exhausted all agents (build chain_set once)

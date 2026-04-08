@@ -423,7 +423,7 @@ impl RouterConfig {
         // Value may be a single string ("model-name") or a JSON array (["m1","m2"]).
         // Iterate over all known complexity tiers regardless of what is in model_map —
         // the Default impl has no hardcoded entries, so iterating over keys() would be a no-op.
-        let known_agents = ["claude", "codex", "opencode", "kimi", "minimax"];
+        let known_agents = crate::engine::configured_agents();
         let known_complexities = ["simple", "medium", "complex", "review"];
         for complexity in known_complexities {
             for agent in &known_agents {
@@ -826,6 +826,52 @@ mod tests {
         assert!(
             !RouterConfig::is_valid_model_identifier("github-copilot/"),
             "model ending with slash after prefix should be invalid"
+        );
+    }
+
+    #[test]
+    fn from_config_loads_model_map_for_custom_agents() {
+        let _lock = cwd_mutex().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // Simulate a config with a custom agent (olm) in both agents and model_map
+        std::fs::write(
+            dir.path().join(".orch.yml"),
+            r#"
+agents:
+  - claude
+  - olm
+model_map:
+  simple:
+    claude: haiku
+    olm: qwen3.5
+  medium:
+    claude: sonnet
+    olm: gemma4
+  complex:
+    claude: opus
+    olm: gemma4
+"#,
+        )
+        .unwrap();
+        let _guard = CurrentDirGuard::set(dir.path());
+
+        let config = RouterConfig::from_config();
+
+        // olm models should be loaded from the model_map
+        assert_eq!(
+            config.model_for_complexity("olm", "simple", "test-task"),
+            Some("qwen3.5".to_string()),
+            "custom agent olm should have simple model from config"
+        );
+        assert_eq!(
+            config.model_for_complexity("olm", "medium", "test-task"),
+            Some("gemma4".to_string()),
+            "custom agent olm should have medium model from config"
+        );
+        // claude should also work
+        assert_eq!(
+            config.model_for_complexity("claude", "simple", "test-task"),
+            Some("haiku".to_string()),
         );
     }
 
