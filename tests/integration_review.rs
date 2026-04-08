@@ -62,7 +62,10 @@ fn verify_review_output(
     // Step 2: per-agent envelope extraction — same as review.rs stage 1
     let text = match find_agent_result(agent_binary, stdout) {
         Some(result) if result.is_error => {
-            panic!("{label}: agent reported is_error=true: {}", result.result_text);
+            panic!(
+                "{label}: agent reported is_error=true: {}",
+                result.result_text
+            );
         }
         Some(result) if !result.result_text.is_empty() => {
             eprintln!("extracted text length: {}", result.result_text.len());
