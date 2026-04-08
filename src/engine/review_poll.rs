@@ -612,7 +612,13 @@ pub(crate) async fn review_open_prs(
                                 )),
                             ),
                         ];
-                        if let Err(e) = store_set_result_by_id(&Some(Arc::clone(store)), task_info.store_id, &fields).await {
+                        if let Err(e) = store_set_result_by_id(
+                            &Some(Arc::clone(store)),
+                            task_info.store_id,
+                            &fields,
+                        )
+                        .await
+                        {
                             tracing::error!(task_id, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
                             continue;
                         }

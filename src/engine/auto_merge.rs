@@ -428,7 +428,9 @@ pub(crate) async fn auto_merge_pr(
                             MAX_CI_MERGE_FAILURES
                         )),
                     )];
-                    if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await {
+                    if let Err(e) =
+                        store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+                    {
                         tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
                         return Ok(());
                     }
@@ -483,7 +485,10 @@ pub(crate) async fn auto_merge_pr(
                                 MAX_CI_MERGE_FAILURES
                             )),
                         )];
-                        if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await {
+                        if let Err(e) =
+                            store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields)
+                                .await
+                        {
                             tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
                             return Ok(());
                         }
@@ -577,7 +582,9 @@ pub(crate) async fn auto_merge_pr(
                         MAX_MERGE_CONFLICT_RETRIES
                     )),
                 )];
-                if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await {
+                if let Err(e) =
+                    store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+                {
                     tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
                     return Ok(());
                 }
@@ -814,7 +821,9 @@ pub(crate) async fn auto_merge_pr(
                 format!("auto-merge rebase failed after merge conflict: {}", e)
             };
             let fields = [("block_reason", serde_json::json!(block_reason))];
-            if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await {
+            if let Err(e) =
+                store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+            {
                 tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
                 return Ok(());
             }
@@ -846,8 +855,12 @@ pub(crate) async fn auto_merge_pr(
         // Persist block_reason BEFORE transitioning to Blocked to avoid
         // a race where auto_unblock sees a blocked task without a reason
         // and immediately unblocks it.
-        let fields = [("block_reason", serde_json::json!(format!("auto-merge failed: {}", e)))];
-        if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await {
+        let fields = [(
+            "block_reason",
+            serde_json::json!(format!("auto-merge failed: {}", e)),
+        )];
+        if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+        {
             tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
             return Ok(());
         }
