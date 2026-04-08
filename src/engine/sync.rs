@@ -3249,7 +3249,40 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
         // Create a router and set deterministic available agents
-        let mut router = Router::new(RouterConfig::default());
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert(
+                "test-agent-3a".to_string(),
+                vec!["test-model-a".to_string()],
+            );
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert(
+                "test-agent-3b".to_string(),
+                vec!["test-model-b".to_string()],
+            );
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert(
+                "test-agent-3c".to_string(),
+                vec!["test-model-c".to_string()],
+            );
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert(
+                "test-agent-3d".to_string(),
+                vec!["test-model-d".to_string()],
+            );
+        let mut router = Router::new(config);
         router.available_agents = vec![
             "test-agent-3a".to_string(),
             "test-agent-3b".to_string(),
@@ -3286,7 +3319,24 @@ mod tests {
 
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
 
-        let mut router = Router::new(RouterConfig::default());
+        let mut config = RouterConfig::default();
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert(
+                "test-agent-2a".to_string(),
+                vec!["test-model-a".to_string()],
+            );
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert(
+                "test-agent-2b".to_string(),
+                vec!["test-model-b".to_string()],
+            );
+        let mut router = Router::new(config);
         router.available_agents = vec!["test-agent-2a".to_string(), "test-agent-2b".to_string()];
 
         // Place only two agents into cooldown — below the threshold of 3
