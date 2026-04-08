@@ -1080,13 +1080,26 @@ async fn apply_fixes(
                             )
                             .await;
                         // Set needs_review + reopen issue + sync labels
-                        reopen_and_set_needs_review(store, *store_id, &task, backend, gh, repo)
-                            .await;
-                        println!(
-                            "  fixed #{}: committed + pushed + created PR #{} + reopened + needs_review",
-                            f.task_id, pr_num
-                        );
-                        fixed += 1;
+                        match reopen_and_set_needs_review(
+                            store, *store_id, &task, backend, gh, repo,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                println!(
+                                    "  fixed #{}: committed + pushed + created PR #{} + reopened + needs_review",
+                                    f.task_id, pr_num
+                                );
+                                fixed += 1;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  fix failed for #{}: PR #{} created but status/reopen failed: {e}",
+                                    f.task_id, pr_num
+                                );
+                                skipped += 1;
+                            }
+                        }
                     }
                     Err(e) => {
                         // PR creation failed — it may be a transient server error. Re-check GitHub
@@ -1103,15 +1116,26 @@ async fn apply_fixes(
                                         &[("pr_number", serde_json::json!(pr_num as i64))],
                                     )
                                     .await;
-                                reopen_and_set_needs_review(
+                                match reopen_and_set_needs_review(
                                     store, *store_id, &task, backend, gh, repo,
                                 )
-                                .await;
-                                println!(
-                                    "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
-                                    f.task_id, pr_num
-                                );
-                                fixed += 1;
+                                .await
+                                {
+                                    Ok(()) => {
+                                        println!(
+                                            "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
+                                            f.task_id, pr_num
+                                        );
+                                        fixed += 1;
+                                    }
+                                    Err(e2) => {
+                                        eprintln!(
+                                            "  fix failed for #{}: PR #{} linked but status/reopen failed: {e2}",
+                                            f.task_id, pr_num
+                                        );
+                                        skipped += 1;
+                                    }
+                                }
                             }
                             Ok(None) => {
                                 eprintln!("  fix failed for #{}: PR creation failed and no PR found for branch", f.task_id);
@@ -1157,13 +1181,26 @@ async fn apply_fixes(
                                 &[("pr_number", serde_json::json!(pr_num as i64))],
                             )
                             .await;
-                        reopen_and_set_needs_review(store, *store_id, &task, backend, gh, repo)
-                            .await;
-                        println!(
-                            "  fixed #{}: pushed + created PR #{} + reopened + needs_review",
-                            f.task_id, pr_num
-                        );
-                        fixed += 1;
+                        match reopen_and_set_needs_review(
+                            store, *store_id, &task, backend, gh, repo,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                println!(
+                                    "  fixed #{}: pushed + created PR #{} + reopened + needs_review",
+                                    f.task_id, pr_num
+                                );
+                                fixed += 1;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  fix failed for #{}: PR #{} created but status/reopen failed: {e}",
+                                    f.task_id, pr_num
+                                );
+                                skipped += 1;
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!(
@@ -1178,15 +1215,26 @@ async fn apply_fixes(
                                         &[("pr_number", serde_json::json!(pr_num as i64))],
                                     )
                                     .await;
-                                reopen_and_set_needs_review(
+                                match reopen_and_set_needs_review(
                                     store, *store_id, &task, backend, gh, repo,
                                 )
-                                .await;
-                                println!(
-                                    "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
-                                    f.task_id, pr_num
-                                );
-                                fixed += 1;
+                                .await
+                                {
+                                    Ok(()) => {
+                                        println!(
+                                            "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
+                                            f.task_id, pr_num
+                                        );
+                                        fixed += 1;
+                                    }
+                                    Err(e2) => {
+                                        eprintln!(
+                                            "  fix failed for #{}: PR #{} linked but status/reopen failed: {e2}",
+                                            f.task_id, pr_num
+                                        );
+                                        skipped += 1;
+                                    }
+                                }
                             }
                             Ok(None) => {
                                 eprintln!("  fix failed for #{}: PR creation failed and no PR found for branch", f.task_id);
@@ -1220,13 +1268,26 @@ async fn apply_fixes(
                                 &[("pr_number", serde_json::json!(pr_num as i64))],
                             )
                             .await;
-                        reopen_and_set_needs_review(store, *store_id, &task, backend, gh, repo)
-                            .await;
-                        println!(
-                            "  fixed #{}: created PR #{} + reopened + needs_review",
-                            f.task_id, pr_num
-                        );
-                        fixed += 1;
+                        match reopen_and_set_needs_review(
+                            store, *store_id, &task, backend, gh, repo,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                println!(
+                                    "  fixed #{}: created PR #{} + reopened + needs_review",
+                                    f.task_id, pr_num
+                                );
+                                fixed += 1;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  fix failed for #{}: PR #{} created but status/reopen failed: {e}",
+                                    f.task_id, pr_num
+                                );
+                                skipped += 1;
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!(
@@ -1241,15 +1302,26 @@ async fn apply_fixes(
                                         &[("pr_number", serde_json::json!(pr_num as i64))],
                                     )
                                     .await;
-                                reopen_and_set_needs_review(
+                                match reopen_and_set_needs_review(
                                     store, *store_id, &task, backend, gh, repo,
                                 )
-                                .await;
-                                println!(
-                                    "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
-                                    f.task_id, pr_num
-                                );
-                                fixed += 1;
+                                .await
+                                {
+                                    Ok(()) => {
+                                        println!(
+                                            "  fixed #{}: PR was present on GitHub as #{} (linked) + reopened + needs_review",
+                                            f.task_id, pr_num
+                                        );
+                                        fixed += 1;
+                                    }
+                                    Err(e2) => {
+                                        eprintln!(
+                                            "  fix failed for #{}: PR #{} linked but status/reopen failed: {e2}",
+                                            f.task_id, pr_num
+                                        );
+                                        skipped += 1;
+                                    }
+                                }
                             }
                             Ok(None) => {
                                 eprintln!("  fix failed for #{}: PR creation failed and no PR found for branch", f.task_id);
@@ -1284,12 +1356,23 @@ async fn apply_fixes(
                         &[("pr_number", serde_json::json!(*pr_number as i64))],
                     )
                     .await;
-                reopen_and_set_needs_review(store, *store_id, &task, backend, gh, repo).await;
-                println!(
-                    "  fixed #{}: linked PR #{} + reopened + needs_review",
-                    f.task_id, pr_number
-                );
-                fixed += 1;
+                match reopen_and_set_needs_review(store, *store_id, &task, backend, gh, repo).await
+                {
+                    Ok(()) => {
+                        println!(
+                            "  fixed #{}: linked PR #{} + reopened + needs_review",
+                            f.task_id, pr_number
+                        );
+                        fixed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  fix failed for #{}: PR #{} linked but status/reopen failed: {e}",
+                            f.task_id, pr_number
+                        );
+                        skipped += 1;
+                    }
+                }
             }
             FixAction::LinkPr {
                 store_id,
@@ -1633,6 +1716,10 @@ async fn apply_fixes(
 }
 
 /// Helper: reopen issue, set status to needs_review, sync labels.
+///
+/// Returns an error if the SQLite status update or the GitHub issue reopen
+/// fails. Backend label sync failures are logged as warnings but do not cause
+/// the function to fail, since they are secondary/cosmetic.
 async fn reopen_and_set_needs_review(
     store: &Arc<TaskStore>,
     store_id: i64,
@@ -1640,20 +1727,37 @@ async fn reopen_and_set_needs_review(
     backend: &Arc<dyn ExternalBackend>,
     gh: &GhHttp,
     repo: &str,
-) {
-    // Update SQLite status
-    let _ = store.update_status(store_id, TaskStatus::NeedsReview).await;
+) -> anyhow::Result<()> {
+    // Update SQLite status — hard failure: without this the task remains in
+    // the wrong state and the next doctor run will attempt the same fix again.
+    store
+        .update_status(store_id, TaskStatus::NeedsReview)
+        .await
+        .context("failed to update task status to NeedsReview in database")?;
 
     // Reopen issue + sync labels for external tasks
     if let Some(ref ext_id) = task.external_id {
-        let _ = gh.reopen_issue(repo, ext_id).await;
-        let _ = backend
+        // Hard failure: if the issue stays closed the engine will never pick it up.
+        gh.reopen_issue(repo, ext_id)
+            .await
+            .with_context(|| format!("failed to reopen GitHub issue {ext_id}"))?;
+
+        // Soft failure: label sync is cosmetic; log a warning but don't block.
+        if let Err(e) = backend
             .update_status(
                 &ExternalId(ext_id.clone()),
                 crate::backends::Status::NeedsReview,
             )
-            .await;
+            .await
+        {
+            eprintln!(
+                "  warning: backend label sync failed for #{}: {e}",
+                task_label(task)
+            );
+        }
     }
+
+    Ok(())
 }
 
 /// Create a PR for a task using `gh` CLI (more reliable for auth than API).
