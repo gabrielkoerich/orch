@@ -936,10 +936,6 @@ pub(crate) async fn sync_tick(
         r.refresh_health(store).await;
     }
 
-    // Emit degraded-agents metric/log if needed (best-effort)
-    let r = router.read().await;
-    emit_degraded_agents_if_needed(&r, Some(store)).await;
-
     Ok(())
 }
 
@@ -1417,7 +1413,7 @@ struct DegradedAgentDetail {
 ///   names, cooled models, cooldown reasons) and a dedicated alert metric
 ///   `metrics:orch.agents_degraded.alert` is set to `"1"`. The alert is
 ///   cleared to `"0"` when the count drops below the threshold.
-async fn emit_degraded_agents_if_needed(
+pub(crate) async fn emit_degraded_agents_if_needed(
     router: &crate::engine::router::Router,
     store: Option<&Arc<TaskStore>>,
 ) {

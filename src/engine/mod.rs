@@ -1487,6 +1487,12 @@ pub async fn serve() -> anyhow::Result<()> {
                                 }
                             }).await;
                         }
+                        // Emit degraded-agents metric/log once per sync cycle (global state,
+                        // not per-project) to avoid N identical WARNs with N configured projects.
+                        if let Some(first_engine) = project_engines.first() {
+                            let r = router.read().await;
+                            sync::emit_degraded_agents_if_needed(&r, Some(&first_engine.store)).await;
+                        }
                         last_sync = std::time::Instant::now();
                     }
                 }
