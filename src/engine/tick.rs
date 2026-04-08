@@ -551,7 +551,9 @@ pub(crate) async fn tick_recover_stuck_tasks(
         // Remove stale agent/model labels so the LLM router re-routes properly
         for label in &task.labels {
             if label.starts_with("agent:") || label.starts_with("model:") {
-                backend.remove_label(&task.id, label).await.ok();
+                if let Err(e) = backend.remove_label(&task.id, label).await {
+                    tracing::warn!(task_id = task.id.0, label, error = %e, "failed to remove stale routing label during stuck-task recovery");
+                }
             }
         }
         if let Ok(Some(store_id)) = store.resolve_task_id(repo, &task.id.0).await {
@@ -957,7 +959,9 @@ pub(crate) async fn tick_route_tasks(
                             || label.starts_with("complexity:")
                             || label.starts_with("model:")
                         {
-                            backend.remove_label(&task.id, label).await.ok();
+                            if let Err(e) = backend.remove_label(&task.id, label).await {
+                                tracing::warn!(task_id = task.id.0, label, error = %e, "failed to remove stale routing label during re-route");
+                            }
                         }
                     }
 
