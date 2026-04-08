@@ -363,13 +363,11 @@ fn extract_bullet_sections(text: &str) -> (Vec<String>, Vec<String>) {
         }
         let lower = trimmed.to_lowercase();
 
-        // Detect section headings (lines ending with ':' or '#' prefixed).
-        let is_heading = trimmed.ends_with(':')
-            || trimmed.starts_with('#')
-            || (trimmed.len() < 60
-                && !trimmed.starts_with('-')
-                && !trimmed.starts_with('*')
-                && !trimmed.starts_with(|c: char| c.is_ascii_digit()));
+        // Detect section headings: only lines with explicit heading markers.
+        // Require trailing ':' or '#'-prefix to avoid misclassifying continuation
+        // lines (e.g. explanatory text after a bullet) as headings, which would
+        // incorrectly reset `in_remaining_section`.
+        let is_heading = trimmed.ends_with(':') || trimmed.starts_with('#');
 
         if is_heading {
             in_remaining_section = remaining_headers.iter().any(|h| lower.contains(h));
