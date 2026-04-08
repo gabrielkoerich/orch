@@ -2,7 +2,7 @@
 //!
 //! Calls REAL agents with a review prompt, captures stdout/stderr,
 //! and verifies the output can be parsed using the SAME code path as review.rs:
-//!   1. `get_runner(agent).extract_text(stdout)` — per-agent envelope extraction
+//!   1. `agents::find_agent_result(agent, stdout)` — per-agent envelope extraction
 //!   2. `parse_review_response(&text)` / `infer_review_response(&text)` — JSON/plain-text review parse
 //!
 //! `#[ignore]`d — needs API keys and installed CLIs. Run locally:
@@ -10,7 +10,7 @@
 //! cargo test --test integration_review -- --ignored --nocapture
 //! ```
 
-use orch::engine::runner::agents::get_runner;
+use orch::engine::runner::agents::find_agent_result;
 use orch::engine::runner::response::{infer_review_response, parse_review_response};
 use std::process::Command;
 
@@ -22,7 +22,7 @@ fn is_available(binary: &str) -> bool {
 }
 
 /// Run the full review parsing flow on agent output.
-/// Uses the same code path as review.rs: extract_text → parse_review_from_output.
+/// Uses the same code path as review.rs: find_agent_result → parse_review_from_output.
 fn verify_review_output(
     agent_binary: &str,
     label: &str,
@@ -60,18 +60,22 @@ fn verify_review_output(
     );
 
     // Step 2: per-agent envelope extraction — same as review.rs stage 1
-    let runner = get_runner(agent_binary);
-    let text = match runner.extract_text(stdout) {
-        Ok(t) if !t.is_empty() => {
-            eprintln!("extracted text length: {}", t.len());
-            eprintln!("extracted first 300 chars:\n{}", &t[..t.len().min(300)]);
-            t
+    let text = match find_agent_result(agent_binary, stdout) {
+        Some(result) if result.is_error => {
+            panic!("{label}: agent reported is_error=true: {}", result.result_text);
         }
-        Ok(_) => {
-            eprintln!("extract_text returned empty, falling back to raw stdout");
+        Some(result) if !result.result_text.is_empty() => {
+            eprintln!("extracted text length: {}", result.result_text.len());
+            eprintln!(
+                "extracted first 300 chars:\n{}",
+                &result.result_text[..result.result_text.len().min(300)]
+            );
+            result.result_text
+        }
+        _ => {
+            eprintln!("find_agent_result returned None/empty, falling back to raw stdout");
             stdout.to_string()
         }
-        Err(e) => panic!("{label}: extract_text returned terminal error: {e}"),
     };
 
     assert!(
