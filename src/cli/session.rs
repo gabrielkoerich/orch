@@ -186,7 +186,7 @@ async fn parse_task_id(task_id: &str, store: &Arc<TaskStore>) -> anyhow::Result<
     if task_id.starts_with("internal:") {
         let id_part = task_id
             .strip_prefix("internal:")
-            .unwrap()
+            .unwrap_or(task_id)
             .parse::<i64>()
             .context("invalid internal task ID")?;
         let repo = store

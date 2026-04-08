@@ -88,7 +88,7 @@ pub fn expand_alias(s: &str) -> anyhow::Result<String> {
             if param.contains(':') {
                 let (h, m) = param
                     .split_once(':')
-                    .expect("contains(':') guarantees split");
+                    .context("invalid time format in @daily alias")?;
                 let hour: u8 = h
                     .parse()
                     .with_context(|| format!("invalid hour in @daily alias: '{h}'"))?;
@@ -148,7 +148,7 @@ pub fn expand_alias(s: &str) -> anyhow::Result<String> {
             if param.contains('-') {
                 let (m, d) = param
                     .split_once('-')
-                    .expect("contains('-') guarantees split");
+                    .context("invalid date format in @yearly alias")?;
                 let month: u8 = m
                     .parse()
                     .with_context(|| format!("invalid month in @yearly alias: '{m}'"))?;
