@@ -1786,6 +1786,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configured_agents_parses_yaml_block_array() {
+        // config::get returns serde_yml::to_string for arrays, which is YAML block format
+        let yaml_str = "- claude\n- codex\n- opencode\n- olm\n";
+        let parsed: Vec<String> = serde_yml::from_str(yaml_str).unwrap();
+        assert_eq!(parsed, vec!["claude", "codex", "opencode", "olm"]);
+    }
+
+    #[test]
+    fn configured_agents_parses_json_inline_array() {
+        let json_str = r#"["claude","codex","olm"]"#;
+        let parsed: Vec<String> = serde_json::from_str(json_str).unwrap();
+        assert_eq!(parsed, vec!["claude", "codex", "olm"]);
+    }
+
+    #[test]
+    fn configured_agents_fallback_returns_default_agents() {
+        // When no config is present, configured_agents() returns DEFAULT_AGENTS
+        let defaults = configured_agents();
+        assert!(defaults.contains(&"claude".to_string()));
+        assert!(defaults.contains(&"codex".to_string()));
+        assert!(defaults.contains(&"opencode".to_string()));
+    }
+
     /// Integration test that requires a fully working tmux environment with
     /// reliable capture-pane timing. Runs locally but not in CI (GitHub Actions
     /// has tmux installed but capture-pane timing is unreliable).
