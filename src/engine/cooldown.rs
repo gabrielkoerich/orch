@@ -440,11 +440,21 @@ pub async fn record_silence_detection(agent_name: &str, model: &str) -> Option<S
     let window_start = now - SILENCE_COUNT_WINDOW_SECS;
 
     let mut timestamps = match store.kv_get(&key).await {
-        Ok(Some(raw)) => serde_json::from_str::<Vec<i64>>(&raw).unwrap_or_default(),
+        Ok(Some(raw)) => match serde_json::from_str::<Vec<i64>>(&raw) {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::warn!(
+                    kv_key = %key,
+                    err = %e,
+                    "failed to parse silence timestamps from KV — resetting window"
+                );
+                Vec::new()
+            }
+        },
         Ok(None) => Vec::new(),
         Err(err) => {
             tracing::warn!(
-                kv_key = key,
+                kv_key = %key,
                 err = %err,
                 "failed to load silence count from KV"
             );
