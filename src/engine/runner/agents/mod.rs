@@ -276,6 +276,136 @@ pub fn error_class_name(err: &AgentError) -> &'static str {
     }
 }
 
+/// Extract file paths from free-form text.
+///
+/// Matches common source file patterns like `src/foo/bar.rs`, `tests/x.py`,
+/// `path/to/file.ts`, etc. Deduplicates and returns them sorted.
+fn extract_file_paths(text: &str) -> Vec<String> {
+    // Match path-like tokens: optional leading slash or no slash, at least one
+    // directory segment or a plain filename, with a recognised extension.
+    let extensions = [
+        "rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh",
+        "md", "toml", "yaml", "yml", "json", "sql", "html", "css", "swift", "kt",
+    ];
+    let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for token in text.split_whitespace() {
+        // Strip surrounding punctuation (backticks, quotes, parens, commas).
+        // We intentionally do NOT strip '.' here because it is part of file extensions.
+        let token = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | ',' | ':' | ';'
+            )
+        });
+        // Strip a lone trailing dot that ends a sentence (e.g. "src/foo.rs.").
+        // Only strip if the result still has a recognised extension — this avoids
+        // accidentally stripping the final dot of "src/foo.rs" when there is none.
+        let token = if token.ends_with('.') {
+            let without = &token[..token.len() - 1];
+            let still_has_ext = extensions
+                .iter()
+                .any(|ext| without.ends_with(&format!(".{ext}")));
+            if still_has_ext {
+                without
+            } else {
+                token
+            }
+        } else {
+            token
+        };
+        // Must contain at least one slash (directory separator) or look like a
+        // root-relative path, and end with a known extension.
+        let has_ext = extensions
+            .iter()
+            .any(|ext| token.ends_with(&format!(".{ext}")));
+        if !has_ext {
+            continue;
+        }
+        // Accept tokens with at least one path separator, or starting with a
+        // known top-level directory name common in Rust/JS/Python projects.
+        let path_like = token.contains('/')
+            || token.starts_with("src")
+            || token.starts_with("tests")
+            || token.starts_with("lib")
+            || token.starts_with("bin")
+            || token.starts_with("prompts")
+            || token.starts_with("migrations");
+        if path_like && token.len() >= 4 && !token.contains("://") {
+            found.insert(token.to_string());
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Split free-form text into accomplished and remaining bullet lists.
+///
+/// Lines under "remaining", "todo", "next steps", "still needed" headings are
+/// classified as `remaining`; all other bullet lines go into `accomplished`.
+fn extract_bullet_sections(text: &str) -> (Vec<String>, Vec<String>) {
+    let remaining_headers = [
+        "remaining",
+        "todo",
+        "to do",
+        "next steps",
+        "still needed",
+        "left to do",
+        "not done",
+        "outstanding",
+    ];
+
+    let mut accomplished: Vec<String> = vec![];
+    let mut remaining: Vec<String> = vec![];
+    let mut in_remaining_section = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+
+        // Detect section headings (lines ending with ':' or '#' prefixed).
+        let is_heading = trimmed.ends_with(':')
+            || trimmed.starts_with('#')
+            || (trimmed.len() < 60
+                && !trimmed.starts_with('-')
+                && !trimmed.starts_with('*')
+                && !trimmed.starts_with(|c: char| c.is_ascii_digit()));
+
+        if is_heading {
+            in_remaining_section = remaining_headers.iter().any(|h| lower.contains(h));
+            continue;
+        }
+
+        // Bullet lines: -, *, or numbered (1., 2.)
+        let is_bullet = trimmed.starts_with('-')
+            || trimmed.starts_with('*')
+            || trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) && trimmed.contains('.');
+
+        if !is_bullet {
+            continue;
+        }
+
+        // Strip leading bullet character(s).
+        let content = trimmed
+            .trim_start_matches(|c: char| c == '-' || c == '*' || c.is_ascii_digit() || c == '.')
+            .trim()
+            .to_string();
+
+        if content.is_empty() {
+            continue;
+        }
+
+        if in_remaining_section {
+            remaining.push(content);
+        } else {
+            accomplished.push(content);
+        }
+    }
+
+    (accomplished, remaining)
+}
+
 /// Build a synthetic agent response from plain text when structured parsing fails.
 ///
 /// Returns `None` for empty/whitespace-only text so callers can preserve the
@@ -355,6 +485,10 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
         "comment posted",
         "changes committed",
         "commit created",
+        "fixed.",
+        "has been fixed",
+        "the fix has been applied",
+        "the fix has already been applied",
         // Agent completion phrases (regression: #1362/#1363)
         "the fix is complete",
         "fix is working",
@@ -445,12 +579,16 @@ pub fn synthesize_response_from_text(text: &str) -> Option<AgentResponse> {
     let error =
         (status == "needs_review").then(|| "agent returned plain text instead of JSON".to_string());
 
+    // Extract structured fields from free-form text.
+    let files = extract_file_paths(trimmed);
+    let (accomplished, remaining) = extract_bullet_sections(trimmed);
+
     Some(AgentResponse {
         status: status.to_string(),
         summary,
-        accomplished: vec![],
-        remaining: vec![],
-        files: vec![],
+        accomplished,
+        remaining,
+        files,
         error,
         input_tokens: None,
         output_tokens: None,
@@ -2271,6 +2409,88 @@ mod tests {
         assert!(
             cmd.contains("--permission-mode bypassPermissions"),
             "should be autonomous (bypassPermissions)"
+        );
+    }
+
+    // --- synthesize_response_from_text structured extraction ---
+
+    #[test]
+    fn synthesize_extracts_file_paths() {
+        let text = "Fixed the issue by modifying src/engine/runner/agents/mod.rs and tests/integration.rs.";
+        let resp = synthesize_response_from_text(text).unwrap();
+        assert!(
+            resp.files
+                .contains(&"src/engine/runner/agents/mod.rs".to_string()),
+            "expected src/engine/runner/agents/mod.rs in files, got: {:?}",
+            resp.files
+        );
+        assert!(
+            resp.files.contains(&"tests/integration.rs".to_string()),
+            "expected tests/integration.rs in files, got: {:?}",
+            resp.files
+        );
+    }
+
+    #[test]
+    fn synthesize_extracts_accomplished_bullets() {
+        let text = "All tests pass.\n- Added logging to src/foo.rs\n- Updated migration file";
+        let resp = synthesize_response_from_text(text).unwrap();
+        assert_eq!(resp.status, "done");
+        assert!(
+            resp.accomplished
+                .iter()
+                .any(|a| a.contains("Added logging")),
+            "expected accomplished bullet, got: {:?}",
+            resp.accomplished
+        );
+        assert!(
+            resp.accomplished
+                .iter()
+                .any(|a| a.contains("Updated migration")),
+            "expected accomplished bullet, got: {:?}",
+            resp.accomplished
+        );
+    }
+
+    #[test]
+    fn synthesize_extracts_remaining_section() {
+        let text = "Completed the main fix.\n- Patched src/lib.rs\n\nRemaining:\n- Write unit tests\n- Update docs";
+        let resp = synthesize_response_from_text(text).unwrap();
+        assert!(
+            resp.remaining
+                .iter()
+                .any(|r| r.contains("Write unit tests")),
+            "expected remaining item, got: {:?}",
+            resp.remaining
+        );
+        assert!(
+            resp.remaining.iter().any(|r| r.contains("Update docs")),
+            "expected remaining item, got: {:?}",
+            resp.remaining
+        );
+        assert!(
+            resp.accomplished.iter().any(|a| a.contains("Patched")),
+            "expected accomplished item, got: {:?}",
+            resp.accomplished
+        );
+    }
+
+    #[test]
+    fn synthesize_fixed_phrase_is_done() {
+        let text = "Fixed. The bug no longer reproduces.";
+        let resp = synthesize_response_from_text(text).unwrap();
+        assert_eq!(resp.status, "done", "expected done for 'Fixed.' text");
+    }
+
+    #[test]
+    fn synthesize_no_false_positive_file_paths() {
+        // URLs and version strings should not appear in files list
+        let text = "See https://example.com/foo.rs for details. Version 1.2.3 is fine.";
+        let resp = synthesize_response_from_text(text).unwrap();
+        assert!(
+            resp.files.is_empty(),
+            "expected no file paths extracted from URL text, got: {:?}",
+            resp.files
         );
     }
 }
