@@ -162,7 +162,7 @@ fn read_file_to_string(path: &Path) -> anyhow::Result<String> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             Ok(tokio::task::block_in_place(|| {
-                handle.block_on(tokio::fs::read_to_string(path))
+                std::fs::read_to_string(path)
             })?)
         }
         _ => Ok(std::fs::read_to_string(path)?),

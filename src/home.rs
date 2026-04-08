@@ -13,7 +13,7 @@ const HOME_DIR: &str = ".orch";
 fn ensure_dir(path: &Path) -> anyhow::Result<()> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| handle.block_on(tokio::fs::create_dir_all(path)))?;
+            tokio::task::block_in_place(|| std::fs::create_dir_all(path))?;
         }
         _ => std::fs::create_dir_all(path)?,
     }
