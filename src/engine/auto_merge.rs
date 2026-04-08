@@ -114,10 +114,10 @@ pub(crate) fn dedup_reviews<'a>(reviews: &'a [GitHubReview]) -> HashMap<String, 
         if review.state != "APPROVED" && review.state != "CHANGES_REQUESTED" {
             continue;
         }
-        let dominated = by_reviewer
+        let is_newer_or_first = by_reviewer
             .get(&review.user.login)
             .is_none_or(|prev| review.submitted_at > prev.submitted_at);
-        if dominated {
+        if is_newer_or_first {
             by_reviewer.insert(review.user.login.clone(), review);
         }
     }
