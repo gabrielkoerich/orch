@@ -806,9 +806,10 @@ pub(crate) mod patterns {
             "econnrefused",
             "network unreachable",
         ];
-        if patterns.iter().any(|p| lower.contains(p)) {
+        let match_pos = patterns.iter().filter_map(|p| lower.find(p)).min();
+        if let Some(pos) = match_pos {
             return Some(AgentError::NetworkError {
-                message: safe_tail(text, 300).to_string(),
+                message: extract_context_around(text, pos, 300),
             });
         }
         None
@@ -1249,6 +1250,28 @@ mod tests {
         assert!(patterns::detect_network_error("ECONNREFUSED").is_some());
         assert!(patterns::detect_network_error("network unreachable").is_some());
         assert!(patterns::detect_network_error("all systems operational").is_none());
+    }
+
+    #[test]
+    fn network_error_message_contains_match_not_tail() {
+        // Simulate real agent output: error appears early, unrelated stats JSON at the end.
+        let prefix = "connection refused connecting to api.anthropic.com:443 ";
+        let suffix = "x".repeat(2000)
+            + r#"":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0}"#;
+        let text = format!("{prefix}{suffix}");
+
+        let err = patterns::detect_network_error(&text).expect("should detect network error");
+        let AgentError::NetworkError { message } = err else {
+            panic!("expected NetworkError, got {err:?}");
+        };
+        assert!(
+            message.to_lowercase().contains("connection refused"),
+            "stored message should contain the matched pattern, got: {message}"
+        );
+        assert!(
+            !message.contains("web_fetch_requests"),
+            "stored message must not be the unrelated stats tail, got: {message}"
+        );
     }
 
     #[test]
