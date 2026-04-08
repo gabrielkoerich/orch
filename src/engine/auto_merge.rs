@@ -15,9 +15,7 @@ use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::github::types::GitHubReview;
 use crate::store::TaskStore;
-use crate::store::{
-    opt_store_get_task, store_increment, store_reset_failure_counters, store_set, store_set_result,
-};
+use crate::store::{opt_store_get_task, store_increment, store_reset_failure_counters, store_set};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
@@ -428,15 +426,13 @@ pub(crate) async fn auto_merge_pr(
                             MAX_CI_MERGE_FAILURES
                         )),
                     )];
-                    if let Err(e) =
-                        store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+                    if let Err(e) = task_manager
+                        .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+                        .await
                     {
-                        tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+                        tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
                         return Ok(());
                     }
-                    task_manager
-                        .update_task_status(&task.id, Status::Blocked)
-                        .await?;
                 } else {
                     tracing::warn!(
                         task_id = task.id.0,
@@ -485,16 +481,13 @@ pub(crate) async fn auto_merge_pr(
                                 MAX_CI_MERGE_FAILURES
                             )),
                         )];
-                        if let Err(e) =
-                            store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields)
-                                .await
+                        if let Err(e) = task_manager
+                            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+                            .await
                         {
-                            tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+                            tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
                             return Ok(());
                         }
-                        task_manager
-                            .update_task_status(&task.id, Status::Blocked)
-                            .await?;
                     } else {
                         tracing::warn!(
                             task_id = task.id.0,
@@ -582,15 +575,13 @@ pub(crate) async fn auto_merge_pr(
                         MAX_MERGE_CONFLICT_RETRIES
                     )),
                 )];
-                if let Err(e) =
-                    store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+                if let Err(e) = task_manager
+                    .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+                    .await
                 {
-                    tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+                    tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
                     return Ok(());
                 }
-                task_manager
-                    .update_task_status(&task.id, Status::Blocked)
-                    .await?;
                 let comment = format!("Auto-merge failed after {} rebase attempts: {}", retries, e);
                 let footer = crate::engine::attribution_footer(
                     "Commented",
@@ -821,15 +812,13 @@ pub(crate) async fn auto_merge_pr(
                 format!("auto-merge rebase failed after merge conflict: {}", e)
             };
             let fields = [("block_reason", serde_json::json!(block_reason))];
-            if let Err(e) =
-                store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+            if let Err(e) = task_manager
+                .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+                .await
             {
-                tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+                tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
                 return Ok(());
             }
-            task_manager
-                .update_task_status(&task.id, Status::Blocked)
-                .await?;
             let footer =
                 crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
             if let Err(e) = gh
@@ -859,14 +848,13 @@ pub(crate) async fn auto_merge_pr(
             "block_reason",
             serde_json::json!(format!("auto-merge failed: {}", e)),
         )];
-        if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+        if let Err(e) = task_manager
+            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
+            .await
         {
-            tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+            tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason and set Blocked");
             return Ok(());
         }
-        task_manager
-            .update_task_status(&task.id, Status::Blocked)
-            .await?;
         let comment = format!("Auto-merge failed: {}", e);
         let footer =
             crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
@@ -1240,16 +1228,11 @@ pub(crate) async fn handle_review_changes(
             "block_reason",
             serde_json::json!(format!("max review cycles ({}) reached", max_cycles)),
         )];
-        if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
-        {
-            tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
-            return Ok(());
-        }
         // A transient store failure here must not be counted as a review-agent
-        // crash.  Log and return Ok — the next tick will re-check the task and
+        // crash. Log and return Ok — the next tick will re-check the task and
         // can retry the status transition.
         if let Err(e) = task_manager
-            .update_task_status(&task.id, Status::Blocked)
+            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
             .await
         {
             tracing::warn!(
@@ -1372,8 +1355,18 @@ pub(crate) async fn handle_review_changes(
             )
             .await;
 
+            let fields = [
+                (
+                    "review_cycles",
+                    serde_json::json!((review_cycles + 1) as i64),
+                ),
+                (
+                    "review_agent_failures",
+                    serde_json::json!(0), // reset failures for the new review round
+                ),
+            ];
             if let Err(e) = task_manager
-                .update_task_status(&task.id, Status::Routed)
+                .update_task_status_and_result(&task.id, Status::Routed, &fields)
                 .await
             {
                 tracing::warn!(
@@ -1383,28 +1376,6 @@ pub(crate) async fn handle_review_changes(
                 );
                 return Ok(());
             }
-
-            // Increment review_cycles only AFTER successful status transition.
-            // This prevents premature escalation if the transition fails.
-            // Use the "_result" variant so failures are propagated to the caller
-            // and the outer caller (review_poll) can retry instead of silently
-            // allowing the task to bypass the max-review guard.
-            store_set_result(
-                &Some(Arc::clone(store)),
-                repo,
-                &task.id.0,
-                &[
-                    (
-                        "review_cycles",
-                        serde_json::json!((review_cycles + 1) as i64),
-                    ),
-                    (
-                        "review_agent_failures",
-                        serde_json::json!(0), // reset failures for the new review round
-                    ),
-                ],
-            )
-            .await?;
 
             tracing::info!(
                 task_id = task.id.0,
@@ -1431,7 +1402,20 @@ pub(crate) async fn handle_review_changes(
             )
             .await;
 
-            if let Err(e) = task_manager.update_task_status(&task.id, Status::New).await {
+            let fields = [
+                (
+                    "review_cycles",
+                    serde_json::json!((review_cycles + 1) as i64),
+                ),
+                (
+                    "review_agent_failures",
+                    serde_json::json!(0), // reset failures for the new review round
+                ),
+            ];
+            if let Err(e) = task_manager
+                .update_task_status_and_result(&task.id, Status::New, &fields)
+                .await
+            {
                 tracing::warn!(
                     task_id = task.id.0,
                     err = %e,
@@ -1439,28 +1423,6 @@ pub(crate) async fn handle_review_changes(
                 );
                 return Ok(());
             }
-
-            // Increment review_cycles only AFTER successful status transition.
-            // This prevents premature escalation if the transition fails.
-            // Use the "_result" variant so failures are propagated to the caller
-            // and the outer caller (review_poll) can retry instead of silently
-            // allowing the task to bypass the max-review guard.
-            store_set_result(
-                &Some(Arc::clone(store)),
-                repo,
-                &task.id.0,
-                &[
-                    (
-                        "review_cycles",
-                        serde_json::json!((review_cycles + 1) as i64),
-                    ),
-                    (
-                        "review_agent_failures",
-                        serde_json::json!(0), // reset failures for the new review round
-                    ),
-                ],
-            )
-            .await?;
 
             tracing::info!(
                 task_id = task.id.0,

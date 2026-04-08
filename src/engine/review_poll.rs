@@ -457,21 +457,11 @@ pub(crate) async fn review_open_prs(
                                 )),
                             ),
                         ];
-                        if let Err(e) = store_set_result_by_id(
-                            &Some(Arc::clone(store)),
-                            task_info.store_id,
-                            &fields,
-                        )
-                        .await
-                        {
-                            tracing::error!(task_id, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
-                            continue;
-                        }
                         if let Err(e) = task_manager
-                            .update_task_status(&task.id, Status::Blocked)
+                            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
                             .await
                         {
-                            tracing::warn!(task_id, err = %e, "failed to set Blocked");
+                            tracing::error!(task_id, err = %e, "failed to write block_reason and set Blocked");
                         }
                         continue;
                     }
@@ -612,21 +602,11 @@ pub(crate) async fn review_open_prs(
                                 )),
                             ),
                         ];
-                        if let Err(e) = store_set_result_by_id(
-                            &Some(Arc::clone(store)),
-                            task_info.store_id,
-                            &fields,
-                        )
-                        .await
-                        {
-                            tracing::error!(task_id, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
-                            continue;
-                        }
                         if let Err(e) = task_manager
-                            .update_task_status(&task.id, Status::Blocked)
+                            .update_task_status_and_result(&task.id, Status::Blocked, &fields)
                             .await
                         {
-                            tracing::warn!(task_id, err = %e, "failed to set Blocked");
+                            tracing::error!(task_id, err = %e, "failed to write block_reason and set Blocked");
                         }
                         continue;
                     }

@@ -416,6 +416,59 @@ impl TaskManager {
         Ok(())
     }
 
+    pub async fn update_task_status_and_result(
+        &self,
+        id: &ExternalId,
+        status: Status,
+        updates: &[(&str, serde_json::Value)],
+    ) -> anyhow::Result<()> {
+        let task_status = status_to_task_status(status);
+
+        // Read pre-update snapshot from the store (old_status + context fields).
+        let (pre_snapshot, snapshot_store_id) = self.read_task_snapshot(&id.0).await;
+
+        if is_internal_id(&id.0) {
+            // Internal tasks: store is the single source of truth
+            let store = self
+                .store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("store required for internal task status update"))?;
+            let store_id = snapshot_store_id
+                .ok_or_else(|| anyhow::anyhow!("internal task {} not found in store", id.0))?;
+
+            store
+                .update_status_and_fields(store_id, task_status, updates)
+                .await?;
+            // Publish event to bus only after confirmed update
+            self.publish_event(id, status, &pre_snapshot, None);
+            return Ok(());
+        }
+
+        // External tasks: store-first, then mirror to backend.
+        if let Some(ref store) = self.store {
+            if let Some(store_id) = snapshot_store_id {
+                store
+                    .update_status_and_fields(store_id, task_status, updates)
+                    .await?;
+            }
+        }
+
+        // Mirror to backend (GitHub labels).
+        if let Err(e) = self.backend.update_status(id, status).await {
+            tracing::warn!(
+                task_id = id.0,
+                ?status,
+                err = %e,
+                "failed to mirror status to backend — store is authoritative"
+            );
+        }
+
+        // Publish event to bus
+        self.publish_event(id, status, &pre_snapshot, None);
+
+        Ok(())
+    }
+
     /// Update the status of a task only if it is currently in `expected_status`.
     ///
     /// Returns `Ok(true)` if the update was applied, `Ok(false)` if the task had

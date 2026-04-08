@@ -9,7 +9,7 @@ use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::repo_context::REPO_CONTEXT;
-use crate::store::{opt_store_get_task, store_set_result, TaskStore};
+use crate::store::{opt_store_get_task, TaskStore};
 use crate::tmux::TmuxManager;
 use dashmap::DashSet;
 use std::sync::Arc;
@@ -465,25 +465,15 @@ pub fn spawn(
                                      ),
                                      ("last_error", serde_json::json!(reason)),
                                  ];
-                                 if let Err(e) = store_set_result(
-                                     &Some(store_c.clone()),
-                                     &repo_s,
-                                     &tid,
-                                     &fields,
-                                 )
-                                 .await
+                                 if let Err(e) = task_manager_c
+                                     .update_task_status_and_result(
+                                         &ExternalId(tid.clone()),
+                                         Status::Blocked,
+                                         &fields,
+                                     )
+                                     .await
                                  {
-                                     tracing::error!(task_id = %tid, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
-                                 } else {
-                                     if let Err(e) = task_manager_c
-                                         .update_task_status(
-                                             &ExternalId(tid.clone()),
-                                             Status::Blocked,
-                                         )
-                                         .await
-                                     {
-                                         tracing::error!(task_id = %tid, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
-                                     }
+                                     tracing::error!(task_id = %tid, err = %e, "update_task_status_and_result(Blocked) failed — task may be stuck in InReview");
                                  }
                              }
                             ReviewOutcome::Ok => {}

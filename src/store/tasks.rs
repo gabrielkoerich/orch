@@ -566,6 +566,77 @@ impl TaskStore {
     // Status
     // ---------------------------------------------------------------
 
+    pub async fn update_status_and_fields(
+        &self,
+        id: i64,
+        status: TaskStatus,
+        updates: &[(&str, serde_json::Value)],
+    ) -> anyhow::Result<()> {
+        for (col, _) in updates {
+            anyhow::ensure!(
+                ALLOWED_FIELDS.contains(col),
+                "column {col} is not in the update allowlist"
+            );
+        }
+
+        let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        let from_status: String = previous.try_get("status").unwrap_or_default();
+        let agent: Option<String> = previous.try_get("agent").unwrap_or(None);
+        let model: Option<String> = previous.try_get("model").unwrap_or(None);
+
+        let mut set_parts = Vec::new();
+        let mut values: Vec<Option<String>> = Vec::new();
+
+        set_parts.push("status = ?".to_string());
+        values.push(Some(status.as_str().to_string()));
+
+        let mut block_reason_in_updates = false;
+        for (col, val) in updates {
+            if *col == "block_reason" {
+                block_reason_in_updates = true;
+            }
+            set_parts.push(format!("{col} = ?"));
+            match val {
+                serde_json::Value::String(s) => values.push(Some(s.clone())),
+                serde_json::Value::Number(n) => values.push(Some(n.to_string())),
+                serde_json::Value::Bool(b) => {
+                    values.push(Some(if *b { "1" } else { "0" }.to_string()));
+                }
+                serde_json::Value::Null => values.push(None),
+                other => values.push(Some(serde_json::to_string(other)?)),
+            }
+        }
+
+        if !block_reason_in_updates && status != TaskStatus::Blocked {
+            set_parts.push("block_reason = NULL".to_string());
+        }
+
+        set_parts.push("updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_string());
+        let sql = format!("UPDATE tasks SET {} WHERE id = ?", set_parts.join(", "));
+
+        let mut query = sqlx::query(&sql);
+        for v in &values {
+            query = query.bind(v.as_deref());
+        }
+        query = query.bind(id);
+        query.execute(&self.pool).await?;
+
+        self.append_activity(
+            id,
+            "status_change",
+            Some(from_status.as_str()),
+            Some(status.as_str()),
+            agent.as_deref(),
+            model.as_deref(),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Update the status of a task.
     pub async fn update_status(&self, id: i64, status: TaskStatus) -> anyhow::Result<()> {
         let previous = sqlx::query("SELECT status, agent, model FROM tasks WHERE id = ?")
