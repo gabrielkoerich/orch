@@ -13,8 +13,8 @@ use crate::backends::{ExternalBackend, ExternalId, ExternalTask, Status};
 use crate::channels::capture::CaptureService;
 use crate::config;
 use crate::engine::cooldown::{
-    github_circuit_remaining_secs, is_github_circuit_open, record_silence_detection,
-    set_agent_cooldown, set_model_cooldown, SILENCE_AGENT_COOLDOWN_SECS,
+    github_circuit_remaining_secs, is_github_circuit_open, record_agent_failure_with_message,
+    record_silence_detection, set_agent_cooldown, set_model_cooldown, SILENCE_AGENT_COOLDOWN_SECS,
     SILENCE_EXTENDED_COOLDOWN_SECS,
 };
 use crate::engine::dispatch_guard::DispatchGuard;
@@ -494,6 +494,57 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 "recovering stuck task: no session found — reclaiming early → new"
             );
         }
+        // For stuck tasks with an active session, record agent/model failure + cooldown so the
+        // router picks a different agent/model on the next attempt. Without this, the router
+        // sees the agent as healthy and selects it again, causing the hang to repeat.
+        // (Mirrors the pattern in tick_detect_silent_agents lines 219–284.)
+        if timing.has_session {
+            let store_task = match store.resolve_task_id(repo, &task.id.0).await {
+                Ok(Some(store_id)) => match store.get(store_id).await {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!(task_id = task.id.0, error = %e, "failed to fetch task from store for stuck-task cooldown");
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(task_id = task.id.0, error = %e, "failed to resolve task id for stuck-task cooldown");
+                    None
+                }
+            };
+            let agent_name = store_task
+                .as_ref()
+                .and_then(|t| t.agent.clone())
+                .unwrap_or_default();
+            let model_name = store_task
+                .as_ref()
+                .and_then(|t| t.model.clone())
+                .unwrap_or_default();
+
+            if !agent_name.is_empty() && !model_name.is_empty() {
+                set_model_cooldown(&agent_name, &model_name, config.silence_cooldown);
+                record_agent_failure_with_message(
+                    &agent_name,
+                    &format!(
+                        "stuck with active session after {}m",
+                        timing.age.num_minutes()
+                    ),
+                )
+                .await;
+            }
+            if !agent_name.is_empty() {
+                set_agent_cooldown(&agent_name, SILENCE_AGENT_COOLDOWN_SECS);
+            }
+            tracing::warn!(
+                task_id = task.id.0,
+                agent = %agent_name,
+                model = %model_name,
+                cooldown_secs = config.silence_cooldown,
+                "stuck-task cooldown applied — router will avoid this agent/model on next attempt"
+            );
+        }
+
         // Remove stale agent/model labels so the LLM router re-routes properly
         for label in &task.labels {
             if label.starts_with("agent:") || label.starts_with("model:") {
