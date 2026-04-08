@@ -97,6 +97,18 @@ Do NOT respond with prose summaries.
 }
 ```
 
+### Examples
+
+**Example 1: Approve with no issues**
+```json
+{"decision":"approve","notes":"CI passes, code follows existing patterns, no issues found.","test_results":"pass","issues":[]}
+```
+
+**Example 2: Request changes with issues**
+```json
+{"decision":"request_changes","notes":"Off-by-one in loop bound causes panic on empty input.","test_results":"fail","issues":[{"file":"src/engine/tick.rs","line":142,"severity":"error","description":"Loop iterates to `len` instead of `len-1`, causing index-out-of-bounds on the last element."}]}
+```
+
 Decision rules:
 - **approve**: Required GitHub CI checks pass, branch is rebased, code meets requirements, no major issues
 - **request_changes**: Required GitHub CI checks fail on PR-related code, there are bugs, scope creep, or the code doesn't meet requirements
