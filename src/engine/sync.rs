@@ -108,6 +108,7 @@ fn filter_mentions_by_since(comments: &[Mention], since: &str) -> Vec<Mention> {
 enum FailureCategory {
     FalseFailure,
     RateLimit,
+    CreditExhausted,
     SilentExit0,
     Timeout,
     ConnectionError,
@@ -128,6 +129,7 @@ impl FailureCategory {
             self,
             FailureCategory::FalseFailure
                 | FailureCategory::RateLimit
+                | FailureCategory::CreditExhausted
                 | FailureCategory::SilentExit0
                 | FailureCategory::Timeout
                 | FailureCategory::ConnectionError
@@ -143,6 +145,7 @@ impl FailureCategory {
         match self {
             FailureCategory::FalseFailure => "FalseFailure",
             FailureCategory::RateLimit => "RateLimit",
+            FailureCategory::CreditExhausted => "CreditExhausted",
             FailureCategory::SilentExit0 => "SilentExit0",
             FailureCategory::Timeout => "Timeout",
             FailureCategory::ConnectionError => "ConnectionError",
@@ -168,6 +171,13 @@ fn classify_failure(error: &str, outcome: &str) -> FailureCategory {
 
     if outcome == "rate_limit" || lower.contains("rate limit") || lower.contains("usage limit") {
         return FailureCategory::RateLimit;
+    }
+
+    // Credit exhaustion is a transient condition (credits replenish, billing cycles
+    // reset). Classifying it as recoverable allows auto-unblock to retry once the
+    // credit-related cooldown expires, instead of permanently blocking the task.
+    if crate::engine::cooldown::detect_credit_exhaustion(&lower).is_some() {
+        return FailureCategory::CreditExhausted;
     }
 
     if error.trim().is_empty() {
