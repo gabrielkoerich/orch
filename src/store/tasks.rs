@@ -496,6 +496,38 @@ impl TaskStore {
         }
     }
 
+    /// Lightweight lookup: return only the numeric `id` for a given repo + external_id.
+    ///
+    /// Many call sites only need the internal store ID and were previously calling
+    /// `get_by_external_id()` which deserializes the full 60-column `Task` row. This
+    /// method avoids that work by selecting only `id`.
+    pub async fn resolve_id_by_external(&self, repo: &str, ext_id: &str) -> anyhow::Result<Option<i64>> {
+        let row = sqlx::query("SELECT id FROM tasks WHERE repo = ? AND external_id = ?")
+            .bind(repo)
+            .bind(ext_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.try_get("id").unwrap_or(0)))
+    }
+
+    /// Lightweight lookup: return only the `agent` column for a given repo + external_id.
+    /// Returns None when no row matches or the agent is NULL/empty.
+    pub async fn get_agent_by_external_id(
+        &self,
+        repo: &str,
+        ext_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query("SELECT agent FROM tasks WHERE repo = ? AND external_id = ?")
+            .bind(repo)
+            .bind(ext_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(r) => Ok(r.try_get::<Option<String>, _>("agent").unwrap_or(None)),
+            None => Ok(None),
+        }
+    }
+
     /// Upsert an external task — insert if new, update title/body/labels if exists.
     pub async fn upsert_external(&self, ext: &UpsertExternal<'_>) -> anyhow::Result<i64> {
         let labels_json = serde_json::to_string(ext.labels)?;
@@ -1774,8 +1806,8 @@ impl TaskStore {
     pub async fn resolve_task_id(&self, repo: &str, task_id: &str) -> anyhow::Result<Option<i64>> {
         if let Some(suffix) = task_id.strip_prefix("internal:") {
             // Internal tasks: look up by external_id="internal:{n}" with origin='internal'
-            if let Some(task) = self.get_by_external_id(repo, task_id).await? {
-                return Ok(Some(task.id));
+            if let Some(id) = self.resolve_id_by_external(repo, task_id).await? {
+                return Ok(Some(id));
             }
             // Fallback: try the numeric suffix as a direct store ID.
             // Must include the repo filter to avoid resolving a task that
@@ -1792,11 +1824,9 @@ impl TaskStore {
             }
             return Ok(None);
         }
-        // External tasks: look up by external_id
-        match self.get_by_external_id(repo, task_id).await? {
-            Some(task) => Ok(Some(task.id)),
-            None => Ok(None),
-        }
+        // External tasks: look up by external_id using the lightweight id-only
+        // lookup to avoid deserializing the full Task row.
+        self.resolve_id_by_external(repo, task_id).await
     }
 
     fn row_to_run(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<TaskRun> {

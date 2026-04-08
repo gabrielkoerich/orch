@@ -535,13 +535,19 @@ impl Router {
 
         loop {
             // 1. Check store agent field first (set by failover, authoritative over labels)
-            let store_agent = match store.resolve_task_id(repo, &task.id.0).await {
-                Ok(Some(store_id)) => match store.get(store_id).await {
-                    Ok(t) => t
-                        .agent
-                        .filter(|a| !a.is_empty() && self.config.agents.iter().any(|cfg| cfg == a)),
-                    Err(_) => None,
-                },
+            // Use a lightweight lookup to avoid deserializing the full Task row when
+            // only the `agent` column is needed. This avoids two full-row loads
+            // per routing pass (resolve_task_id + get) and significantly reduces
+            // CPU work on busy instances.
+            let store_agent = match store.get_agent_by_external_id(repo, &task.id.0).await {
+                Ok(Some(agent)) => {
+                    // Router enforces that the agent string matches a configured agent
+                    if !agent.is_empty() && self.config.agents.iter().any(|cfg| cfg == &agent) {
+                        Some(agent)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             };
 
