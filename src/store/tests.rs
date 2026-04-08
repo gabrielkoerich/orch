@@ -5452,6 +5452,7 @@ async fn batch_reset_failure_counters_preserves_review_cycles() {
         store.increment(id, "review_cycles").await.unwrap();
         store.increment(id, "ci_merge_failures").await.unwrap();
         store.increment(id, "merge_conflict_retries").await.unwrap();
+        store.increment(id, "needs_review_refires").await.unwrap();
     }
 
     store
@@ -5463,6 +5464,10 @@ async fn batch_reset_failure_counters_preserves_review_cycles() {
         let t = store.get(id).await.unwrap();
         assert_eq!(t.attempts, 0);
         assert_eq!(t.merge_conflict_retries, 0);
+        assert_eq!(
+            t.needs_review_refires, 0,
+            "needs_review_refires must be reset"
+        );
         assert_eq!(t.review_cycles, 1, "review_cycles must be preserved");
         assert_eq!(
             t.ci_merge_failures, 1,
