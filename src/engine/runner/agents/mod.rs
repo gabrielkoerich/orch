@@ -1471,7 +1471,7 @@ mod tests {
              // Check if directory is writable\n\
              if !path.is_writable() { ... }\n\
              }\n"
-            .repeat(80);
+        .repeat(80);
         let actual_error = "\nerror: command not found: cargo\n";
         let text = format!("{work_product}{actual_error}");
         let err = patterns::classify_from_text(1, &text);
@@ -1508,7 +1508,7 @@ mod tests {
              // SSH agent will ask for the deploy key passphrase\n\
              fn handle_ssh_passphrase() { ... }\n\
              )\n"
-            .repeat(80);
+        .repeat(80);
         let actual_error = "\nerror: command not found: cargo\n";
         let text = format!("{work_product}{actual_error}");
         let err = patterns::classify_from_text(1, &text);
