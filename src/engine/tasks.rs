@@ -673,7 +673,8 @@ impl TaskManager {
             .backend
             .create_task(&task.title, &task.body, labels)
             .await?;
-        store.update_status(id, TaskStatus::Done).await?;
+        store.update_external_id(id, &ext_id.0).await?;
+        store.update_status(id, TaskStatus::New).await?;
         Ok(ext_id)
     }
 }
