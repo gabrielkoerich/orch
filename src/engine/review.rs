@@ -1800,13 +1800,24 @@ pub(crate) async fn review_and_merge(
                 )
                 .await
                 {
-                    tracing::error!(
-                        task_id = task.id.0,
-                        pr_number = pr_number_early,
-                        branch = %branch_name,
-                        error = %e,
-                        "auto-merge failed"
-                    );
+                    let error_msg = e.to_string();
+                    if error_msg.contains("not yet computed") {
+                        tracing::warn!(
+                            task_id = task.id.0,
+                            pr_number = pr_number_early,
+                            branch = %branch_name,
+                            error = %e,
+                            "auto-merge deferred — PR mergeability not yet computed"
+                        );
+                    } else {
+                        tracing::error!(
+                            task_id = task.id.0,
+                            pr_number = pr_number_early,
+                            branch = %branch_name,
+                            error = %e,
+                            "auto-merge failed"
+                        );
+                    }
                     return Ok(ReviewDecision::Failed(format!("merge failed: {e}")));
                 }
             } else {
