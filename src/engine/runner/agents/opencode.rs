@@ -709,21 +709,59 @@ fn classify_opencode_message(message: &str) -> AgentError {
     }
 
     // Model not available (opencode-specific extraction pattern)
-    if lower.contains("model") && (lower.contains("not found") || lower.contains("not supported")) {
+    //
+    // Patterns handled:
+    //   "Model not found: anthropic/claude-sonnet-4-6."
+    //   "Model not found: github-copilot/gemini-3.1-pro. Did you mean: gemini-3.1-pro-preview?"
+    //   "model not supported: X"
+    //   "The free model has been deprecated. Transition to qwen/qwen3.6-plus for continued paid access."
+    //   "No endpoints found for qwen/qwen3.6-plus:free."
+    let is_model_unavailable = (lower.contains("model")
+        && (lower.contains("not found")
+            || lower.contains("not supported")
+            || lower.contains("deprecated")))
+        || lower.contains("no endpoints found");
+
+    if is_model_unavailable {
         // Try to extract model name from patterns like "Model not found: anthropic/claude-sonnet-4-6."
-        // or "Model not found: github-copilot/gemini-3.1-pro. Did you mean: gemini-3.1-pro-preview?"
-        let model = message
-            .split(": ")
-            .nth(1)
-            .map(|s| {
-                // Strip opencode's "Did you mean: X?" suggestion suffix if present
-                s.split(". Did you mean")
-                    .next()
-                    .unwrap_or(s)
-                    .trim_end_matches('.')
-                    .to_string()
-            })
-            .unwrap_or_default();
+        // or "No endpoints found for qwen/qwen3.6-plus:free."
+        let model = if lower.contains("no endpoints found") {
+            // "No endpoints found for X." — extract X after "for "
+            message
+                .split(" for ")
+                .nth(1)
+                .map(|s| s.trim_end_matches('.').to_string())
+                .unwrap_or_default()
+        } else {
+            // Try "Model not found: X" or "model not supported: X" patterns
+            let from_colon = message
+                .split(": ")
+                .nth(1)
+                .map(|s| {
+                    // Strip opencode's "Did you mean: X?" suggestion suffix if present
+                    s.split(". Did you mean")
+                        .next()
+                        .unwrap_or(s)
+                        .trim_end_matches('.')
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty());
+
+            // For deprecated messages like "The free model has been deprecated. Transition to X for..."
+            // extract the model from "Transition to X" when colon-based extraction yields nothing.
+            let from_transition = if lower.contains("deprecated") {
+                message
+                    .split("Transition to ")
+                    .nth(1)
+                    .and_then(|s| s.split(" for ").next())
+                    .map(|s| s.trim_end_matches('.').to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            };
+
+            from_colon.or(from_transition).unwrap_or_default()
+        };
         return AgentError::ModelUnavailable {
             message: message.to_string(),
             model,
@@ -1051,6 +1089,36 @@ mod tests {
             AgentError::ModelUnavailable { model, message } => {
                 assert_eq!(model, "github-copilot/gemini-3.1-pro");
                 assert!(message.contains("Did you mean"));
+            }
+            other => panic!("expected ModelUnavailable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_opencode_model_deprecated() {
+        // Issue #2228: "The free model has been deprecated." should be ModelUnavailable
+        // with the model extracted from "Transition to X" so the cooldown key is non-empty.
+        let err = classify_opencode_message(
+            "The free model has been deprecated. Transition to qwen/qwen3.6-plus for continued paid access.",
+        );
+        match err {
+            AgentError::ModelUnavailable { model, .. } => {
+                assert_eq!(
+                    model, "qwen/qwen3.6-plus",
+                    "expected model extracted from 'Transition to X', got: {model:?}"
+                );
+            }
+            other => panic!("expected ModelUnavailable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_opencode_no_endpoints_found() {
+        // Issue #2228: "No endpoints found for X." should be ModelUnavailable with model extracted
+        let err = classify_opencode_message("No endpoints found for qwen/qwen3.6-plus:free.");
+        match err {
+            AgentError::ModelUnavailable { model, .. } => {
+                assert_eq!(model, "qwen/qwen3.6-plus:free");
             }
             other => panic!("expected ModelUnavailable, got: {other:?}"),
         }
