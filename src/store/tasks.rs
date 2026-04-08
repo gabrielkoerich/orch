@@ -501,13 +501,18 @@ impl TaskStore {
     /// Many call sites only need the internal store ID and were previously calling
     /// `get_by_external_id()` which deserializes the full 60-column `Task` row. This
     /// method avoids that work by selecting only `id`.
-    pub async fn resolve_id_by_external(&self, repo: &str, ext_id: &str) -> anyhow::Result<Option<i64>> {
+    pub async fn resolve_id_by_external(
+        &self,
+        repo: &str,
+        ext_id: &str,
+    ) -> anyhow::Result<Option<i64>> {
         let row = sqlx::query("SELECT id FROM tasks WHERE repo = ? AND external_id = ?")
             .bind(repo)
             .bind(ext_id)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|r| r.try_get("id").unwrap_or(0)))
+        let id = row.map(|r| r.try_get::<i64, _>("id")).transpose()?;
+        Ok(id)
     }
 
     /// Lightweight lookup: return only the `agent` column for a given repo + external_id.
@@ -522,10 +527,11 @@ impl TaskStore {
             .bind(ext_id)
             .fetch_optional(&self.pool)
             .await?;
-        match row {
-            Some(r) => Ok(r.try_get::<Option<String>, _>("agent").unwrap_or(None)),
-            None => Ok(None),
-        }
+        let agent = row
+            .map(|r| r.try_get::<Option<String>, _>("agent"))
+            .transpose()?
+            .flatten();
+        Ok(agent)
     }
 
     /// Upsert an external task — insert if new, update title/body/labels if exists.
