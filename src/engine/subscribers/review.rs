@@ -531,6 +531,17 @@ async fn classify_review_failure(
         return ReviewOutcome::Reset;
     }
 
+    // Transient mergeability check: GitHub hasn't finished computing yet.
+    // This is a normal, expected transient state for freshly-pushed PRs.
+    if lower_reason.contains("not yet computed") {
+        tracing::warn!(
+            task_id,
+            reason,
+            "{context} PR mergeability check still pending — deferring for retry"
+        );
+        return ReviewOutcome::Reset;
+    }
+
     // Merge conflicts are infrastructure failures, not review agent failures.
     // The merge_conflict_retries counter handles these separately.
     if lower_reason.contains("merge conflict")
