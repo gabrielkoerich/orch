@@ -92,6 +92,7 @@ Your final output MUST be a single JSON object and nothing else. Do not wrap it 
   "files_changed": ["list of files modified"],
   "blockers": ["list of blockers, empty if none"],
   "reason": "reason if blocked or needs_review, empty string otherwise",
+  "learnings": ["key insights from this attempt that would help future retries, e.g. 'cargo fmt must be run before committing'"],
   "delegations": [{"title": "...", "body": "...", "labels": ["..."]}]
 }
 ```
@@ -139,3 +140,4 @@ Your output is parsed by orch and posted as a comment on the GitHub issue. Write
 - **files_changed**: include every file you touched
 - **reason**: include the exact command and error message, not just "permission denied"
 - **blockers**: be actionable (e.g., "Need SSH key configured for git push", not "Permission denied")
+- **learnings**: key insights from this attempt (toolchain quirks, discovered constraints, effective approaches). These are injected into future retry prompts to help the agent avoid repeating mistakes.
