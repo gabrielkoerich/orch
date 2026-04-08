@@ -741,17 +741,11 @@ async fn store_token_usage(
     let model = model_name.unwrap_or("haiku");
     if let Some(ref st) = ctx.store {
         if let Some(store_id) = ctx.store_id_opt {
-            if let Err(e) = st
-                .store_tokens(store_id, input, output, model)
-                .await
-            {
+            if let Err(e) = st.store_tokens(store_id, input, output, model).await {
                 tracing::warn!(task_id = ctx.task_id, ?e, "failed to store token usage");
             }
         } else if let Ok(Some(store_id)) = st.resolve_task_id(ctx.repo, ctx.task_id).await {
-            if let Err(e) = st
-                .store_tokens(store_id, input, output, model)
-                .await
-            {
+            if let Err(e) = st.store_tokens(store_id, input, output, model).await {
                 tracing::warn!(task_id = ctx.task_id, ?e, "failed to store token usage");
             }
         }
