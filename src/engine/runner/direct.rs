@@ -216,17 +216,15 @@ async fn run_shell_command(
     timeout: Duration,
     agent: &str,
 ) -> Result<DirectResult> {
-    let output = tokio::time::timeout(
-        timeout + Duration::from_secs(5),
-        tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg(shell_cmd)
-            .current_dir(work_dir)
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("agent timed out after {}s", timeout.as_secs()))?
-    .map_err(|e| anyhow::anyhow!("spawning agent: {e}"))?;
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg("-c")
+        .arg(shell_cmd)
+        .current_dir(work_dir)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(timeout + Duration::from_secs(5), cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("agent timed out after {}s", timeout.as_secs()))?
+        .map_err(|e| anyhow::anyhow!("spawning agent: {e}"))?;
 
     finish_output(output, agent)
 }

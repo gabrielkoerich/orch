@@ -192,15 +192,12 @@ pub async fn validate_model(spec: &ModelSpec) -> Result<()> {
 
 /// List available opencode models via `opencode models`.
 async fn list_opencode_models() -> Result<Vec<String>> {
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new("opencode")
-            .args(["models"])
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("opencode models timed out after 10s"))?
-    .context("running opencode models")?;
+    let mut cmd = tokio::process::Command::new("opencode");
+    cmd.args(["models"]).kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("opencode models timed out after 10s"))?
+        .context("running opencode models")?;
 
     if !output.status.success() {
         anyhow::bail!("opencode models failed");
@@ -275,48 +272,39 @@ pub async fn assemble_context(store: &TaskStore, session_id: &str) -> Result<Cha
     };
 
     // 3. Service status via `brew services info orch` (best-effort, 10s timeout)
-    let service_status = match timeout(
-        SUBPROCESS_TIMEOUT,
-        tokio::process::Command::new("brew")
-            .args(["services", "info", "orch"])
-            .output(),
-    )
-    .await
-    {
-        Ok(Ok(output)) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let service_status = {
+        let mut cmd = tokio::process::Command::new("brew");
+        cmd.args(["services", "info", "orch"]).kill_on_drop(true);
+        match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            _ => "(could not check service status)".to_string(),
         }
-        _ => "(could not check service status)".to_string(),
     };
 
     // 4. Live state via `orch task list` (best-effort, 10s timeout)
-    let task_list = match timeout(
-        SUBPROCESS_TIMEOUT,
-        tokio::process::Command::new("orch")
-            .args(["task", "list"])
-            .output(),
-    )
-    .await
-    {
-        Ok(Ok(output)) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let task_list = {
+        let mut cmd = tokio::process::Command::new("orch");
+        cmd.args(["task", "list"]).kill_on_drop(true);
+        match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            _ => "(could not fetch live state)".to_string(),
         }
-        _ => "(could not fetch live state)".to_string(),
     };
 
     // 5. Scheduled jobs via `orch job list` (best-effort, 10s timeout)
-    let job_list = match timeout(
-        SUBPROCESS_TIMEOUT,
-        tokio::process::Command::new("orch")
-            .args(["job", "list"])
-            .output(),
-    )
-    .await
-    {
-        Ok(Ok(output)) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let job_list = {
+        let mut cmd = tokio::process::Command::new("orch");
+        cmd.args(["job", "list"]).kill_on_drop(true);
+        match timeout(SUBPROCESS_TIMEOUT, cmd.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            _ => "(no jobs configured)".to_string(),
         }
-        _ => "(no jobs configured)".to_string(),
     };
 
     let version = env!("ORCH_VERSION");
