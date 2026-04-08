@@ -49,8 +49,8 @@ pub struct RunAudit {
     pub parsed_response: String,
     pub outcome: String,
     pub error: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     pub total_cost_usd: f64,
     pub duration_secs: f64,
 }
@@ -152,17 +152,17 @@ fn classify_run_error_type(last_error: &str) -> &'static str {
 
 fn extract_run_tokens(
     parse_result: &Result<agents::ParsedResponse, agents::AgentError>,
-) -> (i64, i64) {
+) -> (u64, u64) {
     match parse_result {
         Ok(parsed) => (
             parsed
                 .input_tokens
                 .or(parsed.response.input_tokens)
-                .unwrap_or(0) as i64,
+                .unwrap_or(0),
             parsed
                 .output_tokens
                 .or(parsed.response.output_tokens)
-                .unwrap_or(0) as i64,
+                .unwrap_or(0),
         ),
         Err(_) => (0, 0),
     }

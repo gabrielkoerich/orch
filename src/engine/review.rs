@@ -1234,11 +1234,11 @@ pub(crate) async fn review_and_merge(
         input_tokens: agent_result_for_tokens
             .as_ref()
             .and_then(|r| r.input_tokens)
-            .unwrap_or(0) as i64,
+            .unwrap_or(0),
         output_tokens: agent_result_for_tokens
             .as_ref()
             .and_then(|r| r.output_tokens)
-            .unwrap_or(0) as i64,
+            .unwrap_or(0),
         total_cost_usd: agent_result_for_tokens
             .as_ref()
             .and_then(|r| r.cost_usd)
