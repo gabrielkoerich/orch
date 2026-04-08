@@ -169,11 +169,14 @@ impl Channel for SlackChannel {
 
         let bot_token = self.bot_token.clone();
         let client = self.client.clone();
-        // SAFETY: checked is_none() above and returned early
-        let channel_id = self
-            .channel_id
-            .clone()
-            .expect("BUG: channel_id is Some; None case returned early above");
+        let channel_id = match self.channel_id.clone() {
+            Some(id) => id,
+            None => {
+                // Defensive: is_none() early-return above should prevent reaching here
+                tracing::error!("slack channel_id unexpectedly None after guard check");
+                return Ok(rx);
+            }
+        };
         let last_ts = self.last_ts.clone();
 
         let token_fingerprint = {

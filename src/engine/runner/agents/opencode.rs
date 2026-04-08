@@ -589,7 +589,15 @@ fn ensure_router_opencode_config() -> anyhow::Result<std::path::PathBuf> {
 
     // Return the parent of the "opencode" subdirectory — that is the value to
     // set as XDG_CONFIG_HOME so opencode finds opencode/opencode.json inside it.
-    Ok(dir.parent().expect("dir always has a parent").to_path_buf())
+    Ok(dir
+        .parent()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "router opencode config dir has no parent: {}",
+                dir.display()
+            )
+        })?
+        .to_path_buf())
 }
 
 /// Map from unified allowed_tools names to OpenCode permission keys.

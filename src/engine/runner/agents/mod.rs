@@ -692,11 +692,12 @@ pub(crate) mod patterns {
         // numbers like line numbers, port numbers, or file sizes.
         let has_529 = lower.contains("http 529")
             || lower.contains("529 service")
-            || (lower.contains(": 529")
-                && !lower[lower.find(": 529").unwrap() + 5..]
+            || (lower.find(": 529").is_some_and(|pos| {
+                !lower[pos + 5..]
                     .chars()
                     .next()
-                    .is_some_and(|c| c.is_ascii_digit()));
+                    .is_some_and(|c| c.is_ascii_digit())
+            }));
         if match_pos.is_some() || has_429 || has_529 {
             let message = if let Some(pos) = match_pos {
                 extract_context_around(text, pos, 300)
