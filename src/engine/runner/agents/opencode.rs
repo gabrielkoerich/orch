@@ -733,7 +733,8 @@ fn classify_opencode_message(message: &str) -> AgentError {
                 .map(|s| s.trim_end_matches('.').to_string())
                 .unwrap_or_default()
         } else {
-            message
+            // Try "Model not found: X" or "model not supported: X" patterns
+            let from_colon = message
                 .split(": ")
                 .nth(1)
                 .map(|s| {
@@ -744,7 +745,22 @@ fn classify_opencode_message(message: &str) -> AgentError {
                         .trim_end_matches('.')
                         .to_string()
                 })
-                .unwrap_or_default()
+                .filter(|s| !s.is_empty());
+
+            // For deprecated messages like "The free model has been deprecated. Transition to X for..."
+            // extract the model from "Transition to X" when colon-based extraction yields nothing.
+            let from_transition = if lower.contains("deprecated") {
+                message
+                    .split("Transition to ")
+                    .nth(1)
+                    .and_then(|s| s.split(" for ").next())
+                    .map(|s| s.trim_end_matches('.').to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            };
+
+            from_colon.or(from_transition).unwrap_or_default()
         };
         return AgentError::ModelUnavailable {
             message: message.to_string(),
@@ -1081,13 +1097,19 @@ mod tests {
     #[test]
     fn classify_opencode_model_deprecated() {
         // Issue #2228: "The free model has been deprecated." should be ModelUnavailable
+        // with the model extracted from "Transition to X" so the cooldown key is non-empty.
         let err = classify_opencode_message(
             "The free model has been deprecated. Transition to qwen/qwen3.6-plus for continued paid access.",
         );
-        assert!(
-            matches!(err, AgentError::ModelUnavailable { .. }),
-            "expected ModelUnavailable, got: {err:?}"
-        );
+        match err {
+            AgentError::ModelUnavailable { model, .. } => {
+                assert_eq!(
+                    model, "qwen/qwen3.6-plus",
+                    "expected model extracted from 'Transition to X', got: {model:?}"
+                );
+            }
+            other => panic!("expected ModelUnavailable, got: {other:?}"),
+        }
     }
 
     #[test]
