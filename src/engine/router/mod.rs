@@ -798,10 +798,12 @@ impl Router {
                     if let Some(err) = e.downcast_ref::<AllCooledError>() {
                         let scope = err.scope.as_str();
                         tracing::warn!(scope = %scope, "router cooldown gate tripped");
-                        let scope_opt = if scope == "all agents" {
-                            None
-                        } else {
-                            Some(scope)
+                        // "router pool" scope means all router LLM pool entries were pre-cooled.
+                        // Pass None so wait_for_cooldown queries all agent+model cooldowns generically
+                        // (no complexity-specific pool lookup, which would fail for "router pool").
+                        let scope_opt = match scope {
+                            "all agents" | "router pool" => None,
+                            _ => Some(scope),
                         };
                         self.wait_for_cooldown(scope_opt).await?;
                         continue;
