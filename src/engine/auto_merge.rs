@@ -1233,6 +1233,18 @@ pub(crate) async fn handle_review_changes(
             max_cycles,
             "max review cycles exceeded, blocking for human review"
         );
+        // Persist block_reason BEFORE transitioning to Blocked to avoid
+        // a race where auto_unblock sees a blocked task without a reason
+        // and immediately unblocks it.
+        let fields = [(
+            "block_reason",
+            serde_json::json!(format!("max review cycles ({}) reached", max_cycles)),
+        )];
+        if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+        {
+            tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+            return Ok(());
+        }
         // A transient store failure here must not be counted as a review-agent
         // crash.  Log and return Ok — the next tick will re-check the task and
         // can retry the status transition.

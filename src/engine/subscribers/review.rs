@@ -9,7 +9,7 @@ use crate::engine::router::Router;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::repo_context::REPO_CONTEXT;
-use crate::store::{opt_store_get_task, store_set, TaskStore};
+use crate::store::{opt_store_get_task, store_set_result, TaskStore};
 use crate::tmux::TmuxManager;
 use dashmap::DashSet;
 use std::sync::Arc;
@@ -454,30 +454,38 @@ pub fn spawn(
                                     tracing::error!(task_id = %tid, err = %e, "update_task_status(NeedsReview) failed after rate limit backoff — task may be stuck in InReview");
                                 }
                             }
-                            ReviewOutcome::Block(reason) => {
-                                store_set(
-                                    &Some(store_c.clone()),
-                                    &repo_s,
-                                    &tid,
-                                    &[
-                                        (
-                                            "block_reason",
-                                            serde_json::json!("review agent blocked — exceeded failure threshold"),
-                                        ),
-                                        ("last_error", serde_json::json!(reason)),
-                                    ],
-                                )
-                                .await;
-                                if let Err(e) = task_manager_c
-                                    .update_task_status(
-                                        &ExternalId(tid.clone()),
-                                        Status::Blocked,
-                                    )
-                                    .await
-                                {
-                                    tracing::error!(task_id = %tid, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
-                                }
-                            }
+                             ReviewOutcome::Block(reason) => {
+                                 // Persist block_reason BEFORE transitioning to Blocked to avoid
+                                 // a race where auto_unblock sees a blocked task without a reason
+                                 // and immediately unblocks it.
+                                 let fields = [
+                                     (
+                                         "block_reason",
+                                         serde_json::json!("review agent blocked — exceeded failure threshold"),
+                                     ),
+                                     ("last_error", serde_json::json!(reason)),
+                                 ];
+                                 if let Err(e) = store_set_result(
+                                     &Some(store_c.clone()),
+                                     &repo_s,
+                                     &tid,
+                                     &fields,
+                                 )
+                                 .await
+                                 {
+                                     tracing::error!(task_id = %tid, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+                                 } else {
+                                     if let Err(e) = task_manager_c
+                                         .update_task_status(
+                                             &ExternalId(tid.clone()),
+                                             Status::Blocked,
+                                         )
+                                         .await
+                                     {
+                                         tracing::error!(task_id = %tid, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
+                                     }
+                                 }
+                             }
                             ReviewOutcome::Ok => {}
                         }
 
