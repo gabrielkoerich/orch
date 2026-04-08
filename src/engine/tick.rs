@@ -1028,23 +1028,22 @@ pub(crate) async fn tick_dispatch_tasks(
         .filter(|t| !t.labels.iter().any(|l| l == "no-agent"))
         .collect();
 
-    if dispatchable.is_empty() {
-        tracing::debug!(count = 0, "dispatchable tasks found");
-    } else {
-        tracing::info!(count = dispatchable.len(), "dispatchable tasks found");
-    }
-
     // Check if we are in degraded mode (fewer than threshold healthy agents)
     let threshold = crate::engine::router::config::min_healthy_agents_threshold();
     let healthy_count = router.healthy_agent_count("simple");
     let is_degraded = healthy_count < threshold;
 
-    if is_degraded {
-        tracing::warn!(
-            healthy_agents = healthy_count,
-            threshold = threshold,
-            "degraded mode: using sequential dispatch"
-        );
+    if dispatchable.is_empty() {
+        tracing::debug!(count = 0, "dispatchable tasks found");
+    } else {
+        tracing::info!(count = dispatchable.len(), "dispatchable tasks found");
+        if is_degraded {
+            tracing::warn!(
+                healthy_agents = healthy_count,
+                threshold = threshold,
+                "degraded mode: using sequential dispatch"
+            );
+        }
     }
 
     let sequential_delay = if is_degraded {
