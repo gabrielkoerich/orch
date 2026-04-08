@@ -940,13 +940,13 @@ impl Router {
         task: &ExternalTask,
         repo: &str,
     ) -> anyhow::Result<RouteResult> {
-        // Filter out cooled agents so the LLM only sees available ones.
-        // Fall back to the full list if all agents are cooled.
+        // Filter out cooled and degraded agents so the LLM only sees available ones.
+        // Fall back to the full list if all agents are cooled/degraded.
         // Cloned to avoid borrow conflict with &mut self in the loop.
         let uncooled_agents: Vec<String> = self
             .available_agents
             .iter()
-            .filter(|a| !is_agent_in_cooldown(a))
+            .filter(|a| !is_agent_in_cooldown(a) && !is_agent_degraded(a))
             .cloned()
             .collect();
         if uncooled_agents.is_empty() {
