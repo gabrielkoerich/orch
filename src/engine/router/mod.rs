@@ -2231,10 +2231,20 @@ Hope that helps!"#;
 
     #[tokio::test]
     async fn last_agent_tracks_routing() {
-        let config = RouterConfig {
+        let mut config = RouterConfig {
             mode: "round_robin".to_string(),
             ..Default::default()
         };
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert("test_x".to_string(), vec!["test-model-x".to_string()]);
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert("test_y".to_string(), vec!["test-model-y".to_string()]);
         let agents = vec!["test_x".to_string(), "test_y".to_string()];
         let mut weights = AgentWeights::default();
         weights.ensure_agents(&agents);
