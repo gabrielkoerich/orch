@@ -448,7 +448,7 @@ impl RouterConfig {
 
     pub fn has_available_model_for_complexity(&self, agent: &str, complexity: &str) -> bool {
         match self.expanded_model_pool(agent, complexity) {
-            None => true,
+            None => false,
             Some(pool) => pool
                 .iter()
                 .any(|model| !crate::engine::cooldown::is_model_in_cooldown(agent, model)),
@@ -597,6 +597,41 @@ mod tests {
             result.as_deref(),
             Some("healthy-model"),
             "should return the model when it is not in cooldown"
+        );
+    }
+
+    #[test]
+    fn has_available_model_returns_false_when_no_pool_configured() {
+        let mut config = RouterConfig::default();
+        // Simulate olm agent with only simple and medium configured (missing complex and review)
+        config
+            .model_map
+            .entry("simple".to_string())
+            .or_default()
+            .insert("olm".to_string(), vec!["qwen3.5".to_string()]);
+        config
+            .model_map
+            .entry("medium".to_string())
+            .or_default()
+            .insert("olm".to_string(), vec!["gemma4".to_string()]);
+        // Note: complex and review tiers are NOT configured for olm
+
+        // has_available_model_for_complexity should return false when no pool exists
+        assert!(
+            config.has_available_model_for_complexity("olm", "simple"),
+            "should return true when model pool exists and is configured"
+        );
+        assert!(
+            config.has_available_model_for_complexity("olm", "medium"),
+            "should return true when model pool exists and is configured"
+        );
+        assert!(
+            !config.has_available_model_for_complexity("olm", "complex"),
+            "should return false when no model pool is configured for agent+complexity"
+        );
+        assert!(
+            !config.has_available_model_for_complexity("olm", "review"),
+            "should return false when no model pool is configured for agent+complexity"
         );
     }
 
