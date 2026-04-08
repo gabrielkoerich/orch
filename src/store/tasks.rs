@@ -1447,7 +1447,7 @@ impl TaskStore {
         repo: &str,
     ) -> anyhow::Result<std::collections::HashSet<String>> {
         let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT external_id FROM tasks WHERE repo = ? AND worktree_cleaned = 1")
+            sqlx::query_as("SELECT external_id FROM tasks WHERE repo = ? AND worktree_cleaned = 1 AND external_id IS NOT NULL")
                 .bind(repo)
                 .fetch_all(&self.pool)
                 .await?;
