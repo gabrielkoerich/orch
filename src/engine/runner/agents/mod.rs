@@ -300,8 +300,7 @@ fn extract_file_paths(text: &str) -> Vec<String> {
         // Strip a lone trailing dot that ends a sentence (e.g. "src/foo.rs.").
         // Only strip if the result still has a recognised extension — this avoids
         // accidentally stripping the final dot of "src/foo.rs" when there is none.
-        let token = if token.ends_with('.') {
-            let without = &token[..token.len() - 1];
+        let token = if let Some(without) = token.strip_suffix('.') {
             let still_has_ext = extensions
                 .iter()
                 .any(|ext| without.ends_with(&format!(".{ext}")));
