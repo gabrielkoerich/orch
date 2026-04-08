@@ -555,132 +555,6 @@ pub struct ReviewIssue {
     pub description: String,
 }
 
-/// Parse a review response from raw agent output, handling NDJSON streams.
-///
-/// This is the primary entry point for review response parsing. It handles:
-/// 1. Direct JSON (`ReviewResponse` object)
-/// 2. Markdown with ` ```json ` code blocks containing a `ReviewResponse`
-/// 3. NDJSON streams (opencode `run --format json` output) — extracts text
-///    from `type:"text"` events and then applies steps 1 & 2
-///
-/// Use this in the review pipeline instead of `parse_review_response` so that
-/// raw opencode NDJSON output is handled even when the normal agent-envelope
-/// parsing chain fails (e.g. format change, empty summary).
-#[allow(dead_code)] // used by integration tests; production code uses parse_review_from_agent_output
-pub fn parse_review_from_output(output: &str) -> anyhow::Result<ReviewResponse> {
-    // Step 1: direct JSON / markdown parse
-    if let Ok(r) = parse_review_response(output) {
-        return Ok(r);
-    }
-
-    // Step 2: NDJSON — extract text events and parse the concatenated text
-    let extracted = ndjson_extract_text(output);
-    if !extracted.is_empty() {
-        return parse_review_response(&extracted)
-            .map_err(|e| anyhow::anyhow!("parse failed after NDJSON extraction: {e}"));
-    }
-
-    // Step 3: heuristic fallback for plain-text decisions
-    if let Some(resp) = infer_review_response_from_text(output) {
-        tracing::warn!(
-            output_len = output.len(),
-            "review response parsed via keyword fallback"
-        );
-        return Ok(resp);
-    }
-
-    anyhow::bail!("failed to parse review response from output")
-}
-
-/// Extract the concatenated text content from an NDJSON event stream.
-///
-/// **Deprecated**: Prefer `parse_review_from_agent_output` which uses per-agent
-/// extractors. This generic version is retained for backward compatibility
-/// when the agent name is unknown.
-///
-/// Handles text event formats from all agents:
-/// - opencode Format 1: `{"type":"text","part":{"type":"text","text":"..."}}`
-/// - opencode Format 2: `{"type":"text","text":"..."}`
-/// - codex Format:      `{"type":"item.completed","item":{"type":"agent_message","text":"..."}}`
-/// - claude stream-json: `{"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}`
-/// - claude result:      `{"type":"result","result":"..."}`
-#[allow(dead_code)] // used by parse_review_from_output (integration tests)
-fn ndjson_extract_text(ndjson: &str) -> String {
-    let texts: Vec<String> = ndjson
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|e| {
-            let event_type = e.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match event_type {
-                // opencode: text event
-                "text" => {
-                    // Format 1: text nested under "part"
-                    e.get("part")
-                        .and_then(|p| p.get("text"))
-                        .and_then(|t| t.as_str())
-                        .map(str::to_string)
-                        // Format 2: text directly in event
-                        .or_else(|| e.get("text").and_then(|t| t.as_str()).map(str::to_string))
-                }
-                // codex: item.completed with agent_message item
-                "item.completed" => e
-                    .get("item")
-                    .filter(|item| {
-                        item.get("type").and_then(|v| v.as_str()) == Some("agent_message")
-                    })
-                    .and_then(|item| item.get("text"))
-                    .and_then(|t| t.as_str())
-                    .map(str::to_string),
-                // claude stream-json: assistant message with content array
-                "assistant" => e
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|item| {
-                                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                    item.get("text")
-                                        .and_then(|t| t.as_str())
-                                        .map(str::to_string)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("")
-                    })
-                    .filter(|s| !s.is_empty()),
-                // claude stream-json: final result event
-                "result" => e.get("result").and_then(|r| r.as_str()).map(str::to_string),
-                _ => None,
-            }
-        })
-        .collect();
-
-    let joined = texts.join("");
-    if parse_review_response(&joined).is_ok() {
-        return joined;
-    }
-
-    for text in texts.iter().rev() {
-        let trimmed = text.trim();
-        // Only accept a chunk that actually parses as JSON containing a
-        // "decision" key — substring matching on "decision" can false-positive
-        // on prose that merely mentions the word.
-        if trimmed.contains('{') {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if val.as_object().is_some_and(|o| o.contains_key("decision")) {
-                    return text.clone();
-                }
-            }
-        }
-    }
-
-    joined
-}
-
 /// Parse a review response from already-unwrapped text.
 ///
 /// Expects the raw result text (already extracted from the agent envelope
@@ -1218,26 +1092,35 @@ That's all."#;
         assert_eq!(result.as_deref(), Some("{\"real\": true}"));
     }
 
-    // ── parse_review_from_output ─────────────────────────────────
+    // ── parse_review_response + infer_review_response (production path) ─
+
+    /// Helper that mirrors the production plain-text path in review.rs:
+    /// parse_review_response → infer_review_response.
+    fn parse_review_plain(text: &str) -> anyhow::Result<ReviewResponse> {
+        parse_review_response(text).or_else(|_| {
+            infer_review_response(text)
+                .ok_or_else(|| anyhow::anyhow!("failed to parse review response"))
+        })
+    }
 
     #[test]
     fn parse_review_from_output_direct_json() {
         let json = r#"{"decision":"approve","notes":"LGTM","test_results":"pass","issues":[]}"#;
-        let resp = parse_review_from_output(json).unwrap();
+        let resp = parse_review_response(json).unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
     #[test]
     fn parse_review_from_output_markdown() {
         let md = "Review complete.\n\n```json\n{\"decision\":\"request_changes\",\"notes\":\"Fix it\",\"issues\":[]}\n```\n";
-        let resp = parse_review_from_output(md).unwrap();
+        let resp = parse_review_response(md).unwrap();
         assert_eq!(resp.decision, "request_changes");
     }
 
     #[test]
     fn parse_review_from_output_plain_text_fallback() {
         let text = "The review is done — all tests passed and the PR was approved.";
-        let resp = parse_review_from_output(text).unwrap();
+        let resp = parse_review_plain(text).unwrap();
         assert_eq!(resp.decision, "approve");
         assert!(resp.issues.is_empty());
     }
@@ -1252,7 +1135,7 @@ That's all."#;
             "\n",
             r#"{"type":"step_finish","timestamp":1002,"part":{"type":"step-finish","reason":"stop"}}"#,
         );
-        let resp = parse_review_from_output(ndjson).unwrap();
+        let resp = parse_via_agent_path("opencode", ndjson).unwrap();
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "All checks pass");
     }
@@ -1267,7 +1150,7 @@ That's all."#;
             "\n",
             r#"{"type":"step_finish","timestamp":1002,"sessionID":"ses_abc"}"#,
         );
-        let resp = parse_review_from_output(ndjson).unwrap();
+        let resp = parse_via_agent_path("opencode", ndjson).unwrap();
         assert_eq!(resp.decision, "request_changes");
         assert_eq!(resp.notes, "Fix the bug");
     }
@@ -1282,7 +1165,7 @@ That's all."#;
             "\n",
             r#"{"type":"step_finish","timestamp":1002}"#,
         );
-        let resp = parse_review_from_output(ndjson).unwrap();
+        let resp = parse_via_agent_path("opencode", ndjson).unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
@@ -1293,7 +1176,7 @@ That's all."#;
             "\n",
             r#"{"type":"text","timestamp":1002,"part":{"type":"text","text":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"test_results\":\"pass\",\"issues\":[]}"}}"#,
         );
-        let resp = parse_review_from_output(ndjson).unwrap();
+        let resp = parse_via_agent_path("opencode", ndjson).unwrap();
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "LGTM");
     }
@@ -1306,7 +1189,7 @@ That's all."#;
             "\n",
             r#"{"type":"text","timestamp":1002,"part":{"type":"text","text":"review:\n\n```json\n{\"decision\":\"approve\",\"notes\":\"OK\",\"test_results\":\"pass\",\"issues\":[]}\n```\n"}}"#,
         );
-        let resp = parse_review_from_output(ndjson).unwrap();
+        let resp = parse_via_agent_path("opencode", ndjson).unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
@@ -1329,7 +1212,7 @@ That's all."#;
             "\n",
             r#"{"type":"turn.completed"}"#,
         );
-        let resp = parse_review_from_output(ndjson).unwrap();
+        let resp = parse_via_agent_path("codex", ndjson).unwrap();
         assert_eq!(resp.decision, "approve");
         assert_eq!(resp.notes, "All checks pass");
     }
@@ -1348,29 +1231,29 @@ That's all."#;
             "\n",
             r#"{"type":"turn.completed"}"#,
         );
-        let resp = parse_review_from_output(ndjson).unwrap();
+        let resp = parse_via_agent_path("codex", ndjson).unwrap();
         assert_eq!(resp.decision, "request_changes");
         assert_eq!(resp.notes, "Fix the tests");
     }
 
-    /// reasoning items must NOT be extracted as review text.
+    /// codex reasoning items must NOT be extracted as review text — only agent_message is used.
     #[test]
-    fn ndjson_extract_text_codex_skips_reasoning() {
+    fn codex_skips_reasoning_items() {
         let ndjson = concat!(
             r#"{"type":"item.completed","item":{"type":"reasoning","text":"internal thoughts..."}}"#,
             "\n",
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"actual output"}}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"{\"decision\":\"approve\",\"notes\":\"LGTM\",\"issues\":[]}"}}"#,
         );
-        let extracted = ndjson_extract_text(ndjson);
-        assert_eq!(extracted, "actual output");
-        assert!(!extracted.contains("internal thoughts"));
+        let resp = parse_via_agent_path("codex", ndjson).unwrap();
+        assert_eq!(resp.decision, "approve");
+        assert_eq!(resp.notes, "LGTM");
     }
 
     /// Negation patterns must NOT trigger a false approval.
     #[test]
     fn infer_review_response_negation_not_approved() {
         assert!(
-            parse_review_from_output("The changes were not approved.").is_err(),
+            parse_review_plain("The changes were not approved.").is_err(),
             "\"not approved\" should not infer approval"
         );
     }
@@ -1378,7 +1261,7 @@ That's all."#;
     #[test]
     fn infer_review_response_negation_unapproved() {
         assert!(
-            parse_review_from_output("Unapproved changes found in the diff.").is_err(),
+            parse_review_plain("Unapproved changes found in the diff.").is_err(),
             "\"unapproved\" should not infer approval"
         );
     }
@@ -1386,7 +1269,7 @@ That's all."#;
     #[test]
     fn infer_review_response_negation_not_approving() {
         assert!(
-            parse_review_from_output("I am not approving this PR.").is_err(),
+            parse_review_plain("I am not approving this PR.").is_err(),
             "\"not approving\" should not infer approval"
         );
     }
@@ -1394,20 +1277,20 @@ That's all."#;
     /// Positive plain-text approval signals must still work.
     #[test]
     fn infer_review_response_lgtm() {
-        let resp = parse_review_from_output("LGTM, everything looks fine.").unwrap();
+        let resp = parse_review_plain("LGTM, everything looks fine.").unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
     #[test]
     fn infer_review_response_looks_good() {
-        let resp = parse_review_from_output("Looks good to me!").unwrap();
+        let resp = parse_review_plain("Looks good to me!").unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
     /// "All checks passed" should infer approval (real failure observed in task 16393).
     #[test]
     fn infer_review_response_all_checks_passed() {
-        let resp = parse_review_from_output(
+        let resp = parse_review_plain(
             "The background task completed but I already got the CI results directly. All checks passed — no action needed.",
         )
         .unwrap();
@@ -1416,23 +1299,20 @@ That's all."#;
 
     #[test]
     fn infer_review_response_checks_passed() {
-        let resp =
-            parse_review_from_output("All checks passed (fmt ✓, clippy ✓, tests ✓).").unwrap();
+        let resp = parse_review_plain("All checks passed (fmt ✓, clippy ✓, tests ✓).").unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
     #[test]
     fn infer_review_response_all_tests_passed() {
         let resp =
-            parse_review_from_output("All tests passed and the implementation looks correct.")
-                .unwrap();
+            parse_review_plain("All tests passed and the implementation looks correct.").unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
     #[test]
     fn infer_review_response_no_issues_found() {
-        let resp =
-            parse_review_from_output("Review complete. No issues found in the diff.").unwrap();
+        let resp = parse_review_plain("Review complete. No issues found in the diff.").unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
@@ -1440,21 +1320,21 @@ That's all."#;
     #[test]
     fn infer_review_response_partial_tests_passed_no_approve() {
         let text = "The existing tests passed before this change but the new payment logic has a null-pointer risk on line 42.";
-        assert!(parse_review_from_output(text).is_err());
+        assert!(parse_review_plain(text).is_err());
     }
 
     /// Partial "checks passed" mid-sentence must NOT infer approval without "all" prefix.
     #[test]
     fn infer_review_response_partial_checks_passed_no_approve() {
         let text = "CI checks passed for the base branch but this PR adds a broken path.";
-        assert!(parse_review_from_output(text).is_err());
+        assert!(parse_review_plain(text).is_err());
     }
 
     /// LLMs sometimes echo the JSON decision field value literally: "Decision is `approve`."
     #[test]
     fn infer_review_response_decision_is_approve_backtick() {
         let text = "Already retrieved the output and completed the review above. The CI test check passed (3m11s) and all other checks are green. Decision is `approve`.";
-        let resp = parse_review_from_output(text).unwrap();
+        let resp = parse_review_plain(text).unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
@@ -1462,7 +1342,7 @@ That's all."#;
     #[test]
     fn infer_review_response_decision_colon_approve() {
         let text = "Reviewed the PR. No blocking issues found. Decision: approve";
-        let resp = parse_review_from_output(text).unwrap();
+        let resp = parse_review_plain(text).unwrap();
         assert_eq!(resp.decision, "approve");
     }
 
@@ -1472,7 +1352,7 @@ That's all."#;
     fn infer_review_response_negation_do_not_approve_backtick() {
         let text = "There are unresolved issues — do not `approve` this PR until they are fixed.";
         assert!(
-            parse_review_from_output(text).is_err(),
+            parse_review_plain(text).is_err(),
             "negative context with backtick approve must not infer approval"
         );
     }

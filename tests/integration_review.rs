@@ -3,7 +3,7 @@
 //! Calls REAL agents with a review prompt, captures stdout/stderr,
 //! and verifies the output can be parsed using the SAME code path as review.rs:
 //!   1. `get_runner(agent).extract_text(stdout)` — per-agent envelope extraction
-//!   2. `parse_review_from_output(&text)` — JSON/plain-text review parse
+//!   2. `parse_review_response(&text)` / `infer_review_response(&text)` — JSON/plain-text review parse
 //!
 //! `#[ignore]`d — needs API keys and installed CLIs. Run locally:
 //! ```bash
@@ -11,7 +11,7 @@
 //! ```
 
 use orch::engine::runner::agents::get_runner;
-use orch::engine::runner::response::parse_review_from_output;
+use orch::engine::runner::response::{infer_review_response, parse_review_response};
 use std::process::Command;
 
 const REVIEW_PROMPT: &str = r#"You are a code review agent. Review this trivial change and respond with ONLY this JSON (no markdown, no explanation):
@@ -81,11 +81,12 @@ fn verify_review_output(
     );
 
     // Step 3: parse as ReviewResponse — same as review.rs stage 2
-    let review = parse_review_from_output(&text);
+    let review = parse_review_response(&text)
+        .ok()
+        .or_else(|| infer_review_response(&text));
     assert!(
-        review.is_ok(),
-        "{label}: parse_review_from_output failed: {}\nextracted text:\n{}",
-        review.unwrap_err(),
+        review.is_some(),
+        "{label}: parse_review_response and infer_review_response both failed\nextracted text:\n{}",
         &text[..text.len().min(500)]
     );
 
