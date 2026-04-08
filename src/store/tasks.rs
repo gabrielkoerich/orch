@@ -289,8 +289,8 @@ pub struct TaskActivity {
 /// Token usage for a run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunTokenUsage {
-    pub input_tokens: i64,
-    pub output_tokens: i64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     pub total_cost_usd: f64,
     pub duration_secs: f64,
 }
@@ -1113,14 +1113,14 @@ impl TaskStore {
     pub async fn store_tokens(
         &self,
         id: i64,
-        input: i64,
-        output: i64,
+        input: u64,
+        output: u64,
         model: &str,
     ) -> anyhow::Result<()> {
         let pricing = pricing_for_model(model);
         let usage = TokenUsage {
-            input_tokens: input as u64,
-            output_tokens: output as u64,
+            input_tokens: input,
+            output_tokens: output,
         };
         let cost = pricing.estimate_cost_usd(usage);
 
@@ -1131,8 +1131,8 @@ impl TaskStore {
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
         )
-        .bind(input)
-        .bind(output)
+        .bind(input as i64)
+        .bind(output as i64)
         .bind(model)
         .bind(cost.input_cost_usd)
         .bind(cost.output_cost_usd)
@@ -1462,8 +1462,8 @@ impl TaskStore {
         .bind(run.parsed)
         .bind(run.outcome)
         .bind(run.error)
-        .bind(run.tokens.input_tokens)
-        .bind(run.tokens.output_tokens)
+        .bind(run.tokens.input_tokens as i64)
+        .bind(run.tokens.output_tokens as i64)
         .bind(run.tokens.total_cost_usd)
         .bind(run.tokens.duration_secs)
         .bind(run.run_id)
