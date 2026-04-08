@@ -561,6 +561,18 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Persist the external_id (e.g. a newly-created GitHub issue number) onto an existing task row.
+    pub async fn update_external_id(&self, id: i64, external_id: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE tasks SET external_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
+        )
+        .bind(external_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Conditionally update the status of a task only if it currently has `expected` status.
     ///
     /// Returns `true` if the row was updated, `false` if the current status did not match
