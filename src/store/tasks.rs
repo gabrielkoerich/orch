@@ -35,6 +35,76 @@ const TASK_RUN_COLS: &str =
 const TASK_ACTIVITY_COLS: &str =
     "id, task_id, timestamp, event_type, from_status, to_status, agent, model, details";
 
+/// Allowlist of columns that can be updated via `set_fields` and `batch_set_fields`.
+const ALLOWED_FIELDS: &[&str] = &[
+    "agent",
+    "model",
+    "complexity",
+    "route_reason",
+    "agent_profile",
+    "selected_skills",
+    "route_attempts",
+    "attempts",
+    "branch",
+    "worktree",
+    "worktree_cleaned",
+    "summary",
+    "last_error",
+    "parent_id",
+    "block_reason",
+    "pr_number",
+    "pr_review_context",
+    "last_review_ts",
+    "last_comment_review_ts",
+    "merge_conflict_retries",
+    "ci_merge_failures",
+    "pr_create_failures",
+    "push_failures",
+    "review_agent_failures",
+    "review_cycles",
+    "review_invocations",
+    "needs_review_refires",
+    "review_session_expected",
+    "input_tokens",
+    "output_tokens",
+    "input_cost_usd",
+    "output_cost_usd",
+    "total_cost_usd",
+    "model_reroute_chain",
+    "limit_reroute_chain",
+    "budget_warning",
+    "budget_exceeded",
+    "memory",
+    "delegations",
+    "source",
+    "source_id",
+    "labels",
+    "auto_unblock_count",
+    "auto_unblock_last_at",
+    "auto_unblock_last_reason",
+    "ci_recovery_count",
+    "no_code_reroutes",
+    "network_retries",
+];
+
+/// Allowlist of fields that can be incremented via `increment` and `batch_increment`.
+const INCREMENTABLE_FIELDS: &[&str] = &[
+    "attempts",
+    "route_attempts",
+    "merge_conflict_retries",
+    "ci_merge_failures",
+    "pr_create_failures",
+    "push_failures",
+    "review_agent_failures",
+    "review_cycles",
+    "review_invocations",
+    "needs_review_refires",
+    "auto_unblock_count",
+    "ci_recovery_count",
+    "no_code_reroutes",
+    "network_retries",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -823,61 +893,9 @@ impl TaskStore {
             return Ok(());
         }
 
-        // Allowlist of columns that can be updated dynamically
-        const ALLOWED: &[&str] = &[
-            "agent",
-            "model",
-            "complexity",
-            "route_reason",
-            "agent_profile",
-            "selected_skills",
-            "route_attempts",
-            "attempts",
-            "branch",
-            "worktree",
-            "worktree_cleaned",
-            "summary",
-            "last_error",
-            "parent_id",
-            "block_reason",
-            "pr_number",
-            "pr_review_context",
-            "last_review_ts",
-            "last_comment_review_ts",
-            "merge_conflict_retries",
-            "ci_merge_failures",
-            "pr_create_failures",
-            "push_failures",
-            "review_agent_failures",
-            "review_cycles",
-            "review_invocations",
-            "needs_review_refires",
-            "review_session_expected",
-            "input_tokens",
-            "output_tokens",
-            "input_cost_usd",
-            "output_cost_usd",
-            "total_cost_usd",
-            "model_reroute_chain",
-            "limit_reroute_chain",
-            "budget_warning",
-            "budget_exceeded",
-            "memory",
-            "delegations",
-            "source",
-            "source_id",
-            "labels",
-            "auto_unblock_count",
-            "auto_unblock_last_at",
-            "auto_unblock_last_reason",
-            "ci_recovery_count",
-            "no_code_reroutes",
-            "network_retries",
-        ];
-
         for (col, _) in updates {
             anyhow::ensure!(
-                ALLOWED.contains(col),
+                ALLOWED_FIELDS.contains(col),
                 "column {col} is not in the update allowlist"
             );
         }
@@ -914,25 +932,8 @@ impl TaskStore {
 
     /// Increment an integer field by 1, returning the new value.
     pub async fn increment(&self, id: i64, field: &str) -> anyhow::Result<i32> {
-        const INCREMENTABLE: &[&str] = &[
-            "attempts",
-            "route_attempts",
-            "merge_conflict_retries",
-            "ci_merge_failures",
-            "pr_create_failures",
-            "push_failures",
-            "review_agent_failures",
-            "review_cycles",
-            "review_invocations",
-            "needs_review_refires",
-            "auto_unblock_count",
-            "ci_recovery_count",
-            "no_code_reroutes",
-            "network_retries",
-        ];
-
         anyhow::ensure!(
-            INCREMENTABLE.contains(&field),
+            INCREMENTABLE_FIELDS.contains(&field),
             "field {field} is not incrementable"
         );
 
@@ -1182,62 +1183,10 @@ impl TaskStore {
             return Ok(());
         }
 
-        // Allowlist matches set_fields
-        const ALLOWED: &[&str] = &[
-            "agent",
-            "model",
-            "complexity",
-            "route_reason",
-            "agent_profile",
-            "selected_skills",
-            "route_attempts",
-            "attempts",
-            "branch",
-            "worktree",
-            "worktree_cleaned",
-            "summary",
-            "last_error",
-            "parent_id",
-            "block_reason",
-            "pr_number",
-            "pr_review_context",
-            "last_review_ts",
-            "last_comment_review_ts",
-            "merge_conflict_retries",
-            "ci_merge_failures",
-            "pr_create_failures",
-            "push_failures",
-            "review_agent_failures",
-            "review_cycles",
-            "review_invocations",
-            "needs_review_refires",
-            "review_session_expected",
-            "input_tokens",
-            "output_tokens",
-            "input_cost_usd",
-            "output_cost_usd",
-            "total_cost_usd",
-            "model_reroute_chain",
-            "limit_reroute_chain",
-            "budget_warning",
-            "budget_exceeded",
-            "memory",
-            "delegations",
-            "source",
-            "source_id",
-            "labels",
-            "auto_unblock_count",
-            "auto_unblock_last_at",
-            "auto_unblock_last_reason",
-            "ci_recovery_count",
-            "no_code_reroutes",
-            "needs_review_refires",
-        ];
-
         for (_, entry_updates) in updates {
             for (col, _) in *entry_updates {
                 anyhow::ensure!(
-                    ALLOWED.contains(col),
+                    ALLOWED_FIELDS.contains(col),
                     "column {col} is not in the update allowlist"
                 );
             }
@@ -1285,25 +1234,9 @@ impl TaskStore {
             return Ok(());
         }
 
-        const INCREMENTABLE: &[&str] = &[
-            "attempts",
-            "route_attempts",
-            "merge_conflict_retries",
-            "ci_merge_failures",
-            "pr_create_failures",
-            "push_failures",
-            "review_agent_failures",
-            "review_cycles",
-            "review_invocations",
-            "needs_review_refires",
-            "auto_unblock_count",
-            "ci_recovery_count",
-            "no_code_reroutes",
-        ];
-
         for (_, field) in entries {
             anyhow::ensure!(
-                INCREMENTABLE.contains(field),
+                INCREMENTABLE_FIELDS.contains(field),
                 "field {field} is not incrementable"
             );
         }
