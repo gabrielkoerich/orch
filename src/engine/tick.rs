@@ -343,18 +343,21 @@ pub(crate) async fn tick_detect_silent_agents(
         }
 
         if let Some(store_id) = store_task.as_ref().map(|t| t.id) {
-            if next_agent.is_some() {
+            if let Some(ref fallback) = next_agent {
+                // Write the fallback agent into the store so dispatch can proceed
+                // directly without an LLM re-routing cycle. Clearing model forces
+                // model_for_complexity to pick the best available model for the new agent.
                 store_set_by_id(
                     &Some(Arc::clone(store)),
                     store_id,
                     &[
-                        ("agent", serde_json::json!("")),
+                        ("agent", serde_json::json!(fallback)),
                         ("model", serde_json::json!("")),
                         (
                             "last_error",
                             serde_json::json!(format!(
-                                "silence detected after {}s, clearing agent/model for re-route",
-                                config.silence_grace_period
+                                "silence detected after {}s, failing over to {}",
+                                config.silence_grace_period, fallback
                             )),
                         ),
                     ],
@@ -662,6 +665,55 @@ pub(crate) async fn tick_recover_stuck_tasks(
                 age_mins = timing.age.num_minutes(),
                 threshold_mins = timing.threshold / 60,
                 "recovering stuck task: no session found — reclaiming early → new"
+            );
+        }
+        // Apply agent/model cooldown for internal stuck tasks with active sessions,
+        // mirroring the external path (lines 501-546). Without this, the router picks
+        // the same agent/model that caused the hang, creating an infinite loop.
+        if timing.has_session {
+            let store_task = match store.resolve_task_id(repo, &task_id).await {
+                Ok(Some(store_id)) => match store.get(store_id).await {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!(task_id, error = %e, "failed to fetch task from store for stuck internal-task cooldown");
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(task_id, error = %e, "failed to resolve task id for stuck internal-task cooldown");
+                    None
+                }
+            };
+            let agent_name = store_task
+                .as_ref()
+                .and_then(|t| t.agent.clone())
+                .unwrap_or_default();
+            let model_name = store_task
+                .as_ref()
+                .and_then(|t| t.model.clone())
+                .unwrap_or_default();
+
+            if !agent_name.is_empty() && !model_name.is_empty() {
+                set_model_cooldown(&agent_name, &model_name, config.silence_cooldown);
+                record_agent_failure_with_message(
+                    &agent_name,
+                    &format!(
+                        "internal task stuck with active session after {}m",
+                        timing.age.num_minutes()
+                    ),
+                )
+                .await;
+            }
+            if !agent_name.is_empty() {
+                set_agent_cooldown(&agent_name, SILENCE_AGENT_COOLDOWN_SECS);
+            }
+            tracing::warn!(
+                task_id,
+                agent = %agent_name,
+                model = %model_name,
+                cooldown_secs = config.silence_cooldown,
+                "internal stuck-task cooldown applied — router will avoid this agent/model on next attempt"
             );
         }
         // Reset routing state so the LLM router is used on the next attempt
