@@ -172,7 +172,7 @@ impl Router {
         // Prime the RouterConfig free-model cache at startup (sync context) so
         // that async callers hitting expanded_model_pool() later return
         // instantly from cache instead of blocking a Tokio worker thread.
-        RouterConfig::prime_free_model_cache();
+        crate::engine::runner::agents::opencode::prime_free_model_cache();
         Self {
             config,
             available_agents,
@@ -313,19 +313,10 @@ impl Router {
         self.pool_index = 0;
     }
 
-    /// Discover free opencode models by delegating to RouterConfig.
-    ///
-    /// This delegates to RouterConfig::discover_free_opencode_models() to ensure
-    /// all callers use the same module-level cache that is primed at startup via
-    /// RouterConfig::prime_free_model_cache(). See module-level FREE_MODELS_CACHE
-    /// comment in config.rs for details on why the cache is shared.
     fn discover_free_opencode_models() -> Vec<String> {
-        RouterConfig::discover_free_opencode_models()
+        crate::engine::runner::agents::opencode::discover_free_opencode_models()
     }
 
-    /// Async version of discover_free_opencode_models that delegates to the cached
-    /// sync function via spawn_blocking so the blocking subprocess call does not
-    /// stall the Tokio runtime. The sync function handles the 1-hour cache internally.
     async fn discover_free_opencode_models_async() -> Vec<String> {
         tokio::task::spawn_blocking(Self::discover_free_opencode_models)
             .await

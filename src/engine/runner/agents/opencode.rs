@@ -22,25 +22,21 @@
 //! ## Free models
 //!
 //! Discoverable via: `opencode models | grep free`
-//! Known free models:
-//! - `opencode/minimax-m2.5-free`
-//! - `opencode/trinity-large-preview-free`
+//! Discovered dynamically at startup with 1-hour cache.
 
 use super::{AgentError, AgentRunner, ParsedResponse, PermissionRules};
 use crate::parser;
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
-type FreeModelsCache = Arc<Mutex<Option<(Vec<String>, std::time::Instant)>>>;
+/// Module-level cache for discovered free opencode models.
+/// Shared across all callers (router, runner, failover).
+static FREE_MODELS_CACHE: OnceLock<Mutex<(i64, Vec<String>)>> = OnceLock::new();
+static FREE_MODELS_REFRESH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Runner for OpenCode agent.
-pub struct OpenCodeRunner {
-    /// Cached free models (model list + timestamp).
-    free_models_cache: FreeModelsCache,
-    /// True while a background thread is refreshing the free-models cache.
-    /// Guards against spawning duplicate refresh threads.
-    free_models_refresh_in_progress: Arc<std::sync::atomic::AtomicBool>,
-}
+pub struct OpenCodeRunner;
 
 pub(crate) fn extract_ndjson_text(events: &[serde_json::Value]) -> Option<String> {
     let mut texts = Vec::new();
@@ -276,10 +272,7 @@ mod router_text_tests {
 
 impl OpenCodeRunner {
     pub fn new() -> Self {
-        Self {
-            free_models_cache: Arc::new(Mutex::new(None)),
-            free_models_refresh_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
+        Self
     }
 
     /// Extract text from `text` events.
@@ -368,52 +361,6 @@ impl OpenCodeRunner {
             },
             classify_opencode_message,
         )
-    }
-
-    /// Return the cached free-model list, refreshing in the background when stale.
-    ///
-    /// This method is intentionally non-blocking: it never calls the subprocess
-    /// directly. When the cache is cold or expired it spawns a `std::thread` to
-    /// run `discover_free_models()` in the background and returns the known
-    /// defaults immediately. This avoids stalling a Tokio worker thread with
-    /// blocking subprocess I/O when called from an async context.
-    ///
-    /// See: <https://github.com/gabrielkoerich/orch/issues/1473>
-    fn discover_free_models_cached(&self) -> Vec<String> {
-        // Fast path: return cached data if still fresh.
-        {
-            let cache = self
-                .free_models_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some((ref models, ref ts)) = *cache {
-                if ts.elapsed() < std::time::Duration::from_secs(3600) {
-                    return models.clone();
-                }
-            }
-        }
-
-        // Cache is cold. Spawn a background thread to refresh it without
-        // blocking the calling (async) thread. Only one refresh runs at a time.
-        if !self
-            .free_models_refresh_in_progress
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            let cache_arc = Arc::clone(&self.free_models_cache);
-            let flag_arc = Arc::clone(&self.free_models_refresh_in_progress);
-            std::thread::spawn(move || {
-                let _guard = scopeguard::guard((), |_| {
-                    flag_arc.store(false, std::sync::atomic::Ordering::Release);
-                });
-                let models = discover_free_models();
-                if let Ok(mut cache) = cache_arc.lock() {
-                    *cache = Some((models, std::time::Instant::now()));
-                }
-            });
-        }
-
-        // Return known defaults while the background refresh is in progress.
-        known_free_models()
     }
 }
 
@@ -557,7 +504,7 @@ printf '%s\n' {sq_permission_json} > .orch-opencode/opencode/opencode.json || {{
     }
 
     fn free_models(&self) -> Vec<String> {
-        self.discover_free_models_cached()
+        discover_free_opencode_models()
     }
 
     fn available_models(&self) -> Vec<String> {
@@ -780,26 +727,68 @@ fn classify_opencode_message(message: &str) -> AgentError {
     }
 }
 
-/// Statically-known free models used as a fallback when dynamic discovery
-/// is unavailable or has not completed yet.
-fn known_free_models() -> Vec<String> {
-    vec![
-        "opencode/minimax-m2.5-free".to_string(),
-        "opencode/trinity-large-preview-free".to_string(),
-    ]
+/// Discover free opencode models, with 1-hour cache and background refresh.
+///
+/// This is the single source of truth for free model discovery. Called by
+/// the router (pool expansion, model_map), the runner (failover), and
+/// startup priming.
+///
+/// Non-blocking: returns cached data immediately. When the cache is cold
+/// or expired, spawns a background thread to refresh via `opencode models`.
+pub fn discover_free_opencode_models() -> Vec<String> {
+    let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+
+    let now = chrono::Utc::now().timestamp();
+    // Fast path: return cached data if still fresh (1-hour TTL).
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let (ts, models) = &*guard;
+        if *ts != 0 && now.saturating_sub(*ts) < 3600 {
+            return models.clone();
+        }
+    }
+
+    // Cache is cold or expired. Spawn a background thread to refresh.
+    // Only one refresh runs at a time.
+    if !FREE_MODELS_REFRESH_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        std::thread::spawn(|| {
+            let _guard = scopeguard::guard((), |_| {
+                FREE_MODELS_REFRESH_IN_PROGRESS.store(false, Ordering::Release);
+            });
+            let discovered = run_opencode_models_discovery();
+            let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+            let now = chrono::Utc::now().timestamp();
+            if let Ok(mut guard) = cache.lock() {
+                *guard = (now, discovered);
+            }
+        });
+    }
+
+    // Return whatever is in cache (may be empty on first call).
+    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard.1.clone()
 }
 
-/// Discover free models by running `opencode models` and filtering.
+/// Prime the free-model cache synchronously at startup.
 ///
-/// This function is synchronous and may block while the subprocess runs.
-/// Do not call it directly from async code; use `discover_free_models_cached()`
-/// instead, which wraps discovery in a background thread.
-fn discover_free_models() -> Vec<String> {
-    // Known free models as fallback
-    let known = known_free_models();
+/// Called from `Router::new()` via `spawn_blocking` so the initial
+/// blocking subprocess doesn't stall the Tokio runtime.
+pub fn prime_free_model_cache() {
+    let discovered = run_opencode_models_discovery();
+    let cache = FREE_MODELS_CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+    let now = chrono::Utc::now().timestamp();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = (now, discovered);
+    }
+}
 
-    // Spawn with a 30s timeout to prevent orphaned processes.
-    // `opencode models` can hang indefinitely on network requests.
+/// Execute `opencode models` with a 30s timeout and return lines containing "free".
+fn run_opencode_models_discovery() -> Vec<String> {
+    if !crate::cmd_cache::command_exists("opencode") {
+        tracing::debug!("opencode not in PATH — skipping free model discovery");
+        return vec![];
+    }
+
     let mut child = match std::process::Command::new("opencode")
         .args(["models"])
         .stdout(std::process::Stdio::piped())
@@ -807,15 +796,18 @@ fn discover_free_models() -> Vec<String> {
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return known,
+        Err(e) => {
+            tracing::debug!(error = %e, "failed to spawn opencode models");
+            return vec![];
+        }
     };
 
     let timeout = std::time::Duration::from_secs(30);
     let start = std::time::Instant::now();
-    let stdout = loop {
+    loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
-                break child
+                let stdout = child
                     .stdout
                     .take()
                     .map(|mut s| {
@@ -824,34 +816,32 @@ fn discover_free_models() -> Vec<String> {
                         buf
                     })
                     .unwrap_or_default();
+                return stdout
+                    .lines()
+                    .filter(|l| l.to_lowercase().contains("free"))
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
             }
-            Ok(Some(_)) => return known,
+            Ok(Some(status)) => {
+                tracing::debug!(?status, "opencode models command failed");
+                return vec![];
+            }
             Ok(None) => {
                 if start.elapsed() > timeout {
                     tracing::warn!("opencode models timed out after 30s, killing process");
                     let _ = child.kill();
                     let _ = child.wait();
-                    return known;
+                    return vec![];
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            Err(_) => {
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to wait on opencode models");
                 let _ = child.kill();
-                return known;
+                return vec![];
             }
         }
-    };
-    let discovered: Vec<String> = stdout
-        .lines()
-        .filter(|line| line.to_lowercase().contains("free"))
-        .map(|line| line.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if discovered.is_empty() {
-        known
-    } else {
-        discovered
     }
 }
 
@@ -1192,12 +1182,13 @@ mod tests {
     }
 
     #[test]
-    fn free_models_returns_known_defaults() {
-        // When opencode isn't installed, should return known defaults
-        let models = discover_free_models();
-        assert!(!models.is_empty());
-        // Should at least have the known free models
-        assert!(models.iter().any(|m| m.contains("free")));
+    fn free_models_discovery_returns_vec() {
+        // discover_free_opencode_models returns empty when cache is cold
+        // and opencode isn't installed (no hardcoded fallbacks)
+        let models = discover_free_opencode_models();
+        // Just verify it returns without panicking — actual content
+        // depends on whether opencode is installed and responsive
+        assert!(models.len() < 1000, "sanity check");
     }
 
     // ── Fixture-based tests ─────────────────────────────────────
