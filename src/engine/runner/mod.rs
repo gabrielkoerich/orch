@@ -952,11 +952,48 @@ impl TaskRunner {
             WeightSignal::RateLimited {
                 agent: agent_name.clone(),
             }
-        } else if status == "done"
-            || status == "needs_review"
-            || status == "in_progress"
-            || status == "in_review"
-        {
+        } else if status == "needs_review" {
+            // Rate limit errors that escalate to needs_review must NOT reset backoff
+            // counters (issue #2153).  These errors indicate the agent is genuinely
+            // unavailable — resetting would wipe the cooldown and cause the next dispatch
+            // to retry the same rate-limited agent immediately.
+            //
+            // Detection: classify_run_error_type() confirms "rate limit" in last_error.
+            // We detect rate limits from the last_error text (consistent with the
+            // classify_run_error_type() pattern used in record_metrics).
+            let has_rate_limit_error =
+                last_error.contains("rate limit") || last_error.contains("usage limit");
+            if has_rate_limit_error {
+                // Record in the metrics store so the router's health check detects it.
+                if let Some(ref store) = self.store {
+                    let _ = store
+                        .record_rate_limit(&agent_name, "rate_limit", Some(task_id))
+                        .await;
+                }
+                // Also record via the cooldown system so model_for_complexity() skips
+                // this model.  Use the stored last_error text as the message since
+                // classify_run_error_type() already confirmed it contains "rate limit".
+                crate::engine::cooldown::record_agent_failure_with_message(
+                    &agent_name,
+                    &last_error,
+                )
+                .await;
+                if let Some(m) = model {
+                    crate::engine::cooldown::record_model_failure(&agent_name, m).await;
+                }
+                WeightSignal::RateLimited {
+                    agent: agent_name.clone(),
+                }
+            } else {
+                // Non-rate-limit "needs_review" (e.g. agent successfully completed but
+                // review agent is needed) — reset backoff so the next failure starts fresh.
+                crate::engine::cooldown::record_agent_success(&agent_name, model.unwrap_or(""))
+                    .await;
+                WeightSignal::Success {
+                    agent: agent_name.clone(),
+                }
+            }
+        } else if status == "done" || status == "in_progress" || status == "in_review" {
             // Reset exponential backoff counters so the next failure starts fresh.
             crate::engine::cooldown::record_agent_success(&agent_name, model.unwrap_or("")).await;
             WeightSignal::Success {
