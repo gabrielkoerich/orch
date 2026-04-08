@@ -1025,19 +1025,16 @@ pub(crate) mod patterns {
         if let Some(e) = detect_worktree_missing(text) {
             return e;
         }
-        if let Some(e) = detect_context_overflow(text) {
-            return e;
-        }
         // Only scan the tail of the combined output for CLI-style error
         // patterns. The full output may contain agent work product (code,
         // diffs, commit messages) that incidentally mentions rate limiting,
-        // authorization, or HTTP status codes. Real process errors appear at
-        // the end of the output. Scan a bounded tail
-        // (`RATE_LIMIT_SCAN_TAIL_BYTES`) to reduce false positives. Also, do
-        // not consider plain success envelopes (e.g. `is_error=false` handled
-        // earlier in agent-specific parsing) as errors — callers should only
-        // invoke classify_from_text when the process indicates failure.
+        // authorization, HTTP status codes, or context/auth errors. Real
+        // process errors appear at the end of the output. Scan a bounded tail
+        // (`RATE_LIMIT_SCAN_TAIL_BYTES`) to reduce false positives.
         let scan_tail = safe_tail(text, RATE_LIMIT_SCAN_TAIL_BYTES);
+        if let Some(e) = detect_context_overflow(scan_tail) {
+            return e;
+        }
         if let Some(e) = detect_rate_limit(scan_tail) {
             return e;
         }
@@ -1047,10 +1044,10 @@ pub(crate) mod patterns {
         if let Some(e) = detect_auth_error(scan_tail) {
             return e;
         }
-        if let Some(e) = detect_waiting_for_input(text) {
+        if let Some(e) = detect_waiting_for_input(scan_tail) {
             return e;
         }
-        if let Some(e) = detect_permission_denied(text) {
+        if let Some(e) = detect_permission_denied(scan_tail) {
             return e;
         }
         if let Some(e) = detect_stale_session(text) {
@@ -1424,6 +1421,115 @@ mod tests {
         assert!(
             matches!(err, AgentError::Auth { .. }),
             "real auth error at tail must be detected, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_no_false_positive_context_overflow_from_work_product() {
+        // Regression test for issue #2205: context overflow keywords in agent
+        // work product must not trigger ContextOverflow when the real failure is
+        // unrelated and appears at the end of the output.
+        let work_product = "const MAX_TOKEN_LIMIT = 10000;\n\
+             // Ensure we don't exceed the token limit per request\n\
+             fn check_token_limit(tokens: usize) { ... }\n\
+             if total_tokens > MAX_TOKEN_LIMIT { ... }\n\
+             // Note: too many tokens in the prompt causes context_length_exceeded\n"
+            .repeat(80);
+        let actual_error = "\nerror: command not found: cargo\n";
+        let text = format!("{work_product}{actual_error}");
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            !matches!(err, AgentError::ContextOverflow { .. }),
+            "work product context keywords must not trigger ContextOverflow, got: {err:?}"
+        );
+        assert!(
+            matches!(err, AgentError::MissingTool { .. }),
+            "the real tail error should still win, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_still_detects_real_context_overflow_at_tail() {
+        let padding = "normal agent work output ".repeat(100);
+        let text = format!("{padding}\nError: context_length_exceeded\n");
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            matches!(err, AgentError::ContextOverflow { .. }),
+            "real context overflow at tail must be detected, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_no_false_positive_permission_denied_from_work_product() {
+        // Regression test for issue #2205: permission-related keywords in agent
+        // work product must not trigger PermissionDenied when the real failure
+        // is unrelated and appears at the end of the output.
+        let work_product = "match fs::metadata(path) {\n\
+             Err(ref e) if e.kind() == ErrorKind::PermissionDenied => {\n\
+                 bail!(\"access denied: {path}\");\n\
+             }\n\
+             // Check if directory is writable\n\
+             if !path.is_writable() { ... }\n\
+             }\n"
+            .repeat(80);
+        let actual_error = "\nerror: command not found: cargo\n";
+        let text = format!("{work_product}{actual_error}");
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            !matches!(err, AgentError::PermissionDenied { .. }),
+            "work product permission keywords must not trigger PermissionDenied, got: {err:?}"
+        );
+        assert!(
+            matches!(err, AgentError::MissingTool { .. }),
+            "the real tail error should still win, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_still_detects_real_permission_denied_at_tail() {
+        let padding = "normal agent work output ".repeat(100);
+        let text = format!("{padding}\npermission denied: /etc/hosts\n");
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            matches!(err, AgentError::PermissionDenied { .. }),
+            "real permission denied at tail must be detected, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_no_false_positive_waiting_for_input_from_work_product() {
+        // Regression test for issue #2205: input-request keywords in agent work
+        // product must not trigger WaitingForInput when the real failure is
+        // unrelated and appears at the end of the output.
+        let work_product = "// Handle password prompts gracefully\n\
+             if prompt.contains(\"password:\") {\n\
+                 log::warn!(\"Password prompt detected — skipping interactive step\");\n\
+             }\n\
+             // SSH agent will ask for the deploy key passphrase\n\
+             fn handle_ssh_passphrase() { ... }\n\
+             )\n"
+            .repeat(80);
+        let actual_error = "\nerror: command not found: cargo\n";
+        let text = format!("{work_product}{actual_error}");
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            !matches!(err, AgentError::WaitingForInput { .. }),
+            "work product input keywords must not trigger WaitingForInput, got: {err:?}"
+        );
+        assert!(
+            matches!(err, AgentError::MissingTool { .. }),
+            "the real tail error should still win, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_from_text_still_detects_real_waiting_for_input_at_tail() {
+        let padding = "normal agent work output ".repeat(100);
+        let text = format!("{padding}\nEnter passphrase for key:\n");
+        let err = patterns::classify_from_text(1, &text);
+        assert!(
+            matches!(err, AgentError::WaitingForInput { .. }),
+            "real waiting for input at tail must be detected, got: {err:?}"
         );
     }
 
