@@ -370,8 +370,9 @@ pub async fn tick(
                 tracing::error!(
                     job_id = job.id,
                     ?e,
-                    "failed to persist job state before execution"
+                    "failed to persist job state before execution — skipping this tick to preserve restart safety"
                 );
+                continue; // retry next tick instead of risking duplicate execution
             }
         }
 
