@@ -145,6 +145,7 @@ pub async fn run_direct_command_raw(
     cmd: &mut tokio::process::Command,
     timeout: Duration,
 ) -> std::result::Result<String, DirectCommandError> {
+    cmd.kill_on_drop(true);
     let output = tokio::time::timeout(timeout + Duration::from_secs(5), cmd.output())
         .await
         .map_err(|_| DirectCommandError::Timeout {
