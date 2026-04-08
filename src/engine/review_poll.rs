@@ -593,6 +593,35 @@ pub(crate) async fn review_open_prs(
                     let retries = stored_task.merge_conflict_retries as u64;
                     if retries >= MAX_MERGE_CONFLICT_RETRIES {
                         tracing::error!(task_id, pr_number, retries, "PR approved but merge conflict retry limit reached — blocking for human review (auto_close disabled)");
+                        // Persist block_reason BEFORE transitioning to Blocked to avoid
+                        // a race where auto_unblock sees a blocked task without a reason
+                        // and immediately unblocks it.
+                        let fields = [
+                            (
+                                "block_reason",
+                                serde_json::json!(format!(
+                                    "merge conflict retry limit ({}) reached",
+                                    MAX_MERGE_CONFLICT_RETRIES
+                                )),
+                            ),
+                            (
+                                "last_error",
+                                serde_json::json!(format!(
+                                    "PR approved but has unresolved merge conflicts after {} retries",
+                                    retries
+                                )),
+                            ),
+                        ];
+                        if let Err(e) = store_set_result_by_id(
+                            &Some(Arc::clone(store)),
+                            task_info.store_id,
+                            &fields,
+                        )
+                        .await
+                        {
+                            tracing::error!(task_id, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+                            continue;
+                        }
                         if let Err(e) = task_manager
                             .update_task_status(&task.id, Status::Blocked)
                             .await

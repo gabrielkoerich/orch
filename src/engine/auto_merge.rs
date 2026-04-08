@@ -418,22 +418,25 @@ pub(crate) async fn auto_merge_pr(
                         ci_failures,
                         "CI failure limit reached — blocking for human intervention"
                     );
+                    // Persist block_reason BEFORE transitioning to Blocked to avoid
+                    // a race where auto_unblock sees a blocked task without a reason
+                    // and immediately unblocks it.
+                    let fields = [(
+                        "block_reason",
+                        serde_json::json!(format!(
+                            "CI failure limit ({}) reached during auto-merge",
+                            MAX_CI_MERGE_FAILURES
+                        )),
+                    )];
+                    if let Err(e) =
+                        store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+                    {
+                        tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+                        return Ok(());
+                    }
                     task_manager
                         .update_task_status(&task.id, Status::Blocked)
                         .await?;
-                    store_set(
-                        &Some(Arc::clone(store)),
-                        repo,
-                        &task.id.0,
-                        &[(
-                            "block_reason",
-                            serde_json::json!(format!(
-                                "CI failure limit ({}) reached during auto-merge",
-                                MAX_CI_MERGE_FAILURES
-                            )),
-                        )],
-                    )
-                    .await;
                 } else {
                     tracing::warn!(
                         task_id = task.id.0,
@@ -472,22 +475,26 @@ pub(crate) async fn auto_merge_pr(
                             ci_failures,
                             "CI timeout limit reached — blocking for human intervention"
                         );
+                        // Persist block_reason BEFORE transitioning to Blocked to avoid
+                        // a race where auto_unblock sees a blocked task without a reason
+                        // and immediately unblocks it.
+                        let fields = [(
+                            "block_reason",
+                            serde_json::json!(format!(
+                                "CI checks timed out after {} auto-merge failures",
+                                MAX_CI_MERGE_FAILURES
+                            )),
+                        )];
+                        if let Err(e) =
+                            store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields)
+                                .await
+                        {
+                            tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+                            return Ok(());
+                        }
                         task_manager
                             .update_task_status(&task.id, Status::Blocked)
                             .await?;
-                        store_set(
-                            &Some(Arc::clone(store)),
-                            repo,
-                            &task.id.0,
-                            &[(
-                                "block_reason",
-                                serde_json::json!(format!(
-                                    "CI checks timed out after {} auto-merge failures",
-                                    MAX_CI_MERGE_FAILURES
-                                )),
-                            )],
-                        )
-                        .await;
                     } else {
                         tracing::warn!(
                             task_id = task.id.0,
@@ -565,22 +572,25 @@ pub(crate) async fn auto_merge_pr(
                     retries,
                     "merge conflict retry limit reached"
                 );
+                // Persist block_reason BEFORE transitioning to Blocked to avoid
+                // a race where auto_unblock sees a blocked task without a reason
+                // and immediately unblocks it.
+                let fields = [(
+                    "block_reason",
+                    serde_json::json!(format!(
+                        "merge conflict retry limit ({}) reached",
+                        MAX_MERGE_CONFLICT_RETRIES
+                    )),
+                )];
+                if let Err(e) =
+                    store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+                {
+                    tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+                    return Ok(());
+                }
                 task_manager
                     .update_task_status(&task.id, Status::Blocked)
                     .await?;
-                store_set(
-                    &Some(Arc::clone(store)),
-                    repo,
-                    &task.id.0,
-                    &[(
-                        "block_reason",
-                        serde_json::json!(format!(
-                            "merge conflict retry limit ({}) reached",
-                            MAX_MERGE_CONFLICT_RETRIES
-                        )),
-                    )],
-                )
-                .await;
                 let comment = format!("Auto-merge failed after {} rebase attempts: {}", retries, e);
                 let footer = crate::engine::attribution_footer(
                     "Commented",
@@ -788,9 +798,9 @@ pub(crate) async fn auto_merge_pr(
             }
 
             // Rebase failed or no worktree or push failure — block
-            task_manager
-                .update_task_status(&task.id, Status::Blocked)
-                .await?;
+            // Persist block_reason BEFORE transitioning to Blocked to avoid
+            // a race where auto_unblock sees a blocked task without a reason
+            // and immediately unblocks it.
             let comment = if push_failed {
                 format!(
                     "Auto-merge failed (rebase succeeded but force-push failed): {}",
@@ -810,13 +820,16 @@ pub(crate) async fn auto_merge_pr(
             } else {
                 format!("auto-merge rebase failed after merge conflict: {}", e)
             };
-            store_set(
-                &Some(Arc::clone(store)),
-                repo,
-                &task.id.0,
-                &[("block_reason", serde_json::json!(block_reason))],
-            )
-            .await;
+            let fields = [("block_reason", serde_json::json!(block_reason))];
+            if let Err(e) =
+                store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+            {
+                tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+                return Ok(());
+            }
+            task_manager
+                .update_task_status(&task.id, Status::Blocked)
+                .await?;
             let footer =
                 crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
             if let Err(e) = gh
@@ -839,19 +852,21 @@ pub(crate) async fn auto_merge_pr(
 
         // Non-conflict merge failure (permissions, branch protection, etc.)
         tracing::error!(task_id = task.id.0, error = %e, "merge failed — blocking for human review");
+        // Persist block_reason BEFORE transitioning to Blocked to avoid
+        // a race where auto_unblock sees a blocked task without a reason
+        // and immediately unblocks it.
+        let fields = [(
+            "block_reason",
+            serde_json::json!(format!("auto-merge failed: {}", e)),
+        )];
+        if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+        {
+            tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+            return Ok(());
+        }
         task_manager
             .update_task_status(&task.id, Status::Blocked)
             .await?;
-        store_set(
-            &Some(Arc::clone(store)),
-            repo,
-            &task.id.0,
-            &[(
-                "block_reason",
-                serde_json::json!(format!("auto-merge failed: {}", e)),
-            )],
-        )
-        .await;
         let comment = format!("Auto-merge failed: {}", e);
         let footer =
             crate::engine::attribution_footer("Commented", review_agent, Some(review_model));
@@ -1218,6 +1233,18 @@ pub(crate) async fn handle_review_changes(
             max_cycles,
             "max review cycles exceeded, blocking for human review"
         );
+        // Persist block_reason BEFORE transitioning to Blocked to avoid
+        // a race where auto_unblock sees a blocked task without a reason
+        // and immediately unblocks it.
+        let fields = [(
+            "block_reason",
+            serde_json::json!(format!("max review cycles ({}) reached", max_cycles)),
+        )];
+        if let Err(e) = store_set_result(&Some(Arc::clone(store)), repo, &task.id.0, &fields).await
+        {
+            tracing::error!(task_id = task.id.0, err = %e, "failed to write block_reason — skipping block to avoid silent auto-unblock loop");
+            return Ok(());
+        }
         // A transient store failure here must not be counted as a review-agent
         // crash.  Log and return Ok — the next tick will re-check the task and
         // can retry the status transition.
