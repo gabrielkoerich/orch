@@ -108,17 +108,29 @@ pub async fn handle_error(
     let (retryable, error_msg) = match agent_err {
         agents::AgentError::RateLimit { message, .. } => {
             // Check for credit exhaustion - these require longer agent-wide cooldowns.
-            // For all other rate limits, record the agent-level cooldown immediately so
-            // the router can observe it before any concurrent tasks start their runs.
-            // handle_failover() also records the cooldown later, but setting it here
-            // means the in-memory map is updated right away — without this, concurrent
-            // dispatches that check cooldowns between now and handle_failover() will
-            // see no cooldown and waste another run against the same rate-limited agent.
+            // For all other rate limits, record both the agent-level and model-level
+            // cooldowns immediately so the router can observe them before any concurrent
+            // tasks start their runs. handle_failover() also records the cooldown later,
+            // but setting it here means the in-memory map is updated right away — without
+            // this, concurrent dispatches that check cooldowns between now and
+            // handle_failover() will see no cooldown and waste another run against the
+            // same rate-limited model.
+            //
+            // Setting BOTH cooldowns is critical: the router's model selection
+            // (model_for_complexity) checks is_model_in_cooldown(agent, model) which
+            // uses the agent:model key, so a model-level cooldown is needed to prevent
+            // the same model from being re-selected even when the agent-level cooldown
+            // is set. Without the model-level cooldown, the model continues to be
+            // picked and fails repeatedly (issue #2153).
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
                 crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
             } else {
                 crate::engine::cooldown::record_agent_failure_with_message(agent_name, message)
                     .await;
+                // Also record the model-specific cooldown so model_for_complexity skips it.
+                if let Some(model) = model_name {
+                    response::record_model_failure(agent_name, model).await;
+                }
             }
             (
                 response::RetryableError::UsageLimit,
@@ -127,14 +139,17 @@ pub async fn handle_error(
         }
         agents::AgentError::Auth { message } => {
             // Check for credit exhaustion first — those need longer agent-wide cooldowns.
-            // For plain auth failures (expired key, wrong token, etc.) record a standard
-            // agent-level failure so the router can observe it before concurrent tasks
-            // start another run against the same unavailable agent.
+            // For plain auth failures (expired key, wrong token, etc.) record both the
+            // agent-level and model-level cooldowns so the router can observe them before
+            // concurrent tasks start another run against the same unavailable model.
             if let Some(reason) = crate::engine::cooldown::detect_credit_exhaustion(message) {
                 crate::engine::cooldown::record_credit_exhaustion(agent_name, reason).await;
             } else {
                 crate::engine::cooldown::record_agent_failure_with_message(agent_name, message)
                     .await;
+                if let Some(model) = model_name {
+                    response::record_model_failure(agent_name, model).await;
+                }
             }
             (
                 response::RetryableError::AuthError,
@@ -551,6 +566,97 @@ mod tests {
         assert!(
             crate::engine::cooldown::is_agent_in_cooldown(agent),
             "agent should be in cooldown immediately after handle_error for RateLimit"
+        );
+    }
+
+    /// Verify that a rate limit error sets BOTH the agent-level and model-level cooldowns.
+    ///
+    /// This is critical: the router's model selection (model_for_complexity) checks
+    /// is_model_in_cooldown(agent, model) which uses the agent:model key format.
+    /// An agent-level cooldown alone does NOT prevent the same model from being
+    /// re-selected, causing the rate-limited model to fail repeatedly (issue #2153).
+    #[tokio::test]
+    async fn rate_limit_sets_both_agent_and_model_cooldowns() {
+        let runner = MockRunner { free: vec![] };
+        let agent = "test-agent-2153-model-cooldown";
+        let model = "opencode/github-copilot/qwen3.6-plus-free";
+
+        // Confirm no cooldowns before the error.
+        assert!(
+            !crate::engine::cooldown::is_agent_in_cooldown(agent),
+            "agent should not be in cooldown before handle_error"
+        );
+        assert!(
+            !crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "model should not be in cooldown before handle_error"
+        );
+
+        let err = AgentError::RateLimit {
+            message: "Upstream error from Alibaba: Request rate increased too quickly.".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-2153-a",
+            &err,
+            agent,
+            &runner,
+            Some(model),
+            Some("simple"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        // Agent-level cooldown must be set immediately.
+        assert!(
+            crate::engine::cooldown::is_agent_in_cooldown(agent),
+            "agent should be in agent-level cooldown after RateLimit"
+        );
+        // Model-level cooldown must ALSO be set immediately — this is the fix for issue #2153.
+        // Without this, model_for_complexity would still pick the same model.
+        assert!(
+            crate::engine::cooldown::is_model_in_cooldown(agent, model),
+            "model should be in model-level cooldown after RateLimit (fixes issue #2153)"
+        );
+    }
+
+    /// Verify that rate limit for a specific model does NOT cool other models of the same agent.
+    #[tokio::test]
+    async fn rate_limit_cooldown_is_model_specific() {
+        let runner = MockRunner { free: vec![] };
+        let agent = "test-agent-2153-model-specific";
+        let cooled_model = "opencode/github-copilot/qwen3.6-plus-free";
+        let other_model = "opencode/minimax-m2.5-free";
+
+        let err = AgentError::RateLimit {
+            message: "rate limit exceeded".to_string(),
+        };
+
+        let _result = handle_error(
+            "test-2153-b",
+            &err,
+            agent,
+            &runner,
+            Some(cooled_model),
+            Some("simple"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        // The specific model that hit the rate limit should be cooled.
+        assert!(
+            crate::engine::cooldown::is_model_in_cooldown(agent, cooled_model),
+            "rate-limited model should be in cooldown"
+        );
+        // Other models of the same agent should NOT be cooled.
+        assert!(
+            !crate::engine::cooldown::is_model_in_cooldown(agent, other_model),
+            "other models should not be cooled by a single model's rate limit"
         );
     }
 
