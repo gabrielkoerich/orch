@@ -999,6 +999,14 @@ impl GhHttp {
             .await
     }
 
+    /// Check whether an issue number refers to a pull request.
+    pub async fn is_pull_request(&self, repo: &str, number: &str) -> bool {
+        self.get_issue(repo, number)
+            .await
+            .map(|i| i.pull_request.is_some())
+            .unwrap_or(false)
+    }
+
     /// List issues filtered by a label (paginated).
     #[allow(dead_code)]
     pub async fn list_issues(&self, repo: &str, label: &str) -> anyhow::Result<Vec<GitHubIssue>> {

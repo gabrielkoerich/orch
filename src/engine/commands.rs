@@ -119,16 +119,7 @@ pub fn parse_command(body: &str) -> Option<OwnerCommand> {
     None
 }
 
-/// Extract issue number from a GitHub API issue URL.
-///
-/// Expected format: `https://api.github.com/repos/owner/repo/issues/123`
-fn extract_issue_number(issue_url: &str) -> Option<String> {
-    issue_url
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-        .map(String::from)
-}
+use crate::github::types::extract_issue_number_from_url;
 
 /// Scan recent comments for owner slash commands and execute them.
 ///
@@ -193,7 +184,11 @@ pub async fn scan_commands(
         };
 
         // Extract issue number from the comment's issue URL
-        let issue_number = match mention.issue_url.as_deref().and_then(extract_issue_number) {
+        let issue_number = match mention
+            .issue_url
+            .as_deref()
+            .and_then(extract_issue_number_from_url)
+        {
             Some(n) => n,
             None => {
                 tracing::warn!(
@@ -204,95 +199,22 @@ pub async fn scan_commands(
             }
         };
 
-        // Only execute commands on open issues/PRs to prevent acting on
-        // closed/merged issues (e.g. review comments with code examples).
-        match gh.get_issue(repo, &issue_number).await {
-            Ok(issue) if issue.state == "open" => {}
-            Ok(issue) => {
-                tracing::debug!(
-                    issue = %issue_number,
-                    state = %issue.state,
-                    command = %command,
-                    "ignoring slash command on non-open issue"
-                );
-                new_processed.push(mention.id.clone());
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    issue = %issue_number,
-                    err = %e,
-                    "failed to check issue state, skipping command"
-                );
-                continue;
-            }
+        let outcome = validate_and_run_command(
+            backend,
+            &gh,
+            repo,
+            &issue_number,
+            &command,
+            &mention.author,
+            store,
+            task_manager,
+        )
+        .await;
+
+        match outcome {
+            CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => continue,
+            _ => new_processed.push(mention.id.clone()),
         }
-
-        // Validate author is repo owner or collaborator
-        match gh.is_collaborator(repo, &mention.author).await {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::info!(
-                    author = %mention.author,
-                    command = %command,
-                    issue = %issue_number,
-                    "ignoring slash command from non-collaborator"
-                );
-                new_processed.push(mention.id.clone());
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    author = %mention.author,
-                    err = %e,
-                    "failed to check collaborator status, skipping command"
-                );
-                continue;
-            }
-        }
-
-        // Execute the command
-        let task_id = ExternalId(issue_number.clone());
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-        let result =
-            execute_command(backend, &gh, repo, &task_id, &command, store, task_manager).await;
-
-        match result {
-            Ok(msg) => {
-                tracing::info!(
-                    issue = %issue_number,
-                    author = %mention.author,
-                    command = %command,
-                    "executed owner command"
-                );
-                let confirmation = format!(
-                    "[{now}] {msg} — executed by @{}{}",
-                    mention.author,
-                    crate::engine::orch_footer()
-                );
-                if let Err(e) = backend.post_comment(&task_id, &confirmation).await {
-                    tracing::warn!(issue = %issue_number, err = %e, "failed to post confirmation");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    issue = %issue_number,
-                    command = %command,
-                    err = %e,
-                    "failed to execute owner command"
-                );
-                let error_msg = format!(
-                    "[{now}] Failed to execute `{command}`: {e}{}",
-                    crate::engine::orch_footer()
-                );
-                if let Err(e2) = backend.post_comment(&task_id, &error_msg).await {
-                    tracing::warn!(issue = %issue_number, err = %e2, "failed to post error comment");
-                }
-            }
-        }
-
-        new_processed.push(mention.id.clone());
     }
 
     // Persist processed IDs (keep last 500 to avoid unbounded growth)
@@ -413,6 +335,92 @@ pub async fn execute_command(
             )
         }
     }
+}
+
+/// Result of attempting to validate and run a slash command.
+pub enum CommandOutcome {
+    /// Command executed successfully or failed — either way, it was handled.
+    Executed,
+    /// Issue/PR is not open — command was skipped.
+    NotOpen,
+    /// Author is not a collaborator — command was skipped.
+    NotCollaborator,
+    /// Failed to fetch issue state — should retry.
+    FetchFailed,
+    /// Failed to check collaborator status — should retry.
+    CollaboratorCheckFailed,
+}
+
+/// Validate a slash command (issue open, author is collaborator) and execute it.
+///
+/// Shared by both `scan_commands` (issue comments) and `scan_mentions` (mention
+/// handling). Posts a confirmation or error comment on the issue/PR.
+#[allow(clippy::too_many_arguments)]
+pub async fn validate_and_run_command(
+    backend: &Arc<dyn ExternalBackend>,
+    gh: &GhHttp,
+    repo: &str,
+    issue_number: &str,
+    command: &OwnerCommand,
+    author: &str,
+    store: &Option<Arc<crate::store::TaskStore>>,
+    task_manager: &Arc<crate::engine::tasks::TaskManager>,
+) -> CommandOutcome {
+    // Check issue state
+    let issue_data = match gh.get_issue(repo, issue_number).await {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!(issue = %issue_number, err = %e, "failed to check issue state");
+            return CommandOutcome::FetchFailed;
+        }
+    };
+
+    if issue_data.state != "open" {
+        tracing::debug!(issue = %issue_number, state = %issue_data.state, command = %command, "ignoring slash command on non-open issue");
+        return CommandOutcome::NotOpen;
+    }
+
+    // Check collaborator status
+    match gh.is_collaborator(repo, author).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(author, command = %command, issue = %issue_number, "ignoring slash command from non-collaborator");
+            return CommandOutcome::NotCollaborator;
+        }
+        Err(e) => {
+            tracing::warn!(author, err = %e, "failed to check collaborator status");
+            return CommandOutcome::CollaboratorCheckFailed;
+        }
+    }
+
+    // Execute and post result
+    let task_id = ExternalId(issue_number.to_string());
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    match execute_command(backend, gh, repo, &task_id, command, store, task_manager).await {
+        Ok(msg) => {
+            tracing::info!(issue = %issue_number, author, command = %command, "executed command");
+            let confirmation = format!(
+                "[{now}] {msg} — executed by @{author}{}",
+                crate::engine::orch_footer()
+            );
+            if let Err(e) = backend.post_comment(&task_id, &confirmation).await {
+                tracing::warn!(issue = %issue_number, err = %e, "failed to post confirmation");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(issue = %issue_number, command = %command, err = %e, "failed to execute command");
+            let error_msg = format!(
+                "[{now}] Failed to execute `{command}`: {e}{}",
+                crate::engine::orch_footer()
+            );
+            if let Err(e2) = backend.post_comment(&task_id, &error_msg).await {
+                tracing::warn!(issue = %issue_number, err = %e2, "failed to post error comment");
+            }
+        }
+    }
+
+    CommandOutcome::Executed
 }
 
 #[cfg(test)]
@@ -702,14 +710,14 @@ mod tests {
     #[test]
     fn extract_issue_number_works() {
         assert_eq!(
-            extract_issue_number("https://api.github.com/repos/owner/repo/issues/123"),
+            extract_issue_number_from_url("https://api.github.com/repos/owner/repo/issues/123"),
             Some("123".into())
         );
     }
 
     #[test]
     fn extract_issue_number_empty_url() {
-        assert_eq!(extract_issue_number(""), None);
+        assert_eq!(extract_issue_number_from_url(""), None);
     }
 
     #[test]

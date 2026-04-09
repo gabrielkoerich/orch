@@ -85,6 +85,17 @@ pub struct GitHubComment {
     pub author_association: Option<String>,
 }
 
+/// Extract issue/PR number from a GitHub API URL.
+///
+/// Parses the trailing numeric segment from URLs like:
+/// `https://api.github.com/repos/owner/repo/issues/123`
+pub fn extract_issue_number_from_url(url: &str) -> Option<String> {
+    url.rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .map(String::from)
+}
+
 /// PR review state - "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubReview {
