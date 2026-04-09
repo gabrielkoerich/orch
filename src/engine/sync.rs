@@ -283,31 +283,33 @@ fn classify_failure_from_run(run: &crate::store::TaskRun) -> Option<FailureCateg
     Some(category)
 }
 
-/// Extract a linked issue number from PR body text.
-/// Looks for patterns like "Fixes #123", "Closes #123", "Resolves #123",
-/// or "Related to #123" and returns the first match.
-fn extract_linked_issue(body: &str) -> Option<String> {
-    // GitHub closing keywords: https://docs.github.com/en/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue
-    // Also matches "Related to #123" for non-closing links
-    let patterns = [
-        r"(?i)fixes\s+#(\d+)",
-        r"(?i)closes\s+#(\d+)",
-        r"(?i)resolves\s+#(\d+)",
-        r"(?i)fixed\s+#(\d+)",
-        r"(?i)closed\s+#(\d+)",
-        r"(?i)resolved\s+#(\d+)",
-        r"(?i)related\s+to\s+#(\d+)",
-    ];
-
-    for pattern in &patterns {
-        let re = regex::Regex::new(pattern).ok()?;
-        if let Some(caps) = re.captures(body) {
-            if let Some(matched) = caps.get(1) {
-                return Some(matched.as_str().to_string());
-            }
+/// Resolve the parent task ID for a mention.
+///
+/// - If the mention is on a PR, look up the task that owns that PR via `pr_number`.
+/// - If the mention is on an issue, look up the task by external_id (issue number).
+async fn resolve_mention_parent_id(
+    store: &crate::store::TaskStore,
+    repo: &str,
+    issue_num: &str,
+    is_pr: bool,
+) -> Option<i64> {
+    if is_pr {
+        if let Ok(pr_num) = issue_num.parse::<i32>() {
+            store
+                .resolve_id_by_pr_number(repo, pr_num)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
         }
+    } else {
+        store
+            .resolve_id_by_external(repo, issue_num)
+            .await
+            .ok()
+            .flatten()
     }
-    None
 }
 
 fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
@@ -1112,21 +1114,11 @@ async fn scan_mentions(
 
             // If we have an issue number, try to execute the command
             if let Some(issue_num) = issue_number {
-                // Fetch issue data and check if it's a PR
+                // Fetch issue data to check state and whether it's a PR
                 let issue_data = gh.get_issue(repo, &issue_num).await.ok();
                 let is_pr = issue_data
                     .as_ref()
                     .is_some_and(|i| i.pull_request.is_some());
-
-                // Extract linked issue number for PRs (to use as parent_id)
-                let linked_issue_num = if is_pr {
-                    issue_data
-                        .as_ref()
-                        .and_then(|issue| issue.body.as_ref())
-                        .and_then(|body| extract_linked_issue(body))
-                } else {
-                    None
-                };
 
                 // Check if issue is still open
                 match issue_data {
@@ -1146,12 +1138,8 @@ async fn scan_mentions(
                                 "Mention by @{}:\n\n{}\n\n**Skipped:** target issue is closed",
                                 mention.author, mention.body
                             );
-                            // Use linked issue for parent_id if available, otherwise no parent
-                            let parent_id = if let Some(ref linked) = linked_issue_num {
-                                s.resolve_id_by_external(repo, linked).await.ok().flatten()
-                            } else {
-                                None
-                            };
+                            let parent_id =
+                                resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
                             let _ = s
                                 .create_internal(
                                     repo,
@@ -1199,12 +1187,8 @@ async fn scan_mentions(
                                 "Mention by @{}:\n\n{}\n\n**Skipped:** author is not a collaborator",
                                 mention.author, mention.body
                             );
-                            // Use linked issue for parent_id if available, otherwise no parent
-                            let parent_id = if let Some(ref linked) = linked_issue_num {
-                                s.resolve_id_by_external(repo, linked).await.ok().flatten()
-                            } else {
-                                None
-                            };
+                            let parent_id =
+                                resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
                             let _ = s
                                 .create_internal(
                                     repo,
@@ -1290,15 +1274,7 @@ async fn scan_mentions(
                         "Mention by @{} on issue #{}:\n\n{}\n\n**Status:** Command executed",
                         mention.author, issue_num, mention.body
                     );
-                    // Use linked issue for parent_id if available (for PRs), otherwise use issue_num
-                    let parent_id = if let Some(ref linked) = linked_issue_num {
-                        s.resolve_id_by_external(repo, linked).await.ok().flatten()
-                    } else {
-                        s.resolve_id_by_external(repo, &issue_num)
-                            .await
-                            .ok()
-                            .flatten()
-                    };
+                    let parent_id = resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
                     if let Err(e) = s
                         .create_internal(
                             repo,
@@ -1334,16 +1310,15 @@ async fn scan_mentions(
             .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
             .map(|n| n.to_string());
 
-        // Detect whether the comment is on a PR and capture the issue/PR data.
-        // For PRs, we'll need the body to find the linked issue for parent_id.
-        let issue_data = if let Some(ref num) = issue_num_opt {
-            gh.get_issue(repo, num).await.ok()
+        // Detect whether the comment is on a PR (GitHub PRs share the issue number namespace).
+        let is_pr = if let Some(ref num) = issue_num_opt {
+            gh.get_issue(repo, num)
+                .await
+                .map(|i| i.pull_request.is_some())
+                .unwrap_or(false)
         } else {
-            None
+            false
         };
-        let is_pr = issue_data
-            .as_ref()
-            .is_some_and(|i| i.pull_request.is_some());
 
         let (title, task_body) = match (&issue_num_opt, is_pr) {
             (Some(num), false) => (
@@ -1370,24 +1345,8 @@ async fn scan_mentions(
         };
 
         if let Some(s) = store {
-            // Determine parent_id: for PRs, extract linked issue from body
-            let parent_id = if is_pr {
-                // For PRs, look for "Fixes #123" or "Closes #123" patterns in the PR body
-                if let Some(issue_num) = issue_data
-                    .as_ref()
-                    .and_then(|issue| issue.body.as_ref())
-                    .and_then(|body| extract_linked_issue(body))
-                {
-                    s.resolve_id_by_external(repo, &issue_num)
-                        .await
-                        .ok()
-                        .flatten()
-                } else {
-                    None
-                }
-            } else if let Some(ref num) = issue_num_opt {
-                // For regular issues, use the issue number directly
-                s.resolve_id_by_external(repo, num).await.ok().flatten()
+            let parent_id = if let Some(ref num) = issue_num_opt {
+                resolve_mention_parent_id(s, repo, num, is_pr).await
             } else {
                 None
             };
@@ -3503,73 +3462,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alert_val.as_deref(), Some("0"));
-    }
-
-    // ── extract_linked_issue tests ─────────────────────────────────────────
-
-    #[test]
-    fn test_extract_linked_issue_fixes() {
-        let body = "This PR fixes #123";
-        assert_eq!(extract_linked_issue(body), Some("123".to_string()));
-    }
-
-    #[test]
-    fn test_extract_linked_issue_closes() {
-        let body = "This PR closes #456";
-        assert_eq!(extract_linked_issue(body), Some("456".to_string()));
-    }
-
-    #[test]
-    fn test_extract_linked_issue_resolves() {
-        let body = "This resolves #789";
-        assert_eq!(extract_linked_issue(body), Some("789".to_string()));
-    }
-
-    #[test]
-    fn test_extract_linked_issue_related_to() {
-        let body = "This is related to #101112";
-        assert_eq!(extract_linked_issue(body), Some("101112".to_string()));
-    }
-
-    #[test]
-    fn test_extract_linked_issue_case_insensitive() {
-        let body = "This FIXES #111 and Closes #222";
-        assert_eq!(extract_linked_issue(body), Some("111".to_string()));
-    }
-
-    #[test]
-    fn test_extract_linked_issue_multiple_returns_first() {
-        let body = "This fixes #1 and closes #2";
-        assert_eq!(extract_linked_issue(body), Some("1".to_string()));
-    }
-
-    #[test]
-    fn test_extract_linked_issue_no_match() {
-        let body = "This PR has no linked issues";
-        assert_eq!(extract_linked_issue(body), None);
-    }
-
-    #[test]
-    fn test_extract_linked_issue_empty() {
-        let body = "";
-        assert_eq!(extract_linked_issue(body), None);
-    }
-
-    #[test]
-    fn test_extract_linked_issue_fixed_past_tense() {
-        let body = "This fixed #999";
-        assert_eq!(extract_linked_issue(body), Some("999".to_string()));
-    }
-
-    #[test]
-    fn test_extract_linked_issue_resolved_past_tense() {
-        let body = "This resolved #888";
-        assert_eq!(extract_linked_issue(body), Some("888".to_string()));
-    }
-
-    #[test]
-    fn test_extract_linked_issue_closed_past_tense() {
-        let body = "This closed #777";
-        assert_eq!(extract_linked_issue(body), Some("777".to_string()));
     }
 }

@@ -524,6 +524,25 @@ impl TaskStore {
         Ok(id)
     }
 
+    /// Resolve the parent task ID by PR number.
+    ///
+    /// When a mention arrives on a PR, we need to find the issue task that owns
+    /// this PR. The task store tracks `pr_number` on tasks, so we look up the
+    /// task whose `pr_number` matches the given PR number.
+    pub async fn resolve_id_by_pr_number(
+        &self,
+        repo: &str,
+        pr_number: i32,
+    ) -> anyhow::Result<Option<i64>> {
+        let row = sqlx::query("SELECT id FROM tasks WHERE repo = ? AND pr_number = ? LIMIT 1")
+            .bind(repo)
+            .bind(pr_number)
+            .fetch_optional(&self.pool)
+            .await?;
+        let id = row.map(|r| r.try_get::<i64, _>("id")).transpose()?;
+        Ok(id)
+    }
+
     /// Lightweight lookup: return only the `agent` column for a given repo + external_id.
     /// Returns None when no row matches or the agent is NULL/empty.
     pub async fn get_agent_by_external_id(
