@@ -716,6 +716,9 @@ pub trait AgentRunner: Send + Sync {
 
 /// Get the appropriate AgentRunner implementation for an agent name.
 pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
+    // Agents that are known to be claude-compatible (same NDJSON output format)
+    const CLAUDE_COMPATIBLE_AGENTS: &[&str] = &["claude", "kimi", "minimax", "olm"];
+
     match agent_name {
         "claude" => Box::new(claude::ClaudeRunner::new(agent_name)),
         "kimi" => Box::new(kimi::KimiClaudeRunner::new()),
@@ -724,10 +727,13 @@ pub fn get_runner(agent_name: &str) -> Box<dyn AgentRunner> {
         "opencode" => Box::new(opencode::OpenCodeRunner::new()),
         // Unknown agents fall back to Claude-compatible parsing
         other => {
-            tracing::warn!(
-                agent = other,
-                "unknown agent, using claude-compatible runner"
-            );
+            // Only warn if the agent is not known to be claude-compatible
+            if !CLAUDE_COMPATIBLE_AGENTS.contains(&other) {
+                tracing::warn!(
+                    agent = other,
+                    "unknown agent, using claude-compatible runner"
+                );
+            }
             Box::new(claude::ClaudeRunner::new(other))
         }
     }
@@ -1267,6 +1273,8 @@ mod tests {
         assert_eq!(get_runner("minimax").name(), "minimax");
         assert_eq!(get_runner("codex").name(), "codex");
         assert_eq!(get_runner("opencode").name(), "opencode");
+        // olm is claude-compatible and should return correct name
+        assert_eq!(get_runner("olm").name(), "olm");
         // Unknown falls back to claude-compatible
         assert_eq!(get_runner("unknown-agent").name(), "unknown-agent");
     }
