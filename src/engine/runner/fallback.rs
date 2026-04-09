@@ -71,7 +71,10 @@ async fn try_free_model_reroute(
     if let Some(agent) = set_agent {
         fields.push(("agent", serde_json::json!(agent)));
     }
-    store::store_set(store, repo, task_id, &fields).await;
+    if let Err(e) = store::store_set_result(store, repo, task_id, &fields).await {
+        tracing::warn!(task_id, err = %e, "try_free_model_reroute: failed to persist model update — not rerouting");
+        return None; // let caller fall through to normal failover
+    }
     if apply_backoff {
         response::wait_for_fallback_backoff(task_id, store, repo).await;
     }
@@ -815,6 +818,39 @@ mod tests {
         assert!(
             matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "needs_review"),
             "context overflow must escalate directly to needs_review without cycling through fallback agents"
+        );
+    }
+
+    /// When store is None, store_set_result returns Ok(()) — reroute proceeds normally.
+    /// This verifies the happy path is not broken by the error-propagation change.
+    #[tokio::test]
+    async fn free_model_reroute_succeeds_without_store() {
+        let runner = MockRunner {
+            free: vec!["opencode/mimo-v2-omni-free".to_string()],
+        };
+        let err = AgentError::Unknown {
+            exit_code: 0,
+            message: String::new(),
+        };
+
+        // store=None → store_set_result returns Ok(()) → reroute proceeds
+        let result = handle_error(
+            "test-2293-a",
+            &err,
+            "opencode",
+            &runner,
+            Some("opencode/gpt-5.4-mini"),
+            Some("simple"),
+            1,
+            &None,
+            "owner/repo",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(result, ErrorHandleResult::EarlyReturn { ref status } if status == "routed"),
+            "expected EarlyReturn{{status: routed}} — store_set_result with None store should not prevent reroute"
         );
     }
 
