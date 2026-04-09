@@ -1177,7 +1177,12 @@ pub async fn serve() -> anyhow::Result<()> {
                     action = %msg.metadata.get("action").and_then(|v| v.as_str()).unwrap_or("unknown"),
                     "webhook event received, triggering immediate tick"
                 );
-                let _ = transport_for_webhook.route(&msg).await;
+                let route = transport_for_webhook.route(&msg).await;
+                tracing::debug!(
+                    channel = %msg.channel,
+                    route = ?route,
+                    "webhook event routed"
+                );
                 // Wake up the engine tick immediately instead of waiting up to 10s
                 notify.notify_one();
             }
