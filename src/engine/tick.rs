@@ -214,7 +214,7 @@ pub(crate) async fn tick_detect_silent_agents(
     let grace = std::time::Duration::from_secs(config.silence_grace_period);
     let silent_sessions = capture.get_silent_sessions_for_repo(repo, grace).await;
 
-    for (task_id, session_name) in silent_sessions {
+    for (task_id, session_name, silence_age_secs) in silent_sessions {
         let use_backend = should_use_backend(&task_id);
         // Look up agent + model from the store so we can cooldown the right model.
         let store_task = match store.resolve_task_id(repo, &task_id).await {
@@ -244,6 +244,7 @@ pub(crate) async fn tick_detect_silent_agents(
             task_id,
             agent = %agent_name,
             model = %model_name,
+            silence_age_secs,
             grace_secs = config.silence_grace_period,
             cooldown_secs = config.silence_cooldown,
             "agent silent since session start — killing session, cooling down model + agent, failing over"
