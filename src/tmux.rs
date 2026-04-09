@@ -73,6 +73,9 @@ impl TmuxManager {
         let mut cmd = Command::new("tmux");
         cmd.args(["new-session", "-d", "-s", &name, "-c", working_dir]);
 
+        // Suppress oh-my-zsh update prompts that can intercept agent input.
+        cmd.arg("-e").arg("DISABLE_AUTO_UPDATE=true");
+
         // Inject non-secret environment variables into the new session if provided.
         // For secrets like GH_TOKEN, callers should use `set_env()` after
         // session creation to avoid exposing them in process arguments.
@@ -588,6 +591,17 @@ mod tests {
         )
     }
 
+    /// RAII guard that kills a tmux session on drop, even if the test panics.
+    struct SessionGuard(String);
+
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &self.0])
+                .output();
+        }
+    }
+
     #[test]
     fn session_name_internal_task_id_is_sanitized() {
         let tmux = TmuxManager::new();
@@ -705,6 +719,7 @@ mod tests {
                 return;
             }
         }
+        let _guard = SessionGuard(session.clone());
 
         // Use our helper to set an environment variable
         let result = tmux.set_env(&session, "TEST_VAR", "test_value").await;
@@ -720,7 +735,6 @@ mod tests {
             Ok(o) => o,
             Err(_) => {
                 eprintln!("Skipping test: unable to check tmux environment");
-                let _ = tmux.kill_session(&session).await;
                 return;
             }
         };
@@ -730,9 +744,6 @@ mod tests {
             "Expected TEST_VAR=test_value, got: {}",
             stdout
         );
-
-        // Cleanup: kill the test session
-        let _ = tmux.kill_session(&session).await;
     }
 
     /// Verify unset_env runs the correct tmux set-environment -u command.
@@ -756,6 +767,7 @@ mod tests {
                 return;
             }
         }
+        let _guard = SessionGuard(session.clone());
 
         // First set a variable
         let set_result = tmux.set_env(&session, "TO_DELETE", "temporary").await;
@@ -771,7 +783,6 @@ mod tests {
             Ok(o) => o,
             Err(_) => {
                 eprintln!("Skipping test: unable to check tmux environment");
-                let _ = tmux.kill_session(&session).await;
                 return;
             }
         };
@@ -784,9 +795,6 @@ mod tests {
         // Call unset_session_env - verify it runs without error
         let unset_result = tmux.unset_env(&session, "TO_DELETE").await;
         assert!(unset_result.is_ok(), "unset_env should succeed");
-
-        // Cleanup: kill the test session
-        let _ = tmux.kill_session(&session).await;
     }
 
     #[tokio::test]
@@ -806,11 +814,10 @@ mod tests {
                 return;
             }
         }
+        let _guard = SessionGuard(session.clone());
 
         assert!(tmux.session_blocks_dispatch(&session).await);
         assert!(tmux.session_exists(&session).await);
-
-        let _ = tmux.kill_session(&session).await;
     }
 
     #[tokio::test]
@@ -830,6 +837,7 @@ mod tests {
                 return;
             }
         }
+        let _guard = SessionGuard(session.clone());
 
         let set_option_result = tokio::process::Command::new("tmux")
             .args(["set-option", "-t", &session, "remain-on-exit", "on"])
@@ -837,7 +845,6 @@ mod tests {
             .await;
         if !matches!(set_option_result, Ok(ref o) if o.status.success()) {
             eprintln!("Skipping test: unable to set tmux remain-on-exit option");
-            let _ = tmux.kill_session(&session).await;
             return;
         }
 
@@ -847,7 +854,6 @@ mod tests {
             .await;
         if !matches!(send_exit_result, Ok(ref o) if o.status.success()) {
             eprintln!("Skipping test: unable to exit tmux pane");
-            let _ = tmux.kill_session(&session).await;
             return;
         }
 

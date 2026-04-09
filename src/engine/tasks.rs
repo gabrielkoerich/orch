@@ -201,30 +201,10 @@ impl TaskManager {
     pub async fn list_tasks(&self, filter: TaskFilter) -> anyhow::Result<Vec<Task>> {
         let mut tasks = Vec::new();
 
+        let is_all = filter.status.as_deref() == Some("all");
+
         if let Some(status_str) = &filter.status {
-            if status_str == "all" {
-                // Return all tasks regardless of status
-                if let Some(ref store) = self.store {
-                    let all_tasks = store.list_all(&self.repo).await?;
-                    for t in all_tasks {
-                        if let Some(ref source) = filter.source {
-                            if t.source != *source {
-                                continue;
-                            }
-                        }
-                        if t.origin == "internal" {
-                            tasks.push(Task::Internal(t));
-                        } else {
-                            tasks.push(Task::External(store_task_to_external(&t)));
-                        }
-                    }
-                } else {
-                    let external_tasks = self.backend.list_all_tasks().await?;
-                    for t in external_tasks {
-                        tasks.push(Task::External(t));
-                    }
-                }
-            } else {
+            if !is_all {
                 let task_status = TaskStatus::from_str(status_str).unwrap_or(TaskStatus::New);
                 let backend_status = match status_str.as_str() {
                     "new" => Status::New,
@@ -266,11 +246,22 @@ impl TaskManager {
                     tasks.push(Task::Internal(t));
                 }
             }
-        } else {
-            // No filters — return all active tasks (exclude done) via SQL WHERE
-            if let Some(ref store) = self.store {
-                let active_tasks = store.list_active(&self.repo).await?;
-                for t in active_tasks {
+        }
+
+        // No status filter or --status all: return all tasks for the repo
+        if filter.status.is_none() || is_all {
+            let store_tasks = if let Some(ref store) = self.store {
+                if is_all {
+                    store.list_all(&self.repo).await?
+                } else {
+                    store.list_active(&self.repo).await?
+                }
+            } else {
+                vec![]
+            };
+
+            if !store_tasks.is_empty() {
+                for t in store_tasks {
                     if t.origin == "internal" {
                         tasks.push(Task::Internal(t));
                     } else {
@@ -278,7 +269,6 @@ impl TaskManager {
                     }
                 }
             } else {
-                // No store — fall back to backend for external tasks
                 let external_tasks = self.backend.list_all_tasks().await?;
                 for t in external_tasks {
                     tasks.push(Task::External(t));

@@ -1850,6 +1850,17 @@ mod tests {
             .await
             .expect("failed to start tmux session");
 
+        // Guard ensures session cleanup even on panic
+        struct SessionGuard(String);
+        impl Drop for SessionGuard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &self.0])
+                    .output();
+            }
+        }
+        let _guard = SessionGuard(session_name.clone());
+
         // Register session with capture service and transport binding
         capture
             .register_session("owner/repo", &task_id, &session_name)
@@ -1902,12 +1913,8 @@ mod tests {
             }
         }
 
-        // Clean up: unregister and kill tmux session
+        // Clean up: unregister session (tmux kill handled by SessionGuard on drop)
         capture.unregister_session("owner/repo", &task_id).await;
-        let _ = tokio::process::Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output()
-            .await;
 
         // Wait for capture.run to finish
         let _ = capture_handle.await;
