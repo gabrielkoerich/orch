@@ -2209,7 +2209,15 @@ Hope that helps!"#;
 
     #[test]
     fn review_rr_index_advances() {
-        let config = RouterConfig::default();
+        let mut config = RouterConfig::default();
+        // Set up model_map so has_available_model_for_complexity returns true for test agents
+        for agent in &["test_a", "test_b", "test_c"] {
+            config
+                .model_map
+                .entry("medium".to_string())
+                .or_default()
+                .insert((*agent).to_string(), vec!["test-model".to_string()]);
+        }
         let agents = vec![
             "test_a".to_string(),
             "test_b".to_string(),
