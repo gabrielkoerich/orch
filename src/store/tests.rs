@@ -1124,6 +1124,7 @@ async fn store_route_updates_routing_fields() {
             agent: "codex",
             model: Some("gpt-5.2"),
             complexity: "complex",
+            estimate: 8,
             reason: "needs deep analysis",
             profile: r#"{"role":"backend"}"#,
             skills: "git,rust",
@@ -1135,6 +1136,7 @@ async fn store_route_updates_routing_fields() {
     assert_eq!(task.agent, Some("codex".to_string()));
     assert_eq!(task.model, Some("gpt-5.2".to_string()));
     assert_eq!(task.complexity, "complex");
+    assert_eq!(task.estimate, 8);
     assert_eq!(task.route_reason, "needs deep analysis");
     assert_eq!(task.selected_skills, "git,rust");
 }
@@ -2534,6 +2536,7 @@ async fn store_route_persists_all_routing_fields() {
             agent: "codex",
             model: Some("gpt-5.2"),
             complexity: "complex",
+            estimate: 13,
             reason: "needs deep refactoring",
             profile: r#"{"role":"backend"}"#,
             skills: r#"["git","rust"]"#,
@@ -2545,6 +2548,7 @@ async fn store_route_persists_all_routing_fields() {
     assert_eq!(task.agent.as_deref(), Some("codex"));
     assert_eq!(task.model.as_deref(), Some("gpt-5.2"));
     assert_eq!(task.complexity, "complex");
+    assert_eq!(task.estimate, 13);
     assert_eq!(task.route_reason, "needs deep refactoring");
     assert_eq!(task.agent_profile, r#"{"role":"backend"}"#);
     assert_eq!(task.selected_skills, r#"["git","rust"]"#);

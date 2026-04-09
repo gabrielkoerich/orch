@@ -10,7 +10,7 @@ use sqlx::Row;
 /// metadata vector was built at prepare time. Explicit columns prevent the
 /// mismatch.
 pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, status, \
-    source, source_id, author, url, labels, agent, model, complexity, \
+    source, source_id, author, url, labels, agent, model, complexity, estimate, \
     route_reason, agent_profile, selected_skills, route_attempts, attempts, \
     branch, worktree, worktree_cleaned, summary, last_error, parent_id, \
     block_reason, pr_number, pr_review_context, last_review_ts, review_ts_map, \
@@ -23,7 +23,7 @@ pub(crate) const TASK_COLS: &str = "id, external_id, repo, origin, title, body, 
      ci_recovery_count, auto_unblock_last_reason, no_code_reroutes, network_retries";
 
 /// Number of columns in TASK_COLS (used for diagnostic verification).
-pub(crate) const TASK_COLS_COUNT: usize = 60;
+pub(crate) const TASK_COLS_COUNT: usize = 61;
 
 /// Explicit column list for `SELECT` queries on the `task_runs` table.
 const TASK_RUN_COLS: &str =
@@ -165,6 +165,8 @@ pub struct Task {
     pub agent: Option<String>,
     pub model: Option<String>,
     pub complexity: String,
+    /// Fibonacci effort estimate (1, 2, 3, 5, 8, 13, or 21). 0 means not provided.
+    pub estimate: u8,
     pub route_reason: String,
     pub agent_profile: String,
     pub selected_skills: String,
@@ -327,6 +329,8 @@ pub struct StoreRoute<'a> {
     pub agent: &'a str,
     pub model: Option<&'a str>,
     pub complexity: &'a str,
+    /// Fibonacci effort estimate (1, 2, 3, 5, 8, 13, or 21). 0 means not provided.
+    pub estimate: u8,
     pub reason: &'a str,
     pub profile: &'a str,
     pub skills: &'a str,
@@ -1150,7 +1154,7 @@ impl TaskStore {
     pub async fn store_route(&self, route: &StoreRoute<'_>) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE tasks SET
-            agent = ?, model = ?, complexity = ?, route_reason = ?,
+            agent = ?, model = ?, complexity = ?, estimate = ?, route_reason = ?,
             agent_profile = ?, selected_skills = ?,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE id = ?",
@@ -1158,6 +1162,7 @@ impl TaskStore {
         .bind(route.agent)
         .bind(route.model)
         .bind(route.complexity)
+        .bind(route.estimate as i64)
         .bind(route.reason)
         .bind(route.profile)
         .bind(route.skills)
@@ -1166,6 +1171,7 @@ impl TaskStore {
         .await?;
         let details = serde_json::json!({
             "complexity": route.complexity,
+            "estimate": route.estimate,
             "reason": route.reason,
             "skills": route.skills,
         });
@@ -1813,6 +1819,7 @@ impl TaskStore {
             agent: row.try_get("agent").unwrap_or(None),
             model: row.try_get("model").unwrap_or(None),
             complexity: row.try_get("complexity").unwrap_or_default(),
+            estimate: row.try_get::<i32, _>("estimate").unwrap_or(0) as u8,
             route_reason: row.try_get("route_reason").unwrap_or_default(),
             agent_profile: row.try_get("agent_profile").unwrap_or_default(),
             selected_skills: row.try_get("selected_skills").unwrap_or_default(),

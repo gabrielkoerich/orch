@@ -999,6 +999,7 @@ pub(crate) async fn tick_route_tasks(
                                 agent: &result.agent,
                                 model: result.model.as_deref(),
                                 complexity: &result.complexity,
+                                estimate: result.estimate,
                                 reason: &result.reason,
                                 profile: &profile_json,
                                 skills: &skills_json,

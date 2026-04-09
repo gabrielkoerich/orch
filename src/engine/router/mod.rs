@@ -52,6 +52,8 @@ pub struct RouteResult {
     pub model: Option<String>,
     /// Complexity level: "simple", "medium", or "complex"
     pub complexity: String,
+    /// Fibonacci effort estimate (1, 2, 3, 5, 8, 13, or 21). 0 means not provided.
+    pub estimate: u8,
     /// Why this agent was selected
     pub reason: String,
     /// Specialized agent profile (skills, tools, constraints)
@@ -104,6 +106,7 @@ impl RouteResult {
             agent,
             model,
             complexity,
+            estimate: 0,
             reason,
             profile: AgentProfile::default_from_config(config),
             selected_skills: config.default_skills.clone(),
@@ -773,6 +776,7 @@ impl Router {
                             agent: fallback_agent.clone(),
                             model: fallback_model,
                             complexity: result.complexity.clone(),
+                            estimate: result.estimate,
                             reason: reason.clone(),
                             profile: result.profile.clone(),
                             selected_skills: result.selected_skills.clone(),
@@ -1231,6 +1235,7 @@ pub async fn get_route_result(
         agent,
         model,
         complexity,
+        estimate: 0,
         reason,
         profile: AgentProfile::default(),
         selected_skills: vec![],
@@ -1362,6 +1367,7 @@ mod tests {
             agent: "claude".to_string(),
             model: Some("sonnet".to_string()),
             complexity: "medium".to_string(),
+            estimate: 5,
             reason: "test".to_string(),
             profile: AgentProfile {
                 role: "backend".to_string(),

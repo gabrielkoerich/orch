@@ -27,6 +27,9 @@ pub(crate) struct LlmRouteResponse {
     pub(crate) executor: String,
     #[serde(default)]
     pub(crate) complexity: String,
+    /// Fibonacci effort estimate (1, 2, 3, 5, 8, 13, or 21). 0 means not provided.
+    #[serde(default)]
+    pub(crate) estimate: u8,
     #[serde(default)]
     pub(crate) reason: String,
     #[serde(default)]
@@ -577,6 +580,7 @@ impl LlmRouter {
             agent,
             model,
             complexity,
+            estimate: llm_response.estimate,
             reason: llm_response.reason,
             profile,
             selected_skills,
