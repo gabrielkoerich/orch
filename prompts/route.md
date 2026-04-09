@@ -28,6 +28,7 @@ Label handling:
 Return ONLY JSON with the following keys:
 executor: one of the installed executors above
 complexity: simple|medium|complex
+estimate: numeric effort estimate (Fibonacci: 1, 2, 3, 5, 8, 13, or 21)
 reason: short reason
 profile:
   role: short role name
@@ -43,6 +44,17 @@ Complexity guide:
 - simple: docs, config changes, single-file edits, typos, README updates
 - medium: multi-file features, bug fixes, test additions, small refactors
 - complex: architecture changes, large refactors, cross-system debugging, migrations
+
+Effort estimate guide (Fibonacci scale — not linear, complexity grows exponentially):
+- 1: Trivial change, a few lines, no reasoning needed
+- 2: Simple, well-understood change
+- 3: Small task with minor unknowns
+- 5: Moderate task — roughly 60% more complex than a 3, with proportionally more uncertainty
+- 8: Significant task, multiple moving parts, some design decisions
+- 13: Large task, broad impact, considerable uncertainty
+- 21: Very large or poorly scoped task; consider splitting before starting
+
+A 5 is not "like 5 hours" — it is meaningfully harder than a 3 due to the non-linear nature of the scale. When in doubt, round up.
 
 Complexity controls model tier:
 - The selected complexity directly determines the model tier via `config.yml` `model_map` (resolved per executor).

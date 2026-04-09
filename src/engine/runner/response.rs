@@ -825,6 +825,7 @@ mod tests {
             agent: None,
             model: None,
             complexity: "simple".to_string(),
+            estimate: 0,
             route_reason: String::new(),
             agent_profile: String::new(),
             selected_skills: String::new(),
