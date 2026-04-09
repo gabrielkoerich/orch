@@ -83,12 +83,17 @@ jobs:
           BRANCH: ${{ github.ref_name }}
 
       - name: Report coverage on PR
-        uses: romeovs/lcov-reporter-action@v0.4.0
         if: steps.find-pr.outputs.pr_number != ''
-        with:
-          lcov-file: lcov.info
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          pr-number: ${{ steps.find-pr.outputs.pr_number }}
+        run: |
+          SUMMARY=$(lcov --summary lcov.info 2>&1 || echo "Coverage summary unavailable")
+          gh pr comment "$PR_NUMBER" --body "## Coverage Report
+
+          \`\`\`
+          ${SUMMARY}
+          \`\`\`"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.find-pr.outputs.pr_number }}
 
   # Scan the full git history for accidentally committed secrets (tokens, keys).
   # Runs gitleaks with the project's .gitleaks.toml allowlist to suppress
