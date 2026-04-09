@@ -17,6 +17,9 @@ jobs:
   # Uses cargo-llvm-cov for line/branch coverage — cheaper than tarpaulin.
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
 
@@ -70,12 +73,22 @@ jobs:
           name: coverage-lcov
           path: lcov.info
 
+      - name: Find associated PR
+        id: find-pr
+        run: |
+          PR_NUMBER=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+
       - name: Report coverage on PR
         uses: romeovs/lcov-reporter-action@v0.4.0
-        if: github.event_name == 'pull_request'
+        if: steps.find-pr.outputs.pr_number != ''
         with:
           lcov-file: lcov.info
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ steps.find-pr.outputs.pr_number }}
 
   # Scan the full git history for accidentally committed secrets (tokens, keys).
   # Runs gitleaks with the project's .gitleaks.toml allowlist to suppress
