@@ -108,6 +108,15 @@ pub(crate) fn find_stash_ref_by_hash(stash_list: &str, stash_hash: &str) -> Opti
     })
 }
 
+/// Resolve the git author identity from config, falling back to `{agent}[bot]`.
+fn git_identity(agent: &str) -> (String, String) {
+    let name =
+        crate::config::get("git.name").unwrap_or_else(|_| format!("{agent}[bot]"));
+    let email = crate::config::get("git.email")
+        .unwrap_or_else(|_| format!("{agent}[bot]@users.noreply.github.com"));
+    (name, email)
+}
+
 /// Auto-commit any uncommitted changes.
 pub async fn auto_commit(
     dir: &Path,
@@ -138,9 +147,14 @@ pub async fn auto_commit(
         return Ok(false);
     }
 
-    // git commit
+    // git commit — override author/committer to match the agent identity
+    let (git_name, git_email) = git_identity(agent);
     let commit = Command::new("git")
         .args(["commit", "-m", &commit_msg])
+        .env("GIT_AUTHOR_NAME", &git_name)
+        .env("GIT_COMMITTER_NAME", &git_name)
+        .env("GIT_AUTHOR_EMAIL", &git_email)
+        .env("GIT_COMMITTER_EMAIL", &git_email)
         .current_dir(dir)
         .output_with_context()
         .await?;
@@ -552,8 +566,13 @@ async fn strip_workflow_files(dir: &Path, default_branch: &str) -> anyhow::Resul
         combined
     };
 
+    let (git_name, git_email) = git_identity("orchestrator");
     let commit = Command::new("git")
         .args(["commit", "-m", &commit_msg])
+        .env("GIT_AUTHOR_NAME", &git_name)
+        .env("GIT_COMMITTER_NAME", &git_name)
+        .env("GIT_AUTHOR_EMAIL", &git_email)
+        .env("GIT_COMMITTER_EMAIL", &git_email)
         .current_dir(dir)
         .output_with_context()
         .await?;
