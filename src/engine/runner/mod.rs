@@ -117,9 +117,11 @@ fn classify_run_error_type(last_error: &str) -> &'static str {
         "success"
     } else if last_error.contains("timeout") {
         "timeout"
+    } else if last_error.contains("billing cycle") {
+        "billing_cycle_exhausted"
     } else if last_error.contains("rate limit") || last_error.contains("usage limit") {
         "rate_limit"
-    } else if last_error.contains("auth") || last_error.contains("billing") {
+    } else if last_error.contains("auth") {
         "auth_error"
     } else if last_error.contains("push failed") {
         "push_failed"
@@ -1594,6 +1596,28 @@ mod tests {
         assert_eq!(
             classify_run_error_type("exceeded usage limit for this billing period"),
             "rate_limit"
+        );
+    }
+
+    #[test]
+    fn classify_run_error_type_billing_cycle_is_not_auth_error() {
+        // "billing cycle" quota-exhaustion messages must be classified as billing_cycle_exhausted,
+        // not auth_error — aligning with cooldown.rs CreditExhaustionReason::BillingCycleExhausted.
+        assert_eq!(
+            classify_run_error_type(
+                "You've reached your usage limit for this billing cycle. \
+                 Your quota will be refreshed in the next cycle."
+            ),
+            "billing_cycle_exhausted"
+        );
+        assert_eq!(
+            classify_run_error_type("quota exhausted for billing cycle"),
+            "billing_cycle_exhausted"
+        );
+        // Plain "billing" without "cycle" that used to map to auth_error now falls through to "failed".
+        assert_eq!(
+            classify_run_error_type("billing account suspended"),
+            "failed"
         );
     }
 
