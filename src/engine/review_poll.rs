@@ -391,8 +391,8 @@ pub(crate) async fn review_open_prs(
 
         let review_ts_map: serde_json::Value =
             match serde_json::from_str(&stored_task.review_ts_map) {
-                Ok(map) => map,
-                Err(_) => serde_json::json!({}),
+                Ok(serde_json::Value::Object(m)) => serde_json::Value::Object(m),
+                _ => serde_json::json!({}),
             };
 
         let reviews = &batch_data.reviews;
