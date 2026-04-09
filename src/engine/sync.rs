@@ -312,6 +312,196 @@ async fn resolve_mention_parent_id(
     }
 }
 
+/// Extract the issue/PR number from a GitHub API URL (e.g. `.../issues/123`).
+fn extract_issue_number(url: &str) -> Option<String> {
+    url.rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .map(|n| n.to_string())
+}
+
+/// Create a sentinel mention task in the store and advance the cursor.
+async fn record_mention_task(
+    store: &TaskStore,
+    repo: &str,
+    mention: &Mention,
+    title: &str,
+    body: &str,
+    parent_id: Option<i64>,
+    last_success_ts: &mut Option<String>,
+) {
+    match store
+        .create_internal(repo, title, body, "mention", &mention.id, parent_id)
+        .await
+    {
+        Ok(task_id) => {
+            tracing::info!(task_id, mention_id = %mention.id, "created mention task");
+        }
+        Err(e) => {
+            tracing::warn!(mention_id = %mention.id, err = %e, "failed to create mention task");
+        }
+    }
+    advance_cursor(last_success_ts, &mention.created_at);
+}
+
+/// Advance the mention cursor if the timestamp is newer.
+fn advance_cursor(last_success_ts: &mut Option<String>, ts: &str) {
+    if last_success_ts.as_deref() < Some(ts) {
+        *last_success_ts = Some(ts.to_string());
+    }
+}
+
+/// Handle a slash command from a mention. Returns `true` if the mention was
+/// fully handled (command executed or skipped with sentinel), `false` if it
+/// should fall through to the generic mention-task path.
+#[allow(clippy::too_many_arguments)]
+async fn handle_slash_command(
+    backend: &Arc<dyn ExternalBackend>,
+    store: Option<&Arc<TaskStore>>,
+    repo: &str,
+    task_manager: &Arc<TaskManager>,
+    gh: &crate::github::http::GhHttp,
+    mention: &Mention,
+    command: &crate::engine::commands::OwnerCommand,
+    last_success_ts: &mut Option<String>,
+) -> bool {
+    let issue_num = match mention.issue_url.as_deref().and_then(extract_issue_number) {
+        Some(num) => num,
+        None => {
+            tracing::warn!(comment_id = %mention.id, "slash command without valid issue number");
+            return false; // fall through to generic mention task
+        }
+    };
+
+    // Fetch issue data to check state and whether it's a PR
+    let issue_data = match gh.get_issue(repo, &issue_num).await {
+        Ok(data) => data,
+        Err(_) => {
+            tracing::warn!(issue = %issue_num, "failed to check issue state for slash command");
+            return true; // don't create a generic task for it either — retry next tick
+        }
+    };
+    let is_pr = issue_data.pull_request.is_some();
+
+    // Check if issue is still open
+    if issue_data.state != "open" {
+        tracing::debug!(issue = %issue_num, state = %issue_data.state, command = %command, "ignoring slash command on non-open issue");
+        if let Some(s) = store {
+            let parent_id = resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
+            record_mention_task(
+                s,
+                repo,
+                mention,
+                &format!(
+                    "Skipped @orch command on closed issue #{issue_num} from @{}",
+                    mention.author
+                ),
+                &format!(
+                    "Mention by @{}:\n\n{}\n\n**Skipped:** target issue is closed",
+                    mention.author, mention.body
+                ),
+                parent_id,
+                last_success_ts,
+            )
+            .await;
+        }
+        return true;
+    }
+
+    // Check if author is collaborator
+    match gh.is_collaborator(repo, &mention.author).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(author = %mention.author, command = %command, issue = %issue_num, "ignoring slash command from non-collaborator");
+            if let Some(s) = store {
+                let parent_id = resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
+                record_mention_task(
+                    s,
+                    repo,
+                    mention,
+                    &format!(
+                        "Skipped @orch command on issue #{issue_num} from non-collaborator @{}",
+                        mention.author
+                    ),
+                    &format!(
+                        "Mention by @{}:\n\n{}\n\n**Skipped:** author is not a collaborator",
+                        mention.author, mention.body
+                    ),
+                    parent_id,
+                    last_success_ts,
+                )
+                .await;
+            }
+            return true;
+        }
+        Err(e) => {
+            tracing::warn!(author = %mention.author, err = %e, "failed to check collaborator status");
+            return true;
+        }
+    }
+
+    // Execute the command
+    let task_id = ExternalId(issue_num.clone());
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let store_opt = store.cloned();
+
+    match execute_command(
+        backend,
+        gh,
+        repo,
+        &task_id,
+        command,
+        &store_opt,
+        task_manager,
+    )
+    .await
+    {
+        Ok(msg) => {
+            tracing::info!(issue = %issue_num, author = %mention.author, command = %command, "executed command from @mention");
+            let confirmation = format!(
+                "[{now}] {msg} — executed by @{}{}",
+                mention.author,
+                crate::engine::orch_footer()
+            );
+            if let Err(e) = backend.post_comment(&task_id, &confirmation).await {
+                tracing::warn!(issue = %issue_num, err = %e, "failed to post confirmation");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(issue = %issue_num, command = %command, err = %e, "failed to execute command from @mention");
+            let error_msg = format!(
+                "[{now}] Failed to execute `{command}`: {e}{}",
+                crate::engine::orch_footer()
+            );
+            if let Err(e2) = backend.post_comment(&task_id, &error_msg).await {
+                tracing::warn!(issue = %issue_num, err = %e2, "failed to post error comment");
+            }
+        }
+    }
+
+    // Record sentinel
+    if let Some(s) = store {
+        let parent_id = resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
+        record_mention_task(
+            s,
+            repo,
+            mention,
+            &format!(
+                "Respond to mention by @{} on task #{issue_num} — command executed",
+                mention.author
+            ),
+            &format!(
+                "Mention by @{} on issue #{issue_num}:\n\n{}\n\n**Status:** Command executed",
+                mention.author, mention.body
+            ),
+            parent_id,
+            last_success_ts,
+        )
+        .await;
+    }
+    true
+}
+
 fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
     if count == 0 {
         return true;
@@ -1055,262 +1245,45 @@ async fn scan_mentions(
     let mut last_success_ts: Option<String> = None;
 
     for mention in mentions {
-        // Skip if already processed
+        // Skip already-processed or non-targeted mentions
         if existing_mentions.contains(&mention.id) {
-            // Advance the cursor past already-processed mentions so the scan
-            // doesn't get stuck re-fetching the same window when the latest
-            // mention is a duplicate. Only advance when the mention's
-            // timestamp is newer than our current cursor.
-            if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
-                last_success_ts = Some(mention.created_at.clone());
-            }
+            advance_cursor(&mut last_success_ts, &mention.created_at);
             continue;
         }
-
         if !mention.body.contains(&current_user)
             && !mention.body.contains("@orch")
             && !mention.body.contains("@orchestrator")
         {
-            // This mention batch may include comments that the backend
-            // returned but that are not actually addressed to the bot
-            // (e.g., legacy fetch semantics). Treat these as handled for
-            // cursor advancement so we don't repeatedly re-fetch them.
-            if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
-                last_success_ts = Some(mention.created_at.clone());
-            }
+            advance_cursor(&mut last_success_ts, &mention.created_at);
             continue;
         }
 
-        // Acknowledge the mention with an eyes reaction (non-fatal)
+        // Acknowledge with eyes reaction (non-fatal)
         if let Err(e) = backend.acknowledge_mention(&mention.id).await {
             tracing::debug!(err = %e, mention_id = %mention.id, "failed to acknowledge mention");
         }
 
-        // Create internal task for this mention
-        // Try to parse a slash command from the mention
+        // Try slash command first
         if let Some(command) = parse_command(&mention.body) {
-            // Extract issue number from the mention's issue URL
-            let issue_number: Option<String> = match mention.issue_url.as_deref() {
-                Some(url) => match url.rsplit('/').next() {
-                    Some(num) if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) => {
-                        Some(num.to_string())
-                    }
-                    _ => {
-                        tracing::warn!(
-                            comment_id = %mention.id,
-                            "slash command in mention without valid issue number, creating task instead"
-                        );
-                        None
-                    }
-                },
-                None => {
-                    tracing::warn!(
-                        comment_id = %mention.id,
-                        "slash command in mention without issue_url, creating task instead"
-                    );
-                    None
-                }
-            };
-
-            // If we have an issue number, try to execute the command
-            if let Some(issue_num) = issue_number {
-                // Fetch issue data to check state and whether it's a PR
-                let issue_data = gh.get_issue(repo, &issue_num).await.ok();
-                let is_pr = issue_data
-                    .as_ref()
-                    .is_some_and(|i| i.pull_request.is_some());
-
-                // Check if issue is still open
-                match issue_data {
-                    Some(ref issue) if issue.state != "open" => {
-                        tracing::debug!(
-                            issue = %issue_num,
-                            state = %issue.state,
-                            command = %command,
-                            "ignoring slash command in mention on non-open issue"
-                        );
-                        if let Some(s) = store {
-                            let title = format!(
-                                "Skipped @orch command on closed issue #{issue_num} from @{}",
-                                mention.author
-                            );
-                            let task_body = format!(
-                                "Mention by @{}:\n\n{}\n\n**Skipped:** target issue is closed",
-                                mention.author, mention.body
-                            );
-                            let parent_id =
-                                resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
-                            let _ = s
-                                .create_internal(
-                                    repo,
-                                    &title,
-                                    &task_body,
-                                    "mention",
-                                    &mention.id,
-                                    parent_id,
-                                )
-                                .await;
-                        }
-                        // Advance cursor: we created a sentinel task so this mention
-                        // is considered handled and the cursor should move past it.
-                        if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
-                            last_success_ts = Some(mention.created_at.clone());
-                        }
-                        continue;
-                    }
-                    Some(_) => {}
-                    None => {
-                        tracing::warn!(
-                            issue = %issue_num,
-                            "failed to check issue state for slash command in mention"
-                        );
-                        continue;
-                    }
-                }
-
-                // Check if author is collaborator
-                match gh.is_collaborator(repo, &mention.author).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::info!(
-                            author = %mention.author,
-                            command = %command,
-                            issue = %issue_num,
-                            "ignoring slash command in mention from non-collaborator"
-                        );
-                        if let Some(s) = store {
-                            let title = format!(
-                                "Skipped @orch command on issue #{issue_num} from non-collaborator @{}",
-                                mention.author
-                            );
-                            let task_body = format!(
-                                "Mention by @{}:\n\n{}\n\n**Skipped:** author is not a collaborator",
-                                mention.author, mention.body
-                            );
-                            let parent_id =
-                                resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
-                            let _ = s
-                                .create_internal(
-                                    repo,
-                                    &title,
-                                    &task_body,
-                                    "mention",
-                                    &mention.id,
-                                    parent_id,
-                                )
-                                .await;
-                        }
-                        // Advance cursor: sentinel created for skipped non-collaborator mention
-                        if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
-                            last_success_ts = Some(mention.created_at.clone());
-                        }
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            author = %mention.author,
-                            err = %e,
-                            "failed to check collaborator status for slash command in mention"
-                        );
-                        continue;
-                    }
-                }
-
-                // Execute the command
-                let task_id = ExternalId(issue_num.clone());
-                let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-                let store_opt = store.cloned();
-
-                match execute_command(
-                    backend,
-                    &gh,
-                    repo,
-                    &task_id,
-                    &command,
-                    &store_opt,
-                    task_manager,
-                )
-                .await
-                {
-                    Ok(msg) => {
-                        tracing::info!(
-                            issue = %issue_num,
-                            author = %mention.author,
-                            command = %command,
-                            "executed command from @mention"
-                        );
-                        let confirmation = format!(
-                            "[{now}] {msg} — executed by @{}{}",
-                            mention.author,
-                            crate::engine::orch_footer()
-                        );
-                        if let Err(e) = backend.post_comment(&task_id, &confirmation).await {
-                            tracing::warn!(issue = %issue_num, err = %e, "failed to post confirmation for mention command");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            issue = %issue_num,
-                            command = %command,
-                            err = %e,
-                            "failed to execute command from @mention"
-                        );
-                        let error_msg = format!(
-                            "[{now}] Failed to execute `{command}`: {e}{}",
-                            crate::engine::orch_footer()
-                        );
-                        if let Err(e2) = backend.post_comment(&task_id, &error_msg).await {
-                            tracing::warn!(issue = %issue_num, err = %e2, "failed to post error comment for mention command");
-                        }
-                    }
-                }
-                // Mark as processed by creating the task
-                if let Some(s) = store {
-                    let title = format!(
-                        "Respond to mention by @{} on task #{} — command executed",
-                        mention.author, issue_num
-                    );
-                    let task_body = format!(
-                        "Mention by @{} on issue #{}:\n\n{}\n\n**Status:** Command executed",
-                        mention.author, issue_num, mention.body
-                    );
-                    let parent_id = resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
-                    if let Err(e) = s
-                        .create_internal(
-                            repo,
-                            &title,
-                            &task_body,
-                            "mention",
-                            &mention.id,
-                            parent_id,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            mention_id = %mention.id,
-                            err = %e,
-                            "failed to create sentinel for command-executed mention — mention untracked in DB"
-                        );
-                    }
-                }
-                // Command was executed (or error-replied) — mention is handled.
-                if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
-                    last_success_ts = Some(mention.created_at.clone());
-                }
+            if handle_slash_command(
+                backend,
+                store,
+                repo,
+                task_manager,
+                &gh,
+                &mention,
+                &command,
+                &mut last_success_ts,
+            )
+            .await
+            {
                 continue;
             }
         }
 
-        // No command found — create internal task for the mention.
-        // Extract issue/PR number from the mention URL to build a unique, descriptive title.
-        let issue_num_opt: Option<String> = mention
-            .issue_url
-            .as_deref()
-            .and_then(|url| url.rsplit('/').next())
-            .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-            .map(|n| n.to_string());
+        // No command (or command had no valid issue URL) — create a mention task
+        let issue_num_opt = mention.issue_url.as_deref().and_then(extract_issue_number);
 
-        // Detect whether the comment is on a PR (GitHub PRs share the issue number namespace).
         let is_pr = if let Some(ref num) = issue_num_opt {
             gh.get_issue(repo, num)
                 .await
@@ -1322,20 +1295,17 @@ async fn scan_mentions(
 
         let (title, task_body) = match (&issue_num_opt, is_pr) {
             (Some(num), false) => (
-                format!("Respond to mention by @{} on task #{}", mention.author, num),
+                format!("Respond to mention by @{} on task #{num}", mention.author),
                 format!(
-                    "Mention by @{} on GitHub issue #{}:\n\n{}\n\n---\nThis mention was posted on issue #{}. Review the full issue to understand the context before responding.",
-                    mention.author, num, mention.body, num
+                    "Mention by @{} on GitHub issue #{num}:\n\n{}\n\n---\nThis mention was posted on issue #{num}. Review the full issue to understand the context before responding.",
+                    mention.author, mention.body
                 ),
             ),
             (Some(num), true) => (
+                format!("Respond to mention by @{} on PR #{num}", mention.author),
                 format!(
-                    "Respond to mention by @{} on task #{}, PR #{}",
-                    mention.author, num, num
-                ),
-                format!(
-                    "Mention by @{} on GitHub PR #{}:\n\n{}\n\n---\nThis mention was posted on PR #{}. Review the full PR (diff, description, and comments) to understand the context before responding.",
-                    mention.author, num, mention.body, num
+                    "Mention by @{} on GitHub PR #{num}:\n\n{}\n\n---\nThis mention was posted on PR #{num}. Review the full PR (diff, description, and comments) to understand the context before responding.",
+                    mention.author, mention.body
                 ),
             ),
             (None, _) => (
@@ -1350,22 +1320,16 @@ async fn scan_mentions(
             } else {
                 None
             };
-            match s
-                .create_internal(repo, &title, &task_body, "mention", &mention.id, parent_id)
-                .await
-            {
-                Ok(task_id) => {
-                    tracing::info!(task_id, mention_id = %mention.id, "created mention task");
-                    if last_success_ts.as_deref() < Some(mention.created_at.as_str()) {
-                        last_success_ts = Some(mention.created_at.clone());
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    mention_id = %mention.id,
-                    err = %e,
-                    "failed to create mention task — skipping"
-                ),
-            }
+            record_mention_task(
+                s,
+                repo,
+                &mention,
+                &title,
+                &task_body,
+                parent_id,
+                &mut last_success_ts,
+            )
+            .await;
         }
     }
 
