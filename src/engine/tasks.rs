@@ -159,6 +159,7 @@ impl TaskManager {
                         &req.body,
                         &req.source,
                         &req.source_id,
+                        None,
                     )
                     .await?;
                 let task = store.get(id).await?;
@@ -1000,7 +1001,7 @@ mod tests {
 
         // Create an internal task in the store
         let internal_id = store
-            .create_internal("owner/repo", "Internal task", "body", "cron", "job:1")
+            .create_internal("owner/repo", "Internal task", "body", "cron", "job:1", None)
             .await
             .unwrap();
 
@@ -1143,7 +1144,7 @@ mod tests {
         let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
 
         let id = store
-            .create_internal("owner/repo", "Fetch me", "body", "cron", "job:1")
+            .create_internal("owner/repo", "Fetch me", "body", "cron", "job:1", None)
             .await
             .unwrap();
 
@@ -1162,7 +1163,7 @@ mod tests {
 
         // Create internal task (starts as New)
         store
-            .create_internal("owner/repo", "Route me", "", "cron", "job:2")
+            .create_internal("owner/repo", "Route me", "", "cron", "job:2", None)
             .await
             .unwrap();
 
@@ -1179,7 +1180,7 @@ mod tests {
         let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
 
         let id = store
-            .create_internal("owner/repo", "Already routed", "", "cron", "job:3")
+            .create_internal("owner/repo", "Already routed", "", "cron", "job:3", None)
             .await
             .unwrap();
         store
@@ -1201,11 +1202,11 @@ mod tests {
         let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
 
         store
-            .create_internal("owner/repo", "Task A", "", "cron", "a")
+            .create_internal("owner/repo", "Task A", "", "cron", "a", None)
             .await
             .unwrap();
         let id_b = store
-            .create_internal("owner/repo", "Task B", "", "cron", "b")
+            .create_internal("owner/repo", "Task B", "", "cron", "b", None)
             .await
             .unwrap();
         store
@@ -1227,7 +1228,14 @@ mod tests {
     async fn store_task_to_external_maps_fields_correctly() {
         let store = TaskStore::open_memory().await.unwrap();
         let id = store
-            .create_internal("owner/repo", "Convert me", "body text", "manual", "m:1")
+            .create_internal(
+                "owner/repo",
+                "Convert me",
+                "body text",
+                "manual",
+                "m:1",
+                None,
+            )
             .await
             .unwrap();
         let task = store.get(id).await.unwrap();
@@ -1248,16 +1256,16 @@ mod tests {
         let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
 
         store
-            .create_internal("owner/repo", "T1", "", "cron", "1")
+            .create_internal("owner/repo", "T1", "", "cron", "1", None)
             .await
             .unwrap();
         store
-            .create_internal("owner/repo", "T2", "", "cron", "2")
+            .create_internal("owner/repo", "T2", "", "cron", "2", None)
             .await
             .unwrap();
         // Different repo — should not appear
         store
-            .create_internal("other/repo", "T3", "", "cron", "3")
+            .create_internal("other/repo", "T3", "", "cron", "3", None)
             .await
             .unwrap();
 
@@ -1303,7 +1311,7 @@ mod tests {
 
         // Create an internal task with Routed status
         let id = store
-            .create_internal("owner/repo", "Internal task", "", "cron", "1")
+            .create_internal("owner/repo", "Internal task", "", "cron", "1", None)
             .await
             .unwrap();
         store.update_status(id, TaskStatus::Routed).await.unwrap();
@@ -1348,7 +1356,7 @@ mod tests {
         let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
 
         let id = store
-            .create_internal("owner/repo", "Internal task", "", "cron", "1")
+            .create_internal("owner/repo", "Internal task", "", "cron", "1", None)
             .await
             .unwrap();
         store.update_status(id, TaskStatus::Routed).await.unwrap();
@@ -1380,7 +1388,7 @@ mod tests {
             .unwrap();
         // Also a new internal task
         store
-            .create_internal("owner/repo", "New internal", "", "cron", "1")
+            .create_internal("owner/repo", "New internal", "", "cron", "1", None)
             .await
             .unwrap();
 
@@ -1406,7 +1414,7 @@ mod tests {
         let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
 
         store
-            .create_internal("owner/repo", "Internal new", "", "cron", "1")
+            .create_internal("owner/repo", "Internal new", "", "cron", "1", None)
             .await
             .unwrap();
 
@@ -1459,7 +1467,7 @@ mod tests {
 
         // Internal tasks should be excluded
         store
-            .create_internal("owner/repo", "Internal", "", "cron", "1")
+            .create_internal("owner/repo", "Internal", "", "cron", "1", None)
             .await
             .unwrap();
 
@@ -1487,7 +1495,7 @@ mod tests {
         let tm = TaskManager::with_store(backend, store.clone(), "owner/repo".to_string());
 
         store
-            .create_internal("owner/repo", "Internal", "", "cron", "1")
+            .create_internal("owner/repo", "Internal", "", "cron", "1", None)
             .await
             .unwrap();
 
@@ -1539,7 +1547,7 @@ mod tests {
 
         // Create an internal task
         let store_id = store
-            .create_internal("owner/repo", "task", "body", "manual", "")
+            .create_internal("owner/repo", "task", "body", "manual", "", None)
             .await
             .unwrap();
 
@@ -1637,7 +1645,14 @@ mod tests {
 
         // Create an internal task (starts as New)
         let store_id = store
-            .create_internal("owner/repo", "internal ctx test", "body", "manual", "")
+            .create_internal(
+                "owner/repo",
+                "internal ctx test",
+                "body",
+                "manual",
+                "",
+                None,
+            )
             .await
             .unwrap();
 

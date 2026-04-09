@@ -440,7 +440,14 @@ pub async fn execute_job(
                     }
                 } else if let Some(s) = store {
                     match s
-                        .create_internal(repo, &template.title, &template.body, "cron", &job.id)
+                        .create_internal(
+                            repo,
+                            &template.title,
+                            &template.body,
+                            "cron",
+                            &job.id,
+                            None,
+                        )
                         .await
                     {
                         Ok(internal_id) => {

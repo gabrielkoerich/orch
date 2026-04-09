@@ -17,6 +17,7 @@ async fn create_and_get_task() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -140,6 +141,7 @@ async fn update_status() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -169,6 +171,7 @@ async fn list_by_status() {
                 author: "".to_string(),
                 url: "".to_string(),
                 labels: vec![],
+                parent_id: None,
             })
             .await
             .unwrap();
@@ -205,6 +208,7 @@ async fn increment_and_reset_counters() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -235,6 +239,7 @@ async fn increment_propagates_returned_value_decode_errors() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -657,6 +662,7 @@ async fn memory_append_and_recent() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -702,6 +708,7 @@ async fn task_runs_lifecycle() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -767,6 +774,7 @@ async fn set_fields_updates_task() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -805,6 +813,7 @@ async fn set_fields_rejects_unknown_column() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -832,6 +841,7 @@ async fn store_tokens() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -864,6 +874,7 @@ async fn list_cleanable() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -983,6 +994,7 @@ async fn list_by_status_scopes_to_repo() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -999,6 +1011,7 @@ async fn list_by_status_scopes_to_repo() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1033,6 +1046,7 @@ async fn set_fields_empty_is_noop() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1056,6 +1070,7 @@ async fn set_fields_with_null_value() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1091,6 +1106,7 @@ async fn increment_rejects_disallowed_field() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1114,6 +1130,7 @@ async fn store_route_updates_routing_fields() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1156,6 +1173,7 @@ async fn memory_empty_by_default() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1185,6 +1203,7 @@ async fn labels_roundtrip_as_json() {
             author: "user".to_string(),
             url: "".to_string(),
             labels: labels.clone(),
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1209,6 +1228,7 @@ async fn task_with_parent_id() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1225,6 +1245,7 @@ async fn task_with_parent_id() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1254,6 +1275,7 @@ async fn multiple_runs_per_task() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1389,6 +1411,7 @@ async fn start_run_upserts_on_conflict() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1445,6 +1468,7 @@ async fn reset_counters_preserves_other_fields() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1495,6 +1519,7 @@ async fn reset_failure_counters_preserves_review_cycles() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1539,6 +1564,7 @@ async fn status_lifecycle_full_flow() {
             author: "user".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1575,6 +1601,7 @@ async fn list_routable_returns_only_new() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1591,6 +1618,7 @@ async fn list_routable_returns_only_new() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1617,6 +1645,7 @@ async fn cleanable_excludes_in_progress_tasks() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1656,6 +1685,7 @@ async fn delegations_stored_as_json() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1690,6 +1720,7 @@ async fn created_at_and_updated_at_are_set() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1717,6 +1748,7 @@ async fn concurrent_increments() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1747,6 +1779,7 @@ async fn internal_task_has_no_external_id() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -1772,6 +1805,7 @@ async fn default_values_are_correct() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -2924,6 +2958,7 @@ async fn append_memory_within_transaction() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -2983,6 +3018,7 @@ async fn set_fields_with_numeric_bool_null_types() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -3027,6 +3063,7 @@ async fn resolve_task_id_for_external_and_internal() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -3068,6 +3105,7 @@ async fn list_cleanable_excludes_active_and_already_cleaned() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -3092,6 +3130,7 @@ async fn list_cleanable_excludes_active_and_already_cleaned() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -3116,6 +3155,7 @@ async fn list_cleanable_excludes_active_and_already_cleaned() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -3151,6 +3191,7 @@ async fn prune_old_runs_only_removes_old_terminal_tasks() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -3193,6 +3234,7 @@ async fn prune_old_runs_only_removes_old_terminal_tasks() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -3259,6 +3301,7 @@ async fn set_fields_multiple_fields_at_once() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -3303,6 +3346,7 @@ async fn store_tokens_overwrites_previous_values() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();
@@ -3338,6 +3382,7 @@ async fn cost_summary_across_multiple_tasks() {
                 author: "".to_string(),
                 url: "".to_string(),
                 labels: vec![],
+                parent_id: None,
             })
             .await
             .unwrap();
@@ -3369,6 +3414,7 @@ async fn status_counts_with_mixed_statuses() {
                 author: "".to_string(),
                 url: "".to_string(),
                 labels: vec![],
+                parent_id: None,
             })
             .await
             .unwrap();
@@ -3484,7 +3530,7 @@ async fn resolve_task_id_returns_none_for_unknown_internal() {
 async fn create_internal_sets_external_id() {
     let store = TaskStore::open_memory().await.unwrap();
     let id = store
-        .create_internal("owner/repo", "Test task", "body", "cron", "job:1")
+        .create_internal("owner/repo", "Test task", "body", "cron", "job:1", None)
         .await
         .unwrap();
 
@@ -3500,7 +3546,7 @@ async fn create_internal_sets_external_id() {
 async fn create_internal_resolvable_by_task_id() {
     let store = TaskStore::open_memory().await.unwrap();
     let id = store
-        .create_internal("owner/repo", "Resolvable", "body", "cron", "job:2")
+        .create_internal("owner/repo", "Resolvable", "body", "cron", "job:2", None)
         .await
         .unwrap();
 
@@ -3517,7 +3563,7 @@ async fn list_internal_by_status_filters_origin() {
 
     // Create one internal and one external task, both with status New
     store
-        .create_internal("owner/repo", "Internal task", "", "cron", "j1")
+        .create_internal("owner/repo", "Internal task", "", "cron", "j1", None)
         .await
         .unwrap();
     store
@@ -3545,11 +3591,11 @@ async fn list_all_internal_returns_only_internal() {
     let store = TaskStore::open_memory().await.unwrap();
 
     store
-        .create_internal("owner/repo", "Int 1", "", "cron", "j1")
+        .create_internal("owner/repo", "Int 1", "", "cron", "j1", None)
         .await
         .unwrap();
     store
-        .create_internal("owner/repo", "Int 2", "", "manual", "")
+        .create_internal("owner/repo", "Int 2", "", "manual", "", None)
         .await
         .unwrap();
     store
@@ -3903,15 +3949,15 @@ async fn high_review_cycle_tasks_filters_by_threshold() {
 
     // Create tasks with different review_cycles values
     let id_low = store
-        .create_internal("owner/repo", "Low cycles", "", "manual", "")
+        .create_internal("owner/repo", "Low cycles", "", "manual", "", None)
         .await
         .unwrap();
     let id_high = store
-        .create_internal("owner/repo", "High cycles", "", "manual", "")
+        .create_internal("owner/repo", "High cycles", "", "manual", "", None)
         .await
         .unwrap();
     let id_boundary = store
-        .create_internal("owner/repo", "At boundary", "", "manual", "")
+        .create_internal("owner/repo", "At boundary", "", "manual", "", None)
         .await
         .unwrap();
 
@@ -3942,7 +3988,7 @@ async fn high_review_cycle_tasks_excludes_old_tasks() {
     let store = TaskStore::open_memory().await.unwrap();
 
     let id_old = store
-        .create_internal("owner/repo", "Old task", "", "manual", "")
+        .create_internal("owner/repo", "Old task", "", "manual", "", None)
         .await
         .unwrap();
     store.increment(id_old, "review_cycles").await.unwrap();
@@ -3956,7 +4002,7 @@ async fn high_review_cycle_tasks_excludes_old_tasks() {
         .unwrap();
 
     let id_recent = store
-        .create_internal("owner/repo", "Recent task", "", "manual", "")
+        .create_internal("owner/repo", "Recent task", "", "manual", "", None)
         .await
         .unwrap();
     store.increment(id_recent, "review_cycles").await.unwrap();
@@ -4191,7 +4237,7 @@ async fn has_external_tasks_returns_true_after_external_insert() {
 async fn has_external_tasks_ignores_internal_rows() {
     let store = TaskStore::open_memory().await.unwrap();
     store
-        .create_internal("owner/repo", "task", "body", "manual", "")
+        .create_internal("owner/repo", "task", "body", "manual", "", None)
         .await
         .unwrap();
 
@@ -4219,7 +4265,7 @@ async fn list_external_scopes_ignore_internal_rows() {
     let store = TaskStore::open_memory().await.unwrap();
 
     let internal_id = store
-        .create_internal("owner/repo", "internal", "", "manual", "")
+        .create_internal("owner/repo", "internal", "", "manual", "", None)
         .await
         .unwrap();
     store
@@ -4263,7 +4309,7 @@ async fn list_external_scopes_ignore_internal_rows() {
 async fn list_cleanable_returns_done_with_worktree() {
     let store = TaskStore::open_memory().await.unwrap();
     let id = store
-        .create_internal("owner/repo", "task", "body", "manual", "")
+        .create_internal("owner/repo", "task", "body", "manual", "", None)
         .await
         .unwrap();
     store.update_status(id, TaskStatus::Done).await.unwrap();
@@ -4281,7 +4327,7 @@ async fn list_cleanable_returns_done_with_worktree() {
 async fn list_cleanable_excludes_already_cleaned() {
     let store = TaskStore::open_memory().await.unwrap();
     let id = store
-        .create_internal("owner/repo", "task", "body", "manual", "")
+        .create_internal("owner/repo", "task", "body", "manual", "", None)
         .await
         .unwrap();
     store.update_status(id, TaskStatus::Done).await.unwrap();
@@ -4301,7 +4347,7 @@ async fn list_cleanable_excludes_already_cleaned() {
 async fn get_last_run_returns_most_recent() {
     let store = TaskStore::open_memory().await.unwrap();
     let task_id = store
-        .create_internal("owner/repo", "task", "body", "manual", "")
+        .create_internal("owner/repo", "task", "body", "manual", "", None)
         .await
         .unwrap();
 
@@ -4337,7 +4383,7 @@ async fn get_last_run_returns_most_recent() {
 async fn get_last_run_filters_by_type() {
     let store = TaskStore::open_memory().await.unwrap();
     let task_id = store
-        .create_internal("owner/repo", "task", "body", "manual", "")
+        .create_internal("owner/repo", "task", "body", "manual", "", None)
         .await
         .unwrap();
 
@@ -4382,7 +4428,7 @@ async fn get_last_run_filters_by_type() {
 async fn prune_old_runs_removes_completed_task_runs() {
     let store = TaskStore::open_memory().await.unwrap();
     let task_id = store
-        .create_internal("owner/repo", "task", "body", "manual", "")
+        .create_internal("owner/repo", "task", "body", "manual", "", None)
         .await
         .unwrap();
     store
@@ -4416,7 +4462,7 @@ async fn prune_old_runs_removes_completed_task_runs() {
 async fn prune_old_runs_keeps_recent_task_runs() {
     let store = TaskStore::open_memory().await.unwrap();
     let task_id = store
-        .create_internal("owner/repo", "task", "body", "manual", "")
+        .create_internal("owner/repo", "task", "body", "manual", "", None)
         .await
         .unwrap();
     store
@@ -4447,7 +4493,7 @@ async fn prune_old_runs_keeps_recent_task_runs() {
 async fn increment_returns_new_value_via_named_column() {
     let store = TaskStore::open_memory().await.unwrap();
     let id = store
-        .create_internal("owner/repo", "task", "body", "manual", "")
+        .create_internal("owner/repo", "task", "body", "manual", "", None)
         .await
         .unwrap();
 
@@ -4538,11 +4584,11 @@ async fn metrics_summary_by_repo_filters_correctly() {
 
     // Create tasks in different repos
     let id1 = store
-        .create_internal("owner/orch", "Task A", "", "test", "")
+        .create_internal("owner/orch", "Task A", "", "test", "", None)
         .await
         .unwrap();
     let id2 = store
-        .create_internal("owner/bean", "Task B", "", "test", "")
+        .create_internal("owner/bean", "Task B", "", "test", "", None)
         .await
         .unwrap();
 
@@ -4803,7 +4849,7 @@ async fn cost_summary_by_repo_falls_back_to_tasks_join() {
 
     // Create a task with a known repo so the join can resolve it
     let task_id = store
-        .create_internal("owner/orch", "task", "body", "manual", "")
+        .create_internal("owner/orch", "task", "body", "manual", "", None)
         .await
         .unwrap();
 
@@ -5095,7 +5141,7 @@ async fn resolve_task_id_fallback_respects_repo() {
     // Create an internal task for repo-a.  The store assigns id=1 and sets
     // external_id = "internal:1".
     let id_a = store
-        .create_internal("owner/repo-a", "Task A", "body", "test", "src-a")
+        .create_internal("owner/repo-a", "Task A", "body", "test", "src-a", None)
         .await
         .unwrap();
 
@@ -5381,6 +5427,7 @@ async fn make_task(store: &TaskStore) -> i64 {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap()
@@ -5576,6 +5623,7 @@ async fn task_row_deserialization_no_oob_panic() {
             author: "".to_string(),
             url: "".to_string(),
             labels: vec![],
+            parent_id: None,
         })
         .await
         .unwrap();

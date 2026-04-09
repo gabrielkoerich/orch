@@ -1562,6 +1562,7 @@ mod tests {
                 author: "".to_string(),
                 url: "".to_string(),
                 labels: vec![],
+                parent_id: None,
             })
             .await
             .unwrap();
@@ -1670,6 +1671,7 @@ mod tests {
                 author: "".to_string(),
                 url: "".to_string(),
                 labels: vec![],
+                parent_id: None,
             })
             .await
             .unwrap();
@@ -1808,6 +1810,7 @@ mod tests {
                 author: "".to_string(),
                 url: "".to_string(),
                 labels: vec![],
+                parent_id: None,
             })
             .await
             .unwrap();
@@ -1934,6 +1937,7 @@ mod tests {
                 author: "".to_string(),
                 url: "".to_string(),
                 labels: vec![],
+                parent_id: None,
             })
             .await
             .unwrap();

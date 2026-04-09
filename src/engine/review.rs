@@ -2326,7 +2326,7 @@ mod tests {
         let store = Arc::new(TaskStore::open_memory().await.unwrap());
         let repo = "owner/repo";
         store
-            .create_internal(repo, "Fix review recovery", "", "review", "review-1")
+            .create_internal(repo, "Fix review recovery", "", "review", "review-1", None)
             .await
             .unwrap();
         let ext = ExternalTask {

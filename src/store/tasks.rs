@@ -246,6 +246,8 @@ pub struct NewTask {
     pub author: String,
     pub url: String,
     pub labels: Vec<String>,
+    /// Optional link to a parent task (e.g. the issue/PR a mention was posted on).
+    pub parent_id: Option<i64>,
 }
 
 /// A single run (agent execution, review, or routing attempt).
@@ -413,8 +415,8 @@ impl TaskStore {
     pub async fn create(&self, new: &NewTask) -> anyhow::Result<i64> {
         let labels_json = serde_json::to_string(&new.labels)?;
         let row = sqlx::query(
-        "INSERT INTO tasks (external_id, repo, origin, title, body, source, source_id, author, url, labels)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO tasks (external_id, repo, origin, title, body, source, source_id, author, url, labels, parent_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING id",
     )
     .bind(&new.external_id)
@@ -427,6 +429,7 @@ impl TaskStore {
     .bind(&new.author)
     .bind(&new.url)
     .bind(&labels_json)
+    .bind(new.parent_id)
     .fetch_one(&self.pool)
     .await?;
 
@@ -445,6 +448,7 @@ impl TaskStore {
         body: &str,
         source: &str,
         source_id: &str,
+        parent_id: Option<i64>,
     ) -> anyhow::Result<i64> {
         let id = self
             .create(&NewTask {
@@ -458,6 +462,7 @@ impl TaskStore {
                 author: String::new(),
                 url: String::new(),
                 labels: vec![],
+                parent_id,
             })
             .await?;
         // Set external_id to "internal:{id}" so resolve_task_id can find it

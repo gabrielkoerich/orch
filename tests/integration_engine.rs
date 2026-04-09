@@ -239,6 +239,7 @@ async fn task_manager_creates_internal_task() {
             "The widget is broken",
             "test",
             "1",
+            None,
         )
         .await
         .expect("create internal task");
@@ -288,6 +289,7 @@ async fn create_external_task_and_retrieve() {
             author: "user1".to_string(),
             url: "https://github.com/owner/repo/issues/42".to_string(),
             labels: vec!["enhancement".to_string()],
+            parent_id: None,
         })
         .await
         .expect("create external task");
@@ -322,7 +324,7 @@ async fn task_status_lifecycle() {
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     let id = store
-        .create_internal("test/repo", "Lifecycle test", "", "test", "lc-1")
+        .create_internal("test/repo", "Lifecycle test", "", "test", "lc-1", None)
         .await
         .expect("create task");
 
@@ -376,7 +378,7 @@ async fn store_route_result_persists() {
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     let id = store
-        .create_internal("test/repo", "Route me", "task body", "test", "rt-1")
+        .create_internal("test/repo", "Route me", "task body", "test", "rt-1", None)
         .await
         .expect("create task");
 
@@ -543,7 +545,7 @@ async fn task_activity_tracking() {
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     let id = store
-        .create_internal("test/repo", "Activity test", "", "test", "act-1")
+        .create_internal("test/repo", "Activity test", "", "test", "act-1", None)
         .await
         .expect("create task");
 
@@ -684,7 +686,7 @@ async fn task_blocked_with_reason() {
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     let id = store
-        .create_internal("test/repo", "Blocked task", "", "test", "blk-1")
+        .create_internal("test/repo", "Blocked task", "", "test", "blk-1", None)
         .await
         .expect("create task");
 
@@ -733,11 +735,11 @@ async fn multi_repo_task_isolation() {
     let store = Arc::new(TaskStore::open_single(&tmp).await.expect("open store"));
 
     store
-        .create_internal("repo-a/project", "Task A", "", "test", "a-1")
+        .create_internal("repo-a/project", "Task A", "", "test", "a-1", None)
         .await
         .expect("create task A");
     store
-        .create_internal("repo-b/project", "Task B", "", "test", "b-1")
+        .create_internal("repo-b/project", "Task B", "", "test", "b-1", None)
         .await
         .expect("create task B");
 

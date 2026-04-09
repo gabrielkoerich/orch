@@ -1103,8 +1103,20 @@ async fn scan_mentions(
                                 "Mention by @{}:\n\n{}\n\n**Skipped:** target issue is closed",
                                 mention.author, mention.body
                             );
+                            let parent_id = s
+                                .resolve_id_by_external(repo, &issue_num)
+                                .await
+                                .ok()
+                                .flatten();
                             let _ = s
-                                .create_internal(repo, &title, &task_body, "mention", &mention.id)
+                                .create_internal(
+                                    repo,
+                                    &title,
+                                    &task_body,
+                                    "mention",
+                                    &mention.id,
+                                    parent_id,
+                                )
                                 .await;
                         }
                         // Advance cursor: we created a sentinel task so this mention
@@ -1137,15 +1149,27 @@ async fn scan_mentions(
                         );
                         if let Some(s) = store {
                             let title = format!(
-                                "Skipped @orch command from non-collaborator @{}",
+                                "Skipped @orch command on issue #{issue_num} from non-collaborator @{}",
                                 mention.author
                             );
                             let task_body = format!(
                                 "Mention by @{}:\n\n{}\n\n**Skipped:** author is not a collaborator",
                                 mention.author, mention.body
                             );
+                            let parent_id = s
+                                .resolve_id_by_external(repo, &issue_num)
+                                .await
+                                .ok()
+                                .flatten();
                             let _ = s
-                                .create_internal(repo, &title, &task_body, "mention", &mention.id)
+                                .create_internal(
+                                    repo,
+                                    &title,
+                                    &task_body,
+                                    "mention",
+                                    &mention.id,
+                                    parent_id,
+                                )
                                 .await;
                         }
                         // Advance cursor: sentinel created for skipped non-collaborator mention
@@ -1215,15 +1239,27 @@ async fn scan_mentions(
                 // Mark as processed by creating the task
                 if let Some(s) = store {
                     let title = format!(
-                        "Respond to mention by @{} — command executed",
-                        mention.author
+                        "Respond to mention by @{} on task #{} — command executed",
+                        mention.author, issue_num
                     );
                     let task_body = format!(
-                        "Mention by @{}:\n\n{}\n\n**Status:** Command executed",
-                        mention.author, mention.body
+                        "Mention by @{} on issue #{}:\n\n{}\n\n**Status:** Command executed",
+                        mention.author, issue_num, mention.body
                     );
+                    let parent_id = s
+                        .resolve_id_by_external(repo, &issue_num)
+                        .await
+                        .ok()
+                        .flatten();
                     if let Err(e) = s
-                        .create_internal(repo, &title, &task_body, "mention", &mention.id)
+                        .create_internal(
+                            repo,
+                            &title,
+                            &task_body,
+                            "mention",
+                            &mention.id,
+                            parent_id,
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -1241,13 +1277,57 @@ async fn scan_mentions(
             }
         }
 
-        // No command found or command execution failed — create internal task for the mention
-        let title = format!("Respond to mention by @{}", mention.author);
-        let task_body = format!("Mention by @{}:\n\n{}", mention.author, mention.body);
+        // No command found — create internal task for the mention.
+        // Extract issue/PR number from the mention URL to build a unique, descriptive title.
+        let issue_num_opt: Option<String> = mention
+            .issue_url
+            .as_deref()
+            .and_then(|url| url.rsplit('/').next())
+            .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+            .map(|n| n.to_string());
+
+        // Detect whether the comment is on a PR (GitHub PRs share the issue number namespace).
+        let is_pr = if let Some(ref num) = issue_num_opt {
+            match gh.get_issue(repo, num).await {
+                Ok(issue) => issue.pull_request.is_some(),
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
+        let (title, task_body) = match (&issue_num_opt, is_pr) {
+            (Some(num), false) => (
+                format!("Respond to mention by @{} on task #{}", mention.author, num),
+                format!(
+                    "Mention by @{} on GitHub issue #{}:\n\n{}\n\n---\nThis mention was posted on issue #{}. Review the full issue to understand the context before responding.",
+                    mention.author, num, mention.body, num
+                ),
+            ),
+            (Some(num), true) => (
+                format!(
+                    "Respond to mention by @{} on task #{}, PR #{}",
+                    mention.author, num, num
+                ),
+                format!(
+                    "Mention by @{} on GitHub PR #{}:\n\n{}\n\n---\nThis mention was posted on PR #{}. Review the full PR (diff, description, and comments) to understand the context before responding.",
+                    mention.author, num, mention.body, num
+                ),
+            ),
+            (None, _) => (
+                format!("Respond to mention by @{}", mention.author),
+                format!("Mention by @{}:\n\n{}", mention.author, mention.body),
+            ),
+        };
 
         if let Some(s) = store {
+            let parent_id = if let Some(ref num) = issue_num_opt {
+                s.resolve_id_by_external(repo, num).await.ok().flatten()
+            } else {
+                None
+            };
             match s
-                .create_internal(repo, &title, &task_body, "mention", &mention.id)
+                .create_internal(repo, &title, &task_body, "mention", &mention.id, parent_id)
                 .await
             {
                 Ok(task_id) => {

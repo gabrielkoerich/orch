@@ -546,6 +546,7 @@ mod tests {
                 author: "bot".to_string(),
                 url: "".to_string(),
                 labels: vec![],
+                parent_id: None,
             })
             .await
             .unwrap();
