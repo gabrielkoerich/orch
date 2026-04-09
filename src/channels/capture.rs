@@ -166,9 +166,15 @@ impl CaptureService {
     /// A session is "silent" when:
     /// 1. It has been registered for longer than `grace_period`
     /// 2. It has NEVER produced any meaningful output (`has_output == false`)
+    /// 3. It has NEVER been confirmed alive by `capture_pane` succeeding at least once
     ///
-    /// This intentionally does NOT flag agents that produced output then went
-    /// quiet (e.g. long tool calls with sparse output).
+    /// Condition (3) is critical: a session that's been alive for 774s+ without
+    /// terminal output is doing real work (writing files, running long tool calls),
+    /// not stuck. Only sessions that were NEVER confirmed alive should be killed —
+    /// sessions that were seen alive at least once (even with empty pane) are
+    /// actively working and will be handled by the hard timeout if they exceed
+    /// `stuck_timeout`. This prevents killing complex refactoring tasks that
+    /// produce minimal terminal output (issue #2318).
     pub async fn get_silent_sessions_for_repo(
         &self,
         repo: &str,
@@ -182,6 +188,13 @@ impl CaptureService {
                 continue;
             }
             if buf.has_output {
+                continue;
+            }
+            // Only kill sessions that were never confirmed alive. If capture_pane
+            // succeeded at least once, the session is alive and actively working
+            // (just with no terminal output). The hard timeout handler will catch
+            // it if it runs too long.
+            if buf.seen_alive {
                 continue;
             }
             let age = now.signed_duration_since(buf.registered_at);
@@ -461,7 +474,8 @@ mod tests {
         let svc = CaptureService::new(transport);
         let repo = "owner/repo";
 
-        // Register a session and backdate it past the grace period
+        // Register a session and backdate it past the grace period.
+        // seen_alive=false (default) + has_output=false → IS silent.
         svc.register_session(repo, "silent-task", "orch-test-silent")
             .await;
         {
@@ -471,7 +485,7 @@ mod tests {
             buf.registered_at = Utc::now() - chrono::Duration::seconds(200);
         }
 
-        // Register a session that HAS produced output (should not be returned)
+        // Register a session that HAS produced output (should not be returned).
         svc.register_session(repo, "active-task", "orch-test-active")
             .await;
         {
@@ -482,7 +496,7 @@ mod tests {
             buf.has_output = true;
         }
 
-        // Register a fresh session within grace period (should not be returned)
+        // Register a fresh session within grace period (should not be returned).
         svc.register_session(repo, "new-task", "orch-test-new")
             .await;
 
@@ -490,6 +504,54 @@ mod tests {
         let silent = svc.get_silent_sessions_for_repo(repo, grace).await;
         assert_eq!(silent.len(), 1);
         assert_eq!(silent[0].0, "silent-task");
+    }
+
+    /// Regression test for issue #2318: sessions that were confirmed alive (capture_pane
+    /// succeeded at least once) must NOT be killed by silence detection, even if they
+    /// have no terminal output and exceed the grace period.
+    ///
+    /// Claude agents doing complex refactoring can run for 15+ minutes producing no
+    /// terminal output (they write files via Edit/Write tools). Such sessions are alive
+    /// and working — only the hard timeout handler should terminate them.
+    #[tokio::test]
+    async fn get_silent_sessions_excludes_seen_alive_sessions() {
+        let transport = Arc::new(Transport::new());
+        let svc = CaptureService::new(transport);
+        let repo = "owner/repo";
+
+        // Session past grace period, never seen alive → IS silent.
+        svc.register_session(repo, "never-seen-task", "orch-never-seen")
+            .await;
+        {
+            let skey = session_key(repo, "never-seen-task");
+            let mut buffers = svc.buffers.write().await;
+            let buf = buffers.get_mut(&skey).unwrap();
+            buf.registered_at = Utc::now() - chrono::Duration::seconds(500);
+            // seen_alive = false (default), has_output = false
+        }
+
+        // Session past grace period, seen alive but no output → NOT silent (issue #2318).
+        svc.register_session(repo, "seen-but-quiet-task", "orch-seen-quiet")
+            .await;
+        {
+            let skey = session_key(repo, "seen-but-quiet-task");
+            let mut buffers = svc.buffers.write().await;
+            let buf = buffers.get_mut(&skey).unwrap();
+            buf.registered_at = Utc::now() - chrono::Duration::seconds(500);
+            buf.seen_alive = true; // capture_pane succeeded at least once
+                                   // has_output = false (empty terminal, but session IS alive)
+        }
+
+        let grace = std::time::Duration::from_secs(120);
+        let silent = svc.get_silent_sessions_for_repo(repo, grace).await;
+        // Only "never-seen-task" should be returned. "seen-but-quiet-task" is alive and
+        // actively working (just with no terminal output) — let the hard timeout handle it.
+        assert_eq!(
+            silent.len(),
+            1,
+            "seen_alive=true session must not be silenced"
+        );
+        assert_eq!(silent[0].0, "never-seen-task");
     }
 
     #[tokio::test]
