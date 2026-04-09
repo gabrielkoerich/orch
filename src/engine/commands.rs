@@ -23,7 +23,9 @@ async fn kv_get(store: &Option<Arc<TaskStore>>, key: &str) -> Option<String> {
 /// Write a KV value to the store.
 async fn kv_set(store: &Option<Arc<TaskStore>>, key: &str, value: &str) {
     if let Some(ref s) = store {
-        let _ = s.kv_set(key, value).await;
+        if let Err(e) = s.kv_set(key, value).await {
+            tracing::warn!(key, err = %e, "commands: failed to persist KV key");
+        }
     }
 }
 
