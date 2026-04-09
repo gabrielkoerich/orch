@@ -19,6 +19,9 @@ use tokio::sync::{RwLock, Semaphore};
 enum ReviewOutcome {
     Reset,
     RateLimited,
+    /// PR was approved but mergeability not yet computed — retry the merge
+    /// without resetting to NeedsReview (avoids spawning a redundant review agent).
+    RetryMerge,
     Block(String),
     Ok,
 }
@@ -418,6 +421,18 @@ pub fn spawn(
                                     tracing::error!(task_id = %tid, err = %e, "update_task_status(NeedsReview) failed — task may be stuck in InReview");
                                 }
                             }
+                            ReviewOutcome::RetryMerge => {
+                                // PR was already approved; GitHub just hasn't computed
+                                // mergeability yet.  Keep the task in InReview and wait
+                                // for review_poll to retry the merge — do NOT reset to
+                                // NeedsReview, which would spawn a redundant review agent.
+                                tracing::info!(
+                                    task_id = tid,
+                                    "mergeability pending — task stays in InReview, review_poll will retry merge"
+                                );
+                                // Brief pause so the next review_poll cycle fires soon.
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
                             ReviewOutcome::RateLimited => {
                                 // Kill stale tmux session — same as Reset.
                                 let stale_session =
@@ -531,13 +546,15 @@ async fn classify_review_failure(
 
     // Transient mergeability check: GitHub hasn't finished computing yet.
     // This is a normal, expected transient state for freshly-pushed PRs.
+    // Return RetryMerge (not Reset) so the task stays in InReview — avoids
+    // spawning a redundant review agent that would just re-approve anyway.
     if lower_reason.contains("not yet computed") {
         tracing::warn!(
             task_id,
             reason,
-            "{context} PR mergeability check still pending — deferring for retry"
+            "{context} PR mergeability check still pending — will retry merge without re-reviewing"
         );
-        return ReviewOutcome::Reset;
+        return ReviewOutcome::RetryMerge;
     }
 
     // Merge conflicts are infrastructure failures, not review agent failures.
