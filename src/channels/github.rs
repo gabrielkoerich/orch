@@ -290,7 +290,11 @@ fn prune_dedup_inner(inner: &mut DedupInner, now_secs: u64, window_secs: u64, ma
 fn load_dedup_file(path: &Path, window_secs: u64) -> HashMap<String, u64> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => return HashMap::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            tracing::warn!(?e, path = %path.display(), "failed to read webhook dedup file, starting fresh");
+            return HashMap::new();
+        }
     };
 
     #[derive(serde::Deserialize)]
