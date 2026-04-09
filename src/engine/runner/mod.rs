@@ -885,7 +885,7 @@ impl TaskRunner {
                 .unwrap_or(0)
                 + 1;
             if let Ok(Some(store_id)) = store.resolve_task_id(&self.repo, task_id).await {
-                store
+                match store
                     .start_run(&crate::store::StartRun {
                         task_id: store_id,
                         attempt,
@@ -896,7 +896,17 @@ impl TaskRunner {
                         prompt: &task.body,
                     })
                     .await
-                    .ok()
+                {
+                    Ok(run_id) => Some(run_id),
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id,
+                            error = %e,
+                            "failed to record run start in audit trail"
+                        );
+                        None
+                    }
+                }
             } else {
                 None
             }
@@ -1055,7 +1065,7 @@ impl TaskRunner {
         // Complete run in task_runs audit trail (include exit code from runner when available)
         if let Some(run_id) = run_audit_id {
             if let Some(ref store) = self.store {
-                let _ = store
+                if let Err(e) = store
                     .complete_run(&crate::store::CompleteRun {
                         run_id,
                         exit_code: exit_code_opt,
@@ -1071,7 +1081,15 @@ impl TaskRunner {
                             duration_secs: run_audit.duration_secs,
                         },
                     })
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        task_id,
+                        run_id,
+                        error = %e,
+                        "failed to record run completion in audit trail"
+                    );
+                }
             }
         }
 
