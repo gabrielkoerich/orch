@@ -464,7 +464,7 @@ async fn complete_review_run(
     tokens: RunTokenUsage,
 ) {
     if let Some(run_id) = run_id {
-        let _ = store
+        if let Err(e) = store
             .complete_run(&CompleteRun {
                 run_id,
                 exit_code,
@@ -475,7 +475,14 @@ async fn complete_review_run(
                 error,
                 tokens,
             })
-            .await;
+            .await
+        {
+            tracing::warn!(
+                run_id,
+                error = %e,
+                "failed to record review run completion in audit trail"
+            );
+        }
     }
 }
 
@@ -487,7 +494,7 @@ async fn invoke_review_agent(
     store: &Arc<TaskStore>,
 ) -> ReviewPhase<ReviewRun> {
     let run_id = if let Some(sid) = ctx.store_id {
-        store
+        match store
             .start_run(&StartRun {
                 task_id: sid,
                 attempt: ctx.review_attempt as i32,
@@ -498,7 +505,17 @@ async fn invoke_review_agent(
                 prompt: "",
             })
             .await
-            .ok()
+        {
+            Ok(run_id) => Some(run_id),
+            Err(e) => {
+                tracing::warn!(
+                    task_id = task.id.0,
+                    error = %e,
+                    "failed to record review run start in audit trail"
+                );
+                None
+            }
+        }
     } else {
         None
     };
