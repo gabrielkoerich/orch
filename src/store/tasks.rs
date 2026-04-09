@@ -1676,20 +1676,27 @@ impl TaskStore {
         if task_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let placeholders = task_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let sql = format!(
-            "SELECT {TASK_RUN_COLS} FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY task_id ASC, attempt ASC, run_type ASC"
-        );
-        let mut query = sqlx::query(&sql);
-        for id in task_ids {
-            query = query.bind(*id);
-        }
-        let rows = query.fetch_all(&self.pool).await?;
+        // SQLite has a hard limit on host parameters (commonly 999). Chunk the
+        // IN-list into smaller batches to avoid exceeding the limit.
+        const CHUNK_SIZE: usize = 500;
+
         let mut result: std::collections::HashMap<i64, Vec<TaskRun>> =
             std::collections::HashMap::new();
-        for row in &rows {
-            let run = Self::row_to_run(row)?;
-            result.entry(run.task_id).or_default().push(run);
+
+        for chunk in task_ids.chunks(CHUNK_SIZE) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT {TASK_RUN_COLS} FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY task_id ASC, attempt ASC, run_type ASC"
+            );
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(*id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for row in &rows {
+                let run = Self::row_to_run(row)?;
+                result.entry(run.task_id).or_default().push(run);
+            }
         }
         Ok(result)
     }
@@ -1703,17 +1710,24 @@ impl TaskStore {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-        let sql = format!("SELECT {TASK_COLS} FROM tasks WHERE id IN ({placeholders})");
-        let mut query = sqlx::query(&sql);
-        for id in ids {
-            query = query.bind(*id);
-        }
-        let rows = query.fetch_all(&self.pool).await?;
+        // SQLite has a hard limit on host parameters (commonly 999). Chunk the
+        // IN-list into smaller batches to avoid exceeding the limit.
+        const CHUNK_SIZE: usize = 500;
+
         let mut result = std::collections::HashMap::new();
-        for row in &rows {
-            let task = Self::row_to_task(row)?;
-            result.insert(task.id, task);
+
+        for chunk in ids.chunks(CHUNK_SIZE) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!("SELECT {TASK_COLS} FROM tasks WHERE id IN ({placeholders})");
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(*id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for row in &rows {
+                let task = Self::row_to_task(row)?;
+                result.insert(task.id, task);
+            }
         }
         Ok(result)
     }
