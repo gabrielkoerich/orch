@@ -457,9 +457,16 @@ impl Router {
         // retries every `tick_interval` (default 10s), so allow the tick loop
         // to drive retries instead of sleeping here.
         let now = chrono::Utc::now().timestamp();
-        let earliest = self.earliest_cooldown_until(complexity).ok_or_else(|| {
-            anyhow::anyhow!("no cooldowns found while waiting for routing availability")
-        })?;
+        let Some(earliest) = self.earliest_cooldown_until(complexity) else {
+            // All agents are degraded but none have a timed cooldown entry
+            // (e.g. over-threshold rate limiting without explicit cooldown duration).
+            // Log at warn and return Ok so the tick skips this task cleanly and retries.
+            tracing::warn!(
+                scope = complexity.unwrap_or("all agents"),
+                "all agents degraded (no cooldown timestamp available) — skipping task, tick will retry"
+            );
+            return Ok(());
+        };
 
         let remaining = earliest.saturating_sub(now);
         if remaining > 0 {
