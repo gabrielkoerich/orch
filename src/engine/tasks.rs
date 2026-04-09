@@ -202,37 +202,61 @@ impl TaskManager {
         let mut tasks = Vec::new();
 
         if let Some(status_str) = &filter.status {
-            let task_status = TaskStatus::from_str(status_str).unwrap_or(TaskStatus::New);
-            let backend_status = match status_str.as_str() {
-                "new" => Status::New,
-                "routed" => Status::Routed,
-                "in_progress" => Status::InProgress,
-                "done" => Status::Done,
-                "blocked" => Status::Blocked,
-                "in_review" => Status::InReview,
-                "needs_review" => Status::NeedsReview,
-                _ => Status::New,
-            };
-
-            // Get internal tasks from store
-            if let Some(ref store) = self.store {
-                let internal_tasks = store
-                    .list_internal_by_status(&self.repo, task_status)
-                    .await?;
-                for t in internal_tasks {
-                    if let Some(ref source) = filter.source {
-                        if t.source != *source {
-                            continue;
+            if status_str == "all" {
+                // Return all tasks regardless of status
+                if let Some(ref store) = self.store {
+                    let all_tasks = store.list_all(&self.repo).await?;
+                    for t in all_tasks {
+                        if let Some(ref source) = filter.source {
+                            if t.source != *source {
+                                continue;
+                            }
+                        }
+                        if t.origin == "internal" {
+                            tasks.push(Task::Internal(t));
+                        } else {
+                            tasks.push(Task::External(store_task_to_external(&t)));
                         }
                     }
-                    tasks.push(Task::Internal(t));
+                } else {
+                    let external_tasks = self.backend.list_all_tasks().await?;
+                    for t in external_tasks {
+                        tasks.push(Task::External(t));
+                    }
                 }
-            }
+            } else {
+                let task_status = TaskStatus::from_str(status_str).unwrap_or(TaskStatus::New);
+                let backend_status = match status_str.as_str() {
+                    "new" => Status::New,
+                    "routed" => Status::Routed,
+                    "in_progress" => Status::InProgress,
+                    "done" => Status::Done,
+                    "blocked" => Status::Blocked,
+                    "in_review" => Status::InReview,
+                    "needs_review" => Status::NeedsReview,
+                    _ => Status::New,
+                };
 
-            // Get external tasks with this status (store-first, same pattern as list_external_by_status)
-            let external_tasks = self.list_external_by_status(backend_status).await?;
-            for t in external_tasks {
-                tasks.push(Task::External(t));
+                // Get internal tasks from store
+                if let Some(ref store) = self.store {
+                    let internal_tasks = store
+                        .list_internal_by_status(&self.repo, task_status)
+                        .await?;
+                    for t in internal_tasks {
+                        if let Some(ref source) = filter.source {
+                            if t.source != *source {
+                                continue;
+                            }
+                        }
+                        tasks.push(Task::Internal(t));
+                    }
+                }
+
+                // Get external tasks with this status (store-first, same pattern as list_external_by_status)
+                let external_tasks = self.list_external_by_status(backend_status).await?;
+                for t in external_tasks {
+                    tasks.push(Task::External(t));
+                }
             }
         } else if let Some(source) = &filter.source {
             // Only source filter — query internal tasks by source directly in SQL

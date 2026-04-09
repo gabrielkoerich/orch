@@ -990,6 +990,18 @@ impl TaskStore {
         rows.iter().map(Self::row_to_task).collect()
     }
 
+    /// List all tasks across all repos regardless of status.
+    ///
+    /// Used by the CLI when `--status all` is passed.
+    pub async fn list_all_global(&self) -> anyhow::Result<Vec<Task>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {TASK_COLS} FROM tasks ORDER BY created_at DESC"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::row_to_task).collect()
+    }
+
     /// List all active tasks matching an optional status filter, across all repos.
     ///
     /// Used by the CLI fallback path when no project context is available.

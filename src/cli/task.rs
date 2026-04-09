@@ -244,9 +244,13 @@ async fn list_from_global_store(
     };
 
     let tasks = if let Some(ref status_str) = status {
-        let task_status =
-            crate::store::TaskStatus::from_str(status_str).unwrap_or(crate::store::TaskStatus::New);
-        store.list_all_by_status_global(task_status).await?
+        if status_str == "all" {
+            store.list_all_global().await?
+        } else {
+            let task_status = crate::store::TaskStatus::from_str(status_str)
+                .unwrap_or(crate::store::TaskStatus::New);
+            store.list_all_by_status_global(task_status).await?
+        }
     } else {
         store.list_all_active_global().await?
     };
