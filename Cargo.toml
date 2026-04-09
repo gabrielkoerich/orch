@@ -79,7 +79,7 @@ hmac = "0.12"
 subtle = "2"
 
 # GitHub App JWT authentication
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 base64 = "0.22"
 
 # Async combinators (FuturesUnordered for concurrent routing)
