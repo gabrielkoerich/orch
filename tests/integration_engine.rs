@@ -427,11 +427,23 @@ async fn router_round_robin_routes_task() {
 
     // Use round_robin mode so no LLM call is needed.
     // Only include agents likely to be in PATH on CI/dev machines.
-    let config = RouterConfig {
+    let mut config = RouterConfig {
         mode: "round_robin".to_string(),
         agents: vec!["claude".to_string(), "codex".to_string()],
         ..RouterConfig::default()
     };
+    // has_available_model_for_complexity returns false when no model_map entry exists,
+    // so we must configure models for the agents we want to route to.
+    // Tasks with no complexity label default to "medium" complexity.
+    for agent in &["claude", "codex"] {
+        for tier in &["simple", "medium", "complex"] {
+            config
+                .model_map
+                .entry(tier.to_string())
+                .or_default()
+                .insert(agent.to_string(), vec!["sonnet".to_string()]);
+        }
+    }
 
     let mut router = Router::new(config);
 
