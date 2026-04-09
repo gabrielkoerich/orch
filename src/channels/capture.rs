@@ -175,11 +175,13 @@ impl CaptureService {
     /// actively working and will be handled by the hard timeout if they exceed
     /// `stuck_timeout`. This prevents killing complex refactoring tasks that
     /// produce minimal terminal output (issue #2318).
+    ///
+    /// Returns (task_id, session_name, age_secs) for silent sessions.
     pub async fn get_silent_sessions_for_repo(
         &self,
         repo: &str,
         grace_period: std::time::Duration,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<(String, String, i64)> {
         let now = Utc::now();
         let buffers = self.buffers.read().await;
         let mut silent = Vec::new();
@@ -199,7 +201,7 @@ impl CaptureService {
             }
             let age = now.signed_duration_since(buf.registered_at);
             if age.num_seconds() > grace_period.as_secs() as i64 {
-                silent.push((buf.task_id.clone(), buf.session.clone()));
+                silent.push((buf.task_id.clone(), buf.session.clone(), age.num_seconds()));
             }
         }
         silent
