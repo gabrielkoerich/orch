@@ -573,6 +573,26 @@ impl LlmRouter {
             "LLM router parsed response (debug)"
         );
 
+        // Validate and normalize estimate to allowed Fibonacci values.
+        const FIBONACCI_ESTIMATES: [u8; 8] = [0, 1, 2, 3, 5, 8, 13, 21];
+        let estimate = if FIBONACCI_ESTIMATES.contains(&llm_response.estimate) {
+            llm_response.estimate
+        } else {
+            // Map to nearest allowed value; warn so operators can tune the prompt.
+            let nearest = FIBONACCI_ESTIMATES
+                .iter()
+                .min_by_key(|&&v| (v as i16 - llm_response.estimate as i16).unsigned_abs())
+                .copied()
+                .unwrap_or(0);
+            tracing::warn!(
+                task_id = task.id.0,
+                raw_estimate = llm_response.estimate,
+                normalized_estimate = nearest,
+                "LLM returned non-Fibonacci estimate; normalized to nearest allowed value"
+            );
+            nearest
+        };
+
         // Track last routed agent for distribution
         *last_agent = Some(agent.clone());
 
@@ -580,7 +600,7 @@ impl LlmRouter {
             agent,
             model,
             complexity,
-            estimate: llm_response.estimate,
+            estimate,
             reason: llm_response.reason,
             profile,
             selected_skills,

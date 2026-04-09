@@ -1819,7 +1819,16 @@ impl TaskStore {
             agent: row.try_get("agent").unwrap_or(None),
             model: row.try_get("model").unwrap_or(None),
             complexity: row.try_get("complexity").unwrap_or_default(),
-            estimate: row.try_get::<i32, _>("estimate").unwrap_or(0) as u8,
+            estimate: {
+                let raw: i32 = row.try_get("estimate").unwrap_or(0);
+                u8::try_from(raw).unwrap_or_else(|_| {
+                    tracing::warn!(
+                        raw_estimate = raw,
+                        "estimate value out of u8 range; defaulting to 0"
+                    );
+                    0
+                })
+            },
             route_reason: row.try_get("route_reason").unwrap_or_default(),
             agent_profile: row.try_get("agent_profile").unwrap_or_default(),
             selected_skills: row.try_get("selected_skills").unwrap_or_default(),
