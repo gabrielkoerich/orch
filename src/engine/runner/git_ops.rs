@@ -110,8 +110,7 @@ pub(crate) fn find_stash_ref_by_hash(stash_list: &str, stash_hash: &str) -> Opti
 
 /// Resolve the git author identity from config, falling back to `{agent}[bot]`.
 fn git_identity(agent: &str) -> (String, String) {
-    let name =
-        crate::config::get("git.name").unwrap_or_else(|_| format!("{agent}[bot]"));
+    let name = crate::config::get("git.name").unwrap_or_else(|_| format!("{agent}[bot]"));
     let email = crate::config::get("git.email")
         .unwrap_or_else(|_| format!("{agent}[bot]@users.noreply.github.com"));
     (name, email)
