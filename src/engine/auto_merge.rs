@@ -1224,10 +1224,19 @@ pub(crate) async fn handle_review_changes(
         // Persist block_reason BEFORE transitioning to Blocked to avoid
         // a race where auto_unblock sees a blocked task without a reason
         // and immediately unblocks it.
-        let fields = [(
-            "block_reason",
-            serde_json::json!(format!("max review cycles ({}) reached", max_cycles)),
-        )];
+        let fields = [
+            (
+                "block_reason",
+                serde_json::json!(format!("max review cycles ({}) exceeded", max_cycles)),
+            ),
+            (
+                "last_error",
+                serde_json::json!(format!(
+                    "review agent requested changes {} times — escalated to human review",
+                    review_cycles
+                )),
+            ),
+        ];
         // A transient store failure here must not be counted as a review-agent
         // crash. Log and return Ok — the next tick will re-check the task and
         // can retry the status transition.
@@ -1242,25 +1251,6 @@ pub(crate) async fn handle_review_changes(
             );
             return Ok(());
         }
-        store_set(
-            &Some(Arc::clone(store)),
-            repo,
-            &task.id.0,
-            &[
-                (
-                    "block_reason",
-                    serde_json::json!(format!("max review cycles ({}) exceeded", max_cycles)),
-                ),
-                (
-                    "last_error",
-                    serde_json::json!(format!(
-                        "review agent requested changes {} times — escalated to human review",
-                        review_cycles
-                    )),
-                ),
-            ],
-        )
-        .await;
         let escalation = format!(
             "🔍 Review agent requested changes after {} cycles. Escalating to human.\n\n**Review Notes:**\n{}",
             review_cycles, notes
