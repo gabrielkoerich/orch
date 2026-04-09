@@ -1861,7 +1861,7 @@ mod tests {
 
         // Create an internal task in InReview with old updated_at
         let id = store
-            .create_internal("owner/repo", "Internal InReview", "", "cron", "1")
+            .create_internal("owner/repo", "Internal InReview", "", "cron", "1", None)
             .await
             .unwrap();
         store
@@ -2008,7 +2008,7 @@ mod tests {
         };
 
         let internal_id = store
-            .create_internal("owner/repo", "Silent internal", "", "cron", "1")
+            .create_internal("owner/repo", "Silent internal", "", "cron", "1", None)
             .await
             .unwrap();
         store
@@ -2088,7 +2088,7 @@ mod tests {
         // Without the fix this task would be reclaimed by Phase 2 (age >> threshold,
         // no session running in the test environment).
         let id = store
-            .create_internal("owner/repo", "Completed task", "", "cron", "1")
+            .create_internal("owner/repo", "Completed task", "", "cron", "1", None)
             .await
             .unwrap();
         store
