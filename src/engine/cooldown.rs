@@ -668,7 +668,12 @@ async fn set_cooldown_async(key: &str, cooldown_until: i64, reason: &str) -> boo
                 "failed to persist cooldown to KV store — rolling back in-memory entry"
             );
             let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
-            map.remove(key);
+            // Only roll back if nothing has superseded our write.
+            // A racing thread may have set a longer cooldown in the meantime;
+            // removing unconditionally would erase that valid entry.
+            if map.get(key).map(|e| e.cooldown_until) == Some(cooldown_until) {
+                map.remove(key);
+            }
             return false;
         }
     }
