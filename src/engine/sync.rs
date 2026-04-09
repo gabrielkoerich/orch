@@ -383,13 +383,20 @@ async fn handle_slash_command(
     )
     .await;
 
+    // Extract is_pr from the outcome (avoids a second get_issue call)
+    let is_pr = match &outcome {
+        CommandOutcome::Executed { is_pr }
+        | CommandOutcome::NotOpen { is_pr }
+        | CommandOutcome::NotCollaborator { is_pr } => *is_pr,
+        CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => return true,
+    };
+
     // Record a sentinel task for the mention (with correct parent_id)
     if let Some(s) = store {
-        let is_pr = gh.is_pull_request(repo, &issue_num).await;
         let parent_id = resolve_mention_parent_id(s, repo, &issue_num, is_pr).await;
 
         let (title, body) = match &outcome {
-            CommandOutcome::NotOpen => (
+            CommandOutcome::NotOpen { .. } => (
                 format!(
                     "Skipped @orch command on closed #{issue_num} from @{}",
                     mention.author
@@ -399,7 +406,7 @@ async fn handle_slash_command(
                     mention.author, mention.body
                 ),
             ),
-            CommandOutcome::NotCollaborator => (
+            CommandOutcome::NotCollaborator { .. } => (
                 format!(
                     "Skipped @orch command on #{issue_num} from non-collaborator @{}",
                     mention.author
@@ -409,7 +416,7 @@ async fn handle_slash_command(
                     mention.author, mention.body
                 ),
             ),
-            CommandOutcome::Executed => (
+            CommandOutcome::Executed { .. } => (
                 format!(
                     "Respond to mention by @{} on task #{issue_num} — command executed",
                     mention.author
@@ -419,8 +426,10 @@ async fn handle_slash_command(
                     mention.author, mention.body
                 ),
             ),
-            // Fetch/collaborator check failures — don't record, retry next tick
-            CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => return true,
+            // Already handled above
+            CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => {
+                unreachable!()
+            }
         };
 
         record_mention_task(s, repo, mention, &title, &body, parent_id, last_success_ts).await;

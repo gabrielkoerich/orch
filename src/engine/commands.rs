@@ -211,10 +211,13 @@ pub async fn scan_commands(
         )
         .await;
 
-        match outcome {
-            CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => continue,
-            _ => new_processed.push(mention.id.clone()),
+        if matches!(
+            outcome,
+            CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed
+        ) {
+            continue;
         }
+        new_processed.push(mention.id.clone());
     }
 
     // Persist processed IDs (keep last 500 to avoid unbounded growth)
@@ -338,13 +341,16 @@ pub async fn execute_command(
 }
 
 /// Result of attempting to validate and run a slash command.
+///
+/// Variants that successfully fetched issue data include `is_pr` so callers
+/// don't need a second `get_issue` call.
 pub enum CommandOutcome {
     /// Command executed successfully or failed — either way, it was handled.
-    Executed,
+    Executed { is_pr: bool },
     /// Issue/PR is not open — command was skipped.
-    NotOpen,
+    NotOpen { is_pr: bool },
     /// Author is not a collaborator — command was skipped.
-    NotCollaborator,
+    NotCollaborator { is_pr: bool },
     /// Failed to fetch issue state — should retry.
     FetchFailed,
     /// Failed to check collaborator status — should retry.
@@ -375,9 +381,11 @@ pub async fn validate_and_run_command(
         }
     };
 
+    let is_pr = issue_data.pull_request.is_some();
+
     if issue_data.state != "open" {
         tracing::debug!(issue = %issue_number, state = %issue_data.state, command = %command, "ignoring slash command on non-open issue");
-        return CommandOutcome::NotOpen;
+        return CommandOutcome::NotOpen { is_pr };
     }
 
     // Check collaborator status
@@ -385,7 +393,7 @@ pub async fn validate_and_run_command(
         Ok(true) => {}
         Ok(false) => {
             tracing::info!(author, command = %command, issue = %issue_number, "ignoring slash command from non-collaborator");
-            return CommandOutcome::NotCollaborator;
+            return CommandOutcome::NotCollaborator { is_pr };
         }
         Err(e) => {
             tracing::warn!(author, err = %e, "failed to check collaborator status");
@@ -420,7 +428,7 @@ pub async fn validate_and_run_command(
         }
     }
 
-    CommandOutcome::Executed
+    CommandOutcome::Executed { is_pr }
 }
 
 #[cfg(test)]
