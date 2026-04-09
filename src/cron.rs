@@ -12,7 +12,7 @@ use cron::Schedule;
 use std::str::FromStr;
 
 /// Normalize day-of-week field: standard cron allows 0 for Sunday, but the
-/// `cron` crate only accepts 1-7 (Sun=1). Replace standalone `0` with `7`.
+/// `cron` crate only accepts 1-7 (1=Mon, 7=Sun). Replace standalone `0` with `7`.
 pub fn normalize_dow(expression: &str) -> String {
     let fields: Vec<&str> = expression.split_whitespace().collect();
     if fields.len() != 5 {
@@ -182,7 +182,8 @@ pub fn check(expression: &str, since: Option<&str>) -> anyhow::Result<bool> {
     // cron crate expects 7-field expressions (sec min hour dom mon dow year)
     // We accept 5-field (min hour dom mon dow) and wrap with "0" seconds + "*" year.
     //
-    // The cron crate uses 1-7 for DOW (Sun=1..Sat=7), but standard cron uses
+    // The cron crate uses 1-7 for DOW where 1=Mon and 7=Sun (ISO weekday
+    // ordering, with Sunday mapped to 7 instead of 0). Standard cron accepts
     // 0-7 where both 0 and 7 mean Sunday. Normalize DOW=0 → DOW=7.
     let expanded =
         expand_alias(expression).with_context(|| format!("invalid cron alias: {expression}"))?;
@@ -296,7 +297,7 @@ mod tests {
 
     #[test]
     fn sunday_as_zero_parses() {
-        // Standard cron uses 0 for Sunday; the cron crate uses 1-7 (Sun=1)
+        // Standard cron uses 0 for Sunday; the cron crate uses 1-7 (1=Mon, 7=Sun)
         let result = check("0 20 * * 0", None);
         assert!(
             result.is_ok(),
