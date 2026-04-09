@@ -245,9 +245,15 @@ pub async fn record_agent_success(agent_name: &str, model: &str) {
         let agent_key = format!("{FAILURE_COUNT_PREFIX}{agent_name}");
         let model_key = format!("{FAILURE_COUNT_PREFIX}{agent_name}:{model}");
         let credit_key = format!("{CREDIT_FAILURE_COUNT_PREFIX}{agent_name}");
-        let _ = store.kv_set(&agent_key, "0").await;
-        let _ = store.kv_set(&model_key, "0").await;
-        let _ = store.kv_set(&credit_key, "0").await;
+        if let Err(e) = store.kv_set(&agent_key, "0").await {
+            tracing::warn!(key = agent_key, err = %e, "failed to reset failure count");
+        }
+        if let Err(e) = store.kv_set(&model_key, "0").await {
+            tracing::warn!(key = model_key, err = %e, "failed to reset failure count");
+        }
+        if let Err(e) = store.kv_set(&credit_key, "0").await {
+            tracing::warn!(key = credit_key, err = %e, "failed to reset failure count");
+        }
     }
 }
 
@@ -552,25 +558,35 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
         };
         for k in &keys {
             let kv_key = format!("{KV_PREFIX}{k}");
-            let _ = store.kv_set(&kv_key, "0").await;
+            if let Err(e) = store.kv_set(&kv_key, "0").await {
+                tracing::warn!(key = kv_key, err = %e, "failed to clear cooldown");
+            }
             // Reset failure count so backoff restarts from base.
             let fc_key = format!("{FAILURE_COUNT_PREFIX}{k}");
-            let _ = store.kv_set(&fc_key, "0").await;
+            if let Err(e) = store.kv_set(&fc_key, "0").await {
+                tracing::warn!(key = fc_key, err = %e, "failed to reset failure count");
+            }
             // Also reset credit-specific failure count.
             let credit_fc_key = format!("{CREDIT_FAILURE_COUNT_PREFIX}{k}");
-            let _ = store.kv_set(&credit_fc_key, "0").await;
+            if let Err(e) = store.kv_set(&credit_fc_key, "0").await {
+                tracing::warn!(key = credit_fc_key, err = %e, "failed to reset credit failure count");
+            }
         }
         // Also reset any persisted failure_count keys that are not in the
         // in-memory map (e.g. survived a restart or were set without a
         // corresponding in-memory cooldown entry).
         if let Ok(fc_entries) = store.kv_list_prefix(FAILURE_COUNT_PREFIX).await {
             for (fc_key, _) in fc_entries {
-                let _ = store.kv_set(&fc_key, "0").await;
+                if let Err(e) = store.kv_set(&fc_key, "0").await {
+                    tracing::warn!(key = fc_key, err = %e, "failed to reset failure count");
+                }
             }
         }
         if let Ok(cfc_entries) = store.kv_list_prefix(CREDIT_FAILURE_COUNT_PREFIX).await {
             for (cfc_key, _) in cfc_entries {
-                let _ = store.kv_set(&cfc_key, "0").await;
+                if let Err(e) = store.kv_set(&cfc_key, "0").await {
+                    tracing::warn!(key = cfc_key, err = %e, "failed to reset credit failure count");
+                }
             }
         }
         tracing::info!(
@@ -583,13 +599,19 @@ pub async fn clear_cooldown(key: &str, store: &Arc<crate::store::TaskStore>) {
             map.remove(key);
         }
         let kv_key = format!("{KV_PREFIX}{key}");
-        let _ = store.kv_set(&kv_key, "0").await;
+        if let Err(e) = store.kv_set(&kv_key, "0").await {
+            tracing::warn!(key = kv_key, err = %e, "failed to clear cooldown");
+        }
         // Reset failure count so backoff restarts from base.
         let fc_key = format!("{FAILURE_COUNT_PREFIX}{key}");
-        let _ = store.kv_set(&fc_key, "0").await;
+        if let Err(e) = store.kv_set(&fc_key, "0").await {
+            tracing::warn!(key = fc_key, err = %e, "failed to reset failure count");
+        }
         // Also reset credit-specific failure count.
         let credit_fc_key = format!("{CREDIT_FAILURE_COUNT_PREFIX}{key}");
-        let _ = store.kv_set(&credit_fc_key, "0").await;
+        if let Err(e) = store.kv_set(&credit_fc_key, "0").await {
+            tracing::warn!(key = credit_fc_key, err = %e, "failed to reset credit failure count");
+        }
         tracing::info!(key, "cleared cooldown and failure count");
     }
 }
