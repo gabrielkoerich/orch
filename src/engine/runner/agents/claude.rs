@@ -732,6 +732,43 @@ pub fn find_claude_result(ndjson: &str) -> Option<super::AgentResult> {
     })
 }
 
+/// Concatenate text content from all `type:assistant` NDJSON messages in
+/// the stream.  Used as a fallback when the `type:result` envelope text
+/// does not contain valid AgentResponse JSON but an earlier assistant turn
+/// might have emitted it.
+pub fn collect_assistant_messages_text(ndjson: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for line in ndjson.trim().lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if val.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(content) = val
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        {
+            for item in content {
+                if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                        let t = text.trim();
+                        if !t.is_empty() {
+                            parts.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    parts.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
