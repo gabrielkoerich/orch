@@ -211,7 +211,7 @@ async fn select_review_agent(
 
     loop {
         let tmp_exclude_refs: Vec<&str> = exclude_set.iter().map(|s| s.as_str()).collect();
-        let agent = match r.next_round_robin_agent(&tmp_exclude_refs) {
+        let agent = match r.next_round_robin_agent(&tmp_exclude_refs, "review") {
             Some(a) => a,
             None => break,
         };
@@ -239,7 +239,7 @@ async fn select_review_agent(
     } else {
         let final_exclude_refs: Vec<&str> = exclude_set.iter().map(|s| s.as_str()).collect();
         let fallback_agent = r
-            .next_round_robin_agent(&final_exclude_refs)
+            .next_round_robin_agent(&final_exclude_refs, "review")
             .unwrap_or_else(|| "claude".to_string());
         let fallback_model = r
             .config

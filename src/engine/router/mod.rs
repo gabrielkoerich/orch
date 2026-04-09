@@ -488,13 +488,14 @@ impl Router {
     /// Pick next agent via round-robin (for review or other non-task routing).
     /// Pick the next review agent, optionally excluding one (e.g. the task's original agent).
     /// Falls back to the excluded agent only if it's the only one available.
-    pub fn next_round_robin_agent(&mut self, exclude: &[&str]) -> Option<String> {
+    pub fn next_round_robin_agent(&mut self, exclude: &[&str], complexity: &str) -> Option<String> {
         if self.available_agents.is_empty() {
             return None;
         }
         let idx = self.review_rr_index;
 
-        // Try to find an agent that isn't excluded, isn't in cooldown, and isn't degraded
+        // Try to find an agent that isn't excluded, isn't in cooldown, isn't degraded,
+        // and has an available model for the given complexity tier.
         let n = self.available_agents.len();
         let agent = (0..n)
             .map(|offset| &self.available_agents[(idx + offset) % n])
@@ -502,26 +503,24 @@ impl Router {
                 !exclude.contains(&a.as_str())
                     && !crate::engine::runner::response::is_agent_in_cooldown(a)
                     && !is_agent_degraded(a)
+                    && self
+                        .config
+                        .has_available_model_for_complexity(a, complexity)
             })
             .cloned()
-            // Fallback: any non-cooled, non-degraded agent (including excluded) — healthy agent beats rate-limited one
+            // Fallback: any non-cooled, non-degraded agent with available model
             .or_else(|| {
                 (0..n)
                     .map(|offset| &self.available_agents[(idx + offset) % n])
                     .find(|a| {
                         !crate::engine::runner::response::is_agent_in_cooldown(a)
                             && !is_agent_degraded(a)
+                            && self
+                                .config
+                                .has_available_model_for_complexity(a, complexity)
                     })
                     .cloned()
-            })
-            // Last resort: non-excluded even if cooled or degraded
-            .or_else(|| {
-                (0..n)
-                    .map(|offset| &self.available_agents[(idx + offset) % n])
-                    .find(|a| !exclude.contains(&a.as_str()))
-                    .cloned()
-            })
-            .or_else(|| self.available_agents.get(idx % n).cloned())?;
+            })?;
 
         self.review_rr_index = (idx + 1) % n;
         Some(agent)
@@ -2210,7 +2209,15 @@ Hope that helps!"#;
 
     #[test]
     fn review_rr_index_advances() {
-        let config = RouterConfig::default();
+        let mut config = RouterConfig::default();
+        // Set up model_map so has_available_model_for_complexity returns true for test agents
+        for agent in &["test_a", "test_b", "test_c"] {
+            config
+                .model_map
+                .entry("medium".to_string())
+                .or_default()
+                .insert((*agent).to_string(), vec!["test-model".to_string()]);
+        }
         let agents = vec![
             "test_a".to_string(),
             "test_b".to_string(),
@@ -2230,9 +2237,9 @@ Hope that helps!"#;
             pool_index: 0,
         };
 
-        let a1 = router.next_round_robin_agent(&[]).unwrap();
-        let a2 = router.next_round_robin_agent(&[]).unwrap();
-        let a3 = router.next_round_robin_agent(&[]).unwrap();
+        let a1 = router.next_round_robin_agent(&[], "medium").unwrap();
+        let a2 = router.next_round_robin_agent(&[], "medium").unwrap();
+        let a3 = router.next_round_robin_agent(&[], "medium").unwrap();
 
         // All three agents should appear (order depends on start index)
         let mut seen = vec![a1, a2, a3];
