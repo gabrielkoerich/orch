@@ -311,8 +311,8 @@ impl OutputBuffer {
             current_content.to_string()
         } else {
             let mut offset = self.last_len.min(current_len);
-            while offset < current_len && !current_content.is_char_boundary(offset) {
-                offset += 1;
+            while offset > 0 && !current_content.is_char_boundary(offset) {
+                offset -= 1;
             }
             String::from_utf8_lossy(&current_bytes[offset..]).to_string()
         };
@@ -548,6 +548,21 @@ mod tests {
         assert_ne!(buf_a.session, buf_b.session);
         assert_eq!(buf_a.repo, "owner/repo-a");
         assert_eq!(buf_b.repo, "owner/repo-b");
+    }
+
+    #[test]
+    fn multibyte_boundary_no_bytes_dropped() {
+        // "Hello " is 6 bytes. Append a 3-byte CJK character (世, U+4E16).
+        // Simulate last_len landing in the middle of the 3-byte sequence.
+        let mut buf = make_buffer();
+        buf.diff_and_update("Hello ");
+        // Full string with CJK appended
+        let full = "Hello 世界";
+        let result = buf.diff_and_update(full);
+        // The new suffix must contain both CJK characters intact.
+        let s = result.expect("should return new content");
+        assert!(s.contains('世'), "first CJK char must not be dropped");
+        assert!(s.contains('界'), "second CJK char must not be dropped");
     }
 
     #[test]
