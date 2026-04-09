@@ -266,21 +266,27 @@ pub(crate) async fn review_open_prs(
                         "no PR or code changes after {}/{} reroute attempts",
                         reroutes, max_reroutes
                     );
-                    store_set_by_id(
-                        &Some(Arc::clone(store)),
-                        task_info.store_id,
-                        &[
-                            ("agent", serde_json::json!(null)),
-                            ("model", serde_json::json!(null)),
-                            ("last_error", serde_json::json!(msg)),
-                        ],
-                    )
-                    .await;
+                    // Write block_reason atomically with the status transition to prevent
+                    // auto_unblock_blocked_tasks (block_reason.is_none() gate) from
+                    // re-dispatching this task.
+                    let fields = [
+                        (
+                            "block_reason",
+                            serde_json::json!(format!(
+                                "max reroute attempts ({}) reached — no PR or code changes produced",
+                                max_reroutes
+                            )),
+                        ),
+                        ("last_error", serde_json::json!(msg)),
+                        ("agent", serde_json::json!(null)),
+                        ("model", serde_json::json!(null)),
+                    ];
                     if let Err(e) = task_manager
-                        .update_task_status(&task_info.task.id, Status::Blocked)
+                        .update_task_status_and_result(&task_info.task.id, Status::Blocked, &fields)
                         .await
                     {
-                        tracing::warn!(task_id, err = %e, "failed to update status to blocked");
+                        tracing::error!(task_id, err = %e, "update_task_status_and_result(Blocked) failed — skipping block to avoid silent auto-unblock loop");
+                        continue;
                     }
                 } else {
                     tracing::warn!(

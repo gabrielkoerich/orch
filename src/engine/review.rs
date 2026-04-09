@@ -1798,11 +1798,24 @@ async fn ensure_pr_exists(
                         branch = %branch_name,
                         "no PR and no commits after max attempts — marking blocked to stop loop"
                     );
+                    // Write block_reason atomically with the status transition to prevent
+                    // auto_unblock_blocked_tasks (block_reason.is_none() gate) from
+                    // re-dispatching this task.
+                    let fields = [
+                        (
+                            "block_reason",
+                            serde_json::json!("max attempts exceeded — no PR or commits produced"),
+                        ),
+                        ("last_error", serde_json::json!(last_error)),
+                    ];
                     if let Err(e) = task_manager
-                        .update_task_status(&task.id, Status::Blocked)
+                        .update_task_status_and_result(&task.id, Status::Blocked, &fields)
                         .await
                     {
-                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
+                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status_and_result(Blocked) failed — skipping block to avoid silent auto-unblock loop");
+                        return Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
+                            format!("failed to write block_reason: {e}"),
+                        )));
                     }
                     return Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Skipped));
                 }
@@ -1831,11 +1844,24 @@ async fn ensure_pr_exists(
                         last_error = %last_error,
                         "no PR and no commits after failover exhaustion — marking blocked to stop loop"
                     );
+                    // Write block_reason atomically with the status transition to prevent
+                    // auto_unblock_blocked_tasks (block_reason.is_none() gate) from
+                    // re-dispatching this task.
+                    let fields = [
+                        (
+                            "block_reason",
+                            serde_json::json!("all agents exhausted — no PR or commits produced"),
+                        ),
+                        ("last_error", serde_json::json!(last_error)),
+                    ];
                     if let Err(e) = task_manager
-                        .update_task_status(&task.id, Status::Blocked)
+                        .update_task_status_and_result(&task.id, Status::Blocked, &fields)
                         .await
                     {
-                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Blocked) failed — task may be stuck in NeedsReview");
+                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status_and_result(Blocked) failed — skipping block to avoid silent auto-unblock loop");
+                        return Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
+                            format!("failed to write block_reason: {e}"),
+                        )));
                     }
                     return Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Skipped));
                 }
@@ -1903,27 +1929,30 @@ async fn ensure_pr_exists(
                         max_reroutes,
                         "reached max reroute attempts for no-pr-result — blocking for human review"
                     );
-                    // Clear agent/model and record an explanatory last_error
                     let msg = format!(
                         "no PR or code changes after {}/{} reroute attempts",
                         reroutes, max_reroutes
                     );
-                    store_set(
-                        &Some(Arc::clone(store)),
-                        repo,
-                        &task.id.0,
-                        &[
-                            ("agent", serde_json::json!(null)),
-                            ("model", serde_json::json!(null)),
-                            ("last_error", serde_json::json!(msg)),
-                        ],
-                    )
-                    .await;
+                    // Write block_reason atomically with the status transition to prevent
+                    // auto_unblock_blocked_tasks (block_reason.is_none() gate) from
+                    // re-dispatching this task.
+                    let fields = [
+                        (
+                            "block_reason",
+                            serde_json::json!(format!(
+                                "max reroute attempts ({}) reached — no PR or code changes produced",
+                                max_reroutes
+                            )),
+                        ),
+                        ("last_error", serde_json::json!(msg)),
+                        ("agent", serde_json::json!(null)),
+                        ("model", serde_json::json!(null)),
+                    ];
                     if let Err(e) = task_manager
-                        .update_task_status(&task.id, Status::Blocked)
+                        .update_task_status_and_result(&task.id, Status::Blocked, &fields)
                         .await
                     {
-                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status(Blocked) failed — task may be stuck in InReview");
+                        tracing::error!(task_id = task.id.0, err = %e, "update_task_status_and_result(Blocked) failed — skipping block to avoid silent auto-unblock loop");
                     }
                 } else {
                     // Clear agent/model so router picks a different one and note the
