@@ -793,7 +793,10 @@ pub async fn send_message(
         let mut map = SESSION_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
         // Re-check under the map lock: a concurrent caller may have cloned the Arc
         // between our strong_count check above and acquiring the map lock.
-        if map.get(session_id).is_some_and(|l| Arc::strong_count(l) == 1) {
+        if map
+            .get(session_id)
+            .is_some_and(|l| Arc::strong_count(l) == 1)
+        {
             map.remove(session_id);
         }
     }
