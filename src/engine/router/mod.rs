@@ -487,23 +487,27 @@ impl Router {
         }
         let idx = self.review_rr_index;
 
-        // Try to find an agent that isn't excluded and isn't in cooldown
+        // Try to find an agent that isn't excluded, isn't in cooldown, and isn't degraded
         let n = self.available_agents.len();
         let agent = (0..n)
             .map(|offset| &self.available_agents[(idx + offset) % n])
             .find(|a| {
                 !exclude.contains(&a.as_str())
                     && !crate::engine::runner::response::is_agent_in_cooldown(a)
+                    && !is_agent_degraded(a)
             })
             .cloned()
-            // Fallback: any non-cooled agent (including excluded) — healthy agent beats rate-limited one
+            // Fallback: any non-cooled, non-degraded agent (including excluded) — healthy agent beats rate-limited one
             .or_else(|| {
                 (0..n)
                     .map(|offset| &self.available_agents[(idx + offset) % n])
-                    .find(|a| !crate::engine::runner::response::is_agent_in_cooldown(a))
+                    .find(|a| {
+                        !crate::engine::runner::response::is_agent_in_cooldown(a)
+                            && !is_agent_degraded(a)
+                    })
                     .cloned()
             })
-            // Last resort: non-excluded even if cooled
+            // Last resort: non-excluded even if cooled or degraded
             .or_else(|| {
                 (0..n)
                     .map(|offset| &self.available_agents[(idx + offset) % n])
