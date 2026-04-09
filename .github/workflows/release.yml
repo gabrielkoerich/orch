@@ -67,6 +67,9 @@ jobs:
       - name: Run tests with coverage
         run: cargo llvm-cov nextest --lcov --output-path lcov.info
 
+      - name: Install lcov
+        run: sudo apt-get update && sudo apt-get install -y lcov
+
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
         with:
