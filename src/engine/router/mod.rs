@@ -520,15 +520,7 @@ impl Router {
                                 .has_available_model_for_complexity(a, complexity)
                     })
                     .cloned()
-            })
-            // Last resort: non-excluded even if cooled or degraded (will fail later)
-            .or_else(|| {
-                (0..n)
-                    .map(|offset| &self.available_agents[(idx + offset) % n])
-                    .find(|a| !exclude.contains(&a.as_str()))
-                    .cloned()
-            })
-            .or_else(|| self.available_agents.get(idx % n).cloned())?;
+            })?;
 
         self.review_rr_index = (idx + 1) % n;
         Some(agent)
