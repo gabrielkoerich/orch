@@ -64,16 +64,19 @@ jobs:
           fi
           echo "✓ No SELECT * found in store files"
 
-      - name: Run tests with coverage
-        run: cargo llvm-cov nextest --lcov --output-path lcov.info
+       - name: Run tests with coverage
+         run: cargo llvm-cov nextest --lcov --output-path lcov.info
 
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-lcov
-          path: lcov.info
+       - name: Install lcov
+         run: sudo apt-get update && sudo apt-get install -y lcov
 
-      - name: Find associated PR
+       - name: Upload coverage artifact
+         uses: actions/upload-artifact@v4
+         with:
+           name: coverage-lcov
+           path: lcov.info
+
+       - name: Find associated PR
         id: find-pr
         run: |
           PR_NUMBER=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
