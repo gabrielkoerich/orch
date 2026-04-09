@@ -983,6 +983,18 @@ impl TaskRunner {
         // Any reroute ("new"/"routed") should avoid review-gate and go back through
         // normal dispatch, regardless of why it was rerouted.
         let is_rerouted = status == "new" || status == "routed";
+        if is_rerouted {
+            store::store_set(
+                &self.store,
+                &self.repo,
+                task_id,
+                &[
+                    ("agent", serde_json::json!("")),
+                    ("model", serde_json::json!("")),
+                ],
+            )
+            .await;
+        }
         let weight_signal = if is_rerouted {
             WeightSignal::RateLimited {
                 agent: agent_name.clone(),
