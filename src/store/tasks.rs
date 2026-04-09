@@ -1627,6 +1627,12 @@ impl TaskStore {
                 )
                 .await?;
             }
+        } else if run.outcome != "success" {
+            tracing::warn!(
+                run_id = run.run_id,
+                outcome = run.outcome,
+                "run_id not found in task_runs; skipping timeout/error activity log"
+            );
         }
         Ok(())
     }
