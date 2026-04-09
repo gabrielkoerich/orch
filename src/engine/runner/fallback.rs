@@ -276,22 +276,27 @@ pub async fn handle_error(
             // needs_review so a human is notified rather than looping forever.
             const MAX_NETWORK_RETRIES: u64 = 8;
             let msg = format!("{agent_name} network error: {message}");
-            let retry_count =
-                match store::store_increment(store, repo, task_id, "network_retries").await {
-                    Ok(count) => {
-                        tracing::info!(
-                            task_id,
-                            retry_count = count,
-                            agent = agent_name,
-                            "network retry scheduled"
-                        );
-                        count
-                    }
-                    Err(e) => {
-                        tracing::warn!(task_id, error = %e, "failed to increment network_retries");
-                        0
-                    }
-                };
+            let retry_count = match store::store_increment(store, repo, task_id, "network_retries")
+                .await
+            {
+                Ok(count) => {
+                    tracing::info!(
+                        task_id,
+                        retry_count = count,
+                        agent = agent_name,
+                        "network retry scheduled"
+                    );
+                    count
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id,
+                        error = %e,
+                        "failed to increment network_retries — assuming 1 to prevent infinite loop"
+                    );
+                    1
+                }
+            };
             store::store_set(
                 store,
                 repo,
