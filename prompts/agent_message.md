@@ -47,3 +47,6 @@ Learnings from previous task attempts (to help you avoid repeating mistakes):
 {{MEMORY_SECTION}}
 {{/if}}
 
+---
+
+**Final action**: Your last message MUST be the JSON output block described in the system prompt. Output ONLY the JSON — no prose, no markdown fences, no text before or after it.

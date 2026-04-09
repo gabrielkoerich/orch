@@ -99,7 +99,7 @@ Your final output MUST be a single JSON object and nothing else. Do not wrap it 
 
 Note: `delegations` is optional — only include it when delegating subtasks.
 
-Any malformed, partial, or non-JSON final output is treated as an invalid agent response and will not be recorded as a successful completion.
+Prose or non-JSON output triggers a synthesis fallback that produces incomplete results — `files_changed` and `learnings` will be empty, losing context for future retries. Always output valid JSON.
 
 Status rules:
 - **done**: all work is committed (if code changes were made) and tests pass. You must have produced a visible result (committed code, posted a comment, created an issue, or completed the requested action). Orch pushes and creates the PR automatically — do NOT mention pushing in your summary. **Never report done if you did not complete the task. Asking a clarifying question is NOT done — it is blocked. Producing a plan or analysis when the task asked for code changes is NOT completing the task — use `blocked` with a reason explaining why you could not implement.**
