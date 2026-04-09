@@ -98,7 +98,7 @@ pub async fn has_changes(dir: &Path) -> bool {
     has_diff || has_cached || has_untracked
 }
 
-fn find_stash_ref_by_hash(stash_list: &str, stash_hash: &str) -> Option<String> {
+pub(crate) fn find_stash_ref_by_hash(stash_list: &str, stash_hash: &str) -> Option<String> {
     stash_list.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
         match (parts.next(), parts.next()) {
