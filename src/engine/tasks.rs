@@ -504,6 +504,11 @@ impl TaskManager {
         }
 
         // External tasks: conditional store update, then mirror to backend.
+        // The conditional guarantee (update only when current == expected) relies on
+        // having a local store record. If the unified store isn't available or the
+        // task has no store record (e.g. not yet synced), we cannot safely perform
+        // the conditional update — return false and warn so callers treat this as
+        // a no-op instead of assuming the update succeeded.
         if let Some(ref store) = self.store {
             if let Some(store_id) = snapshot_store_id {
                 if task_status != crate::store::TaskStatus::Blocked {
@@ -515,7 +520,21 @@ impl TaskManager {
                 if !updated {
                     return Ok(false);
                 }
+            } else {
+                tracing::warn!(
+                    task_id = id.0,
+                    ?expected_task_status,
+                    "update_task_status_if: external task has no store record — cannot perform conditional update"
+                );
+                return Ok(false);
             }
+        } else {
+            tracing::warn!(
+                task_id = id.0,
+                ?expected_task_status,
+                "update_task_status_if: no store available — cannot perform conditional update for external task"
+            );
+            return Ok(false);
         }
 
         if let Err(e) = self.backend.update_status(id, status).await {
