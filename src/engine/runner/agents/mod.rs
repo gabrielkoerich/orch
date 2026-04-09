@@ -164,6 +164,14 @@ pub struct AgentResult {
     pub duration_ms: Option<u64>,
 }
 
+/// Concatenate text from all assistant-turn messages in the agent's NDJSON
+/// output stream.  Used as an intermediate fallback when the `type:result`
+/// envelope text is not valid AgentResponse JSON but an earlier assistant
+/// message in the conversation might contain it.
+pub fn collect_assistant_messages_text(_agent: &str, ndjson: &str) -> String {
+    claude::collect_assistant_messages_text(ndjson)
+}
+
 /// Dispatch to the appropriate per-agent result extractor.
 ///
 /// Returns `None` if no structured result could be found in the output

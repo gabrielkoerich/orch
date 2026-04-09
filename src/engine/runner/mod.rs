@@ -211,6 +211,29 @@ fn parse_success_output(
                 });
             }
             Err(_) => {
+                // Strategy 2: scan all earlier assistant messages in the NDJSON
+                // stream for valid AgentResponse JSON. Agents often emit the
+                // JSON in an intermediate turn and then summarise in prose as
+                // their final output, so the `type:result` text may be pure
+                // narrative while a prior assistant turn contains the JSON.
+                let assistant_text =
+                    agents::collect_assistant_messages_text(agent_name, raw_stdout);
+                if !assistant_text.is_empty() {
+                    if let Ok(response) = crate::parser::parse(&assistant_text) {
+                        tracing::debug!(
+                            task_id,
+                            agent = agent_name,
+                            "found AgentResponse JSON in earlier assistant message"
+                        );
+                        return Ok(agents::ParsedResponse {
+                            response,
+                            input_tokens: agent_result.input_tokens,
+                            output_tokens: agent_result.output_tokens,
+                            duration_ms: agent_result.duration_ms,
+                        });
+                    }
+                }
+
                 // Only fall back to text synthesis when parsing fails
                 if let Some(response) =
                     agents::synthesize_response_from_text(&agent_result.result_text)
