@@ -13,7 +13,7 @@ use crate::engine::cleanup::cleanup_task_worktree;
 use crate::engine::runner::worktree;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
-use crate::github::types::GitHubReview;
+use crate::github::types::{GitHubPullRequest, GitHubReview};
 use crate::store::TaskStore;
 use crate::store::{opt_store_get_task, store_increment, store_reset_failure_counters, store_set};
 use std::collections::HashMap;
@@ -35,6 +35,39 @@ static CI_POLL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn ci_poll_semaphore() -> &'static Arc<Semaphore> {
     CI_POLL_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(3)))
+}
+
+/// Poll GitHub for PR mergeability until it is computed or `max_wait` elapses.
+///
+/// GitHub returns `None` for `mergeable` when it hasn't computed the value yet —
+/// common when the review agent approves seconds after PR creation. Polling for
+/// a brief window avoids an unnecessary deferral to the next sync tick (~10-45s).
+///
+/// Returns the PR with `mergeable` resolved, or bails if GitHub hasn't computed
+/// it within `max_wait` or if the PR has merge conflicts.
+async fn poll_mergeable_until(
+    gh: &GhHttp,
+    repo: &str,
+    pr_number: u64,
+    max_wait: std::time::Duration,
+) -> anyhow::Result<GitHubPullRequest> {
+    let interval = std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + max_wait;
+    loop {
+        let pr = gh.get_pr(repo, pr_number).await?;
+        match pr.mergeable {
+            Some(false) => anyhow::bail!("PR is not mergeable (merge conflicts present)"),
+            Some(true) => return Ok(pr),
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("PR mergeability not yet computed — retry");
+                }
+                let remaining = deadline - std::time::Instant::now();
+                let sleep_for = std::cmp::min(remaining, interval);
+                tokio::time::sleep(sleep_for).await;
+            }
+        }
+    }
 }
 
 fn required_checks_state(
@@ -333,13 +366,20 @@ pub(crate) async fn auto_merge_pr(
     let start = std::time::Instant::now();
     let mut poll_count: u32 = 0;
 
-    // Fetch PR and required contexts once (outside the polling loop).
-    let pr = gh.get_pr(repo, pr_number).await?;
-    match pr.mergeable {
-        Some(false) => anyhow::bail!("PR is not mergeable (merge conflicts present)"),
-        None => anyhow::bail!("PR mergeability not yet computed — retry"),
-        Some(true) => {} // proceed
-    }
+    // Poll for mergeability to avoid deferring to the next sync tick (~10-45s)
+    // when GitHub returns None because it hasn't computed mergeability yet.
+    // This is common when the review agent approves quickly after PR creation.
+    let mergeability_poll_secs: u64 = config::get("workflow.mergeability_poll_secs")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let pr = poll_mergeable_until(
+        &gh,
+        repo,
+        pr_number,
+        std::time::Duration::from_secs(mergeability_poll_secs),
+    )
+    .await?;
     let head_sha = pr.head.sha.clone();
     let base_branch = pr.base.ref_.clone();
     let required_contexts = gh
