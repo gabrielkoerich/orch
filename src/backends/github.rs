@@ -529,7 +529,13 @@ impl ExternalBackend for GitHubBackend {
                     if let Ok(issue) = self.gh.get_issue(&self.repo, n).await {
                         is_trusted_author(&issue)
                     } else {
-                        // failed to fetch issue -> treat as untrusted
+                        tracing::warn!(
+                            repo = %self.repo,
+                            issue_url = %issue_url,
+                            comment_id = c.id,
+                            author = %c.user.login,
+                            "get_mentions: failed to fetch parent issue to check author trust, treating as untrusted — mention may be silently dropped"
+                        );
                         false
                     }
                 } else {
