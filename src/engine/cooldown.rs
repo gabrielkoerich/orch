@@ -640,7 +640,14 @@ async fn set_cooldown_async(key: &str, cooldown_until: i64, reason: &str) -> boo
         let kv_key = format!("{KV_PREFIX}{key}");
         let value = cooldown_until.to_string();
         if let Err(e) = store.kv_set(&kv_key, &value).await {
-            tracing::warn!(kv_key, err = %e, "failed to persist cooldown to KV store");
+            tracing::warn!(
+                kv_key,
+                err = %e,
+                "failed to persist cooldown to KV store — rolling back in-memory entry"
+            );
+            let mut map = cooldowns().lock().unwrap_or_else(|e| e.into_inner());
+            map.remove(key);
+            return false;
         }
     }
     true
