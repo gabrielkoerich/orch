@@ -699,18 +699,11 @@ async fn parse_review_output(
         duration_secs: 0.0,
     };
 
-    let result_is_error = raw_output
-        .lines()
-        .rev()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|value| value.get("type").and_then(|t| t.as_str()) == Some("result"))
-        .and_then(|value| value.get("is_error").and_then(|e| e.as_bool()))
-        .unwrap_or(false);
     let agent_result_is_error = agent_result_for_tokens
         .as_ref()
         .map(|r| r.is_error)
         .unwrap_or(false);
-    let is_hard_failure = raw_output.is_empty() || result_is_error || agent_result_is_error;
+    let is_hard_failure = raw_output.is_empty() || agent_result_is_error;
 
     if is_hard_failure {
         tracing::warn!(
