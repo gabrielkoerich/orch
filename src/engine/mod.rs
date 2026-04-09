@@ -1178,7 +1178,7 @@ pub async fn serve() -> anyhow::Result<()> {
                     "webhook event received, triggering immediate tick"
                 );
                 let route = transport_for_webhook.route(&msg).await;
-                tracing::debug!(
+                tracing::info!(
                     channel = %msg.channel,
                     route = ?route,
                     "webhook event routed"
