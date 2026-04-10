@@ -1214,13 +1214,36 @@ async fn scan_mentions(
 
     let gh = crate::github::http::GhHttp::new()?;
 
+    // Pre-fetch is_pull_request for every mention that has an issue URL,
+    // running all checks in parallel instead of N serial API calls.
+    let is_pr_results: Vec<bool> = {
+        let futs: Vec<_> = mentions
+            .iter()
+            .map(|m| {
+                let num_opt = m
+                    .issue_url
+                    .as_deref()
+                    .and_then(extract_issue_number_from_url);
+                let gh = &gh;
+                async move {
+                    if let Some(ref num) = num_opt {
+                        gh.is_pull_request(repo, num).await
+                    } else {
+                        false
+                    }
+                }
+            })
+            .collect();
+        futures::future::join_all(futs).await
+    };
+
     // Track the latest timestamp of a successfully processed mention so the
     // cursor only advances past mentions that were actually handled.  If a
     // `create_internal` call fails we leave the cursor before that mention so
     // the next tick retries it instead of permanently losing it.
     let mut last_success_ts: Option<String> = None;
 
-    for mention in mentions {
+    for (mention_idx, mention) in mentions.iter().enumerate() {
         // Skip already-processed or non-targeted mentions
         if existing_mentions.contains(&mention.id) {
             advance_cursor(&mut last_success_ts, &mention.created_at);
@@ -1247,7 +1270,7 @@ async fn scan_mentions(
                 repo,
                 task_manager,
                 &gh,
-                &mention,
+                mention,
                 &command,
                 &mut last_success_ts,
             )
@@ -1263,11 +1286,7 @@ async fn scan_mentions(
             .as_deref()
             .and_then(extract_issue_number_from_url);
 
-        let is_pr = if let Some(ref num) = issue_num_opt {
-            gh.is_pull_request(repo, num).await
-        } else {
-            false
-        };
+        let is_pr = is_pr_results[mention_idx];
 
         let (title, task_body) = match (&issue_num_opt, is_pr) {
             (Some(num), false) => (
@@ -1299,7 +1318,7 @@ async fn scan_mentions(
             record_mention_task(
                 s,
                 repo,
-                &mention,
+                mention,
                 &title,
                 &task_body,
                 parent_id,
