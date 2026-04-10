@@ -448,7 +448,12 @@ enum ChatAction {
         /// Max results
         #[arg(long, default_value = "20")]
         limit: i64,
+        /// Include cost per message
+        #[arg(long)]
+        with_cost: bool,
     },
+    /// Show session cost statistics
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -766,8 +771,12 @@ async fn main() -> anyhow::Result<()> {
                 search,
                 since,
                 limit,
+                with_cost,
             }) => {
-                cli::chat::history(&session, search, since, limit).await?;
+                cli::chat::history(&session, search, since, limit, with_cost).await?;
+            }
+            Some(ChatAction::Stats) => {
+                cli::chat::stats(&session).await?;
             }
             None if !message.is_empty() => {
                 cli::chat::single_message(&session, &message.join(" ")).await?;

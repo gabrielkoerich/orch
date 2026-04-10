@@ -36,7 +36,7 @@ mod pricing;
 mod tasks;
 
 #[allow(unused_imports)]
-pub use control::{parse_since_duration, ControlMessage, MemoryEntry};
+pub use control::{parse_since_duration, ChatCostSummary, ControlMessage, MemoryEntry};
 #[allow(unused_imports)]
 pub use helpers::{
     get_cost_estimate, get_recent_memory, get_token_summary, get_token_usage, get_total_tokens,

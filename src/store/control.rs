@@ -10,7 +10,7 @@ use sqlx::Row;
 /// column metadata may not match the current table structure. Explicit columns
 /// prevent this mismatch.
 const CONTROL_MESSAGE_COLS: &str = "id, session_id, role, channel, channel_thread, \
-    content, summary, model, agent, tokens_used, cost_usd, created_at";
+    content, summary, model, agent, input_tokens, output_tokens, tokens_used, cost_usd, created_at";
 
 /// A message in the control session conversation history.
 #[derive(Debug, Clone)]
@@ -25,6 +25,8 @@ pub struct ControlMessage {
     pub summary: Option<String>,
     pub model: Option<String>,
     pub agent: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
     pub tokens_used: Option<i64>,
     pub cost_usd: Option<f64>,
     pub created_at: String,
@@ -66,12 +68,14 @@ impl TaskStore {
         summary: Option<&str>,
         model: Option<&str>,
         agent: Option<&str>,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
         tokens_used: Option<i64>,
         cost_usd: Option<f64>,
     ) -> anyhow::Result<i64> {
         let row = sqlx::query(
-        "INSERT INTO control_messages (session_id, role, channel, channel_thread, content, summary, model, agent, tokens_used, cost_usd)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO control_messages (session_id, role, channel, channel_thread, content, summary, model, agent, input_tokens, output_tokens, tokens_used, cost_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(session_id)
     .bind(role)
@@ -81,6 +85,8 @@ impl TaskStore {
     .bind(summary)
     .bind(model)
     .bind(agent)
+    .bind(input_tokens)
+    .bind(output_tokens)
     .bind(tokens_used)
     .bind(cost_usd)
     .fetch_one(&self.pool)
@@ -218,9 +224,123 @@ impl TaskStore {
             summary: row.try_get("summary").unwrap_or(None),
             model: row.try_get("model").unwrap_or(None),
             agent: row.try_get("agent").unwrap_or(None),
+            input_tokens: row.try_get("input_tokens").unwrap_or(None),
+            output_tokens: row.try_get("output_tokens").unwrap_or(None),
             tokens_used: row.try_get("tokens_used").unwrap_or(None),
             cost_usd: row.try_get("cost_usd").unwrap_or(None),
             created_at: row.try_get("created_at").unwrap_or_default(),
+        })
+    }
+}
+
+/// Cost summary for a chat session.
+#[derive(Debug, Clone, Default)]
+pub struct ChatCostSummary {
+    /// Total number of messages (user + assistant)
+    pub total_messages: i64,
+    /// Total number of assistant messages (responses from LLM)
+    pub assistant_messages: i64,
+    /// Total tokens used across all messages
+    pub total_tokens: i64,
+    /// Input tokens from assistant messages.
+    pub total_input_tokens: i64,
+    /// Output tokens from assistant messages.
+    pub total_output_tokens: i64,
+    /// Total estimated cost in USD
+    pub total_cost_usd: f64,
+    /// Breakdown by model (model name -> (message_count, tokens, cost))
+    pub by_model: Vec<(String, i64, i64, f64)>,
+    /// The most frequently used model
+    pub primary_model: Option<String>,
+    /// The agent used (typically consistent per session)
+    pub primary_agent: Option<String>,
+}
+
+impl TaskStore {
+    /// Get cost summary for a chat session.
+    ///
+    /// Returns aggregated statistics including total messages, tokens, cost,
+    /// and breakdown by model.
+    pub async fn get_session_cost_summary(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<ChatCostSummary> {
+        // Get total counts and cost
+        let row = sqlx::query(
+            "SELECT
+                COUNT(*) as total_messages,
+                COUNT(CASE WHEN role = 'assistant' THEN 1 END) as assistant_messages,
+                COALESCE(SUM(tokens_used), 0) as total_tokens,
+                COALESCE(SUM(input_tokens), 0) as total_input_tokens,
+                COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+                COALESCE(SUM(cost_usd), 0.0) as total_cost_usd
+             FROM control_messages
+             WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let total_messages: i64 = row.try_get("total_messages")?;
+        let assistant_messages: i64 = row.try_get("assistant_messages")?;
+        let total_tokens: i64 = row.try_get("total_tokens")?;
+        let total_input_tokens: i64 = row.try_get("total_input_tokens")?;
+        let total_output_tokens: i64 = row.try_get("total_output_tokens")?;
+        let total_cost_usd: f64 = row.try_get("total_cost_usd")?;
+
+        // Get breakdown by model
+        let model_rows = sqlx::query(
+            "SELECT
+                COALESCE(model, 'unknown') as model_name,
+                COUNT(*) as message_count,
+                COALESCE(SUM(tokens_used), 0) as tokens,
+                COALESCE(SUM(cost_usd), 0.0) as cost
+             FROM control_messages
+             WHERE session_id = ? AND role = 'assistant'
+             GROUP BY model
+             ORDER BY message_count DESC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut by_model = Vec::new();
+        for row in model_rows {
+            let model: String = row.try_get("model_name")?;
+            let count: i64 = row.try_get("message_count")?;
+            let tokens: i64 = row.try_get("tokens")?;
+            let cost: f64 = row.try_get("cost")?;
+            by_model.push((model, count, tokens, cost));
+        }
+
+        // Determine primary model (most used)
+        let primary_model = by_model.first().map(|(m, _, _, _)| m.clone());
+
+        // Get primary agent (most used)
+        let agent_row = sqlx::query(
+            "SELECT COALESCE(agent, 'unknown') as agent_name
+             FROM control_messages
+             WHERE session_id = ? AND role = 'assistant' AND agent IS NOT NULL
+             GROUP BY agent
+             ORDER BY COUNT(*) DESC
+             LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let primary_agent = agent_row.and_then(|r| r.try_get::<String, _>("agent_name").ok());
+
+        Ok(ChatCostSummary {
+            total_messages,
+            assistant_messages,
+            total_tokens,
+            total_input_tokens,
+            total_output_tokens,
+            total_cost_usd,
+            by_model,
+            primary_model,
+            primary_agent,
         })
     }
 }
