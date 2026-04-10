@@ -90,9 +90,9 @@ use crate::engine::runner::worktree;
 use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::store::store_log_activity;
-use crate::store::store_set;
 use crate::store::TaskStore;
 use crate::store::{opt_store_get_task, set_review_session_expected, store_increment};
+use crate::store::{store_set, store_set_result};
 use crate::store::{CompleteRun, RunTokenUsage, StartRun};
 use crate::tmux::TmuxManager;
 use anyhow::Context;
@@ -1110,7 +1110,7 @@ async fn push_review_branch(
             )
             .await;
             if ctx.had_prev_push_failure {
-                store_set(
+                if let Err(e) = store_set_result(
                     &Some(Arc::clone(store)),
                     repo,
                     &task.id.0,
@@ -1119,7 +1119,10 @@ async fn push_review_branch(
                         ("push_failures", serde_json::json!(0)),
                     ],
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(task_id = task.id.0, err = %e, "failed to reset push_failures — counter may drift");
+                }
             }
             Ok(())
         }
