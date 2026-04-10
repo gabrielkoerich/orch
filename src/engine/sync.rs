@@ -1183,13 +1183,10 @@ pub(crate) async fn sync_tick(
 /// Scan for @mentions and handle them.
 ///
 /// Checks recent issue comments for @orch (and legacy @orchestrator) mentions.
-/// If a mention contains a slash command and the author is authorized, executes it.
-/// Otherwise, creates an internal task for the mention.
 /// Unified comment scanner — handles both @mentions and slash commands in one pass.
 ///
 /// For each comment, classifies it via [`classify_comment`] and dispatches:
-/// - Slash commands without @mention → validate + execute
-/// - Slash commands on @mentions → validate + execute + record sentinel task
+/// - Slash commands → validate + execute (with sentinel task if it was an @mention)
 /// - @mentions without commands → create internal task for agent to respond
 /// - Everything else → skip
 async fn scan_comments(
@@ -1219,7 +1216,6 @@ async fn scan_comments(
             Some(ts) => ts,
             None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         };
-
         match backend.get_mentions(&since_str).await {
             Ok(m) => m,
             Err(e) => {
@@ -1229,7 +1225,7 @@ async fn scan_comments(
         }
     };
 
-    // Dedup set for mention tasks already created (by source_id).
+    // Dedup set: mention tasks already created (by source_id).
     let existing_mentions: std::collections::HashSet<String> = if let Some(s) = store {
         match s.list_source_ids_by_source(repo, "mention").await {
             Ok(ids) => ids.into_iter().collect(),
@@ -1244,39 +1240,55 @@ async fn scan_comments(
 
     let gh = crate::github::http::GhHttp::new()?;
 
-    // Pre-compute action + is_pr for each comment. Running is_pull_request
-    // checks in parallel (join_all) avoids N serial API calls.
-    let actions_and_is_pr: Vec<(CommentAction, bool)> = {
-        let futs: Vec<_> = comments
-            .iter()
-            .map(|c| {
-                let action = classify_comment(
-                    &c.body,
-                    c.issue_url.as_deref(),
-                    &current_user,
-                    existing_mentions.contains(&c.id),
-                );
-                let num_opt = c
-                    .issue_url
-                    .as_deref()
-                    .and_then(extract_issue_number_from_url);
-                let gh = &gh;
-                async move {
-                    let is_pr = if let Some(ref num) = num_opt {
-                        gh.is_pull_request(repo, num).await
-                    } else {
-                        false
-                    };
-                    (action, is_pr)
-                }
-            })
-            .collect();
-        futures::future::join_all(futs).await
-    };
+    // Pre-classify all comments up front so we can batch the is_pull_request
+    // checks for CreateMentionTask entries before entering the main loop.
+    let actions: Vec<CommentAction> = comments
+        .iter()
+        .map(|c| {
+            classify_comment(
+                &c.body,
+                c.issue_url.as_deref(),
+                &current_user,
+                existing_mentions.contains(&c.id),
+            )
+        })
+        .collect();
+
+    // Collect (comment_index, issue_num) for all CreateMentionTask entries that
+    // need an is_pull_request check, then resolve them all concurrently with
+    // join_all to avoid N × RTT serial API calls inside the loop.
+    let pr_check_inputs: Vec<(usize, String)> = actions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, action)| {
+            if let CommentAction::CreateMentionTask {
+                issue_num: Some(ref num),
+            } = action
+            {
+                Some((i, num.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let is_pr_values: Vec<bool> =
+        futures::future::join_all(pr_check_inputs.iter().map(|(_, num)| {
+            let gh = &gh;
+            async move { gh.is_pull_request(repo, num).await }
+        }))
+        .await;
+
+    // Build a lookup map: comment_index → is_pr.
+    let is_pr_map: std::collections::HashMap<usize, bool> = pr_check_inputs
+        .iter()
+        .map(|(i, _)| *i)
+        .zip(is_pr_values)
+        .collect();
 
     let mut last_success_ts: Option<String> = None;
 
-    for (comment, (action, is_pr)) in comments.iter().zip(actions_and_is_pr.into_iter()) {
+    for (comment_idx, (comment, action)) in comments.iter().zip(actions).enumerate() {
         match action {
             CommentAction::Skip => {
                 advance_cursor(&mut last_success_ts, &comment.created_at);
@@ -1324,6 +1336,9 @@ async fn scan_comments(
                 if let Err(e) = backend.acknowledge_mention(&comment.id).await {
                     tracing::debug!(err = %e, mention_id = %comment.id, "failed to acknowledge mention");
                 }
+
+                // Use the pre-fetched value — no serial API call here.
+                let is_pr = is_pr_map.get(&comment_idx).copied().unwrap_or(false);
 
                 let (title, task_body) = match (&issue_num, is_pr) {
                     (Some(num), false) => (
