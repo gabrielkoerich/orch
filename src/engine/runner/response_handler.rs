@@ -86,6 +86,9 @@ struct DecisionInput<'a> {
     /// Push was attempted and commits existed, but the push error contained a
     /// `workflow` scope complaint — non-retryable.
     is_workflow_scope_failure: bool,
+    /// Push failure recovery attempted a rebase but failed (for example due to
+    /// conflicts). This is non-retryable without human intervention.
+    is_rebase_conflict_failure: bool,
     /// Push was attempted (commits existed) but failed.
     push_failed: bool,
     /// Persistent push-failure counter *after* this run's increment.
@@ -116,7 +119,7 @@ struct DecisionInput<'a> {
 /// current run), and all store side-effects (clearing agent/model, writing
 /// last_error) must be applied **after** based on the returned status.
 fn classify_final_status(input: &DecisionInput<'_>) -> String {
-    if input.is_workflow_scope_failure {
+    if input.is_workflow_scope_failure || input.is_rebase_conflict_failure {
         "blocked".to_string()
     } else if input.push_failed {
         if input.push_failures >= 3 {
@@ -251,6 +254,7 @@ struct GitOpsResult {
 struct PushFailureState {
     push_failed: bool,
     is_workflow_scope_failure: bool,
+    is_rebase_conflict_failure: bool,
     /// Post-increment failure counter (0 when no push was attempted or failed).
     push_failures: u64,
     /// Last error stored in the task record (used for workflow-scope detection).
@@ -309,7 +313,20 @@ async fn check_commits_and_clear_stale_errors(
 
 /// Push the branch to the remote and log the activity.
 ///
-/// Returns `true` on success, `false` on failure.
+/// On push failure due to diverged history (non-fast-forward), attempts to
+/// fetch the remote branch and rebase local commits on top. If rebase succeeds,
+/// the task will be re-routed to a new agent who can push the rebased commits.
+/// If rebase fails (conflicts), the task is blocked for human intervention.
+///
+/// Returns `PushResult::Success` on success, `PushResult::Rebased` if rebase
+/// succeeded and the task should be re-routed, or `PushResult::Failed` if push
+/// failed and recovery was not possible.
+enum PushResult {
+    Success,
+    Rebased,
+    Failed,
+}
+
 async fn push_branch_with_log(
     ctx: &StoreCtx<'_>,
     work_dir: &Path,
@@ -317,7 +334,7 @@ async fn push_branch_with_log(
     default_branch: &str,
     agent_name: &str,
     model_name: Option<&str>,
-) -> bool {
+) -> PushResult {
     match git_ops::push_branch(work_dir, branch, default_branch).await {
         Ok(_) => {
             ctx.append_activity(
@@ -338,10 +355,111 @@ async fn push_branch_with_log(
                 ("push_failures", serde_json::json!(0)),
             ])
             .await;
-            true
+            PushResult::Success
         }
         Err(e) => {
+            let err_str = e.to_string();
             tracing::error!(task_id = ctx.task_id, error = ?e, "push failed");
+
+            // Check if this is a non-fast-forward error that we can recover from.
+            let is_diverged = err_str.contains("non-fast-forward")
+                || err_str.contains("rejected")
+                || err_str.contains("fetch first")
+                || err_str.contains("behind");
+
+            if is_diverged {
+                tracing::info!(
+                    task_id = ctx.task_id,
+                    branch = branch,
+                    "attempting fetch and rebase to recover from diverged branch"
+                );
+
+                // Attempt to fetch and rebase on origin/{branch}.
+                match git_ops::rebase_on_branch(work_dir, branch).await {
+                    Ok(true) => {
+                        // Rebase succeeded with commits replayed.
+                        tracing::info!(
+                            task_id = ctx.task_id,
+                            branch = branch,
+                            "rebase succeeded — task will be re-routed to new agent"
+                        );
+                        ctx.append_activity(
+                            "push_rebased",
+                            Some(agent_name),
+                            model_name,
+                            Some(&serde_json::json!({
+                                "status": "rebased",
+                                "branch": branch,
+                                "reason": "diverged_from_remote",
+                            })),
+                        )
+                        .await;
+                        ctx.set(&[(
+                            "last_error",
+                            serde_json::json!(format!(
+                                "push failed: branch diverged from remote — rebased successfully, will retry with new agent"
+                            )),
+                        )])
+                        .await;
+                        return PushResult::Rebased;
+                    }
+                    Ok(false) => {
+                        // No local commits to rebase — nothing to push.
+                        tracing::info!(
+                            task_id = ctx.task_id,
+                            branch = branch,
+                            "no local commits after fetch — marking as success"
+                        );
+                        ctx.append_activity(
+                            "push",
+                            Some(agent_name),
+                            model_name,
+                            Some(&serde_json::json!({
+                                "status": "ok",
+                                "branch": branch,
+                                "reason": "no_commits_after_fetch",
+                            })),
+                        )
+                        .await;
+                        ctx.set(&[
+                            ("last_error", serde_json::json!("")),
+                            ("push_failures", serde_json::json!(0)),
+                        ])
+                        .await;
+                        return PushResult::Success;
+                    }
+                    Err(rebase_err) => {
+                        // Rebase failed (likely conflicts) — block for human intervention.
+                        tracing::error!(
+                            task_id = ctx.task_id,
+                            branch = branch,
+                            error = ?rebase_err,
+                            "rebase failed — blocking task for human intervention"
+                        );
+                        ctx.append_activity(
+                            "push_rebased",
+                            Some(agent_name),
+                            model_name,
+                            Some(&serde_json::json!({
+                                "status": "error",
+                                "branch": branch,
+                                "error": rebase_err.to_string(),
+                            })),
+                        )
+                        .await;
+                        ctx.set(&[(
+                            "last_error",
+                            serde_json::json!(format!(
+                                "push failed and rebase failed: {rebase_err} — manual resolution required"
+                            )),
+                        )])
+                        .await;
+                        return PushResult::Failed;
+                    }
+                }
+            }
+
+            // Non-recoverable push error — log and return failure.
             ctx.append_activity(
                 "push",
                 Some(agent_name),
@@ -350,13 +468,13 @@ async fn push_branch_with_log(
                     "status": "error",
                     "branch": branch,
                     "default_branch": default_branch,
-                    "error": e.to_string(),
+                    "error": err_str,
                 })),
             )
             .await;
             ctx.set(&[("last_error", serde_json::json!(format!("push failed: {e}")))])
                 .await;
-            false
+            PushResult::Failed
         }
     }
 }
@@ -478,7 +596,7 @@ async fn run_git_ops(
     // Skip push + PR if there are no commits ahead of the default branch.
     // No-op tasks (e.g. "nothing to execute") produce no commits, so pushing
     // and creating a PR would just waste API calls and trigger 422 errors.
-    let push_ok = if !has_commits {
+    let push_result = if !has_commits {
         store::store_log_activity(
             ctx.store,
             ctx.repo,
@@ -496,7 +614,7 @@ async fn run_git_ops(
             })),
         )
         .await;
-        false
+        PushResult::Failed
     } else {
         push_branch_with_log(
             ctx,
@@ -509,16 +627,23 @@ async fn run_git_ops(
         .await
     };
 
-    let mut has_pushed = push_ok;
+    let mut has_pushed = matches!(push_result, PushResult::Success);
     let mut has_pr = false;
 
     // Create PR (skip if push failed or repo is unknown)
-    if has_commits && !push_ok {
+    if has_commits && matches!(push_result, PushResult::Failed) {
         tracing::warn!(
             task_id = ctx.task_id,
             "skipping PR creation due to push failure"
         );
-    } else if !push_ok {
+    } else if matches!(push_result, PushResult::Rebased) {
+        // Rebase succeeded — don't create PR now, task will be re-routed to new agent.
+        // The new agent will push the rebased commits.
+        tracing::info!(
+            task_id = ctx.task_id,
+            "skipping PR creation after successful rebase — task will be re-routed"
+        );
+    } else if !has_pushed {
         // no commits — already logged "no commits ahead, skipping push + PR" at INFO level above
     } else if ctx.repo.is_empty() {
         tracing::warn!(
@@ -566,11 +691,23 @@ async fn detect_push_failure_state(
             || (stored_last_error.contains("refusing to allow")
                 && stored_last_error.contains("workflow")));
 
+    // Detect successful rebase after push failure — this is a recovery case,
+    // not a true failure. The task will be re-routed to a new agent who can
+    // push the rebased commits. Don't increment push_failures counter in this case.
+    let is_rebased_recovery = push_failed && stored_last_error.contains("rebased successfully");
+    let is_rebase_conflict_failure =
+        push_failed && stored_last_error.contains("push failed and rebase failed:");
+
     // Track push failures — block after 3 consecutive failures.
     // Workflow-scope failures are non-retryable and blocked immediately; do not
     // increment this retry counter for them so that later normal push failures
     // are not prematurely blocked.
-    let push_failures = if push_failed && !is_workflow_scope_failure {
+    // Also skip incrementing when rebase succeeded — this is recovery, not failure.
+    let push_failures = if push_failed
+        && !is_workflow_scope_failure
+        && !is_rebased_recovery
+        && !is_rebase_conflict_failure
+    {
         match ctx.increment("push_failures").await {
             Ok(v) => v,
             Err(e) => {
@@ -593,6 +730,7 @@ async fn detect_push_failure_state(
     PushFailureState {
         push_failed,
         is_workflow_scope_failure,
+        is_rebase_conflict_failure,
         push_failures,
         stored_last_error,
     }
@@ -667,7 +805,21 @@ async fn apply_post_decision_effects(
             )),
         )])
         .await;
+    } else if push_state.is_rebase_conflict_failure {
+        tracing::error!(
+            task_id = ctx.task_id,
+            "push failed and automatic rebase recovery failed — blocking for human intervention"
+        );
+        ctx.set(&[
+            ("agent", serde_json::json!(null)),
+            ("model", serde_json::json!(null)),
+        ])
+        .await;
     } else if push_state.push_failed {
+        // Check if this is a rebase recovery case (rebase succeeded after push failure).
+        let is_rebased_recovery = push_state
+            .stored_last_error
+            .contains("rebased successfully");
         // Clear agent and model so router picks a different one on reroute (#1604)
         ctx.set(&[
             ("agent", serde_json::json!(null)),
@@ -675,7 +827,13 @@ async fn apply_post_decision_effects(
         ])
         .await;
         let push_failures = push_state.push_failures;
-        if push_failures >= 3 {
+        if is_rebased_recovery {
+            // Rebase succeeded — next agent will have up-to-date history.
+            tracing::info!(
+                task_id = ctx.task_id,
+                "push failed but rebase succeeded — rerouting to different agent with up-to-date history"
+            );
+        } else if push_failures >= 3 {
             tracing::error!(
                 task_id = ctx.task_id,
                 push_failures,
@@ -973,6 +1131,7 @@ pub async fn handle_success(
     let final_status_owned = classify_final_status(&DecisionInput {
         agent_status: &resp.status,
         is_workflow_scope_failure: push_state.is_workflow_scope_failure,
+        is_rebase_conflict_failure: push_state.is_rebase_conflict_failure,
         push_failed: push_state.push_failed,
         push_failures: push_state.push_failures,
         has_pr: git.has_pr,
@@ -1062,6 +1221,17 @@ mod tests {
             is_workflow_scope_failure: true,
             push_failed: true,
             push_failures: 1,
+            ..Default::default()
+        });
+        assert_eq!(status, "blocked");
+    }
+
+    /// Branch 1b: automatic rebase recovery failed (conflicts) → block immediately.
+    #[test]
+    fn classify_rebase_conflict_failure_blocks() {
+        let status = classify_final_status(&DecisionInput {
+            is_rebase_conflict_failure: true,
+            push_failed: true,
             ..Default::default()
         });
         assert_eq!(status, "blocked");
