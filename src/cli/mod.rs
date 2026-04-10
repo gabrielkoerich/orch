@@ -182,6 +182,19 @@ pub fn log(lines: &str) -> anyhow::Result<()> {
                 .unwrap_or(false)
         {
             log_files.push(path.clone());
+        } else {
+            // Fall back to rotated log files (orch.log.1, orch.log.2, ...) if primary is empty
+            for n in 1..=5 {
+                let rotated = std::path::PathBuf::from(format!("{}.{}", path.display(), n));
+                if rotated.exists()
+                    && std::fs::metadata(&rotated)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false)
+                {
+                    log_files.push(rotated);
+                    break;
+                }
+            }
         }
     }
 
