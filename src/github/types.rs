@@ -331,4 +331,17 @@ mod tests {
         assert_eq!(actionable[0].id, 1);
         assert_eq!(actionable[0].body, "Fix this");
     }
+
+    #[test]
+    fn extract_issue_number_from_url_works() {
+        assert_eq!(
+            extract_issue_number_from_url("https://api.github.com/repos/owner/repo/issues/123"),
+            Some("123".into())
+        );
+    }
+
+    #[test]
+    fn extract_issue_number_from_url_empty() {
+        assert_eq!(extract_issue_number_from_url(""), None);
+    }
 }
