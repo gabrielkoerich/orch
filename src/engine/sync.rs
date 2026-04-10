@@ -655,9 +655,36 @@ async fn auto_unblock_blocked_tasks(
         let new_count = cooldown_count + 1;
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-        // Write all field updates in a single atomic set_fields call, ensuring counter,
-        // timestamp, and reason are updated together. No intermediate states observable
-        // by concurrent ticks.
+        let ext_id = task
+            .external_id
+            .clone()
+            .unwrap_or_else(|| format!("internal:{}", task.id));
+        let new_status = if has_review_failure {
+            Status::NeedsReview
+        } else {
+            Status::New
+        };
+        let new_status_str = if has_review_failure {
+            "needs_review"
+        } else {
+            "new"
+        };
+
+        // First update the status; only increment the counter if this succeeds.
+        // This prevents transient GitHub API errors from exhausting the retry budget.
+        if let Err(e) = task_manager
+            .update_task_status(&crate::backends::ExternalId(ext_id), new_status)
+            .await
+        {
+            tracing::warn!(
+                task_id = task.id,
+                err = %e,
+                "auto-unblock failed to update status — counter not incremented"
+            );
+            continue;
+        }
+
+        // Status update succeeded; now record the counter increment and clear related fields.
         let mut fields: Vec<(&str, serde_json::Value)> = vec![
             ("auto_unblock_count", serde_json::json!(new_count)),
             ("auto_unblock_last_at", serde_json::json!(now)),
@@ -675,24 +702,11 @@ async fn auto_unblock_blocked_tasks(
             fields.push(("review_invocations", serde_json::json!(0)));
         }
         if let Err(e) = store.set_fields(task.id, &fields).await {
-            tracing::warn!(task_id = task.id, err = %e, "failed to set auto_unblock fields (including counter) — skipping unblock, counter not incremented");
-            continue;
+            tracing::warn!(task_id = task.id, err = %e, "failed to set auto_unblock fields after successful status update");
+            // Task is unblocked (correct behavior) but counter hasn't advanced.
+            // Slightly over-eager retries are better than permanent task stalls.
         }
 
-        let ext_id = task
-            .external_id
-            .clone()
-            .unwrap_or_else(|| format!("internal:{}", task.id));
-        let new_status = if has_review_failure {
-            Status::NeedsReview
-        } else {
-            Status::New
-        };
-        let new_status_str = if has_review_failure {
-            "needs_review"
-        } else {
-            "new"
-        };
         if let Err(e) = store
             .append_activity(
                 task.id,
@@ -712,23 +726,12 @@ async fn auto_unblock_blocked_tasks(
             tracing::warn!(task_id = task.id, err = %e, "failed to log auto_unblock activity");
         }
 
-        if let Err(e) = task_manager
-            .update_task_status(&crate::backends::ExternalId(ext_id), new_status)
-            .await
-        {
-            tracing::warn!(
-                task_id = task.id,
-                err = %e,
-                "auto-unblock failed to update status"
-            );
-        } else {
-            tracing::info!(
-                task_id = task.id,
-                failures = ?failures,
-                review_failure = has_review_failure,
-                "auto-unblocked task with recoverable failures"
-            );
-        }
+        tracing::info!(
+            task_id = task.id,
+            failures = ?failures,
+            review_failure = has_review_failure,
+            "auto-unblocked task with recoverable failures"
+        );
     }
 
     Ok(())
