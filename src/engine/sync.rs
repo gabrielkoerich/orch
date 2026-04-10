@@ -478,7 +478,14 @@ async fn handle_slash_command(
         CommandOutcome::Executed { is_pr }
         | CommandOutcome::NotOpen { is_pr }
         | CommandOutcome::NotCollaborator { is_pr } => *is_pr,
-        CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => return,
+        CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => {
+            // Advance cursor so this comment is not re-processed on the next sync tick.
+            // The mention was already acknowledged; the worst case is the command was
+            // not executed but the mention is marked as processed — acceptable vs
+            // an infinite retry loop.
+            advance_cursor(last_success_ts, &mention.created_at);
+            return;
+        }
     };
 
     // Record a sentinel task for the mention (with correct parent_id)
@@ -1307,7 +1314,7 @@ async fn scan_comments(
 
             CommentAction::ExecuteCommand { command, issue_num } => {
                 let store_opt = store.cloned();
-                let outcome = validate_and_run_command(
+                let _outcome = validate_and_run_command(
                     backend,
                     &gh,
                     repo,
@@ -1318,12 +1325,9 @@ async fn scan_comments(
                     task_manager,
                 )
                 .await;
-                if !matches!(
-                    outcome,
-                    CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed
-                ) {
-                    advance_cursor(&mut last_success_ts, &comment.created_at);
-                }
+                // Always advance cursor: the outcome comment (success or error) was
+                // already posted to GitHub, so re-processing would create duplicates.
+                advance_cursor(&mut last_success_ts, &comment.created_at);
             }
 
             CommentAction::ExecuteCommandForMention { command, .. } => {
