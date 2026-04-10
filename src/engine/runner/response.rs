@@ -348,13 +348,16 @@ pub async fn handle_failover(
             "all agents exhausted, marking needs_review"
         );
         let msg = format!("{error_message} (all agents exhausted)");
-        store::store_set(
+        if let Err(e) = store::store_set_result(
             store,
             repo,
             task_id,
             &[("last_error", serde_json::json!(msg))],
         )
-        .await;
+        .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to write agents_exhausted last_error to store");
+        }
         // If this was a timeout, ensure the agent is placed into cooldown
         // so the router's round-robin avoids it for a while.
         if matches!(error_type, RetryableError::Timeout) {
@@ -406,7 +409,7 @@ pub async fn handle_failover(
         set_agent_cooldown(agent_name, 120);
 
         let msg = format!("{error_message}, clearing agent/model for re-route");
-        store::store_set(
+        if let Err(e) = store::store_set_result(
             store,
             repo,
             task_id,
@@ -416,7 +419,10 @@ pub async fn handle_failover(
                 ("last_error", serde_json::json!(msg)),
             ],
         )
-        .await;
+        .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to write agent/model clear to store");
+        }
 
         // Apply exponential backoff with jitter before retry.
         // Return "new" (not "routed") so the task goes through Phase 3a routing
@@ -459,13 +465,16 @@ pub async fn handle_failover(
     }
 
     let msg = format!("{error_message}, no fallback agents");
-    store::store_set(
+    if let Err(e) = store::store_set_result(
         store,
         repo,
         task_id,
         &[("last_error", serde_json::json!(msg))],
     )
-    .await;
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to write no_fallback last_error to store");
+    }
 
     // Log reroute activity for no fallback available
     let details = serde_json::json!({
@@ -519,13 +528,16 @@ pub async fn update_reroute_chain(
         chain = format!("{chain},{current_agent}");
     }
 
-    store::store_set(
+    if let Err(e) = store::store_set_result(
         store,
         repo,
         task_id,
         &[("limit_reroute_chain", serde_json::json!(chain))],
     )
-    .await;
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to write limit_reroute_chain to store");
+    }
     chain
 }
 

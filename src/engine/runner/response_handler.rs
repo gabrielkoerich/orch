@@ -514,13 +514,21 @@ async fn create_pr_with_log(
             // This is set for both newly-created and pre-existing PRs.
             match crate::engine::review::parse_pr_number_from_url(url) {
                 Ok(pr_num) => {
-                    store::store_set(
+                    if let Err(e) = store::store_set_result(
                         ctx.store,
                         ctx.repo,
                         ctx.task_id,
                         &[("pr_number", serde_json::json!(pr_num as i64))],
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::error!(
+                            task_id = ctx.task_id,
+                            pr_url = %url,
+                            err = %e,
+                            "CRITICAL: failed to save pr_number to store — downstream review gate may trigger duplicate gh pr create"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -980,7 +988,7 @@ async fn check_token_budget(
             "token budget exceeded: {}/{} tokens (${:.4})",
             total_tokens, max_tokens, cost.total_cost_usd
         );
-        store::store_set(
+        if let Err(e) = store::store_set_result(
             ctx.store,
             ctx.repo,
             ctx.task_id,
@@ -989,7 +997,14 @@ async fn check_token_budget(
                 ("budget_exceeded", serde_json::json!(true)),
             ],
         )
-        .await;
+        .await
+        {
+            tracing::error!(
+                task_id = ctx.task_id,
+                err = %e,
+                "CRITICAL: failed to write budget_exceeded — task may not be properly budget-gated"
+            );
+        }
         (budget_status.to_string(), true) // signal early return to caller
     } else {
         if total_tokens > warning_threshold {

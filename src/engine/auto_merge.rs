@@ -15,7 +15,9 @@ use crate::engine::tasks::TaskManager;
 use crate::github::http::GhHttp;
 use crate::github::types::{GitHubPullRequest, GitHubReview};
 use crate::store::TaskStore;
-use crate::store::{opt_store_get_task, store_increment, store_reset_failure_counters, store_set};
+use crate::store::{
+    opt_store_get_task, store_increment, store_reset_failure_counters, store_set_result,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
@@ -899,7 +901,7 @@ pub(crate) async fn auto_merge_pr(
                             tracing::warn!(task_id = task.id.0, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
                             return Ok(());
                         }
-                        store_set(
+                        if let Err(e) = store_set_result(
                             &Some(Arc::clone(store)),
                             repo,
                             &task.id.0,
@@ -918,7 +920,10 @@ pub(crate) async fn auto_merge_pr(
                                 ),
                             ],
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
+                        }
                         task_manager
                             .update_task_status(&task.id, Status::Routed)
                             .await?;
@@ -1016,13 +1021,16 @@ pub(crate) async fn auto_merge_pr(
     }
 
     // 6. Update status to done
-    store_set(
+    if let Err(e) = store_set_result(
         &Some(Arc::clone(store)),
         repo,
         &task.id.0,
         &[("ci_merge_failures", serde_json::json!(0))],
     )
-    .await;
+    .await
+    {
+        tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
+    }
     task_manager
         .update_task_status(&task.id, Status::Done)
         .await?;
@@ -1264,13 +1272,16 @@ pub(crate) async fn handle_review_changes(
                 // Reset review_cycles so the fresh review against new code starts
                 // from a clean count. Without this reset, the next review would
                 // immediately see review_cycles >= max_cycles and escalate again.
-                store_set(
+                if let Err(e) = store_set_result(
                     &Some(Arc::clone(store)),
                     repo,
                     &task.id.0,
                     &[("review_cycles", serde_json::json!(0))],
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
+                }
                 return Ok(());
             }
         }
@@ -1292,13 +1303,16 @@ pub(crate) async fn handle_review_changes(
                         review_cycles,
                         "required CI checks pass — auto-recovering from non-required check failure"
                     );
-                    store_set(
+                    if let Err(e) = store_set_result(
                         &Some(Arc::clone(store)),
                         repo,
                         &task.id.0,
                         &[("review_cycles", serde_json::json!(0))],
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
+                    }
                     if let Err(e) = store_increment(
                         &Some(Arc::clone(store)),
                         repo,
@@ -1431,13 +1445,16 @@ pub(crate) async fn handle_review_changes(
 
     // 3. Store review context (but NOT review_cycles — increment only after
     // successful status transition to avoid premature escalation on failure).
-    store_set(
+    if let Err(e) = store_set_result(
         &Some(Arc::clone(store)),
         repo,
         &task.id.0,
         &[("pr_review_context", serde_json::json!(comment.clone()))],
     )
-    .await;
+    .await
+    {
+        tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
+    }
 
     // 3b. Re-assign a valid model for the task's agent using
     // model_for_complexity().  The previous approach of reusing the stored
@@ -1470,7 +1487,7 @@ pub(crate) async fn handle_review_changes(
     match new_model {
         Some(model) => {
             // Got a valid model for this agent — update the store and set Routed.
-            store_set(
+            if let Err(e) = store_set_result(
                 &Some(Arc::clone(store)),
                 repo,
                 &task.id.0,
@@ -1482,7 +1499,10 @@ pub(crate) async fn handle_review_changes(
                     ),
                 ],
             )
-            .await;
+            .await
+            {
+                tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
+            }
 
             let fields = [
                 (
@@ -1519,7 +1539,7 @@ pub(crate) async fn handle_review_changes(
         None => {
             // All models for this agent are cooled — fall back to full re-route.
             // Clear agent/model/route_reason so Phase 3a picks the best available combo.
-            store_set(
+            if let Err(e) = store_set_result(
                 &Some(Arc::clone(store)),
                 repo,
                 &task.id.0,
@@ -1529,7 +1549,10 @@ pub(crate) async fn handle_review_changes(
                     ("route_reason", serde_json::json!("")),
                 ],
             )
-            .await;
+            .await
+            {
+                tracing::warn!(task_id = task.id.0, err = %e, "store write failed");
+            }
 
             let fields = [
                 (

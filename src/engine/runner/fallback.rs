@@ -182,7 +182,7 @@ pub async fn handle_error(
             if let Some(next) = next_model {
                 tracing::info!(task_id, model = %next, "retrying with different model");
                 let msg = format!("model {model} unavailable, trying {next}");
-                store::store_set(
+                if let Err(e) = store::store_set_result(
                     store,
                     repo,
                     task_id,
@@ -191,7 +191,10 @@ pub async fn handle_error(
                         ("last_error", serde_json::json!(msg)),
                     ],
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(task_id, err = %e, "failed to write model failover to store");
+                }
                 // Skip normal failover — we're retrying same agent with different model.
                 // Use "routed" (not "new") since agent/model are already stored;
                 // this avoids a redundant LLM re-routing cycle.
@@ -234,13 +237,16 @@ pub async fn handle_error(
             // immediately to needs_review so a human can intervene (e.g., split the task,
             // reduce context, or manually assign a model with a larger context window).
             let msg = format!("{agent_name} context overflow: {message}");
-            store::store_set(
+            if let Err(e) = store::store_set_result(
                 store,
                 repo,
                 task_id,
                 &[("last_error", serde_json::json!(msg))],
             )
-            .await;
+            .await
+            {
+                tracing::warn!(task_id, err = %e, "failed to write context_overflow last_error to store");
+            }
             return Ok(ErrorHandleResult::EarlyReturn {
                 status: "needs_review".to_string(),
             });
@@ -248,13 +254,16 @@ pub async fn handle_error(
         agents::AgentError::WaitingForInput { message } => {
             // Requires human — skip failover, go straight to needs_review
             let msg = format!("waiting for input: {message}");
-            store::store_set(
+            if let Err(e) = store::store_set_result(
                 store,
                 repo,
                 task_id,
                 &[("last_error", serde_json::json!(msg))],
             )
-            .await;
+            .await
+            {
+                tracing::warn!(task_id, err = %e, "failed to write waiting_for_input last_error to store");
+            }
             return Ok(ErrorHandleResult::EarlyReturn {
                 status: "needs_review".to_string(),
             });
@@ -300,13 +309,16 @@ pub async fn handle_error(
                     1
                 }
             };
-            store::store_set(
+            if let Err(e) = store::store_set_result(
                 store,
                 repo,
                 task_id,
                 &[("last_error", serde_json::json!(msg))],
             )
-            .await;
+            .await
+            {
+                tracing::warn!(task_id, err = %e, "failed to write network_error last_error to store");
+            }
             if retry_count >= MAX_NETWORK_RETRIES {
                 tracing::warn!(
                     task_id,
@@ -383,7 +395,7 @@ pub async fn handle_error(
     // pick a different executor on re-dispatch. Without this the same
     // slow agent can be picked again and will timeout repeatedly.
     if retryable == response::RetryableError::Timeout {
-        store::store_set(
+        if let Err(e) = store::store_set_result(
             store,
             repo,
             task_id,
@@ -392,7 +404,10 @@ pub async fn handle_error(
                 ("last_error", serde_json::json!(error_msg.clone())),
             ],
         )
-        .await;
+        .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to write timeout agent clear to store");
+        }
     }
 
     // Record rate limit in store (sqlx)

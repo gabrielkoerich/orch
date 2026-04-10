@@ -969,13 +969,16 @@ pub(crate) async fn sync_tick(
                 // Reset the failure counter: stale-session recovery is an infrastructure
                 // event (tmux crash, service restart) not a genuine agent parse failure.
                 // Keeping the counter would unfairly consume the budget for the next cycle.
-                store::store_set(
+                if let Err(e) = store::store_set_result(
                     &Some(Arc::clone(store)),
                     repo,
                     task.task_id(),
                     &[("review_agent_failures", serde_json::json!(0))],
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(task_id = task.task_id(), err = %e, "failed to write review_agent_failures to store");
+                }
                 match task_manager
                     .update_task_status_if(&task.external.id, Status::NeedsReview, Status::InReview)
                     .await
