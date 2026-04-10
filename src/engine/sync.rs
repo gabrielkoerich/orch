@@ -438,6 +438,63 @@ async fn handle_slash_command(
     true
 }
 
+/// What to do with a comment in the unified scan loop.
+#[derive(Debug, PartialEq)]
+pub(crate) enum CommentAction {
+    /// Already processed or not relevant — skip.
+    Skip,
+    /// Slash command without @mention — execute the command.
+    ExecuteCommand {
+        command: crate::engine::commands::OwnerCommand,
+        issue_num: String,
+    },
+    /// @mention with a slash command — execute and record sentinel task.
+    ExecuteCommandForMention {
+        command: crate::engine::commands::OwnerCommand,
+        issue_num: String,
+    },
+    /// @mention without command — create internal task for agent to respond.
+    CreateMentionTask { issue_num: Option<String> },
+}
+
+/// Classify a comment into the appropriate action.
+///
+/// Pure function — no I/O, no async. Determines what the scan loop should do
+/// with each comment based on its content and whether it was already processed.
+pub(crate) fn classify_comment(
+    body: &str,
+    issue_url: Option<&str>,
+    current_user: &str,
+    already_processed: bool,
+) -> CommentAction {
+    if already_processed {
+        return CommentAction::Skip;
+    }
+
+    let is_mention =
+        body.contains(current_user) || body.contains("@orch") || body.contains("@orchestrator");
+    let command = parse_command(body);
+    let issue_num = issue_url.and_then(extract_issue_number_from_url);
+
+    match (command, is_mention, issue_num) {
+        (Some(cmd), true, Some(num)) => CommentAction::ExecuteCommandForMention {
+            command: cmd,
+            issue_num: num,
+        },
+        (Some(cmd), false, Some(num)) => CommentAction::ExecuteCommand {
+            command: cmd,
+            issue_num: num,
+        },
+        // Command but no issue URL — if it's a mention, create task; otherwise skip
+        (Some(_), true, None) => CommentAction::CreateMentionTask { issue_num: None },
+        (Some(_), false, None) => CommentAction::Skip,
+        // Mention without command — create task for agent
+        (None, true, issue_num) => CommentAction::CreateMentionTask { issue_num },
+        // Neither mention nor command — skip
+        (None, false, _) => CommentAction::Skip,
+    }
+}
+
 fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
     if count == 0 {
         return true;
@@ -717,17 +774,7 @@ pub(crate) async fn sync_tick(
         let mention_since = kv_get_prefer_store(&Some(store), "mentions_last_checked")
             .await
             .unwrap_or_else(|| mention_fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-        let command_fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-        let command_since = store
-            .kv_get("owner_commands_last_checked")
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| command_fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string());
-        let shared_since = mention_since
-            .as_str()
-            .min(command_since.as_str())
-            .to_string();
+        let shared_since = mention_since.clone();
 
         let (merge_result, comments_result, review_result) = tokio::join!(
             check_merged_prs(
@@ -757,31 +804,12 @@ pub(crate) async fn sync_tick(
 
         match comments_result {
             Ok(comments) => {
-                let mention_comments = filter_mentions_by_since(&comments, &mention_since);
-                let command_comments = filter_mentions_by_since(&comments, &command_since);
+                let filtered = filter_mentions_by_since(&comments, &mention_since);
 
-                if let Err(e) = scan_mentions(
-                    backend,
-                    Some(store),
-                    repo,
-                    task_manager,
-                    Some(&mention_comments),
-                )
-                .await
+                if let Err(e) =
+                    scan_comments(backend, Some(store), repo, task_manager, Some(&filtered)).await
                 {
-                    tracing::warn!(err = %e, "mention scan failed");
-                }
-
-                if let Err(e) = super::commands::scan_commands(
-                    backend,
-                    repo,
-                    &Some(Arc::clone(store)),
-                    task_manager,
-                    Some(&command_comments),
-                )
-                .await
-                {
-                    tracing::warn!(err = %e, "owner command scan failed");
+                    tracing::warn!(err = %e, "comment scan failed");
                 }
             }
             Err(e) => {
@@ -1114,57 +1142,54 @@ pub(crate) async fn sync_tick(
 /// Scan for @mentions and handle them.
 ///
 /// Checks recent issue comments for @orch (and legacy @orchestrator) mentions.
-/// If a mention contains a slash command and the author is authorized, executes it.
-/// Otherwise, creates an internal task for the mention.
-async fn scan_mentions(
+/// Unified comment scanner — handles both @mentions and slash commands in one pass.
+///
+/// For each comment, classifies it via [`classify_comment`] and dispatches:
+/// - Slash commands → validate + execute (with sentinel task if it was an @mention)
+/// - @mentions without commands → create internal task for agent to respond
+/// - Everything else → skip
+async fn scan_comments(
     backend: &Arc<dyn ExternalBackend>,
     store: Option<&Arc<TaskStore>>,
     repo: &str,
     task_manager: &Arc<TaskManager>,
-    prefetched_mentions: Option<&[Mention]>,
+    prefetched_comments: Option<&[Mention]>,
 ) -> anyhow::Result<()> {
-    // Get the current user (for mention detection)
     let current_user = match backend.get_authenticated_user().await {
         Ok(Some(u)) => format!("@{}", u),
         Ok(None) => {
-            tracing::debug!("backend does not support user identity, skipping mentions");
+            tracing::debug!("backend does not support user identity, skipping comment scan");
             return Ok(());
         }
         Err(e) => {
-            tracing::warn!(err = %e, "failed to get current user, skipping mentions");
+            tracing::warn!(err = %e, "failed to get current user, skipping comment scan");
             return Ok(());
         }
     };
 
-    let mentions = if let Some(mentions) = prefetched_mentions {
-        mentions.to_vec()
+    let comments = if let Some(c) = prefetched_comments {
+        c.to_vec()
     } else {
-        // Use persisted cursor if available, otherwise fall back to 24h ago
         let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
         let since_str = match kv_get_prefer_store(&store, "mentions_last_checked").await {
             Some(ts) => ts,
             None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         };
-
         match backend.get_mentions(&since_str).await {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!(err = %e, "failed to get mentions");
+                tracing::warn!(err = %e, "failed to get comments");
                 return Ok(());
             }
         }
     };
 
-    // Get existing mention tasks across ALL statuses to avoid duplicates.
-    // Uses a targeted source_id-only query to avoid fetching all 57 task columns.
-    // If the DB query fails, log and skip the mention scan for this tick to
-    // avoid treating every historical mention as new (which would create
-    // duplicate internal tasks during transient DB failures).
+    // Dedup set: mention tasks already created (by source_id).
     let existing_mentions: std::collections::HashSet<String> = if let Some(s) = store {
         match s.list_source_ids_by_source(repo, "mention").await {
             Ok(ids) => ids.into_iter().collect(),
             Err(e) => {
-                tracing::warn!(err = %e, "failed to load existing mention source IDs — skipping mention scan this tick to prevent duplicates");
+                tracing::warn!(err = %e, "failed to load mention source IDs — skipping to prevent duplicates");
                 return Ok(());
             }
         }
@@ -1173,111 +1198,115 @@ async fn scan_mentions(
     };
 
     let gh = crate::github::http::GhHttp::new()?;
-
-    // Track the latest timestamp of a successfully processed mention so the
-    // cursor only advances past mentions that were actually handled.  If a
-    // `create_internal` call fails we leave the cursor before that mention so
-    // the next tick retries it instead of permanently losing it.
     let mut last_success_ts: Option<String> = None;
 
-    for mention in mentions {
-        // Skip already-processed or non-targeted mentions
-        if existing_mentions.contains(&mention.id) {
-            advance_cursor(&mut last_success_ts, &mention.created_at);
-            continue;
-        }
-        if !mention.body.contains(&current_user)
-            && !mention.body.contains("@orch")
-            && !mention.body.contains("@orchestrator")
-        {
-            advance_cursor(&mut last_success_ts, &mention.created_at);
-            continue;
-        }
+    for comment in comments {
+        let action = classify_comment(
+            &comment.body,
+            comment.issue_url.as_deref(),
+            &current_user,
+            existing_mentions.contains(&comment.id),
+        );
 
-        // Acknowledge with eyes reaction (non-fatal)
-        if let Err(e) = backend.acknowledge_mention(&mention.id).await {
-            tracing::debug!(err = %e, mention_id = %mention.id, "failed to acknowledge mention");
-        }
-
-        // Try slash command first
-        if let Some(command) = parse_command(&mention.body) {
-            if handle_slash_command(
-                backend,
-                store,
-                repo,
-                task_manager,
-                &gh,
-                &mention,
-                &command,
-                &mut last_success_ts,
-            )
-            .await
-            {
-                continue;
+        match action {
+            CommentAction::Skip => {
+                advance_cursor(&mut last_success_ts, &comment.created_at);
             }
-        }
 
-        // No command (or command had no valid issue URL) — create a mention task
-        let issue_num_opt = mention
-            .issue_url
-            .as_deref()
-            .and_then(extract_issue_number_from_url);
+            CommentAction::ExecuteCommand { command, issue_num } => {
+                let store_opt = store.cloned();
+                let outcome = validate_and_run_command(
+                    backend,
+                    &gh,
+                    repo,
+                    &issue_num,
+                    &command,
+                    &comment.author,
+                    &store_opt,
+                    task_manager,
+                )
+                .await;
+                if !matches!(
+                    outcome,
+                    CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed
+                ) {
+                    advance_cursor(&mut last_success_ts, &comment.created_at);
+                }
+            }
 
-        let is_pr = if let Some(ref num) = issue_num_opt {
-            gh.is_pull_request(repo, num).await
-        } else {
-            false
-        };
+            CommentAction::ExecuteCommandForMention { command, .. } => {
+                if let Err(e) = backend.acknowledge_mention(&comment.id).await {
+                    tracing::debug!(err = %e, mention_id = %comment.id, "failed to acknowledge mention");
+                }
+                handle_slash_command(
+                    backend,
+                    store,
+                    repo,
+                    task_manager,
+                    &gh,
+                    &comment,
+                    &command,
+                    &mut last_success_ts,
+                )
+                .await;
+            }
 
-        let (title, task_body) = match (&issue_num_opt, is_pr) {
-            (Some(num), false) => (
-                format!("Respond to mention by @{} on task #{num}", mention.author),
-                format!(
-                    "Mention by @{} on GitHub issue #{num}:\n\n{}\n\n---\nThis mention was posted on issue #{num}. Review the full issue to understand the context before responding.",
-                    mention.author, mention.body
-                ),
-            ),
-            (Some(num), true) => (
-                format!("Respond to mention by @{} on PR #{num}", mention.author),
-                format!(
-                    "Mention by @{} on GitHub PR #{num}:\n\n{}\n\n---\nThis mention was posted on PR #{num}. Review the full PR (diff, description, and comments) to understand the context before responding.",
-                    mention.author, mention.body
-                ),
-            ),
-            (None, _) => (
-                format!("Respond to mention by @{}", mention.author),
-                format!("Mention by @{}:\n\n{}", mention.author, mention.body),
-            ),
-        };
+            CommentAction::CreateMentionTask { issue_num } => {
+                if let Err(e) = backend.acknowledge_mention(&comment.id).await {
+                    tracing::debug!(err = %e, mention_id = %comment.id, "failed to acknowledge mention");
+                }
 
-        if let Some(s) = store {
-            let parent_id = if let Some(ref num) = issue_num_opt {
-                resolve_mention_parent_id(s, repo, num, is_pr).await
-            } else {
-                None
-            };
-            record_mention_task(
-                s,
-                repo,
-                &mention,
-                &title,
-                &task_body,
-                parent_id,
-                &mut last_success_ts,
-            )
-            .await;
+                let is_pr = if let Some(ref num) = issue_num {
+                    gh.is_pull_request(repo, num).await
+                } else {
+                    false
+                };
+
+                let (title, task_body) = match (&issue_num, is_pr) {
+                    (Some(num), false) => (
+                        format!("Respond to mention by @{} on task #{num}", comment.author),
+                        format!(
+                            "Mention by @{} on GitHub issue #{num}:\n\n{}\n\n---\nThis mention was posted on issue #{num}. Review the full issue to understand the context before responding.",
+                            comment.author, comment.body
+                        ),
+                    ),
+                    (Some(num), true) => (
+                        format!("Respond to mention by @{} on PR #{num}", comment.author),
+                        format!(
+                            "Mention by @{} on GitHub PR #{num}:\n\n{}\n\n---\nThis mention was posted on PR #{num}. Review the full PR (diff, description, and comments) to understand the context before responding.",
+                            comment.author, comment.body
+                        ),
+                    ),
+                    (None, _) => (
+                        format!("Respond to mention by @{}", comment.author),
+                        format!("Mention by @{}:\n\n{}", comment.author, comment.body),
+                    ),
+                };
+
+                if let Some(s) = store {
+                    let parent_id = if let Some(ref num) = issue_num {
+                        resolve_mention_parent_id(s, repo, num, is_pr).await
+                    } else {
+                        None
+                    };
+                    record_mention_task(
+                        s,
+                        repo,
+                        &comment,
+                        &title,
+                        &task_body,
+                        parent_id,
+                        &mut last_success_ts,
+                    )
+                    .await;
+                }
+            }
         }
     }
 
-    // Persist cursor so the next sync tick only fetches newer comments.
-    // Use the latest successfully-processed mention timestamp rather than
-    // `now`, so any mention whose `create_internal` failed is retried on the
-    // next tick instead of being permanently skipped.
     if let Some(ts) = last_success_ts {
         kv_set_prefer_store(&store, "mentions_last_checked", &ts).await;
     }
-    // If no mention was successfully processed, leave the cursor unchanged so
-    // the entire batch is retried on the next sync tick.
 
     Ok(())
 }
@@ -3362,5 +3391,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alert_val.as_deref(), Some("0"));
+    }
+
+    // ── classify_comment tests ──────────────────────────────────────────
+
+    use super::{classify_comment, CommentAction};
+    use crate::engine::commands::OwnerCommand;
+
+    #[test]
+    fn classify_skip_already_processed() {
+        let action = classify_comment(
+            "@orch /retry",
+            Some("https://api.github.com/repos/o/r/issues/1"),
+            "@bot",
+            true,
+        );
+        assert_eq!(action, CommentAction::Skip);
+    }
+
+    #[test]
+    fn classify_skip_irrelevant_comment() {
+        let action = classify_comment("just a regular comment", None, "@bot", false);
+        assert_eq!(action, CommentAction::Skip);
+    }
+
+    #[test]
+    fn classify_command_without_mention() {
+        let action = classify_comment(
+            "/retry",
+            Some("https://api.github.com/repos/o/r/issues/42"),
+            "@bot",
+            false,
+        );
+        assert_eq!(
+            action,
+            CommentAction::ExecuteCommand {
+                command: OwnerCommand::Retry,
+                issue_num: "42".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_command_with_mention() {
+        let action = classify_comment(
+            "@orch /close",
+            Some("https://api.github.com/repos/o/r/issues/7"),
+            "@bot",
+            false,
+        );
+        assert_eq!(
+            action,
+            CommentAction::ExecuteCommandForMention {
+                command: OwnerCommand::Close,
+                issue_num: "7".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_mention_without_command() {
+        let action = classify_comment(
+            "@orch can you look at this?",
+            Some("https://api.github.com/repos/o/r/issues/99"),
+            "@bot",
+            false,
+        );
+        assert_eq!(
+            action,
+            CommentAction::CreateMentionTask {
+                issue_num: Some("99".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_mention_without_issue_url() {
+        let action = classify_comment("@orch help me", None, "@bot", false);
+        assert_eq!(action, CommentAction::CreateMentionTask { issue_num: None });
+    }
+
+    #[test]
+    fn classify_command_no_mention_no_url_skips() {
+        let action = classify_comment("/retry", None, "@bot", false);
+        assert_eq!(action, CommentAction::Skip);
+    }
+
+    #[test]
+    fn classify_mention_via_current_user() {
+        let action = classify_comment(
+            "@bot please help",
+            Some("https://api.github.com/repos/o/r/issues/5"),
+            "@bot",
+            false,
+        );
+        assert_eq!(
+            action,
+            CommentAction::CreateMentionTask {
+                issue_num: Some("5".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_command_with_mention_no_url_creates_task() {
+        // @mention + command but no issue URL → can't run command, create mention task
+        let action = classify_comment("@orch /retry", None, "@bot", false);
+        assert_eq!(action, CommentAction::CreateMentionTask { issue_num: None });
     }
 }

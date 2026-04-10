@@ -1,33 +1,13 @@
-//! Owner slash commands — detect and execute /commands in issue comments.
+//! Owner slash commands — parse, validate, and execute /commands in issue comments.
 //!
-//! Scans recent GitHub issue comments for slash commands (e.g. `/retry`,
-//! `/close`, `/block reason`) posted by repo collaborators. Commands are
-//! executed against the issue's task and a confirmation comment is posted.
+//! Provides command parsing (`parse_command`), validation + execution
+//! (`validate_and_run_command`), and the individual command implementations.
+//! The scanning loop lives in `sync.rs` (`scan_comments`).
 
-use crate::backends::{ExternalBackend, ExternalId, Mention, Status};
+use crate::backends::{ExternalBackend, ExternalId, Status};
 use crate::github::http::GhHttp;
 use crate::store;
-use crate::store::TaskStore;
 use std::sync::Arc;
-
-/// Read a KV value from the store.
-async fn kv_get(store: &Option<Arc<TaskStore>>, key: &str) -> Option<String> {
-    if let Some(ref s) = store {
-        if let Ok(v) = s.kv_get(key).await {
-            return v;
-        }
-    }
-    None
-}
-
-/// Write a KV value to the store.
-async fn kv_set(store: &Option<Arc<TaskStore>>, key: &str, value: &str) {
-    if let Some(ref s) = store {
-        if let Err(e) = s.kv_set(key, value).await {
-            tracing::warn!(key, err = %e, "commands: failed to persist KV key");
-        }
-    }
-}
 
 /// Parsed owner command from an issue comment.
 #[derive(Debug, Clone, PartialEq)]
@@ -117,125 +97,6 @@ pub fn parse_command(body: &str) -> Option<OwnerCommand> {
         }
     }
     None
-}
-
-use crate::github::types::extract_issue_number_from_url;
-
-/// Scan recent comments for owner slash commands and execute them.
-///
-/// Uses a timestamp cursor (`owner_commands_last_checked`) for dedup.
-/// Reuses the same comment endpoint as `scan_mentions`.
-pub async fn scan_commands(
-    backend: &Arc<dyn ExternalBackend>,
-    repo: &str,
-    store: &Option<Arc<crate::store::TaskStore>>,
-    task_manager: &Arc<crate::engine::tasks::TaskManager>,
-    prefetched_comments: Option<&[Mention]>,
-) -> anyhow::Result<()> {
-    let gh = GhHttp::new()?;
-
-    let comments = if let Some(comments) = prefetched_comments {
-        comments.to_vec()
-    } else {
-        // Use persisted cursor, fall back to 24h ago
-        let fallback = chrono::Utc::now() - chrono::Duration::hours(24);
-        let since_str = match kv_get(store, "owner_commands_last_checked").await {
-            Some(ts) => ts,
-            None => fallback.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        };
-
-        // Fetch recent comments (same endpoint as mentions)
-        match backend.get_mentions(&since_str).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(err = %e, "failed to fetch comments for command scanning");
-                return Ok(());
-            }
-        }
-    };
-
-    if comments.is_empty() {
-        // Still advance cursor even if no comments
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        kv_set(store, "owner_commands_last_checked", &now).await;
-        return Ok(());
-    }
-
-    // Build dedup set from already-processed command comment IDs.
-    // We store processed IDs in KV to survive restarts within the cursor window.
-    let processed_ids: std::collections::HashSet<String> =
-        match kv_get(store, "owner_commands_processed_ids").await {
-            Some(ids) if !ids.is_empty() => ids.split(',').map(String::from).collect(),
-            _ => std::collections::HashSet::new(),
-        };
-
-    let mut new_processed = Vec::new();
-
-    for mention in &comments {
-        // Skip already processed
-        if processed_ids.contains(&mention.id) {
-            continue;
-        }
-
-        // Try to parse a command
-        let command = match parse_command(&mention.body) {
-            Some(cmd) => cmd,
-            None => continue,
-        };
-
-        // Extract issue number from the comment's issue URL
-        let issue_number = match mention
-            .issue_url
-            .as_deref()
-            .and_then(extract_issue_number_from_url)
-        {
-            Some(n) => n,
-            None => {
-                tracing::warn!(
-                    comment_id = %mention.id,
-                    "slash command without issue_url, skipping"
-                );
-                continue;
-            }
-        };
-
-        let outcome = validate_and_run_command(
-            backend,
-            &gh,
-            repo,
-            &issue_number,
-            &command,
-            &mention.author,
-            store,
-            task_manager,
-        )
-        .await;
-
-        if matches!(
-            outcome,
-            CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed
-        ) {
-            continue;
-        }
-        new_processed.push(mention.id.clone());
-    }
-
-    // Persist processed IDs (keep last 500 to avoid unbounded growth)
-    if !new_processed.is_empty() {
-        let mut all: Vec<String> = processed_ids.into_iter().collect();
-        all.extend(new_processed);
-        all.sort_by_key(|id| id.parse::<u64>().unwrap_or(0));
-        if all.len() > 500 {
-            all = all.split_off(all.len() - 500);
-        }
-        kv_set(store, "owner_commands_processed_ids", &all.join(",")).await;
-    }
-
-    // Advance cursor
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    kv_set(store, "owner_commands_last_checked", &now).await;
-
-    Ok(())
 }
 
 /// Execute a single owner command against a task.
@@ -716,19 +577,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_issue_number_works() {
-        assert_eq!(
-            extract_issue_number_from_url("https://api.github.com/repos/owner/repo/issues/123"),
-            Some("123".into())
-        );
-    }
-
-    #[test]
-    fn extract_issue_number_empty_url() {
-        assert_eq!(extract_issue_number_from_url(""), None);
-    }
-
-    #[test]
     fn parse_ignores_command_in_code_fence() {
         let body = "Some context\n```\n/retry\n```\nMore text";
         assert_eq!(parse_command(body), None);
@@ -796,54 +644,5 @@ mod tests {
         assert_eq!(OwnerCommand::Block(None).to_string(), "/block");
         assert_eq!(OwnerCommand::Unblock.to_string(), "/unblock");
         assert_eq!(OwnerCommand::Review.to_string(), "/review");
-    }
-
-    // ── kv_get / kv_set store-first helpers ──────────────────────────
-
-    #[tokio::test]
-    async fn kv_get_reads_from_store() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
-
-        store.kv_set("key1", "from_store").await.unwrap();
-
-        let opt_store = Some(store);
-        let val = kv_get(&opt_store, "key1").await;
-        assert_eq!(val.as_deref(), Some("from_store"));
-    }
-
-    #[tokio::test]
-    async fn kv_get_returns_none_without_store() {
-        let opt_store: Option<Arc<crate::store::TaskStore>> = None;
-        let val = kv_get(&opt_store, "key2").await;
-        assert_eq!(val, None);
-    }
-
-    #[tokio::test]
-    async fn kv_get_returns_none_for_missing_key() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
-
-        let opt_store = Some(store);
-        let val = kv_get(&opt_store, "nonexistent").await;
-        assert_eq!(val, None);
-    }
-
-    #[tokio::test]
-    async fn kv_set_writes_to_store_when_present() {
-        let store = Arc::new(crate::store::TaskStore::open_memory().await.unwrap());
-
-        let opt_store = Some(Arc::clone(&store));
-        kv_set(&opt_store, "key3", "value3").await;
-
-        assert_eq!(
-            store.kv_get("key3").await.unwrap().as_deref(),
-            Some("value3")
-        );
-    }
-
-    #[tokio::test]
-    async fn kv_set_noop_without_store() {
-        let opt_store: Option<Arc<crate::store::TaskStore>> = None;
-        // Should not panic
-        kv_set(&opt_store, "key4", "value4").await;
     }
 }
