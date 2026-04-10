@@ -689,7 +689,7 @@ pub(crate) async fn auto_merge_pr(
                                                 .current_dir(&wt_path)
                                                 .output()
                                                 .await;
-                                            ref_out
+                                            let stash_hash = ref_out
                                                 .ok()
                                                 .filter(|o| o.status.success())
                                                 .map(|o| {
@@ -697,7 +697,23 @@ pub(crate) async fn auto_merge_pr(
                                                         .trim()
                                                         .to_string()
                                                 })
-                                                .filter(|s| !s.is_empty())
+                                                .filter(|s| !s.is_empty());
+                                            if stash_hash.is_none() {
+                                                // Stash was created but we can't track its ref.
+                                                // Pop immediately to avoid orphaning the changes,
+                                                // then bail — the next tick will retry.
+                                                tracing::warn!(
+                                                    task_id = task.id.0,
+                                                    "git stash succeeded but rev-parse failed — popping stash and skipping rebase"
+                                                );
+                                                let _ = tokio::process::Command::new("git")
+                                                    .args(["stash", "pop"])
+                                                    .current_dir(&wt_path)
+                                                    .output()
+                                                    .await;
+                                                return Ok(());
+                                            }
+                                            stash_hash
                                         }
                                         _ => None,
                                     }
