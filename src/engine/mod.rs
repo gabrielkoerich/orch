@@ -1635,104 +1635,118 @@ pub async fn serve() -> anyhow::Result<()> {
             } => {
                 tracing::info!(signal = signal_name, "beginning graceful shutdown");
 
-                // Reset in_progress tasks to routed so they re-dispatch after restart.
-                // Also reset in_review tasks to needs_review — their review agent
-                // tmux sessions will be killed when the process exits.
-                let mut reset_count = 0u32;
-                let mut review_reset_count = 0u32;
-                for engine in &project_engines {
-                    if let Ok(tasks) = engine.task_manager.list_external_by_status(Status::InProgress).await {
-                        for task in &tasks {
-                            if let Err(e) = engine.task_manager.update_task_status(&task.id, Status::Routed).await {
-                                tracing::warn!(task_id = task.id.0, ?e, "failed to reset task on shutdown");
-                            } else {
-                                reset_count += 1;
+                // Wrap the entire shutdown sequence in a timeout to enforce the configured limit.
+                // This prevents indefinite blocking if status updates or tmux operations hang.
+                let shutdown_result = tokio::time::timeout(
+                    config.graceful_shutdown_timeout,
+                    async {
+                        // Reset in_progress tasks to routed so they re-dispatch after restart.
+                        // Also reset in_review tasks to needs_review — their review agent
+                        // tmux sessions will be killed when the process exits.
+                        let mut reset_count = 0u32;
+                        let mut review_reset_count = 0u32;
+                        for engine in &project_engines {
+                            if let Ok(tasks) = engine.task_manager.list_external_by_status(Status::InProgress).await {
+                                for task in &tasks {
+                                    if let Err(e) = engine.task_manager.update_task_status(&task.id, Status::Routed).await {
+                                        tracing::warn!(task_id = task.id.0, ?e, "failed to reset task on shutdown");
+                                    } else {
+                                        reset_count += 1;
+                                    }
+                                }
+                            }
+                            // Also reset internal in_progress tasks
+                            if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, crate::store::TaskStatus::InProgress).await {
+                                for task in &tasks {
+                                    let task_id = format!("internal:{}", task.id);
+                                    if let Err(e) = engine.task_manager.update_task_status(
+                                        &crate::backends::ExternalId(task_id.clone()),
+                                        Status::Routed,
+                                    ).await {
+                                        tracing::warn!(task_id, ?e, "failed to reset internal task on shutdown");
+                                    } else {
+                                        reset_count += 1;
+                                    }
+                                }
+                            }
+                            // Reset in_review tasks — review agent sessions die on shutdown
+                            if let Ok(tasks) = engine.task_manager.list_external_by_status(Status::InReview).await {
+                                for task in &tasks {
+                                    if let Err(e) = engine.task_manager.update_task_status(&task.id, Status::NeedsReview).await {
+                                        tracing::warn!(task_id = task.id.0, ?e, "failed to reset in_review task on shutdown");
+                                    } else {
+                                        set_review_session_expected(&engine.store, &engine.repo, &task.id.0, false).await;
+                                        review_reset_count += 1;
+                                    }
+                                }
+                            }
+                            // Also reset internal in_review tasks
+                            if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, crate::store::TaskStatus::InReview).await {
+                                for task in &tasks {
+                                    let task_id = format!("internal:{}", task.id);
+                                    if let Err(e) = engine.task_manager.update_task_status(
+                                        &crate::backends::ExternalId(task_id.clone()),
+                                        Status::NeedsReview,
+                                    ).await {
+                                        tracing::warn!(task_id, ?e, "failed to reset internal in_review task on shutdown");
+                                    } else {
+                                        set_review_session_expected(&engine.store, &engine.repo, &task_id, false).await;
+                                        review_reset_count += 1;
+                                    }
+                                }
                             }
                         }
-                    }
-                    // Also reset internal in_progress tasks
-                    if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, crate::store::TaskStatus::InProgress).await {
-                        for task in &tasks {
-                            let task_id = format!("internal:{}", task.id);
-                            if let Err(e) = engine.task_manager.update_task_status(
-                                &crate::backends::ExternalId(task_id.clone()),
-                                Status::Routed,
-                            ).await {
-                                tracing::warn!(task_id, ?e, "failed to reset internal task on shutdown");
-                            } else {
-                                reset_count += 1;
-                            }
+                        if reset_count > 0 {
+                            tracing::info!(reset_count, "reset in_progress tasks to routed for re-dispatch");
                         }
-                    }
-                    // Reset in_review tasks — review agent sessions die on shutdown
-                    if let Ok(tasks) = engine.task_manager.list_external_by_status(Status::InReview).await {
-                        for task in &tasks {
-                            if let Err(e) = engine.task_manager.update_task_status(&task.id, Status::NeedsReview).await {
-                                tracing::warn!(task_id = task.id.0, ?e, "failed to reset in_review task on shutdown");
-                            } else {
-                                set_review_session_expected(&engine.store, &engine.repo, &task.id.0, false).await;
-                                review_reset_count += 1;
-                            }
+                        if review_reset_count > 0 {
+                            tracing::info!(review_reset_count, "reset in_review tasks to needs_review for re-dispatch");
                         }
-                    }
-                    // Also reset internal in_review tasks
-                    if let Ok(tasks) = engine.store.list_internal_by_status(&engine.repo, crate::store::TaskStatus::InReview).await {
-                        for task in &tasks {
-                            let task_id = format!("internal:{}", task.id);
-                            if let Err(e) = engine.task_manager.update_task_status(
-                                &crate::backends::ExternalId(task_id.clone()),
-                                Status::NeedsReview,
-                            ).await {
-                                tracing::warn!(task_id, ?e, "failed to reset internal in_review task on shutdown");
-                            } else {
-                                set_review_session_expected(&engine.store, &engine.repo, &task_id, false).await;
-                                review_reset_count += 1;
-                            }
-                        }
-                    }
-                }
-                if reset_count > 0 {
-                    tracing::info!(reset_count, "reset in_progress tasks to routed for re-dispatch");
-                }
-                if review_reset_count > 0 {
-                    tracing::info!(review_reset_count, "reset in_review tasks to needs_review for re-dispatch");
-                }
 
-                // Kill all orch-managed tmux sessions so stale sessions don't
-                // block dispatch after restart (session_exists check).
-                let mut killed_sessions = Vec::new();
-                if let Ok(sessions) = tmux.list_sessions().await {
-                    for session in &sessions {
-                        if session.name.starts_with("orch-") {
-                            if let Err(e) = tmux.kill_session(&session.name).await {
-                                tracing::warn!(session = %session.name, error = %e, "failed to kill tmux session");
-                            } else {
-                                killed_sessions.push(session.name.clone());
+                        // Kill all orch-managed tmux sessions so stale sessions don't
+                        // block dispatch after restart (session_exists check).
+                        let mut killed_sessions = Vec::new();
+                        if let Ok(sessions) = tmux.list_sessions().await {
+                            for session in &sessions {
+                                if session.name.starts_with("orch-") {
+                                    if let Err(e) = tmux.kill_session(&session.name).await {
+                                        tracing::warn!(session = %session.name, error = %e, "failed to kill tmux session");
+                                    } else {
+                                        killed_sessions.push(session.name.clone());
+                                    }
+                                }
+                            }
+                            if !killed_sessions.is_empty() {
+                                tracing::info!(killed = killed_sessions.len(), "killing orch tmux sessions on shutdown");
                             }
                         }
-                    }
-                    if !killed_sessions.is_empty() {
-                        tracing::info!(killed = killed_sessions.len(), "killing orch tmux sessions on shutdown");
-                    }
-                }
 
-                // Wait for sessions to actually die before exiting.
-                // Prevents race where process exits before tmux finishes cleanup.
-                if !killed_sessions.is_empty() {
-                    let still_alive = tmux
-                        .wait_for_sessions_dead(
-                            &killed_sessions,
-                            std::time::Duration::from_millis(100),
-                            std::time::Duration::from_secs(5),
-                        )
-                        .await;
-                    if still_alive > 0 {
-                        tracing::warn!(
-                            still_alive,
-                            "some tmux sessions did not terminate cleanly - they will be cleaned up on startup"
-                        );
-                    }
-                    tracing::info!(killed = killed_sessions.len() - still_alive, "confirmed tmux sessions terminated");
+                        // Wait for sessions to actually die before exiting.
+                        // Prevents race where process exits before tmux finishes cleanup.
+                        if !killed_sessions.is_empty() {
+                            let still_alive = tmux
+                                .wait_for_sessions_dead(
+                                    &killed_sessions,
+                                    std::time::Duration::from_millis(100),
+                                    std::time::Duration::from_secs(5),
+                                )
+                                .await;
+                            if still_alive > 0 {
+                                tracing::warn!(
+                                    still_alive,
+                                    "some tmux sessions did not terminate cleanly - they will be cleaned up on startup"
+                                );
+                            }
+                            tracing::info!(killed = killed_sessions.len() - still_alive, "confirmed tmux sessions terminated");
+                        }
+                    },
+                ).await;
+
+                if shutdown_result.is_err() {
+                    tracing::error!(
+                        timeout_secs = config.graceful_shutdown_timeout.as_secs(),
+                        "graceful shutdown timed out, forcing exit"
+                    );
                 }
 
                 break;
