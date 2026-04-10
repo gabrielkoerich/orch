@@ -55,6 +55,7 @@ const ALLOWED_FIELDS: &[&str] = &[
     "pr_number",
     "pr_review_context",
     "last_review_ts",
+    "review_ts_map",
     "last_comment_review_ts",
     "merge_conflict_retries",
     "ci_merge_failures",

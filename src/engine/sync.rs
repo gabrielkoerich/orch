@@ -827,16 +827,27 @@ pub(crate) async fn sync_tick(
                 &needs_review_tasks,
             ),
             fetch_comments_since(backend, &shared_since),
-            review_open_prs(
-                backend,
-                repo,
-                config,
-                task_manager,
-                store,
-                dispatching,
-                auto_merge_in_flight,
-                &in_review_tasks,
-            )
+            async {
+                let gh = match crate::github::http::GhHttp::new() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        tracing::warn!(err = %e, "failed to create GitHub HTTP client for review poll");
+                        return Ok(());
+                    }
+                };
+                review_open_prs(
+                    backend,
+                    repo,
+                    config,
+                    task_manager,
+                    store,
+                    dispatching,
+                    auto_merge_in_flight,
+                    &in_review_tasks,
+                    &gh,
+                )
+                .await
+            }
         );
 
         if let Err(e) = merge_result {

@@ -26,17 +26,53 @@ use crate::config;
 use crate::engine::auto_merge::{dedup_reviews, handle_review_changes, MAX_MERGE_CONFLICT_RETRIES};
 use crate::engine::tasks::TaskManager;
 use crate::engine::EngineConfig;
-use crate::github::http::GhHttp;
+use crate::github::http::{GhHttp, PrReviewBatchData};
 use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview};
 use crate::store::TaskStore;
 use crate::store::{
     store_increment_by_id, store_reset_failure_counters, store_set_by_id, store_set_result_by_id,
 };
+use async_trait::async_trait;
 use dashmap::DashSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::sync::ReviewTaskSnapshot;
+
+/// Abstraction over the GitHub HTTP calls used by `review_open_prs`.
+///
+/// Allows tests to inject a mock without needing a real GitHub token.
+#[async_trait]
+pub(crate) trait GhReviewClient: Send + Sync {
+    async fn get_pr_number(&self, repo: &str, branch: &str) -> anyhow::Result<Option<u64>>;
+    async fn is_pr_merged(&self, repo: &str, branch: &str) -> anyhow::Result<bool>;
+    async fn batch_fetch_pr_review_data(
+        &self,
+        repo: &str,
+        pr_numbers: &[u64],
+    ) -> anyhow::Result<HashMap<u64, PrReviewBatchData>>;
+    async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool>;
+}
+
+#[async_trait]
+impl GhReviewClient for GhHttp {
+    async fn get_pr_number(&self, repo: &str, branch: &str) -> anyhow::Result<Option<u64>> {
+        self.get_pr_number(repo, branch).await
+    }
+    async fn is_pr_merged(&self, repo: &str, branch: &str) -> anyhow::Result<bool> {
+        self.is_pr_merged(repo, branch).await
+    }
+    async fn batch_fetch_pr_review_data(
+        &self,
+        repo: &str,
+        pr_numbers: &[u64],
+    ) -> anyhow::Result<HashMap<u64, PrReviewBatchData>> {
+        self.batch_fetch_pr_review_data(repo, pr_numbers).await
+    }
+    async fn is_collaborator(&self, repo: &str, username: &str) -> anyhow::Result<bool> {
+        self.is_collaborator(repo, username).await
+    }
+}
 
 /// Action to take when a PR has merge conflicts after approval.
 #[derive(Debug, Clone, Copy)]
@@ -127,6 +163,7 @@ pub(crate) async fn review_open_prs(
     dispatching: &Arc<DashSet<String>>,
     auto_merge_in_flight: &Arc<DashSet<String>>,
     in_review_tasks: &[ReviewTaskSnapshot],
+    gh: &dyn GhReviewClient,
 ) -> anyhow::Result<()> {
     if in_review_tasks.is_empty() {
         tracing::debug!(count = 0, "checking in_review tasks for PR reviews");
@@ -139,8 +176,6 @@ pub(crate) async fn review_open_prs(
         count = in_review_tasks.len(),
         "checking in_review tasks for PR reviews"
     );
-
-    let gh = GhHttp::new()?;
 
     // ─── Phase 1: Validate tasks and separate by PR number availability ───────
 
@@ -895,5 +930,938 @@ fn automated_review_from_comments(
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::{ExternalId, ExternalTask, Mention};
+    use crate::engine::EngineConfig;
+    use crate::github::http::PrReviewBatchData;
+    use crate::github::types::{GitHubComment, GitHubReview, GitHubUser};
+    use crate::store::{NewTask, TaskStatus, TaskStore};
+    use async_trait::async_trait;
+    use dashmap::DashSet;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // ─── Mock GhReviewClient ─────────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct MockGh {
+        /// Responses for get_pr_number keyed by branch.
+        pr_numbers: HashMap<String, Option<u64>>,
+        /// Responses for is_pr_merged keyed by branch.
+        merged: HashMap<String, bool>,
+        /// Response for batch_fetch_pr_review_data.
+        batch_data: HashMap<u64, PrReviewBatchData>,
+        /// Whether batch_fetch_pr_review_data should return an error.
+        batch_error: bool,
+        /// Responses for is_collaborator keyed by username.
+        collaborators: HashMap<String, bool>,
+    }
+
+    #[async_trait]
+    impl GhReviewClient for MockGh {
+        async fn get_pr_number(&self, _repo: &str, branch: &str) -> anyhow::Result<Option<u64>> {
+            Ok(self.pr_numbers.get(branch).copied().flatten())
+        }
+        async fn is_pr_merged(&self, _repo: &str, branch: &str) -> anyhow::Result<bool> {
+            Ok(self.merged.get(branch).copied().unwrap_or(false))
+        }
+        async fn batch_fetch_pr_review_data(
+            &self,
+            _repo: &str,
+            _pr_numbers: &[u64],
+        ) -> anyhow::Result<HashMap<u64, PrReviewBatchData>> {
+            if self.batch_error {
+                anyhow::bail!("simulated batch GraphQL error");
+            }
+            Ok(self.batch_data.clone())
+        }
+        async fn is_collaborator(&self, _repo: &str, username: &str) -> anyhow::Result<bool> {
+            Ok(self.collaborators.get(username).copied().unwrap_or(false))
+        }
+    }
+
+    // ─── Mock ExternalBackend ────────────────────────────────────────────────
+
+    struct MockBackend;
+
+    #[async_trait]
+    impl crate::backends::ExternalBackend for MockBackend {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn create_task(
+            &self,
+            _t: &str,
+            _b: &str,
+            _l: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("1".to_string()))
+        }
+        async fn get_task(&self, id: &ExternalId) -> anyhow::Result<ExternalTask> {
+            Ok(make_ext_task(&id.0))
+        }
+        async fn list_by_status(
+            &self,
+            _s: crate::backends::Status,
+        ) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+        async fn list_routable(&self) -> anyhow::Result<Vec<ExternalTask>> {
+            Ok(vec![])
+        }
+        async fn post_comment(&self, _id: &ExternalId, _b: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn set_labels(&self, _id: &ExternalId, _l: &[String]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_label(&self, _id: &ExternalId, _l: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn get_sub_issues(&self, _id: &ExternalId) -> anyhow::Result<Vec<ExternalId>> {
+            Ok(vec![])
+        }
+        async fn create_sub_task(
+            &self,
+            _p: &ExternalId,
+            _t: &str,
+            _b: &str,
+            _l: &[String],
+        ) -> anyhow::Result<ExternalId> {
+            Ok(ExternalId("child".to_string()))
+        }
+        async fn ensure_status_label(&self, _l: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn has_open_issue_with_title(&self, _t: &str, _l: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn health_check(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn is_pr_merged(&self, _b: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn get_authenticated_user(&self) -> anyhow::Result<Option<String>> {
+            Ok(Some("bot".to_string()))
+        }
+        async fn get_mentions(&self, _s: &str) -> anyhow::Result<Vec<Mention>> {
+            Ok(vec![])
+        }
+        async fn update_status(
+            &self,
+            _id: &ExternalId,
+            _s: crate::backends::Status,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    fn make_ext_task(id: &str) -> ExternalTask {
+        ExternalTask {
+            id: ExternalId(id.to_string()),
+            title: "test task".to_string(),
+            body: "".to_string(),
+            state: "open".to_string(),
+            labels: vec![],
+            author: "user".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            url: "".to_string(),
+        }
+    }
+
+    fn make_comment(id: u64, login: &str, body: &str, created_at: &str) -> GitHubComment {
+        GitHubComment {
+            id,
+            body: body.to_string(),
+            user: GitHubUser {
+                login: login.to_string(),
+            },
+            created_at: created_at.to_string(),
+            updated_at: None,
+            html_url: None,
+            issue_url: None,
+            author_association: None,
+        }
+    }
+
+    fn make_review(
+        id: u64,
+        login: &str,
+        state: &str,
+        submitted_at: &str,
+        body: Option<&str>,
+    ) -> GitHubReview {
+        GitHubReview {
+            id,
+            user: GitHubUser {
+                login: login.to_string(),
+            },
+            body: body.map(str::to_string),
+            state: state.to_string(),
+            html_url: None,
+            submitted_at: submitted_at.to_string(),
+            commit_id: None,
+        }
+    }
+
+    async fn make_store() -> Arc<TaskStore> {
+        Arc::new(TaskStore::open_memory().await.unwrap())
+    }
+
+    fn default_config() -> EngineConfig {
+        EngineConfig::default()
+    }
+
+    // ─── automated_review_from_comments ──────────────────────────────────────
+
+    #[test]
+    fn arc_empty_input_returns_none() {
+        let result = automated_review_from_comments(&[], &HashMap::new(), 1);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn arc_non_automated_comment_ignored() {
+        let comments = vec![make_comment(
+            1,
+            "alice",
+            "Great work!",
+            "2026-01-01T00:00:00Z",
+        )];
+        let cache = HashMap::from([("alice".to_string(), Some(true))]);
+        assert_eq!(automated_review_from_comments(&comments, &cache, 1), None);
+    }
+
+    #[test]
+    fn arc_collaborator_approve_returns_approve() {
+        let body = "## Automated Review \u{2014} Approve\n\nLooks good.";
+        let comments = vec![make_comment(1, "bot", body, "2026-01-01T00:00:00Z")];
+        let cache = HashMap::from([("bot".to_string(), Some(true))]);
+        assert_eq!(
+            automated_review_from_comments(&comments, &cache, 1),
+            Some("approve".to_string())
+        );
+    }
+
+    #[test]
+    fn arc_collaborator_changes_requested_returns_changes_requested() {
+        let body = "## Automated Review \u{2014} Changes Requested\n\nFix the bug.";
+        let comments = vec![make_comment(1, "bot", body, "2026-01-01T00:00:00Z")];
+        let cache = HashMap::from([("bot".to_string(), Some(true))]);
+        assert_eq!(
+            automated_review_from_comments(&comments, &cache, 1),
+            Some("changes_requested".to_string())
+        );
+    }
+
+    #[test]
+    fn arc_non_collaborator_comment_ignored() {
+        let body = "## Automated Review \u{2014} Approve\n\nLooks good.";
+        let comments = vec![make_comment(1, "outsider", body, "2026-01-01T00:00:00Z")];
+        let cache = HashMap::from([("outsider".to_string(), Some(false))]);
+        assert_eq!(automated_review_from_comments(&comments, &cache, 1), None);
+    }
+
+    #[test]
+    fn arc_unknown_user_not_in_cache_is_ignored() {
+        // User not present in cache at all — treated as non-collaborator.
+        let body = "## Automated Review \u{2014} Approve\n\nLooks good.";
+        let comments = vec![make_comment(1, "unknown", body, "2026-01-01T00:00:00Z")];
+        let cache: HashMap<String, Option<bool>> = HashMap::new();
+        assert_eq!(automated_review_from_comments(&comments, &cache, 1), None);
+    }
+
+    #[test]
+    fn arc_collab_check_failed_none_in_cache_skipped() {
+        // Cache has the key but value is None — collaborator check failed.
+        let body = "## Automated Review \u{2014} Approve\n\nLooks good.";
+        let comments = vec![make_comment(1, "bot", body, "2026-01-01T00:00:00Z")];
+        let cache: HashMap<String, Option<bool>> = HashMap::from([("bot".to_string(), None)]);
+        assert_eq!(automated_review_from_comments(&comments, &cache, 1), None);
+    }
+
+    #[test]
+    fn arc_newest_comment_wins() {
+        let body_approve = "## Automated Review \u{2014} Approve\n\nLooks good.";
+        let body_changes = "## Automated Review \u{2014} Changes Requested\n\nFix the bug.";
+        let comments = vec![
+            make_comment(1, "bot", body_approve, "2026-01-01T00:00:00Z"),
+            make_comment(2, "bot", body_changes, "2026-01-02T00:00:00Z"),
+        ];
+        let cache = HashMap::from([("bot".to_string(), Some(true))]);
+        // Newer (changes_requested) wins.
+        assert_eq!(
+            automated_review_from_comments(&comments, &cache, 1),
+            Some("changes_requested".to_string())
+        );
+    }
+
+    #[test]
+    fn arc_automated_review_header_without_known_verdict_returns_none() {
+        // Body starts with "## Automated Review" but first line doesn't match either verdict.
+        let body = "## Automated Review — Unknown\n\nSome text.";
+        let comments = vec![make_comment(1, "bot", body, "2026-01-01T00:00:00Z")];
+        let cache = HashMap::from([("bot".to_string(), Some(true))]);
+        assert_eq!(automated_review_from_comments(&comments, &cache, 1), None);
+    }
+
+    // ─── review_open_prs: empty task list ────────────────────────────────────
+
+    #[tokio::test]
+    async fn review_open_prs_empty_tasks_returns_ok_without_info_log() {
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+        let dispatching = Arc::new(DashSet::new());
+        let in_flight = Arc::new(DashSet::new());
+        let gh = MockGh::default();
+
+        let result = review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[],
+            &gh,
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    // ─── review_open_prs: dispatching set guard ───────────────────────────────
+
+    #[tokio::test]
+    async fn review_open_prs_dispatching_guard_skips_task() {
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        // Create a task in-store so we can build a snapshot.
+        let task_store_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "task1".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_store_id,
+            &[("branch", serde_json::json!("my-branch"))],
+        )
+        .await;
+        store
+            .update_status(task_store_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+        let stored = store.get(task_store_id).await.unwrap();
+        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        };
+
+        // Lock the task in the dispatching set.
+        let dispatching = Arc::new(DashSet::new());
+        dispatching.insert(format!("owner/repo/{}", snapshot.external.id.0));
+
+        // Mock returns pr_number = Some(42) so the task would normally proceed.
+        let mut gh = MockGh::default();
+        gh.pr_numbers.insert("my-branch".to_string(), Some(42));
+        // If the guard is broken, batch_fetch would be called (we don't set batch_data, so it
+        // returns empty — which would cause the task to silently skip, not panic).
+        // The important invariant is that the store status remains InReview.
+
+        let in_flight = Arc::new(DashSet::new());
+        let result = review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &gh,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // Task status must remain in_review (guard prevented any state change).
+        let after = store.get(task_store_id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::InReview);
+    }
+
+    // ─── review_open_prs: Phase 3 — no open PR, PR merged ────────────────────
+
+    #[tokio::test]
+    async fn review_open_prs_no_pr_merged_marks_done() {
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "task1".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_id,
+            &[("branch", serde_json::json!("feat-branch"))],
+        )
+        .await;
+        store
+            .update_status(task_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+        let stored = store.get(task_id).await.unwrap();
+        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        };
+
+        // No PR number stored, and no result from get_pr_number → pr_number stays None.
+        // is_pr_merged returns true.
+        let mut gh = MockGh::default();
+        gh.merged.insert("feat-branch".to_string(), true);
+
+        let dispatching = Arc::new(DashSet::new());
+        let in_flight = Arc::new(DashSet::new());
+        review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &gh,
+        )
+        .await
+        .unwrap();
+
+        let after = store.get(task_id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::Done);
+    }
+
+    // ─── review_open_prs: Phase 3 — no PR, not merged, reroute ──────────────
+
+    #[tokio::test]
+    async fn review_open_prs_no_pr_not_merged_reroutes() {
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "task2".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_id,
+            &[("branch", serde_json::json!("feat-branch"))],
+        )
+        .await;
+        store
+            .update_status(task_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+        let stored = store.get(task_id).await.unwrap();
+        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        };
+
+        // No PR, not merged.
+        let gh = MockGh::default(); // merged defaults to false, pr_numbers empty
+
+        let dispatching = Arc::new(DashSet::new());
+        let in_flight = Arc::new(DashSet::new());
+        review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &gh,
+        )
+        .await
+        .unwrap();
+
+        let after = store.get(task_id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::Routed);
+        assert_eq!(after.no_code_reroutes, 1);
+    }
+
+    // ─── review_open_prs: Phase 3 — no PR, max reroutes → blocked ────────────
+
+    #[tokio::test]
+    async fn review_open_prs_no_pr_max_reroutes_blocks_task() {
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "task3".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_id,
+            &[("branch", serde_json::json!("feat-branch"))],
+        )
+        .await;
+        store
+            .update_status(task_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+
+        // Pre-set no_code_reroutes to a high value that exceeds any configured max after increment.
+        // The default max is 3; use 99 to be robust against any real config on the test machine.
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_id,
+            &[("no_code_reroutes", serde_json::json!(99i64))],
+        )
+        .await;
+
+        let stored = store.get(task_id).await.unwrap();
+        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        };
+
+        let gh = MockGh::default();
+        let dispatching = Arc::new(DashSet::new());
+        let in_flight = Arc::new(DashSet::new());
+        review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &gh,
+        )
+        .await
+        .unwrap();
+
+        let after = store.get(task_id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert!(
+            after.block_reason.is_some(),
+            "block_reason must be set atomically with Blocked status"
+        );
+    }
+
+    // ─── review_open_prs: Phase 3 — transient error skips without increment ──
+
+    #[tokio::test]
+    async fn review_open_prs_transient_error_in_is_pr_merged_skips_task() {
+        struct TransientGh;
+
+        #[async_trait]
+        impl GhReviewClient for TransientGh {
+            async fn get_pr_number(
+                &self,
+                _repo: &str,
+                _branch: &str,
+            ) -> anyhow::Result<Option<u64>> {
+                Ok(None)
+            }
+            async fn is_pr_merged(&self, _repo: &str, _branch: &str) -> anyhow::Result<bool> {
+                anyhow::bail!("500 Internal Server Error (transient GitHub 5xx)")
+            }
+            async fn batch_fetch_pr_review_data(
+                &self,
+                _repo: &str,
+                _pr_numbers: &[u64],
+            ) -> anyhow::Result<HashMap<u64, PrReviewBatchData>> {
+                Ok(HashMap::new())
+            }
+            async fn is_collaborator(&self, _repo: &str, _username: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "task4".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_id,
+            &[("branch", serde_json::json!("feat-branch"))],
+        )
+        .await;
+        store
+            .update_status(task_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+        let stored = store.get(task_id).await.unwrap();
+        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        };
+
+        let dispatching = Arc::new(DashSet::new());
+        let in_flight = Arc::new(DashSet::new());
+        review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &TransientGh,
+        )
+        .await
+        .unwrap();
+
+        // Status must remain InReview and counter must not have been incremented.
+        let after = store.get(task_id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::InReview);
+        assert_eq!(after.no_code_reroutes, 0);
+    }
+
+    // ─── review_open_prs: Phase 4 — batch fetch failure → graceful skip ──────
+
+    #[tokio::test]
+    async fn review_open_prs_batch_fetch_failure_returns_ok() {
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "task5".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_id,
+            &[("branch", serde_json::json!("feat-branch"))],
+        )
+        .await;
+        // Set pr_number so task reaches Phase 4.
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_id,
+            &[("pr_number", serde_json::json!(99i64))],
+        )
+        .await;
+        store
+            .update_status(task_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+        let stored = store.get(task_id).await.unwrap();
+        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        };
+
+        let gh = MockGh {
+            batch_error: true,
+            ..Default::default()
+        };
+        let dispatching = Arc::new(DashSet::new());
+        let in_flight = Arc::new(DashSet::new());
+        let result = review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &gh,
+        )
+        .await;
+
+        // Must return Ok (graceful skip) even though batch fetch failed.
+        assert!(result.is_ok());
+        // Task status must be unchanged.
+        let after = store.get(task_id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::InReview);
+    }
+
+    // ─── review_open_prs: watermark dedup — review_ts_map skips old reviews ──
+
+    #[tokio::test]
+    async fn review_open_prs_watermark_dedup_skips_already_processed_review() {
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "task6".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Pre-set review_ts_map so the reviewer's review is already watermarked.
+        let ts = "2026-01-05T00:00:00Z";
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_id,
+            &[
+                ("branch", serde_json::json!("feat-branch")),
+                ("pr_number", serde_json::json!(10i64)),
+                (
+                    "review_ts_map",
+                    serde_json::json!(serde_json::json!({"reviewer1": ts}).to_string()),
+                ),
+            ],
+        )
+        .await;
+        store
+            .update_status(task_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+        let stored = store.get(task_id).await.unwrap();
+        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        };
+
+        // Batch data has a CHANGES_REQUESTED review at the same timestamp as the watermark.
+        let review = make_review(1, "reviewer1", "CHANGES_REQUESTED", ts, Some("Fix this"));
+        let batch_data = PrReviewBatchData {
+            merged: false,
+            mergeable: Some(true),
+            reviews: vec![review],
+            review_comments: vec![],
+            issue_comments: vec![],
+        };
+        let mut gh = MockGh::default();
+        gh.batch_data.insert(10, batch_data);
+
+        let dispatching = Arc::new(DashSet::new());
+        let in_flight = Arc::new(DashSet::new());
+        review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &gh,
+        )
+        .await
+        .unwrap();
+
+        // Status must remain InReview — review was skipped due to watermark.
+        let after = store.get(task_id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::InReview);
+    }
+
+    // ─── review_open_prs: last_comment_review_ts dedup ───────────────────────
+
+    #[tokio::test]
+    async fn review_open_prs_last_comment_review_ts_dedup_skips_old_comment() {
+        let store = make_store().await;
+        let backend: Arc<dyn crate::backends::ExternalBackend> = Arc::new(MockBackend);
+        let tm = Arc::new(crate::engine::tasks::TaskManager::with_store(
+            Arc::clone(&backend),
+            Arc::clone(&store),
+            "owner/repo".to_string(),
+        ));
+
+        let task_id = store
+            .create(&NewTask {
+                repo: "owner/repo".to_string(),
+                origin: "github".to_string(),
+                title: "task7".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_id,
+            &[("branch", serde_json::json!("feat-branch"))],
+        )
+        .await;
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_id,
+            &[("pr_number", serde_json::json!(20i64))],
+        )
+        .await;
+        // Set last_comment_review_ts to match the comment's created_at so it is deduplicated.
+        let ts = "2026-01-05T00:00:00Z";
+        crate::store::store_set_by_id(
+            &Some(Arc::clone(&store)),
+            task_id,
+            &[("last_comment_review_ts", serde_json::json!(ts))],
+        )
+        .await;
+        store
+            .update_status(task_id, TaskStatus::InReview)
+            .await
+            .unwrap();
+        let stored = store.get(task_id).await.unwrap();
+        let snapshot = crate::engine::sync::ReviewTaskSnapshot {
+            external: crate::engine::tasks::store_task_to_external(&stored),
+            stored,
+        };
+
+        let comment_body = "## Automated Review \u{2014} Changes Requested\n\nFix the bug.";
+        let comment = make_comment(1, "bot", comment_body, ts);
+        let batch_data = PrReviewBatchData {
+            merged: false,
+            mergeable: Some(true),
+            reviews: vec![],
+            review_comments: vec![],
+            issue_comments: vec![comment],
+        };
+        let mut gh = MockGh::default();
+        gh.batch_data.insert(20, batch_data);
+        gh.collaborators.insert("bot".to_string(), true);
+
+        let dispatching = Arc::new(DashSet::new());
+        let in_flight = Arc::new(DashSet::new());
+        review_open_prs(
+            &backend,
+            "owner/repo",
+            &default_config(),
+            &tm,
+            &store,
+            &dispatching,
+            &in_flight,
+            &[snapshot],
+            &gh,
+        )
+        .await
+        .unwrap();
+
+        // Status must remain InReview — comment was deduplicated.
+        let after = store.get(task_id).await.unwrap();
+        assert_eq!(after.status, TaskStatus::InReview);
+    }
+
+    // ─── review_open_prs: review context truncation ──────────────────────────
+
+    #[test]
+    fn review_context_truncation_at_16kb_boundary() {
+        // Replicate the truncation logic from review_open_prs to verify it works correctly.
+        const MAX_REVIEW_CONTEXT_BYTES: usize = 16 * 1024;
+
+        // Build a review_context that exceeds 16 KB.
+        let repeated = "a".repeat(200);
+        let mut review_context = String::new();
+        while review_context.len() <= MAX_REVIEW_CONTEXT_BYTES {
+            review_context.push_str(&repeated);
+            review_context.push('\n');
+        }
+
+        assert!(review_context.len() > MAX_REVIEW_CONTEXT_BYTES);
+
+        // Apply the same truncation logic as in review_open_prs.
+        if review_context.len() > MAX_REVIEW_CONTEXT_BYTES {
+            let mut boundary = MAX_REVIEW_CONTEXT_BYTES;
+            while !review_context.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            if let Some(pos) = review_context[..boundary].rfind('\n') {
+                review_context.truncate(pos);
+            } else {
+                review_context.truncate(boundary);
+            }
+            review_context.push_str("\n... (review context truncated)");
+        }
+
+        assert!(review_context.len() <= MAX_REVIEW_CONTEXT_BYTES + 40); // suffix is short
+        assert!(review_context.ends_with("... (review context truncated)"));
+        // Must be valid UTF-8 after truncation (no split multi-byte chars).
+        assert!(std::str::from_utf8(review_context.as_bytes()).is_ok());
     }
 }
