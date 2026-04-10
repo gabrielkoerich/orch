@@ -123,12 +123,8 @@ static LEAK_PATTERNS: LazyLock<Vec<(&str, Regex, bool)>> =
 /// - `//` (C-style comments)
 /// - `#` (shell/Python comments)
 /// - `<!--` (HTML comments)
-/// - `* ` (markdown bullets)
 fn is_comment_line(trimmed: &str) -> bool {
-    trimmed.starts_with("//")
-        || trimmed.starts_with('#')
-        || trimmed.starts_with("<!--")
-        || trimmed.starts_with("* ")
+    trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("<!--")
 }
 
 /// Scan text for potential leaked secrets.
@@ -253,10 +249,11 @@ mod tests {
     }
 
     #[test]
-    fn ignores_markdown_bullets() {
+    fn scans_markdown_bullets() {
+        // Markdown bullet lines must NOT be skipped — they're content, not code comments.
         let text = "* token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
         let matches = scan(text);
-        assert!(matches.is_empty());
+        assert!(!matches.is_empty());
     }
 
     #[test]
