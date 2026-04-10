@@ -220,11 +220,20 @@ pub async fn rebase_on_branch(dir: &Path, branch: &str) -> anyhow::Result<bool> 
         .await;
 
     let commit_count: usize = match count_output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0),
-        _ => 0,
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            raw.trim().parse().map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to parse commit count from git rev-list output {:?}: {e}",
+                    raw.trim()
+                )
+            })?
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            anyhow::bail!("git rev-list --count failed: {stderr}");
+        }
+        Err(e) => anyhow::bail!("failed to run git rev-list --count: {e}"),
     };
 
     if commit_count == 0 {
