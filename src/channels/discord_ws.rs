@@ -710,9 +710,12 @@ mod tests {
             &client,
         )
         .await
-        .unwrap();
+        .expect("dispatch should succeed for valid MESSAGE_CREATE");
 
-        let msg = rx.recv().await.unwrap();
+        let msg = rx
+            .recv()
+            .await
+            .expect("should receive MESSAGE_CREATE event from dispatch");
         assert_eq!(msg.id, "123456789");
         assert_eq!(msg.thread_id, "987654321");
         assert_eq!(msg.topic_id, Some("987654321".to_string()));
@@ -745,7 +748,7 @@ mod tests {
             &client,
         )
         .await
-        .unwrap();
+        .expect("dispatch should succeed for bot message (just skipping send)");
 
         // Nothing should arrive
         assert!(rx.try_recv().is_err());
@@ -775,9 +778,12 @@ mod tests {
             &client,
         )
         .await
-        .unwrap();
+        .expect("dispatch should succeed for MESSAGE_CREATE from any channel");
 
-        let msg = rx.recv().await.unwrap();
+        let msg = rx
+            .recv()
+            .await
+            .expect("should receive message from any channel");
         assert_eq!(msg.body, "hello from any channel");
         assert_eq!(msg.thread_id, "any-channel-id");
         assert_eq!(msg.topic_id, Some("any-channel-id".to_string()));
@@ -805,7 +811,7 @@ mod tests {
             &client,
         )
         .await
-        .unwrap();
+        .expect("dispatch should succeed for READY event");
 
         assert_eq!(session_id.as_deref(), Some("abc123"));
         assert_eq!(resume_url.as_deref(), Some("wss://us-east1.discord.gg"));
@@ -835,9 +841,12 @@ mod tests {
             &client,
         )
         .await
-        .unwrap();
+        .expect("dispatch should succeed for open channel MESSAGE_CREATE");
 
-        let msg = rx.recv().await.unwrap();
+        let msg = rx
+            .recv()
+            .await
+            .expect("should receive message from random channel");
         assert_eq!(msg.id, "42");
         assert_eq!(msg.thread_id, "random-channel");
         assert_eq!(msg.topic_id, Some("random-channel".to_string()));
@@ -903,9 +912,12 @@ mod tests {
             &client,
         )
         .await
-        .unwrap();
+        .expect("dispatch should succeed for INTERACTION_CREATE");
 
-        let msg = rx.recv().await.unwrap();
+        let msg = rx
+            .recv()
+            .await
+            .expect("should receive INTERACTION_CREATE event from dispatch");
         assert_eq!(msg.channel, "discord");
         assert_eq!(msg.id, "interaction-123");
         assert_eq!(msg.thread_id, "chan-456");
@@ -949,7 +961,7 @@ mod tests {
             &client,
         )
         .await
-        .unwrap();
+        .expect("dispatch should succeed for non-component INTERACTION_CREATE");
 
         // Should not produce a message for non-component interactions
         assert!(rx.try_recv().is_err());
