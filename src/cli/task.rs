@@ -45,7 +45,11 @@ fn format_age(updated_at: &str) -> String {
 /// Truncate an error message to a maximum length, appending an ellipsis when truncated.
 fn truncate_err(err: &str, max: usize) -> String {
     if err.len() > max {
-        format!("{}...", &err[..max])
+        let mut end = max;
+        while end > 0 && !err.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &err[..end])
     } else {
         err.to_string()
     }
@@ -1925,5 +1929,54 @@ mod tests {
             model_none.as_deref().unwrap_or("(router default)"),
             "(router default)"
         );
+    }
+
+    #[test]
+    fn truncate_err_under_limit() {
+        let s = "short error";
+        assert_eq!(truncate_err(s, 50), "short error");
+    }
+
+    #[test]
+    fn truncate_err_exact_limit() {
+        let s = "short error";
+        assert_eq!(truncate_err(s, 11), "short error");
+    }
+
+    #[test]
+    fn truncate_err_truncates() {
+        let s = "this is a long error message that should be cut";
+        let result = truncate_err(s, 10);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 13); // 10 chars + "..."
+    }
+
+    #[test]
+    fn truncate_err_multi_byte_char_boundary() {
+        // "héllo world" bytes: h(0)=1, é(1-2)=2, l(3)=1, l(4)=1, o(5)=1, sp(6)=1, w(7)=1...
+        // byte 3 = 'l' (valid boundary); byte 4 = 'l' (valid); byte 5 = 'o' (valid)
+        // No panic = success; exact result varies by where the boundary lands
+        let s = "héllo world";
+        let result = truncate_err(s, 3);
+        assert!(result.ends_with("..."));
+        assert!(!result.contains("panic"));
+    }
+
+    #[test]
+    fn truncate_err_emoji() {
+        // "🔥 error message": 🔥=4 bytes, space=1, e=1, r=1, r=1, o=1, sp=1, m=1...
+        // byte 5 = 'e' (valid boundary); walk-back not needed
+        let s = "🔥 error message";
+        let result = truncate_err(s, 5);
+        assert_eq!(result, "🔥 ...");
+    }
+
+    #[test]
+    fn truncate_err_cjk() {
+        // "你好世界": 你=3 bytes(0-2), 好=3 bytes(3-5), 世=3 bytes(6-8), 界=3 bytes(9-11)
+        // byte 4 falls inside 好; walk back to byte 3 (= end of 你)
+        let s = "你好世界";
+        let result = truncate_err(s, 4);
+        assert_eq!(result, "你...");
     }
 }
