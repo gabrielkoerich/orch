@@ -1644,45 +1644,50 @@ impl GhHttp {
             .split_once('/')
             .ok_or_else(|| anyhow::anyhow!("invalid repo format: {}", repo))?;
 
-        let aliases: String = issue_numbers
-            .iter()
-            .map(|n| {
-                format!("issue{n}: issue(number: {n}) {{ state labels(first: 100) {{ nodes {{ name }} }} }}")
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let query = format!(
-            r#"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"#
-        );
-
-        let resp = self
-            .graphql_with_vars(&query, serde_json::json!({ "owner": owner, "name": name }))
-            .await?;
-        let repo_data = resp
-            .pointer("/data/repository")
-            .ok_or_else(|| anyhow::anyhow!("missing /data/repository in GraphQL response"))?;
-
+        // GitHub GraphQL complexity limit: chunk at 50 to avoid slow/rejected queries.
+        const CHUNK_SIZE: usize = 50;
         let mut result = std::collections::HashMap::new();
-        for n in issue_numbers {
-            if let Some(issue) = repo_data.get(format!("issue{n}")) {
-                let state = issue
-                    .get("state")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("UNKNOWN")
-                    .to_lowercase();
-                let labels: Vec<String> = issue
-                    .pointer("/labels/nodes")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|l| {
-                                l.get("name").and_then(|nm| nm.as_str()).map(String::from)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                result.insert(n.to_string(), (state, labels));
+
+        for chunk in issue_numbers.chunks(CHUNK_SIZE) {
+            let aliases: String = chunk
+                .iter()
+                .map(|n| {
+                    format!("issue{n}: issue(number: {n}) {{ state labels(first: 100) {{ nodes {{ name }} }} }}")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let query = format!(
+                r#"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {aliases} }} }}"#
+            );
+
+            let resp = self
+                .graphql_with_vars(&query, serde_json::json!({ "owner": owner, "name": name }))
+                .await?;
+            let repo_data = resp
+                .pointer("/data/repository")
+                .ok_or_else(|| anyhow::anyhow!("missing /data/repository in GraphQL response"))?;
+
+            for n in chunk {
+                if let Some(issue) = repo_data.get(format!("issue{n}")) {
+                    let state = issue
+                        .get("state")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("UNKNOWN")
+                        .to_lowercase();
+                    let labels: Vec<String> = issue
+                        .pointer("/labels/nodes")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|l| {
+                                    l.get("name").and_then(|nm| nm.as_str()).map(String::from)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    result.insert(n.to_string(), (state, labels));
+                }
             }
         }
         Ok(result)
