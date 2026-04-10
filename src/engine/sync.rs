@@ -377,9 +377,9 @@ fn advance_cursor(last_success_ts: &mut Option<String>, ts: &str) {
     }
 }
 
-/// Handle a slash command from a mention. Returns `true` if the mention was
-/// fully handled (command executed or skipped with sentinel), `false` if it
-/// should fall through to the generic mention-task path.
+/// Handle a slash command from a mention. Records a sentinel task and advances
+/// the cursor on success; logs a warning and returns early if the mention has
+/// no valid issue URL.
 #[allow(clippy::too_many_arguments)]
 async fn handle_slash_command(
     backend: &Arc<dyn ExternalBackend>,
@@ -390,7 +390,7 @@ async fn handle_slash_command(
     mention: &Mention,
     command: &crate::engine::commands::OwnerCommand,
     last_success_ts: &mut Option<String>,
-) -> bool {
+) {
     let issue_num = match mention
         .issue_url
         .as_deref()
@@ -399,7 +399,7 @@ async fn handle_slash_command(
         Some(num) => num,
         None => {
             tracing::warn!(comment_id = %mention.id, "slash command without valid issue number");
-            return false;
+            return;
         }
     };
 
@@ -421,7 +421,7 @@ async fn handle_slash_command(
         CommandOutcome::Executed { is_pr }
         | CommandOutcome::NotOpen { is_pr }
         | CommandOutcome::NotCollaborator { is_pr } => *is_pr,
-        CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => return true,
+        CommandOutcome::FetchFailed | CommandOutcome::CollaboratorCheckFailed => return,
     };
 
     // Record a sentinel task for the mention (with correct parent_id)
@@ -467,8 +467,6 @@ async fn handle_slash_command(
 
         record_mention_task(s, repo, mention, &title, &body, parent_id, last_success_ts).await;
     }
-
-    true
 }
 
 fn auto_unblock_cooldown_elapsed(count: i32, last_at: &str) -> bool {
@@ -1264,7 +1262,7 @@ async fn scan_mentions(
 
         // Try slash command first
         if let Some(command) = parse_command(&mention.body) {
-            if handle_slash_command(
+            handle_slash_command(
                 backend,
                 store,
                 repo,
@@ -1274,13 +1272,11 @@ async fn scan_mentions(
                 &command,
                 &mut last_success_ts,
             )
-            .await
-            {
-                continue;
-            }
+            .await;
+            continue;
         }
 
-        // No command (or command had no valid issue URL) — create a mention task
+        // No command — create a mention task
         let issue_num_opt = mention
             .issue_url
             .as_deref()
