@@ -126,6 +126,14 @@ pub fn format_line(line: &str) -> Option<String> {
 
         "thread.started" | "turn.started" | "turn.completed" => None,
 
+        "turn.failed" => {
+            let error = v
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown error");
+            Some(format!("✗ {}", truncate(error, 200)))
+        }
+
         // ── OpenCode format ────────────────────────────────────────────────
         "text" => {
             // Format 1: {"type":"text","part":{"type":"text","text":"..."}}
@@ -379,6 +387,21 @@ mod tests {
         assert!(format_line(r#"{"type":"thread.started","thread_id":"t1"}"#).is_none());
         assert!(format_line(r#"{"type":"turn.started"}"#).is_none());
         assert!(format_line(r#"{"type":"turn.completed"}"#).is_none());
+    }
+
+    #[test]
+    fn codex_turn_failed() {
+        let line = r#"{"type":"turn.failed","error":"Provider quota exceeded"}"#;
+        let out = format_line(line).unwrap();
+        assert!(out.starts_with("✗ "));
+        assert!(out.contains("Provider quota exceeded"));
+    }
+
+    #[test]
+    fn codex_turn_failed_unknown() {
+        let line = r#"{"type":"turn.failed"}"#;
+        let out = format_line(line).unwrap();
+        assert_eq!(out, "✗ unknown error");
     }
 
     // ── OpenCode format ────────────────────────────────────────────────────
