@@ -32,28 +32,43 @@ fn outcome_for_agent_error(err: &runner::agents::AgentError) -> &'static str {
 ///
 /// Validates that the URL matches the expected GitHub PR URL format
 /// (`https://github.com/<owner>/<repo>/pull/<number>`) before extracting the
-/// number. Returns `None` for any URL that doesn't conform to this structure,
-/// including URLs with wrong domains, missing `/pull/` segments, or
-/// non-numeric trailing components.
+/// number. Returns `Err` with a descriptive message for any URL that doesn't
+/// conform to this structure, including URLs with wrong domains, missing
+/// `/pull/` segments, or non-numeric trailing components.
 ///
 /// The extracted segment is stripped of any query string (`?`) or hash
 /// fragment (`#`) before parsing so that URLs like
 /// `https://github.com/owner/repo/pull/42?tab=files` are handled correctly.
-pub(crate) fn parse_pr_number_from_url(url: &str) -> Option<u64> {
+pub(crate) fn parse_pr_number_from_url(url: &str) -> Result<u64, String> {
     let url = url.trim();
+    if url.is_empty() {
+        return Err("URL is empty".to_string());
+    }
     if !url.starts_with("https://github.com/") {
-        return None;
+        return Err(format!(
+            "URL does not start with 'https://github.com/': {url}"
+        ));
     }
     if !url.contains("/pull/") {
-        return None;
+        return Err(format!("URL missing '/pull/' segment: {url}"));
     }
-    url.trim_end_matches('/')
+    let last_segment = url
+        .trim_end_matches('/')
         .rsplit('/')
         .next()
-        .and_then(|seg| seg.split(['?', '#']).next())
+        .ok_or_else(|| format!("No segment after '/pull/' in URL: {url}"))?;
+    let number_part = last_segment
+        .split(['?', '#'])
+        .next()
         .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
+        .ok_or_else(|| format!("PR number segment is empty in URL: {url}"))?;
+    let pr_num: u64 = number_part.parse().map_err(|_| {
+        format!("PR number is not a valid positive integer: '{number_part}' in URL: {url}")
+    })?;
+    if pr_num == 0 {
+        return Err(format!("PR number cannot be zero in URL: {url}"));
+    }
+    Ok(pr_num)
 }
 
 fn review_started_comment(review_agent: &str, review_model: &str) -> String {
@@ -1533,9 +1548,8 @@ async fn ensure_pr_exists(
                     .create_pr(repo, &task.title, &pr_body, branch_name, &default_branch)
                     .await
                 {
-                    Ok(url) => {
-                        let pr_num = parse_pr_number_from_url(&url);
-                        if let Some(pr_num) = pr_num {
+                    Ok(url) => match parse_pr_number_from_url(&url) {
+                        Ok(pr_num) => {
                             store_set(
                                 &Some(Arc::clone(store)),
                                 repo,
@@ -1543,21 +1557,27 @@ async fn ensure_pr_exists(
                                 &[("pr_number", serde_json::json!(pr_num as i64))],
                             )
                             .await;
-                        }
-                        tracing::info!(
-                            task_id = task.id.0,
-                            branch = %branch_name,
-                            pr_url = %url,
-                            "created missing PR via GhHttp — continuing review"
-                        );
-                        if let Some(pr_num) = pr_num {
+                            tracing::info!(
+                                task_id = task.id.0,
+                                branch = %branch_name,
+                                pr_url = %url,
+                                "created missing PR via GhHttp — continuing review"
+                            );
                             Ok(EnsurePrResult::Ready(pr_num))
-                        } else {
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = task.id.0,
+                                branch = %branch_name,
+                                pr_url = %url,
+                                error = %e,
+                                "created missing PR via GhHttp, but failed to parse PR number"
+                            );
                             Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
-                                "created missing PR, but could not parse PR number".to_string(),
+                                format!("created missing PR, but could not parse PR number: {e}"),
                             )))
                         }
-                    }
+                    },
                     Err(e) => {
                         let e_str = format!("{e}");
                         if e_str.contains("already exists") {
@@ -1618,28 +1638,34 @@ async fn ensure_pr_exists(
                         match pr_result {
                             Ok(o) if o.status.success() => {
                                 let stdout = String::from_utf8_lossy(&o.stdout);
-                                let pr_num = parse_pr_number_from_url(stdout.trim());
-                                if let Some(pr_num) = pr_num {
-                                    store_set(
-                                        &Some(Arc::clone(store)),
-                                        repo,
-                                        &task.id.0,
-                                        &[("pr_number", serde_json::json!(pr_num as i64))],
-                                    )
-                                    .await;
-                                }
-                                tracing::info!(
-                                    task_id = task.id.0,
-                                    branch = %branch_name,
-                                    "created missing PR via CLI — continuing review"
-                                );
-                                if let Some(pr_num) = pr_num {
-                                    Ok(EnsurePrResult::Ready(pr_num))
-                                } else {
-                                    Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
-                                        "created missing PR via CLI, but could not parse PR number"
-                                            .to_string(),
-                                    )))
+                                match parse_pr_number_from_url(stdout.trim()) {
+                                    Ok(pr_num) => {
+                                        store_set(
+                                            &Some(Arc::clone(store)),
+                                            repo,
+                                            &task.id.0,
+                                            &[("pr_number", serde_json::json!(pr_num as i64))],
+                                        )
+                                        .await;
+                                        tracing::info!(
+                                            task_id = task.id.0,
+                                            branch = %branch_name,
+                                            "created missing PR via CLI — continuing review"
+                                        );
+                                        Ok(EnsurePrResult::Ready(pr_num))
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            task_id = task.id.0,
+                                            branch = %branch_name,
+                                            stdout = %stdout,
+                                            error = %e,
+                                            "created missing PR via CLI, but failed to parse PR number"
+                                        );
+                                        Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Failed(
+                                            format!("created missing PR via CLI, but could not parse PR number: {e}")
+                                        )))
+                                    }
                                 }
                             }
                             Ok(o) => {
@@ -1648,22 +1674,36 @@ async fn ensure_pr_exists(
                                     if let Some(pr_url) =
                                         stderr.lines().find(|l| l.trim().starts_with("https://"))
                                     {
-                                        let pr_num = parse_pr_number_from_url(pr_url.trim());
-                                        if let Some(pr_num) = pr_num {
-                                            store_set(
-                                                &Some(Arc::clone(store)),
-                                                repo,
-                                                &task.id.0,
-                                                &[("pr_number", serde_json::json!(pr_num as i64))],
-                                            )
-                                            .await;
-                                            tracing::info!(
-                                                task_id = task.id.0,
-                                                branch = %branch_name,
-                                                pr_url = %pr_url,
-                                                "PR already exists (from CLI stderr) — retrying review"
-                                            );
-                                            return Ok(EnsurePrResult::Ready(pr_num));
+                                        match parse_pr_number_from_url(pr_url.trim()) {
+                                            Ok(pr_num) => {
+                                                store_set(
+                                                    &Some(Arc::clone(store)),
+                                                    repo,
+                                                    &task.id.0,
+                                                    &[(
+                                                        "pr_number",
+                                                        serde_json::json!(pr_num as i64),
+                                                    )],
+                                                )
+                                                .await;
+                                                tracing::info!(
+                                                    task_id = task.id.0,
+                                                    branch = %branch_name,
+                                                    pr_url = %pr_url,
+                                                    "PR already exists (from CLI stderr) — retrying review"
+                                                );
+                                                return Ok(EnsurePrResult::Ready(pr_num));
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    task_id = task.id.0,
+                                                    branch = %branch_name,
+                                                    pr_url = %pr_url,
+                                                    error = %e,
+                                                    "found existing PR URL in CLI stderr, but failed to parse PR number"
+                                                );
+                                                // Continue to the error handling below
+                                            }
                                         }
                                     }
                                 }
@@ -2054,7 +2094,7 @@ mod tests {
     fn parse_pr_number_standard_url() {
         assert_eq!(
             parse_pr_number_from_url("https://github.com/owner/repo/pull/42"),
-            Some(42)
+            Ok(42)
         );
     }
 
@@ -2062,7 +2102,7 @@ mod tests {
     fn parse_pr_number_trailing_slash() {
         assert_eq!(
             parse_pr_number_from_url("https://github.com/owner/repo/pull/42/"),
-            Some(42)
+            Ok(42)
         );
     }
 
@@ -2070,7 +2110,7 @@ mod tests {
     fn parse_pr_number_with_query_string() {
         assert_eq!(
             parse_pr_number_from_url("https://github.com/owner/repo/pull/42?tab=files"),
-            Some(42)
+            Ok(42)
         );
     }
 
@@ -2078,7 +2118,7 @@ mod tests {
     fn parse_pr_number_with_hash_fragment() {
         assert_eq!(
             parse_pr_number_from_url("https://github.com/owner/repo/pull/42#issuecomment-123"),
-            Some(42)
+            Ok(42)
         );
     }
 
@@ -2086,7 +2126,7 @@ mod tests {
     fn parse_pr_number_with_query_and_hash() {
         assert_eq!(
             parse_pr_number_from_url("https://github.com/owner/repo/pull/42?quick_pull=1#top"),
-            Some(42)
+            Ok(42)
         );
     }
 
@@ -2094,55 +2134,61 @@ mod tests {
     fn parse_pr_number_with_leading_whitespace() {
         assert_eq!(
             parse_pr_number_from_url("  https://github.com/owner/repo/pull/42\n"),
-            Some(42)
+            Ok(42)
         );
     }
 
     #[test]
     fn parse_pr_number_wrong_domain() {
-        assert_eq!(
-            parse_pr_number_from_url("https://gitlab.com/owner/repo/merge_requests/42"),
-            None
-        );
+        let url = "https://gitlab.com/owner/repo/merge_requests/42";
+        let result = parse_pr_number_from_url(url);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("does not start with 'https://github.com/'"));
     }
 
     #[test]
     fn parse_pr_number_missing_pull_segment() {
         // Issue URL — not a PR URL
-        assert_eq!(
-            parse_pr_number_from_url("https://github.com/owner/repo/issues/42"),
-            None
-        );
+        let url = "https://github.com/owner/repo/issues/42";
+        let result = parse_pr_number_from_url(url);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing '/pull/' segment"));
     }
 
     #[test]
     fn parse_pr_number_zero_is_rejected() {
-        assert_eq!(
-            parse_pr_number_from_url("https://github.com/owner/repo/pull/0"),
-            None
-        );
+        let url = "https://github.com/owner/repo/pull/0";
+        let result = parse_pr_number_from_url(url);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot be zero"));
     }
 
     #[test]
     fn parse_pr_number_non_numeric_segment() {
-        assert_eq!(
-            parse_pr_number_from_url("https://github.com/owner/repo/pull/abc"),
-            None
-        );
+        let url = "https://github.com/owner/repo/pull/abc";
+        let result = parse_pr_number_from_url(url);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not a valid positive integer"));
     }
 
     #[test]
     fn parse_pr_number_empty_string() {
-        assert_eq!(parse_pr_number_from_url(""), None);
+        let result = parse_pr_number_from_url("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
     }
 
     #[test]
     fn parse_pr_number_http_not_https() {
         // HTTP URLs are not accepted — only HTTPS
-        assert_eq!(
-            parse_pr_number_from_url("http://github.com/owner/repo/pull/42"),
-            None
-        );
+        let url = "http://github.com/owner/repo/pull/42";
+        let result = parse_pr_number_from_url(url);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("does not start with 'https://github.com/'"));
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {

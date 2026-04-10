@@ -394,14 +394,24 @@ async fn create_pr_with_log(
             // Save pr_number to the store so the review gate can find it
             // immediately without racing GitHub's list-API cache (~300 ms lag).
             // This is set for both newly-created and pre-existing PRs.
-            if let Some(pr_num) = crate::engine::review::parse_pr_number_from_url(url) {
-                store::store_set(
-                    ctx.store,
-                    ctx.repo,
-                    ctx.task_id,
-                    &[("pr_number", serde_json::json!(pr_num as i64))],
-                )
-                .await;
+            match crate::engine::review::parse_pr_number_from_url(url) {
+                Ok(pr_num) => {
+                    store::store_set(
+                        ctx.store,
+                        ctx.repo,
+                        ctx.task_id,
+                        &[("pr_number", serde_json::json!(pr_num as i64))],
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = ctx.task_id,
+                        pr_url = %url,
+                        error = %e,
+                        "PR created but failed to parse PR number from URL"
+                    );
+                }
             }
             ctx.append_activity(
                 "pr_create",
