@@ -1152,10 +1152,14 @@ impl TaskStore {
     /// undoing the review-cycle count that `handle_review_changes` just set.
     /// `ci_merge_failures` is preserved here because it must accumulate across attempts
     /// to enforce `MAX_CI_MERGE_FAILURES`, just like `review_cycles`.
+    ///
+    /// NOTE: `attempts` is intentionally NOT reset here. It must increase monotonically
+    /// across the task's lifetime so that `(task_id, attempt, run_type)` keys in
+    /// `task_runs` remain unique. Resetting it caused subsequent retries to overwrite
+    /// earlier audit trail records via the ON CONFLICT UPSERT in `start_run()`.
     pub async fn reset_failure_counters(&self, id: i64) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE tasks SET
-            attempts = 0,
             route_attempts = 0,
             review_agent_failures = 0,
             review_invocations = 0,
@@ -1453,7 +1457,6 @@ impl TaskStore {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             let sql = format!(
                 "UPDATE tasks SET
-            attempts = 0,
             route_attempts = 0,
             review_agent_failures = 0,
             review_invocations = 0,

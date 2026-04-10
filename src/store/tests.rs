@@ -569,7 +569,7 @@ async fn helper_store_reset_failure_counters_preserves_review_cycles() {
     let task = store.get(id).await.unwrap();
     assert_eq!(task.review_cycles, 1);
     assert_eq!(task.review_invocations, 0);
-    assert_eq!(task.attempts, 0);
+    assert_eq!(task.attempts, 1, "attempts must be preserved (monotonic)");
     assert_eq!(task.merge_conflict_retries, 0);
 }
 
@@ -1533,7 +1533,7 @@ async fn reset_failure_counters_preserves_review_cycles() {
     store.increment(id, "merge_conflict_retries").await.unwrap();
     store.increment(id, "network_retries").await.unwrap();
 
-    // reset_failure_counters must zero transient counters but preserve review_cycles and ci_merge_failures
+    // reset_failure_counters must zero transient counters but preserve review_cycles, ci_merge_failures, and attempts
     store.reset_failure_counters(id).await.unwrap();
 
     let task = store.get(id).await.unwrap();
@@ -1542,7 +1542,7 @@ async fn reset_failure_counters_preserves_review_cycles() {
         task.ci_merge_failures, 2,
         "ci_merge_failures must be preserved"
     );
-    assert_eq!(task.attempts, 0);
+    assert_eq!(task.attempts, 1, "attempts must be preserved (monotonic)");
     assert_eq!(task.review_agent_failures, 0);
     assert_eq!(task.merge_conflict_retries, 0);
     assert_eq!(task.network_retries, 0);
@@ -5597,7 +5597,7 @@ async fn batch_reset_failure_counters_preserves_review_cycles() {
 
     for id in [id1, id2] {
         let t = store.get(id).await.unwrap();
-        assert_eq!(t.attempts, 0);
+        assert_eq!(t.attempts, 1, "attempts must be preserved (monotonic)");
         assert_eq!(t.merge_conflict_retries, 0);
         assert_eq!(
             t.needs_review_refires, 0,
