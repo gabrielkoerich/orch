@@ -961,7 +961,7 @@ mod tests {
             &client,
         )
         .await
-        .unwrap();
+        .expect("dispatch should succeed for non-component INTERACTION_CREATE");
 
         // Should not produce a message for non-component interactions
         assert!(rx.try_recv().is_err());
