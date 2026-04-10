@@ -362,12 +362,12 @@ async fn record_mention_task(
     {
         Ok(task_id) => {
             tracing::info!(task_id, mention_id = %mention.id, "created mention task");
+            advance_cursor(last_success_ts, &mention.created_at);
         }
         Err(e) => {
             tracing::warn!(mention_id = %mention.id, err = %e, "failed to create mention task");
         }
     }
-    advance_cursor(last_success_ts, &mention.created_at);
 }
 
 /// Advance the mention cursor if the timestamp is newer.
