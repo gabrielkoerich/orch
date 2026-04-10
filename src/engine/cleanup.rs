@@ -962,24 +962,32 @@ async fn fallback_is_pr_merged_by_branch(
     backend: &Arc<dyn ExternalBackend>,
     branches: &[String],
 ) -> HashMap<String, bool> {
-    let mut merged_map = HashMap::with_capacity(branches.len());
-
-    for branch in branches {
-        match backend.is_pr_merged(branch).await {
-            Ok(is_merged) => {
-                merged_map.insert(branch.clone(), is_merged);
+    let futs: Vec<_> = branches
+        .iter()
+        .map(|branch| {
+            let backend = Arc::clone(backend);
+            let branch = branch.clone();
+            async move {
+                match backend.is_pr_merged(&branch).await {
+                    Ok(is_merged) => Some((branch, is_merged)),
+                    Err(err) => {
+                        tracing::warn!(
+                            branch,
+                            err = %err,
+                            "fallback PR merge check failed for branch"
+                        );
+                        None
+                    }
+                }
             }
-            Err(err) => {
-                tracing::warn!(
-                    branch,
-                    err = %err,
-                    "fallback PR merge check failed for branch"
-                );
-            }
-        }
-    }
+        })
+        .collect();
 
-    merged_map
+    futures::future::join_all(futs)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 #[cfg(test)]
