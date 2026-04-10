@@ -1679,7 +1679,7 @@ async fn ensure_pr_exists(
                                     {
                                         match parse_pr_number_from_url(pr_url.trim()) {
                                             Ok(pr_num) => {
-                                                store_set(
+                                                if let Err(e) = store_set_result(
                                                     &Some(Arc::clone(store)),
                                                     repo,
                                                     &task.id.0,
@@ -1688,7 +1688,15 @@ async fn ensure_pr_exists(
                                                         serde_json::json!(pr_num as i64),
                                                     )],
                                                 )
-                                                .await;
+                                                .await
+                                                {
+                                                    tracing::warn!(
+                                                        task_id = task.id.0,
+                                                        pr_num,
+                                                        err = %e,
+                                                        "failed to persist pr_number from already-exists recovery — downstream may retry PR creation"
+                                                    );
+                                                }
                                                 tracing::info!(
                                                     task_id = task.id.0,
                                                     branch = %branch_name,
