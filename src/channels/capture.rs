@@ -483,7 +483,9 @@ mod tests {
         {
             let skey = session_key(repo, "silent-task");
             let mut buffers = svc.buffers.write().await;
-            let buf = buffers.get_mut(&skey).unwrap();
+            let buf = buffers
+                .get_mut(&skey)
+                .expect("buffer should exist for registered silent-task session");
             buf.registered_at = Utc::now() - chrono::Duration::seconds(200);
         }
 
@@ -493,7 +495,9 @@ mod tests {
         {
             let skey = session_key(repo, "active-task");
             let mut buffers = svc.buffers.write().await;
-            let buf = buffers.get_mut(&skey).unwrap();
+            let buf = buffers
+                .get_mut(&skey)
+                .expect("buffer should exist for registered active-task session");
             buf.registered_at = Utc::now() - chrono::Duration::seconds(200);
             buf.has_output = true;
         }
@@ -527,7 +531,9 @@ mod tests {
         {
             let skey = session_key(repo, "never-seen-task");
             let mut buffers = svc.buffers.write().await;
-            let buf = buffers.get_mut(&skey).unwrap();
+            let buf = buffers
+                .get_mut(&skey)
+                .expect("buffer should exist for registered never-seen-task session");
             buf.registered_at = Utc::now() - chrono::Duration::seconds(500);
             // seen_alive = false (default), has_output = false
         }
@@ -538,7 +544,9 @@ mod tests {
         {
             let skey = session_key(repo, "seen-but-quiet-task");
             let mut buffers = svc.buffers.write().await;
-            let buf = buffers.get_mut(&skey).unwrap();
+            let buf = buffers
+                .get_mut(&skey)
+                .expect("buffer should exist for registered seen-but-quiet-task session");
             buf.registered_at = Utc::now() - chrono::Duration::seconds(500);
             buf.seen_alive = true; // capture_pane succeeded at least once
                                    // has_output = false (empty terminal, but session IS alive)
@@ -569,9 +577,13 @@ mod tests {
             let skey_a = session_key("owner/repo-a", "task-a");
             let skey_b = session_key("owner/repo-b", "task-b");
             let mut buffers = svc.buffers.write().await;
-            let buf_a = buffers.get_mut(&skey_a).unwrap();
+            let buf_a = buffers
+                .get_mut(&skey_a)
+                .expect("buffer should exist for registered task-a session");
             buf_a.registered_at = Utc::now() - chrono::Duration::seconds(200);
-            let buf_b = buffers.get_mut(&skey_b).unwrap();
+            let buf_b = buffers
+                .get_mut(&skey_b)
+                .expect("buffer should exist for registered task-b session");
             buf_b.registered_at = Utc::now() - chrono::Duration::seconds(200);
         }
 
@@ -604,8 +616,12 @@ mod tests {
         let skey_b = session_key("owner/repo-b", "42");
 
         let buffers = svc.buffers.read().await;
-        let buf_a = buffers.get(&skey_a).unwrap();
-        let buf_b = buffers.get(&skey_b).unwrap();
+        let buf_a = buffers
+            .get(&skey_a)
+            .expect("buffer should exist for repo-a session");
+        let buf_b = buffers
+            .get(&skey_b)
+            .expect("buffer should exist for repo-b session");
 
         assert_eq!(buf_a.session, "orch-a-42");
         assert_eq!(buf_b.session, "orch-b-42");
