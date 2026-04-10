@@ -312,6 +312,12 @@ pub fn spawn(
                                 }
                                 ReviewOutcome::Ok
                             }
+                            Ok(ReviewDecision::Rerouted) => {
+                                // Task was re-routed because there was no PR and no commits.
+                                // Do NOT reset failure counters — no_code_reroutes must accumulate
+                                // so the max_reroute_attempts safety limit can be reached.
+                                ReviewOutcome::Ok
+                            }
                             Ok(ReviewDecision::Skipped) => {
                                 // Skipped indicates there's nothing to review (no PR etc.).
                                 // Clear transient failure counters but preserve review_cycles.

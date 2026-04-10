@@ -1548,6 +1548,88 @@ async fn reset_failure_counters_preserves_review_cycles() {
     assert_eq!(task.network_retries, 0);
 }
 
+/// Regression test for issue #2392.
+///
+/// `reset_failure_counters` zeros `no_code_reroutes`. This is why
+/// `ReviewDecision::Rerouted` must NOT call `reset_failure_counters` — the
+/// `Skipped` path did call it, causing the counter to reset to 0 on every cycle
+/// so the `max_reroute_attempts` limit was never reached.
+#[tokio::test]
+async fn reset_failure_counters_resets_no_code_reroutes() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id = store
+        .create(&NewTask {
+            external_id: None,
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "no-code-reroute regression".to_string(),
+            body: "".to_string(),
+            source: "manual".to_string(),
+            source_id: "".to_string(),
+            author: "".to_string(),
+            url: "".to_string(),
+            labels: vec![],
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+
+    store.increment(id, "no_code_reroutes").await.unwrap();
+    store.increment(id, "no_code_reroutes").await.unwrap();
+    let task = store.get(id).await.unwrap();
+    assert_eq!(task.no_code_reroutes, 2);
+
+    // Calling reset_failure_counters (the Skipped path) zeros the counter —
+    // this is the original bug: the counter could never reach max_reroute_attempts.
+    store.reset_failure_counters(id).await.unwrap();
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(
+        task.no_code_reroutes, 0,
+        "reset_failure_counters must zero no_code_reroutes (bug: Skipped path called this)"
+    );
+}
+
+/// Regression test for issue #2392.
+///
+/// When `ReviewDecision::Rerouted` is returned the subscriber must NOT call
+/// `reset_failure_counters`, so `no_code_reroutes` accumulates across cycles
+/// and the `max_reroute_attempts` safety limit is reachable.
+#[tokio::test]
+async fn no_code_reroutes_accumulates_when_reset_not_called() {
+    let store = TaskStore::open_memory().await.unwrap();
+
+    let id = store
+        .create(&NewTask {
+            external_id: None,
+            repo: "owner/repo".to_string(),
+            origin: "internal".to_string(),
+            title: "no-code-reroute accumulation regression".to_string(),
+            body: "".to_string(),
+            source: "manual".to_string(),
+            source_id: "".to_string(),
+            author: "".to_string(),
+            url: "".to_string(),
+            labels: vec![],
+            parent_id: None,
+        })
+        .await
+        .unwrap();
+
+    // Simulate 3 consecutive Rerouted cycles: increment only, no reset.
+    for _ in 0..3 {
+        store.increment(id, "no_code_reroutes").await.unwrap();
+        // ReviewDecision::Rerouted path: reset_failure_counters is NOT called here.
+    }
+
+    let task = store.get(id).await.unwrap();
+    assert_eq!(
+        task.no_code_reroutes, 3,
+        "no_code_reroutes must accumulate across Rerouted cycles so max_reroute_attempts is enforced"
+    );
+}
+
 #[tokio::test]
 async fn status_lifecycle_full_flow() {
     let store = TaskStore::open_memory().await.unwrap();

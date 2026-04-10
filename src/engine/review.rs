@@ -119,6 +119,8 @@ pub(crate) enum ReviewDecision {
     Blocked(String),
     /// No PR exists — nothing to review, task marked done directly.
     Skipped,
+    /// No PR and no commits — task re-routed for retry (no_code_reroutes counter must not be reset).
+    Rerouted,
 }
 
 /// Outcome of [`ensure_pr_exists`]: either a ready PR number or an early return decision.
@@ -663,6 +665,7 @@ fn review_decision_name(decision: &ReviewDecision) -> &'static str {
         ReviewDecision::Failed(_) => "failed",
         ReviewDecision::Blocked(_) => "blocked",
         ReviewDecision::Skipped => "skipped",
+        ReviewDecision::Rerouted => "rerouted",
     }
 }
 
@@ -949,7 +952,8 @@ async fn finalize_review_run(
     let outcome = match &parsed.decision {
         ReviewDecision::Approve
         | ReviewDecision::RequestChanges { .. }
-        | ReviewDecision::Skipped => "success",
+        | ReviewDecision::Skipped
+        | ReviewDecision::Rerouted => "success",
         ReviewDecision::Failed(_) | ReviewDecision::Blocked(_) => "failed",
     };
     let error = match &parsed.decision {
@@ -2036,7 +2040,7 @@ async fn ensure_pr_exists(
                         tracing::error!(task_id = task.id.0, err = %e, "update_task_status(New) failed — task may be stuck in InReview");
                     }
                 }
-                Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Skipped))
+                Ok(EnsurePrResult::EarlyReturn(ReviewDecision::Rerouted))
             }
         }
         Err(e) => {
