@@ -29,9 +29,7 @@ use crate::engine::EngineConfig;
 use crate::github::http::{GhHttp, PrReviewBatchData};
 use crate::github::types::{GitHubComment, GitHubReviewComment, PullRequestReview};
 use crate::store::TaskStore;
-use crate::store::{
-    store_increment_by_id, store_reset_failure_counters, store_set_by_id, store_set_result_by_id,
-};
+use crate::store::{store_increment_by_id, store_reset_failure_counters, store_set_result_by_id};
 use async_trait::async_trait;
 use dashmap::DashSet;
 use std::collections::HashMap;
@@ -262,12 +260,15 @@ pub(crate) async fn review_open_prs(
             match result {
                 Ok(Some(n)) => {
                     ready_tasks[task_idx].pr_number = Some(*n);
-                    store_set_by_id(
+                    if let Err(e) = store_set_result_by_id(
                         &Some(Arc::clone(store)),
                         ready_tasks[task_idx].store_id,
                         &[("pr_number", serde_json::json!(*n as i64))],
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!(task_id, err = %e, "failed to persist pr_number");
+                    }
                 }
                 Ok(None) => {
                     // No open PR — handled in phase 3.
@@ -479,12 +480,15 @@ pub(crate) async fn review_open_prs(
         };
 
         // Persist PR number (idempotent if already stored).
-        store_set_by_id(
+        if let Err(e) = store_set_result_by_id(
             &Some(Arc::clone(store)),
             task_info.store_id,
             &[("pr_number", serde_json::json!(pr_number as i64))],
         )
-        .await;
+        .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to persist pr_number");
+        }
 
         let batch_data = match batch.get(&pr_number) {
             Some(d) => d,
