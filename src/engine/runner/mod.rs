@@ -869,14 +869,7 @@ impl TaskRunner {
         // Record start time for metrics (before any work begins)
         let started_at = Utc::now();
 
-        // Store task info for prompt building
-        store::store_set(
-            &self.store,
-            &self.repo,
-            task_id,
-            &[], // title/body already in store tasks table
-        )
-        .await;
+        // Store task info for prompt building (title/body already in store tasks table)
 
         // Record run start in task_runs audit trail
         let run_audit_id = if let Some(ref store) = self.store {
@@ -940,25 +933,31 @@ impl TaskRunner {
                 Ok(delegations) if !delegations.is_empty() => {
                     self.process_delegations(task, &delegations, backend)
                         .await?;
-                    store::store_set(
+                    if let Err(e) = store::store_set_result(
                         &self.store,
                         &self.repo,
                         task_id,
                         &[("delegations", serde_json::json!([]))],
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!(task_id, err = %e, "failed to clear delegations in store");
+                    }
                 }
                 Ok(_) => {} // empty list, nothing to do
                 Err(e) => {
                     tracing::error!(task_id, error = %e, "corrupt delegations JSON — clearing");
-                    store::store_set(
+                    if let Err(e2) = store::store_set_result(
                         &self.store,
                         &self.repo,
                         task_id,
                         &[("delegations", serde_json::json!([]))],
                     )
-                    .await;
-                    store::store_set(
+                    .await
+                    {
+                        tracing::warn!(task_id, err = %e2, "failed to clear corrupt delegations in store");
+                    }
+                    if let Err(e2) = store::store_set_result(
                         &self.store,
                         &self.repo,
                         task_id,
@@ -967,7 +966,10 @@ impl TaskRunner {
                             serde_json::json!(format!("delegation parse failed: {e}")),
                         )],
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!(task_id, err = %e2, "failed to write delegation_parse_failed last_error to store");
+                    }
                 }
             }
         }
@@ -984,7 +986,7 @@ impl TaskRunner {
         // normal dispatch, regardless of why it was rerouted.
         let is_rerouted = status == "new" || status == "routed";
         if is_rerouted {
-            store::store_set(
+            if let Err(e) = store::store_set_result(
                 &self.store,
                 &self.repo,
                 task_id,
@@ -993,7 +995,10 @@ impl TaskRunner {
                     ("model", serde_json::json!("")),
                 ],
             )
-            .await;
+            .await
+            {
+                tracing::warn!(task_id, err = %e, "failed to clear agent/model for reroute in store");
+            }
         }
         let weight_signal = if is_rerouted {
             WeightSignal::RateLimited {

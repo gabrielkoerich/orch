@@ -71,13 +71,16 @@ pub async fn check_guards(
         tracing::warn!(task_id, attempts, max_attempts, "exceeded max attempts");
         let msg =
             format!("exceeded max attempts ({attempts}/{max_attempts}). Use `/retry` to reset.");
-        store::store_set(
+        if let Err(e) = store::store_set_result(
             store,
             repo,
             task_id,
             &[("last_error", serde_json::json!(msg))],
         )
-        .await;
+        .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to write max_attempts last_error to store");
+        }
         return Ok(GuardOutcome::MaxAttempts);
     }
 
@@ -126,7 +129,7 @@ pub async fn check_token_budget(
             "token budget exceeded: {}/{} tokens (${:.4})",
             total_tokens, max_tokens, cost.total_cost_usd
         );
-        store::store_set(
+        if let Err(e) = store::store_set_result(
             store,
             repo,
             task_id,
@@ -135,7 +138,10 @@ pub async fn check_token_budget(
                 ("budget_exceeded", serde_json::json!(true)),
             ],
         )
-        .await;
+        .await
+        {
+            tracing::warn!(task_id, err = %e, "failed to write budget_exceeded to store — budget enforcement may be incorrect on restart");
+        }
         store::store_log_activity(
             store,
             repo,

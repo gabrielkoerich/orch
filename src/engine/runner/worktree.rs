@@ -608,7 +608,7 @@ pub async fn setup_worktree(
     }
 
     // Save worktree info to store
-    store::store_set(
+    if let Err(e) = store::store_set_result(
         store,
         repo,
         task_id,
@@ -620,7 +620,10 @@ pub async fn setup_worktree(
             ("branch", serde_json::json!(branch_name_str)),
         ],
     )
-    .await;
+    .await
+    {
+        tracing::warn!(task_id, err = %e, "failed to save worktree info to store (non-fatal)");
+    }
 
     tracing::info!(
         task_id,

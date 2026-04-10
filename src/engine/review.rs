@@ -1553,13 +1553,13 @@ async fn ensure_pr_exists(
                 {
                     Ok(url) => match parse_pr_number_from_url(&url) {
                         Ok(pr_num) => {
-                            store_set(
+                            store_set_result(
                                 &Some(Arc::clone(store)),
                                 repo,
                                 &task.id.0,
                                 &[("pr_number", serde_json::json!(pr_num as i64))],
                             )
-                            .await;
+                            .await?;
                             tracing::info!(
                                 task_id = task.id.0,
                                 branch = %branch_name,
@@ -1605,13 +1605,13 @@ async fn ensure_pr_exists(
                                     branch = %branch_name,
                                     "found existing PR after create_pr 422 — retrying review"
                                 );
-                                store_set(
+                                store_set_result(
                                     &Some(Arc::clone(store)),
                                     repo,
                                     &task.id.0,
                                     &[("pr_number", serde_json::json!(n as i64))],
                                 )
-                                .await;
+                                .await?;
                                 return Ok(EnsurePrResult::Ready(n));
                             }
                         }
@@ -1643,13 +1643,13 @@ async fn ensure_pr_exists(
                                 let stdout = String::from_utf8_lossy(&o.stdout);
                                 match parse_pr_number_from_url(stdout.trim()) {
                                     Ok(pr_num) => {
-                                        store_set(
+                                        store_set_result(
                                             &Some(Arc::clone(store)),
                                             repo,
                                             &task.id.0,
                                             &[("pr_number", serde_json::json!(pr_num as i64))],
                                         )
-                                        .await;
+                                        .await?;
                                         tracing::info!(
                                             task_id = task.id.0,
                                             branch = %branch_name,

@@ -279,13 +279,16 @@ pub fn spawn(
                                 )
                                 .await;
                                 // Also reset needs_review_refires so the sync backoff doesn't persist across a successful review
-                                crate::store::store_set(
+                                if let Err(e) = crate::store::store_set_result(
                                     &Some(store_c.clone()),
                                     &repo_s,
                                     &tid,
                                     &[("needs_review_refires", serde_json::json!(0))],
                                 )
-                                .await;
+                                .await
+                                {
+                                    tracing::warn!(task_id = %tid, err = %e, "failed to write needs_review_refires to store");
+                                }
 
                                 // Ensure approved PRs do not re-enter the review loop
                                 // when `auto_close_task_on_approval` is disabled.
@@ -318,13 +321,16 @@ pub fn spawn(
                                     &tid,
                                 )
                                 .await;
-                                crate::store::store_set(
+                                if let Err(e) = crate::store::store_set_result(
                                     &Some(store_c.clone()),
                                     &repo_s,
                                     &tid,
                                     &[("needs_review_refires", serde_json::json!(0))],
                                 )
-                                .await;
+                                .await
+                                {
+                                    tracing::warn!(task_id = %tid, err = %e, "failed to write needs_review_refires to store");
+                                }
                                 ReviewOutcome::Ok
                             }
                             Ok(ReviewDecision::RequestChanges { .. }) => {
@@ -336,13 +342,16 @@ pub fn spawn(
                                     &tid,
                                 )
                                 .await;
-                                crate::store::store_set(
+                                if let Err(e) = crate::store::store_set_result(
                                     &Some(store_c.clone()),
                                     &repo_s,
                                     &tid,
                                     &[("needs_review_refires", serde_json::json!(0))],
                                 )
-                                .await;
+                                .await
+                                {
+                                    tracing::warn!(task_id = %tid, err = %e, "failed to write needs_review_refires to store");
+                                }
                                 ReviewOutcome::Ok
                             }
                         };
