@@ -103,7 +103,10 @@ async fn handle_merge_conflict(
         tracing::warn!(task_id, err = %e, "failed to increment merge_conflict_retries — skipping dispatch to avoid bypassing retry limit");
         return ConflictAction::BlockForHuman;
     }
-    if let Err(e) = task_manager.update_task_status(id, Status::NeedsReview).await {
+    if let Err(e) = task_manager
+        .update_task_status(id, Status::NeedsReview)
+        .await
+    {
         tracing::warn!(task_id, err = %e, "failed to set NeedsReview for conflict retry");
     }
     ConflictAction::RetryReview
