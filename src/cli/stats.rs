@@ -117,7 +117,7 @@ fn get_configured_repos() -> Vec<String> {
             let candidate = std::path::PathBuf::from(path_str).join(".orch.yml");
             if candidate.exists() {
                 if let Ok(content) = std::fs::read_to_string(&candidate) {
-                    if let Ok(val) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                    if let Ok(val) = serde_norway::from_str::<serde_norway::Value>(&content) {
                         if let Some(repo) = val
                             .get("gh")
                             .and_then(|g| g.get("repo"))

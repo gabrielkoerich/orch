@@ -875,7 +875,7 @@ fn project_add_local(path: &str) -> anyhow::Result<()> {
     // Show the repo from .orch.yml if available
     if orch_yml.exists() {
         let project_content = std::fs::read_to_string(&orch_yml)?;
-        let project_doc: serde_yml::Value = serde_yml::from_str(&project_content)?;
+        let project_doc: serde_norway::Value = serde_norway::from_str(&project_content)?;
         if let Some(repo) = project_doc
             .get("gh")
             .and_then(|gh| gh.get("repo"))
@@ -947,10 +947,10 @@ fn register_project_path(path_str: &str) -> anyhow::Result<()> {
         String::new()
     };
 
-    let mut doc: serde_yml::Value = if content.is_empty() {
-        serde_yml::Value::Mapping(serde_yml::Mapping::new())
+    let mut doc: serde_norway::Value = if content.is_empty() {
+        serde_norway::Value::Mapping(serde_norway::Mapping::new())
     } else {
-        serde_yml::from_str(&content)?
+        serde_norway::from_str(&content)?
     };
 
     let root = doc
@@ -958,9 +958,12 @@ fn register_project_path(path_str: &str) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("config is not a YAML mapping"))?;
 
     // Get or create projects list
-    let projects_key = serde_yml::Value::String("projects".to_string());
+    let projects_key = serde_norway::Value::String("projects".to_string());
     if !root.contains_key(&projects_key) {
-        root.insert(projects_key.clone(), serde_yml::Value::Sequence(Vec::new()));
+        root.insert(
+            projects_key.clone(),
+            serde_norway::Value::Sequence(Vec::new()),
+        );
     }
 
     let projects = root
@@ -978,8 +981,8 @@ fn register_project_path(path_str: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    projects.push(serde_yml::Value::String(path_str.to_string()));
-    std::fs::write(&config_path, serde_yml::to_string(&doc)?)?;
+    projects.push(serde_norway::Value::String(path_str.to_string()));
+    std::fs::write(&config_path, serde_norway::to_string(&doc)?)?;
 
     println!("Added project: {}", path_str);
 
@@ -999,13 +1002,13 @@ pub fn project_remove(path: &str) -> anyhow::Result<()> {
     }
 
     let content = std::fs::read_to_string(&config_path)?;
-    let mut doc: serde_yml::Value = serde_yml::from_str(&content)?;
+    let mut doc: serde_norway::Value = serde_norway::from_str(&content)?;
 
     let root = doc
         .as_mapping_mut()
         .ok_or_else(|| anyhow::anyhow!("config is not a YAML mapping"))?;
 
-    let projects_key = serde_yml::Value::String("projects".to_string());
+    let projects_key = serde_norway::Value::String("projects".to_string());
     let projects = root
         .get_mut(&projects_key)
         .and_then(|v| v.as_sequence_mut())
@@ -1023,7 +1026,7 @@ pub fn project_remove(path: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    std::fs::write(&config_path, serde_yml::to_string(&doc)?)?;
+    std::fs::write(&config_path, serde_norway::to_string(&doc)?)?;
     println!("Removed project: {}", path_str);
 
     Ok(())
@@ -1060,7 +1063,7 @@ pub fn project_list() -> anyhow::Result<()> {
 fn read_project_repo(project_path: &std::path::Path) -> Option<String> {
     let orch_yml = project_path.join(".orch.yml");
     let content = std::fs::read_to_string(&orch_yml).ok()?;
-    let doc: serde_yml::Value = serde_yml::from_str(&content).ok()?;
+    let doc: serde_norway::Value = serde_norway::from_str(&content).ok()?;
     doc.get("gh")
         .and_then(|gh| gh.get("repo"))
         .and_then(|r| r.as_str())

@@ -826,7 +826,7 @@ pub(crate) async fn resolve_repo_root(repo: &str) -> anyhow::Result<String> {
             continue;
         };
         if let Ok(content) = tokio::fs::read_to_string(&config_file).await {
-            if let Ok(doc) = serde_yml::from_str::<serde_yml::Value>(&content) {
+            if let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content) {
                 if let Some(r) = doc
                     .get("gh")
                     .and_then(|gh| gh.get("repo"))

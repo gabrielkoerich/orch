@@ -19,7 +19,7 @@ use tokio::sync::broadcast;
 
 /// Cached YAML values — parsed once per file, reused for all key lookups.
 /// Protected by RwLock for concurrent read access.
-static CACHE: std::sync::LazyLock<RwLock<HashMap<PathBuf, serde_yml::Value>>> =
+static CACHE: std::sync::LazyLock<RwLock<HashMap<PathBuf, serde_norway::Value>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Files currently being watched for changes.
@@ -56,7 +56,7 @@ pub async fn warm_cache() -> anyhow::Result<()> {
     if global_path.exists() {
         match tokio::fs::read_to_string(&global_path).await {
             Ok(content) => {
-                if let Ok(parsed) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                if let Ok(parsed) = serde_norway::from_str::<serde_norway::Value>(&content) {
                     if let Ok(mut cache) = CACHE.write() {
                         cache.insert(global_path.clone(), parsed);
                     }
@@ -73,7 +73,7 @@ pub async fn warm_cache() -> anyhow::Result<()> {
     if project_path.exists() {
         match tokio::fs::read_to_string(&project_path).await {
             Ok(content) => {
-                if let Ok(parsed) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                if let Ok(parsed) = serde_norway::from_str::<serde_norway::Value>(&content) {
                     if let Ok(mut cache) = CACHE.write() {
                         cache.insert(project_path.clone(), parsed);
                     }
@@ -169,7 +169,7 @@ fn read_file_to_string(path: &Path) -> anyhow::Result<String> {
     }
 }
 
-fn load_cached_root(path: &PathBuf) -> anyhow::Result<serde_yml::Value> {
+fn load_cached_root(path: &PathBuf) -> anyhow::Result<serde_norway::Value> {
     if let Ok(cache) = CACHE.read() {
         if let Some(cached) = cache.get(path) {
             return Ok(cached.clone());
@@ -178,8 +178,8 @@ fn load_cached_root(path: &PathBuf) -> anyhow::Result<serde_yml::Value> {
 
     let content =
         read_file_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed: serde_yml::Value =
-        serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+    let parsed: serde_norway::Value =
+        serde_norway::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
 
     if let Ok(mut cache) = CACHE.write() {
         cache.insert(path.clone(), parsed.clone());
@@ -244,7 +244,7 @@ fn resolve_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String>> {
 }
 
 /// Extract a list of strings from a YAML tree by dot-separated key.
-fn extract_list(root: &serde_yml::Value, key: &str) -> anyhow::Result<Vec<String>> {
+fn extract_list(root: &serde_norway::Value, key: &str) -> anyhow::Result<Vec<String>> {
     let mut current = root;
     for part in key.split('.') {
         match current.get(part) {
@@ -254,11 +254,11 @@ fn extract_list(root: &serde_yml::Value, key: &str) -> anyhow::Result<Vec<String
     }
 
     match current {
-        serde_yml::Value::Sequence(seq) => Ok(seq
+        serde_norway::Value::Sequence(seq) => Ok(seq
             .iter()
             .filter_map(|item| item.as_str().map(String::from))
             .collect()),
-        serde_yml::Value::String(s) => {
+        serde_norway::Value::String(s) => {
             // Support comma-separated string format
             Ok(s.split(',')
                 .map(|s| s.trim().to_string())
@@ -342,7 +342,7 @@ pub fn get_projects_with_paths() -> anyhow::Result<Vec<(String, std::path::PathB
             };
 
             if let Ok(content) = std::fs::read_to_string(&config_file) {
-                if let Ok(doc) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                if let Ok(doc) = serde_norway::from_str::<serde_norway::Value>(&content) {
                     if let Some(repo) = doc
                         .get("gh")
                         .and_then(|gh| gh.get("repo"))
@@ -386,7 +386,7 @@ pub fn get_repo_for_project(project_path: &std::path::Path) -> anyhow::Result<St
     };
 
     let content = std::fs::read_to_string(&config_file)?;
-    let doc: serde_yml::Value = serde_yml::from_str(&content)?;
+    let doc: serde_norway::Value = serde_norway::from_str(&content)?;
 
     doc.get("gh")
         .and_then(|gh| gh.get("repo"))
@@ -473,14 +473,14 @@ pub fn get_skills() -> anyhow::Result<Vec<SkillConfig>> {
 }
 
 /// Extract skills list from a YAML tree.
-fn extract_skills_list(root: &serde_yml::Value) -> anyhow::Result<Vec<SkillConfig>> {
-    let Some(serde_yml::Value::Sequence(seq)) = root.get("skills") else {
+fn extract_skills_list(root: &serde_norway::Value) -> anyhow::Result<Vec<SkillConfig>> {
+    let Some(serde_norway::Value::Sequence(seq)) = root.get("skills") else {
         return Ok(vec![]);
     };
 
     let mut skills = Vec::new();
     for item in seq {
-        if let serde_yml::Value::Mapping(map) = item {
+        if let serde_norway::Value::Mapping(map) = item {
             let repo = map
                 .get("repo")
                 .and_then(|v| v.as_str())
@@ -511,7 +511,7 @@ fn resolve_projects_list(path: &PathBuf, key: &str) -> anyhow::Result<Vec<String
 }
 
 /// Extract a projects list from a YAML tree.
-fn extract_projects_list(root: &serde_yml::Value, key: &str) -> anyhow::Result<Vec<String>> {
+fn extract_projects_list(root: &serde_norway::Value, key: &str) -> anyhow::Result<Vec<String>> {
     let mut current = root;
     for part in key.split('.') {
         // If key doesn't exist, return empty vector
@@ -523,14 +523,14 @@ fn extract_projects_list(root: &serde_yml::Value, key: &str) -> anyhow::Result<V
     }
 
     match current {
-        serde_yml::Value::Sequence(seq) => {
+        serde_norway::Value::Sequence(seq) => {
             let mut projects = Vec::new();
             for item in seq {
-                if let serde_yml::Value::String(s) = item {
+                if let serde_norway::Value::String(s) = item {
                     projects.push(s.clone());
-                } else if let serde_yml::Value::Mapping(map) = item {
+                } else if let serde_norway::Value::Mapping(map) = item {
                     // Support map format: { repo: "owner/repo", project_dir: "/path" }
-                    if let Some(serde_yml::Value::String(repo)) = map.get("repo") {
+                    if let Some(serde_norway::Value::String(repo)) = map.get("repo") {
                         projects.push(repo.clone());
                     }
                 }
@@ -555,7 +555,7 @@ fn resolve_key(path: &PathBuf, key: &str) -> anyhow::Result<String> {
 }
 
 /// Extract a value from a YAML tree by dot-separated key.
-fn extract_value(root: &serde_yml::Value, key: &str) -> anyhow::Result<String> {
+fn extract_value(root: &serde_norway::Value, key: &str) -> anyhow::Result<String> {
     let mut current = root;
     for part in key.split('.') {
         current = current
@@ -564,11 +564,11 @@ fn extract_value(root: &serde_yml::Value, key: &str) -> anyhow::Result<String> {
     }
 
     match current {
-        serde_yml::Value::String(s) => Ok(s.clone()),
-        serde_yml::Value::Number(n) => Ok(n.to_string()),
-        serde_yml::Value::Bool(b) => Ok(b.to_string()),
-        serde_yml::Value::Null => Ok(String::new()),
-        _ => Ok(serde_yml::to_string(current)?),
+        serde_norway::Value::String(s) => Ok(s.clone()),
+        serde_norway::Value::Number(n) => Ok(n.to_string()),
+        serde_norway::Value::Bool(b) => Ok(b.to_string()),
+        serde_norway::Value::Null => Ok(String::new()),
+        _ => Ok(serde_norway::to_string(current)?),
     }
 }
 
@@ -670,22 +670,24 @@ mod tests {
     #[test]
     fn extract_projects_list_from_sequence() {
         let yaml =
-            serde_yml::from_str::<serde_yml::Value>("projects:\n  - a\n  - b\n  - c\n").unwrap();
+            serde_norway::from_str::<serde_norway::Value>("projects:\n  - a\n  - b\n  - c\n")
+                .unwrap();
         let projects = extract_projects_list(&yaml, "projects").unwrap();
         assert_eq!(projects, vec!["a", "b", "c"]);
     }
 
     #[test]
     fn extract_projects_list_from_mapping_sequence() {
-        let yaml = serde_yml::from_str::<serde_yml::Value>("projects:\n  - repo: a\n  - repo: b\n")
-            .unwrap();
+        let yaml =
+            serde_norway::from_str::<serde_norway::Value>("projects:\n  - repo: a\n  - repo: b\n")
+                .unwrap();
         let projects = extract_projects_list(&yaml, "projects").unwrap();
         assert_eq!(projects, vec!["a", "b"]);
     }
 
     #[test]
     fn extract_projects_list_empty_for_missing() {
-        let yaml = serde_yml::from_str::<serde_yml::Value>("foo: bar").unwrap();
+        let yaml = serde_norway::from_str::<serde_norway::Value>("foo: bar").unwrap();
         let projects = extract_projects_list(&yaml, "projects").unwrap();
         assert!(projects.is_empty());
     }
@@ -764,7 +766,7 @@ mod tests {
 
     #[test]
     fn extract_skills_list_from_sequence() {
-        let yaml = serde_yml::from_str::<serde_yml::Value>(
+        let yaml = serde_norway::from_str::<serde_norway::Value>(
             "skills:\n  - repo: owner/skills1\n  - repo: owner/skills2\n",
         )
         .unwrap();
@@ -777,7 +779,8 @@ mod tests {
     #[test]
     fn extract_skills_list_single_repo() {
         let yaml =
-            serde_yml::from_str::<serde_yml::Value>("skills:\n  - repo: owner/skills\n").unwrap();
+            serde_norway::from_str::<serde_norway::Value>("skills:\n  - repo: owner/skills\n")
+                .unwrap();
         let skills = extract_skills_list(&yaml).unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].repo, "owner/skills");
@@ -785,7 +788,7 @@ mod tests {
 
     #[test]
     fn extract_skills_list_empty_for_missing() {
-        let yaml = serde_yml::from_str::<serde_yml::Value>("foo: bar").unwrap();
+        let yaml = serde_norway::from_str::<serde_norway::Value>("foo: bar").unwrap();
         let skills = extract_skills_list(&yaml).unwrap();
         assert!(skills.is_empty());
     }

@@ -116,14 +116,14 @@ pub struct ProjectEngine {
 /// without code changes.
 ///
 /// The key is top-level (`agents:`) rather than nested (`engine.agents:`)
-/// because `config::get` serializes nested YAML arrays via `serde_yml::to_string`
+/// because `config::get` serializes nested YAML arrays via `serde_norway::to_string`
 /// which produces YAML block format, not JSON — breaking downstream parsing.
 pub fn configured_agents() -> Vec<String> {
     if let Ok(agents_str) = crate::config::get("agents") {
         if !agents_str.is_empty() && agents_str != "[]" {
-            // config::get returns serde_yml::to_string for arrays, which is
+            // config::get returns serde_norway::to_string for arrays, which is
             // YAML block format ("- claude\n- codex\n..."). Parse as YAML first.
-            if let Ok(agents_arr) = serde_yml::from_str::<Vec<String>>(&agents_str) {
+            if let Ok(agents_arr) = serde_norway::from_str::<Vec<String>>(&agents_str) {
                 if !agents_arr.is_empty() {
                     return agents_arr;
                 }
@@ -562,7 +562,7 @@ fn read_project_channel_config(project_dir: &std::path::Path) -> ProjectChannelC
         Ok(c) => c,
         Err(_) => return ProjectChannelConfig::default(),
     };
-    let val: serde_yml::Value = match serde_yml::from_str(&content) {
+    let val: serde_norway::Value = match serde_norway::from_str(&content) {
         Ok(v) => v,
         Err(_) => return ProjectChannelConfig::default(),
     };
@@ -1813,9 +1813,9 @@ mod tests {
 
     #[test]
     fn configured_agents_parses_yaml_block_array() {
-        // config::get returns serde_yml::to_string for arrays, which is YAML block format
+        // config::get returns serde_norway::to_string for arrays, which is YAML block format
         let yaml_str = "- claude\n- codex\n- opencode\n- olm\n";
-        let parsed: Vec<String> = serde_yml::from_str(yaml_str).unwrap();
+        let parsed: Vec<String> = serde_norway::from_str(yaml_str).unwrap();
         assert_eq!(parsed, vec!["claude", "codex", "opencode", "olm"]);
     }
 

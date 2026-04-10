@@ -87,7 +87,7 @@ struct ConfigFile {
     jobs: Vec<Job>,
     // Capture all other fields so we can round-trip them
     #[serde(flatten)]
-    other: serde_yml::Mapping,
+    other: serde_norway::Mapping,
 }
 
 /// Resolve the config file that contains jobs.
@@ -128,7 +128,7 @@ pub fn load_jobs(path: &PathBuf) -> anyhow::Result<Vec<Job>> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let file: ConfigFile =
-        serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+        serde_norway::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
     for job in &file.jobs {
         let expanded = crate::cron::expand_alias(&job.schedule).with_context(|| {
             format!("job '{}': invalid cron schedule '{}'", job.id, job.schedule)
@@ -148,16 +148,16 @@ pub fn save_jobs(path: &PathBuf, jobs: &[Job]) -> anyhow::Result<()> {
     let mut file: ConfigFile = if path.exists() {
         let content =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        serde_yml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?
+        serde_norway::from_str(&content).with_context(|| format!("parsing {}", path.display()))?
     } else {
         ConfigFile {
             jobs: vec![],
-            other: serde_yml::Mapping::new(),
+            other: serde_norway::Mapping::new(),
         }
     };
 
     file.jobs = jobs.to_vec();
-    let content = serde_yml::to_string(&file)?;
+    let content = serde_norway::to_string(&file)?;
     std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }

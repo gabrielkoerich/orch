@@ -290,10 +290,10 @@ pub async fn write_project_config(sync: &ProjectSync) -> anyhow::Result<()> {
     };
 
     // Parse existing YAML or start fresh
-    let mut doc: serde_yml::Value = if content.is_empty() {
-        serde_yml::Value::Mapping(serde_yml::Mapping::new())
+    let mut doc: serde_norway::Value = if content.is_empty() {
+        serde_norway::Value::Mapping(serde_norway::Mapping::new())
     } else {
-        serde_yml::from_str(&content)?
+        serde_norway::from_str(&content)?
     };
 
     let root = doc
@@ -301,11 +301,11 @@ pub async fn write_project_config(sync: &ProjectSync) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("config is not a YAML mapping"))?;
 
     // Ensure gh section exists
-    let gh_key = serde_yml::Value::String("gh".to_string());
+    let gh_key = serde_norway::Value::String("gh".to_string());
     if !root.contains_key(&gh_key) {
         root.insert(
             gh_key.clone(),
-            serde_yml::Value::Mapping(serde_yml::Mapping::new()),
+            serde_norway::Value::Mapping(serde_norway::Mapping::new()),
         );
     }
     let gh = root
@@ -315,28 +315,28 @@ pub async fn write_project_config(sync: &ProjectSync) -> anyhow::Result<()> {
 
     // Set project fields
     gh.insert(
-        serde_yml::Value::String("project_id".to_string()),
-        serde_yml::Value::String(sync.project_id.clone()),
+        serde_norway::Value::String("project_id".to_string()),
+        serde_norway::Value::String(sync.project_id.clone()),
     );
     gh.insert(
-        serde_yml::Value::String("project_status_field_id".to_string()),
-        serde_yml::Value::String(sync.status_field_id.clone()),
+        serde_norway::Value::String("project_status_field_id".to_string()),
+        serde_norway::Value::String(sync.status_field_id.clone()),
     );
 
     // Build status map
-    let mut map = serde_yml::Mapping::new();
+    let mut map = serde_norway::Mapping::new();
     for (key, val) in &sync.status_map {
         map.insert(
-            serde_yml::Value::String(key.clone()),
-            serde_yml::Value::String(val.clone()),
+            serde_norway::Value::String(key.clone()),
+            serde_norway::Value::String(val.clone()),
         );
     }
     gh.insert(
-        serde_yml::Value::String("project_status_map".to_string()),
-        serde_yml::Value::Mapping(map),
+        serde_norway::Value::String("project_status_map".to_string()),
+        serde_norway::Value::Mapping(map),
     );
 
-    tokio::fs::write(&config_path, serde_yml::to_string(&doc)?).await?;
+    tokio::fs::write(&config_path, serde_norway::to_string(&doc)?).await?;
     Ok(())
 }
 

@@ -690,7 +690,7 @@ impl LlmRouter {
         let catalog = tokio::task::spawn_blocking(move || -> String {
             // Try skills.yml in current directory
             if let Ok(content) = std::fs::read_to_string("skills.yml") {
-                if let Ok(yaml) = serde_yml::from_str::<serde_yml::Value>(&content) {
+                if let Ok(yaml) = serde_norway::from_str::<serde_norway::Value>(&content) {
                     if let Some(skills) = yaml.get("skills") {
                         if let Ok(json) = serde_json::to_string(skills) {
                             return json;
