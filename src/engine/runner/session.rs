@@ -3,7 +3,6 @@
 //! Extracted from `runner/mod.rs`. Handles the tmux session lifecycle:
 //! spawning the agent, waiting for completion, reading output files, and cleanup.
 
-use crate::config;
 use crate::tmux::TmuxManager;
 use std::path::{Path, PathBuf};
 use tokio::time::{timeout, Duration};
@@ -28,16 +27,10 @@ pub async fn run_agent_session(
     attempt_dir: &Path,
     orch_home: &Path,
 ) -> (TmuxManager, String, SessionOutput) {
-    // Read workflow.timeout_seconds from config with default of 1800 (30 minutes).
-    // Enforce a minimum of 1800 seconds (30 minutes) to ensure tasks have sufficient time.
-    let task_timeout_secs: u64 = config::get("workflow.timeout_seconds")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1800)
-        .max(1800);
-
+    // Use the pre-computed timeout from the invocation (set by task_init.rs, which
+    // reads workflow.timeout_seconds and applies per-complexity overrides).
     // Add 120s grace so the shell timeout (in runner.sh) fires before Tokio kills the session.
-    let task_timeout = Duration::from_secs(task_timeout_secs + 120);
+    let task_timeout = Duration::from_secs(invocation.timeout_seconds + 120);
 
     let tmux = TmuxManager::new();
 

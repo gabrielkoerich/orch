@@ -331,12 +331,27 @@ pub async fn prepare_task(
         ]);
     }
 
-    // Timeout: enforce a minimum of 1800 seconds (30 minutes)
-    let timeout_seconds: u64 = config::get("workflow.timeout_seconds")
+    // Timeout: read base from workflow.timeout_seconds (min 1800s), then apply per-complexity
+    // override from workflow.timeout_by_complexity.{simple,medium,complex} if configured.
+    // The per-complexity value is also floored at the base to prevent accidental regression.
+    let base_timeout: u64 = config::get("workflow.timeout_seconds")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1800)
         .max(1800);
+    let timeout_seconds: u64 = match complexity.as_deref() {
+        Some("complex") => config::get("workflow.timeout_by_complexity.complex")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(base_timeout)
+            .max(base_timeout),
+        Some("medium") => config::get("workflow.timeout_by_complexity.medium")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(base_timeout)
+            .max(base_timeout),
+        _ => base_timeout,
+    };
 
     // Build agent invocation
     let invocation = agent::AgentInvocation {
