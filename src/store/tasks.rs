@@ -1371,6 +1371,10 @@ impl TaskStore {
             let mut set_parts = Vec::new();
             let mut values: Vec<Option<String>> = Vec::new();
             for (col, val) in *entry_updates {
+                anyhow::ensure!(
+                    ALLOWED_FIELDS.contains(col),
+                    "column {col} is not in the update allowlist"
+                );
                 set_parts.push(format!("{col} = ?"));
                 match val {
                     serde_json::Value::String(s) => values.push(Some(s.clone())),
